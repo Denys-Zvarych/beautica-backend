@@ -12,6 +12,8 @@ import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.dto.SearchSort;
+import com.beautica.service.service.PlatformCategoryLabel;
+import com.beautica.service.service.PlatformCategoryLabelResolver;
 import com.beautica.service.service.ServiceTypeMatch;
 import com.beautica.service.service.ServiceTypeSlugResolver;
 import jakarta.persistence.EntityManager;
@@ -88,6 +90,12 @@ class SearchServiceTest {
     @Mock
     private ServiceTypeSlugResolver serviceTypeSlugResolver;
 
+    // Category half of free-text search. Stubbed empty by default in setUp(), so every
+    // pre-existing test below generates byte-identical SQL to before the feature — the
+    // category disjunct only appears once a test supplies a matching display name.
+    @Mock
+    private PlatformCategoryLabelResolver platformCategoryLabelResolver;
+
     // Filter-scoped total memo (perf follow-up): getCache(...) returns null (no cache bean
     // registered under that name) by default, so readMemoizedTotal/writeMemoizedTotal are
     // no-ops and every pre-existing test below exercises the exact same code path as before
@@ -102,7 +110,8 @@ class SearchServiceTest {
     @BeforeEach
     void setUp() {
         service = new SearchService(
-                salonRepository, discoveryLocationResolver, serviceTypeSlugResolver, cacheManager);
+                salonRepository, discoveryLocationResolver, serviceTypeSlugResolver,
+                platformCategoryLabelResolver, cacheManager);
         ReflectionTestUtils.setField(service, "entityManager", entityManager);
         sqlCaptor = ArgumentCaptor.forClass(String.class);
         // The seam passes through the (cityId, districtId) pair by default;
@@ -116,6 +125,10 @@ class SearchServiceTest {
         lenient().when(discoveryLocationResolver.resolveLabels(any(), any()))
                 .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
         lenient().when(cacheManager.getCache(anyString())).thenReturn(null);
+        // No selectable categories by default → resolveQueryCategories() returns empty
+        // → every category disjunct collapses to the empty string, so the generated SQL
+        // is byte-identical to the pre-feature form for all existing assertions.
+        lenient().when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
     }
 
     private void stubNativeQueries(List<Object[]> rows, long total) {
@@ -777,6 +790,175 @@ class SearchServiceTest {
                 .doesNotContain(":stName0");
         // The FK target binds as a plain UUID object (no CAST), mirroring the master path.
         verify(dataQuery).setParameter("stId0", typeId);
+    }
+
+    // ── free-text search by CATEGORY display name ────────────────────────────
+    //
+    // «Нарощення вій» is a platform_categories.display_name and appears in NO
+    // service_definitions.name and NO service_types.name_uk, so before this feature
+    // the q predicate — which searched provider names + service names only — returned
+    // zero rows for it. These guards pin the two halves of the fix: the resolved
+    // category set becomes a bound `category IN (…)` disjunct, and a query that
+    // resolves to NOTHING leaves the SQL byte-identical to its pre-feature form.
+
+    /** «Нарощення вій» — the LASH_EXTENSIONS label from the V74 seed. */
+    private static final PlatformCategoryLabel LASH_EXTENSIONS =
+            new PlatformCategoryLabel("LASH_EXTENSIONS", "Нарощення вій");
+
+    @Test
+    @DisplayName("q matching a category display name ORs sd.category IN (:qcat0) into the master q predicate and binds the CANONICAL name (not the typed text)")
+    void should_emitCategoryDisjunct_when_qMatchesCategoryDisplayName() {
+        stubNativeQueries(List.of(), 0L);
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(LASH_EXTENSIONS));
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "Нарощення вій", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        assertThat(sql)
+                .as("the index-servable pre-filter widens to name-or-category")
+                .contains("AND (sd.name ILIKE :q0 OR sd.category IN (:qcat0))")
+                .contains("AND (sd.name ILIKE :q1 OR sd.category IN (:qcat0))");
+        assertThat(sql)
+                .as("the exact group predicate widens the SAME way, so the two cannot diverge")
+                .contains("OR sdg.name ILIKE :q0 OR sdg.category IN (:qcat0)")
+                .contains("OR sdg.name ILIKE :q1 OR sdg.category IN (:qcat0)");
+        assertThat(sql)
+                .as("the category set is bound, never interpolated")
+                .doesNotContain("LASH_EXTENSIONS")
+                .doesNotContain("CAST(:");
+        // The BOUND value is the canonical wire name, not the Ukrainian text the user
+        // typed — that text only ever selected which category rows matched.
+        verify(dataQuery).setParameter("qcat0", "LASH_EXTENSIONS");
+    }
+
+    @Test
+    @DisplayName("the category disjunct sits INSIDE the active-assignment EXISTS — a category match cannot bypass the active-master gate")
+    void should_keepCategoryDisjunctInsideActiveAssignmentExists_when_qMatchesCategory() {
+        stubNativeQueries(List.of(), 0L);
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(LASH_EXTENSIONS));
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "Нарощення вій", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        // The disjunct must never be lifted to the master level: it has to stay behind
+        // the active master_services / active service_definitions / owner gate, or a
+        // master would become discoverable by a category they no longer actually offer.
+        assertThat(sql)
+                .as("pre-filter: the category disjunct is downstream of the active-assignment join and the owner gate")
+                .contains("JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true "
+                        + "WHERE ms.master_id = m.id AND ms.is_active = true "
+                        + "AND sd.owner_type = 'INDEPENDENT_MASTER' AND sd.owner_id = ms.master_id "
+                        + "AND (sd.name ILIKE :q0 OR sd.category IN (:qcat0))");
+        assertThat(sql)
+                .as("no bare master-level category predicate escaped the EXISTS")
+                .doesNotContain("AND m.id IN (:qcat0)");
+    }
+
+    @Test
+    @DisplayName("q that matches NO category leaves the generated SQL free of any :qcat slot (hot path unchanged, plan protected)")
+    void should_omitCategoryDisjunct_when_qMatchesNoCategoryDisplayName() {
+        stubNativeQueries(List.of(), 0L);
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(LASH_EXTENSIONS));
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "кова", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        assertThat(sql)
+                .as("no category matched, so the disjunct collapses away entirely")
+                .doesNotContain(":qcat")
+                .doesNotContain(".category IN (");
+        assertThat(sql)
+                .as("the pre-filter keeps its original un-parenthesised shape — the same SQL "
+                        + "string, hence the same server-side plan-cache entry")
+                .contains("AND sd.name ILIKE :q0))");
+        verify(dataQuery, never()).setParameter(eq("qcat0"), any());
+    }
+
+    @Test
+    @DisplayName("only categories matching ALL tokens are bound — a label carrying just one token is excluded (group semantics preserved)")
+    void should_bindOnlyAllTokenCategories_when_qHasMultipleTokens() {
+        stubNativeQueries(List.of(), 0L);
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(
+                LASH_EXTENSIONS,
+                // Shares «вій» but not «нарощення» — must NOT be bound, or the query
+                // would silently widen to a category the user did not ask for.
+                new PlatformCategoryLabel("LASH_LAMINATION", "Ламінування вій"),
+                // Shares «нарощ…» only as a different word stem — no token containment.
+                new PlatformCategoryLabel("HAIR_EXTENSIONS", "Нарощування волосся")));
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "нарощення вій", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        verify(dataQuery).setParameter("qcat0", "LASH_EXTENSIONS");
+        verify(dataQuery, never()).setParameter(eq("qcat1"), any());
+        assertThat(sqlCaptor.getAllValues().get(0))
+                .as("exactly one category slot is emitted")
+                .contains("sd.category IN (:qcat0)")
+                .doesNotContain(":qcat1");
+    }
+
+    @Test
+    @DisplayName("the matched_names lateral is widened by the category disjunct so a category match explains itself instead of falling back to an arbitrary catalogue slice")
+    void should_widenMatchedNamesLateral_when_qMatchesCategoryDisplayName() {
+        stubNativeQueries(List.of(), 0L);
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(LASH_EXTENSIONS));
+        MasterSearchRequest request = new MasterSearchRequest(
+                null, "Нарощення вій", null, null, null, null, null, 0, 20, null);
+
+        service.searchMasters(request, PageRequest.of(0, 20));
+
+        String sql = sqlCaptor.getAllValues().get(0);
+        // Condition (2) of the lateral — "contributes at least one token through its own
+        // name" — would reject EVERY service on a category-name query (no service name
+        // contains any token), leaving matchedServiceNames empty.
+        assertThat(sql)
+                .as("belonging to a matched category counts as an explanation")
+                .contains("AND (sd.name ILIKE :q0 OR sd.name ILIKE :q1 OR sd.category IN (:qcat0))");
+    }
+
+    @Test
+    @DisplayName("a salon q that resolves to a category is routed to the DYNAMIC builder — the static repository projections cannot express a variable-length IN list")
+    void should_routeSalonSearchToDynamicBuilder_when_qMatchesCategoryDisplayName() {
+        stubNativeQueries(List.of(), 0L);
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(LASH_EXTENSIONS));
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, "Нарощення вій", null, null, null, null, 0, 20, null);
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        // If this dispatch is ever narrowed back to "slugs only", salon category search
+        // silently returns zero rows again — hence an explicit no-interaction assertion
+        // on the static path rather than only a positive one on the dynamic path.
+        verifyNoInteractions(salonRepository);
+        String salonSql = sqlCaptor.getAllValues().get(0);
+        assertThat(salonSql)
+                .as("the bookable-master gate still guards the category disjunct — a salon's "
+                        + "client-visible offering stays master-performed only")
+                .contains("JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true")
+                .contains("sdq.name ILIKE :q0 OR sdq.category IN (:qcat0)")
+                .doesNotContain("CAST(:");
+        verify(dataQuery).setParameter("qcat0", "LASH_EXTENSIONS");
+    }
+
+    @Test
+    @DisplayName("a salon q that matches NO category keeps using the tuned static repository projection (no dynamic-builder regression for ordinary traffic)")
+    void should_keepSalonStaticProjection_when_qMatchesNoCategory() {
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(LASH_EXTENSIONS));
+        SalonSearchRequest request = new SalonSearchRequest(
+                null, "кова", null, null, null, null, 0, 20, null);
+
+        service.searchSalons(request, PageRequest.of(0, 20));
+
+        verify(entityManager, never()).createNativeQuery(anyString());
+        verify(salonRepository).findByIsActiveTrueNoPriceAsProjection(
+                any(), any(), any(), any(), isNull(), anyString(), anyInt(), anyLong());
     }
 
     @Test

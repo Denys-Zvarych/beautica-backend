@@ -13,6 +13,7 @@ import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.dto.SearchSort;
+import com.beautica.service.service.PlatformCategoryLabelResolver;
 import com.beautica.service.service.ServiceTypeMatch;
 import com.beautica.service.service.ServiceTypeSlugResolver;
 import jakarta.persistence.EntityManager;
@@ -163,6 +164,18 @@ public class SearchService {
      */
     private static final String Q_PARAM_PREFIX = "q";
 
+    /**
+     * Named-parameter prefix for the canonical {@code platform_categories.name} of
+     * resolved category {@code n} ({@code :qcat0}, {@code :qcat1}, …) — the category
+     * half of free-text search.
+     *
+     * <p><b>Must stay equal to</b> the {@code qcat} prefix hard-coded in
+     * {@code SalonSearchSql.categoryDisjunct}. That class cannot import this constant
+     * (a {@code @Query} value must be a compile-time constant expression), which is
+     * the same split-brain that already exists for {@link #Q_PARAM_PREFIX} / {@code :qN}.
+     */
+    private static final String Q_CATEGORY_PARAM_PREFIX = "qcat";
+
     /** Projection index of the {@code service_names} {@code array_agg} column. */
     private static final int SERVICE_NAMES_IDX = 10;
 
@@ -260,6 +273,7 @@ public class SearchService {
     private final SalonRepository salonRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final ServiceTypeSlugResolver serviceTypeSlugResolver;
+    private final PlatformCategoryLabelResolver platformCategoryLabelResolver;
     private final CacheManager cacheManager;
 
     /**
@@ -317,7 +331,8 @@ public class SearchService {
             return new PageImpl<>(List.of(), pageable, 0L);
         }
 
-        MasterSearchFilters filters = normalize(request, query, resolved.get());
+        MasterSearchFilters filters =
+                normalize(request, query, resolved.get(), resolveQueryCategories(query));
 
         // Filter-scoped total memo (perf follow-up, architect decision — keyset/cursor
         // pagination is REJECTED for this surface; see the backlog entry). A memoized
@@ -433,6 +448,9 @@ public class SearchService {
             return new PageImpl<>(List.of(), pageable, 0L);
         }
         List<ResolvedServiceType> serviceTypes = resolved.get();
+        // Category half of free-text search — see resolveQueryCategories. Empty for
+        // almost every query; non-empty only when the user typed a category label.
+        List<String> qCategories = resolveQueryCategories(query);
 
         // Filter-scoped total memo (perf follow-up) — mirrors searchMasters (see its Javadoc
         // note for the full trade-off). Computed once here, from the raw request, so the SAME
@@ -464,10 +482,22 @@ public class SearchService {
         // salon-side mirror in the same suite. Do not convert this to AND semantics, and do not
         // introduce a flattened provider→service-type projection table to serve AND semantics,
         // without a product decision reversing that rule first.
-        if (!serviceTypes.isEmpty()) {
+        //
+        // THE CATEGORY DISPATCH — do not narrow this condition. The six static
+        // SalonRepository projection queries declare a FIXED bind arity (:q0…:q3) and a
+        // @Query value must be a compile-time constant, so they cannot express the
+        // variable-length `sdq.category IN (:qcat…)` disjunct that makes a search for a
+        // CATEGORY DISPLAY NAME («Нарощення вій») match anything at all. The dynamic
+        // builder can, so a query that resolved to any platform category is routed here
+        // too — not just a serviceTypeSlugs filter. This is the sole reason
+        // SalonSearchSql's static and dynamic forms are allowed to differ on the
+        // category half (see its class Javadoc); drop the `|| !qCategories.isEmpty()`
+        // and salon category search silently returns zero rows again, with every
+        // existing test still green.
+        if (!serviceTypes.isEmpty() || !qCategories.isEmpty()) {
             return searchSalonsWithServiceFilter(
-                    cityId, districtId, category, query.tokens(), minPrice, maxPrice,
-                    sort, serviceTypes, pageable, totalKey);
+                    cityId, districtId, category, query.tokens(), qCategories,
+                    minPrice, maxPrice, sort, serviceTypes, pageable, totalKey);
         }
 
         if (pageable.getOffset() > 0) {
@@ -532,7 +562,7 @@ public class SearchService {
      */
     private Page<SalonSearchResult> searchSalonsWithServiceFilter(
             UUID cityId, UUID districtId, String category, List<String> qTokens,
-            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
+            List<String> qCategories, BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
             List<ResolvedServiceType> serviceTypes, Pageable pageable, Object totalKey) {
         if (pageable.getOffset() > 0) {
             Long memoizedTotal = readMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey);
@@ -542,7 +572,7 @@ public class SearchService {
         }
 
         SqlAndParams dataSql = buildSalonSearchSql(
-                cityId, districtId, category, qTokens, minPrice, maxPrice,
+                cityId, districtId, category, qTokens, qCategories, minPrice, maxPrice,
                 sort, serviceTypes, pageable);
         Query dataQuery = entityManager.createNativeQuery(dataSql.sql());
         bind(dataQuery, dataSql.params());
@@ -555,7 +585,7 @@ public class SearchService {
             // See probeTotalForEmptyPage.
             long recovered = pageable.getOffset() == 0 ? 0L
                     : probeTotalForEmptyPage(
-                            buildSalonSearchSql(cityId, districtId, category, qTokens,
+                            buildSalonSearchSql(cityId, districtId, category, qTokens, qCategories,
                                     minPrice, maxPrice, sort, serviceTypes, TOTAL_PROBE_PAGE),
                             SALON_TOTAL_COUNT_IDX);
             writeMemoizedTotal(SearchCacheNames.SALONS_TOTAL, totalKey, recovered);
@@ -663,11 +693,21 @@ public class SearchService {
      * {@code qTokens} holds the whitespace tokens of the free-text query (see
      * {@link NormalizedSearchQuery}) — empty means "no text filter"; {@code sort}
      * is the resolved ordering (never null after {@link #normalize}).
+     *
+     * <p>{@code qCategories} holds the canonical {@code platform_categories.name}
+     * values whose Ukrainian display name contains EVERY {@code qTokens} entry (see
+     * {@link #resolveQueryCategories}). It is derived from {@code qTokens}, NOT from
+     * the caller's {@code category} request filter — the two are unrelated and must
+     * not be conflated: {@code category} is an explicit facet the client selected and
+     * it NARROWS the result set (an ANDed {@code EXISTS}), whereas {@code qCategories}
+     * is inferred from free text and WIDENS it (an extra {@code OR} disjunct inside
+     * the {@code q} predicate). Almost always empty.
      */
     private record MasterSearchFilters(
             UUID cityId,
             UUID districtId,
             List<String> qTokens,
+            List<String> qCategories,
             String category,
             SearchSort sort,
             BigDecimal minRating,
@@ -891,15 +931,61 @@ public class SearchService {
         return Optional.of(List.copyOf(resolved));
     }
 
+    /**
+     * Resolves the free-text query to the canonical {@code platform_categories.name}
+     * values whose Ukrainian {@code display_name} contains EVERY token — the fix for
+     * "typing a category name returns nothing".
+     *
+     * <h4>The bug this closes</h4>
+     * «Нарощення вій» is a {@code platform_categories.display_name}. It exists in no
+     * {@code service_definitions.name} and no {@code service_types.name_uk}, and the
+     * free-text predicate reached neither {@code platform_categories} nor any
+     * category column — so the single most natural query a client can type (the name
+     * of the category they are shopping for) returned zero rows while 341 active
+     * masters offered exactly that category.
+     *
+     * <h4>Why resolving up front rather than joining</h4>
+     * Joining {@code platform_categories} into the predicate would put a second
+     * relation under the {@code ILIKE} and forfeit the
+     * {@code idx_service_definitions_name_trgm} plan on {@code sd.name} — the classic
+     * OR-across-relations index defeat this query was already refactored once to
+     * avoid (see {@link #buildMasterSearchSql}). Resolved here, the SQL gains a plain
+     * {@code category IN (…)} equality set that {@code idx_service_def_category} (V6)
+     * serves, and the trigram branch is untouched.
+     *
+     * <h4>Cost, and why it needs no cache key of its own</h4>
+     * One read of the cached approved+active category list
+     * ({@code platform-category-order}, 60-min TTL) plus a scan over ~20 in-memory
+     * labels. No extra round-trip, and nothing is added to the {@code @Cacheable} key
+     * on {@link #searchMasters}/{@link #searchSalons}: the resolved set is a pure
+     * function of the normalised {@code q}, which the key already carries. The one
+     * consequence is that approving or renaming a category can leave a search page
+     * stale for up to that cache's TTL (30–60 s) — the same staleness window every
+     * other search result already has, and far shorter than the 60-min reference-data
+     * TTL, so no eviction hook is warranted.
+     *
+     * @return matching canonical category names, in a deterministic order; empty for
+     *         an absent query and for the overwhelming majority of real queries
+     */
+    private List<String> resolveQueryCategories(NormalizedSearchQuery query) {
+        if (!query.hasTokens()) {
+            return List.of();
+        }
+        return QueryCategoryMatcher.matchingCategoryNames(
+                platformCategoryLabelResolver.selectableLabels(), query.tokens());
+    }
+
     private MasterSearchFilters normalize(
             MasterSearchRequest request,
             NormalizedSearchQuery query,
-            List<ResolvedServiceType> serviceTypes) {
+            List<ResolvedServiceType> serviceTypes,
+            List<String> qCategories) {
         DiscoveryLocationKey key = resolveLocation(request.location());
         return new MasterSearchFilters(
                 key == null ? null : key.cityId(),
                 key == null ? null : key.districtId(),
                 query.tokens(),
+                qCategories,
                 normalizeCategory(request.category()),
                 SearchSort.orDefault(request.sort()),
                 normalizeRating(request.minRating()),
@@ -969,7 +1055,7 @@ public class SearchService {
 
         String sql = wrapWithServiceNamesLateral(
                 inner.toString(), filters.sort(), filters.category() != null,
-                filters.serviceTypes(), filters.qTokens().size());
+                filters.serviceTypes(), filters.qTokens().size(), filters.qCategories());
         return new SqlAndParams(sql, params);
     }
 
@@ -1021,7 +1107,8 @@ public class SearchService {
      */
     private static String wrapWithServiceNamesLateral(
             String innerSql, SearchSort sort, boolean hasCategoryFilter,
-            List<ResolvedServiceType> serviceTypes, int qTokenCount) {
+            List<ResolvedServiceType> serviceTypes, int qTokenCount,
+            List<String> qCategories) {
         boolean hasServiceFilter = !serviceTypes.isEmpty();
         // Phase 20.3 + free-text extension: matched_names is now produced for a
         // per-service filter, a free-text q, or both (see appendMatchedNamesLateral).
@@ -1103,7 +1190,7 @@ public class SearchService {
         }
         sb.append(") sn ON true ");
         if (hasMatchedNames) {
-            appendMatchedNamesLateral(sb, serviceTypes, qTokenCount);
+            appendMatchedNamesLateral(sb, serviceTypes, qTokenCount, qCategories);
         }
         appendOuterOrderBy(sb, sort);
         return sb.toString();
@@ -1245,8 +1332,8 @@ public class SearchService {
             sb.append("AND ").append(DISCOVERY_CITY_EXPR).append(" = :cityId ");
             params.put("cityId", filters.cityId());
         }
-        // Free-text name / service-name match — see appendQPredicate.
-        appendQPredicate(sb, filters.qTokens(), params);
+        // Free-text name / service-name / category-name match — see appendQPredicate.
+        appendQPredicate(sb, filters.qTokens(), filters.qCategories(), params);
         // Category filter as a correlated EXISTS over the master's active
         // services — no main-query service join, so the Top-N stays index-ordered.
         if (filters.category() != null) {
@@ -1422,13 +1509,19 @@ public class SearchService {
      * predicate stays bounded.</p>
      */
     private static void appendQPredicate(
-            StringBuilder sb, List<String> qTokens, Map<String, Object> params) {
+            StringBuilder sb, List<String> qTokens, List<String> qCategories,
+            Map<String, Object> params) {
         if (qTokens.isEmpty()) {
             return;
         }
         for (int i = 0; i < qTokens.size(); i++) {
             params.put(Q_PARAM_PREFIX + i, likeContains(qTokens.get(i)));
         }
+        bindQueryCategoryParams(qCategories, params);
+        // Category half of free-text search — the EMPTY STRING for any query that
+        // named no platform category, which is what keeps everything below
+        // byte-identical to its pre-fix form on the dominant traffic shape.
+        String preFilterCategories = categoryDisjunct("sd", qCategories);
         // (1) Index-servable pre-filter — logically implied by (2), see Javadoc.
         //     Emitted only for trigram-servable tokens: a 1–2 char pattern cannot
         //     reach idx_service_definitions_name_trgm and becomes a full seq scan.
@@ -1451,7 +1544,9 @@ public class SearchService {
             // INNER-ONLY equality that Postgres folds straight into the existing
             // hash condition instead of widening the outer correlation. See Javadoc.
             appendMasterOwnedServiceGate(sb, "sd", "ms.master_id");
-            sb.append("AND sd.name ILIKE :").append(param).append(")) ");
+            sb.append("AND ");
+            appendServiceNameMatch(sb, "sd", param, preFilterCategories);
+            sb.append(")) ");
         }
         // (2) Exact group-scoped predicate: all tokens by the name columns, OR all
         //     tokens by the name columns / ONE single service.
@@ -1484,8 +1579,78 @@ public class SearchService {
                 .append("JOIN service_definitions sdg ON sdg.id = msg.service_def_id AND sdg.is_active = true ")
                 .append("WHERE msg.master_id = m.id AND msg.is_active = true ");
         appendMasterOwnedServiceGate(sb, "sdg", "m.id");
-        appendMasterTokenConjunction(sb, "u", "sdg", qTokens.size());
+        appendMasterTokenConjunction(sb, "u", "sdg", qTokens.size(), qCategories);
         sb.append(")) ");
+    }
+
+    /**
+     * Appends the {@code service_definitions} half of one per-token clause:
+     * {@code <defAlias>.name ILIKE :qN}, widened to
+     * {@code (<defAlias>.name ILIKE :qN OR <defAlias>.category IN (:qcat…))} when the
+     * query resolved to platform categories.
+     *
+     * <p>The extra parenthesis pair is emitted ONLY in the widened form, so a query
+     * that named no category produces the exact byte sequence this call site emitted
+     * before the category half existed.
+     */
+    private static void appendServiceNameMatch(
+            StringBuilder sb, String defAlias, String param, String categoryDisjunct) {
+        if (categoryDisjunct.isEmpty()) {
+            sb.append(defAlias).append(".name ILIKE :").append(param);
+            return;
+        }
+        sb.append("(").append(defAlias).append(".name ILIKE :").append(param)
+                .append(categoryDisjunct).append(")");
+    }
+
+    /**
+     * Builds {@code " OR <defAlias>.category IN (:qcat0, :qcat1, …)"}, or the empty
+     * string when the query matched no platform category.
+     *
+     * <p><b>The empty case is the point.</b> Returning {@code ""} makes every
+     * predicate that splices it byte-identical to its pre-fix form for the
+     * overwhelming majority of queries (a provider name, a service name — anything
+     * that is not a category label). That is the query-plan protection: the hot path
+     * is not merely semantically equivalent, it is the SAME SQL string, so it reuses
+     * the same server-side plan-cache entry and cannot regress. Only a query that
+     * actually named a category pays for the extra disjunct.
+     *
+     * <p>The list length is bounded by the approved+active {@code platform_categories}
+     * row count (admin-gated reference data, a couple of dozen rows) — never by
+     * anything the caller can inflate with query text. Adding tokens can only SHRINK
+     * the set, since every token is another conjunct each label must satisfy.
+     *
+     * <p>Mirrors {@code SalonSearchSql.categoryDisjunct}, which must emit the
+     * identical {@code :qcat{n}} spelling because both bind through
+     * {@link #bindQueryCategoryParams}. The duplication is forced by the same
+     * compile-time-constant constraint documented on {@link #Q_CATEGORY_PARAM_PREFIX}.
+     */
+    private static String categoryDisjunct(String defAlias, List<String> qCategories) {
+        if (qCategories.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(" OR ").append(defAlias).append(".category IN (");
+        for (int i = 0; i < qCategories.size(); i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(":").append(Q_CATEGORY_PARAM_PREFIX).append(i);
+        }
+        return sb.append(")").toString();
+    }
+
+    /**
+     * Binds each resolved category's {@code :qcat{n}} slot as a plain {@code String}
+     * (no {@code CAST(:p …)} idiom — {@code SearchServiceTest} guard). The values are
+     * canonical {@code platform_categories.name} rows read from the database, never
+     * caller text, so no user input reaches the SQL through this path even though the
+     * user's query is what selected them.
+     */
+    private static void bindQueryCategoryParams(
+            List<String> qCategories, Map<String, Object> params) {
+        for (int i = 0; i < qCategories.size(); i++) {
+            params.put(Q_CATEGORY_PARAM_PREFIX + i, qCategories.get(i));
+        }
     }
 
     /**
@@ -1541,16 +1706,38 @@ public class SearchService {
      * ({@code t} / {@code sdq}, outer block) so the two cannot express different
      * semantics.</p>
      *
-     * @param nameAlias alias carrying {@code first_name} / {@code last_name}
-     * @param defAlias  alias of the single {@code service_definitions} row under test
+     * <h4>Category half — why per-token placement does not loosen the group rule</h4>
+     * When the query resolved to platform categories, each clause gains
+     * {@code OR <defAlias>.category IN (:qcat…)}. That looks like it would let
+     * different tokens be satisfied for different reasons, re-opening the
+     * cross-service false positives this group predicate was built to close. It does
+     * not, because membership in the resolved set already proves the category's
+     * display name contained <b>every</b> token
+     * ({@code QueryCategoryMatcher} matches all-tokens-against-one-label). So whenever
+     * the disjunct is true it is true for all tokens at once, and the per-token and
+     * whole-group placements are provably the same predicate — which is what lets the
+     * fix reuse this skeleton, and the single-token short-circuit identity in
+     * {@link #appendQPredicate}, untouched.
+     *
+     * <p>This is also the answer to the multi-token problem that defeats the naive
+     * fix: «нарощення» and «вій» co-occur in no single service name, so any
+     * formulation requiring each token to be independently satisfiable by one service
+     * row still returns nothing. Resolving the label as a whole is what breaks that.
+     *
+     * @param nameAlias   alias carrying {@code first_name} / {@code last_name}
+     * @param defAlias    alias of the single {@code service_definitions} row under test
+     * @param qCategories resolved canonical category names; empty for almost every query
      */
     private static void appendMasterTokenConjunction(
-            StringBuilder sb, String nameAlias, String defAlias, int tokenCount) {
+            StringBuilder sb, String nameAlias, String defAlias, int tokenCount,
+            List<String> qCategories) {
+        String categories = categoryDisjunct(defAlias, qCategories);
         for (int i = 0; i < tokenCount; i++) {
             String param = Q_PARAM_PREFIX + i;
             sb.append("AND (").append(nameAlias).append(".first_name ILIKE :").append(param)
                     .append(" OR ").append(nameAlias).append(".last_name ILIKE :").append(param)
-                    .append(" OR ").append(defAlias).append(".name ILIKE :").append(param).append(") ");
+                    .append(" OR ").append(defAlias).append(".name ILIKE :").append(param)
+                    .append(categories).append(") ");
         }
     }
 
@@ -1698,7 +1885,8 @@ public class SearchService {
      * {@code serviceNames} — the same fallback as the pure-name case above.
      */
     private static void appendMatchedNamesLateral(
-            StringBuilder sb, List<ResolvedServiceType> serviceTypes, int qTokenCount) {
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, int qTokenCount,
+            List<String> qCategories) {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT array_agg(xm.name) AS matched_names FROM (")
                 .append("SELECT DISTINCT sd.name ")
@@ -1715,7 +1903,13 @@ public class SearchService {
         }
         if (qTokenCount > 0) {
             // (2) own-name contribution — keeps a pure name match from listing the
-            //     whole catalogue.
+            //     whole catalogue. Widened by the category disjunct so a CATEGORY-name
+            //     match still explains itself: no service name contains any token in
+            //     that case, so without the disjunct every candidate would be rejected
+            //     here and the card would fall back to an arbitrary alphabetical slice
+            //     of the master's whole catalogue. Belonging to the category the user
+            //     typed is a scoped explanation, not the arbitrary slice this
+            //     condition exists to prevent.
             sb.append("AND (");
             for (int i = 0; i < qTokenCount; i++) {
                 if (i > 0) {
@@ -1723,9 +1917,9 @@ public class SearchService {
                 }
                 sb.append("sd.name ILIKE :").append(Q_PARAM_PREFIX).append(i);
             }
-            sb.append(") ");
+            sb.append(categoryDisjunct("sd", qCategories)).append(") ");
             // (1) same group-scoped condition as the WHERE clause, against THIS service.
-            appendMasterTokenConjunction(sb, "t", "sd", qTokenCount);
+            appendMasterTokenConjunction(sb, "t", "sd", qTokenCount, qCategories);
         }
         sb.append("ORDER BY sd.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") xm) mn ON true ");
@@ -1871,7 +2065,7 @@ public class SearchService {
      */
     private static SqlAndParams buildSalonSearchSql(
             UUID cityId, UUID districtId, String category, List<String> qTokens,
-            BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
+            List<String> qCategories, BigDecimal minPrice, BigDecimal maxPrice, SearchSort sort,
             List<ResolvedServiceType> serviceTypes, Pageable pageable) {
         StringBuilder inner = new StringBuilder();
         Map<String, Object> params = new LinkedHashMap<>();
@@ -1913,7 +2107,11 @@ public class SearchService {
         for (int i = 0; i < qTokens.size(); i++) {
             params.put(Q_PARAM_PREFIX + i, likeContains(qTokens.get(i)));
         }
-        inner.append(SalonSearchSql.dynamicQGroupPredicate(qTokens.size()));
+        // Category half — bound here (not in SalonSearchSql, which only emits text)
+        // through the same helper the master path uses, so the two paths cannot bind
+        // the :qcat{n} slots differently.
+        bindQueryCategoryParams(qCategories, params);
+        inner.append(SalonSearchSql.dynamicQGroupPredicate(qTokens.size(), qCategories.size()));
         if (hasCategory) {
             params.put("category", category);
         }
@@ -1933,7 +2131,7 @@ public class SearchService {
         params.put("offset", pageable.getOffset());
 
         String sql = wrapSalonWithNameLaterals(
-                inner.toString(), hasCategory, sort, serviceTypes, qTokens.size());
+                inner.toString(), hasCategory, sort, serviceTypes, qTokens.size(), qCategories);
         return new SqlAndParams(sql, params);
     }
 
@@ -1952,7 +2150,8 @@ public class SearchService {
      */
     private static String wrapSalonWithNameLaterals(
             String innerSql, boolean hasCategory, SearchSort sort,
-            List<ResolvedServiceType> serviceTypes, int qTokenCount) {
+            List<ResolvedServiceType> serviceTypes, int qTokenCount,
+            List<String> qCategories) {
         StringBuilder sb = new StringBuilder();
         sb.append("SELECT t.id, t.name, t.city_id, t.district_id, t.avatar_url, ")
                 .append("t.pmin, t.pmax, pn.pnames, ")
@@ -1960,7 +2159,7 @@ public class SearchService {
                 .append("mn.matched_names, t.total_count ")
                 .append("FROM (").append(innerSql).append(") t ");
         appendSalonNamePreviewLateral(sb, hasCategory);
-        appendSalonMatchedNamesLateral(sb, serviceTypes, qTokenCount);
+        appendSalonMatchedNamesLateral(sb, serviceTypes, qTokenCount, qCategories);
         appendSalonOuterOrderBy(sb, sort);
         return sb.toString();
     }
@@ -2052,12 +2251,16 @@ public class SearchService {
      * intersection rule mirror the master path exactly — see
      * {@link #appendMatchedNamesLateral}.</p>
      *
-     * <p>Always emitted (unlike the master lateral): this builder is only reached
-     * on the per-service-filtered path, so at least the slug half is always
-     * present.</p>
+     * <p>Always emitted (unlike the master lateral): this builder is reached only
+     * when a {@code serviceTypeSlugs} filter is active OR the free-text query
+     * resolved to a platform category, so at least one half is always present. The
+     * category branch cannot arrive with {@code qTokenCount == 0}, because categories
+     * are resolved FROM the query tokens — a non-empty {@code qCategories} implies a
+     * non-empty token list.</p>
      */
     private static void appendSalonMatchedNamesLateral(
-            StringBuilder sb, List<ResolvedServiceType> serviceTypes, int qTokenCount) {
+            StringBuilder sb, List<ResolvedServiceType> serviceTypes, int qTokenCount,
+            List<String> qCategories) {
         sb.append("LEFT JOIN LATERAL (")
                 .append("SELECT array_agg(zm.name) AS matched_names FROM (")
                 .append("SELECT DISTINCT sd3.name AS name ")
@@ -2070,7 +2273,7 @@ public class SearchService {
             appendServiceTypeMatchDisjunction(sb, "sd3", serviceTypes.size());
             sb.append(") ");
         }
-        sb.append(SalonSearchSql.dynamicMatchedNamesPredicate("sd3", qTokenCount));
+        sb.append(SalonSearchSql.dynamicMatchedNamesPredicate("sd3", qTokenCount, qCategories.size()));
         sb.append("ORDER BY sd3.name LIMIT ").append(SERVICE_NAME_CAP)
                 .append(") zm) mn ON true ");
     }

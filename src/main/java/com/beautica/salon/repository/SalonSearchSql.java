@@ -110,6 +110,18 @@ package com.beautica.salon.repository;
  * the generated SQL contains no {@code "CAST(:"}). Only the wrapper differs;
  * the semantic body — including the bookable-master gate — is defined once.
  *
+ * <h3>The ONE sanctioned asymmetry: the category disjunct</h3>
+ * The dynamic form carries a {@code sdq.category IN (:qcat…)} disjunct (free-text
+ * search by <em>category display name</em>); the static form does not, because a
+ * {@code @Query} body declares a fixed bind arity and cannot express a
+ * variable-length {@code IN} list. This is <b>not</b> defect-E drift, because the two
+ * forms are never both eligible for the same input: {@code SearchService.searchSalons}
+ * routes to the dynamic builder whenever the query resolved to any category, so the
+ * static form is only ever reached with an empty category set — where the disjunct is
+ * the empty string and the two forms are byte-identical again. The whole safety of
+ * this arrangement rests on that dispatch condition; see
+ * {@link #dynamicQGroupPredicate(int, int)}.
+ *
  * <h3>Alias contract</h3>
  * The predicate forms assume the salon row is aliased {@code s}. That holds in
  * the static queries' inner derived table and in the
@@ -537,6 +549,43 @@ public final class SalonSearchSql {
     // ── dynamic (StringBuilder) form: emitted only for tokens that exist ──────
 
     /**
+     * The {@code " OR <alias>.category IN (:qcat0, …)"} disjunct — the category half
+     * of free-text search — or the <b>empty string</b> when the query matched no
+     * platform category.
+     *
+     * <h4>Why the empty case matters more than the non-empty one</h4>
+     * Returning {@code ""} makes every fragment below <em>byte-identical</em> to its
+     * pre-fix form for any query that did not name a category, which is the
+     * overwhelming majority of traffic. That is the query-plan protection: the hot
+     * path is not merely "equivalent", it is the same SQL string, so it hits the same
+     * server-side plan cache entry and cannot regress. Only a query that actually
+     * named a category pays for the extra disjunct.
+     *
+     * <p>{@code categoryCount} is bounded by the number of approved+active
+     * {@code platform_categories} rows (admin-gated reference data, a couple of
+     * dozen) — never by anything the caller can inflate through query text.
+     *
+     * <p><b>Bind-name contract:</b> the {@code qcat} prefix must stay equal to
+     * {@code SearchService.Q_CATEGORY_PARAM_PREFIX}, which binds these slots. The
+     * same split-brain applies to {@code :qN} / {@code SearchService.Q_PARAM_PREFIX}
+     * and exists for the same reason — a {@code @Query} value must be a compile-time
+     * constant, so this class cannot import the constant.
+     */
+    private static String categoryDisjunct(String alias, int categoryCount) {
+        if (categoryCount <= 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(" OR ").append(alias).append(".category IN (");
+        for (int i = 0; i < categoryCount; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(":qcat").append(i);
+        }
+        return sb.append(")").toString();
+    }
+
+    /**
      * The group-scoped {@code q} predicate for the dynamic builder: no
      * {@code CAST(:p …)} wrapper and no null gate, because the builder emits this
      * only when at least one token exists and binds each pattern as a plain
@@ -551,14 +600,41 @@ public final class SalonSearchSql {
      * (where the token count cannot be known at compile time). Single-token is the
      * dominant traffic shape from an incremental search box.</p>
      *
-     * @param tokenCount number of bound {@code :q0}…{@code :q{n-1}} slots, {@code >= 1}
+     * <h4>Category half — and why the static form does not carry it</h4>
+     * When the query resolved to one or more platform categories, each per-token
+     * clause gains {@code OR sdq.category IN (:qcat…)}. Placing it per-token rather
+     * than as a whole-group disjunct does <b>not</b> loosen the group semantics:
+     * membership in the resolved set already proves the category's display name
+     * contained EVERY token (see {@code QueryCategoryMatcher}), so whenever the
+     * disjunct is true it is true for all tokens simultaneously — the two placements
+     * are the same predicate. Crucially the disjunct sits <em>inside</em>
+     * {@link #BOOKABLE_SERVICE_MATCH_HEAD}, so a category match still has to be
+     * carried by a salon-owned service an ACTIVE master of THIS salon performs: the
+     * locked "salon offering = master-performed only" rule is enforced by the same
+     * gate as before, and the category disjunct cannot route around it.
+     *
+     * <p><b>The static ({@code @Query}) form deliberately has no category half, and
+     * that is NOT the drift this class exists to prevent.</b> A static body declares a
+     * fixed bind arity and cannot express a variable-length {@code IN} list, so the
+     * category path is instead routed to this dynamic builder:
+     * {@code SearchService.searchSalons} dispatches to
+     * {@code searchSalonsWithServiceFilter} whenever the query resolved to any
+     * category, exactly as it already does for a {@code serviceTypeSlugs} filter. The
+     * two forms therefore remain interchangeable on every input either one can
+     * actually receive — the static form is never reached with a non-empty category
+     * set. <b>If that dispatch condition is ever narrowed, salon category search
+     * silently returns to zero results</b>; it is pinned by an integration test.
+     *
+     * @param tokenCount    number of bound {@code :q0}…{@code :q{n-1}} slots, {@code >= 1}
+     * @param categoryCount number of bound {@code :qcat0}…{@code :qcat{n-1}} slots, {@code >= 0}
      * @return the {@code AND (…)} predicate, or the empty string when {@code tokenCount == 0}
      */
-    public static String dynamicQGroupPredicate(int tokenCount) {
+    public static String dynamicQGroupPredicate(int tokenCount, int categoryCount) {
         if (tokenCount <= 0) {
             return "";
         }
         boolean multiToken = tokenCount > 1;
+        String categories = categoryDisjunct("sdq", categoryCount);
         StringBuilder sb = new StringBuilder("AND ((");
         for (int i = 0; i < tokenCount; i++) {
             if (i > 0) {
@@ -575,7 +651,7 @@ public final class SalonSearchSql {
             if (multiToken) {
                 sb.append("s.name ILIKE :q").append(i).append(" OR ");
             }
-            sb.append("sdq.name ILIKE :q").append(i).append(")");
+            sb.append("sdq.name ILIKE :q").append(i).append(categories).append(")");
         }
         return sb.append(")) ").toString();
     }
@@ -602,15 +678,28 @@ public final class SalonSearchSql {
      * cannot be enforced here because the caller owns the surrounding
      * {@code FROM}/alias, so it is stated as a contract instead.
      *
-     * @param defAlias   alias of the {@code service_definitions} row in the caller's
-     *                   lateral, already gated to bookable services by the caller
-     * @param tokenCount number of bound {@code :q0}…{@code :q{n-1}} slots, {@code >= 1}
+     * <h4>Category half</h4>
+     * When the query resolved to platform categories, a service ALSO explains the
+     * match by belonging to one of them — so the disjunct is added to the
+     * own-contribution condition as well as to the group condition. Without it a
+     * category-name search would return providers whose cards list an arbitrary
+     * alphabetical slice of their catalogue, because no service name contains any
+     * token and the "contributes through its own name" test would reject every
+     * candidate. This is a scoped explanation, not the arbitrary slice condition (b)
+     * was written to prevent: the services surfaced are exactly the ones in the
+     * category the user typed.
+     *
+     * @param defAlias      alias of the {@code service_definitions} row in the caller's
+     *                      lateral, already gated to bookable services by the caller
+     * @param tokenCount    number of bound {@code :q0}…{@code :q{n-1}} slots, {@code >= 1}
+     * @param categoryCount number of bound {@code :qcat0}…{@code :qcat{n-1}} slots, {@code >= 0}
      * @return the {@code AND …} conditions, or the empty string when {@code tokenCount == 0}
      */
-    public static String dynamicMatchedNamesPredicate(String defAlias, int tokenCount) {
+    public static String dynamicMatchedNamesPredicate(String defAlias, int tokenCount, int categoryCount) {
         if (tokenCount <= 0) {
             return "";
         }
+        String categories = categoryDisjunct(defAlias, categoryCount);
         StringBuilder sb = new StringBuilder("AND (");
         for (int i = 0; i < tokenCount; i++) {
             if (i > 0) {
@@ -618,10 +707,11 @@ public final class SalonSearchSql {
             }
             sb.append(defAlias).append(".name ILIKE :q").append(i);
         }
-        sb.append(") ");
+        sb.append(categories).append(") ");
         for (int i = 0; i < tokenCount; i++) {
             sb.append("AND (t.name ILIKE :q").append(i)
-                    .append(" OR ").append(defAlias).append(".name ILIKE :q").append(i).append(") ");
+                    .append(" OR ").append(defAlias).append(".name ILIKE :q").append(i)
+                    .append(categories).append(") ");
         }
         return sb.toString();
     }

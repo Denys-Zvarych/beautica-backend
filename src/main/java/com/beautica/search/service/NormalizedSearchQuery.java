@@ -124,7 +124,7 @@ public record NormalizedSearchQuery(List<String> tokens, boolean belowMinimumLen
         if (rawQuery == null || rawQuery.isBlank()) {
             return ABSENT;
         }
-        String folded = CURLY_APOSTROPHES.matcher(rawQuery).replaceAll(STRAIGHT_APOSTROPHE);
+        String folded = foldApostrophes(rawQuery);
         List<String> retained = WHITESPACE.splitAsStream(folded.trim())
                 .filter(token -> !token.isEmpty())
                 .limit(MAX_TOKENS)
@@ -136,6 +136,27 @@ public record NormalizedSearchQuery(List<String> tokens, boolean belowMinimumLen
         }
         boolean trigramServable = retained.stream().anyMatch(token -> token.length() >= MIN_QUERY_LENGTH);
         return trigramServable ? new NormalizedSearchQuery(retained, false) : BELOW_MINIMUM;
+    }
+
+    /**
+     * Folds the four curly apostrophe variants onto {@code U+0027} — the single
+     * definition of the fold {@link #of(String)} applies to the query side.
+     *
+     * <p>Exposed because the {@code q}-token → {@code platform_categories.display_name}
+     * match ({@code QueryCategoryMatcher}) runs in Java rather than in SQL, so it has
+     * to fold <b>both</b> operands the same way this class folds the query. Stored
+     * display names use the straight {@code U+0027} today
+     * («Ін'єкційна косметологія»), but relying on that is exactly the assumption that
+     * breaks the day an admin pastes a name from a word processor: folding both sides
+     * through one function makes the match insensitive to which apostrophe either side
+     * happens to carry. Re-implementing the fold at the call site would be a second
+     * definition free to drift from the one {@code ILIKE} patterns are built with.
+     *
+     * @param value raw text; must not be {@code null}
+     * @return {@code value} with every curly apostrophe variant replaced
+     */
+    public static String foldApostrophes(String value) {
+        return CURLY_APOSTROPHES.matcher(value).replaceAll(STRAIGHT_APOSTROPHE);
     }
 
     /** {@code true} when no query was supplied — the {@code q} predicate is omitted entirely. */

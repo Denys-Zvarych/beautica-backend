@@ -3932,6 +3932,168 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         return objectMapper.readTree(response.getBody()).path("data");
     }
 
+    // ── free-text search by CATEGORY DISPLAY NAME ────────────────────────────
+    //
+    // «Нарощення вій» is a platform_categories.display_name (V74 seed,
+    // name = LASH_EXTENSIONS, active). It appears in NO service_definitions.name and
+    // NO service_types.name_uk, and the free-text predicate reached neither
+    // platform_categories nor any category column — so typing the name of the
+    // category you are shopping for, the single most natural query there is,
+    // returned zero rows while hundreds of masters offered exactly that category.
+    //
+    // These are end-to-end guards over the WHOLE stack (resolver → cached label list
+    // → generated SQL → Postgres), which is the only level at which the fix can be
+    // proven: SearchServiceTest can only assert the SQL text.
+
+    /** {@code LASH_EXTENSIONS} — display name «Нарощення вій» (V74 seed, active). */
+    private static final String LASH_EXTENSIONS_CATEGORY = "LASH_EXTENSIONS";
+    /** The literal a client types. Deliberately NOT any seeded service name. */
+    private static final String LASH_EXTENSIONS_LABEL = "Нарощення вій";
+
+    @Test
+    @DisplayName("GET /search/masters?q=«Нарощення вій» — a CATEGORY display name matches masters offering that category, even though no service NAME contains either token")
+    void should_findMastersByCategoryDisplayName_when_qIsACategoryLabel() throws Exception {
+        ensureHttpClient();
+
+        // The service NAME shares no token with the query — the ONLY thing linking
+        // this master to «Нарощення вій» is service_definitions.category. Before the
+        // fix this search returned nothing at all.
+        UUID lashMaster = seedNamedIndependentMaster("Київ", "4.90", "Оксана", "Литвин");
+        seedNamedServiceForMaster(lashMaster, "Класика 2Д", LASH_EXTENSIONS_CATEGORY,
+                new BigDecimal("600.00"));
+
+        // Decoy in a different category, so an empty/total assertion cannot pass
+        // vacuously and a "match everything" regression would be caught.
+        UUID otherMaster = seedNamedIndependentMaster("Київ", "4.80", "Олена", "Ковач");
+        seedNamedServiceForMaster(otherMaster, "Манікюр класичний", "MANICURE",
+                new BigDecimal("400.00"));
+
+        JsonNode data = masterSearchRaw("?q=" + enc(LASH_EXTENSIONS_LABEL) + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("the category display name resolves to LASH_EXTENSIONS and matches by category")
+                .containsExactly(lashMaster.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=«Нарощення вій» — the free-text result set EQUALS the category-filter result set (the correctness target)")
+    void should_matchCategoryFilterResultSet_when_qIsACategoryLabel() throws Exception {
+        ensureHttpClient();
+
+        UUID lashOne = seedNamedIndependentMaster("Київ", "4.90", "Оксана", "Литвин");
+        seedNamedServiceForMaster(lashOne, "Класика 2Д", LASH_EXTENSIONS_CATEGORY, new BigDecimal("600.00"));
+        UUID lashTwo = seedNamedIndependentMaster("Київ", "4.10", "Ірина", "Гнатюк");
+        seedNamedServiceForMaster(lashTwo, "Об'єм 3Д", LASH_EXTENSIONS_CATEGORY, new BigDecimal("800.00"));
+        UUID decoy = seedNamedIndependentMaster("Київ", "4.80", "Олена", "Ковач");
+        seedNamedServiceForMaster(decoy, "Манікюр класичний", "MANICURE", new BigDecimal("400.00"));
+
+        java.util.List<String> byFreeText = masterIds(
+                masterSearchRaw("?q=" + enc(LASH_EXTENSIONS_LABEL) + "&page=0&size=20"));
+        java.util.List<String> byCategoryFilter = masterIds(
+                masterSearchRaw("?category=" + LASH_EXTENSIONS_CATEGORY + "&page=0&size=20"));
+
+        assertThat(byFreeText)
+                .as("typing the category label must reach exactly the providers the explicit "
+                        + "category facet reaches — anything less is the bug, anything more is a leak")
+                .containsExactlyInAnyOrderElementsOf(byCategoryFilter)
+                .containsExactlyInAnyOrder(lashOne.toString(), lashTwo.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=«Нарощення вій» — matchedServiceNames EXPLAINS the category match instead of falling back to an arbitrary catalogue slice")
+    void should_explainCategoryMatch_inMatchedServiceNames_when_qIsACategoryLabel() throws Exception {
+        ensureHttpClient();
+
+        // A multi-category master: without the category half of the matched-names
+        // lateral, condition (b) ("contributes a token through its own name") rejects
+        // every service here, matchedServiceNames comes back empty, and the card falls
+        // back to a whole-catalogue preview that can show the MANICURE service.
+        UUID master = seedNamedIndependentMaster("Київ", "4.90", "Оксана", "Литвин");
+        seedNamedServiceForMaster(master, "Класика 2Д", LASH_EXTENSIONS_CATEGORY, new BigDecimal("600.00"));
+        seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("400.00"));
+
+        JsonNode row = masterSearchRaw("?q=" + enc(LASH_EXTENSIONS_LABEL) + "&page=0&size=20")
+                .path("data").get(0);
+
+        assertThat(matchedServiceNames(row))
+                .as("only the services in the matched category explain the match")
+                .containsExactly("Класика 2Д");
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=«Нарощення вій» — an INACTIVE master_services assignment must NOT make the master discoverable by category (the active gate is not bypassed)")
+    void should_notDiscoverMasterByCategory_when_theAssignmentIsInactive() throws Exception {
+        ensureHttpClient();
+
+        // The category disjunct sits INSIDE the correlated EXISTS over active
+        // assignments. If it were ever lifted to the master level, this master would
+        // surface for a category they no longer offer.
+        UUID master = seedNamedIndependentMaster("Київ", "4.90", "Оксана", "Литвин");
+        seedTypedServiceForMaster(master, "Класика 2Д", LASH_EXTENSIONS_CATEGORY,
+                new BigDecimal("600.00"), null, true, false);
+
+        // Control: an identical master with an ACTIVE assignment IS found, so the
+        // empty result below is the active gate and not an unsearchable fixture.
+        UUID control = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Гнатюк");
+        seedNamedServiceForMaster(control, "Класика 3Д", LASH_EXTENSIONS_CATEGORY,
+                new BigDecimal("700.00"));
+
+        JsonNode data = masterSearchRaw("?q=" + enc(LASH_EXTENSIONS_LABEL) + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("a category match still requires an ACTIVE assignment to an ACTIVE definition")
+                .containsExactly(control.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/masters?q=«Педикюр» — a SOFT-DISABLED category label must NOT resolve (only selectable categories participate)")
+    void should_notResolveCategory_when_theCategoryIsInactive() throws Exception {
+        ensureHttpClient();
+
+        // PEDICURE is soft-disabled by V74 (active = FALSE) while its display name
+        // «Педикюр» survives. It must not widen the search, or a category an admin
+        // deliberately retired would quietly come back to life through the search box.
+        UUID hidden = seedNamedIndependentMaster("Київ", "4.90", "Оксана", "Литвин");
+        seedNamedServiceForMaster(hidden, "Догляд за стопами", "PEDICURE", new BigDecimal("500.00"));
+        UUID byName = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Гнатюк");
+        seedNamedServiceForMaster(byName, "Педикюр класичний", "PEDICURE", new BigDecimal("450.00"));
+
+        JsonNode data = masterSearchRaw("?q=" + enc("Педикюр") + "&page=0&size=20");
+
+        assertThat(masterIds(data))
+                .as("only the master whose SERVICE NAME contains the token matches — the disabled "
+                        + "category label resolves to nothing")
+                .containsExactly(byName.toString());
+    }
+
+    @Test
+    @DisplayName("GET /search/salons?q=«Нарощення вій» — the category label matches salons, and an ORPHAN service in that category stays invisible (salon offering = master-performed only)")
+    void should_findSalonsByCategoryDisplayName_andKeepOrphanServicesHidden() throws Exception {
+        ensureHttpClient();
+
+        // Bookable: an ACTIVE master of THIS salon performs the LASH_EXTENSIONS service.
+        UUID bookableSalon = seedActiveSalon("Київ", null);
+        UUID bookableMaster = seedSalonMasterFor(bookableSalon, "Київ", "4.60");
+        seedNamedSalonServiceForMaster(bookableMaster, bookableSalon, "Класика 2Д",
+                LASH_EXTENSIONS_CATEGORY, new BigDecimal("600.00"));
+
+        // Orphan: the SAME category, but no active master performs it. The locked rule
+        // is that it is hidden everywhere — the category disjunct must not route around
+        // the bookable-master gate it is nested inside.
+        UUID orphanSalon = seedActiveSalon("Київ", null);
+        seedSalonOwnedServiceNoMaster(orphanSalon, "Об'єм 3Д", LASH_EXTENSIONS_CATEGORY,
+                "FIXED", new BigDecimal("800.00"), null, null, true);
+
+        JsonNode data = salonSearchRaw("?q=" + enc(LASH_EXTENSIONS_LABEL) + "&page=0&size=20");
+
+        assertThat(salonIds(data))
+                .as("the category label finds the bookable salon; the orphan salon service must "
+                        + "not make its salon discoverable by category any more than by name")
+                .containsExactly(bookableSalon.toString());
+        assertThat(data.path("totalElements").asLong()).isEqualTo(1L);
+    }
+
     /** Reads the {@code matchedServiceNames} array of a single search result row. */
     private static java.util.List<String> matchedServiceNames(JsonNode row) {
         java.util.List<String> names = new java.util.ArrayList<>();
