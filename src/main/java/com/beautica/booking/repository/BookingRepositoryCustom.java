@@ -1,5 +1,6 @@
 package com.beautica.booking.repository;
 
+import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -90,6 +91,53 @@ public interface BookingRepositoryCustom {
      */
     Page<UUID> findIdsByClientIdFiltered(
             UUID clientId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
+
+    // ── Phase 28.1/28.2 — GET /bookings/me?partition= ──────────────────────────────────────────
+    //
+    // Deliberately THREE NEW, distinctly-named methods rather than two extra params bolted onto
+    // the three methods above. `partition` and `status` are mutually exclusive (§ precedence rule
+    // — see BookingService#getMyBookings): a caller either filters by status/no-filter (the three
+    // methods above, UNCHANGED) or by partition (these three), never both. Routing to a genuinely
+    // separate method — never the same method with a `partition == null` branch bolted on — is
+    // what makes the "absent `partition` ⇒ byte-identical to today" backwards-compatibility
+    // contract airtight at the type level: the pre-28.1 methods above are not touched by a single
+    // line, so every pre-28.1 caller (production and test) keeps compiling and behaving
+    // identically. BookingService#listClientBookings/#listProviderBookings dispatch to whichever
+    // family applies.
+
+    /**
+     * Partition counterpart to {@link #findIdsByMasterIdFiltered}. Same scope-predicate contract
+     * (Anti-Bug §E-4 — the authenticated user's OWN {@code master.id}, never an arbitrary UUID)
+     * and the same Phase 26.2/26.4 optional date-range/service-filter contract. {@code status} is
+     * NOT a parameter here — {@code partition} composes {@link
+     * BookingSpecifications#partition(BookingPartition, OffsetDateTime)} instead of {@link
+     * BookingSpecifications#statusIn}, never both (this is what "status is ignored when partition
+     * is present" means at the query layer: the status predicate is never even constructible from
+     * this method's parameter list).
+     *
+     * <p>{@code now} is an already-resolved absolute instant (see {@link
+     * BookingSpecifications#partition}'s javadoc for the clock/timezone invariant) — resolved
+     * once in {@code BookingService#getMyBookings} from {@code Clock#instant()}, never computed
+     * here.
+     */
+    Page<UUID> findIdsByMasterIdFilteredByPartition(
+            UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
+
+    /** Partition counterpart to {@link #findIdsBySalonIdsFiltered} — see {@link
+     * #findIdsByMasterIdFilteredByPartition} for the full contract. */
+    Page<UUID> findIdsBySalonIdsFilteredByPartition(
+            List<UUID> salonIds, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
+
+    /** Partition counterpart to {@link #findIdsByClientIdFiltered} — see {@link
+     * #findIdsByMasterIdFilteredByPartition} for the full contract. */
+    Page<UUID> findIdsByClientIdFilteredByPartition(
+            UUID clientId, BookingPartition partition, OffsetDateTime now,
             OffsetDateTime from, OffsetDateTime toExclusive,
             Collection<UUID> serviceIds, Pageable pageable);
 }

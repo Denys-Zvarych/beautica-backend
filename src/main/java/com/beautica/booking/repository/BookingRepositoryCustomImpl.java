@@ -1,6 +1,7 @@
 package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -93,6 +94,45 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         if (statuses != null && !statuses.isEmpty()) {
             spec = spec.and(BookingSpecifications.statusIn(statuses));
         }
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    // ── Phase 28.1/28.2 — GET /bookings/me?partition= (see BookingRepositoryCustom's class-level
+    // comment for why these are separate methods, never extra params on the three above) ────────
+
+    @Override
+    public Page<UUID> findIdsByMasterIdFilteredByPartition(
+            UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.masterIdEquals(masterId))
+                .and(BookingSpecifications.partition(partition, now));
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    @Override
+    public Page<UUID> findIdsBySalonIdsFilteredByPartition(
+            List<UUID> salonIds, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.salonIdIn(salonIds))
+                .and(BookingSpecifications.partition(partition, now));
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    @Override
+    public Page<UUID> findIdsByClientIdFilteredByPartition(
+            UUID clientId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.clientIdEquals(clientId))
+                .and(BookingSpecifications.partition(partition, now));
         spec = applyDateRange(spec, from, toExclusive);
         spec = applyServiceFilter(spec, serviceIds);
         return findIdPage(spec, pageable);

@@ -1062,7 +1062,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when authenticated CLIENT lists their bookings")
     void should_return200_when_authenticatedListMyBookings() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1077,7 +1077,7 @@ class BookingControllerTest {
             + "when a single ?status=CANCELLED is supplied (Phase 26.1 backward compatibility)")
     void should_return200_and_passStatusParam_when_statusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1088,15 +1088,14 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(true));
 
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any(), any(), any(), any());
+                .getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED)), any(), any(), any(), any(), any());
     }
 
     @Test
     @DisplayName("GET /me — repeated ?status=A&status=B binds to a 2-element list forwarded to the service (Phase 26.1)")
     void should_return200_and_passMultiStatusParam_when_repeatedStatusQueryParamProvided() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(),
-                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1106,15 +1105,14 @@ class BookingControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
 
-        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(),
-                eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any(), any(), any(), any());
+        org.mockito.Mockito.verify(bookingService).getMyBookings(any(), any(), eq(java.util.List.of(BookingStatus.CANCELLED, BookingStatus.DECLINED)), any(), any(), any(), any(), any());
     }
 
     @Test
     @DisplayName("GET /me — the actor id passed to the service is the security principal, never a client-supplied value")
     void should_usePrincipalAsActor_when_listingMyBookings() throws Exception {
         var principalId = UUID.randomUUID();
-        when(bookingService.getMyBookings(eq(principalId), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(eq(principalId), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         // An attacker-controlled "clientId" query param must be ignored — the actor is the principal.
@@ -1126,7 +1124,7 @@ class BookingControllerTest {
 
         var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(actorCaptor.capture(), any(), any(), any(), any(), any(), any());
+                .getMyBookings(actorCaptor.capture(), any(), any(), any(), any(), any(), any(), any());
         org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(principalId);
     }
 
@@ -1136,7 +1134,7 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var row = stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID());
-        when(bookingService.getMyBookings(eq(clientId), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(eq(clientId), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(row), 0, 20, 1L, 1));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1164,7 +1162,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when SALON_OWNER lists their bookings")
     void should_return200_when_salonOwnerListsBookings() throws Exception {
         var ownerId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1178,7 +1176,7 @@ class BookingControllerTest {
     @DisplayName("GET /me — 200 when INDEPENDENT_MASTER lists their bookings")
     void should_return200_when_independentMasterListsBookings() throws Exception {
         var masterId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1194,7 +1192,7 @@ class BookingControllerTest {
             + "Data's own clamping behavior against a regression of the application.yml property.")
     void should_clampPageSizeTo100_when_sizeExceedsMaxPageSize() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 100, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1205,7 +1203,7 @@ class BookingControllerTest {
 
         var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
+                .getMyBookings(any(), any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
         org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageSize()).isEqualTo(100);
     }
 
@@ -1214,7 +1212,7 @@ class BookingControllerTest {
             + "BookingController.java:127-130) — existing-cap regression pin, Phase 26.6")
     void should_clampPageNumberTo1000_when_pageExceeds1000() throws Exception {
         var clientId = UUID.randomUUID();
-        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 1000, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1225,7 +1223,7 @@ class BookingControllerTest {
 
         var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
+                .getMyBookings(any(), any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
         org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
     }
 
@@ -1411,7 +1409,7 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(false));
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .getMyBookings(any(), any(), any(), any(), any(), any(), any());
+                .getMyBookings(any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1423,7 +1421,7 @@ class BookingControllerTest {
         for (int i = 0; i < 50; i++) {
             params.add("serviceId", UUID.randomUUID().toString());
         }
-        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/me")
@@ -1454,7 +1452,7 @@ class BookingControllerTest {
                 .doesNotContain("not-a-uuid");
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .getMyBookings(any(), any(), any(), any(), any(), any(), any());
+                .getMyBookings(any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     // ── QA-MEDIUM-2: enum validation — decline cancellationReason ────────────

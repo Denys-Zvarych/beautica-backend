@@ -9,6 +9,7 @@ import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
@@ -368,11 +369,54 @@ public class BookingService {
      * already constrains every query, so a {@code serviceId} belonging to a different provider
      * simply matches nothing rather than surfacing a 404 that would turn this endpoint into an
      * existence oracle for {@code MasterService} ids (locked decision — see the phase doc).
+     *
+     * <p><b>Phase 28.2.</b> This 7-argument overload is preserved byte-for-byte and simply
+     * delegates to the 8-argument {@link #getMyBookings(UUID, Authentication, List, LocalDate,
+     * LocalDate, List, BookingPartition, Pageable)} overload below with {@code partition = null}
+     * — no line of the actual query logic lives here any more. This is what pins the "absent
+     * {@code partition} ⇒ byte-identical to today" backwards-compatibility contract at the type
+     * level: every pre-28.1 caller (production and test — including the five sibling {@code
+     * BookingMyBookings*IT} suites this phase must not edit) keeps compiling and behaving
+     * identically without a single call site changing. {@code @Transactional(readOnly = true)} is
+     * repeated here (not just on the 8-arg overload) so an EXTERNAL caller of this overload still
+     * gets a transaction from the Spring proxy; the resulting self-invocation into the 8-arg
+     * overload then simply runs inside that already-open transaction (Spring's default {@code
+     * REQUIRED} propagation) rather than needing a second proxy interception.
      */
     @Transactional(readOnly = true)
     public PageResponse<BookingDetailResponse> getMyBookings(
             UUID actorUserId, Authentication auth, List<BookingStatus> status,
             LocalDate from, LocalDate to, List<UUID> serviceId, Pageable pageable) {
+        return getMyBookings(actorUserId, auth, status, from, to, serviceId, null, pageable);
+    }
+
+    /**
+     * Phase 28.2 — {@code partition} overload backing {@code GET /bookings/me?partition=}. Same
+     * {@code status}/{@code from}/{@code to}/{@code serviceId} contract as the 7-argument overload
+     * above (see its javadoc), plus:
+     *
+     * <p><b>Precedence — {@code partition != null} makes {@code status} IGNORED, not a 400.</b>
+     * This is deliberate: it is the rollout safety valve. A mobile client sends BOTH params during
+     * the transition, so a build hitting an OLD backend (which silently drops the unknown {@code
+     * partition} query param) degrades exactly to today's shipped {@code status}-only behaviour
+     * instead of an unfiltered list. {@code statuses} below is computed as {@code null} (no
+     * predicate at all) whenever {@code partition != null} — the ignore happens by construction,
+     * not by a downstream filter that could regress into an accidental {@code AND}.
+     *
+     * <p>{@code now} is resolved exactly once, here, as an absolute-instant {@link
+     * OffsetDateTime} derived from {@link Clock#instant()} — never {@code OffsetDateTime.now()} or
+     * {@code Instant.now()} (Anti-Bug §G) — and only when {@code partition != null} (an unused
+     * partition boundary is never computed). {@link ZoneOffset#UTC} is used purely as the
+     * fixed-offset REPRESENTATION of that instant so it can bind to the {@code OffsetDateTime}-
+     * typed {@code endsAt} Criteria path; {@link TimeZones#KYIV} must never appear here — see
+     * {@code BookingSpecifications#partition}'s javadoc for the full clock/timezone invariant this
+     * mirrors.
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<BookingDetailResponse> getMyBookings(
+            UUID actorUserId, Authentication auth, List<BookingStatus> status,
+            LocalDate from, LocalDate to, List<UUID> serviceId, BookingPartition partition,
+            Pageable pageable) {
         // Role is already encoded in the JWT-derived authority — no DB round-trip needed to
         // resolve the role. Only SALON_OWNER requires a DB call to fetch the associated salonId.
         // AuthenticationUtils.role is the single source of truth for this read (B14): it scans
@@ -380,7 +424,8 @@ public class BookingService {
         // multi-role principal — do NOT reintroduce a local extractor here or in getMyBookedDays.
         Role role = AuthenticationUtils.role(auth);
 
-        Set<BookingStatus> statuses = (status == null || status.isEmpty())
+        // Phase 28.2 precedence rule: partition present -> status predicate is never built at all.
+        Set<BookingStatus> statuses = (partition != null || status == null || status.isEmpty())
                 ? null
                 : EnumSet.copyOf(status);
 
@@ -404,6 +449,10 @@ public class BookingService {
         OffsetDateTime fromTs = from == null ? null : from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toExclusive = to == null ? null : to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
+        // Phase 28.1: absolute-instant "now" for the partition boundary — Clock#instant(), never
+        // Kyiv-zoned, resolved only when a partition was actually requested.
+        OffsetDateTime now = partition == null ? null : OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+
         // Phase 26.3: validate/whitelist/default/tiebreak the sort BEFORE the role dispatch, so
         // BOTH the client projection query and the provider ID-page query receive an identical,
         // already-safe Pageable — see normalizeBookingSort's javadoc for why this must happen
@@ -411,8 +460,8 @@ public class BookingService {
         Pageable normalizedPageable = normalizeBookingSort(pageable);
 
         Page<BookingDetailResponse> page = role == Role.CLIENT
-                ? listClientBookings(actorUserId, statuses, fromTs, toExclusive, serviceIds, normalizedPageable)
-                : listProviderBookings(role, actorUserId, statuses, fromTs, toExclusive, serviceIds, normalizedPageable);
+                ? listClientBookings(actorUserId, statuses, fromTs, toExclusive, serviceIds, partition, now, normalizedPageable)
+                : listProviderBookings(role, actorUserId, statuses, fromTs, toExclusive, serviceIds, partition, now, normalizedPageable);
 
         return PageResponse.of(
                 page.getContent(),
@@ -660,13 +709,22 @@ public class BookingService {
      * {@code idPage.getContent()}, the identical pattern {@link #listProviderBookings} already
      * uses for {@code findAllByIdsWithGraph}. An empty ID page short-circuits before the hydrate
      * ever runs, so this method never emits {@code IN ()} (an invalid, dialect-breaking clause).
+     *
+     * <p><b>Phase 28.2.</b> {@code partition != null} routes to {@link
+     * BookingRepository#findIdsByClientIdFilteredByPartition} instead of {@link
+     * BookingRepository#findIdsByClientIdFiltered} — a genuinely different repository method, not
+     * a branch inside the same one, so the {@code partition == null} path below is textually
+     * identical to the pre-28.1 code.
      */
     private Page<BookingDetailResponse> listClientBookings(
             UUID clientId, Set<BookingStatus> statuses,
             OffsetDateTime from, OffsetDateTime toExclusive,
-            Set<UUID> serviceIds, Pageable pageable) {
-        Page<UUID> idPage = bookingRepository.findIdsByClientIdFiltered(
-                clientId, statuses, from, toExclusive, serviceIds, pageable);
+            Set<UUID> serviceIds, BookingPartition partition, OffsetDateTime now, Pageable pageable) {
+        Page<UUID> idPage = partition != null
+                ? bookingRepository.findIdsByClientIdFilteredByPartition(
+                        clientId, partition, now, from, toExclusive, serviceIds, pageable)
+                : bookingRepository.findIdsByClientIdFiltered(
+                        clientId, statuses, from, toExclusive, serviceIds, pageable);
         if (idPage.isEmpty()) {
             return new PageImpl<>(List.of(), pageable, idPage.getTotalElements());
         }
@@ -690,11 +748,16 @@ public class BookingService {
     /**
      * Provider path — ID-page + graph hydrate (Fix H1), then one batched review-existence
      * query and the two-query label resolution for the whole page.
+     *
+     * <p><b>Phase 28.2.</b> {@code partition != null} routes each branch to its {@code
+     * ...ByPartition} repository counterpart instead of the {@code statuses}-filtered method —
+     * see {@link #listClientBookings}'s javadoc for why this is a distinct-method dispatch, not a
+     * branch inside one shared query method.
      */
     private Page<BookingDetailResponse> listProviderBookings(
             Role role, UUID actorUserId, Set<BookingStatus> statuses,
             OffsetDateTime from, OffsetDateTime toExclusive,
-            Set<UUID> serviceIds, Pageable pageable) {
+            Set<UUID> serviceIds, BookingPartition partition, OffsetDateTime now, Pageable pageable) {
         // Two-query pattern (Fix H1 — HHH90003004): first fetch a page of IDs using
         // plain JPQL with no JOIN FETCH (so the DB applies LIMIT/OFFSET correctly), then
         // batch-hydrate only those IDs with the full association graph in a second query.
@@ -702,8 +765,11 @@ public class BookingService {
             case SALON_MASTER, INDEPENDENT_MASTER -> {
                 Master master = masterRepository.findByUserId(actorUserId)
                         .orElseThrow(() -> new NotFoundException("Master profile not found"));
-                yield bookingRepository.findIdsByMasterIdFiltered(
-                        master.getId(), statuses, from, toExclusive, serviceIds, pageable);
+                yield partition != null
+                        ? bookingRepository.findIdsByMasterIdFilteredByPartition(
+                                master.getId(), partition, now, from, toExclusive, serviceIds, pageable)
+                        : bookingRepository.findIdsByMasterIdFiltered(
+                                master.getId(), statuses, from, toExclusive, serviceIds, pageable);
             }
             case SALON_OWNER -> {
                 // Fix HIGH-1: salonId is on Salon.owner_id, NOT on User.salonId.
@@ -715,8 +781,11 @@ public class BookingService {
                 if (salonIds.isEmpty()) {
                     yield Page.empty(pageable);
                 }
-                yield bookingRepository.findIdsBySalonIdsFiltered(
-                        salonIds, statuses, from, toExclusive, serviceIds, pageable);
+                yield partition != null
+                        ? bookingRepository.findIdsBySalonIdsFilteredByPartition(
+                                salonIds, partition, now, from, toExclusive, serviceIds, pageable)
+                        : bookingRepository.findIdsBySalonIdsFiltered(
+                                salonIds, statuses, from, toExclusive, serviceIds, pageable);
             }
             // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings.
             // If this restriction is ever relaxed, add a SALON_ADMIN branch scoped to their salon.

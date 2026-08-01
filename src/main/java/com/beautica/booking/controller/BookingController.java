@@ -6,6 +6,7 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.ApiResponse;
@@ -109,7 +110,8 @@ public class BookingController {
             // requires. @Validated on the class (see class-level annotation) makes a violation
             // surface as a 400 ConstraintViolationException (GlobalExceptionHandler), not a 500.
             @Parameter(description = "Repeatable status filter, e.g. ?status=CONFIRMED&status=DECLINED. "
-                    + "Omit for no status predicate.")
+                    + "Omit for no status predicate. IGNORED whenever `partition` is present — see "
+                    + "that parameter's doc for the precedence rule.")
             @RequestParam(required = false) @Size(max = 5) List<BookingStatus> status,
             // Phase 26.2: optional date-range filter on startsAt, independent of each other —
             // `from` alone is an open-ended future window, `to` alone an open-ended past window.
@@ -133,6 +135,18 @@ public class BookingController {
             @Parameter(description = "Repeatable MasterService id filter, e.g. "
                     + "?serviceId=<A>&serviceId=<B>. Omit for no service predicate.")
             @RequestParam(required = false) @Size(max = 50) List<UUID> serviceId,
+            // Phase 28.2: additive-optional time-based partition, ANDs with from/to/serviceId
+            // exactly like `status` does. Absent (the default) => SQL and response byte-identical
+            // to pre-28.1 behaviour — see BookingService#getMyBookings(..., BookingPartition, ...)
+            // for the full contract.
+            @Parameter(description = "Time-based partition: UPCOMING (status=CONFIRMED and not yet "
+                    + "elapsed), PAST (COMPLETED/NOT_COMPLETED, or an elapsed unclosed CONFIRMED), "
+                    + "or CANCELLED (CANCELLED/DECLINED) — a total, disjoint cover of every "
+                    + "booking status. When present, `status` is IGNORED — NOT a 400 — this is the "
+                    + "additive rollout safety valve: a client sending both params degrades cleanly "
+                    + "to the pre-partition `status`-only behaviour against a backend that does not "
+                    + "yet know `partition`. Omit for byte-identical pre-Phase-28 behaviour.")
+            @RequestParam(required = false) BookingPartition partition,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
@@ -141,7 +155,7 @@ public class BookingController {
             pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
         }
         return ApiResponse.ok(bookingService.getMyBookings(
-                AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, pageable));
+                AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, partition, pageable));
     }
 
     // Phase 26.5: three path segments (/me/booked-days) so it cannot collide with the
