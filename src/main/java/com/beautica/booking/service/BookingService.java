@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
@@ -8,10 +9,12 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.dto.UnclosedCountResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingSpecifications;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
 import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
@@ -43,6 +46,7 @@ import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
@@ -204,9 +208,24 @@ public class BookingService {
                 cityId == null ? List.of() : List.of(cityId),
                 districtId == null ? List.of() : List.of(districtId));
 
+        // Phase 29.2: single-row path, so "once per request" trivially holds — there is only one
+        // row to disagree with itself.
         return BookingDetailResponse.from(
                 booking, canReview, providerCanReviewClient,
-                labels.cityLabel(cityId), labels.districtLabel(districtId));
+                labels.cityLabel(cityId), labels.districtLabel(districtId), resolveNow());
+    }
+
+    /**
+     * Absolute-instant "now" for the Phase 29.1 {@link BookingClosureRule} — {@link
+     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, mirroring the identical
+     * expression {@link #getMyBookings(UUID, Authentication, List, LocalDate, LocalDate, List,
+     * BookingPartition, Pageable)} already resolves for the Phase 28.1 partition boundary. Never
+     * {@code Instant.now()} / {@code OffsetDateTime.now()} (Anti-Bug §G), and {@link
+     * TimeZones#KYIV} must never appear here — see {@code BookingSpecifications#partition}'s
+     * javadoc for the clock/timezone invariant this mirrors.
+     */
+    private OffsetDateTime resolveNow() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
     }
 
     /**
@@ -264,9 +283,14 @@ public class BookingService {
         return discoveryLocationResolver.resolveLabels(cityIds, districtIds);
     }
 
-    /** Maps a CLIENT projection row to the enriched response, stamping resolved labels. */
+    /**
+     * Maps a CLIENT projection row to the enriched response, stamping resolved labels. {@code now}
+     * is the SAME instant resolved once in {@link #getMyBookings(UUID, Authentication, List,
+     * LocalDate, LocalDate, List, BookingPartition, Pageable)} for the whole page — threaded
+     * through, never re-read here (Phase 29.2).
+     */
     private static BookingDetailResponse toDetailResponse(
-            ClientBookingDetailProjection p, DiscoveryLabels labels) {
+            ClientBookingDetailProjection p, DiscoveryLabels labels, OffsetDateTime now) {
         return new BookingDetailResponse(
                 p.id(),
                 p.clientId(),
@@ -309,7 +333,8 @@ public class BookingService {
                 // No null-guard needed (unlike BookingDetailResponse#from's entity path): this
                 // projection is CLIENT-scoped via `JOIN b.client`, so a guest booking cannot
                 // appear here at all. A client with no uploaded photo yields null naturally.
-                p.clientAvatarUrl());
+                p.clientAvatarUrl(),
+                BookingClosureRule.isAwaitingClosure(p.status(), p.endsAt(), now));
     }
 
     /**
@@ -405,12 +430,19 @@ public class BookingService {
      *
      * <p>{@code now} is resolved exactly once, here, as an absolute-instant {@link
      * OffsetDateTime} derived from {@link Clock#instant()} — never {@code OffsetDateTime.now()} or
-     * {@code Instant.now()} (Anti-Bug §G) — and only when {@code partition != null} (an unused
-     * partition boundary is never computed). {@link ZoneOffset#UTC} is used purely as the
+     * {@code Instant.now()} (Anti-Bug §G). {@link ZoneOffset#UTC} is used purely as the
      * fixed-offset REPRESENTATION of that instant so it can bind to the {@code OffsetDateTime}-
      * typed {@code endsAt} Criteria path; {@link TimeZones#KYIV} must never appear here — see
      * {@code BookingSpecifications#partition}'s javadoc for the full clock/timezone invariant this
      * mirrors.
+     *
+     * <p><b>Phase 29.2 — {@code now} is resolved UNCONDITIONALLY</b>, even when {@code partition ==
+     * null}. It is no longer only the partition boundary's input: it is also threaded into every
+     * row's {@code awaitingClosure} response flag (both the CLIENT projection path and the
+     * provider entity path), so a plain {@code GET /bookings/me} with no {@code partition} still
+     * needs one resolved instant for the whole page. This is the SAME single-instant-per-page
+     * discipline the partition boundary already established — one {@code now} answers every row on
+     * one page, never re-derived per row.
      */
     @Transactional(readOnly = true)
     public PageResponse<BookingDetailResponse> getMyBookings(
@@ -449,9 +481,10 @@ public class BookingService {
         OffsetDateTime fromTs = from == null ? null : from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime toExclusive = to == null ? null : to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
-        // Phase 28.1: absolute-instant "now" for the partition boundary — Clock#instant(), never
-        // Kyiv-zoned, resolved only when a partition was actually requested.
-        OffsetDateTime now = partition == null ? null : OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+        // Phase 28.1/29.2: absolute-instant "now" — Clock#instant(), never Kyiv-zoned — resolved
+        // ONCE for the whole page. Used for the partition boundary (when partition != null) AND
+        // for every row's awaitingClosure flag (always) — see resolveNow()'s javadoc.
+        OffsetDateTime now = resolveNow();
 
         // Phase 26.3: validate/whitelist/default/tiebreak the sort BEFORE the role dispatch, so
         // BOTH the client projection query and the provider ID-page query receive an identical,
@@ -546,6 +579,57 @@ public class BookingService {
         // lossless: the AT TIME ZONE 'Europe/Kyiv' expression in SQL already produced the correct
         // Kyiv calendar date before JDBC ever sees it — do not move that grouping into Java.
         return bookedDates.stream().map(java.sql.Date::toLocalDate).toList();
+    }
+
+    /**
+     * Phase 29.4 — {@code GET /bookings/me/unclosed-count}: a cheap, single {@code COUNT(*)} of
+     * bookings {@link BookingClosureRule#awaitingClosure(OffsetDateTime) awaiting the caller's own
+     * closure} — exactly the same rows {@code ?partition=AWAITING_CLOSURE} (Phase 29.3) would
+     * return, without paying for a page of hydrated rows just to read {@code totalElements}.
+     *
+     * <p><b>Scope resolution mirrors {@code getMyBookings}'s provider/client scope exactly</b> —
+     * same role dispatch, same {@code masterRepository.findByUserId} / {@code
+     * salonRepository.findIdsByOwnerIdAndIsActiveTrue} lookups, same {@link BookingSpecifications}
+     * scope factories, same {@code SALON_ADMIN} rejection (they manage staff/services, not
+     * bookings — identical boundary to {@link #getMyBookedDays} and {@link #listProviderBookings}).
+     * No new {@code @authz} method, no new authorization surface — see this phase's own
+     * "Authorization — nothing new" clause. A {@code SALON_OWNER} with no active salons gets
+     * {@code count: 0} with no query at all, mirroring {@link #listProviderBookings}'s {@code
+     * Page.empty} short-circuit for the same case.
+     *
+     * <p><b>One query, no N+1.</b> The scope predicate is ANDed with {@link
+     * BookingClosureRule#awaitingClosure(OffsetDateTime)} and executed as a single {@code
+     * COUNT(*)} via {@link BookingRepository#count(Specification)} — never a hydrated {@link Page}
+     * whose {@code getTotalElements()} is read for its side effect, and never a per-master count
+     * loop for the salon-scope case.
+     */
+    @Transactional(readOnly = true)
+    public UnclosedCountResponse getUnclosedCount(UUID actorUserId, Authentication auth) {
+        Role role = AuthenticationUtils.role(auth);
+        OffsetDateTime now = resolveNow();
+
+        Specification<Booking> scope = switch (role) {
+            case CLIENT -> BookingSpecifications.clientIdEquals(actorUserId);
+            case SALON_MASTER, INDEPENDENT_MASTER -> {
+                Master master = masterRepository.findByUserId(actorUserId)
+                        .orElseThrow(() -> new NotFoundException("Master profile not found"));
+                yield BookingSpecifications.masterIdEquals(master.getId());
+            }
+            case SALON_OWNER -> {
+                List<UUID> salonIds = salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorUserId);
+                yield salonIds.isEmpty() ? null : BookingSpecifications.salonIdIn(salonIds);
+            }
+            // SALON_ADMIN intentionally excluded: they manage staff/services, not bookings — same
+            // boundary getMyBookings/getMyBookedDays enforce for the identical reason.
+            case SALON_ADMIN -> throw new ForbiddenException("SALON_ADMIN cannot list bookings via this endpoint");
+        };
+
+        if (scope == null) {
+            return new UnclosedCountResponse(0L);
+        }
+
+        long count = bookingRepository.count(scope.and(BookingClosureRule.awaitingClosure(now)));
+        return new UnclosedCountResponse(count);
     }
 
     /**
@@ -740,7 +824,7 @@ public class BookingService {
         List<BookingDetailResponse> ordered = idPage.getContent().stream()
                 .map(byId::get)
                 .filter(Objects::nonNull)
-                .map(p -> toDetailResponse(p, labels))
+                .map(p -> toDetailResponse(p, labels, now))
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }
@@ -820,7 +904,7 @@ public class BookingService {
                     // BookingDetailResponse's class javadoc. Only GET /bookings/{id}
                     // (BookingService#getBooking) computes it for real.
                     return BookingDetailResponse.from(
-                            b, canReview, false, labels.cityLabel(cityId), labels.districtLabel(districtId));
+                            b, canReview, false, labels.cityLabel(cityId), labels.districtLabel(districtId), now);
                 })
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
@@ -842,7 +926,7 @@ public class BookingService {
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        return BookingResponse.from(saved);
+        return BookingResponse.from(saved, resolveNow());
     }
 
     /**
@@ -940,7 +1024,7 @@ public class BookingService {
         }
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit(actorUserId);
-        return BookingResponse.from(saved);
+        return BookingResponse.from(saved, resolveNow());
     }
 
     @Transactional
@@ -972,7 +1056,7 @@ public class BookingService {
         outboxService.enqueueStatusChanged(saved.getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit(actorUserId);
-        return BookingResponse.from(saved);
+        return BookingResponse.from(saved, resolveNow());
     }
 
     /**
@@ -1056,7 +1140,7 @@ public class BookingService {
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        return BookingResponse.from(saved);
+        return BookingResponse.from(saved, resolveNow());
     }
 
     /**
@@ -1369,7 +1453,7 @@ public class BookingService {
         outboxService.enqueueNewBooking(saved.getId());
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
-        return BookingResponse.from(saved);
+        return BookingResponse.from(saved, resolveNow());
     }
 
     /**

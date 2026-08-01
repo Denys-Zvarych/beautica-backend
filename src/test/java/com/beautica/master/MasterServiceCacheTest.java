@@ -52,7 +52,11 @@ import static org.mockito.Mockito.when;
 @SpringBootTest(
         // The REAL prefix evictor, never a @MockBean: it owns the cache-key-shape predicate whose
         // silent mismatch made five evictions no-ops, so these tests must execute it.
-        classes = {MasterService.class, CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
+        // com.beautica.config.ClockConfig (Phase 29.2 fallout): getMasterCalendar now needs a
+        // Clock bean to resolve BookingResponse.awaitingClosure's "now" — none of this class's
+        // tests assert on that flag, so the real systemUTC() clock ClockConfig provides is fine.
+        classes = {MasterService.class, CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class,
+                com.beautica.config.ClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @Import(MasterServiceCacheTest.TransactionConfig.class)

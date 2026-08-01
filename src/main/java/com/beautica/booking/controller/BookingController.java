@@ -6,6 +6,7 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.dto.UnclosedCountResponse;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
@@ -156,6 +157,15 @@ public class BookingController {
         }
         return ApiResponse.ok(bookingService.getMyBookings(
                 AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, partition, pageable));
+    }
+
+    // Phase 29.4: three path segments (/me/unclosed-count), same collision-avoidance rationale as
+    // /me/booked-days below — Spring's PathPattern always prefers the more specific literal match
+    // over /{bookingId}, but is kept explicit rather than relied upon, per that endpoint's comment.
+    @GetMapping("/me/unclosed-count")
+    @PreAuthorize("isAuthenticated()")
+    public ApiResponse<UnclosedCountResponse> getUnclosedCount(Authentication auth) {
+        return ApiResponse.ok(bookingService.getUnclosedCount(AuthenticationUtils.userId(auth), auth));
     }
 
     // Phase 26.5: three path segments (/me/booked-days) so it cannot collide with the

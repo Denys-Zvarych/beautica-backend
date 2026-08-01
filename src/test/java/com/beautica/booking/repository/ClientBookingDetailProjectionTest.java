@@ -584,7 +584,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.flush();
 
         BookingDetailResponse entityResponse =
-                BookingDetailResponse.from(booking, false, false, "Kyiv", "Podil");
+                BookingDetailResponse.from(booking, false, false, "Kyiv", "Podil",
+                        // Phase 29.2 — this suite pins entity-vs-projection PARITY, not the
+                        // awaitingClosure derivation itself (covered by BookingDetailResponseTest);
+                        // an arbitrary fixed instant well before every seeded booking's startsAt
+                        // keeps both response paths' awaitingClosure identically false.
+                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
 
         em.clear();
 
@@ -668,7 +673,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
 
         em.flush();
         BookingDetailResponse entityResponse =
-                BookingDetailResponse.from(booking, false, false, "Kyiv", "Podil");
+                BookingDetailResponse.from(booking, false, false, "Kyiv", "Podil",
+                        // Phase 29.2 — this suite pins entity-vs-projection PARITY, not the
+                        // awaitingClosure derivation itself (covered by BookingDetailResponseTest);
+                        // an arbitrary fixed instant well before every seeded booking's startsAt
+                        // keeps both response paths' awaitingClosure identically false.
+                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
         em.clear();
 
         Page<ClientBookingDetailProjection> page = findClientBookingDetails(

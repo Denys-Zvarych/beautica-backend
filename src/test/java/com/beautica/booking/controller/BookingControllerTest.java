@@ -133,7 +133,12 @@ class BookingControllerTest {
                 // appointmentId (BE-5 additive) — legacy single-service booking has no visit
                 null,
                 // clientAvatarUrl (additive) — the provider timeline's client photo
-                "https://cdn.test/client-avatar.png"
+                "https://cdn.test/client-avatar.png",
+                // awaitingClosure (Phase 29.2 additive) — this fixture's startsAt is always
+                // tomorrow (CONFIRMED, not yet elapsed), so false is the only correct value; the
+                // real derivation is exercised by BookingResponseTest/BookingDetailResponseTest
+                // and the booking ITs, not this controller-slice stub.
+                false
         );
     }
 
@@ -1225,6 +1230,56 @@ class BookingControllerTest {
         org.mockito.Mockito.verify(bookingService)
                 .getMyBookings(any(), any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
         org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
+    }
+
+    // ── GET /me/unclosed-count (Phase 29.4 — provider work-queue badge) ──────────
+
+    @Test
+    @DisplayName("GET /me/unclosed-count — 200 shape {success:true,data:{count:N}}, delegating to "
+            + "exactly one service call with no arithmetic of its own")
+    void should_return200WithCountShape_when_authenticatedRequestsUnclosedCount() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(bookingService.getUnclosedCount(eq(masterId), any()))
+                .thenReturn(new com.beautica.booking.dto.UnclosedCountResponse(7L));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/unclosed-count")
+                        .with(authenticatedAs(masterId, "master@beautica.test", Role.INDEPENDENT_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.count").value(7));
+
+        org.mockito.Mockito.verify(bookingService).getUnclosedCount(eq(masterId), any());
+        org.mockito.Mockito.verifyNoMoreInteractions(bookingService);
+    }
+
+    @Test
+    @DisplayName("GET /me/unclosed-count — the actor id passed to the service is the security "
+            + "principal, never a client-supplied value")
+    void should_usePrincipalAsActor_when_requestingUnclosedCount() throws Exception {
+        var principalId = UUID.randomUUID();
+        when(bookingService.getUnclosedCount(eq(principalId), any()))
+                .thenReturn(new com.beautica.booking.dto.UnclosedCountResponse(0L));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/me/unclosed-count")
+                        .with(authenticatedAs(principalId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.count").value(0));
+
+        var actorCaptor = org.mockito.ArgumentCaptor.forClass(UUID.class);
+        org.mockito.Mockito.verify(bookingService).getUnclosedCount(actorCaptor.capture(), any());
+        org.assertj.core.api.Assertions.assertThat(actorCaptor.getValue()).isEqualTo(principalId);
+    }
+
+    @Test
+    @DisplayName("GET /me/unclosed-count — 401 when no Authorization header")
+    void should_return401_when_unauthenticatedUnclosedCountRequest() throws Exception {
+        mockMvc.perform(get(BOOKINGS_URL + "/me/unclosed-count")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+
+        org.mockito.Mockito.verifyNoInteractions(bookingService);
     }
 
     // ── GET /me/booked-days (Phase 26.5 — day-rail dot set) ──────────────────────

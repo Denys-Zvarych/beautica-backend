@@ -1,5 +1,6 @@
 package com.beautica.booking.dto;
 
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
@@ -53,9 +54,18 @@ public record BookingResponse(
                         + "Bookings list collapses them into a single card and fetches the full visit "
                         + "via GET /appointments/{appointmentId}. A client that ignores this field is "
                         + "unaffected (strictly additive).")
-        UUID appointmentId
+        UUID appointmentId,
+        @Schema(description = "Derived, read-time-only (Phase 29.1/29.2) — TRUE when this "
+                + "booking's status is still CONFIRMED but its endsAt has already elapsed: no "
+                + "scheduled job ever transitions such a booking to a terminal state, so this "
+                + "flags the ones the provider still needs to close via /complete, "
+                + "/not-complete or /decline. NEVER persisted, NEVER cached — recomputed on "
+                + "every read from (status, endsAt, the current instant). Orthogonal to any "
+                + "review-eligibility field on the enriched detail DTO: an elapsed CONFIRMED "
+                + "booking is never itself review-eligible.")
+        boolean awaitingClosure
 ) {
-    public static BookingResponse from(Booking booking) {
+    public static BookingResponse from(Booking booking, OffsetDateTime now) {
         return new BookingResponse(
                 booking.getId(),
                 // Guest (LINK) bookings have no registered client (V89 chk_bookings_guest_fields) —
@@ -74,7 +84,8 @@ public record BookingResponse(
                 // appointment is a LAZY @ManyToOne on a nullable FK — Hibernate serves the
                 // identifier off the proxy (or resolves it as null) from the booking row itself,
                 // with no extra SELECT and no widening of any caller's fetch graph.
-                booking.getAppointment() != null ? booking.getAppointment().getId() : null
+                booking.getAppointment() != null ? booking.getAppointment().getId() : null,
+                BookingClosureRule.isAwaitingClosure(booking.getStatus(), booking.getEndsAt(), now)
         );
     }
 }

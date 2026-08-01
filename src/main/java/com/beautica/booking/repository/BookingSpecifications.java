@@ -1,5 +1,6 @@
 package com.beautica.booking.repository;
 
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
@@ -257,6 +258,23 @@ public final class BookingSpecifications {
      * <p>Do not remove this conjunct "for simplification" — without it, V130's index is silently
      * dead weight (write-amplification with zero read benefit) because Postgres never proves the
      * unmodified {@code cb.or(...)} implies the index's partial predicate.
+     *
+     * <p><b>Phase 29.1 — the {@code PAST} branch's second OR-leg delegates to {@link
+     * BookingClosureRule#awaitingClosure(OffsetDateTime)}</b> instead of re-writing {@code
+     * statusIn(CONFIRMED).and(endsAtBefore(now))} inline. {@link BookingClosureRule} is now the
+     * single canonical definition of "an elapsed CONFIRMED booking awaits closure" — this delegate
+     * call is byte-for-byte the same predicate composition the inline expression produced before,
+     * so it changes no query result and no query plan.
+     *
+     * <p><b>Phase 29.3 — the standalone {@code AWAITING_CLOSURE} arm.</b> Gives that same OR-leg a
+     * name a caller can request on its own ({@code GET /bookings/me?partition=AWAITING_CLOSURE}).
+     * {@link BookingPartition#AWAITING_CLOSURE} is a NAMED SUBSET OF {@code PAST}, not a fourth
+     * member of the total-disjoint cover — see {@link BookingPartition}'s javadoc. Its predicate is
+     * a plain {@code status = 'CONFIRMED'} equality (no OR/AND nesting), so it needs none of the
+     * {@code PAST} arm's redundant outer conjunct: Postgres's partial-index implication prover
+     * handles {@code status = 'CONFIRMED'} &#8658; {@code status IN ('COMPLETED','NOT_COMPLETED',
+     * 'CONFIRMED')} without help — the gap that forced the conjunct is specific to the nested
+     * OR/AND shape of {@code PAST}.
      */
     public static Specification<Booking> partition(BookingPartition partition, OffsetDateTime now) {
         return switch (partition) {
@@ -267,9 +285,9 @@ public final class BookingSpecifications {
                     cb.or(
                             statusIn(EnumSet.of(BookingStatus.COMPLETED, BookingStatus.NOT_COMPLETED))
                                     .toPredicate(root, query, cb),
-                            statusIn(EnumSet.of(BookingStatus.CONFIRMED)).and(endsAtBefore(now))
-                                    .toPredicate(root, query, cb)));
+                            BookingClosureRule.awaitingClosure(now).toPredicate(root, query, cb)));
             case CANCELLED -> statusIn(EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED));
+            case AWAITING_CLOSURE -> BookingClosureRule.awaitingClosure(now);
         };
     }
 }

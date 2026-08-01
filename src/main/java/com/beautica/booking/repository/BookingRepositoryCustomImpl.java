@@ -139,6 +139,18 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
     }
 
     /**
+     * Phase 29.4 — public entry point onto the existing {@link #countMatching} helper (previously
+     * private, used only as {@link #findIdPage}'s deferred count supplier). Exposed verbatim —
+     * same {@link CriteriaQuery}-building logic, no new query shape — so {@code
+     * BookingService#getUnclosedCount} gets exactly one {@code SELECT COUNT(*)} statement for an
+     * arbitrary caller-composed {@link Specification}.
+     */
+    @Override
+    public long count(Specification<Booking> spec) {
+        return countMatching(spec);
+    }
+
+    /**
      * Composes the optional Phase 26.2 date-range predicates onto {@code spec} — each bound
      * applied only when non-null, exactly like the {@code statuses} predicate above, so a caller
      * that omits both bounds gets byte-for-byte the same SQL text Phase 26.1 already produces.

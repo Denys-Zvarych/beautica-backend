@@ -1,6 +1,7 @@
 package com.beautica.booking.dto;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
@@ -248,7 +249,19 @@ public record BookingDetailResponse(
                         + "every row of GET /bookings/me, for a provider and for the client "
                         + "themselves alike; a client reading their own booking sees their own "
                         + "photo. Safe to cache by booking id across both endpoints.")
-        String clientAvatarUrl
+        String clientAvatarUrl,
+        @Schema(description = "Derived, read-time-only (Phase 29.1/29.2) — TRUE when this "
+                + "booking's status is still CONFIRMED but its endsAt has already elapsed: no "
+                + "scheduled job ever transitions such a booking to a terminal state, so this "
+                + "flags the ones the provider still needs to close via /complete, "
+                + "/not-complete or /decline. NEVER persisted, NEVER cached — recomputed on "
+                + "every read from (status, endsAt, the current instant). Orthogonal to "
+                + "canReview: an elapsed-but-unclosed CONFIRMED booking reads TRUE here and "
+                + "FALSE for canReview, since review eligibility keys off closure (COMPLETED), "
+                + "never off elapsed wall-clock time. The same for every row of GET "
+                + "/bookings/me and for GET /bookings/{id} — a pure function of the booking, "
+                + "not of the viewer.")
+        boolean awaitingClosure
 ) {
 
     /**
@@ -256,7 +269,10 @@ public record BookingDetailResponse(
      * must supply {@code canReview} (the COMPLETED + no-existing-review predicate),
      * {@code providerCanReviewClient} (the viewer-aware provider-side mirror — see this class's
      * javadoc), and the resolved discovery locality labels — none of the three is derivable from
-     * the entity graph alone.
+     * the entity graph alone. {@code now} is the request-scoped absolute instant (Phase 29.2)
+     * threaded down to {@link com.beautica.booking.domain.BookingClosureRule#isAwaitingClosure} —
+     * an already-resolved {@code clock.instant()}, never re-derived here and never {@link
+     * java.time.OffsetDateTime#now()}.
      *
      * <p>The caller MUST have hydrated the full graph (client, master.user, master.salon,
      * masterService.serviceDefinition) — e.g. via {@code BookingRepository.findByIdWithFullGraph}
@@ -278,7 +294,8 @@ public record BookingDetailResponse(
             boolean canReview,
             boolean providerCanReviewClient,
             String cityLabel,
-            String districtLabel
+            String districtLabel,
+            OffsetDateTime now
     ) {
         Master master = booking.getMaster();
         User masterUser = master.getUser();
@@ -335,7 +352,8 @@ public record BookingDetailResponse(
                 // findAllByIdsWithGraph, both of which already LEFT JOIN FETCH b.client for the
                 // name reads above, so avatarUrl is a scalar off an already-materialised User row
                 // — no extra statement, no widening of either fetch graph.
-                client != null ? client.getAvatarUrl() : null
+                client != null ? client.getAvatarUrl() : null,
+                BookingClosureRule.isAwaitingClosure(booking.getStatus(), booking.getEndsAt(), now)
         );
     }
 }

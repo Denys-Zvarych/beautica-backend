@@ -1,9 +1,11 @@
 package com.beautica.booking.repository;
 
+import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.domain.Specification;
 
 import java.time.OffsetDateTime;
 import java.util.Collection;
@@ -140,4 +142,15 @@ public interface BookingRepositoryCustom {
             UUID clientId, BookingPartition partition, OffsetDateTime now,
             OffsetDateTime from, OffsetDateTime toExclusive,
             Collection<UUID> serviceIds, Pageable pageable);
+
+    /**
+     * Phase 29.4 — a bare {@code COUNT(*)} over an arbitrary {@link Specification}, backing
+     * {@code GET /bookings/me/unclosed-count}. Deliberately generic (unlike every other method on
+     * this interface, which is a named, purpose-specific query) because the caller
+     * ({@code BookingService#getUnclosedCount}) composes its own scope-plus-closure {@link
+     * Specification} and needs exactly one {@code SELECT COUNT(*)} for it — never a hydrated
+     * {@link Page} whose {@code getTotalElements()} is read for its side effect (that would load
+     * rows only to discard them), and never a per-scope-entry count loop.
+     */
+    long count(Specification<Booking> spec);
 }
