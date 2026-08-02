@@ -29,6 +29,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -126,6 +127,40 @@ class NotificationOutboxServiceTest {
     @DisplayName("enqueueReviewRequested throws NullPointerException with message when bookingId is null — no save")
     void should_throwNullPointerException_when_enqueueReviewRequestedCalledWithNull() {
         assertThatThrownBy(() -> service.enqueueReviewRequested(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("bookingId must not be null");
+        verify(outboxRepository, never()).save(any());
+    }
+
+    // -------------------------------------------------------------------------
+    // enqueueClosureReminder (Phase 29.5)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("enqueueClosureReminder saves exactly one CLOSURE_REMINDER entry with PENDING status, 0 attempts, correct aggregateId and null payload")
+    void should_saveClosureReminderEntry_when_enqueueClosureReminderCalled() {
+        UUID bookingId = UUID.randomUUID();
+        ArgumentCaptor<NotificationOutboxEntry> captor =
+                ArgumentCaptor.forClass(NotificationOutboxEntry.class);
+
+        service.enqueueClosureReminder(bookingId);
+
+        verify(outboxRepository, times(1)).save(captor.capture());
+        NotificationOutboxEntry saved = captor.getValue();
+        assertThat(saved.getEventType()).isEqualTo(OutboxEventType.CLOSURE_REMINDER);
+        assertThat(saved.getAggregateId()).isEqualTo(bookingId);
+        assertThat(saved.getPayload()).isNull();
+        assertThat(saved.getStatus()).isEqualTo(OutboxStatus.PENDING);
+        assertThat(saved.getAttempts()).isEqualTo(0);
+        // enqueueClosureReminder must perform NO other write — it never reads or writes a
+        // Booking, so the only interaction with any repository is this one outboxRepository.save.
+        verifyNoMoreInteractions(outboxRepository);
+    }
+
+    @Test
+    @DisplayName("enqueueClosureReminder throws NullPointerException with message when bookingId is null — no save")
+    void should_throwNullPointerException_when_enqueueClosureReminderCalledWithNull() {
+        assertThatThrownBy(() -> service.enqueueClosureReminder(null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessage("bookingId must not be null");
         verify(outboxRepository, never()).save(any());

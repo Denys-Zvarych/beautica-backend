@@ -273,6 +273,83 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // sendClosureReminderEmail (Phase 29.5)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("sendClosureReminderEmail renders the closure-reminder template with all vars and a formatted startsAt")
+    void should_callMailSenderSend_when_sendClosureReminderEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>closure</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+        String bookingUrl = "https://app.beautica.ua/bookings/abc-123";
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendClosureReminderEmail("master@example.com", booking, bookingUrl);
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        verify(mailSender).send(realMessage);
+
+        assertThat(templateCaptor.getValue()).isEqualTo("email/closure-reminder");
+        assertThat(realMessage.getSubject()).isEqualTo("Візит завершився — позначте його статус");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        assertThat(captured.getVariable("bookingUrl")).isEqualTo(bookingUrl);
+        // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date — pre-formatted, never a raw datetime.
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
+        // Per the locked track-25 rule, notes are never rendered into a notification — this
+        // template must not carry providerComment/clientComment/clientCancellationNote at all.
+        assertThat(captured.getVariable("providerComment")).isNull();
+        assertThat(captured.getVariable("clientComment")).isNull();
+        assertThat(captured.getVariable("clientCancellationNote")).isNull();
+    }
+
+    @Test
+    @DisplayName("sendClosureReminderEmail rejects an unsafe bookingUrl scheme before any render or send")
+    void should_throwIllegalArgument_when_sendClosureReminderEmailBookingUrlSchemeUnsafe() {
+        // The scheme guard rejects before the booking graph is touched, so a bare mock suffices
+        // (a full buildBookingMock would trip Mockito's strict UnnecessaryStubbingException).
+        Booking booking = mock(Booking.class);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                        service.sendClosureReminderEmail("master@example.com", booking, "javascript:alert(1)"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("scheme");
+
+        org.mockito.Mockito.verifyNoInteractions(mailSender);
+    }
+
+    @Test
+    @DisplayName("sendClosureReminderEmail strips CRLF from the To address before setTo is called")
+    void should_stripCrlf_when_sendClosureReminderEmailCalledWithInjectedNewline() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>closure</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+
+        service.sendClosureReminderEmail(
+                "master@example.com\r\n", booking, "https://app.beautica.ua/bookings/abc");
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .isNotNull()
+                .hasSize(1);
+        String toHeader = realMessage.getRecipients(Message.RecipientType.TO)[0].toString();
+        assertThat(toHeader).doesNotContain("\r");
+        assertThat(toHeader).doesNotContain("\n");
+        assertThat(toHeader).contains("master@example.com");
+    }
+
+    // -------------------------------------------------------------------------
     // sendBookingDeclinedEmail
     // -------------------------------------------------------------------------
 

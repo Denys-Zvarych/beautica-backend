@@ -172,6 +172,30 @@ public class EmailNotificationService {
         send(to, "Оцініть візит", "email/review-request", ctx);
     }
 
+    /**
+     * Sends the PROVIDER a "this visit is still open — close it" nudge (Phase 29.5). {@code
+     * bookingUrl} is scheme-guarded before rendering (mirrors {@link #sendReviewRequestEmail}).
+     * The template renders only service name, client display name, and visit date/time — per the
+     * locked track-25 rule, {@code clientComment}/{@code clientCancellationNote}/{@code
+     * providerComment} are never passed into this context and never appear in this email.
+     *
+     * @param to        the provider's (master's) email address
+     * @param booking   the elapsed, still-{@code CONFIRMED} booking
+     * @param bookingUrl the fully-built {@code https://.../bookings/{id}} deep link
+     */
+    public void sendClosureReminderEmail(String to, Booking booking, String bookingUrl) {
+        if (!SchemeGuard.isAllowedScheme(bookingUrl)) {
+            throw new IllegalArgumentException(
+                    "bookingUrl must use https:// scheme or http://localhost — caller must validate before reaching email transport");
+        }
+        var ctx = new Context();
+        ctx.setVariable("clientName", resolveClientName(booking));
+        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
+        ctx.setVariable("startsAt", formatStartsAt(booking));
+        ctx.setVariable("bookingUrl", bookingUrl);
+        send(to, "Візит завершився — позначте його статус", "email/closure-reminder", ctx);
+    }
+
     public void sendBookingDeclinedEmail(String to, Booking booking) {
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));

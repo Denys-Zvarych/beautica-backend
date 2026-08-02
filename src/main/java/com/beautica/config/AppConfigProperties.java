@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.booking.closure.ClosureReminderProperties;
 import com.beautica.notification.crypto.OutboxCipherProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
@@ -17,7 +18,8 @@ import org.springframework.context.annotation.Configuration;
         SupportProperties.class,
         TurbosmsProperties.class,
         BookingSmsProperties.class,
-        OutboxReclaimPolicyConfig.class
+        OutboxReclaimPolicyConfig.class,
+        ClosureReminderProperties.class
 })
 public class AppConfigProperties {
 }

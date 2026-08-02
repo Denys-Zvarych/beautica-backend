@@ -106,6 +106,11 @@ dependencies {
     testImplementation("org.apache.httpcomponents.client5:httpclient5")
     // WireMock — stubs the Turbosms HTTP endpoint in TurbosmsService tests (Phase 13.1).
     testImplementation("org.wiremock:wiremock-standalone:3.9.1")
+    // ArchUnit (Phase 29.5) — test-only. The closure-reminder path's "never writes
+    // bookings.status" guarantee is a transitive-call assertion, not expressible as a grep (a
+    // grep-based substitute passes the moment the call moves one indirection away). See
+    // ClosureReminderArchitectureTest.
+    testImplementation("com.tngtech.archunit:archunit-junit5:1.3.0")
 }
 
 // Disable the plain (non-executable) jar task. The Spring Boot plugin otherwise

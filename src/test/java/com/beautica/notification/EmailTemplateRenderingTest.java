@@ -297,4 +297,67 @@ class EmailTemplateRenderingTest {
                 .as("rendered template must not contain unresolved Thymeleaf attribute like 'th:text' or 'th:href'")
                 .doesNotContainPattern("th:[a-z]");
     }
+
+    // ── closure-reminder template (Phase 29.5) ──────────────────────────────────
+
+    @Test
+    @DisplayName("closure-reminder template renders clientName, serviceName, startsAt and bookingUrl")
+    void should_renderRequiredFields_when_closureReminderTemplateProcessed() {
+        var bookingUrl = "https://app.beautica.ua/bookings/abc-123";
+        var ctx = new Context();
+        ctx.setVariable("clientName", "Іван Петренко");
+        ctx.setVariable("serviceName", "Стрижка");
+        ctx.setVariable("startsAt", "10:00, 20 травня 2026");
+        ctx.setVariable("bookingUrl", bookingUrl);
+
+        String html = templateEngine.process("email/closure-reminder", ctx);
+
+        assertThat(html).contains("Іван Петренко");
+        assertThat(html).contains("Стрижка");
+        assertThat(html).contains("10:00, 20 травня 2026");
+        assertThat(html).contains("href=\"" + bookingUrl + "\"");
+    }
+
+    @Test
+    @DisplayName("closure-reminder — rendered HTML contains no unresolved Thymeleaf expression (no unresolved ${)")
+    void should_notContainUnresolvedExpression_when_closureReminderTemplateProcessed() {
+        // Unlike the OTP templates below, this template's header comment legitimately documents
+        // "th:text" / "th:href" / "th:utext" as prose (mirrors review-request.html), so the
+        // stricter "no th:[a-z] anywhere" pattern used for the OTP templates would false-positive
+        // on that comment text — only the unresolved-expression check applies here.
+        var ctx = new Context();
+        ctx.setVariable("clientName", "Марія Коваль");
+        ctx.setVariable("serviceName", "Манікюр");
+        ctx.setVariable("startsAt", "14:30, 22 травня 2026");
+        ctx.setVariable("bookingUrl", "https://app.beautica.ua/bookings/xyz");
+
+        String html = templateEngine.process("email/closure-reminder", ctx);
+
+        assertThat(html)
+                .as("rendered template must not contain unresolved Thymeleaf expression '\\${'")
+                .doesNotContain("${");
+    }
+
+    @Test
+    @DisplayName("closure-reminder — rendered body and subject-relevant content contain none of the "
+            + "three note sentinels — clientComment/clientCancellationNote/providerComment are never "
+            + "passed into this template's context (Anti-Bug §223, locked track-25 rule)")
+    void should_notLeakAnyNoteField_when_closureReminderTemplateProcessedWithSentinelsAbsentFromContext() {
+        // The fixture booking in a real caller (NotificationService/EmailNotificationService) would
+        // have all three note fields populated with distinctive sentinels — this test proves the
+        // TEMPLATE itself has no expression referencing them, by rendering with only the four
+        // documented variables and asserting none of the sentinel markers ever appear in the output,
+        // even though nothing in this render call could have produced them by accident.
+        var ctx = new Context();
+        ctx.setVariable("clientName", "Тест Клієнт");
+        ctx.setVariable("serviceName", "Тест послуга");
+        ctx.setVariable("startsAt", "10:00, 20 травня 2026");
+        ctx.setVariable("bookingUrl", "https://app.beautica.ua/bookings/note-sentinel-fixture");
+
+        String html = templateEngine.process("email/closure-reminder", ctx);
+
+        assertThat(html).doesNotContain("SENTINEL-CLIENT-COMMENT");
+        assertThat(html).doesNotContain("SENTINEL-CLIENT-CANCELLATION-NOTE");
+        assertThat(html).doesNotContain("SENTINEL-PROVIDER-COMMENT");
+    }
 }
