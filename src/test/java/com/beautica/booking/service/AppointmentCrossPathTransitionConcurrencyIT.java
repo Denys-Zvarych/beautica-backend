@@ -93,6 +93,48 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * {@code CONFIRMED} in this branch and aborts with a clean {@code 409} instead — so this test's
  * outcome is now genuinely race-order-dependent for the CANCEL side (see the branch below), where
  * it previously was not.
+ *
+ * <p><b>QA cycle-8 audit (2026-08-03) — six of the seven tests below rewritten as deterministic
+ * one-sided gates, this class's own primary test included.</b> Every test in this class originally
+ * used a two-arrivals {@code CyclicBarrier} to force both racers to attempt their respective header
+ * locks at effectively the same instant, then asserted the LOSING racer's outcome with a lenient
+ * {@code isIn(...)} (for this class's own primary test, {@code isIn(NO_CONTENT, CONFLICT)}) — branching
+ * the rest of the assertions on whichever status actually came back. The audit found this makes the
+ * guard each test exists to pin untestable by construction: with a two-arrivals barrier, whichever
+ * racer's {@code SELECT ... FOR UPDATE} statement Postgres happens to service first is effectively a
+ * coin flip the test does not control, so removing the very guard under test (the loser's own
+ * freshness re-check, or — for the batched G3 test — its filter) simply flips which branch of the
+ * {@code isIn(...)}/{@code if} executes; the test keeps passing either way. This was verified
+ * empirically for two of the six (commenting out the guard and watching the test stay green). The
+ * seventh test in this class,
+ * {@link #should_serializeCleanlyWithCoherentFinalState_when_perItemRescheduleRacesWholeVisitDecline},
+ * is exempt: its correctness comes from an UNCONDITIONAL guard on one side (the decline's header lock
+ * always succeeds), so its outcome was never actually ambiguous — its {@code isIn(...)} covers the
+ * OTHER racer only, never the guard under test itself.
+ *
+ * <p><b>The fix, applied to all six.</b> Replace the two-arrivals {@code CyclicBarrier} with a
+ * ONE-SIDED gate (the pattern already proven in {@code BookingCancelRescheduleConcurrencyIT} and
+ * {@code BookingProviderTransitionCancelRaceConcurrencyIT}): pause the racer that is meant to LOSE at
+ * the exact instant it would attempt its own header-lock call — BEFORE the real method runs, so it has
+ * acquired no lock and holds no contention against the other racer — drive the WINNING racer to full,
+ * uncontended completion (commit included), then release the loser. The loser's own lock now succeeds
+ * trivially (nothing contends for it), and its freshness re-check (or filter) runs against a row the
+ * winner has ALREADY moved off {@code CONFIRMED} — the one condition that actually exercises the guard
+ * under test. The outcome is therefore a single, forced, deterministic status code and a single,
+ * forced, deterministic persisted state — never {@code isIn(...)}, never an {@code if} branching on
+ * the operation under test's own result.
+ *
+ * <p><b>What is gained, and what is deliberately given up.</b> Gained: every rewritten test now FAILS
+ * if its own targeted guard is removed — verified empirically, individually, for each. Given up: the
+ * two-arrivals {@code CyclicBarrier} also incidentally exercised deadlock freedom under LITERAL
+ * simultaneous lock contention (both racers' {@code SELECT ... FOR UPDATE} statements genuinely racing
+ * at the DB level) — a one-sided gate never creates that contention (the loser is paused before it
+ * ever attempts its own lock), so none of the six rewritten tests below prove deadlock freedom under
+ * contention any more. That property was verified empirically for the ORIGINAL lock-order fixes this
+ * class exists to guard (see, e.g., the cycle-2 trial-run paragraph above — "ONE trial produced a
+ * genuine Postgres {@code ERROR: deadlock detected}") and is not re-proven here; each rewritten test's
+ * own Javadoc and {@code @DisplayName} say so explicitly rather than implying a "must not deadlock"
+ * guarantee the one-sided gate no longer makes.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Concurrent whole-visit decline vs. per-leg client cancel — lock-order/deadlock regression (fixed)")
@@ -123,10 +165,30 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
+    /**
+     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
+     * replacing the original two-arrivals {@code CyclicBarrier}. Forces the WHOLE-VISIT decline to
+     * commit FIRST, uncontended, then releases the per-leg CLIENT cancel of child0 to run its own
+     * (now-uncontended) header lock and F1 freshness re-check for real.
+     *
+     * <p><b>What this isolates.</b> {@code cancelBooking}'s own F1 freshness re-check
+     * ({@code isStillConfirmed}/{@code existsConfirmedById} on child0) — empirically confirmed to be
+     * the guard that makes this test's outcome deterministic and its removal detectable (mutation-
+     * verified: commenting it out flips the cancel response to {@code 204} and child0's DB status to
+     * {@code CANCELLED}, silently overwriting the provider's decline decision).
+     *
+     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
+     * freedom under literal simultaneous lock contention. The cancel thread is paused BEFORE it
+     * attempts its own header lock at all, so there is no real contention for
+     * {@code lockAppointmentHeaderBeforeClientItemCancel} to resolve here — that property was verified
+     * separately, empirically, for the underlying lock-order fix (see this class's own top-of-file
+     * "Before this fix" / cycle-2 trial-run paragraph).
+     */
     @Test
-    @DisplayName("provider whole-visit decline racing a client per-leg cancel on the SAME visit must not "
-            + "deadlock and must land in a consistent state: the client's cancelled leg stays CANCELLED, "
-            + "the other leg is DECLINED by the whole-visit transition, and the header collapses to DECLINED")
+    @DisplayName("F1 (deterministic) — a per-leg client cancel of child0 that reaches its own header "
+            + "lock AFTER a whole-visit provider decline has ALREADY committed must abort 409 via its "
+            + "own freshness re-check, never overwrite the decline's DECLINED terminal state back to "
+            + "CANCELLED")
     void should_serializeCleanlyWithNoDeadlock_when_wholeVisitDeclineRacesPerLegClientCancel() throws Exception {
         Visit visit = createTwoServiceVisitLegs();
         UUID appointmentId = visit.id();
@@ -135,95 +197,71 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
         String clientToken = visit.clientToken();
         String providerToken = visit.providerToken();
 
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        // One-sided gate: the CANCEL thread's own header-lock attempt pauses BEFORE the real method
+        // ever runs — i.e. before cancel acquires any row lock on the header — so the whole-visit
+        // decline below can run to full, uncontended completion first. Only once decline has
+        // committed is cancel released to attempt its own (now-uncontended) lock + F1 recheck.
+        CountDownLatch cancelReachedGate = new CountDownLatch(1);
+        CountDownLatch declineCommitted = new CountDownLatch(1);
         doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockHeaderForWholeVisitTransition(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            cancelReachedGate.countDown();
+            boolean released = declineCommitted.await(10, TimeUnit.SECONDS);
+            if (!released) {
+                throw new IllegalStateException("decline never committed — test setup is broken");
+            }
             return invocation.callRealMethod();
         }).when(appointmentTransitionService).lockAppointmentHeaderBeforeClientItemCancel(eq(appointmentId));
 
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
-        AtomicReference<ResponseEntity<String>> respDecline = new AtomicReference<>();
+        CountDownLatch cancelDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> respCancel = new AtomicReference<>();
-
         Thread.ofVirtual().start(() -> {
             try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(providerToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                respDecline.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
-                        new HttpEntity<>("{}", headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
                 HttpHeaders headers = fixtures.bearerHeaders(clientToken);
                 headers.setContentType(MediaType.APPLICATION_JSON);
                 HttpEntity<String> entity = new HttpEntity<>(
                         "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", headers);
                 respCancel.set(restTemplate.exchange(
                         BOOKINGS_URL + "/" + child0 + "/cancel", HttpMethod.PATCH, entity, String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             } finally {
-                done.countDown();
+                cancelDone.countDown();
             }
         });
 
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
+        boolean reachedGate = cancelReachedGate.await(10, TimeUnit.SECONDS);
+        assertThat(reachedGate).as("the cancel thread must reach its header-lock attempt within 10s").isTrue();
 
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        // The whole-visit decline's own header lock (lockHeaderForWholeVisitTransition) is
-        // UNCONDITIONAL, so it always succeeds regardless of race order.
-        assertThat(respDecline.get().getStatusCode())
-                .as("whole-visit decline must succeed — body: %s", respDecline.get().getBody())
+        // Drive the whole-visit decline to full completion on the main thread WHILE the cancel
+        // thread is paused BEFORE it has acquired any lock — no contention, decline always succeeds.
+        HttpHeaders declineHeaders = fixtures.bearerHeaders(providerToken);
+        declineHeaders.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> respDecline = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
+                new HttpEntity<>("{}", declineHeaders), String.class);
+        assertThat(respDecline.getStatusCode())
+                .as("the whole-visit decline must succeed — nothing has raced it yet at this point — "
+                        + "body: %s", respDecline.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        // F1 (cycle-6 audit 2026-08-03): the per-leg cancel's outcome is now race-order-dependent —
-        // see this class's Javadoc "F1 narrowed this further" paragraph. 204 if cancel's own lock
-        // won first (child0 was still CONFIRMED when cancel's freshness check ran); 409 if decline
-        // won first and already moved child0 to DECLINED before cancel's freshness check ran.
-        assertThat(respCancel.get().getStatusCode())
-                .as("per-leg client cancel must resolve to EXACTLY ONE of the two legal outcomes for "
-                        + "this race — body: %s", respCancel.get().getBody())
-                .isIn(HttpStatus.NO_CONTENT, HttpStatus.CONFLICT);
 
-        // The sibling leg and the header are deterministic regardless of which racer wins the header
-        // lock — see class Javadoc: transitionItems' pre-existing resurrection guard means the
-        // whole-visit decline only ever flips a STILL-CONFIRMED child, and the header always ends
-        // DECLINED once decline has run (its own lock is unconditional and always succeeds).
+        declineCommitted.countDown();
+        boolean cancelFinished = cancelDone.await(10, TimeUnit.SECONDS);
+        assertThat(cancelFinished).as("the cancel thread must finish within 10s once released").isTrue();
+
+        // The single deterministic outcome this test forces: F1's freshness re-check on child0
+        // SPECIFICALLY rejects the cancel, because the decline already moved child0 off CONFIRMED.
+        assertThat(respCancel.get().getStatusCode())
+                .as("F1: the cancel's own freshness re-check must reject a leg the decline already "
+                        + "moved off CONFIRMED — body: %s", respCancel.get().getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(dbStatus(child0))
+                .as("F1: the provider's DECLINED decision on child0 must survive the LATER, losing "
+                        + "cancel attempt — never silently overwritten back to CANCELLED")
+                .isEqualTo("DECLINED");
         assertThat(dbStatus(child1))
                 .as("the sibling leg is moved to DECLINED by the whole-visit transition")
                 .isEqualTo("DECLINED");
         assertThat(appointmentStatus(appointmentId))
                 .as("the header collapses to DECLINED (the whole-visit transition's target)")
                 .isEqualTo("DECLINED");
-
-        if (respCancel.get().getStatusCode().equals(HttpStatus.NO_CONTENT)) {
-            assertThat(dbStatus(child0))
-                    .as("cancel WON the lock race — child0 must stay CANCELLED, the client's own "
-                            + "effect, not silently overwritten/lost")
-                    .isEqualTo("CANCELLED");
-        } else {
-            // F1 (HIGH): decline WON the lock race and already moved child0 to DECLINED before
-            // cancel's freshness check ran — cancel must have mutated NOTHING, so child0 stays
-            // DECLINED (the provider's decision), never resurrected/overwritten by the later-failing
-            // cancel attempt.
-            assertThat(dbStatus(child0))
-                    .as("F1 (HIGH): decline WON the lock race — child0 must stay DECLINED; the "
-                            + "provider's decision is never silently overwritten by a losing cancel")
-                    .isEqualTo("DECLINED");
-        }
     }
 
     /**
@@ -346,57 +384,30 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
     }
 
     /**
-     * Regression test for cycle-5 audit finding 1 (HIGH, 2026-08-03) — races a CLIENT-owned
-     * WHOLE-VISIT reschedule ({@code AppointmentTransitionService#rescheduleAppointment}) against a
-     * PER-LEG client cancel ({@code BookingService#cancelBooking}) of the SAME leg the reschedule is
-     * about to move, via the SAME {@code @SpyBean} + {@code CyclicBarrier} technique as the two
-     * tests above — now pointed at {@code rescheduleAppointment}'s OWN header-lock seam
-     * ({@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule}, the fix this
-     * test guards) and the per-leg cancel's existing one
-     * ({@link AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel}, already
-     * spied on above).
+     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
+     * replacing the original two-arrivals {@code CyclicBarrier}. Forces the PER-LEG client cancel of
+     * leg0 to commit FIRST, uncontended, then releases the CLIENT-owned WHOLE-VISIT reschedule
+     * ({@code AppointmentTransitionService#rescheduleAppointment}) to run its own (now-uncontended)
+     * header lock and post-lock freshness re-check for real.
      *
-     * <p><b>Before this fix.</b> {@code rescheduleAppointment} took NO header lock at all, so
-     * nothing serialized it against a concurrent per-leg cancel — the two could interleave with no
-     * ordering guarantee whatsoever (not even the "one blocks the other" guarantee this test now
-     * proves), the exact lost-update-class gap the backlog flagged.
+     * <p><b>What this isolates.</b> {@code rescheduleAppointment}'s post-lock freshness re-check
+     * ({@code BookingRepository#findConfirmedIdsByAppointmentId}, cycle-5 audit finding 1) — mutation-
+     * verified: commenting it out lets the reschedule proceed after its (still-succeeding) header lock
+     * and move leg0's (and leg1's) window to the NEW block start even though leg0 was already
+     * CANCELLED, flipping this test's "leg0 stays at its ORIGINAL time" and "reschedule returns 409"
+     * assertions.
      *
-     * <p><b>Coherent outcome regardless of race order.</b> The cancel's own header lock
-     * ({@code lockHeaderIfConfirmed}, via {@code lockAppointmentHeaderBeforeClientItemCancel}) and
-     * the reschedule's ({@code lockHeaderIfConfirmed}, via
-     * {@code lockAppointmentHeaderBeforeItemReschedule}) are BOTH conditional on the header still
-     * being {@code CONFIRMED} — and cancelling ONE leg of a two-leg visit never flips the header
-     * out of {@code CONFIRMED} (leg1 always remains), so BOTH locks always succeed and the cancel
-     * HTTP call ALWAYS returns {@code 204} whichever racer's lock statement runs first. The
-     * reschedule's outcome is race-order-dependent: {@code 200} if its lock statement runs (and its
-     * post-lock freshness re-check passes) BEFORE the cancel commits leg0's status change, or
-     * {@code 409} ("Visit changed concurrently") if the cancel's commit is visible by the time the
-     * reschedule's freshness re-check ({@code BookingRepository#findConfirmedIdsByAppointmentId})
-     * runs — the fix under test. Either way leg0 always ends {@code CANCELLED} (the cancel's effect
-     * is never lost) and the header always stays {@code CONFIRMED} (leg1 always remains). When the
-     * reschedule LOSES the race, it is proven to have mutated NOTHING — leg1 stays at its ORIGINAL
-     * time, byte-for-byte — the clean-abort guarantee this fix adds.
-     *
-     * <p><b>leg0's own final window — SUPERSEDED by G1 (cycle-7 audit 2026-08-03).</b> F1 (cycle-6)
-     * proved leg0's STATUS is always {@code CANCELLED}, never resurrected, but at the time left
-     * leg0's {@code startsAt} reverting to its ORIGINAL, pre-race value in BOTH branches — even
-     * "reschedule wins" — as a known, deliberately out-of-scope limitation: {@code cancelBooking}'s
-     * own child-row save wrote {@code booking}'s FULL column set (no {@code @DynamicUpdate} on
-     * {@code Booking} at the time), including {@code startsAt}/{@code endsAt} from the STALE
-     * snapshot loaded before the barrier, silently reverting whatever reschedule had just committed.
-     * G1 adds {@code @DynamicUpdate} to {@code Booking}, closing exactly this gap: {@code
-     * cancelBooking} only ever sets {@code status}/{@code cancellationReason}/
-     * {@code clientCancellationNote} on leg0, so its save's dirty-column set never includes
-     * {@code startsAt}/{@code endsAt} — reschedule's committed time, if it landed first, now
-     * SURVIVES the later cancel. leg0's final window is therefore now race-order-dependent, exactly
-     * mirroring leg1's branching below: the NEW time if reschedule won the lock race, the ORIGINAL
-     * time if cancel won (reschedule's own post-lock freshness re-check then aborted with 409 before
-     * mutating anything).
+     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
+     * freedom under literal simultaneous lock contention, nor the header LOCK's own false branch in
+     * isolation (removing only the lock call here would not by itself flip this test, since the
+     * freshness re-check alone already rejects a stale leg0 once the sequencing below forces cancel to
+     * commit first — the lock's role in TRUE concurrent contention is a separate property, not
+     * re-proven by a one-sided gate).
      */
     @Test
-    @DisplayName("client-owned WHOLE-VISIT reschedule racing a per-leg client cancel of the SAME visit's "
-            + "leg0 must not deadlock; the cancel's effect is never lost (leg0 always ends CANCELLED, "
-            + "header always stays CONFIRMED), and a reschedule that LOSES the race mutates nothing")
+    @DisplayName("cycle-5 finding 1 (deterministic) — a client-owned WHOLE-VISIT reschedule whose own "
+            + "header lock succeeds AFTER a per-leg client cancel of leg0 has ALREADY committed must "
+            + "abort 409 via its post-lock freshness re-check, mutating NEITHER leg0 NOR leg1")
     void should_serializeCleanlyWithCoherentFinalState_when_wholeVisitRescheduleRacesPerLegClientCancel()
             throws Exception {
         Visit visit = createTwoServiceVisitLegs();
@@ -409,143 +420,110 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
                 .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
         String clientToken = visit.clientToken();
 
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        // One-sided gate: the RESCHEDULE thread's own header-lock attempt pauses BEFORE the real
+        // method ever runs, so the per-leg cancel below can run to full, uncontended completion
+        // first. Only once cancel has committed is reschedule released to attempt its own
+        // (now-uncontended) lock + post-lock freshness re-check.
+        CountDownLatch rescheduleReachedGate = new CountDownLatch(1);
+        CountDownLatch cancelCommitted = new CountDownLatch(1);
         doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            rescheduleReachedGate.countDown();
+            boolean released = cancelCommitted.await(10, TimeUnit.SECONDS);
+            if (!released) {
+                throw new IllegalStateException("cancel never committed — test setup is broken");
+            }
             return invocation.callRealMethod();
         }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeClientItemCancel(eq(appointmentId));
 
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
+        CountDownLatch rescheduleDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
-        AtomicReference<ResponseEntity<String>> respCancel = new AtomicReference<>();
-
         Thread.ofVirtual().start(() -> {
             try {
-                go.await();
                 HttpHeaders headers = fixtures.bearerHeaders(clientToken);
                 headers.setContentType(MediaType.APPLICATION_JSON);
                 String body = "{\"newStartsAt\":\"" + newBlockStart + "\"}";
                 respReschedule.set(restTemplate.exchange(
                         APPOINTMENTS_URL + "/" + appointmentId + "/reschedule",
                         HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                HttpEntity<String> entity = new HttpEntity<>(
-                        "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", headers);
-                respCancel.set(restTemplate.exchange(
-                        BOOKINGS_URL + "/" + leg0 + "/cancel", HttpMethod.PATCH, entity, String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
+                rescheduleDone.countDown();
             }
         });
 
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
+        boolean reachedGate = rescheduleReachedGate.await(10, TimeUnit.SECONDS);
+        assertThat(reachedGate).as("the reschedule thread must reach its header-lock attempt within 10s").isTrue();
 
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        assertThat(respCancel.get().getStatusCode())
-                .as("the per-leg cancel must ALWAYS succeed regardless of race order — body: %s",
-                        respCancel.get().getBody())
+        // Drive the per-leg cancel to full completion on the main thread WHILE the reschedule
+        // thread is paused BEFORE it has acquired any lock — no contention, cancel always succeeds.
+        HttpHeaders cancelHeaders = fixtures.bearerHeaders(clientToken);
+        cancelHeaders.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> cancelEntity = new HttpEntity<>(
+                "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", cancelHeaders);
+        ResponseEntity<String> respCancel = restTemplate.exchange(
+                BOOKINGS_URL + "/" + leg0 + "/cancel", HttpMethod.PATCH, cancelEntity, String.class);
+        assertThat(respCancel.getStatusCode())
+                .as("the per-leg cancel must succeed — nothing has raced it yet at this point — body: %s",
+                        respCancel.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(respReschedule.get().getStatusCode())
-                .as("the whole-visit reschedule must resolve to EXACTLY ONE of the two legal outcomes "
-                        + "for this race — body: %s", respReschedule.get().getBody())
-                .isIn(HttpStatus.OK, HttpStatus.CONFLICT);
 
+        cancelCommitted.countDown();
+        boolean rescheduleFinished = rescheduleDone.await(10, TimeUnit.SECONDS);
+        assertThat(rescheduleFinished).as("the reschedule thread must finish within 10s once released").isTrue();
+
+        // The single deterministic outcome this test forces: the post-lock freshness re-check
+        // rejects the reschedule, because the cancel already moved leg0 off CONFIRMED.
+        assertThat(respReschedule.get().getStatusCode())
+                .as("the whole-visit reschedule's post-lock freshness re-check must reject a visit "
+                        + "whose leg0 the cancel already moved off CONFIRMED — body: %s",
+                        respReschedule.get().getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
         assertThat(appointmentStatus(appointmentId))
-                .as("leg1 always remains CONFIRMED, so the header can never collapse in this race")
+                .as("leg1 was never touched by either racer, so the header stays CONFIRMED throughout")
                 .isEqualTo("CONFIRMED");
         assertThat(dbStatus(leg0))
-                .as("F1 (HIGH): the cancel's effect on leg0's STATUS is never lost NOR resurrected to "
-                        + "CONFIRMED, whichever racer wins the lock first")
+                .as("the cancel's effect on leg0's STATUS survives the LATER, losing reschedule attempt")
                 .isEqualTo("CANCELLED");
-
-        // G1 (cycle-7 audit 2026-08-03): leg0's final window is now race-order-dependent — see this
-        // test's class-level Javadoc "leg0's own final window" paragraph. Booking's @DynamicUpdate
-        // means the later cancel's save dirties only status/cancellationReason/clientCancellationNote
-        // on leg0, so it can no longer revert a reschedule that committed first.
-        if (respReschedule.get().getStatusCode().equals(HttpStatus.CONFLICT)) {
-            // Cancel WON the lock race first — reschedule's own post-lock freshness re-check then
-            // found leg0 no longer CONFIRMED and aborted with 409 BEFORE mutating anything. leg0 and
-            // leg1 both stay at their ORIGINAL times, byte-for-byte.
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("the reschedule LOST the race — leg0 stays at its ORIGINAL time")
-                    .isEqualTo(originalLeg0Start.toInstant());
-            assertThat(dbStartsAt(leg1).toInstant())
-                    .as("the reschedule LOST the race — it must have mutated NOTHING; leg1 stays at "
-                            + "its ORIGINAL time, byte-for-byte")
-                    .isEqualTo(originalLeg1Start.toInstant());
-        } else {
-            // The reschedule WON the LOCK race and committed its whole-block move (leg0 + leg1)
-            // BEFORE the later cancel's own save ran. leg0 keeps that committed NEW time (G1's
-            // @DynamicUpdate is what makes this true — pre-G1 the later cancel's blind full-column
-            // save would have reverted it). leg1, never touched by the cancel at all regardless of
-            // G1, keeps its committed move unconditionally: chained immediately after leg0's NEW
-            // window, i.e. at newBlockStart + leg0's frozen (duration + buffer).
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("G1: leg0 keeps reschedule's committed NEW time — the later cancel's "
-                            + "@DynamicUpdate save no longer reverts it")
-                    .isEqualTo(newBlockStart.toInstant());
-            assertThat(dbStartsAt(leg1).toInstant())
-                    .as("leg1 (untouched by the cancel) must be chained immediately after the NEW "
-                            + "block start, at newBlockStart + 60 minutes")
-                    .isEqualTo(newBlockStart.plusMinutes(60).toInstant());
-        }
+        assertThat(dbStartsAt(leg0).toInstant())
+                .as("the reschedule LOST the race — its post-lock recheck aborted before mutating "
+                        + "anything, so leg0 stays at its ORIGINAL time")
+                .isEqualTo(originalLeg0Start.toInstant());
+        assertThat(dbStartsAt(leg1).toInstant())
+                .as("the reschedule LOST the race — it must have mutated NOTHING; leg1 stays at its "
+                        + "ORIGINAL time, byte-for-byte")
+                .isEqualTo(originalLeg1Start.toInstant());
     }
 
     /**
-     * Regression test for F1 (HIGH, cycle-6 audit 2026-08-03) — the security auditor's own
-     * concrete, single-actor exploit: races a per-item CLIENT reschedule of leg0
-     * ({@link AppointmentTransitionService#rescheduleAppointmentItem}) against a per-item CLIENT
-     * cancel of the SAME leg0 ({@code BookingService#cancelAppointmentItem} →
-     * {@code BookingService#cancelBooking}), fired by the SAME client account — exactly {@code
-     * PATCH .../services/{itemA}/cancel} and {@code PATCH .../services/{itemA}/reschedule} for the
-     * SAME item, near-concurrently, as described in the finding. Cancelling ONE leg of a two-leg
-     * visit never flips the header out of {@code CONFIRMED} (leg1 always remains), so — before this
-     * fix — BOTH operations' header-lock guard alone could never detect that leg0 SPECIFICALLY had
-     * changed, letting whichever call committed LAST silently win with a corrupted result (a
-     * CANCELLED leg written back to CONFIRMED at a brand-new time). Uses the SAME {@code @SpyBean}
-     * + {@code CyclicBarrier} technique as the tests above, pointed at
-     * {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule} (reschedule's
-     * header-lock seam) and {@link AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel}
-     * (cancel's).
+     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
+     * replacing the original two-arrivals {@code CyclicBarrier}, for F1 (HIGH, cycle-6 audit
+     * 2026-08-03), the security auditor's own concrete, single-actor exploit: races a per-item CLIENT
+     * reschedule of leg0 ({@link AppointmentTransitionService#rescheduleAppointmentItem}) against a
+     * per-item CLIENT cancel of the SAME leg0 ({@code BookingService#cancelAppointmentItem} →
+     * {@code BookingService#cancelBooking}), fired by the SAME client account. Cancelling ONE leg of a
+     * two-leg visit never flips the header out of {@code CONFIRMED} (leg1 always remains), so — before
+     * F1 — BOTH operations' header-lock guard alone could never detect that leg0 SPECIFICALLY had
+     * changed, letting whichever call committed LAST silently win with a corrupted result (a CANCELLED
+     * leg written back to CONFIRMED at a brand-new time). Forces the per-item CANCEL to commit FIRST,
+     * uncontended, then releases the per-item RESCHEDULE to run its own (now-uncontended) header lock
+     * and F1 freshness re-check for real.
      *
-     * <p><b>Coherent outcome regardless of race order.</b> Both header locks are CONDITIONAL
-     * ({@code lockHeaderIfConfirmed}) but always succeed here (leg1 keeps the header CONFIRMED), so
-     * the cancel HTTP call ALWAYS returns {@code 204}. The reschedule's outcome is race-order
-     * dependent: {@code 409} ("Service changed concurrently") if the cancel's commit is visible by
-     * the time reschedule's F1 freshness re-check ({@code BookingRepository#existsConfirmedById})
-     * runs — the fix under test, closing the exploit exactly as described — or {@code 200} if
-     * reschedule's own lock+recheck ran first, in which case its move commits BEFORE the later
-     * cancel's own save runs. G1 (cycle-7 audit 2026-08-03) changes what happens next: {@code
-     * Booking}'s new {@code @DynamicUpdate} means the LATER cancel's save dirties only
-     * {@code status}/{@code cancellationReason}/{@code clientCancellationNote} on leg0 — unlike the
-     * pre-G1 behavior (see this class's earlier "leg0's own final window" Javadoc paragraph for the
-     * history), it no longer reverts leg0's time from its own stale, pre-barrier snapshot, so
-     * reschedule's committed NEW time now SURVIVES the later cancel too. What F1 actually guarantees,
-     * unconditionally regardless of G1, is narrower: leg0's STATUS can never end up back at
-     * {@code CONFIRMED}.
+     * <p><b>What this isolates.</b> {@code rescheduleAppointmentItem}'s F1 freshness re-check
+     * ({@code BookingRepository#existsConfirmedById} on the target item ITSELF, not just the header) —
+     * empirically confirmed to be the guard that makes this test's outcome deterministic and its
+     * removal detectable (mutation-verified: commenting it out lets the reschedule proceed after its
+     * still-succeeding header lock and move leg0's window to the NEW time even though leg0 was already
+     * CANCELLED, flipping this test's "leg0 stays at its ORIGINAL time" and "reschedule returns 409"
+     * assertions — leg0's STATUS itself stays CANCELLED either way, because {@code Booking}'s
+     * {@code @DynamicUpdate} (G1) means {@code target.reschedule(...)} never touches the status column,
+     * so the pre-fix corruption is now visible only via the TIME column, not the status one).
+     *
+     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
+     * freedom under literal simultaneous lock contention.
      */
     @Test
-    @DisplayName("F1 (HIGH) — per-item CLIENT reschedule of leg0 racing a per-item CLIENT cancel of the "
-            + "SAME leg0 (the security auditor's exact single-actor exploit) must never resurrect the "
-            + "cancelled leg to CONFIRMED; exactly one operation's status effect survives")
+    @DisplayName("F1 (deterministic) — a per-item CLIENT reschedule of leg0 whose own header lock "
+            + "succeeds AFTER a per-item CLIENT cancel of the SAME leg0 has ALREADY committed must "
+            + "abort 409 via its own freshness re-check, never resurrecting or moving the cancelled leg")
     void should_neverResurrectCancelledLegToConfirmed_when_perItemRescheduleRacesPerItemCancelOfSameLeg()
             throws Exception {
         Visit visit = createTwoServiceVisitLegs();
@@ -558,87 +536,73 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
                 .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
         String clientToken = visit.clientToken();
 
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        // One-sided gate: the RESCHEDULE thread's own header-lock attempt pauses BEFORE the real
+        // method ever runs, so the per-item cancel below can run to full, uncontended completion
+        // first. Only once cancel has committed is reschedule released to attempt its own
+        // (now-uncontended) lock + F1 recheck.
+        CountDownLatch rescheduleReachedGate = new CountDownLatch(1);
+        CountDownLatch cancelCommitted = new CountDownLatch(1);
         doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            rescheduleReachedGate.countDown();
+            boolean released = cancelCommitted.await(10, TimeUnit.SECONDS);
+            if (!released) {
+                throw new IllegalStateException("cancel never committed — test setup is broken");
+            }
             return invocation.callRealMethod();
         }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeClientItemCancel(eq(appointmentId));
 
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
+        CountDownLatch rescheduleDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
-        AtomicReference<ResponseEntity<String>> respCancel = new AtomicReference<>();
-
         Thread.ofVirtual().start(() -> {
             try {
-                go.await();
                 HttpHeaders headers = fixtures.bearerHeaders(clientToken);
                 headers.setContentType(MediaType.APPLICATION_JSON);
                 String body = "{\"newStartsAt\":\"" + newLeg0Start + "\"}";
                 respReschedule.set(restTemplate.exchange(
                         APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/reschedule",
                         HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                HttpEntity<String> entity = new HttpEntity<>(
-                        "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", headers);
-                respCancel.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/cancel",
-                        HttpMethod.PATCH, entity, String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
+                rescheduleDone.countDown();
             }
         });
 
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
+        boolean reachedGate = rescheduleReachedGate.await(10, TimeUnit.SECONDS);
+        assertThat(reachedGate).as("the reschedule thread must reach its header-lock attempt within 10s").isTrue();
 
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        assertThat(respCancel.get().getStatusCode())
-                .as("the per-item cancel must ALWAYS succeed regardless of race order — body: %s",
-                        respCancel.get().getBody())
+        // Drive the per-item cancel to full completion on the main thread WHILE the reschedule
+        // thread is paused BEFORE it has acquired any lock — no contention, cancel always succeeds.
+        HttpHeaders cancelHeaders = fixtures.bearerHeaders(clientToken);
+        cancelHeaders.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> cancelEntity = new HttpEntity<>(
+                "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", cancelHeaders);
+        ResponseEntity<String> respCancel = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/cancel",
+                HttpMethod.PATCH, cancelEntity, String.class);
+        assertThat(respCancel.getStatusCode())
+                .as("the per-item cancel must succeed — nothing has raced it yet at this point — body: %s",
+                        respCancel.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(respReschedule.get().getStatusCode())
-                .as("the per-item reschedule must resolve to EXACTLY ONE of the two legal outcomes for "
-                        + "this race — body: %s", respReschedule.get().getBody())
-                .isIn(HttpStatus.OK, HttpStatus.CONFLICT);
 
-        // The central F1 assertion: leg0's status is NEVER resurrected to CONFIRMED, whichever
-        // racer won the lock first.
+        cancelCommitted.countDown();
+        boolean rescheduleFinished = rescheduleDone.await(10, TimeUnit.SECONDS);
+        assertThat(rescheduleFinished).as("the reschedule thread must finish within 10s once released").isTrue();
+
+        // The single deterministic outcome this test forces: F1's freshness re-check on leg0
+        // SPECIFICALLY rejects the reschedule, because the cancel already moved leg0 off CONFIRMED.
+        assertThat(respReschedule.get().getStatusCode())
+                .as("F1: the reschedule's own freshness re-check must reject a leg the cancel already "
+                        + "moved off CONFIRMED — body: %s", respReschedule.get().getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
         assertThat(dbStatus(leg0))
-                .as("F1 (HIGH): leg0 must never be resurrected to CONFIRMED — it must end CANCELLED "
-                        + "regardless of which racer won the lock first")
+                .as("F1: leg0 must never be resurrected to CONFIRMED — the cancel's effect survives "
+                        + "the LATER, losing reschedule attempt")
                 .isEqualTo("CANCELLED");
-        // G1 (cycle-7 audit 2026-08-03): leg0's final window is now race-order-dependent — see this
-        // test's own Javadoc "Coherent outcome" paragraph. NEW time if reschedule won (its commit
-        // now survives the later cancel's narrower, @DynamicUpdate save); ORIGINAL time if cancel
-        // won (reschedule's own freshness re-check aborted with 409 before mutating anything).
-        if (respReschedule.get().getStatusCode().equals(HttpStatus.OK)) {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("G1: reschedule won the race and committed leg0's NEW time — the later "
-                            + "cancel's @DynamicUpdate save no longer reverts it")
-                    .isEqualTo(newLeg0Start.toInstant());
-        } else {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("cancel won the race — reschedule's freshness re-check aborted before "
-                            + "mutating leg0, so it stays at its ORIGINAL time")
-                    .isEqualTo(originalLeg0Start.toInstant());
-        }
+        assertThat(dbStartsAt(leg0).toInstant())
+                .as("the reschedule LOST the race — its F1 recheck aborted before mutating anything, "
+                        + "so leg0 stays at its ORIGINAL time (this is the assertion that would have "
+                        + "caught F1's absence: pre-fix, a stale reschedule moved this time even though "
+                        + "@DynamicUpdate left the status column alone)")
+                .isEqualTo(originalLeg0Start.toInstant());
         assertThat(dbStatus(leg1))
                 .as("leg1 (untouched by either per-item racer) stays CONFIRMED throughout")
                 .isEqualTo("CONFIRMED");
@@ -651,38 +615,28 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
     }
 
     /**
-     * Regression test for F1 (HIGH, cycle-6 audit 2026-08-03) — the same exploit shape as
+     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
+     * replacing the original two-arrivals {@code CyclicBarrier}, for F1 (HIGH, cycle-6 audit
+     * 2026-08-03) — the same exploit shape as
      * {@link #should_neverResurrectCancelledLegToConfirmed_when_perItemRescheduleRacesPerItemCancelOfSameLeg}
-     * above, but pairing the per-item CLIENT reschedule of leg0 against a per-item PROVIDER
-     * decline of the SAME leg0 ({@link AppointmentTransitionService#declineAppointmentItem})
-     * instead of a per-item cancel — the OTHER per-item write path F1 fixes.
+     * above, but pairing the per-item CLIENT reschedule of leg0 against a per-item PROVIDER decline of
+     * the SAME leg0 ({@link AppointmentTransitionService#declineAppointmentItem}) instead of a per-item
+     * cancel — the OTHER per-item write path F1 fixes. Forces the per-item DECLINE to commit FIRST,
+     * uncontended, then releases the per-item RESCHEDULE to run its own (now-uncontended) header lock
+     * and F1 freshness re-check for real.
      *
-     * <p><b>Different rendezvous point, same technique.</b> {@code declineAppointmentItem}'s own
-     * header-lock call used to go straight through the PRIVATE {@code lockHeaderBeforeItemTransition}
-     * — not spy-able directly, and spying the underlying
-     * {@link AppointmentRepository#lockHeaderIfConfirmed} repository method directly does not work
-     * either (Mockito cannot {@code callRealMethod()} on a Spring Data JPA repository's
-     * dynamically-proxied interface method — {@code MockitoException: Cannot call abstract real
-     * method on java object!}, verified against this exact attempt). Fixed the same way the
-     * cancel/reschedule pair already was: {@code declineAppointmentItem} now calls a new, thin
-     * package-private wrapper, {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemDecline},
-     * spied on below — giving an identical two-arrivals rendezvous point at the exact header-lock
-     * instant.
+     * <p><b>What this isolates.</b> {@code rescheduleAppointmentItem}'s F1 freshness re-check
+     * ({@code BookingRepository#existsConfirmedById} on the target item ITSELF) against a DECLINE
+     * racer specifically (the sibling test above covers the CANCEL racer) — empirically the same guard,
+     * exercised against the other per-item write path F1 also fixes.
      *
-     * <p><b>Coherent outcome regardless of race order</b> — identical shape to the cancel-pairing
-     * test above: the decline HTTP call ALWAYS returns {@code 204} (leg1 keeps the header
-     * CONFIRMED); the reschedule returns {@code 409} if the decline's commit is visible by the time
-     * its F1 freshness re-check runs, or {@code 200} if it locked first, in which case its committed
-     * NEW time on leg0 now SURVIVES the LATER decline's save too — {@code Booking}'s
-     * {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03) means that save dirties only
-     * {@code status}/{@code cancellationReason}/{@code providerComment}, the same column-disjoint
-     * property documented for the cancel-pairing test above. leg0's STATUS, unconditionally, is
-     * never resurrected to CONFIRMED.
+     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
+     * freedom under literal simultaneous lock contention.
      */
     @Test
-    @DisplayName("F1 (HIGH) — per-item CLIENT reschedule of leg0 racing a per-item PROVIDER decline of "
-            + "the SAME leg0 must never resurrect the declined leg to CONFIRMED; exactly one operation's "
-            + "status effect survives")
+    @DisplayName("F1 (deterministic) — a per-item CLIENT reschedule of leg0 whose own header lock "
+            + "succeeds AFTER a per-item PROVIDER decline of the SAME leg0 has ALREADY committed must "
+            + "abort 409 via its own freshness re-check, never resurrecting or moving the declined leg")
     void should_neverResurrectDeclinedLegToConfirmed_when_perItemRescheduleRacesPerItemDeclineOfSameLeg()
             throws Exception {
         Visit visit = createTwoServiceVisitLegs();
@@ -696,84 +650,69 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
         String clientToken = visit.clientToken();
         String providerToken = visit.providerToken();
 
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        // One-sided gate: the RESCHEDULE thread's own header-lock attempt pauses BEFORE the real
+        // method ever runs, so the per-item decline below can run to full, uncontended completion
+        // first. Only once decline has committed is reschedule released to attempt its own
+        // (now-uncontended) lock + F1 recheck.
+        CountDownLatch rescheduleReachedGate = new CountDownLatch(1);
+        CountDownLatch declineCommitted = new CountDownLatch(1);
         doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            rescheduleReachedGate.countDown();
+            boolean released = declineCommitted.await(10, TimeUnit.SECONDS);
+            if (!released) {
+                throw new IllegalStateException("decline never committed — test setup is broken");
+            }
             return invocation.callRealMethod();
         }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemDecline(eq(appointmentId));
 
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
+        CountDownLatch rescheduleDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
-        AtomicReference<ResponseEntity<String>> respDecline = new AtomicReference<>();
-
         Thread.ofVirtual().start(() -> {
             try {
-                go.await();
                 HttpHeaders headers = fixtures.bearerHeaders(clientToken);
                 headers.setContentType(MediaType.APPLICATION_JSON);
                 String body = "{\"newStartsAt\":\"" + newLeg0Start + "\"}";
                 respReschedule.set(restTemplate.exchange(
                         APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/reschedule",
                         HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(providerToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                respDecline.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/decline",
-                        HttpMethod.PATCH, new HttpEntity<>("{}", headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
+                rescheduleDone.countDown();
             }
         });
 
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
+        boolean reachedGate = rescheduleReachedGate.await(10, TimeUnit.SECONDS);
+        assertThat(reachedGate).as("the reschedule thread must reach its header-lock attempt within 10s").isTrue();
 
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        assertThat(respDecline.get().getStatusCode())
-                .as("the per-item decline must ALWAYS succeed regardless of race order — body: %s",
-                        respDecline.get().getBody())
+        // Drive the per-item decline to full completion on the main thread WHILE the reschedule
+        // thread is paused BEFORE it has acquired any lock — no contention, decline always succeeds.
+        HttpHeaders declineHeaders = fixtures.bearerHeaders(providerToken);
+        declineHeaders.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> respDecline = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/decline",
+                HttpMethod.PATCH, new HttpEntity<>("{}", declineHeaders), String.class);
+        assertThat(respDecline.getStatusCode())
+                .as("the per-item decline must succeed — nothing has raced it yet at this point — body: %s",
+                        respDecline.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(respReschedule.get().getStatusCode())
-                .as("the per-item reschedule must resolve to EXACTLY ONE of the two legal outcomes for "
-                        + "this race — body: %s", respReschedule.get().getBody())
-                .isIn(HttpStatus.OK, HttpStatus.CONFLICT);
 
-        // The central F1 assertion: leg0's status is NEVER resurrected to CONFIRMED, whichever
-        // racer won the lock first.
+        declineCommitted.countDown();
+        boolean rescheduleFinished = rescheduleDone.await(10, TimeUnit.SECONDS);
+        assertThat(rescheduleFinished).as("the reschedule thread must finish within 10s once released").isTrue();
+
+        // The single deterministic outcome this test forces: F1's freshness re-check on leg0
+        // SPECIFICALLY rejects the reschedule, because the decline already moved leg0 off CONFIRMED.
+        assertThat(respReschedule.get().getStatusCode())
+                .as("F1: the reschedule's own freshness re-check must reject a leg the decline already "
+                        + "moved off CONFIRMED — body: %s", respReschedule.get().getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
         assertThat(dbStatus(leg0))
-                .as("F1 (HIGH): leg0 must never be resurrected to CONFIRMED — it must end DECLINED "
-                        + "regardless of which racer won the lock first")
+                .as("F1: leg0 must never be resurrected to CONFIRMED — the decline's effect survives "
+                        + "the LATER, losing reschedule attempt")
                 .isEqualTo("DECLINED");
-        // G1 (cycle-7 audit 2026-08-03): leg0's final window is now race-order-dependent, the same
-        // widening as the cancel-pairing test above — see this test's own Javadoc "Coherent outcome"
-        // paragraph.
-        if (respReschedule.get().getStatusCode().equals(HttpStatus.OK)) {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("G1: reschedule won the race and committed leg0's NEW time — the later "
-                            + "decline's @DynamicUpdate save no longer reverts it")
-                    .isEqualTo(newLeg0Start.toInstant());
-        } else {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("decline won the race — reschedule's freshness re-check aborted before "
-                            + "mutating leg0, so it stays at its ORIGINAL time")
-                    .isEqualTo(originalLeg0Start.toInstant());
-        }
+        assertThat(dbStartsAt(leg0).toInstant())
+                .as("the reschedule LOST the race — its F1 recheck aborted before mutating anything, "
+                        + "so leg0 stays at its ORIGINAL time")
+                .isEqualTo(originalLeg0Start.toInstant());
         assertThat(dbStatus(leg1))
                 .as("leg1 (untouched by either per-item racer) stays CONFIRMED throughout")
                 .isEqualTo("CONFIRMED");
@@ -786,36 +725,38 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
     }
 
     /**
-     * Regression test for G2 (HIGH, cycle-7 audit 2026-08-03) — the LEGACY, booking-scoped
-     * {@code PATCH /bookings/{id}/reschedule} route (unlike the appointment-scoped
-     * {@code PATCH /appointments/{id}/services/{id}/reschedule} route the two tests above drive) is
-     * fully reachable for an appointment child (it never calls {@code assertNotAppointmentChild}) and
-     * was the FOURTH sibling missing the F1-class freshness re-check: it already took the header lock
-     * ({@code lockAppointmentHeaderBeforeItemReschedule}, added earlier in this work) but never
-     * verified {@code booking} itself was still CONFIRMED afterward — the exact exploit the auditors
-     * traced: a provider declines leg0 via the per-item route (commits {@code DECLINED}); a
-     * concurrent legacy reschedule of the SAME leg was blocked on the header lock, acquires it right
-     * after (the header is still CONFIRMED — leg1 remains), and — pre-fix — proceeded straight to its
-     * save with no check that leg0 itself was still CONFIRMED.
+     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
+     * replacing the original two-arrivals {@code CyclicBarrier}, for G2 (HIGH, cycle-7 audit
+     * 2026-08-03) — the LEGACY, booking-scoped {@code PATCH /bookings/{id}/reschedule} route (unlike
+     * the appointment-scoped {@code PATCH /appointments/{id}/services/{id}/reschedule} route the two
+     * tests above drive) is fully reachable for an appointment child (it never calls
+     * {@code assertNotAppointmentChild}) and was the FOURTH sibling missing the F1-class freshness
+     * re-check: it already took the header lock ({@code lockAppointmentHeaderBeforeItemReschedule})
+     * but never verified {@code booking} itself was still CONFIRMED afterward — the exact exploit the
+     * auditors traced: a provider declines leg0 via the per-item route; a concurrent legacy reschedule
+     * of the SAME leg acquires the (still-CONFIRMED, leg1 remains) header lock and — pre-fix —
+     * proceeds straight to its save with no check that leg0 itself was still CONFIRMED. Forces the
+     * per-item DECLINE to commit FIRST, uncontended, then releases the LEGACY reschedule to run its own
+     * (now-uncontended) header lock and G2 freshness re-check for real.
      *
-     * <p><b>Same rendezvous point as the appointment-scoped pairing above</b> — the legacy route
-     * calls the SAME {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule}
-     * seam ({@code BookingService#rescheduleBooking}'s Phase 30.2 lock-order fix), so this test reuses
-     * the identical {@code @SpyBean} + {@code CyclicBarrier} technique, just pointed at
-     * {@code PATCH /bookings/{leg0}/reschedule} instead of the appointment-scoped route.
+     * <p><b>Same rendezvous point as the appointment-scoped pairing above</b> — the legacy route calls
+     * the SAME {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule} seam
+     * ({@code BookingService#rescheduleBooking}'s Phase 30.2 lock-order fix), so this test reuses the
+     * identical spy point, just pointed at {@code PATCH /bookings/{leg0}/reschedule} instead of the
+     * appointment-scoped route.
      *
-     * <p><b>Coherent outcome regardless of race order</b> — identical shape to the appointment-scoped
-     * pairing: the decline HTTP call ALWAYS returns {@code 204} (leg1 keeps the header CONFIRMED);
-     * the LEGACY reschedule returns {@code 409} (G2's fix under test) if the decline's commit is
-     * visible by the time its freshness re-check runs, or {@code 200} if it locked first, in which
-     * case its committed NEW time on leg0 SURVIVES the later decline's {@code @DynamicUpdate} (G1)
-     * save. leg0's STATUS, unconditionally, is never resurrected to CONFIRMED — the property that was
-     * NOT guaranteed before G2, since the legacy route had no recheck at all to abort on.
+     * <p><b>What this isolates.</b> {@code rescheduleBooking}'s G2 freshness re-check
+     * ({@code isStillConfirmed} on the target booking ITSELF) for the LEGACY route specifically — the
+     * property that was NOT guaranteed before G2, since the legacy route had no recheck at all to
+     * abort on.
+     *
+     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
+     * freedom under literal simultaneous lock contention.
      */
     @Test
-    @DisplayName("G2 (HIGH) — the LEGACY booking-scoped reschedule route racing a per-item PROVIDER "
-            + "decline of the SAME leg (the auditor-traced exploit) must never resurrect the declined "
-            + "leg to CONFIRMED; exactly one operation's status effect survives")
+    @DisplayName("G2 (deterministic) — the LEGACY booking-scoped reschedule route whose own header lock "
+            + "succeeds AFTER a per-item PROVIDER decline of the SAME leg has ALREADY committed must "
+            + "abort 409 via its own freshness re-check, never resurrecting or moving the declined leg")
     void should_neverResurrectDeclinedLegToConfirmed_when_legacyBookingRescheduleRacesPerItemDeclineOfSameLeg()
             throws Exception {
         Visit visit = createTwoServiceVisitLegs();
@@ -829,24 +770,25 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
         String clientToken = visit.clientToken();
         String providerToken = visit.providerToken();
 
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        // One-sided gate: the LEGACY-RESCHEDULE thread's own header-lock attempt pauses BEFORE the
+        // real method ever runs, so the per-item decline below can run to full, uncontended
+        // completion first. Only once decline has committed is reschedule released to attempt its
+        // own (now-uncontended) lock + G2 recheck.
+        CountDownLatch rescheduleReachedGate = new CountDownLatch(1);
+        CountDownLatch declineCommitted = new CountDownLatch(1);
         doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            rescheduleReachedGate.countDown();
+            boolean released = declineCommitted.await(10, TimeUnit.SECONDS);
+            if (!released) {
+                throw new IllegalStateException("decline never committed — test setup is broken");
+            }
             return invocation.callRealMethod();
         }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemDecline(eq(appointmentId));
 
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
+        CountDownLatch rescheduleDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
-        AtomicReference<ResponseEntity<String>> respDecline = new AtomicReference<>();
-
         Thread.ofVirtual().start(() -> {
             try {
-                go.await();
                 HttpHeaders headers = fixtures.bearerHeaders(clientToken);
                 headers.setContentType(MediaType.APPLICATION_JSON);
                 String body = "{\"newStartsAt\":\"" + newLeg0Start + "\"}";
@@ -854,58 +796,45 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
                 respReschedule.set(restTemplate.exchange(
                         BOOKINGS_URL + "/" + leg0 + "/reschedule",
                         HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(providerToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                respDecline.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/decline",
-                        HttpMethod.PATCH, new HttpEntity<>("{}", headers), String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
+                rescheduleDone.countDown();
             }
         });
 
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
+        boolean reachedGate = rescheduleReachedGate.await(10, TimeUnit.SECONDS);
+        assertThat(reachedGate).as("the reschedule thread must reach its header-lock attempt within 10s").isTrue();
 
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        assertThat(respDecline.get().getStatusCode())
-                .as("the per-item decline must ALWAYS succeed regardless of race order — body: %s",
-                        respDecline.get().getBody())
+        // Drive the per-item decline to full completion on the main thread WHILE the reschedule
+        // thread is paused BEFORE it has acquired any lock — no contention, decline always succeeds.
+        HttpHeaders declineHeaders = fixtures.bearerHeaders(providerToken);
+        declineHeaders.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> respDecline = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/decline",
+                HttpMethod.PATCH, new HttpEntity<>("{}", declineHeaders), String.class);
+        assertThat(respDecline.getStatusCode())
+                .as("the per-item decline must succeed — nothing has raced it yet at this point — body: %s",
+                        respDecline.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(respReschedule.get().getStatusCode())
-                .as("G2: the LEGACY reschedule route must resolve to EXACTLY ONE of the two legal "
-                        + "outcomes for this race — body: %s", respReschedule.get().getBody())
-                .isIn(HttpStatus.OK, HttpStatus.CONFLICT);
 
-        // The central G2 assertion: leg0's status is NEVER resurrected to CONFIRMED via the legacy
-        // route, whichever racer won the lock first — before G2 this route had no recheck at all to
-        // prevent it from proceeding regardless.
+        declineCommitted.countDown();
+        boolean rescheduleFinished = rescheduleDone.await(10, TimeUnit.SECONDS);
+        assertThat(rescheduleFinished).as("the reschedule thread must finish within 10s once released").isTrue();
+
+        // The single deterministic outcome this test forces: G2's freshness re-check on leg0
+        // SPECIFICALLY rejects the legacy reschedule, because the decline already moved leg0 off
+        // CONFIRMED.
+        assertThat(respReschedule.get().getStatusCode())
+                .as("G2: the legacy reschedule's own freshness re-check must reject a leg the decline "
+                        + "already moved off CONFIRMED — body: %s", respReschedule.get().getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
         assertThat(dbStatus(leg0))
-                .as("G2 (HIGH): leg0 must never be resurrected to CONFIRMED via the legacy reschedule "
-                        + "route — it must end DECLINED regardless of which racer won the lock first")
+                .as("G2: leg0 must never be resurrected to CONFIRMED via the legacy reschedule route — "
+                        + "the decline's effect survives the LATER, losing reschedule attempt")
                 .isEqualTo("DECLINED");
-        if (respReschedule.get().getStatusCode().equals(HttpStatus.OK)) {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("G1: the legacy reschedule won the race and committed leg0's NEW time — the "
-                            + "later decline's @DynamicUpdate save no longer reverts it")
-                    .isEqualTo(newLeg0Start.toInstant());
-        } else {
-            assertThat(dbStartsAt(leg0).toInstant())
-                    .as("G2: decline won the race — the legacy reschedule's NEW freshness re-check "
-                            + "aborted before mutating leg0, so it stays at its ORIGINAL time")
-                    .isEqualTo(originalLeg0Start.toInstant());
-        }
+        assertThat(dbStartsAt(leg0).toInstant())
+                .as("the legacy reschedule LOST the race — its G2 recheck aborted before mutating "
+                        + "anything, so leg0 stays at its ORIGINAL time")
+                .isEqualTo(originalLeg0Start.toInstant());
         assertThat(dbStatus(leg1))
                 .as("leg1 (untouched by either racer) stays CONFIRMED throughout")
                 .isEqualTo("CONFIRMED");
@@ -918,47 +847,48 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
     }
 
     /**
-     * Regression test for G3 (HIGH, cycle-7 audit 2026-08-03) — races the BATCHED
-     * schedule-override-conflict decline ({@link AppointmentTransitionService#declineAppointmentItems},
-     * driven end to end via {@code PUT /masters/{masterId}/overrides/{date}} with
-     * {@code cancelOverlapping=true}, targeting BOTH legs of the visit) against a per-item CLIENT
-     * cancel of leg0 ({@code PATCH /appointments/{id}/services/{leg0}/cancel}) — the cross-endpoint
-     * racer both auditors independently identified: this batched method has no racer AT its OWN
-     * endpoint (a provider's {@code PUT /overrides} write calls it at most once per appointment),
-     * but a client acting on a leg the provider's schedule change is about to orphan is a realistic
-     * interleaving.
+     * QA cycle-8 rewrite (see class Javadoc "QA cycle-8 audit" section) — deterministic one-sided gate
+     * replacing the original two-arrivals {@code CyclicBarrier}, for G3 (HIGH, cycle-7 audit
+     * 2026-08-03) — races the BATCHED schedule-override-conflict decline
+     * ({@link AppointmentTransitionService#declineAppointmentItems}, driven end to end via
+     * {@code PUT /masters/{masterId}/overrides/{date}} with {@code cancelOverlapping=true}, targeting
+     * BOTH legs of the visit) against a per-item CLIENT cancel of leg0
+     * ({@code PATCH /appointments/{id}/services/{leg0}/cancel}) — the cross-endpoint racer both
+     * auditors independently identified. Forces the per-item CANCEL to commit FIRST, uncontended, then
+     * releases the batched OVERRIDE-decline to run its own (now-uncontended) header lock and G3
+     * batched freshness re-check for real — the exact "filter, not abort" branch the empirically
+     * confirmed defect could not distinguish under the original {@code isIn("CANCELLED", "DECLINED")}.
      *
-     * <p><b>Rendezvous point.</b> Reuses the SAME {@code @SpyBean} + {@code CyclicBarrier} technique
-     * as {@code should_serializeCleanlyWithNoDeadlock_when_wholeVisitDeclineRacesPerLegClientCancel}
-     * above (whole-visit decline vs. per-leg cancel) — now pointed at
+     * <p><b>Rendezvous point</b> — same seam as the single-item decline pairing tests above:
      * {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemDecline}, which the batched
-     * method calls too as of G3 (previously it called the private
-     * {@code lockHeaderBeforeItemTransition} directly, with no dedicated concurrency IT — see that
-     * wrapper's Javadoc for the full history) — and
-     * {@link AppointmentTransitionService#lockAppointmentHeaderBeforeClientItemCancel}.
+     * method also calls (G3 routed it through the SAME wrapper rather than the private
+     * {@code lockHeaderBeforeItemTransition} it used to call directly).
      *
-     * <p><b>Coherent outcome regardless of race order — proves "filter, not abort".</b> Cancelling
-     * ONE of the visit's two legs never flips the header out of {@code CONFIRMED} (the other leg
-     * remains), so BOTH racers' header-lock guard passes regardless of order and the per-item cancel
-     * HTTP call ALWAYS returns {@code 204}. The override write ALWAYS returns {@code 200} too (the
-     * write itself — narrowing the schedule — always succeeds; only WHICH bookings end up declined by
-     * it depends on race order):
-     * <ul>
-     *   <li>if the CANCEL commits first, the override's batched decline's own freshness re-check
-     *       ({@link BookingRepository#findConfirmedIdsByAppointmentId}) finds leg0 no longer
-     *       CONFIRMED and FILTERS it out of the batch — leg0 stays {@code CANCELLED} (the client's
-     *       effect, never re-declined over it), and ONLY leg1 is declined;</li>
-     *   <li>if the OVERRIDE's decline commits first, BOTH legs are declined (leg0 was still
-     *       CONFIRMED when the batch's recheck ran) and the header collapses to {@code DECLINED}
-     *       immediately — the LATER cancel's own header lock then fails (header no longer
-     *       CONFIRMED), so its own freshness re-check aborts with {@code 409} before mutating
-     *       anything, leaving leg0 {@code DECLINED} (never overwritten back to {@code CANCELLED}).</li>
-     * </ul>
+     * <p><b>What this isolates.</b> {@code declineAppointmentItems}' G3 batched freshness re-check
+     * ({@link BookingRepository#findConfirmedIdsByAppointmentId}) and its "filter, not abort" contract
+     * SPECIFICALLY — empirically confirmed to be the guard that makes this test's outcome
+     * deterministic and its removal detectable (mutation-verified: reverting the filter to a
+     * pre-G3-shaped "decline every originally-requested target unconditionally" re-declines leg0 over
+     * the cancel's CANCELLED status, flipping this test's "leg0 stays CANCELLED" assertion to
+     * DECLINED). Unlike the ORIGINAL version of this test, this rewrite asserts a single, specific
+     * terminal state for leg0 ({@code CANCELLED}) rather than {@code isIn("CANCELLED", "DECLINED")} —
+     * the exact ambiguity the audit flagged as unable to distinguish "filtered correctly" from
+     * "blindly re-declined".
+     *
+     * <p><b>What this does NOT isolate</b> (see class Javadoc "What is gained" paragraph): deadlock
+     * freedom under literal simultaneous lock contention, nor the OTHER branch of G3's filter (the
+     * override winning the race and declining a leg0 that was still CONFIRMED when its recheck ran) —
+     * that branch is unconditional application logic with no racer-dependent behaviour to isolate
+     * (every target the recheck still reports CONFIRMED is always declined), so it needs no dedicated
+     * concurrency test; {@code AppointmentTransitionServiceTest}'s
+     * {@code should_declineAllTargetsWithOneLoadOneLockOneCollapse_when_multipleSiblingsProvided} pins
+     * it deterministically at the unit level already.
      */
     @Test
-    @DisplayName("G3 (HIGH) — the BATCHED schedule-override-conflict decline racing a per-item CLIENT "
-            + "cancel of ONE of its targets must filter the stale target out of the batch rather than "
-            + "abort the whole write, and must never let a losing cancel overwrite a winning decline")
+    @DisplayName("G3 (deterministic) — a batched schedule-override decline whose own header lock "
+            + "succeeds AFTER a per-item CLIENT cancel of ONE of its targets has ALREADY committed must "
+            + "FILTER the stale target out of the batch (never re-decline it), while still declining "
+            + "the untouched sibling and collapsing the header")
     void should_filterStaleTargetAndDeclineSurvivor_when_batchedOverrideDeclineRacesPerItemClientCancelOfSameLeg()
             throws Exception {
         Visit visit = createTwoServiceVisitLegs();
@@ -970,24 +900,25 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
         String providerToken = visit.providerToken();
         LocalDate overrideDate = LocalDate.now(TimeZones.KYIV).plusDays(2);
 
-        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        // One-sided gate: the OVERRIDE thread's own header-lock attempt pauses BEFORE the real
+        // method ever runs, so the per-item cancel below can run to full, uncontended completion
+        // first. Only once cancel has committed is override released to attempt its own
+        // (now-uncontended) lock + G3 batched recheck.
+        CountDownLatch overrideReachedGate = new CountDownLatch(1);
+        CountDownLatch cancelCommitted = new CountDownLatch(1);
         doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            overrideReachedGate.countDown();
+            boolean released = cancelCommitted.await(10, TimeUnit.SECONDS);
+            if (!released) {
+                throw new IllegalStateException("cancel never committed — test setup is broken");
+            }
             return invocation.callRealMethod();
         }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemDecline(eq(appointmentId));
-        doAnswer(invocation -> {
-            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeClientItemCancel(eq(appointmentId));
 
-        CountDownLatch go = new CountDownLatch(1);
-        CountDownLatch done = new CountDownLatch(2);
+        CountDownLatch overrideDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> respOverride = new AtomicReference<>();
-        AtomicReference<ResponseEntity<String>> respCancel = new AtomicReference<>();
-
         Thread.ofVirtual().start(() -> {
             try {
-                go.await();
                 HttpHeaders headers = fixtures.bearerHeaders(providerToken);
                 headers.setContentType(MediaType.APPLICATION_JSON);
                 String body = objectMapper.writeValueAsString(new ScheduleOverrideRequest(
@@ -999,57 +930,52 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
             } catch (Exception e) {
                 throw new RuntimeException(e);
             } finally {
-                done.countDown();
-            }
-        });
-        Thread.ofVirtual().start(() -> {
-            try {
-                go.await();
-                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
-                headers.setContentType(MediaType.APPLICATION_JSON);
-                HttpEntity<String> entity = new HttpEntity<>(
-                        "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", headers);
-                respCancel.set(restTemplate.exchange(
-                        APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/cancel",
-                        HttpMethod.PATCH, entity, String.class));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                done.countDown();
+                overrideDone.countDown();
             }
         });
 
-        go.countDown();
-        boolean finished = done.await(30, TimeUnit.SECONDS);
+        boolean reachedGate = overrideReachedGate.await(10, TimeUnit.SECONDS);
+        assertThat(reachedGate).as("the override thread must reach its header-lock attempt within 10s").isTrue();
 
-        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
-        assertThat(respOverride.get().getStatusCode())
-                .as("the override write itself must always succeed — body: %s", respOverride.get().getBody())
-                .isEqualTo(HttpStatus.OK);
-        assertThat(respCancel.get().getStatusCode())
-                .as("the per-item cancel must ALWAYS succeed regardless of race order — body: %s",
-                        respCancel.get().getBody())
+        // Drive the per-item cancel to full completion on the main thread WHILE the override thread
+        // is paused BEFORE it has acquired any lock — no contention, cancel always succeeds.
+        HttpHeaders cancelHeaders = fixtures.bearerHeaders(clientToken);
+        cancelHeaders.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> cancelEntity = new HttpEntity<>(
+                "{\"cancellationReason\":\"CLIENT_CANCELLED\"}", cancelHeaders);
+        ResponseEntity<String> respCancel = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/cancel",
+                HttpMethod.PATCH, cancelEntity, String.class);
+        assertThat(respCancel.getStatusCode())
+                .as("the per-item cancel must succeed — nothing has raced it yet at this point — body: %s",
+                        respCancel.getBody())
                 .isEqualTo(HttpStatus.NO_CONTENT);
 
-        // leg1 is NEVER targeted by the cancel, so it is declined by the override write regardless
-        // of race order — the batch's other, unraced target always survives to be declined.
+        cancelCommitted.countDown();
+        boolean overrideFinished = overrideDone.await(10, TimeUnit.SECONDS);
+        assertThat(overrideFinished).as("the override thread must finish within 10s once released").isTrue();
+
+        // The single deterministic outcome this test forces: the override write itself always
+        // succeeds (narrowing the schedule never fails), but G3's batched recheck must FILTER leg0
+        // out of the batch — it is no longer CONFIRMED by the time the recheck runs — while leg1
+        // (never touched by the cancel) is declined normally.
+        assertThat(respOverride.get().getStatusCode())
+                .as("the override write itself must succeed — body: %s", respOverride.get().getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat(dbStatus(leg0))
+                .as("G3: leg0 must be FILTERED out of the batch, never re-declined over the cancel's "
+                        + "effect — this is the assertion the original isIn(\"CANCELLED\", \"DECLINED\") "
+                        + "could not make: it accepted DECLINED here too, which is exactly what a "
+                        + "removed/broken filter would also produce")
+                .isEqualTo("CANCELLED");
         assertThat(dbStatus(leg1))
-                .as("leg1 (untouched by the cancel) is always declined by the override write")
+                .as("leg1 (untouched by the cancel, still CONFIRMED when the batched recheck ran) is "
+                        + "declined normally by the override write")
                 .isEqualTo("DECLINED");
         assertThat(appointmentStatus(appointmentId))
-                .as("leg1 always ends DECLINED, so the header always collapses to DECLINED")
+                .as("leg1 was the last CONFIRMED sibling once leg0 cancelled, so declining it collapses "
+                        + "the header to DECLINED")
                 .isEqualTo("DECLINED");
-        // The central G3 assertion: leg0 ends at EXACTLY ONE of its two legal terminal states —
-        // CANCELLED (the cancel won the lock race, and the override's batched recheck correctly
-        // FILTERED leg0 out rather than re-declining it) or DECLINED (the override won the lock race
-        // and declined leg0 before the cancel's own freshness re-check could abort it) — but never
-        // resurrected to CONFIRMED, and never silently overwritten from one terminal state to the
-        // other.
-        assertThat(dbStatus(leg0))
-                .as("G3 (HIGH): leg0 must end at EXACTLY ONE legal terminal state, never CONFIRMED — "
-                        + "body(override): %s, body(cancel): %s",
-                        respOverride.get().getBody(), respCancel.get().getBody())
-                .isIn("CANCELLED", "DECLINED");
     }
 
     // ── fixtures ──────────────────────────────────────────────────────────────────────────────────

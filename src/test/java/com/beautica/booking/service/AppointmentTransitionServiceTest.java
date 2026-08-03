@@ -323,6 +323,51 @@ class AppointmentTransitionServiceTest {
         verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
     }
 
+    /**
+     * Regression test for QA cycle-8 finding 2 (LOW) — {@code declineAppointmentItem}'s F1
+     * freshness-recheck-false branch (the {@code existsConfirmedById} → 409 path) previously had NO
+     * deterministic unit coverage; only {@code AppointmentCrossPathTransitionConcurrencyIT}'s
+     * (compromised, branch-on-the-guard-under-test) concurrency tests touched it at all. Mirrors the
+     * equivalent false-branch tests already pinned for {@code BookingService#cancelBooking}/
+     * {@code #rescheduleBooking}/{@code #declineBookingCore}/{@code #completeBooking}/
+     * {@code #notCompleteBooking} in {@code BookingServiceTest}.
+     */
+    @Test
+    @DisplayName("declineAppointmentItem — F1 (cycle-6 audit 2026-08-03): the header lock succeeding "
+            + "is NOT enough if the TARGET ITEM ITSELF already left CONFIRMED concurrently (e.g. a "
+            + "per-item client cancel/reschedule of this SAME leg) — existsConfirmedById returning "
+            + "false is a clean 409, with the target NEVER mutated, saved, or evicted")
+    void should_throw409AndNotMutateOrSave_when_targetItselfLeftConfirmedAfterHeaderLockForDeclineItem() {
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+        Booking target = bookingItem(bookingId, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+        // The header itself is still CONFIRMED — the lock succeeds...
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        // ...but THIS item concurrently left CONFIRMED (e.g. a per-item client cancel or a per-item
+        // reschedule of the SAME leg, fired near-concurrently at a sibling endpoint) — F1's freshness
+        // probe reflects that directly, never a second entity load of target itself.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> appointmentTransitionService.declineAppointmentItem(
+                actorId, appointmentId, bookingId, null))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT))
+                .hasMessageContaining("Service changed concurrently");
+
+        assertThat(target.getStatus())
+                .as("F1: a lost freshness race on the TARGET ITEM ITSELF must mutate nothing")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(target.getProviderComment())
+                .as("the aborted decline's own providerComment must never be written")
+                .isNull();
+        verify(bookingRepository, never()).save(any());
+        verify(appointmentRepository, never()).collapseHeaderIfNoConfirmedSiblingsRemain(any(), any(), any(), any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+        verify(slotCalculationService, never()).evictAvailableSlots(any(), any(), any());
+        verify(cachePrefixEvictor, never()).evictByKeyPrefixNow(any(), any());
+    }
+
     // ── declineAppointmentItems — batched multi-sibling decline (perf finding 1, 2026-07-26 audit) ──
 
     private com.beautica.booking.entity.Booking bookingItem(UUID id, com.beautica.booking.enums.BookingStatus status) {
@@ -1003,6 +1048,55 @@ class AppointmentTransitionServiceTest {
 
         verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
         verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    /**
+     * Regression test for QA cycle-8 finding 2 (LOW) — {@code rescheduleAppointmentItem}'s F1
+     * freshness-recheck-false branch (the {@code existsConfirmedById} → 409 path) previously had NO
+     * deterministic unit coverage; only {@code AppointmentCrossPathTransitionConcurrencyIT}'s
+     * (compromised, branch-on-the-guard-under-test) concurrency tests touched it at all. Distinct from
+     * {@code should_throw409_when_headerNoLongerConfirmed} above, which pins the LOCK's own false
+     * branch ({@code lockHeaderIfConfirmed} empty) — here the lock SUCCEEDS (the header is still
+     * CONFIRMED) and it is F1's separate, item-scoped probe that fails.
+     */
+    @Test
+    @DisplayName("rescheduleAppointmentItem — F1 (cycle-6 audit 2026-08-03): the header lock succeeding "
+            + "is NOT enough if the TARGET ITEM ITSELF already left CONFIRMED concurrently (e.g. a "
+            + "per-item cancel/decline of this SAME leg) — existsConfirmedById returning false is a "
+            + "clean 409, with NO advisory lock ever attempted and NOTHING mutated")
+    void should_throw409AndNeverAcquireAdvisoryLocks_when_targetItselfLeftConfirmedAfterHeaderLock() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking target = confirmedItem(targetId, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+        stubItemSlotAvailable(newStartsAt);
+        // The header itself is still CONFIRMED — the lock succeeds...
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        // ...but THIS item concurrently left CONFIRMED (e.g. a per-item client cancel or provider
+        // decline of the SAME leg, fired near-concurrently at the sibling per-item endpoint) — F1's
+        // freshness probe reflects that directly, never a second entity load of target itself.
+        when(bookingRepository.existsConfirmedById(targetId)).thenReturn(false);
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT))
+                .hasMessageContaining("Service changed concurrently");
+
+        assertThat(target.getStartsAt())
+                .as("F1: a lost freshness race on the TARGET ITEM ITSELF must mutate nothing")
+                .isEqualTo(start);
+        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), org.mockito.ArgumentMatchers.anyBoolean());
     }
 
     @Test
