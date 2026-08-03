@@ -13,11 +13,16 @@ import java.util.UUID;
  * One service line of a multi-service visit (BE-3) — the client-facing projection of a single
  * chained {@code bookings} row that belongs to an {@link com.beautica.booking.entity.Appointment}.
  * Carries the per-item window and the frozen price snapshot, so the mobile visit screen can render
- * the back-to-back timeline without a second round-trip per service.
+ * the visit timeline without a second round-trip per service.
  *
  * <p>{@code startsAt}/{@code endsAt} are Kyiv-zoned, matching {@link BookingDetailResponse}. The
- * item's {@code endsAt} already includes that service's own {@code bufferMinutesAfter} (D4), so the
- * next item's {@code startsAt} equals this item's {@code endsAt}.
+ * item's {@code endsAt} already includes that service's own {@code bufferMinutesAfter} (D4). AT
+ * CREATE TIME the items are chained back-to-back, so the next item's {@code startsAt} equals this
+ * item's {@code endsAt} — but that is true only until an item is rescheduled individually (phase
+ * 30.1's relaxed contiguity: {@code AppointmentTransitionService#rescheduleAppointmentItem} moves
+ * exactly one item, leaving every sibling's window byte-for-byte unchanged). After such a move,
+ * items may be separated by legal gaps; {@code items[]} stays sorted by {@code startsAt} ascending,
+ * but adjacency must never be assumed.
  *
  * <p>{@code status} is the PER-ITEM status: a service line may be {@code DECLINED} on its own (via
  * {@code PATCH /appointments/{id}/services/{bookingId}/decline}) while its siblings stay

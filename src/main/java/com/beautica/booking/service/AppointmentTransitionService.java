@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AppointmentCancelRequest;
 import com.beautica.booking.dto.AppointmentDetailResponse;
+import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.AppointmentRescheduleRequest;
 import com.beautica.booking.entity.Appointment;
@@ -35,6 +36,7 @@ import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -569,6 +571,184 @@ public class AppointmentTransitionService {
         return appointmentService.enrich(appointment, items);
     }
 
+    /**
+     * Moves ONE service line of a CONFIRMED multi-service visit to a new time, leaving every
+     * sibling item's window byte-for-byte unchanged (LOCKED per-item semantics — phase 30.1 L1/L2).
+     * The per-item counterpart of {@link #rescheduleAppointment}, exposed at
+     * {@code PATCH /appointments/{appointmentId}/services/{bookingId}/reschedule} (phase 30.5).
+     *
+     * <p><b>Contiguity is deliberately relaxed.</b> Unlike {@link #rescheduleAppointment}, which
+     * re-lays-out the whole block back-to-back via {@link VisitPlanner#replanFromNewStart}, this
+     * method performs NO follower re-layout, NO cascade and NO gap-closing. After it runs the
+     * visit's items may have gaps between them; the appointment stays ONE appointment with ALL of
+     * its items. What is NOT relaxed is the no-sibling-overlap invariant (phase 30.3) —
+     * {@link #assertNoSiblingOverlap} plus the master-scoped {@code existsOverlapExcluding} plus the
+     * DB's {@code no_overlapping_bookings} EXCLUDE constraint all still forbid a moved item from
+     * colliding with a CONFIRMED sibling of the SAME visit (a self-double-book of one master).
+     *
+     * <p><b>The item stays CONFIRMED at the new time</b> and the header's status cannot change, so
+     * unlike the per-item decline/cancel paths there is NO phase-2 header collapse (phase 30.2 D2) —
+     * verify this is NOT "fixed" back in by a later reader trying to restore symmetry.
+     *
+     * <p><b>Authorization runs before any entity load</b> (phase 30.1 D5, commit {@code 4d156c0}):
+     * the provider path uses the projection-only {@link AuthorizationService#enforceCanManageAppointment};
+     * the client path compares {@link AppointmentRepository#findClientIdById} against
+     * {@code actorUserId} — a missing appointment, a foreign visit, and a guest (LINK) visit all
+     * collapse to the SAME uniform 403 (no existence oracle). The {@code bookingId}-not-a-child 404
+     * is reached only once the caller is already authorized on the visit.
+     *
+     * <p><b>The temporal guard is PER-ROW, not visit-level</b> (phase 30.1 D6) —
+     * {@link #assertVisitNotElapsedForClient} is deliberately never called here: an elapsed sibling
+     * must not freeze a still-future leg, which is exactly the outcome this feature exists to avoid.
+     *
+     * <p><b>Lock order: header → client → master</b> (canonical appointments-before-bookings order,
+     * cycle-2 audit finding 1) — {@link #lockAppointmentHeaderBeforeItemReschedule} runs first and,
+     * UNLIKE its other caller ({@code BookingService#rescheduleBooking}, phase 30.2), a {@code false}
+     * result here IS a 409: on this appointment-scoped route the header is a named part of the
+     * request, so a non-CONFIRMED header is a genuine conflict the caller must see.
+     *
+     * @throws ForbiddenException             missing, foreign, or guest visit (uniform 403)
+     * @throws NotFoundException              {@code bookingId} is not a child of {@code appointmentId} (404)
+     * @throws BusinessException              header or item not CONFIRMED, sibling overlap, or slot
+     *                                        unavailable (409); a bad {@code newStartsAt} (400)
+     * @throws BookingElapsedException        the CLIENT is moving an already-elapsed item (409)
+     * @throws ClientBookingConflictException the new window overlaps another booking the owning
+     *                                        client holds (409, {@code CLIENT_BOOKING_CONFLICT})
+     */
+    @Transactional
+    public AppointmentDetailResponse rescheduleAppointmentItem(
+            UUID actorUserId, Role actorRole, UUID appointmentId, UUID bookingId,
+            AppointmentItemRescheduleRequest req) {
+        boolean initiatedByProvider = actorRole != Role.CLIENT;
+
+        // Step 2 — authorize BEFORE any entity load (phase 30.1 D5). Provider: the projection-only,
+        // per-appointment authority check. Client: a bare client_id projection compared to the
+        // actor — a missing/foreign/guest visit all collapse to the SAME uniform 403.
+        if (initiatedByProvider) {
+            authz.enforceCanManageAppointment(actorUserId, appointmentId);
+        } else {
+            UUID ownerClientId = appointmentRepository.findClientIdById(appointmentId)
+                    .orElseThrow(() -> new ForbiddenException("Access denied"));
+            if (!ownerClientId.equals(actorUserId)) {
+                throw new ForbiddenException("Access denied");
+            }
+        }
+
+        Appointment appointment = appointmentRepository.findById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        List<Booking> items = loadItemsOrThrow(appointmentId);
+        Booking target = items.stream()
+                .filter(item -> item.getId().equals(bookingId))
+                .findFirst()
+                .orElseThrow(() -> new NotFoundException("Appointment service not found"));
+
+        // Security audit F5 (cross-batch) — defense-in-depth tripwire, NOT a redundant re-check of
+        // the guard above. The CLIENT branch above authorizes off Appointment.client_id alone (a
+        // projection-only, pre-load comparison); this checks Booking.client on the TARGET row
+        // itself — a DIFFERENT column the DB does not constrain to agree with the appointment's
+        // client_id (no FK/CHECK ties the two). Today they are always equal by construction
+        // (AppointmentService#doCreateAppointment sets both from the same variable), but that is an
+        // application-level invariant only, and this is the one per-item CLIENT path that does not
+        // otherwise re-verify it: the provider branch gets an equivalent second layer from
+        // AuthorizationService#enforceCanManageAppointment (which reads every item's OWN
+        // masterUserId/salonId, not the header's), and BookingService#cancelAppointmentItem's client
+        // path gets it "for free" because cancelBooking's own load re-filters by booking.getClient().
+        // Fails with the SAME uniform 403 as the guard above — never a distinguishable error.
+        if (!initiatedByProvider
+                && (target.getClient() == null || !target.getClient().getId().equals(actorUserId))) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        assertItemReschedulable(target);
+        if (initiatedByProvider) {
+            BookingTemporalGuard.assertCurrentNotElapsedForReschedule(target.getStartsAt(), clock);
+        } else {
+            assertItemNotElapsedForClient(target);
+        }
+
+        OffsetDateTime newStartsAt = req.newStartsAt();
+        BookingStartsAtValidator.validate(newStartsAt, clock);
+
+        Master master = target.getMaster();
+        UUID masterId = master.getId();
+
+        // Same working-hours / effective-day validation the single-booking reschedule relies on —
+        // the SINGLE-service getAvailableSlots overload, since only ONE item moves (never the
+        // multi-service overload rescheduleAppointment uses for the whole block). Run BEFORE any
+        // lock, keeping the lock window tight (backend-perf).
+        assertItemStartsOnAvailableSlot(masterId, target.getMasterService().getId(), newStartsAt);
+
+        // Duration + buffer are frozen at the original booking; mirror the create-path end-time
+        // formula. NEVER VisitPlanner — no re-layout, no cascade (L2).
+        OffsetDateTime newEndsAt = newStartsAt.plusMinutes(
+                (long) target.getDurationMinutesAtBooking() + target.getBufferMinutesAtBooking());
+
+        // Phase 30.3 layer 1 — in-memory sibling pre-check, before any lock, zero extra queries.
+        assertNoSiblingOverlap(items, bookingId, newStartsAt, newEndsAt);
+
+        // Captured BEFORE any mutation, for after-commit cache eviction.
+        Set<SlotKey> oldSlotKeys = collectSlotKeys(List.of(target));
+
+        // Lock order: header → client → master (canonical, cycle-2 audit finding 1). Unlike
+        // BookingService#rescheduleBooking's use of this SAME method (phase 30.2), a false result
+        // here IS a 409 — the header is a named part of THIS route's request (phase 30.1 D4).
+        if (!lockAppointmentHeaderBeforeItemReschedule(appointmentId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Visit is no longer CONFIRMED");
+        }
+
+        Integer lockResult;
+        User owningClient = appointment.getClient();
+        if (owningClient != null) {
+            acquireClientLock(owningClient.getId());
+            assertNoClientConflictExcludingBooking(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            lockResult = bookingRepository.acquireAdvisoryLock(masterId);
+        } else {
+            // No client lock was taken (guest visit) — the master lock must fuse its own
+            // lock_timeout, mirroring every other no-client-lock shape in this codebase.
+            lockResult = bookingRepository.acquireAdvisoryLockWithTimeout(masterId);
+        }
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+
+        // Phase 30.3 layer 3 — booking-scoped exclusion (excludes ONLY the moving row), so a
+        // CONFIRMED sibling of the SAME visit IS caught. Never existsOverlapExcludingAppointment,
+        // whose appointment-wide exclusion is blind to siblings by construction (30.3's single
+        // highest-risk mistake, called out in three phase docs).
+        if (bookingRepository.existsOverlapExcluding(masterId, newStartsAt, newEndsAt, bookingId)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        target.reschedule(newStartsAt, newEndsAt);
+        Booking saved;
+        try {
+            saved = bookingRepository.saveAndFlush(target);
+        } catch (DataIntegrityViolationException e) {
+            // Phase 30.3 layer 4 — the DB's own no_overlapping_bookings EXCLUDE constraint,
+            // authoritative even if every application guard above were bypassed.
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        // No collapseHeaderIfNoConfirmedSiblingsRemain call — the item stays CONFIRMED, so the
+        // header's status cannot change (phase 30.2 D2). This is a deliberate omission, not an
+        // oversight; do not "restore symmetry" with the decline/cancel item paths by adding one.
+
+        // Reference the MOVED CHILD (never item 0) so the notification names the right service.
+        outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+
+        registerRescheduleEviction(masterId, salonIdOfMaster(master), oldSlotKeys, collectSlotKeys(List.of(saved)));
+
+        // The in-memory list was loaded ordered by the OLD startsAt; the mutation above may have
+        // moved `target` out of that order, so it must be re-sorted before rendering — the stale
+        // order would otherwise emit a wrong header startsAt and a wrong items[] order (phase 30.4
+        // step 19 / phase 30.1 D2). The id tiebreak keeps the order deterministic when a moved item
+        // lands exactly on a sibling's start (legal per phase 30.3).
+        List<Booking> reordered = items.stream()
+                .sorted(Comparator.comparing(Booking::getStartsAt).thenComparing(Booking::getId))
+                .toList();
+        return appointmentService.enrich(appointment, reordered);
+    }
+
     // ── internals ──────────────────────────────────────────────────────────────
 
     private List<Booking> loadItemsOrThrow(UUID appointmentId) {
@@ -759,6 +939,42 @@ public class AppointmentTransitionService {
     }
 
     /**
+     * Phase-1 header lock for a per-item RESCHEDULE that does NOT collapse the header — the
+     * reschedule counterpart of {@link #lockAppointmentHeaderBeforeClientItemCancel} (phase 30.2 —
+     * closes a latent lock-order defect: {@code BookingService#rescheduleBooking} already moves a
+     * single appointment child today, but — unlike {@code cancelBooking}, which compensates with
+     * exactly this seam — took only the per-client/per-master advisory locks and never locked the
+     * {@code appointments} header at all, inverting the canonical appointments-before-bookings lock
+     * order cycle-2 audit finding 1 established for every other class of per-child write).
+     *
+     * <p><b>No phase-2 companion, deliberately.</b> A rescheduled item stays {@code CONFIRMED} — its
+     * transition never removes a {@code CONFIRMED} sibling from the header's count — so
+     * {@link AppointmentRepository#collapseHeaderIfNoConfirmedSiblingsRemain}'s {@code NOT EXISTS}
+     * guard could never fire for this caller. Adding a collapse call here would be a pointless
+     * {@code UPDATE}; do not "restore symmetry" with the cancel pair by adding one.
+     *
+     * <p><b>Two callers, two different uses of the SAME return value (phase 30.1 D4 vs. phase 30.2
+     * D5) — this is the ONE shared seam, not a third mechanism.</b> {@code
+     * BookingService#rescheduleBooking} (this bugfix, cross-package — hence package-private, not
+     * {@code private}) discards the result: on the legacy booking-scoped route a non-CONFIRMED
+     * header under a CONFIRMED child is a state the child-level status guard already vetted, so
+     * turning {@code false} into an error here would be a behaviour change beyond a lock-order fix.
+     * {@link #rescheduleAppointmentItem} (the new appointment-scoped per-item route, phase 30.4,
+     * same class) calls this identical method but DOES treat {@code false} as a 409 — there the
+     * header is a named part of the request URL, so a non-CONFIRMED header is a genuine state
+     * conflict the caller must see. Both callers reuse this ONE seam rather than each rolling their
+     * own lock call, so the two can never drift on lock order.
+     *
+     * @return see {@link #lockHeaderBeforeItemTransition} — interpreted differently by each of the
+     *         two callers above; never a phase-2 trigger either way, since a rescheduled item never
+     *         leaves {@code CONFIRMED}.
+     */
+    @Transactional
+    boolean lockAppointmentHeaderBeforeItemReschedule(UUID appointmentId) {
+        return lockHeaderBeforeItemTransition(appointmentId);
+    }
+
+    /**
      * Phase 2 (collapse) of the header recompute for a CLIENT per-leg cancel — the client-cancel
      * counterpart of {@link #collapseHeaderAfterItemTransition}, called by
      * {@code BookingService#cancelBooking} AFTER it has persisted (via
@@ -788,15 +1004,25 @@ public class AppointmentTransitionService {
     }
 
     /**
-     * Visit read-only-after-elapse guard for the CLIENT cancel path — mirrors
+     * Visit read-only-after-elapse guard for the CLIENT cancel/reschedule-whole-visit path — mirrors
      * {@code BookingService#assertNotElapsedForClient} lifted to the visit: the window has fully
-     * passed once the LAST item's {@code endsAt} is before "now" (items arrive ordered by
-     * {@code startsAt} ascending, so the last is the visit's end). Compared on the absolute instant
-     * via the injected {@link Clock} so tests can pin an elapsed visit deterministically.
+     * passed once the visit's END — {@code max(endsAt)} over every item (terminal included), NOT
+     * {@code items.get(size-1).getEndsAt()} (phase 30.1/30.7: the row with the greatest
+     * {@code startsAt} is no longer necessarily the row with the greatest {@code endsAt} once a
+     * per-item move can separate a terminal sibling from the rest) — is before "now". Compared on
+     * the absolute instant via the injected {@link Clock} so tests can pin an elapsed visit
+     * deterministically.
+     *
+     * <p><b>Whole-visit only.</b> A per-item move ({@link #rescheduleAppointmentItem}) uses the
+     * PER-ROW temporal guard instead (phase 30.1 D6) — an elapsed sibling must never freeze a still-
+     * future leg, which this whole-visit guard would otherwise do if reused there.
      */
     private void assertVisitNotElapsedForClient(List<Booking> items) {
-        Booking last = items.get(items.size() - 1);
-        if (last.getEndsAt().toInstant().isBefore(clock.instant())) {
+        OffsetDateTime visitEnd = items.stream()
+                .map(Booking::getEndsAt)
+                .max(Comparator.naturalOrder())
+                .orElseThrow(); // items is non-empty — loadItemsOrThrow guards this
+        if (visitEnd.toInstant().isBefore(clock.instant())) {
             throw new BookingElapsedException();
         }
     }
@@ -868,6 +1094,76 @@ public class AppointmentTransitionService {
         }
     }
 
+    /**
+     * Per-ITEM schedule-fit guard for {@link #rescheduleAppointmentItem} — the single-service
+     * {@link SlotCalculationService#getAvailableSlots(UUID, LocalDate, UUID)} overload, mirroring
+     * {@code BookingService#assertStartsOnAvailableSlot} exactly. Deliberately NOT the multi-service
+     * overload {@link #assertVisitStartsOnAvailableSlot} uses — only ONE item moves here, never the
+     * whole block.
+     *
+     * <p><b>Perf audit F3 (cross-batch).</b> Delegates to {@link BookingSlotAvailabilityGuard} — the
+     * single shared implementation this method and {@code BookingService#assertStartsOnAvailableSlot}
+     * both call, replacing what used to be two byte-for-byte duplicate method bodies (each one's own
+     * Javadoc said it "mirrors ... exactly"). See that class's Javadoc for why it is a static utility
+     * rather than a shared bean (avoids a circular dependency — {@code BookingService} already
+     * depends on THIS class for the per-item client-cancel header-lock seam).
+     */
+    private void assertItemStartsOnAvailableSlot(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+        BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceId, startsAt);
+    }
+
+    /**
+     * Per-CHILD {@code CONFIRMED}-only transition guard for {@link #rescheduleAppointmentItem} —
+     * a single service line is only reschedulable from {@code CONFIRMED}; an already-terminal
+     * child (a prior per-service decline/cancel, or a whole-visit terminal) is a {@code 409}. Shaped
+     * on {@link #assertItemTransition}, kept distinct because the message names "reschedule" rather
+     * than a generic target status.
+     */
+    private void assertItemReschedulable(Booking target) {
+        if (target.getStatus() != BookingStatus.CONFIRMED) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Cannot reschedule service in status %s".formatted(target.getStatus()));
+        }
+    }
+
+    /**
+     * Per-ROW read-only-after-elapse guard for a CLIENT per-item reschedule — mirrors
+     * {@code BookingService#assertNotElapsedForClient} evaluated on the TARGET item alone, never the
+     * visit (phase 30.1 D6): a sibling's elapsed-ness is irrelevant to whether THIS row may still be
+     * moved. Compared on the absolute instant via the injected {@link Clock}.
+     */
+    private void assertItemNotElapsedForClient(Booking item) {
+        if (item.getEndsAt().toInstant().isBefore(clock.instant())) {
+            throw new BookingElapsedException();
+        }
+    }
+
+    /**
+     * Rejects a per-item move that would overlap a {@code CONFIRMED} sibling of the SAME visit — a
+     * self-double-book of one master (phase 30.3 layer 1). Half-open comparison, so a move that
+     * lands exactly on a sibling's boundary is legal (that is the original back-to-back layout).
+     * Terminal siblings are exempt: their slots are released.
+     *
+     * <p>Runs before any lock, over the already-loaded item list, at zero extra queries. It exists
+     * for DETERMINISM, not for safety — the booking-scoped {@code existsOverlapExcluding} call and
+     * the DB's {@code no_overlapping_bookings} EXCLUDE constraint already make the overlap
+     * unreachable. Without it a same-visit collision would surface as
+     * {@code CLIENT_BOOKING_CONFLICT} for an account-bound visit but as {@code "Slot not available"}
+     * for a guest visit — two different errors for one cause. Keep it, and keep this javadoc, even
+     * if a reviewer proposes deleting it as redundant (phase 30.3 D3).
+     */
+    private void assertNoSiblingOverlap(
+            List<Booking> items, UUID movingBookingId, OffsetDateTime newStartsAt, OffsetDateTime newEndsAt) {
+        boolean overlapsSibling = items.stream()
+                .filter(item -> !item.getId().equals(movingBookingId))
+                .filter(item -> item.getStatus() == BookingStatus.CONFIRMED)
+                .anyMatch(sibling -> newStartsAt.isBefore(sibling.getEndsAt()) && newEndsAt.isAfter(sibling.getStartsAt()));
+        if (overlapsSibling) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Cannot overlap another service in the same visit");
+        }
+    }
+
     private void acquireClientLock(UUID clientId) {
         Integer lockResult = bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId);
         if (lockResult == null) {
@@ -886,6 +1182,23 @@ public class AppointmentTransitionService {
     private void assertNoClientConflictExcludingAppointment(
             UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID appointmentId) {
         bookingRepository.findFirstConflictingClientBookingIdExcludingAppointment(clientId, startsAt, endsAt, appointmentId)
+                .ifPresent(conflictId -> {
+                    throw clientConflictException(conflictId);
+                });
+    }
+
+    /**
+     * Same as {@link #assertNoClientConflictExcludingAppointment} but excludes a SINGLE booking's
+     * own row via {@code bookingId} — the per-item (phase 30.4) counterpart, used by
+     * {@link #rescheduleAppointmentItem} where only ONE item moves rather than the whole visit.
+     * Deliberately NOT {@link BookingRepository#findFirstConflictingClientBookingIdExcludingAppointment},
+     * whose appointment-wide exclusion would also hide a conflict against one of THIS visit's OTHER
+     * (unmoved) items — the same "blind to siblings" trap {@code existsOverlapExcludingAppointment}
+     * carries for the overlap check (phase 30.3).
+     */
+    private void assertNoClientConflictExcludingBooking(
+            UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt, UUID excludeBookingId) {
+        bookingRepository.findFirstConflictingClientBookingIdExcluding(clientId, startsAt, endsAt, excludeBookingId)
                 .ifPresent(conflictId -> {
                     throw clientConflictException(conflictId);
                 });

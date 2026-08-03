@@ -12,6 +12,7 @@ import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
@@ -76,6 +77,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -114,6 +116,8 @@ class BookingServiceTest {
     private ScheduleDateMath dateMath;
     @Mock
     private AppointmentTransitionService appointmentTransitionService;
+    @Mock
+    private AppointmentRepository appointmentRepository;
 
     private Clock clock;
 
@@ -155,7 +159,8 @@ class BookingServiceTest {
                 new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 salonCatalogCacheEvictor,
                 dateMath,
-                appointmentTransitionService
+                appointmentTransitionService,
+                appointmentRepository
         );
 
         clientId = UUID.randomUUID();
@@ -1146,6 +1151,64 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verifyNoInteractions(appointmentTransitionService);
+    }
+
+    // ── phase 30.2 — reschedule header lock (closes the latent lock-order defect) ──────────────
+    //
+    // rescheduleBooking already moved a single appointment child, but — unlike cancelBooking above
+    // — never locked the visit HEADER, inverting the canonical appointments-before-bookings lock
+    // order. These two tests are the executable form of the "zero extra statements on the legacy
+    // path" guard: an appointment-child reschedule MUST invoke the new header-lock seam, and a
+    // standalone (appointment == null) reschedule MUST NEVER invoke it.
+
+    @Test
+    @DisplayName("rescheduling an appointment CHILD locks the visit header via "
+            + "AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule BEFORE the "
+            + "client/master advisory locks — canonical appointments-before-bookings lock order "
+            + "(phase 30.2, cycle-2 audit finding 1)")
+    void should_lockAppointmentHeaderBeforeItemReschedule_when_reschedulingAppointmentChild() {
+        UUID appointmentId = UUID.randomUUID();
+        Appointment appointment = Appointment.builder().id(appointmentId).build();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        booking.setAppointment(appointment);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId))
+                .thenReturn(true);
+
+        bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        InOrder inOrder = inOrder(appointmentTransitionService, bookingRepository);
+        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(appointmentId);
+        inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        inOrder.verify(bookingRepository).saveAndFlush(any());
+        // No phase-2 collapse call exists for reschedule (phase 30.2 D2) — the item stays CONFIRMED.
+        verify(appointmentTransitionService, never())
+                .collapseAppointmentHeaderAfterClientItemCancel(any(), anyBoolean(), any());
+    }
+
+    @Test
+    @DisplayName("rescheduling a LEGACY standalone booking (appointment_id NULL) never touches "
+            + "AppointmentTransitionService — zero extra statements on the non-appointment path "
+            + "(phase 30.2 D3)")
+    void should_notInteractWithAppointmentTransitionService_when_reschedulingLegacyStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         verifyNoInteractions(appointmentTransitionService);
     }
 
@@ -3138,5 +3201,109 @@ class BookingServiceTest {
         assertThat(result.clientId()).isNull();
         assertThat(result.masterProfessionalTitle()).isNull();
         assertThat(result.locationNote()).isNull();
+    }
+
+    // ── cancelAppointmentItem (phase 30.6) — appointment-scoped per-item cancel ─────────────────
+    //
+    // Reached via PATCH /appointments/{appointmentId}/services/{bookingId}/cancel. Adds exactly
+    // two guards (visit ownership, path consistency) then delegates to cancelBooking VERBATIM —
+    // these tests pin the guard ordering and the non-forked delegation, never re-testing
+    // cancelBooking's own body (that is already covered above).
+
+    @Test
+    @DisplayName("cancelAppointmentItem — a foreign visit (client_id belongs to someone else) is "
+            + "a 403 and cancelBooking's own load is never reached")
+    void should_throwForbidden_when_cancelAppointmentItemCalledOnForeignVisit() {
+        UUID appointmentId = UUID.randomUUID();
+        UUID foreignClientId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(foreignClientId));
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        // Perf audit F2 (cross-batch): the dedicated existsByIdAndAppointmentId probe was removed —
+        // path consistency now folds into this SAME findByIdWithFullGraph call, so asserting it is
+        // never reached also proves the (now-deleted) exists probe's job never ran either.
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — a missing/guest appointment id collapses to the SAME "
+            + "uniform 403 as a foreign visit (no existence oracle)")
+    void should_throwForbidden_when_cancelAppointmentItemCalledWithMissingOrGuestAppointment() {
+        UUID appointmentId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — bookingId is not a child of appointmentId is a 404, "
+            + "reached only AFTER visit ownership is already established, and nothing is mutated "
+            + "(perf audit F2: path consistency is now checked in-memory on the SAME "
+            + "findByIdWithFullGraph load the mutation would have used, not a separate exists probe)")
+    void should_throwNotFound_when_cancelAppointmentItemTargetIsNotAChildOfAppointment() {
+        UUID appointmentId = UUID.randomUUID();
+        UUID otherAppointmentId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        Booking foreignChild = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        foreignChild.setAppointment(Appointment.builder().id(otherAppointmentId).build());
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(foreignChild));
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(NotFoundException.class);
+
+        assertThat(foreignChild.getStatus())
+                .as("a bookingId belonging to a DIFFERENT appointment must not be mutated")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — a bookingId that does not exist at all is the SAME 404 as "
+            + "one that exists under a different appointment (findByIdWithFullGraph empty)")
+    void should_throwNotFound_when_cancelAppointmentItemTargetDoesNotExist() {
+        UUID appointmentId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(bookingRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — happy path reuses cancelBooking's shared mutation body with "
+            + "the ALREADY-loaded, path-verified Booking (perf audit F2: findByIdWithFullGraph is "
+            + "called exactly ONCE for the whole operation, not once for the exists-style check and "
+            + "once more inside cancelBooking) — outcome is byte-for-byte the same as before (phase "
+            + "30.6 D1/D6)")
+    void should_delegateToCancelBookingUnchanged_when_cancelAppointmentItemAuthorized() {
+        UUID appointmentId = UUID.randomUUID();
+        Appointment appointment = Appointment.builder().id(appointmentId).build();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        booking.setAppointment(appointment);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, "не потрібно");
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        when(appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId))
+                .thenReturn(true);
+
+        BookingResponse result = bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        assertThat(result.id()).isEqualTo(bookingId);
+        verify(appointmentTransitionService)
+                .collapseAppointmentHeaderAfterClientItemCancel(appointmentId, true, "не потрібно");
+        verify(bookingRepository, times(1)).findByIdWithFullGraph(bookingId);
     }
 }

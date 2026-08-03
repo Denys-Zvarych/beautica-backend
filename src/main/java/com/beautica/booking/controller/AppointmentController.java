@@ -2,14 +2,18 @@ package com.beautica.booking.controller;
 
 import com.beautica.booking.dto.AppointmentCancelRequest;
 import com.beautica.booking.dto.AppointmentDetailResponse;
+import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.AppointmentRescheduleRequest;
+import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.service.AppointmentService;
 import com.beautica.booking.service.AppointmentTransitionService;
+import com.beautica.booking.service.BookingService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.security.AuthenticationUtils;
+import io.swagger.v3.oas.annotations.Operation;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -55,6 +59,10 @@ public class AppointmentController {
 
     private final AppointmentService appointmentService;
     private final AppointmentTransitionService appointmentTransitionService;
+    // Phase 30.6 — needed ONLY for cancelAppointmentItem's per-item cancel, which deliberately
+    // reuses BookingService#cancelBooking verbatim rather than forking its logic (see that
+    // method's own Javadoc, phase 30.6 D1, for why it cannot live on AppointmentTransitionService).
+    private final BookingService bookingService;
 
     @PostMapping
     @PreAuthorize("hasRole('CLIENT')")
@@ -214,5 +222,119 @@ public class AppointmentController {
     ) {
         return ApiResponse.ok(appointmentTransitionService.rescheduleAppointment(
                 AuthenticationUtils.userId(auth), AuthenticationUtils.role(auth), appointmentId, req));
+    }
+
+    /**
+     * Moves ONE service line of a multi-service visit to a new time — the per-item counterpart of
+     * {@link #rescheduleAppointment} (phase 30.5): {@code PATCH
+     * /api/v1/appointments/{appointmentId}/services/{bookingId}/reschedule}. Siblings keep their
+     * windows byte-for-byte; the visit's items may end up non-contiguous afterwards (LOCKED
+     * per-item semantics, phase 30.1 — gaps are legal, overlaps are not). The whole-visit route
+     * above is unchanged and stays the only way to move every leg back-to-back in one call.
+     *
+     * <p>Same URL shape as {@link #declineAppointmentItem} and {@link #cancelAppointmentItem}, so
+     * all three per-item transitions live at {@code /{appointmentId}/services/{bookingId}/<verb>}.
+     *
+     * <p><b>{@code @PreAuthorize} is role-only</b> (perf audit F1, cross-batch — REVERSES phase
+     * 30.5 D1's "copy the whole-visit expression verbatim"). That earlier version additionally
+     * gated the provider arm on {@code @authz.canRescheduleAppointment(authentication,
+     * #appointmentId)}, which runs the exact same {@code findAllCompletionAccessByAppointmentId}
+     * joined projection that {@code AuthorizationService#enforceCanManageAppointment} runs moments
+     * later inside {@code AppointmentTransitionService#rescheduleAppointmentItem} — every provider
+     * request paid for that query twice. Dropping the SpEL authority check here is safe precisely
+     * because {@code enforceCanManageAppointment} is the SOLE authoritative provider gate now (no
+     * layer skips it): a non-owner provider still gets exactly the same 403, just from one query
+     * instead of two — mirrors the sibling {@link #declineAppointmentItem}/
+     * {@link #cancelAppointmentItem} routes, which never duplicated this check in the first place.
+     * {@code SALON_MASTER} is excluded exactly as before: absent from {@code hasAnyRole} here, AND
+     * {@code enforceCanManageAppointment} would fast-reject it too if it were ever reached. For a
+     * CLIENT principal, the provider arm is never evaluated (SpEL {@code or} short-circuits) —
+     * CLIENT ownership is enforced in the service layer instead, via the projection-only
+     * {@code AppointmentRepository#findClientIdById} comparison (phase 30.4 step 2), identical to
+     * how the whole-visit reschedule/cancel routes work. {@code Role} is resolved from the JWT,
+     * never the body — a body-supplied role would be a privilege-escalation vector, since the
+     * service branches on it for both the temporal guard and the outbox addressing.
+     *
+     * <p>Returns {@code 200} + the WHOLE enriched visit (not just the moved line, phase 30.1 D11):
+     * the header window and totals may both have changed, and mobile reuses the same deserializer
+     * as the whole-visit reschedule response.
+     */
+    @Operation(summary = "Reschedule one service line of a visit",
+            description = "Moves ONE service line of a multi-service visit to a new time. Siblings "
+                    + "keep their windows; the visit may become non-contiguous afterwards (gaps are "
+                    + "legal, overlaps are not). Returns the whole enriched visit.")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "400", description = "Bad newStartsAt (null/past/too soon/too far ahead)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "403", description = "Missing, foreign, or guest visit (uniform — no existence oracle)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "bookingId is not a child of appointmentId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "Header/item not CONFIRMED, elapsed, sibling overlap, or "
+                            + "slot unavailable (including CLIENT_BOOKING_CONFLICT)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = "Rate limited (Retry-After: 10)")
+    })
+    @PatchMapping("/{appointmentId}/services/{bookingId}/reschedule")
+    @PreAuthorize("hasRole('CLIENT') or hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
+    public ApiResponse<AppointmentDetailResponse> rescheduleAppointmentItem(
+            @PathVariable UUID appointmentId,
+            @PathVariable UUID bookingId,
+            @Valid @RequestBody AppointmentItemRescheduleRequest req,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(appointmentTransitionService.rescheduleAppointmentItem(
+                AuthenticationUtils.userId(auth), AuthenticationUtils.role(auth),
+                appointmentId, bookingId, req));
+    }
+
+    /**
+     * Client-initiated cancel of ONE service line of a multi-service visit — the appointment-scoped
+     * twin of {@code PATCH /bookings/{bookingId}/cancel}, whose service logic
+     * ({@link BookingService#cancelBooking}) it reuses VERBATIM so the two routes can never diverge
+     * (phase 30.6). The provider's per-item counterpart is {@link #declineAppointmentItem}.
+     *
+     * <p>Request body is the EXISTING {@link CancelBookingRequest} — deliberately NOT
+     * {@link AppointmentCancelRequest}, which carries no {@code cancellationReason} because a
+     * whole-visit cancel always resolves to {@code CLIENT_CANCELLED} (phase 30.6 D4). Body-compatible
+     * with {@code PATCH /bookings/{bookingId}/cancel}, so the two routes stay interchangeable at the
+     * wire level too. Returns {@code 204} (the appointment-family convention), unlike the old
+     * booking-scoped route's {@code 200} + {@code BookingResponse} — both routes stay, unchanged for
+     * their existing consumers.
+     */
+    @Operation(summary = "Cancel one service line of a visit",
+            description = "Client-initiated cancel of ONE service line of a multi-service visit. "
+                    + "Delegates verbatim to the same logic as PATCH /bookings/{bookingId}/cancel, "
+                    + "so the two routes can never diverge.")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Cancelled"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "400", description = "Missing cancellationReason or oversized/invalid comment, "
+                            + "or the item is not CONFIRMED (cancelBooking's status guard throws a bare "
+                            + "BusinessException, mapped to 400 — NOT 409 — same as the legacy "
+                            + "/bookings/{bookingId}/cancel route)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "403", description = "Missing, foreign, or guest visit (uniform — no existence oracle)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "bookingId is not a child of appointmentId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "Item already elapsed (BOOKING_ALREADY_ELAPSED)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = "Rate limited (Retry-After: 10)")
+    })
+    @PatchMapping("/{appointmentId}/services/{bookingId}/cancel")
+    @PreAuthorize("hasRole('CLIENT')")
+    public ResponseEntity<Void> cancelAppointmentItem(
+            @PathVariable UUID appointmentId,
+            @PathVariable UUID bookingId,
+            @Valid @RequestBody CancelBookingRequest req,
+            Authentication auth
+    ) {
+        bookingService.cancelAppointmentItem(
+                AuthenticationUtils.userId(auth), appointmentId, bookingId, req);
+        return ResponseEntity.noContent().build();
     }
 }

@@ -446,8 +446,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
 
     /**
-     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt} so the
-     * items read back in the exact back-to-back order they were performed.
+     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt}
+     * ascending. That ordering is retained unconditionally, but "back-to-back" is NOT: once any
+     * item has been rescheduled individually (phase 30.1's relaxed contiguity —
+     * {@code AppointmentTransitionService#rescheduleAppointmentItem}), consecutive rows may be
+     * separated by a legal gap. Callers must not assume adjacency from this ordering alone.
      *
      * <p>Naturally bounded — a visit holds at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT}
      * (10) rows — so no {@code Pageable} is needed (§E-3). Rides the partial index

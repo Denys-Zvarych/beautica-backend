@@ -61,7 +61,10 @@ import java.util.UUID;
  *       client-then-master order that keeps the two lock classes deadlock-free;</li>
  *   <li>client-conflict check over the WHOLE visit span {@code [firstStart, lastEnd)};</li>
  *   <li>ONE span overlap check against existing CONFIRMED bookings over {@code [firstStart, lastEnd)}
- *       (internal items are contiguous by construction, so their union equals the span; the
+ *       (AT CREATE TIME internal items are contiguous by construction, so their union equals the span — true
+     *       only at the moment of creation; a later per-item reschedule (phase 30.1) may separate
+     *       items with legal gaps, a read/mutation-time concern this create-time check never
+     *       observes; the
  *       {@code no_overlapping_bookings} GIST EXCLUDE still backstops each insert);</li>
  *   <li>persist the appointment + all N bookings atomically;</li>
  *   <li>enqueue EXACTLY ONE new-visit notification (referencing the first item, never one per
@@ -248,9 +251,11 @@ public class AppointmentService {
         }
 
         // Overlap against existing CONFIRMED bookings, checked ONCE over the whole visit span. The
-        // chained items are contiguous by construction (assertContiguous: item[i].startsAt ==
-        // item[i-1].endsAt, no gaps), so the union of all per-item intervals is EXACTLY
-        // [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
+        // chained items are contiguous by construction AT CREATE TIME (assertContiguous:
+        // item[i].startsAt == item[i-1].endsAt, no gaps) — assertContiguous is never re-run after
+        // creation, so this holds only for THIS transaction, not for the visit's lifetime; a later
+        // per-item reschedule (phase 30.1) legally separates items with gaps — so the union of all
+        // per-item intervals is EXACTLY [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
         // but holds the contended per-master advisory lock for one round-trip instead of N. The
         // per-row no_overlapping_bookings GIST EXCLUDE remains the authoritative backstop on each
         // insert (see the DataIntegrityViolation→409 mapping below), so an overlapping chain still

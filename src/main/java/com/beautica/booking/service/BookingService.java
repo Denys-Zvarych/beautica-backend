@@ -13,6 +13,7 @@ import com.beautica.booking.dto.UnclosedCountResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingSpecifications;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
@@ -92,6 +93,14 @@ public class BookingService {
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final ScheduleDateMath dateMath;
     private final AppointmentTransitionService appointmentTransitionService;
+    // Phase 30.6 — needed ONLY for cancelAppointmentItem's visit-ownership + path-consistency
+    // guards. AppointmentTransitionService already depends on THIS class (via
+    // appointmentTransitionService above? no — the other direction: this class depends on
+    // AppointmentTransitionService for the header-lock seam), so cancelAppointmentItem could not
+    // live in AppointmentTransitionService without creating a circular bean graph
+    // (BookingService → AppointmentTransitionService → BookingService). See that method's own
+    // Javadoc (phase 30.6 D1) — do not "move this to where it looks like it belongs".
+    private final AppointmentRepository appointmentRepository;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -1090,13 +1099,45 @@ public class BookingService {
      */
     @Transactional
     public BookingResponse cancelBooking(UUID clientUserId, UUID bookingId, CancelBookingRequest req) {
+        // Existence collapses to the same uniform 403 the ownership filter below also throws for a
+        // foreign/guest booking (Finding 8 — existence oracle) — see cancelBooking(UUID, Booking,
+        // CancelBookingRequest)'s Javadoc for why the ownership check itself moved into that overload
+        // rather than being folded into this query's own .filter(...) (perf audit F2, cross-batch:
+        // cancelAppointmentItem needs the UNFILTERED load to also serve its path-consistency check,
+        // off the SAME round trip, before the ownership check runs).
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        return cancelBooking(clientUserId, booking, req);
+    }
+
+    /**
+     * The body of {@link #cancelBooking(UUID, UUID, CancelBookingRequest)}, factored out so
+     * {@link #cancelAppointmentItem} can supply an ALREADY full-graph-loaded {@link Booking} —
+     * loaded once for its own path-consistency check — instead of paying for a second
+     * {@code findByIdWithFullGraph} round trip here (perf audit F2, cross-batch).
+     *
+     * <p><b>Ownership is re-derived here, never trusted from the caller</b> — the ONE public
+     * entry point ({@link #cancelBooking(UUID, UUID, CancelBookingRequest)}) does the load with NO
+     * filter of its own precisely so this method remains the SINGLE place the
+     * {@code booking.getClient() == clientUserId} check is written; behaviour for that caller is
+     * byte-for-byte unchanged (still one round trip, ownership still checked before anything else).
+     * {@link #cancelAppointmentItem} separately re-verified the VISIT's ({@code Appointment})
+     * {@code client_id} before ever loading this row — this check re-verifies the CHILD
+     * ({@code Booking})'s OWN {@code client_id}, a column the DB does not constrain to agree with
+     * the appointment's (no FK/CHECK ties the two) — so this is genuine defense-in-depth, not a
+     * redundant repeat of the visit-level check that caller already made.
+     *
+     * <p>Preserves the original method's exact guard ORDER: ownership (403) → CONFIRMED-only status
+     * (400) → read-only-after-elapse (409) → the two-phase header lock/collapse → mutation.
+     */
+    private BookingResponse cancelBooking(UUID clientUserId, Booking booking, CancelBookingRequest req) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle):
         // a missing id, a guest (LINK, null-client) booking, and an existing-but-foreign booking
         // must all be indistinguishable to the caller. A prior 404-then-403 split let an
         // authenticated CLIENT probe whether an arbitrary booking id exists at all.
-        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
-                .filter(b -> b.getClient() != null && b.getClient().getId().equals(clientUserId))
-                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        if (booking.getClient() == null || !booking.getClient().getId().equals(clientUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
         BookingStatus current = booking.getStatus();
         if (current != BookingStatus.CONFIRMED) {
             throw new BusinessException("Cannot cancel a booking in status %s".formatted(current));
@@ -1144,6 +1185,75 @@ public class BookingService {
     }
 
     /**
+     * Cancels ONE service line of a multi-service visit, reached via the appointment-scoped
+     * per-item URL {@code PATCH /appointments/{appointmentId}/services/{bookingId}/cancel} (phase
+     * 30.6). Adds exactly two guards — visit ownership and path consistency — then reuses
+     * {@link #cancelBooking(UUID, Booking, CancelBookingRequest)}'s body UNCHANGED, so this route
+     * and the pre-existing {@code PATCH /bookings/{bookingId}/cancel} can NEVER diverge in
+     * semantics. There is deliberately no second implementation of the two-phase header
+     * lock/collapse — see that method's own Javadoc for the full account.
+     *
+     * <p><b>Round-trip count (perf audit F2, cross-batch — FIXED from 3 down to 2).</b> The
+     * pre-fix version issued {@link AppointmentRepository#findClientIdById} (visit ownership), then
+     * {@link BookingRepository#existsByIdAndAppointmentId} (a bare index-probe EXISTS, purely for
+     * path consistency), then delegated to {@code cancelBooking(UUID, UUID, CancelBookingRequest)},
+     * which independently re-issued {@code findByIdWithFullGraph} — three round trips where the last
+     * two both, in effect, re-established "does this booking exist under this appointment". Fixed:
+     * the path-consistency check now runs IN-MEMORY against the SAME full-graph load this method
+     * needs for the mutation anyway — {@code booking.getAppointment().getId()} reads off the
+     * uninitialised {@code @ManyToOne(LAZY)} proxy without a statement (the same zero-cost pattern
+     * {@link #cancelBooking(UUID, UUID, CancelBookingRequest)} already uses for the identical field)
+     * — so the dedicated {@code existsByIdAndAppointmentId} probe is no longer needed at all, and the
+     * full-graph load that {@code cancelBooking} used to do a second time is now done exactly ONCE,
+     * here, and threaded into the shared {@link #cancelBooking(UUID, Booking, CancelBookingRequest)}
+     * overload.
+     *
+     * <p><b>Guard order is preserved EXACTLY</b> (Finding 8 + the 403 → 404 → 409/400 priority): (1)
+     * visit ownership via the projection-only {@code findClientIdById} — 403, zero entity loads; (2)
+     * path consistency — {@code bookingId} must be a child of THIS {@code appointmentId} — checked
+     * on the loaded row's OWN appointment FK, BEFORE the shared overload's ownership re-check runs,
+     * so a bookingId under a different (or no) appointment still 404s exactly as the dedicated probe
+     * did, never leaking into a 403 from the overload's booking-level ownership filter; (3) inside
+     * the shared overload: booking-level ownership (403, defensive — see that method's Javadoc) →
+     * CONFIRMED-only status (400) → elapsed (409).
+     *
+     * <p><b>Lives here rather than in {@code AppointmentTransitionService}</b> to avoid a circular
+     * bean graph: this class already depends on {@code AppointmentTransitionService} for the
+     * header-lock seam {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} uses, so the
+     * reverse edge would cycle (phase 30.6 D1) — do not "move this to where it looks like it
+     * belongs".
+     *
+     * @param clientUserId  the authenticated CLIENT (from the security principal, never the body)
+     * @param appointmentId the visit the target booking must belong to
+     * @param bookingId     the one service line to cancel
+     * @param req           the cancellation reason + optional note, identical shape to
+     *                      {@code PATCH /bookings/{bookingId}/cancel}
+     * @throws ForbiddenException a missing appointment id, a guest (LINK) visit, or a foreign visit
+     *                            (uniform 403 — no existence oracle)
+     * @throws NotFoundException  {@code bookingId} is not a child of {@code appointmentId} (404),
+     *                            reachable only once the caller is authorized on the visit
+     */
+    @Transactional
+    public BookingResponse cancelAppointmentItem(
+            UUID clientUserId, UUID appointmentId, UUID bookingId, CancelBookingRequest req) {
+        // Authorize on the VISIT before loading anything (commit 4d156c0): a projection-only
+        // client-id read collapses a missing appointment, a guest visit (null client_id), and a
+        // foreign visit into ONE uniform 403 — no existence oracle.
+        UUID owner = appointmentRepository.findClientIdById(appointmentId)
+                .orElseThrow(() -> new ForbiddenException("Access denied"));
+        if (!owner.equals(clientUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        // Path consistency, AFTER authorization — so this 404 is reachable only by a caller already
+        // authorized on the visit, exactly as declineAppointmentItem's own 404 is. Folded into the
+        // SAME full-graph load the mutation below needs (perf audit F2) — no separate exists probe.
+        Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
+                .filter(b -> b.getAppointment() != null && b.getAppointment().getId().equals(appointmentId))
+                .orElseThrow(() -> new NotFoundException("Appointment service not found"));
+        return cancelBooking(clientUserId, booking, req);
+    }
+
+    /**
      * Moves a client's own {@code CONFIRMED} booking to a new future time.
      *
      * <p>Reuses the create-path validation: {@link #validateStartsAt(OffsetDateTime)}
@@ -1185,6 +1295,25 @@ public class BookingService {
      * ({@code booking.getClient() == null}) — there is nothing to lock or conflict-check, so that
      * step is skipped cleanly for a provider rescheduling a guest booking (mirrors the guest
      * null-guards elsewhere in this class).
+     *
+     * <p><b>Phase 30.2 — appointment-child header lock (lock-order fix).</b> This method already
+     * moves a single appointment child today (it never called {@code assertNotAppointmentChild}),
+     * but — unlike {@link #cancelBooking}, which compensates with the two-phase header seam — it
+     * took only the client-then-master advisory locks and never locked the visit HEADER at all,
+     * inverting the canonical appointments-before-bookings lock order (cycle-2 audit finding 1) for
+     * this class of write. Fixed below: when {@code booking.getAppointment() != null}, the header is
+     * locked via {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule} —
+     * AFTER guard resolution (never lock for a request about to 403/409) and BEFORE the client/master
+     * advisory locks (restoring the canonical order) — with ZERO extra statements on the legacy
+     * standalone-booking path: {@code booking.getAppointment()} reads the FK id off the uninitialised
+     * {@code @ManyToOne(LAZY)} proxy without a query, and a {@code null} appointment id (the common
+     * case) short-circuits the call entirely. There is deliberately no phase-2 collapse call — a
+     * rescheduled item stays {@code CONFIRMED}, so the header's status can never change on this path
+     * (see that method's own Javadoc). The lock result is intentionally discarded: a non-CONFIRMED
+     * header under a CONFIRMED child is a state the child-level status guard already vetted, and
+     * turning it into an error here would exceed the scope of this lock-order fix (the new
+     * appointment-scoped route, phase 30.4, treats it as a 409 instead, because there the header is a
+     * named part of the request).
      *
      * @param actorUserId the authenticated actor (from the security principal, never the body)
      * @param actorRole   the actor's role, resolved by the controller from the JWT
@@ -1236,6 +1365,19 @@ public class BookingService {
                 (long) booking.getDurationMinutesAtBooking() + booking.getBufferMinutesAtBooking());
 
         LocalDate oldDate = booking.getStartsAt().toLocalDate();
+
+        // Phase 30.2 (cycle-2 audit finding 1 — lock-order fix): lock the visit HEADER, if this
+        // booking is one item of a multi-service visit, BEFORE the client/master advisory locks
+        // below — restoring the canonical appointments-before-bookings order that cancelBooking
+        // (:1119-1121) already established for the same class of write. getAppointment().getId() is
+        // served off the uninitialised @ManyToOne(LAZY) proxy without a statement, so a legacy
+        // standalone booking (appointmentId == null) short-circuits this call entirely — ZERO extra
+        // statements on that path. The boolean result is intentionally discarded (see this method's
+        // own Javadoc, "Phase 30.2"): no phase-2 collapse ever follows a reschedule.
+        UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
+        if (appointmentId != null) {
+            appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId);
+        }
 
         // Same critical section as doCreateBooking, in the same client-then-master order
         // (deadlock freedom — see BookingRepository.acquireClientAdvisoryLockWithTimeout
@@ -1467,14 +1609,16 @@ public class BookingService {
      * generated on {@code SLOT_STEP} boundaries in Kyiv time; {@code isEqual} ignores the
      * offset/zone representation). A non-matching start throws {@code 409 "Slot not available"} —
      * the same status the create/overlap path returns for an unbookable time.
+     *
+     * <p><b>Perf audit F3 (cross-batch).</b> Delegates to {@link BookingSlotAvailabilityGuard} — the
+     * single shared implementation this method and {@code AppointmentTransitionService
+     * #assertItemStartsOnAvailableSlot} both call, replacing what used to be two byte-for-byte
+     * duplicate method bodies. See that class's Javadoc for why it is a static utility rather than a
+     * shared bean (avoids a circular dependency with {@code AppointmentTransitionService}).
      */
     private void assertStartsOnAvailableSlot(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
-        boolean onSchedule = slotCalculationService.getAvailableSlots(masterId, startsAt.toLocalDate(), masterServiceId)
-                .stream()
-                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
-        if (!onSchedule) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceId, startsAt);
     }
 
     private void validateStartsAt(OffsetDateTime startsAt) {

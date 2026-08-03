@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
@@ -23,11 +24,16 @@ import java.util.UUID;
  * {@link BookingDetailResponse} — the same master-summary + Kyiv-zoned window fields — aggregated to
  * the visit level.
  *
- * <p><b>Header window.</b> {@code startsAt} is the first item's start and {@code endsAt} the last
- * item's end, so the pair spans the whole contiguous block (including every service's trailing
- * buffer). {@code totalDurationMinutes} is the block length ({@code endsAt − startsAt}), which by
- * construction equals Σ (item duration + item buffer) — the exact block BE-2 sized the offered slot
- * to.
+ * <p><b>Header window.</b> {@code startsAt} is {@code min(startsAt)} over every item (the loader
+ * orders by {@code startsAt} ascending, so this is item 0) and {@code endsAt} is {@code max(endsAt)}
+ * over every item — an explicit reduction, NOT {@code orderedItems.get(size-1).getEndsAt()} (phase
+ * 30.1/30.7): once a single item can be rescheduled independently of its siblings (relaxed
+ * contiguity — see {@code AppointmentTransitionService#rescheduleAppointmentItem}), the row with the
+ * greatest {@code startsAt} is no longer necessarily the row with the greatest {@code endsAt} — a
+ * terminal sibling (exempt from every overlap guard) may span past the last CONFIRMED item.
+ * {@code totalDurationMinutes} is the SUM of non-excluded PER-ITEM durations (see below) — it equals
+ * {@code endsAt − startsAt} only while the visit remains contiguous, and must never be derived from
+ * the header window.
  *
  * <p><b>Header price.</b> {@code totalPrice} is Σ of the item price floors. {@code totalPriceMax} is
  * Σ over all items of {@code priceMaxAtBooking ?? priceAtBooking}, but is emitted ONLY when at least
@@ -122,7 +128,6 @@ public record AppointmentDetailResponse(
             Appointment appointment, List<Booking> orderedItems, boolean canReview,
             String cityLabel, String districtLabel) {
         Booking first = orderedItems.get(0);
-        Booking last = orderedItems.get(orderedItems.size() - 1);
         Master master = first.getMaster();
         User masterUser = master.getUser();
         Salon salon = master.getSalon();
@@ -138,7 +143,8 @@ public record AppointmentDetailResponse(
         // owed total and total duration — the client must not be shown a price/duration that
         // includes a service they will not receive (LOCKED decision). CONFIRMED/COMPLETED/CANCELLED
         // lines are summed as before; a fully-CONFIRMED visit is byte-for-byte unchanged. The header
-        // time window (startsAt/endsAt below) deliberately still spans ALL items.
+        // time window (startsAt/endsAt below) deliberately still spans ALL items, INCLUDING excluded
+        // (terminal) ones — "owed total" and "visit window" are independent concepts.
         BigDecimal totalPrice = BigDecimal.ZERO;
         BigDecimal totalCeiling = BigDecimal.ZERO;
         boolean anyRange = false;
@@ -162,6 +168,18 @@ public record AppointmentDetailResponse(
                 .map(AppointmentItemResponse::from)
                 .toList();
 
+        // Header window spans ALL items (terminal included) — the intent stated above has always
+        // been this, but orderedItems.get(size-1).getEndsAt() only expressed it correctly while
+        // items were contiguous. Once a single item can be moved independently (phase 30.1), the row
+        // with the greatest startsAt is no longer necessarily the row with the greatest endsAt: a
+        // terminal sibling is exempt from every overlap guard and may span past the last CONFIRMED
+        // item. min(startsAt) is still item 0 (the loader orders by startsAt ASC — see this method's
+        // documented precondition above), so only the end needs an explicit reduction.
+        OffsetDateTime headerEndsAt = orderedItems.stream()
+                .map(Booking::getEndsAt)
+                .max(Comparator.naturalOrder())
+                .orElseThrow(); // orderedItems is non-empty by this method's documented precondition
+
         return new AppointmentDetailResponse(
                 appointment.getId(),
                 appointment.getStatus(),
@@ -173,7 +191,7 @@ public record AppointmentDetailResponse(
                 masterUser.getRole(),
                 salon != null ? salon.getName() : null,
                 first.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
-                last.getEndsAt().atZoneSameInstant(TimeZones.KYIV),
+                headerEndsAt.atZoneSameInstant(TimeZones.KYIV),
                 totalDurationMinutes,
                 totalPrice,
                 anyRange ? totalCeiling : null,

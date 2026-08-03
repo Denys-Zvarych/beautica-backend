@@ -156,6 +156,24 @@ class BookingRateLimitFilterTest {
         return new MockHttpServletRequest("PATCH", "/api/v1/appointments/" + appointmentId + "/reschedule");
     }
 
+    /** Phase 30.5 — the per-item reschedule route. */
+    private static MockHttpServletRequest patchAppointmentServiceReschedule(UUID appointmentId, UUID bookingId) {
+        return new MockHttpServletRequest(
+                "PATCH", "/api/v1/appointments/" + appointmentId + "/services/" + bookingId + "/reschedule");
+    }
+
+    /** Phase 30.6 — the per-item cancel route. */
+    private static MockHttpServletRequest patchAppointmentServiceCancel(UUID appointmentId, UUID bookingId) {
+        return new MockHttpServletRequest(
+                "PATCH", "/api/v1/appointments/" + appointmentId + "/services/" + bookingId + "/cancel");
+    }
+
+    /** No verb suffix at all — must pass through unthrottled (guards against an over-broad prefix match). */
+    private static MockHttpServletRequest patchAppointmentServiceNoVerb(UUID appointmentId, UUID bookingId) {
+        return new MockHttpServletRequest(
+                "PATCH", "/api/v1/appointments/" + appointmentId + "/services/" + bookingId);
+    }
+
     private static MockHttpServletRequest putScheduleOverride(UUID masterId, LocalDate date) {
         return new MockHttpServletRequest(
                 "PUT", "/api/v1/masters/" + masterId + "/overrides/" + date);
@@ -675,6 +693,118 @@ class BookingRateLimitFilterTest {
         assertThat(serviceDeclineResponse.getStatus())
                 .as("the whole-visit decline call above must already have exhausted the shared decline bucket")
                 .isEqualTo(429);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Track 30.x — per-item reschedule (30.5) and per-item cancel (30.6) routes. Zero production
+    // code change was required (the filter's existing endsWith-based suffix matching already
+    // covers both, exactly as it already covered per-service decline) — these tests are the
+    // executable pin for that claim.
+    // -------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("should_return429_when_sameCallerExceedsCapacityOnAppointmentServiceReschedulePath")
+    void should_return429_when_sameCallerExceedsCapacityOnAppointmentServiceReschedulePath() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(
+                patchAppointmentServiceReschedule(UUID.randomUUID(), UUID.randomUUID()),
+                new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse secondResponse = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(
+                patchAppointmentServiceReschedule(UUID.randomUUID(), UUID.randomUUID()), secondResponse, secondChain);
+
+        assertThat(secondResponse.getStatus())
+                .as("PATCH .../services/{bookingId}/reschedule must be throttled on the write bucket")
+                .isEqualTo(429);
+        assertThat(secondResponse.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(secondChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_return429_when_sameClientExceedsCapacityOnAppointmentServiceCancelPath")
+    void should_return429_when_sameClientExceedsCapacityOnAppointmentServiceCancelPath() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(
+                patchAppointmentServiceCancel(UUID.randomUUID(), UUID.randomUUID()),
+                new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse secondResponse = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(
+                patchAppointmentServiceCancel(UUID.randomUUID(), UUID.randomUUID()), secondResponse, secondChain);
+
+        assertThat(secondResponse.getStatus())
+                .as("PATCH .../services/{bookingId}/cancel must be throttled on the write bucket")
+                .isEqualTo(429);
+        assertThat(secondResponse.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(secondChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_shareOneWriteBucket_when_sameCallerAlternatesWholeVisitAndPerItemReschedule")
+    void should_shareOneWriteBucket_when_sameCallerAlternatesWholeVisitAndPerItemReschedule() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(patchAppointmentReschedule(UUID.randomUUID()), new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse perItemResponse = new MockHttpServletResponse();
+        filter.doFilterInternal(
+                patchAppointmentServiceReschedule(UUID.randomUUID(), UUID.randomUUID()),
+                perItemResponse, new MockFilterChain());
+
+        assertThat(perItemResponse.getStatus())
+                .as("the whole-visit reschedule call above must already have exhausted the shared write bucket — "
+                        + "a caller cannot evade the budget by alternating whole-visit and per-item calls")
+                .isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("should_shareOneWriteBucket_when_sameClientAlternatesPerItemCancelAndPerItemReschedule")
+    void should_shareOneWriteBucket_when_sameClientAlternatesPerItemCancelAndPerItemReschedule() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(
+                patchAppointmentServiceCancel(UUID.randomUUID(), UUID.randomUUID()),
+                new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse rescheduleResponse = new MockHttpServletResponse();
+        filter.doFilterInternal(
+                patchAppointmentServiceReschedule(UUID.randomUUID(), UUID.randomUUID()),
+                rescheduleResponse, new MockFilterChain());
+
+        assertThat(rescheduleResponse.getStatus())
+                .as("both per-item write verbs must draw on the SAME shared write bucket")
+                .isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("should_notThrottle_when_pathEndsWithServicesSegmentOnly")
+    void should_notThrottle_when_pathEndsWithServicesSegmentOnly() throws Exception {
+        // Guards against a future over-broad prefix match: a path that ends with the bare
+        // /services/{bookingId} segment (no /decline, /reschedule, or /cancel verb suffix) must
+        // pass through unthrottled — selectRoute returns null for it.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID appointmentId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        MockHttpServletResponse first = new MockHttpServletResponse();
+        MockFilterChain firstChain = new MockFilterChain();
+        filter.doFilterInternal(patchAppointmentServiceNoVerb(appointmentId, bookingId), first, firstChain);
+        MockHttpServletResponse second = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(patchAppointmentServiceNoVerb(appointmentId, bookingId), second, secondChain);
+
+        assertThat(second.getStatus()).isNotEqualTo(429);
+        assertThat(secondChain.getRequest()).isNotNull();
     }
 
     @Test

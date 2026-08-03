@@ -11,6 +11,7 @@ import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -182,6 +183,125 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
                 .isEqualTo("DECLINED");
     }
 
+    /**
+     * Perf/QA audit F8b (cross-batch) — races a per-item CLIENT reschedule of leg0
+     * ({@link AppointmentTransitionService#rescheduleAppointmentItem}, phase 30.1/30.4 — genuinely
+     * NEW code) against a provider WHOLE-VISIT decline of the SAME visit
+     * ({@link AppointmentTransitionService#declineAppointment}), forcing both racers to attempt the
+     * visit header's lock at effectively the same instant via a {@code CyclicBarrier} rendezvous on
+     * {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule} (the reschedule
+     * item's NEW header-lock seam, phase 30.2) and
+     * {@link AppointmentTransitionService#lockHeaderForWholeVisitTransition} (the decline's existing
+     * seam) — exactly the same {@code @SpyBean} + {@code CyclicBarrier} technique the class-level
+     * test above uses, now pointed at the NEW per-item-reschedule lock instead of the per-leg-cancel
+     * one.
+     *
+     * <p><b>Coherent outcome regardless of race order.</b> The decline's header lock
+     * ({@code lockHeaderRegardlessOfStatus}) is UNCONDITIONAL — it always succeeds once acquired, so
+     * the decline HTTP call always returns {@code 204} whichever racer's lock statement runs first.
+     * The reschedule's header lock ({@code lockHeaderIfConfirmed}) is CONDITIONAL on the header still
+     * being {@code CONFIRMED} — so the reschedule HTTP call returns {@code 200} if it wins the lock
+     * race first (the header is still CONFIRMED when it locks), or {@code 409} if the decline commits
+     * first (the header is already DECLINED by the time reschedule's own lock attempt runs). Either
+     * way the header always ends DECLINED and BOTH legs always end DECLINED — leg0 either at its
+     * NEW (rescheduled) time (if reschedule won) or its ORIGINAL time (if decline won), never lost,
+     * never duplicated, never left CONFIRMED.
+     */
+    @Test
+    @DisplayName("per-item CLIENT reschedule of leg0 racing a provider WHOLE-VISIT decline of the SAME "
+            + "visit must not deadlock; the decline's effect always prevails in the terminal state "
+            + "(header + both legs end DECLINED), regardless of which racer wins the header lock first")
+    void should_serializeCleanlyWithCoherentFinalState_when_perItemRescheduleRacesWholeVisitDecline()
+            throws Exception {
+        Visit visit = createTwoServiceVisitLegs();
+        UUID appointmentId = visit.id();
+        UUID leg0 = childAt(appointmentId, 0);
+        UUID leg1 = childAt(appointmentId, 1);
+        OffsetDateTime originalLeg0Start = dbStartsAt(leg0);
+        OffsetDateTime newLeg0Start = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(14).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
+        String clientToken = visit.clientToken();
+        String providerToken = visit.providerToken();
+
+        CyclicBarrier bothRacersAtTheirHeaderLock = new CyclicBarrier(2);
+        doAnswer(invocation -> {
+            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            return invocation.callRealMethod();
+        }).when(appointmentTransitionService).lockHeaderForWholeVisitTransition(eq(appointmentId));
+        doAnswer(invocation -> {
+            bothRacersAtTheirHeaderLock.await(10, TimeUnit.SECONDS);
+            return invocation.callRealMethod();
+        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
+
+        CountDownLatch go = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(2);
+        AtomicReference<ResponseEntity<String>> respReschedule = new AtomicReference<>();
+        AtomicReference<ResponseEntity<String>> respDecline = new AtomicReference<>();
+
+        Thread.ofVirtual().start(() -> {
+            try {
+                go.await();
+                HttpHeaders headers = fixtures.bearerHeaders(clientToken);
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                String body = "{\"newStartsAt\":\"" + newLeg0Start + "\"}";
+                respReschedule.set(restTemplate.exchange(
+                        APPOINTMENTS_URL + "/" + appointmentId + "/services/" + leg0 + "/reschedule",
+                        HttpMethod.PATCH, new HttpEntity<>(body, headers), String.class));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+        Thread.ofVirtual().start(() -> {
+            try {
+                go.await();
+                HttpHeaders headers = fixtures.bearerHeaders(providerToken);
+                headers.setContentType(MediaType.APPLICATION_JSON);
+                respDecline.set(restTemplate.exchange(
+                        APPOINTMENTS_URL + "/" + appointmentId + "/decline", HttpMethod.PATCH,
+                        new HttpEntity<>("{}", headers), String.class));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+
+        go.countDown();
+        boolean finished = done.await(30, TimeUnit.SECONDS);
+
+        assertThat(finished).as("both racers must finish within 30s — no hang, no unbounded lock wait").isTrue();
+        assertThat(respDecline.get().getStatusCode())
+                .as("the whole-visit decline must ALWAYS succeed regardless of race order — body: %s",
+                        respDecline.get().getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(respReschedule.get().getStatusCode())
+                .as("the per-item reschedule must resolve to EXACTLY ONE of the two legal outcomes "
+                        + "for this race — body: %s", respReschedule.get().getBody())
+                .isIn(HttpStatus.OK, HttpStatus.CONFLICT);
+
+        assertThat(appointmentStatus(appointmentId))
+                .as("the decline's effect always prevails in the terminal header state")
+                .isEqualTo("DECLINED");
+        assertThat(dbStatus(leg0)).as("leg0 always ends DECLINED, whichever racer won the lock first")
+                .isEqualTo("DECLINED");
+        assertThat(dbStatus(leg1)).as("the untouched leg1 is also declined by the whole-visit transition")
+                .isEqualTo("DECLINED");
+
+        if (respReschedule.get().getStatusCode().equals(HttpStatus.OK)) {
+            assertThat(dbStartsAt(leg0).toInstant())
+                    .as("reschedule won the lock race FIRST and committed its move BEFORE decline's "
+                            + "fresh post-lock snapshot read it — leg0 must be DECLINED at its NEW time")
+                    .isEqualTo(newLeg0Start.toInstant());
+        } else {
+            assertThat(dbStartsAt(leg0).toInstant())
+                    .as("decline won the lock race FIRST — leg0 must be DECLINED at its ORIGINAL, "
+                            + "never-moved time")
+                    .isEqualTo(originalLeg0Start.toInstant());
+        }
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────────────────────────
 
     /** A created two-service CONFIRMED visit plus the owning client's and provider's tokens. */
@@ -223,6 +343,11 @@ class AppointmentCrossPathTransitionConcurrencyIT extends AbstractIntegrationTes
 
     private String dbStatus(UUID bookingId) {
         return jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    private OffsetDateTime dbStartsAt(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, bookingId);
     }
 
     private String appointmentStatus(UUID appointmentId) {

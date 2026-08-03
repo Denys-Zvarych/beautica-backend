@@ -1,23 +1,40 @@
 package com.beautica.booking.service;
 
+import com.beautica.auth.Role;
+import com.beautica.booking.dto.AppointmentDetailResponse;
+import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
+import com.beautica.booking.dto.AvailableSlotResponse;
+import com.beautica.booking.entity.Appointment;
+import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
+import com.beautica.common.exception.BookingElapsedException;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.master.entity.Master;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
+import com.beautica.user.User;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpStatus;
 
+import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
@@ -28,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -456,5 +474,440 @@ class AppointmentTransitionServiceTest {
                 .isEqualTo(com.beautica.booking.enums.BookingStatus.CONFIRMED);
         verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
         verify(bookingRepository, never()).saveAll(any());
+    }
+
+    // ── rescheduleAppointmentItem (phase 30.4) + assertNoSiblingOverlap (phase 30.3) ────────────
+
+    private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
+
+    private Master master;
+    private MasterServiceAssignment msa;
+    private User itemClient;
+    private UUID masterId;
+    private UUID masterServiceId;
+    private UUID clientId;
+
+    /** A CONFIRMED item sharing the shared master/masterService fixture, unless overridden. */
+    private Booking confirmedItem(UUID id, OffsetDateTime startsAt, OffsetDateTime endsAt) {
+        return Booking.builder()
+                .id(id)
+                .client(itemClient)
+                .master(master)
+                .masterService(msa)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(startsAt)
+                .endsAt(endsAt)
+                .priceAtBooking(new BigDecimal("500.00"))
+                .durationMinutesAtBooking((int) java.time.Duration.between(startsAt, endsAt).toMinutes())
+                .bufferMinutesAtBooking(0)
+                .build();
+    }
+
+    private Booking terminalItem(UUID id, BookingStatus status, OffsetDateTime startsAt, OffsetDateTime endsAt) {
+        Booking b = confirmedItem(id, startsAt, endsAt);
+        b.setStatus(status);
+        return b;
+    }
+
+    private void setIdViaReflection(Object target, UUID id) {
+        try {
+            var field = findIdField(target.getClass());
+            field.setAccessible(true);
+            field.set(target, id);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private java.lang.reflect.Field findIdField(Class<?> clazz) throws NoSuchFieldException {
+        Class<?> current = clazz;
+        while (current != null) {
+            try {
+                return current.getDeclaredField("id");
+            } catch (NoSuchFieldException e) {
+                current = current.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException("id");
+    }
+
+    private void setUpRescheduleItemFixtures() {
+        masterId = UUID.randomUUID();
+        masterServiceId = UUID.randomUUID();
+        clientId = UUID.randomUUID();
+        master = Master.builder().id(masterId).build();
+        msa = MasterServiceAssignment.builder().id(masterServiceId).build();
+        itemClient = new User("client@example.com", "hash", Role.CLIENT, "First", "Last", "+380501234567");
+        setIdViaReflection(itemClient, clientId); // User has no @Builder — id needs reflection
+    }
+
+    /** Stubs the single-service schedule-fit oracle so {@code newStartsAt} resolves to an on-schedule slot. */
+    private void stubItemSlotAvailable(OffsetDateTime newStartsAt) {
+        AvailableSlotResponse slot = new AvailableSlotResponse(
+                newStartsAt.atZoneSameInstant(KYIV), newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(masterServiceId)))
+                .thenReturn(List.of(slot));
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — CLIENT happy path: moves ONLY the target row, leaves "
+            + "the sibling byte-for-byte unchanged, locks header→client→master in order, notifies "
+            + "referencing the MOVED CHILD, and never collapses the header")
+    void should_moveOnlyTargetAndLeaveSiblingUntouched_when_clientReschedulesConfirmedItem() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID siblingId = UUID.randomUUID();
+        OffsetDateTime siblingStart = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking sibling = confirmedItem(siblingId, siblingStart, siblingStart.plusHours(1));
+        Booking target = confirmedItem(targetId, siblingStart.plusHours(2), siblingStart.plusHours(3));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+        AppointmentDetailResponse enriched = org.mockito.Mockito.mock(AppointmentDetailResponse.class);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(sibling, target));
+        stubItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(target)).thenReturn(target);
+        when(appointmentService.enrich(eq(appointment), any())).thenReturn(enriched);
+
+        AppointmentDetailResponse result = appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req);
+
+        assertThat(result).isSameAs(enriched);
+        assertThat(target.getStartsAt()).isEqualTo(newStartsAt);
+        assertThat(sibling.getStartsAt())
+                .as("the sibling must keep its window byte-for-byte unchanged (L2)")
+                .isEqualTo(siblingStart);
+        verify(outboxService).enqueueBookingRescheduled(targetId, false);
+        verify(appointmentRepository, never()).collapseHeaderIfNoConfirmedSiblingsRemain(any(), any(), any(), any());
+
+        InOrder order = inOrder(appointmentRepository, bookingRepository);
+        order.verify(appointmentRepository).lockHeaderIfConfirmed(appointmentId);
+        order.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
+        order.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        order.verify(bookingRepository).saveAndFlush(target);
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — PROVIDER-initiated move notifies with initiatedByProvider=true")
+    void should_notifyProviderInitiated_when_providerReschedulesConfirmedItem() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking target = confirmedItem(targetId, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+        stubItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(target)).thenReturn(target);
+        when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
+
+        appointmentTransitionService.rescheduleAppointmentItem(actorId, Role.SALON_OWNER, appointmentId, targetId, req);
+
+        verify(outboxService).enqueueBookingRescheduled(targetId, true);
+        // Provider path never touches enforceCanManageAppointment's return value here — this test
+        // stubs it as a no-op via the default Mockito void behaviour (authorized).
+        verify(authz).enforceCanManageAppointment(actorId, appointmentId);
+    }
+
+    @Test
+    @DisplayName("assertNoSiblingOverlap (phase 30.3) — moving the target onto a CONFIRMED sibling's "
+            + "window is a 409, and NOTHING is mutated or locked")
+    void should_throw409_when_targetWouldOverlapConfirmedSibling() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID siblingId = UUID.randomUUID();
+        OffsetDateTime siblingStart = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking sibling = confirmedItem(siblingId, siblingStart, siblingStart.plusHours(1));
+        OffsetDateTime targetStart = siblingStart.plusHours(3);
+        Booking target = confirmedItem(targetId, targetStart, targetStart.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        // Requested new window lands EXACTLY on the sibling's window — a strict overlap.
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(siblingStart);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(sibling, target));
+        stubItemSlotAvailable(siblingStart);
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(target.getStartsAt()).isEqualTo(targetStart);
+        assertThat(sibling.getStartsAt()).isEqualTo(siblingStart);
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("assertNoSiblingOverlap (phase 30.3) — landing EXACTLY on a sibling's boundary "
+            + "(half-open touch) is legal, not an overlap")
+    void should_allow_when_targetLandsExactlyOnSiblingBoundary() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID siblingId = UUID.randomUUID();
+        OffsetDateTime siblingStart = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        OffsetDateTime siblingEnd = siblingStart.plusHours(1);
+        Booking sibling = confirmedItem(siblingId, siblingStart, siblingEnd);
+        Booking target = confirmedItem(targetId, siblingStart.plusHours(5), siblingStart.plusHours(6));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        // New window starts EXACTLY where the sibling ends — legal back-to-back touch.
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(siblingEnd);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(sibling, target));
+        stubItemSlotAvailable(siblingEnd);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(target)).thenReturn(target);
+        when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
+
+        appointmentTransitionService.rescheduleAppointmentItem(clientId, Role.CLIENT, appointmentId, targetId, req);
+
+        assertThat(target.getStartsAt()).isEqualTo(siblingEnd);
+    }
+
+    @Test
+    @DisplayName("assertNoSiblingOverlap (phase 30.3) — a DECLINED sibling's released slot may be "
+            + "moved into (terminal exemption)")
+    void should_allow_when_targetOverlapsOnlyADeclinedSibling() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID siblingId = UUID.randomUUID();
+        OffsetDateTime siblingStart = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking declinedSibling = terminalItem(siblingId, BookingStatus.DECLINED, siblingStart, siblingStart.plusHours(6));
+        Booking target = confirmedItem(targetId, siblingStart.plusHours(10), siblingStart.plusHours(11));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        // New window lands INSIDE the declined sibling's released window — allowed, it is terminal.
+        OffsetDateTime newStartsAt = siblingStart.plusHours(1);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(declinedSibling, target));
+        stubItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(target)).thenReturn(target);
+        when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
+
+        appointmentTransitionService.rescheduleAppointmentItem(clientId, Role.CLIENT, appointmentId, targetId, req);
+
+        assertThat(target.getStartsAt()).isEqualTo(newStartsAt);
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — a non-CONFIRMED header (lockAppointmentHeaderBeforeItemReschedule "
+            + "returns false) IS a 409 on this appointment-scoped route (phase 30.1 D4, opposite of the "
+            + "legacy booking-scoped route's phase 30.2 D5)")
+    void should_throw409_when_headerNoLongerConfirmed() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking target = confirmedItem(targetId, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+        stubItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — bookingId is not a child of appointmentId is a 404, "
+            + "reached only AFTER the caller is already authorized on the visit")
+    void should_throwNotFound_when_bookingIdIsNotAChildOfAppointment() {
+        setUpRescheduleItemFixtures();
+        UUID realChild = UUID.randomUUID();
+        UUID foreignBookingId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking item = confirmedItem(realChild, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1));
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(item));
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, foreignBookingId, req))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — PROVIDER without authority over the visit is rejected "
+            + "BEFORE any entity load")
+    void should_throwForbidden_when_providerLacksAuthorityOverVisit() {
+        setUpRescheduleItemFixtures();
+        UUID actorId = UUID.randomUUID();
+        UUID targetId = UUID.randomUUID();
+        doThrow(new ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageAppointment(actorId, appointmentId);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(
+                OffsetDateTime.parse("2026-08-10T09:00:00Z"));
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                actorId, Role.SALON_OWNER, appointmentId, targetId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(appointmentRepository, never()).findById(any());
+        verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — CLIENT on a foreign visit is rejected BEFORE any entity load "
+            + "(uniform 403, no existence oracle)")
+    void should_throwForbidden_when_clientDoesNotOwnVisit() {
+        setUpRescheduleItemFixtures();
+        UUID foreignClientId = UUID.randomUUID();
+        UUID targetId = UUID.randomUUID();
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(foreignClientId));
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(
+                OffsetDateTime.parse("2026-08-10T09:00:00Z"));
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(appointmentRepository, never()).findById(any());
+        verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — security audit F5 tripwire: the CLIENT owns the VISIT "
+            + "(Appointment.client_id matches) but the TARGET child's OWN client_id disagrees — a "
+            + "DB-unenforced invariant violation — rejected with the SAME uniform 403, and NOTHING is "
+            + "locked or mutated")
+    void should_throwForbidden_when_targetChildClientDisagreesWithVisitOwner() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        User mismatchedClient = new User(
+                "mismatch@example.com", "hash", Role.CLIENT, "Mis", "Match", "+380509999999");
+        setIdViaReflection(mismatchedClient, UUID.randomUUID());
+        Booking target = Booking.builder()
+                .id(targetId)
+                .client(mismatchedClient)
+                .master(master)
+                .masterService(msa)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(start)
+                .endsAt(start.plusHours(1))
+                .priceAtBooking(new BigDecimal("500.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .build();
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1));
+
+        // The VISIT-level guard passes — clientId genuinely owns appointmentId.
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(target.getStartsAt())
+                .as("the mismatched child must be completely untouched")
+                .isEqualTo(start);
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — target item already terminal (not CONFIRMED) is a 409")
+    void should_throw409_when_targetItemNotConfirmed() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking target = terminalItem(targetId, BookingStatus.DECLINED, start, start.plusHours(1));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1));
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — CLIENT moving an already-elapsed target item (per-row "
+            + "guard, phase 30.1 D6) is a 409, even though a sibling is still future")
+    void should_throwBookingElapsed_when_clientReschedulesElapsedTargetItem() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID futureSiblingId = UUID.randomUUID();
+        // "now" is 2026-07-26T10:00:00Z (the class-level fixed clock) — this target already ended.
+        OffsetDateTime elapsedStart = Instant.parse("2026-07-26T08:00:00Z").atOffset(ZoneOffset.UTC);
+        Booking target = confirmedItem(targetId, elapsedStart, elapsedStart.plusHours(1));
+        Booking futureSibling = confirmedItem(futureSiblingId,
+                OffsetDateTime.parse("2026-08-10T09:00:00Z"), OffsetDateTime.parse("2026-08-10T10:00:00Z"));
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(
+                OffsetDateTime.parse("2026-08-11T09:00:00Z"));
+
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(List.of(target, futureSibling));
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOf(BookingElapsedException.class);
+
+        verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
+        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
     }
 }
