@@ -971,6 +971,24 @@ public class BookingService {
      * save. Deliberately does NOT touch any cache and does NOT enqueue any notification — both are
      * entirely the caller's responsibility, so the two callers above can differ in how (and how
      * often) they evict and whether they notify at all, never in what the transition itself does.
+     *
+     * <p><b>Freshness re-check (G5, HIGH — same defect class as G4, closing the last of the three
+     * standalone-booking provider transitions).</b> {@link #assertNotAppointmentChild} above
+     * guarantees this is always a STANDALONE booking, so — exactly like {@link
+     * #cancelBooking(UUID, Booking, CancelBookingRequest)} and {@link #rescheduleBooking}'s
+     * standalone branches before G4 — there is no header lock to serialize this write against a
+     * concurrent {@link #cancelBooking} of the SAME row. {@code assertTransition} just above only
+     * proves {@code booking.getStatus() == CONFIRMED} on the snapshot {@code findByIdWithFullGraph}
+     * loaded at the top of this method; it cannot see a client cancel that commits CANCELLED in the
+     * gap between that load and this method's own save below. Before this fix, this method would
+     * then unconditionally overwrite that CANCELLED row with DECLINED, discarding {@code
+     * clientCancellationNote} — an asymmetric exploit, since G4 already protects {@link
+     * #cancelBooking} when it is the SECOND writer (its own {@code isStillConfirmed} recheck), but
+     * nothing protected the reverse direction: a provider could fire decline the instant a
+     * cancellation looked imminent and win by committing last. Routed through {@link
+     * #isStillConfirmed} — the SAME package-private seam G4 introduced, reused rather than
+     * duplicated — because {@code Booking} carries no lock this method could hang a rendezvous off
+     * instead (see that method's Javadoc).
      */
     private Booking declineBookingCore(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Fix M4: require a reason, consistent with notCompleteBooking
@@ -993,6 +1011,13 @@ public class BookingService {
         // Product decision reversal: decline is no longer future-only — a provider may decline a
         // CONFIRMED booking at any time, elapsed or not (e.g. the client never showed up and the
         // provider simply wants to close it out via decline rather than a separate no-show action).
+
+        // Freshness re-check (G5) — see this method's own Javadoc. Must run immediately before the
+        // mutation below: assertTransition above only proves CONFIRMED on the stale pre-load
+        // snapshot, not on the current row.
+        if (!isStillConfirmed(booking.getId())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
+        }
         booking.setStatus(BookingStatus.DECLINED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
@@ -1001,6 +1026,19 @@ public class BookingService {
         return bookingRepository.save(booking);
     }
 
+    /**
+     * Provider-initiated completion of an already-{@code CONFIRMED} booking.
+     *
+     * <p><b>Freshness re-check (G5, HIGH — same defect class as G4/G5 above; see {@link
+     * #declineBookingCore}'s Javadoc for the full rationale, which applies here verbatim).</b>
+     * {@code assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.COMPLETED)} below
+     * fixes this method's source state as {@code CONFIRMED} — the ONLY status it ever transitions
+     * from — so {@link #isStillConfirmed}, the exact predicate {@link #cancelBooking} and {@link
+     * #rescheduleBooking} already recheck against, is the correct freshness probe here too, not a
+     * different one. Without it, this method could commit COMPLETED over a booking a concurrent
+     * client {@link #cancelBooking} already moved to CANCELLED in the gap between this method's
+     * {@code findByIdWithFullGraph} load and its own save.
+     */
     @Transactional
     public BookingResponse completeBooking(UUID actorUserId, UUID bookingId) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
@@ -1020,6 +1058,13 @@ public class BookingService {
         // Phase 27.1: complete unlocks once the appointment has begun/elapsed (now >= startsAt) —
         // no requirement that it has ENDED. Checked AFTER the status guard, same ordering as decline.
         BookingTemporalGuard.assertElapsedForComplete(booking.getStartsAt(), clock);
+
+        // Freshness re-check (G5) — see this method's own Javadoc. Must run immediately before the
+        // mutation below: assertTransition above only proves CONFIRMED on the stale pre-load
+        // snapshot, not on the current row.
+        if (!isStillConfirmed(booking.getId())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
+        }
         booking.setStatus(BookingStatus.COMPLETED);
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
@@ -1036,6 +1081,17 @@ public class BookingService {
         return BookingResponse.from(saved, resolveNow());
     }
 
+    /**
+     * Provider-initiated no-show closure of an already-{@code CONFIRMED} booking.
+     *
+     * <p><b>Freshness re-check (G5, HIGH — same defect class as G4/G5 above; see {@link
+     * #declineBookingCore}'s Javadoc for the full rationale).</b> {@code assertTransition(booking,
+     * BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED)} below fixes this method's source state
+     * as {@code CONFIRMED}, so {@link #isStillConfirmed} is the correct freshness probe here too —
+     * without it, this method could commit NOT_COMPLETED over a booking a concurrent client {@link
+     * #cancelBooking} already moved to CANCELLED in the gap between this method's {@code
+     * findByIdWithFullGraph} load and its own save.
+     */
     @Transactional
     public BookingResponse notCompleteBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle),
@@ -1058,6 +1114,13 @@ public class BookingService {
             throw new BusinessException("Cancellation reason required");
         }
         assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.NOT_COMPLETED);
+
+        // Freshness re-check (G5) — see this method's own Javadoc. Must run immediately before the
+        // mutation below: assertTransition above only proves CONFIRMED on the stale pre-load
+        // snapshot, not on the current row.
+        if (!isStillConfirmed(booking.getId())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
+        }
         booking.setStatus(BookingStatus.NOT_COMPLETED);
         booking.setCancellationReason(req.cancellationReason());
         booking.setProviderComment(BookingComments.normalize(req.comment()));
@@ -1128,7 +1191,54 @@ public class BookingService {
      * redundant repeat of the visit-level check that caller already made.
      *
      * <p>Preserves the original method's exact guard ORDER: ownership (403) → CONFIRMED-only status
-     * (400) → read-only-after-elapse (409) → the two-phase header lock/collapse → mutation.
+     * (400) → read-only-after-elapse (409) → the two-phase header lock/collapse → freshness
+     * re-check (now unconditional — appointment children AND standalone bookings alike, G4) →
+     * mutation.
+     *
+     * <p><b>Freshness re-check (F1, HIGH, cycle-6 audit 2026-08-03; widened to standalone bookings by
+     * G4, cycle-7 audit 2026-08-03).</b> Immediately after the header lock attempt above and BEFORE
+     * {@code booking}'s own status is mutated, this method re-verifies {@code booking} via
+     * {@link BookingRepository#existsConfirmedById} — a scalar, entity-manager-bypassing probe,
+     * never a second entity load. {@code booking} was loaded BEFORE the header lock (if any) existed
+     * to protect that read, so the lock alone only proves the HEADER is still CONFIRMED, not that
+     * THIS leg still is: a per-item reschedule of the SAME leg (fired near-concurrently at the
+     * sibling per-item endpoint) leaves the header CONFIRMED — a sibling remains — while moving
+     * {@code booking} to a new time without changing its status. {@code Booking} now carries
+     * {@code @DynamicUpdate} (G1), so this save's own dirty-column set is {@code status}/
+     * {@code cancellationReason}/{@code clientCancellationNote} only — it can no longer resurrect a
+     * concurrent reschedule's stale in-memory time back over the fresh row, or vice versa. What
+     * remains, and what this check still exists to reject, is completing a cancel whose CONFIRMED
+     * precondition already lapsed: a booking a concurrent operation already moved to a different
+     * terminal state (or, on the standalone path below, already rescheduled) would otherwise be
+     * silently re-declared CANCELLED, discarding whatever the other operation just did, even though
+     * no column would be corrupted in the process. Runs regardless of {@code headerWasLocked} — a
+     * header that already left CONFIRMED (some whole-visit transition landed first) means
+     * {@code booking} itself was already moved to that terminal state, which the
+     * {@code current != CONFIRMED} guard above — evaluated on the SAME pre-lock stale snapshot —
+     * could not have caught either. A mismatch aborts with the same 409 shape used elsewhere in this
+     * class for a concurrently-changed booking.
+     *
+     * <p><b>Standalone booking ({@code appointmentId == null}): now covered too (G4, HIGH, cycle-7
+     * audit 2026-08-03 — fixed here, REVERSES this paragraph's pre-G1 conclusion).</b> Before G1,
+     * this overload deliberately skipped the recheck for a standalone booking: with no
+     * {@code @DynamicUpdate}, a bare scalar recheck with no lock to anchor it could only narrow, not
+     * close, the TOCTOU window against a concurrent {@link #rescheduleBooking} of the same
+     * standalone booking — not worth an extra round trip on the common case. G1 changes the
+     * calculus: {@code Booking}'s {@code @DynamicUpdate} means the two operations' column sets
+     * (status/reason/note vs. starts_at/ends_at) are now disjoint, so this cancel can no longer
+     * clobber a concurrent reschedule's new time (or be clobbered by it) — the column-corruption
+     * concern this paragraph originally worried about is gone. But a DIFFERENT, real gap survives
+     * G1: {@link #rescheduleBooking}'s own standalone branch (see its Javadoc) can return a
+     * misleading {@code 200}/{@code CONFIRMED} response and enqueue a {@code BOOKING_RESCHEDULED}
+     * notification for a booking THIS method concurrently cancelled moments earlier, because
+     * rescheduling never re-verified the booking was still CONFIRMED right before its own save. That
+     * asymmetric exposure lives entirely on the reschedule side (see that method's Javadoc for why
+     * cancel-wins-last is comparatively benign — a terminal, CANCELLED record echoing a stale time is
+     * not actionable), but this recheck is now unconditional on THIS method too, for the same reason
+     * G2 made {@link #rescheduleBooking}'s recheck unconditional: symmetry with the appointment-child
+     * branch above removes any asymmetric "which direction is exploitable" argument for the next
+     * reader, at the cost of one extra, cheap, indexed scalar query on every cancel — negligible next
+     * to the round trips this method already makes.
      */
     private BookingResponse cancelBooking(UUID clientUserId, Booking booking, CancelBookingRequest req) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle):
@@ -1160,6 +1270,16 @@ public class BookingService {
         UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
         boolean headerWasLocked = appointmentId != null
                 && appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId);
+
+        // Freshness re-check (F1, HIGH, cycle-6 audit 2026-08-03; widened to standalone bookings by
+        // G4, cycle-7 audit 2026-08-03) — see this method's own "Freshness re-check" / "Standalone
+        // booking" Javadoc paragraphs above. Unconditional: both an appointment child and a
+        // standalone booking are covered, mirroring rescheduleBooking's identical widening. Routed
+        // through isStillConfirmed (G4) — the spy-able seam a standalone-booking concurrency IT
+        // needs, since this path has no lock call to hang a rendezvous off instead.
+        if (!isStillConfirmed(booking.getId())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
+        }
 
         booking.setStatus(BookingStatus.CANCELLED);
         // cancellationReason is guaranteed non-null by @NotNull on CancelBookingRequest
@@ -1315,6 +1435,51 @@ public class BookingService {
      * appointment-scoped route, phase 30.4, treats it as a 409 instead, because there the header is a
      * named part of the request).
      *
+     * <p><b>Freshness re-check (G2, HIGH, cycle-7 audit 2026-08-03 — fixed here).</b> This method is
+     * the LEGACY {@code PATCH /bookings/{id}/reschedule} route, reachable for an appointment child by
+     * BOTH the CLIENT and PROVIDER paths (see {@code BookingController} — unlike
+     * {@link #declineBooking}/{@link #completeBooking}/{@link #notCompleteBooking}, this path never
+     * calls {@link #assertNotAppointmentChild}). Before this fix it took the header lock above but
+     * never re-verified {@code booking} itself afterward — the one per-item mutator in this class
+     * missing the freshness re-check every OTHER per-item path (this class's
+     * {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} and
+     * {@link AppointmentTransitionService#declineAppointmentItem}/
+     * {@link AppointmentTransitionService#rescheduleAppointmentItem}) already has. Exploit: a
+     * provider declines leg0 via the per-item route (commits {@code DECLINED}); a concurrent call to
+     * THIS method for the same leg was blocked on the header lock, acquires it moments later (the
+     * header is still CONFIRMED — a sibling remains), and — pre-fix — proceeded straight to its own
+     * save with no check that {@code booking} itself was still CONFIRMED. {@code Booking} now carries
+     * {@code @DynamicUpdate} (G1), so that save would only touch {@code starts_at}/{@code ends_at}
+     * and could not resurrect the DECLINED status at the column level — but it would still silently
+     * hand the leg a brand-new time while leaving it DECLINED, an incoherent result the caller has no
+     * way to detect from a 200 response. Immediately after the header lock call above, this method
+     * now re-verifies {@code booking} via {@link BookingRepository#existsConfirmedById} — the same
+     * scalar, entity-manager-bypassing probe every sibling per-item path uses — and aborts with a
+     * clean 409 on a mismatch, exactly mirroring {@link #cancelBooking(UUID, Booking,
+     * CancelBookingRequest)}'s identical guard for the identical class of write.
+     *
+     * <p><b>Unconditional, including standalone bookings (G4, HIGH, cycle-7 audit 2026-08-03 —
+     * widened here).</b> Unlike the header LOCK two lines above (which only ever applies to an
+     * appointment child — a standalone booking has no header), this recheck runs for EVERY
+     * reschedule, appointment child or not. The standalone case is the more important half of this
+     * widening: a standalone booking can race against {@link #cancelBooking(UUID, Booking,
+     * CancelBookingRequest)} of the SAME booking with NO lock at all protecting either side (there is
+     * no header to lock, and neither method acquires a row-level lock keyed on the booking itself —
+     * the client/master advisory locks below protect SLOT conflicts, not this row's own status).
+     * {@code @DynamicUpdate} (G1) means this reschedule's save touches only
+     * {@code starts_at}/{@code ends_at} and cannot resurrect a concurrent cancel's {@code CANCELLED}
+     * status at the column level — but without this check, the reschedule could still complete and
+     * return a {@code 200} response showing {@code CONFIRMED} at the new time, and enqueue a
+     * {@code BOOKING_RESCHEDULED} notification to the other party, for a booking a concurrent cancel
+     * already terminated moments earlier: a materially misleading response/notification, even though
+     * no column is corrupted. The symmetric direction (cancel landing last against a reschedule that
+     * already committed) is comparatively benign — the cancelled record simply echoes a now-stale
+     * time, which is not actionable on a terminal booking — but this check closes BOTH directions
+     * uniformly rather than leaving an asymmetric, direction-dependent gap for the next reader to
+     * puzzle over. Zero extra cost beyond the one indexed scalar query: no lock is skipped for the
+     * standalone case (there never was one to skip), so this recheck is genuinely the ONLY guard
+     * standalone reschedule now has against a concurrent standalone cancel.
+     *
      * @param actorUserId the authenticated actor (from the security principal, never the body)
      * @param actorRole   the actor's role, resolved by the controller from the JWT
      * @param bookingId   the booking to move
@@ -1377,6 +1542,17 @@ public class BookingService {
         UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
         if (appointmentId != null) {
             appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId);
+        }
+
+        // Freshness re-check (G2, HIGH, cycle-7 audit 2026-08-03; widened to standalone bookings by
+        // G4, cycle-7 audit 2026-08-03) — see this method's own "Freshness re-check" / "Unconditional,
+        // including standalone bookings" Javadoc paragraphs above. Unconditional: this is the ONLY
+        // guard a standalone reschedule has against a concurrent standalone cancel (there is no lock
+        // above to short-circuit alongside — the header lock is appointment-only, but this recheck
+        // is not). Routed through isStillConfirmed (G4) — see that method's Javadoc for why a
+        // standalone-booking concurrency IT needs this seam specifically.
+        if (!isStillConfirmed(booking.getId())) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
         }
 
         // Same critical section as doCreateBooking, in the same client-then-master order
@@ -1596,6 +1772,40 @@ public class BookingService {
         outboxService.enqueueStatusChanged(saved.getId());
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
         return BookingResponse.from(saved, resolveNow());
+    }
+
+    /**
+     * Thin, package-private, {@code @SpyBean}-able wrapper around
+     * {@link BookingRepository#existsConfirmedById} — the freshness re-check
+     * {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} and {@link #rescheduleBooking}
+     * run immediately before their own terminal save (G2/G4, cycle-7 audit 2026-08-03), and which
+     * {@link #declineBookingCore}, {@link #completeBooking} and {@link #notCompleteBooking} now
+     * run too (G5 — same defect class, closing the reverse direction of the race G4 only
+     * half-covered: G4 protected {@code cancelBooking} when it lands SECOND, but nothing protected
+     * these three provider transitions from unconditionally overwriting an already-CANCELLED row
+     * when THEY land second instead).
+     *
+     * <p>Mirrors the exact precedent {@code AppointmentTransitionService
+     * #lockAppointmentHeaderBeforeItemDecline} sets for the identical problem: Mockito cannot
+     * {@code callRealMethod()} on a Spring Data JPA repository's dynamically-proxied interface
+     * method (confirmed failure mode — {@code MockitoException: Cannot call abstract real method
+     * on java object!} — see that method's Javadoc and
+     * {@code AppointmentCrossPathTransitionConcurrencyIT}'s class Javadoc for the transcript), so a
+     * bare forwarding method on the concrete, CGLIB-spyable {@code BookingService} bean is the seam
+     * a concurrency test needs to pause ONE racer mid-transaction — after it has loaded the row but
+     * before this recheck runs — while the OTHER racer commits. This is the ONLY such seam the
+     * standalone-booking path has: unlike the appointment-child paths, there is no lock call here to
+     * hang a rendezvous off instead (that absence is exactly what G4 is about — see
+     * {@link #rescheduleBooking}'s "Unconditional, including standalone bookings" Javadoc paragraph).
+     *
+     * <p>{@code cancelBooking}/{@code rescheduleBooking} had no behavioural change when they were
+     * routed through this wrapper (both previously called {@link
+     * BookingRepository#existsConfirmedById} directly) — but {@code declineBookingCore}/{@code
+     * completeBooking}/{@code notCompleteBooking} calling it (G5) IS a behavioural change: those
+     * three previously made no freshness check at all.
+     */
+    boolean isStillConfirmed(UUID bookingId) {
+        return bookingRepository.existsConfirmedById(bookingId);
     }
 
     /**

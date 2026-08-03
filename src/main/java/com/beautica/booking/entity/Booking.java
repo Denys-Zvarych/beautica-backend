@@ -26,12 +26,12 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.DynamicUpdate;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
-@Entity
 @Table(
         name = "bookings",
         indexes = {
@@ -124,6 +124,44 @@ import java.util.UUID;
                 @Index(name = "idx_bookings_appointment", columnList = "appointment_id")
         }
 )
+// Root-cause fix (G1, cycle-7 audit 2026-08-03) for the entity-staleness/terminal-state-
+// resurrection defect class the F1 freshness rechecks (BookingRepository#existsConfirmedById,
+// #findConfirmedIdsByAppointmentId) treat symptomatically throughout this package. Without
+// @DynamicUpdate, Hibernate's default UPDATE writes EVERY mapped column from the in-memory
+// snapshot, regardless of which fields the current transaction actually touched — so a
+// status-only write (cancel/decline/not-complete) also re-writes startsAt/endsAt from its
+// pre-transaction snapshot, and a time-only write (reschedule) also re-writes status. Two
+// concurrent writers of the SAME row, each racing to save a full snapshot taken before the
+// other's commit, can therefore have the LOSER's stale columns silently overwrite the WINNER's
+// fresh ones on unrelated fields — a status-changing write "resurrecting" a status the other
+// writer already moved past, or a status-changing write clobbering a reschedule's new time back
+// to the old one. @DynamicUpdate makes Hibernate compute the actual dirty-property set at flush
+// time and include ONLY those columns in the UPDATE, so a cancel's UPDATE never mentions
+// starts_at/ends_at and a reschedule's UPDATE never mentions status — the two are now
+// column-disjoint and cannot clobber each other regardless of commit order.
+//
+// This does NOT replace the F1 freshness rechecks scattered through BookingService /
+// AppointmentTransitionService — it changes what a LOST race looks like, from a silent partial
+// overwrite to a clean, retryable 409. The rechecks still exist to reject the operation whose
+// precondition (the target being CONFIRMED) is already stale by the time its own write would
+// run; @DynamicUpdate is what makes the write that DOES proceed safe to interleave on disjoint
+// columns even without a recheck (see the standalone-booking analysis in BookingService, where
+// this is now the ONLY guard on that path). See each recheck's own Javadoc
+// ("carries no @DynamicUpdate" — now stale prose describing the pre-fix world) for the exploit
+// each one independently closes.
+//
+// Precedent: User.java:22 already carries this annotation for the analogous reason on that
+// entity. Verified against jakarta.persistence lifecycle callbacks (none in this class or in
+// AuditableEntity — @CreationTimestamp/@UpdateTimestamp are Hibernate-managed value generators,
+// not @PrePersist/@PreUpdate hooks, and updatedAt's regenerated value does not widen the affected
+// column set) and against the V18/V113 no_overlapping_bookings GIST EXCLUDE constraint (Postgres
+// re-validates an EXCLUDE constraint against whatever the row's post-UPDATE column values are,
+// which is correct regardless of whether a given UPDATE statement re-asserted a column's existing
+// value or omitted it — omitting an unchanged column can never make the constraint see a
+// DIFFERENT value than it would have seen otherwise, so a narrower column list cannot weaken the
+// constraint's coverage).
+@Entity
+@DynamicUpdate
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor

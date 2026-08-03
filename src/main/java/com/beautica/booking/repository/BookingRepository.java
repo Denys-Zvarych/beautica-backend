@@ -15,6 +15,7 @@ import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
@@ -854,6 +855,84 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<BookingCompletionAccess> findAllCompletionAccessByAppointmentId(
             @Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Scalar, entity-manager-bypassing projection of the CONFIRMED subset of an appointment's
+     * chained items — the post-lock freshness re-check
+     * {@code AppointmentTransitionService#rescheduleAppointment} runs immediately after acquiring
+     * the header lock (cycle-5 audit finding 1, 2026-08-03) and BEFORE mutating its own target
+     * items, whose entities were necessarily loaded (by {@code resolveVisitForClientReschedule}/
+     * {@code resolveVisitForProviderReschedule}) BEFORE that lock existed to protect the read.
+     *
+     * <p><b>Why a bare {@code b.id} projection, never {@code SELECT b}.</b> The caller's target
+     * items are already managed in the SAME persistence context. An entity-returning query for the
+     * same ids would hand back those SAME cached Java instances from the identity map rather than
+     * fresh column values — Hibernate never overwrites an already-managed entity's fields from a
+     * later query's resultset — mirroring {@link #findAllCompletionAccessByAppointmentId}'s and
+     * {@code AppointmentRepository#findClientIdById}'s identical non-poisoning rationale. A scalar
+     * projection never touches the entity manager, so it cannot be poisoned by (or poison) an
+     * earlier or later load of the same rows.
+     *
+     * <p>{@code Booking} now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so a
+     * plain {@code save()} of a stale, still-{@code CONFIRMED}-in-memory item no longer risks
+     * writing back a concurrently-committed terminal status — Hibernate only includes the columns
+     * this call's own transaction actually dirtied. This check therefore no longer exists to
+     * prevent a silent resurrection; it exists so a stale item is rejected with a clean, retryable
+     * 409 INSTEAD OF proceeding to move an item whose CONFIRMED precondition already lapsed — the
+     * caller compares this result against its own target ids and aborts on any mismatch rather
+     * than silently completing a transition the caller no longer has authority to make (the
+     * concurrent write already resolved this item to a different terminal state).
+     *
+     * @return the ids of {@code appointmentId}'s chained items that are, AS OF THIS CALL,
+     *         genuinely still {@code CONFIRMED} — empty if the appointment has no such items
+     */
+    @Query("""
+            SELECT b.id FROM Booking b
+             WHERE b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    Set<UUID> findConfirmedIdsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Scalar, entity-manager-bypassing CONFIRMED-status probe for exactly ONE booking id — the
+     * per-ITEM counterpart of {@link #findConfirmedIdsByAppointmentId}, used by the three per-item
+     * write paths that mutate a single already-loaded child row after taking the appointment
+     * header lock: {@code AppointmentTransitionService#rescheduleAppointmentItem},
+     * {@code AppointmentTransitionService#declineAppointmentItem}, and
+     * {@code BookingService#cancelBooking(UUID, Booking, CancelBookingRequest)} (F1, HIGH, cycle-6
+     * audit 2026-08-03 — closes the entity-staleness/terminal-state-resurrection defect class
+     * {@code rescheduleAppointment}'s own post-lock recheck already closed for the whole-visit
+     * path).
+     *
+     * <p><b>Why a bare boolean, never {@code SELECT b}.</b> Same non-poisoning rationale as
+     * {@link #findConfirmedIdsByAppointmentId}: each of the three callers' target {@code Booking}
+     * is already managed in the SAME persistence context, loaded (necessarily) BEFORE the header
+     * lock existed to protect that read. An entity-returning query for the same id would hand back
+     * that SAME cached instance from the identity map rather than fresh column values — Hibernate
+     * never overwrites an already-managed entity's fields from a later query's resultset. A scalar
+     * projection never touches the entity manager, so it cannot be poisoned by, or poison, an
+     * earlier or later load of the same row.
+     *
+     * <p>{@code Booking} now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so a
+     * plain {@code save()}/{@code saveAndFlush()} of a stale, still-{@code CONFIRMED}-in-memory
+     * target only writes the columns THIS transaction actually dirtied — e.g. a per-item cancel
+     * and a per-item reschedule of the SAME leg racing each other (both observing the header stay
+     * CONFIRMED because a sibling remains) can no longer clobber each other's disjoint columns
+     * (status vs. starts_at/ends_at). This check's job is therefore narrower than it used to be:
+     * it no longer prevents column-level corruption, it prevents a caller from completing a
+     * transition whose CONFIRMED precondition already lapsed — e.g. a reschedule silently
+     * "succeeding" (new time persisted) on a leg the other racer already declined, which would be
+     * a confusing state even though no column was corrupted. Each caller compares this result and
+     * aborts with a clean 409 on {@code false} rather than let that stale transition through.
+     *
+     * @return {@code true} iff {@code bookingId} exists and is, AS OF THIS CALL, still CONFIRMED
+     */
+    @Query("""
+            SELECT CASE WHEN COUNT(b) > 0 THEN true ELSE false END
+            FROM Booking b
+            WHERE b.id = :bookingId AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    boolean existsConfirmedById(@Param("bookingId") UUID bookingId);
 
     // ── Schedule-override conflict check (2026-07-26 design) ──────────────────
 

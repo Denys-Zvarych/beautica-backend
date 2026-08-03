@@ -49,11 +49,15 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * {@code @WebMvcTest} slice for {@link AppointmentController}, scoped to the two NEW per-item
- * routes added by track 30.x: {@code PATCH .../services/{bookingId}/reschedule} (phase 30.5) and
- * {@code PATCH .../services/{bookingId}/cancel} (phase 30.6). This is the first controller-level
- * test file for {@code AppointmentController} — the pre-existing whole-visit routes are exercised
- * only at IT level today; this slice adds unit-speed coverage for the two additive routes only.
+ * {@code @WebMvcTest} slice for {@link AppointmentController}. Originally scoped to the two NEW
+ * per-item routes added by track 30.x: {@code PATCH .../services/{bookingId}/reschedule} (phase
+ * 30.5) and {@code PATCH .../services/{bookingId}/cancel} (phase 30.6) — this was the first
+ * controller-level test file for {@code AppointmentController}, the pre-existing whole-visit
+ * routes having been exercised only at IT level. Widened (cycle-5 audit finding 2, 2026-08-03) to
+ * also cover the WHOLE-VISIT {@code PATCH /{appointmentId}/reschedule} route's OWN
+ * {@code @PreAuthorize} fix — dropping {@code canRescheduleAppointment} from its SpEL, mirroring
+ * the per-item route's own perf audit F1 fix below — so both routes' role-only gate + single
+ * service-layer authority check are pinned in the SAME file, by the SAME technique.
  *
  * <p>Mirrors {@code BookingControllerTest}'s security scaffolding exactly: a
  * {@code @TestConfiguration} inner class enabling method security with a stateless
@@ -62,7 +66,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(AppointmentController.class)
 @Import(WebMvcTestSupport.class)
-@DisplayName("AppointmentController — @WebMvcTest slice (per-item reschedule/cancel, phase 30.5/30.6)")
+@DisplayName("AppointmentController — @WebMvcTest slice (whole-visit + per-item reschedule/cancel, "
+        + "phase 30.5/30.6, cycle-5 finding 2)")
 class AppointmentControllerTest {
 
     private static final String BASE_URL = "/api/v1/appointments";
@@ -103,6 +108,10 @@ class AppointmentControllerTest {
 
     private String rescheduleUrl(UUID appointmentId, UUID bookingId) {
         return BASE_URL + "/" + appointmentId + "/services/" + bookingId + "/reschedule";
+    }
+
+    private String wholeVisitRescheduleUrl(UUID appointmentId) {
+        return BASE_URL + "/" + appointmentId + "/reschedule";
     }
 
     private String cancelUrl(UUID appointmentId, UUID bookingId) {
@@ -274,6 +283,147 @@ class AppointmentControllerTest {
                 .andExpect(status().isBadRequest());
 
         verify(appointmentTransitionService, never()).rescheduleAppointmentItem(any(), any(), any(), any(), any());
+    }
+
+    // ── PATCH /{appointmentId}/reschedule — WHOLE VISIT (cycle-5 audit finding 2) ──────────────
+
+    @Test
+    @DisplayName("whole-visit reschedule — CLIENT → 200, service invoked with Role.CLIENT (the "
+            + "provider arm — and therefore canRescheduleAppointment — is never evaluated for a "
+            + "CLIENT principal; SpEL 'or' short-circuits)")
+    void should_return200_when_clientReschedulesWholeVisit() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+        UUID clientId = UUID.randomUUID();
+        when(appointmentTransitionService.rescheduleAppointment(
+                eq(clientId), eq(Role.CLIENT), eq(appointmentId), any()))
+                .thenReturn(stubDetailResponse(appointmentId));
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(authenticatedAs(clientId, "client@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":\"" + OffsetDateTime.now().plusDays(1) + "\"}"))
+                .andExpect(status().isOk());
+
+        verify(appointmentTransitionService).rescheduleAppointment(
+                eq(clientId), eq(Role.CLIENT), eq(appointmentId), any());
+        verify(authorizationService, never()).canRescheduleAppointment(any(), any());
+    }
+
+    @Test
+    @DisplayName("whole-visit reschedule — SALON_OWNER role → 200 (cycle-5 audit finding 2: the "
+            + "controller only gates the ROLE now; provider authority over the visit is enforced "
+            + "INSIDE the service via AuthorizationService#enforceCanRescheduleBooking, mocked away "
+            + "in this slice — canRescheduleAppointment's own findAllCompletionAccessByAppointmentId "
+            + "query is never run, closing the double round-trip the finding flagged)")
+    void should_return200_when_salonOwnerRoleReschedulesWholeVisit() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(appointmentTransitionService.rescheduleAppointment(
+                eq(ownerId), eq(Role.SALON_OWNER), eq(appointmentId), any()))
+                .thenReturn(stubDetailResponse(appointmentId));
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(authenticatedAs(ownerId, "owner@example.com", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":\"" + OffsetDateTime.now().plusDays(1) + "\"}"))
+                .andExpect(status().isOk());
+
+        verify(appointmentTransitionService).rescheduleAppointment(
+                eq(ownerId), eq(Role.SALON_OWNER), eq(appointmentId), any());
+        verify(authorizationService, never()).canRescheduleAppointment(any(), any());
+    }
+
+    @Test
+    @DisplayName("whole-visit reschedule — INDEPENDENT_MASTER role → 200 (same role-only gate as "
+            + "SALON_OWNER)")
+    void should_return200_when_independentMasterRoleReschedulesWholeVisit() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        when(appointmentTransitionService.rescheduleAppointment(
+                eq(masterId), eq(Role.INDEPENDENT_MASTER), eq(appointmentId), any()))
+                .thenReturn(stubDetailResponse(appointmentId));
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(authenticatedAs(masterId, "master@example.com", Role.INDEPENDENT_MASTER))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":\"" + OffsetDateTime.now().plusDays(1) + "\"}"))
+                .andExpect(status().isOk());
+
+        verify(authorizationService, never()).canRescheduleAppointment(any(), any());
+    }
+
+    @Test
+    @DisplayName("whole-visit reschedule — SALON_OWNER without authority over the visit → 403 "
+            + "(cycle-5 audit finding 2: decided EXCLUSIVELY inside AppointmentTransitionService via "
+            + "AuthorizationService#enforceCanRescheduleBooking, never by the controller's "
+            + "@PreAuthorize, which is role-only here — same behavioural outcome as before, one "
+            + "fewer query)")
+    void should_return403_when_unauthorizedSalonOwnerReschedulesWholeVisit() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(appointmentTransitionService.rescheduleAppointment(
+                eq(ownerId), eq(Role.SALON_OWNER), eq(appointmentId), any()))
+                .thenThrow(new ForbiddenException("Access denied"));
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(authenticatedAs(ownerId, "owner@example.com", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":\"" + OffsetDateTime.now().plusDays(1) + "\"}"))
+                .andExpect(status().isForbidden());
+
+        verify(appointmentTransitionService).rescheduleAppointment(
+                eq(ownerId), eq(Role.SALON_OWNER), eq(appointmentId), any());
+        verify(authorizationService, never()).canRescheduleAppointment(any(), any());
+    }
+
+    @Test
+    @DisplayName("whole-visit reschedule — SALON_MASTER → 403, and the service is NEVER invoked "
+            + "(role fast-path rejects before the controller even calls into "
+            + "AppointmentTransitionService — SALON_MASTER stays excluded from hasAnyRole exactly "
+            + "as before this fix)")
+    void should_return403_when_salonMasterReschedulesWholeVisit() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(authenticatedAs(UUID.randomUUID(), "salonmaster@example.com", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":\"" + OffsetDateTime.now().plusDays(1) + "\"}"))
+                .andExpect(status().isForbidden());
+
+        verify(authorizationService, never()).canRescheduleAppointment(any(), any());
+        verify(appointmentTransitionService, never()).rescheduleAppointment(any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("whole-visit reschedule — unauthenticated → 401")
+    void should_return401_when_unauthenticatedReschedulesWholeVisit() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":\"" + OffsetDateTime.now().plusDays(1) + "\"}"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("whole-visit reschedule — null newStartsAt → 400, service never invoked")
+    void should_return400_when_wholeVisitNewStartsAtIsNull() throws Exception {
+        UUID appointmentId = UUID.randomUUID();
+
+        mockMvc.perform(patch(wholeVisitRescheduleUrl(appointmentId))
+                        .with(authenticatedAs(UUID.randomUUID(), "client@example.com", Role.CLIENT))
+                        .with(csrf())
+                        .contentType("application/json")
+                        .content("{\"newStartsAt\":null}"))
+                .andExpect(status().isBadRequest());
+
+        verify(appointmentTransitionService, never()).rescheduleAppointment(any(), any(), any(), any());
     }
 
     // ── PATCH /{appointmentId}/services/{bookingId}/cancel (phase 30.6) ────────────────────────

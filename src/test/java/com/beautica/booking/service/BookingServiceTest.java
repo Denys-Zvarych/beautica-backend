@@ -75,6 +75,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -172,6 +173,14 @@ class BookingServiceTest {
         master = buildMaster(masterId, MasterType.INDEPENDENT_MASTER);
         serviceDef = buildServiceDef(new BigDecimal("200.00"), 60, 0);
         msa = buildMsa(masterServiceId, master, serviceDef, null, null);
+
+        // G2/G4 (cycle-7 audit 2026-08-03): cancelBooking's and rescheduleBooking's freshness
+        // re-check (BookingRepository#existsConfirmedById) is now UNCONDITIONAL — it used to run
+        // only for an appointment child, so a standalone-booking test never reached it. Defaulting
+        // to "still CONFIRMED" here (lenient — most tests never touch this row, and MockitoExtension
+        // is STRICT_STUBS) keeps every pre-existing standalone-path test's intent unchanged; the
+        // dedicated negative tests for this recheck override it to false explicitly.
+        lenient().when(bookingRepository.existsConfirmedById(any())).thenReturn(true);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -717,6 +726,41 @@ class BookingServiceTest {
         verify(outboxService, never()).enqueueStatusChanged(bookingId);
     }
 
+    @Test
+    @DisplayName("declineBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
+            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
+            + "save, no mutation, no notification. Coverage gap (backend-qa, cycle-7 batch): G4 gave "
+            + "cancelBooking/rescheduleBooking a dedicated unit test for this exact false branch (see "
+            + "should_throw409AndNeverSave_when_cancelBookingFreshnessRecheckFailsForStandaloneBooking "
+            + "above) but G5 — the reverse direction, closed by routing declineBookingCore/"
+            + "completeBooking/notCompleteBooking through the SAME isStillConfirmed seam — had none; "
+            + "the only prior coverage was the real-DB, virtual-thread "
+            + "BookingProviderTransitionCancelRaceConcurrencyIT, with no fast deterministic signal.")
+    void should_throw409AndNeverSave_when_declineBookingFreshnessRecheckFailsForStandaloneBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Unavailable");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
+        // moved this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.declineBooking(actorId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
+                        + "client's cancellation")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(booking.getProviderComment())
+                .as("providerComment must never be written once the recheck aborts")
+                .isNull();
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
     // ── declineBookingForBatch (2026-07-26 schedule-override-conflict perf fix) ──────────────────
     // Package-private batched-decline counterpart of declineBooking, used only by
     // ScheduleOverrideConflictService to decline many standalone bookings for the same master
@@ -853,6 +897,37 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("completeBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
+            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
+            + "save, no outbox events. Coverage gap (backend-qa, cycle-7 batch) — the completeBooking "
+            + "counterpart of declineBooking's identical new test above; see that test's Javadoc for "
+            + "why the real-DB concurrency IT alone is not a substitute for this fast, deterministic "
+            + "signal.")
+    void should_throw409AndNeverSave_when_completeBookingFreshnessRecheckFailsForStandaloneBooking() {
+        UUID actorId = UUID.randomUUID();
+        // Phase 27.1: assertElapsedForComplete requires now >= startsAt — an elapsed fixture, so the
+        // 409 below is proven to come from the freshness recheck, not the elapsed guard.
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
+        // moved this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.completeBooking(actorId, bookingId))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
+                        + "client's cancellation")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+        verify(outboxService, never()).enqueueReviewRequested(any());
+    }
+
+    @Test
     @DisplayName("revenue-dashboard cache is evicted for the actor when a booking is completed")
     void should_evictRevenueDashboardCache_when_bookingCompleted() {
         // Arrange
@@ -957,6 +1032,38 @@ class BookingServiceTest {
                 .as("status must remain unchanged after a rejected not-complete transition")
                 .isEqualTo(BookingStatus.DECLINED);
         verify(outboxService, never()).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("notCompleteBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
+            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
+            + "save, no outbox events. Coverage gap (backend-qa, cycle-7 batch) — the "
+            + "notCompleteBooking counterpart of declineBooking's identical new test above; see that "
+            + "test's Javadoc for why the real-DB concurrency IT alone is not a substitute for this "
+            + "fast, deterministic signal.")
+    void should_throw409AndNeverSave_when_notCompleteBookingFreshnessRecheckFailsForStandaloneBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
+        // moved this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
+                        + "client's cancellation")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(booking.getProviderComment())
+                .as("providerComment must never be written once the recheck aborts")
+                .isNull();
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
     }
 
     @Test
@@ -1123,6 +1230,9 @@ class BookingServiceTest {
         when(bookingRepository.save(any())).thenReturn(booking);
         when(appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId))
                 .thenReturn(true);
+        // F1 freshness re-check (cycle-6 audit 2026-08-03) — this child is still CONFIRMED as of
+        // the post-lock scalar probe (no concurrent writer raced this test's single-threaded call).
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(true);
 
         bookingService.cancelBooking(clientId, bookingId, req);
 
@@ -1151,6 +1261,33 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verifyNoInteractions(appointmentTransitionService);
+    }
+
+    @Test
+    @DisplayName("cancelBooking — G4 freshness re-check rejects a STANDALONE booking that already left "
+            + "CONFIRMED between the load and this recheck: 409, no save, no mutation, no notification. "
+            + "Coverage gap (backend-qa, cycle-7 batch): every prior negative-freshness test exercised "
+            + "the appointment-child path only (e.g. AppointmentTransitionServiceTest's post-lock "
+            + "freshness-loss case) — this is the standalone counterpart for cancelBooking.")
+    void should_throw409AndNeverSave_when_cancelBookingFreshnessRecheckFailsForStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent writer already moved
+        // this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
         verifyNoInteractions(appointmentTransitionService);
     }
 
@@ -1209,6 +1346,37 @@ class BookingServiceTest {
         bookingService.rescheduleBooking(clientId, bookingId, req);
 
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        verifyNoInteractions(appointmentTransitionService);
+    }
+
+    @Test
+    @DisplayName("rescheduleBooking — G4 freshness re-check rejects a STANDALONE booking that already "
+            + "left CONFIRMED between the load and this recheck: 409, no advisory locks, no save, no "
+            + "mutation. Coverage gap (backend-qa, cycle-7 batch) — the standalone counterpart of "
+            + "cancelBooking's identical new test above; every prior negative-freshness test exercised "
+            + "the appointment-child path only.")
+    void should_throw409AndNeverAcquireLocksOrSave_when_rescheduleBookingFreshnessRecheckFailsForStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent writer already moved
+        // this row off CONFIRMED between the load above and this recheck (which runs BEFORE the
+        // client/master advisory locks and existsOverlapExcluding — see rescheduleBooking's Javadoc).
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStartsAt())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isNotEqualTo(newStartsAt);
+        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
         verifyNoInteractions(appointmentTransitionService);
     }
 
@@ -3297,6 +3465,9 @@ class BookingServiceTest {
         when(bookingRepository.save(any())).thenReturn(booking);
         when(appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId))
                 .thenReturn(true);
+        // F1 freshness re-check (cycle-6 audit 2026-08-03) — this child is still CONFIRMED as of
+        // the post-lock scalar probe (no concurrent writer raced this test's single-threaded call).
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(true);
 
         BookingResponse result = bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req);
 
