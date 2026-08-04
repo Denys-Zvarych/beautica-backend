@@ -370,17 +370,30 @@ class BookingDetailResponseTest {
                 .isEqualTo(clientId);
     }
 
-    // ── awaitingClosure (Phase 29.1/29.2) — derived, never-persisted flag, orthogonal to canReview
+    // ── awaitingClosure (Phase 29.1/29.2) — derived, never-persisted flag ──────────────────────
+    //
+    // awaitingClosure and canReview are two INDEPENDENT boolean/OffsetDateTime inputs this factory
+    // simply passes/derives through — from() never derives canReview FROM awaitingClosure or vice
+    // versa. Since the review-eligibility widening (BookingClosureRule#isReviewEligible), the REAL
+    // caller (BookingService) does compute canReview=true for many elapsed-CONFIRMED bookings too
+    // — but that computation happens upstream, in BookingService, never inside this DTO factory.
+    // The test below therefore deliberately passes a canReview value that would DISAGREE with what
+    // the real service computes for an elapsed CONFIRMED booking, to prove from() never overrides
+    // or derives it — only the caller's business logic (unit-tested separately in
+    // BookingServiceTest) decides the real value.
 
     @Test
-    @DisplayName("awaitingClosure is TRUE, canReview stays FALSE, for an elapsed CONFIRMED booking — "
-            + "the headline orthogonality gate: closure and review-eligibility never agree here")
-    void should_returnTrueAwaitingClosureAndFalseCanReview_when_confirmedAndElapsed() {
+    @DisplayName("awaitingClosure is TRUE for an elapsed CONFIRMED booking; canReview is simply "
+            + "whatever the caller passed in — from() never derives one from the other")
+    void should_returnTrueAwaitingClosure_when_confirmedAndElapsed_independentOfPassedInCanReview() {
         var response = BookingDetailResponse.from(
                 booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusMinutes(1));
 
         assertThat(response.awaitingClosure()).isTrue();
-        assertThat(response.canReview()).isFalse();
+        assertThat(response.canReview())
+                .as("from() must echo the caller-supplied canReview verbatim, not derive it from "
+                        + "awaitingClosure — the real derivation lives in BookingService#canReview")
+                .isFalse();
     }
 
     @Test

@@ -18,7 +18,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     // Cheaper than findByBookingId(...).isPresent() — derived as SELECT COUNT(*) > 0.
     boolean existsByBookingId(UUID bookingId);
 
-    // BE-6 visit-review dedup + canReview probe. Derived as SELECT COUNT(*) > 0; the WHERE
+    // BE-6 visit-review dedup + visit canReview probe. Derived as SELECT COUNT(*) > 0; the WHERE
     // appointment_id = :id predicate implies appointment_id IS NOT NULL, so the partial unique
     // index ux_reviews_appointment (V127) backs it. Legacy reviews (appointment_id NULL) are never
     // matched.

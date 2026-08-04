@@ -73,11 +73,15 @@ public record AppointmentDetailResponse(
         String clientComment,
         OffsetDateTime createdAt,
         List<AppointmentItemResponse> items,
-        @Schema(description = "True iff this visit is COMPLETED, has a registered client, and the "
-                + "client has not yet reviewed it — the CLIENT's one-review-per-visit CTA gate "
-                + "(BE-6). The COMPLETED + no-existing-review predicate, computed by the service, "
-                + "mirrors BookingDetailResponse.canReview lifted to the visit. A visit review is "
-                + "left via POST /appointments/{id}/review.")
+        @Schema(description = "True iff this visit has a registered client, no review exists yet, "
+                + "and the visit is either COMPLETED or still CONFIRMED with an already-elapsed "
+                + "endsAt (max(endsAt) over its items — the visit header carries no time window "
+                + "of its own) — the CLIENT's one-review-per-visit CTA gate (BE-6). Computed by "
+                + "the service via BookingClosureRule#isReviewEligible, the same canonical "
+                + "predicate the write endpoint (POST /appointments/{id}/review) re-checks, "
+                + "mirroring BookingDetailResponse.canReview lifted to the visit. Locked product "
+                + "decision: a visit that entered the client's Past tab by elapsed time is "
+                + "reviewable even before the provider closes it.")
         boolean canReview,
         // ── BE-5 visit-detail enrichment (mirrors BookingDetailResponse) ─────────────
         @Schema(types = {"string", "null"}, nullable = true,

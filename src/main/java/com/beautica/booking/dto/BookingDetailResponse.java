@@ -103,6 +103,16 @@ import java.util.UUID;
  * primary via the salon link when the master is salon-employed, else the master's own user
  * row — mirroring {@code SearchService}'s {@code COALESCE(salon, user)} rule.
  *
+ * <p><b>{@code canReview}</b> is TRUE for an unreviewed booking that is either {@code COMPLETED}
+ * or {@code CONFIRMED} with an already-elapsed {@code endsAt} — the STATUS+TIME half is {@link
+ * com.beautica.booking.domain.BookingClosureRule#isReviewEligible}, the single canonical
+ * definition shared with the write-path gate ({@code ReviewService#createReview}) so a client
+ * offered this CTA can never get a 400 from {@code POST /reviews}. Locked product decision: a
+ * booking that entered the client's "Past" tab BY ELAPSED TIME is reviewable even when the
+ * provider never marked it {@code COMPLETED} — see {@code BookingClosureRule#isReviewEligible}'s
+ * javadoc for the full rationale. Computed by the service, never derivable from the entity graph
+ * alone.
+ *
  * <p><b>{@code locationNote} (client mobile phase 14.3 enrichment)</b> is the provider's
  * free-text arrival hint ("3-й поверх, код 1234"). It follows the EXACT SAME salon-vs-
  * independent resolution rule as {@code street}/{@code buildingNo} above — never a second,
@@ -255,18 +265,21 @@ public record BookingDetailResponse(
                 + "scheduled job ever transitions such a booking to a terminal state, so this "
                 + "flags the ones the provider still needs to close via /complete, "
                 + "/not-complete or /decline. NEVER persisted, NEVER cached — recomputed on "
-                + "every read from (status, endsAt, the current instant). Orthogonal to "
-                + "canReview: an elapsed-but-unclosed CONFIRMED booking reads TRUE here and "
-                + "FALSE for canReview, since review eligibility keys off closure (COMPLETED), "
-                + "never off elapsed wall-clock time. The same for every row of GET "
-                + "/bookings/me and for GET /bookings/{id} — a pure function of the booking, "
-                + "not of the viewer.")
+                + "every read from (status, endsAt, the current instant). NOT orthogonal to "
+                + "canReview since the review-eligibility widening: an elapsed-but-unclosed "
+                + "CONFIRMED booking reads TRUE here AND (when it has a registered client and no "
+                + "existing review) TRUE for canReview too — closure-awaiting and review-eligible "
+                + "now deliberately overlap for exactly this row shape, by locked product "
+                + "decision (a booking that entered the client's Past tab by elapsed time is "
+                + "reviewable even before the provider closes it — see BookingClosureRule#"
+                + "isReviewEligible). The same for every row of GET /bookings/me and for GET "
+                + "/bookings/{id} — a pure function of the booking, not of the viewer.")
         boolean awaitingClosure
 ) {
 
     /**
      * Builds the enriched detail view for the single-entity path. The caller (the service)
-     * must supply {@code canReview} (the COMPLETED + no-existing-review predicate),
+     * must supply {@code canReview} (see this class's javadoc for the full predicate),
      * {@code providerCanReviewClient} (the viewer-aware provider-side mirror — see this class's
      * javadoc), and the resolved discovery locality labels — none of the three is derivable from
      * the entity graph alone. {@code now} is the request-scoped absolute instant (Phase 29.2)

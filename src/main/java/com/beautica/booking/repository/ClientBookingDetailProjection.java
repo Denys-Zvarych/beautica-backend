@@ -35,8 +35,9 @@ import java.util.UUID;
  * master's own user row — mirroring {@code SearchService}); the service stamps the resolved
  * labels onto the response DTO in-memory.
  *
- * <p>{@code canReview} is NOT stored here: it is derived by the service as
- * {@code status == COMPLETED && !reviewExists}, keeping the truth-table logic in one place.
+ * <p>{@code canReview} is NOT stored here: it is derived by the service from {@code status},
+ * {@code endsAt}, {@code reviewExists} and whether a registered client exists — see {@code
+ * BookingService#canReview} and {@code BookingClosureRule#isReviewEligible} for the truth table.
  *
  * <p>{@code priceMaxAtBooking} is read straight off {@code b} — the frozen snapshot column added
  * by V119, the companion to {@code priceAtBooking}'s floor. It needs no join and no derivation:

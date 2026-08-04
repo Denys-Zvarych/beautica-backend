@@ -140,17 +140,20 @@ public class BookingService {
      * Re-reads the just-created (or replayed) booking through the full graph and enriches it.
      *
      * <p>{@code canReview} is hardcoded {@code false} rather than probed, and that is sound by
-     * construction: a booking is born {@code CONFIRMED} and the idempotent-replay query filters to
-     * {@code CONFIRMED} only, while {@link #canReview} requires {@code COMPLETED}. Computing it
-     * would add a guaranteed-false {@code reviewRepository.existsByBookingId} probe to every
-     * create. If a booking ever becomes creatable in a terminal state, this shortcut must go.
-     * {@code providerCanReviewClient} is hardcoded {@code false} for the exact same reason — it
-     * also requires {@code COMPLETED} (see its own predicate below).
+     * construction: a booking is born {@code CONFIRMED} with a FUTURE {@code startsAt} (the
+     * lead-time floor {@link BookingStartsAtValidator} enforces on create), so its {@code endsAt}
+     * is future too — {@link BookingClosureRule#isReviewEligible} is {@code false} for every
+     * disjunct ({@code status != COMPLETED} and {@code isAwaitingClosure} requires an ELAPSED
+     * {@code endsAt}) — and the idempotent-replay query filters to {@code CONFIRMED} only.
+     * Computing it for real would add a guaranteed-false {@code reviewRepository.existsByBookingId}
+     * probe to every create. If a booking ever becomes creatable already-elapsed or in a terminal
+     * state, this shortcut must go. {@code providerCanReviewClient} is hardcoded {@code false} for
+     * the exact same reason — it also requires {@code COMPLETED} (see its own predicate below).
      */
     private BookingDetailResponse enrichCreated(UUID bookingId) {
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
-        return enrichSingle(booking, false, false);
+        return enrichSingle(booking, false, false, resolveNow());
     }
 
     @Transactional(readOnly = true)
@@ -165,17 +168,24 @@ public class BookingService {
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
         authz.enforceCanViewBooking(actorUserId, booking);
+        // now is resolved ONCE here and threaded into both canReview below and enrichSingle's
+        // awaitingClosure computation — never two independent clock.instant() reads for one
+        // response (Phase 29.2's single-instant-per-request discipline, now load-bearing for
+        // canReview too since it depends on endsAt-vs-now, not just status).
+        OffsetDateTime now = resolveNow();
         // reviewRepository.existsByBookingId is the one DB-bound input to canReview(...); short-
-        // circuit on the two in-memory checks first (mirrors computeProviderCanReviewClient below)
-        // so the query only fires when it can actually flip the result — a CONFIRMED or guest
-        // booking (the common case for a detail fetch) never reaches it.
+        // circuit on the in-memory checks first (mirrors computeProviderCanReviewClient below) so
+        // the query only fires when it can actually flip the result — a future-dated CONFIRMED or
+        // guest booking (the common case for a detail fetch) never reaches it.
         boolean hasClient = booking.getClient() != null;
-        boolean completed = booking.getStatus() == BookingStatus.COMPLETED;
+        boolean eligibleByStatusAndTime =
+                BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now);
         boolean canReview = hasClient
-                && completed
-                && canReview(booking.getStatus(), reviewRepository.existsByBookingId(bookingId), hasClient);
+                && eligibleByStatusAndTime
+                && canReview(booking.getStatus(), booking.getEndsAt(), now,
+                        reviewRepository.existsByBookingId(bookingId), hasClient);
         boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking);
-        return enrichSingle(booking, canReview, providerCanReviewClient);
+        return enrichSingle(booking, canReview, providerCanReviewClient, now);
     }
 
     /**
@@ -206,8 +216,14 @@ public class BookingService {
      * resolving the district-primary discovery locality labels through the M2 seam.
      * Salon-employed masters resolve to the salon's locality; independent masters to the
      * master's own user-row locality — mirroring {@code SearchService}'s COALESCE rule.
+     *
+     * <p>{@code now} is supplied by the caller, not resolved here, so a caller that also needs
+     * {@code now} to compute {@code canReview} (see {@link #getBooking}) reads {@code
+     * clock.instant()} exactly once for the whole response — never two independent instants for
+     * {@code canReview} and {@code awaitingClosure} on the same row.
      */
-    private BookingDetailResponse enrichSingle(Booking booking, boolean canReview, boolean providerCanReviewClient) {
+    private BookingDetailResponse enrichSingle(
+            Booking booking, boolean canReview, boolean providerCanReviewClient, OffsetDateTime now) {
         Salon salon = booking.getMaster().getSalon();
         User masterUser = booking.getMaster().getUser();
         UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
@@ -221,7 +237,7 @@ public class BookingService {
         // row to disagree with itself.
         return BookingDetailResponse.from(
                 booking, canReview, providerCanReviewClient,
-                labels.cityLabel(cityId), labels.districtLabel(districtId), resolveNow());
+                labels.cityLabel(cityId), labels.districtLabel(districtId), now);
     }
 
     /**
@@ -238,14 +254,22 @@ public class BookingService {
     }
 
     /**
-     * {@code canReview = COMPLETED && no existing review && a registered client exists to leave
-     * one} — single source of the truth table. A guest (LINK) booking has no account
-     * ({@code client_id} is null, V89 {@code chk_bookings_guest_fields}), so it can never be
-     * review-eligible even once COMPLETED — {@code ReviewService.createReview} requires an
-     * authenticated CLIENT owner, which a guest booking can never have.
+     * {@code canReview = (COMPLETED, or CONFIRMED with an already-elapsed endsAt) && no existing
+     * review && a registered client exists to leave one}. The STATUS+TIME half delegates to
+     * {@link BookingClosureRule#isReviewEligible} — the single canonical definition shared with
+     * {@code ReviewService#createReview}'s write-path gate, so the CTA this flag backs and the
+     * write endpoint that accepts/rejects it can never disagree (locked product decision: a
+     * booking that entered the client's "Past" tab by ELAPSED TIME is reviewable even when the
+     * provider never closed it out — see {@link BookingClosureRule#isReviewEligible}'s javadoc).
+     * A guest (LINK) booking has no account ({@code client_id} is null, V89 {@code
+     * chk_bookings_guest_fields}), so it can never be review-eligible regardless of status/time —
+     * {@code ReviewService.createReview} requires an authenticated CLIENT owner, which a guest
+     * booking can never have.
      */
-    private static boolean canReview(BookingStatus status, boolean reviewExists, boolean hasClient) {
-        return hasClient && status == BookingStatus.COMPLETED && !reviewExists;
+    private static boolean canReview(
+            BookingStatus status, OffsetDateTime endsAt, OffsetDateTime now,
+            boolean reviewExists, boolean hasClient) {
+        return hasClient && !reviewExists && BookingClosureRule.isReviewEligible(status, endsAt, now);
     }
 
     /** Discovery city id: salon's when salon-employed, else the master's own user row. */
@@ -332,7 +356,7 @@ public class BookingService {
                 p.categoryName(),
                 // Defensive only: this projection is CLIENT-scoped (WHERE client_id = :clientId),
                 // so p.clientId() is always non-null in practice — never a guest booking.
-                canReview(p.status(), p.reviewExists(), p.clientId() != null),
+                canReview(p.status(), p.endsAt(), now, p.reviewExists(), p.clientId() != null),
                 // providerCanReviewClient hardcoded false: this path only ever serves the CLIENT
                 // branch of GET /bookings/me (findClientBookingDetails is scoped by client_id), and
                 // a CLIENT viewer structurally fails the provider-authority predicate — see
@@ -349,7 +373,9 @@ public class BookingService {
     /**
      * Lists the actor's bookings as the enriched {@link BookingDetailResponse} (Phase 19.3 —
      * {@code GET /bookings/me} switched from the lean {@code BookingResponse} per locked
-     * Option A). {@code canReview} is true only for a {@code COMPLETED} booking with no review.
+     * Option A). {@code canReview} is true for an unreviewed booking that is either {@code
+     * COMPLETED} or {@code CONFIRMED} with an already-elapsed {@code endsAt} — see {@link
+     * BookingClosureRule#isReviewEligible}.
      *
      * <p><b>CLIENT</b> (Phase 26.7.1) now shares the same two-query ID-page + hydrate shape as
      * the provider roles below: {@code findIdsByClientIdFiltered} (sargable, sentinel-free
@@ -906,7 +932,8 @@ public class BookingService {
                 .map(b -> {
                     UUID cityId = discoveryCityId(b);
                     UUID districtId = discoveryDistrictId(b);
-                    boolean canReview = canReview(b.getStatus(), reviewed.contains(b.getId()), b.getClient() != null);
+                    boolean canReview = canReview(
+                            b.getStatus(), b.getEndsAt(), now, reviewed.contains(b.getId()), b.getClient() != null);
                     // providerCanReviewClient hardcoded false: this row-by-row path backs
                     // GET /bookings/me's provider listing, which is out of scope for the
                     // "Залишити відгук про клієнта" CTA this field gates — see
@@ -1610,14 +1637,20 @@ public class BookingService {
             registerSlotEviction(masterId, salonIdOf(saved), newStartsAt.toLocalDate(), saved.getMasterService().getId());
         }
         evictMasterCalendarAfterCommit(masterId);
-        // A rescheduled booking is always CONFIRMED, so canReview is false by the COMPLETED
-        // predicate — no review-existence query needed on this path. saved.getClient() is
-        // guaranteed non-null on the CLIENT path (the ownership filter only matches account-bound
-        // bookings) but CAN be null on the PROVIDER path (a guest/LINK booking) — canReview's
-        // hasClient parameter already null-guards this correctly either way. providerCanReviewClient
-        // is hardcoded false for the identical reason: it also requires COMPLETED, which a
-        // just-rescheduled (CONFIRMED) booking can never be.
-        return enrichSingle(saved, canReview(saved.getStatus(), false, saved.getClient() != null), false);
+        // A rescheduled booking is always CONFIRMED with a FRESH, FUTURE endsAt — validateStartsAt
+        // enforces the same lead-time floor reschedule uses for the NEW slot, so
+        // BookingClosureRule#isReviewEligible's CONFIRMED-and-elapsed disjunct can never be true
+        // here either (mirrors enrichCreated's identical reasoning) — no review-existence query
+        // needed on this path; reviewExists is passed false purely as a placeholder, never read
+        // for a value that would matter. saved.getClient() is guaranteed non-null on the CLIENT
+        // path (the ownership filter only matches account-bound bookings) but CAN be null on the
+        // PROVIDER path (a guest/LINK booking) — canReview's hasClient parameter already
+        // null-guards this correctly either way. providerCanReviewClient is hardcoded false for
+        // the identical reason: it also requires COMPLETED, which a just-rescheduled (CONFIRMED)
+        // booking can never be.
+        OffsetDateTime now = resolveNow();
+        boolean canReview = canReview(saved.getStatus(), saved.getEndsAt(), now, false, saved.getClient() != null);
+        return enrichSingle(saved, canReview, false, now);
     }
 
     /**

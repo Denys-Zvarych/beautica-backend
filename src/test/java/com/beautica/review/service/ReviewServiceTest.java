@@ -22,6 +22,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.user.User;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -41,6 +42,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -52,6 +54,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -73,6 +76,9 @@ class ReviewServiceTest {
     @Mock
     private ApplicationEventPublisher eventPublisher;
 
+    @Mock
+    private Clock clock;
+
     @InjectMocks
     private ReviewService reviewService;
 
@@ -80,6 +86,16 @@ class ReviewServiceTest {
     private static final UUID BOOKING_ID = UUID.randomUUID();
     private static final UUID MASTER_ID  = UUID.randomUUID();
     private static final UUID REVIEW_ID  = UUID.randomUUID();
+    // Fixed "now" for the review-eligibility (BookingClosureRule#isReviewEligible) checks —
+    // lenient because most tests below never reach a branch that reads the clock at all (e.g.
+    // COMPLETED-status tests short-circuit BEFORE isAwaitingClosure ever evaluates endsAt), so
+    // MockitoExtension's strict-stubs would otherwise flag this as an unnecessary stub for them.
+    private static final OffsetDateTime NOW = OffsetDateTime.parse("2026-06-15T12:00:00Z");
+
+    @BeforeEach
+    void setUp() {
+        lenient().when(clock.instant()).thenReturn(NOW.toInstant());
+    }
 
     // review.booking is NOT NULL (unique FK) and Booking.masterService is NOT NULL, so
     // ReviewResponse.from never null-checks the chain — every mock that reaches
@@ -194,9 +210,11 @@ class ReviewServiceTest {
     }
 
     @ParameterizedTest
-    @DisplayName("throws 400 BusinessException when booking status is not COMPLETED (covers all non-terminal states)")
-    @EnumSource(value = BookingStatus.class, names = {"CONFIRMED", "DECLINED", "CANCELLED", "NOT_COMPLETED"})
-    void should_throw400_when_bookingStatusIsNotCompleted(BookingStatus status) {
+    @DisplayName("throws 400 BusinessException for a terminal-non-reviewable status, REGARDLESS of "
+            + "endsAt (DECLINED/CANCELLED/NOT_COMPLETED never become reviewable by elapsed time — "
+            + "unlike CONFIRMED, covered separately below)")
+    @EnumSource(value = BookingStatus.class, names = {"DECLINED", "CANCELLED", "NOT_COMPLETED"})
+    void should_throw400_when_bookingStatusIsTerminalNonReviewable(BookingStatus status) {
         // Ownership check runs first (fix for IDOR oracle); stub client so it passes through to status check.
         User client = mock(User.class);
         when(client.getId()).thenReturn(CLIENT_ID);
@@ -204,6 +222,10 @@ class ReviewServiceTest {
         Booking booking = mock(Booking.class);
         when(booking.getClient()).thenReturn(client);
         when(booking.getStatus()).thenReturn(status);
+        // endsAt deliberately NOT stubbed (stays null): isReviewEligible's isAwaitingClosure leg
+        // short-circuits on `status == CONFIRMED` before ever dereferencing endsAt, so a
+        // DECLINED/CANCELLED/NOT_COMPLETED booking must reject cleanly even with no endsAt at all —
+        // proving these three are unreviewable independent of time, not just "elapsed or not".
 
         CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, null);
 
@@ -215,6 +237,78 @@ class ReviewServiceTest {
                         .isEqualTo(HttpStatus.BAD_REQUEST));
 
         verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("throws 400 BusinessException when the booking is CONFIRMED and its endsAt has NOT "
+            + "yet elapsed — the important assertion this fix must preserve: a still-open booking "
+            + "stays unreviewable")
+    void should_throw400_when_bookingIsConfirmedAndNotYetElapsed() {
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getStatus()).thenReturn(BookingStatus.CONFIRMED);
+        when(booking.getEndsAt()).thenReturn(NOW.plusHours(1));
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+
+        assertThatThrownBy(() -> reviewService.createReview(CLIENT_ID, request))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                        .isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verify(reviewRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("creates review when the booking is CONFIRMED but its endsAt has already elapsed — "
+            + "the bug fix: a booking the provider never closed but that aged into Past by time "
+            + "must be reviewable")
+    void should_createReview_when_bookingIsConfirmedButElapsed() {
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(CLIENT_ID);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getId()).thenReturn(BOOKING_ID);
+        when(booking.getStatus()).thenReturn(BookingStatus.CONFIRMED);
+        when(booking.getEndsAt()).thenReturn(NOW.minusHours(1));
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(master);
+        when(booking.getSalon()).thenReturn(null);
+
+        User savedClient = mock(User.class);
+        when(savedClient.getFirstName()).thenReturn("Anna");
+        when(savedClient.getLastName()).thenReturn("Koval");
+
+        Review saved = mock(Review.class);
+        when(saved.getId()).thenReturn(REVIEW_ID);
+        when(saved.getClient()).thenReturn(savedClient);
+        when(saved.getMaster()).thenReturn(master);
+        Booking savedBooking = mockBookingWithServiceName("Manicure");
+        when(saved.getBooking()).thenReturn(savedBooking);
+        when(saved.getRating()).thenReturn((short) 4);
+        when(saved.getComment()).thenReturn(null);
+        when(saved.getCreatedAt()).thenReturn(OffsetDateTime.now(ZoneOffset.UTC).toInstant());
+
+        CreateReviewRequest request = new CreateReviewRequest(BOOKING_ID, 4, null);
+
+        when(bookingRepository.findByIdWithFullGraph(BOOKING_ID)).thenReturn(Optional.of(booking));
+        when(reviewRepository.existsByBookingId(BOOKING_ID)).thenReturn(false);
+        when(reviewRepository.saveAndFlush(any(Review.class))).thenReturn(saved);
+
+        ReviewResponse response = reviewService.createReview(CLIENT_ID, request);
+
+        assertThat(response).isNotNull();
+        assertThat(response.id()).isEqualTo(REVIEW_ID);
+        verify(reviewRepository).saveAndFlush(any(Review.class));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, null));
     }
 
     @Test

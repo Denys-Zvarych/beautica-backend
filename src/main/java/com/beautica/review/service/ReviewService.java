@@ -3,9 +3,9 @@ package com.beautica.review.service;
 import org.springframework.data.domain.Sort;
 import java.util.Set;
 import com.beautica.common.web.SortWhitelist;
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
-import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.RatingBucket;
@@ -42,6 +42,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -58,6 +61,18 @@ public class ReviewService {
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
     private final ApplicationEventPublisher eventPublisher;
+    private final Clock clock;
+
+    /**
+     * Absolute-instant "now" for {@link BookingClosureRule#isReviewEligible} — {@link
+     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, the SAME idiom {@code
+     * BookingService#resolveNow} uses for the identical purpose (Anti-Bug §G: never {@code
+     * Instant.now()} / {@code OffsetDateTime.now()} directly, and never a second, divergent clock
+     * idiom for the same rule).
+     */
+    private OffsetDateTime resolveNow() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+    }
 
     @Transactional
     public ReviewResponse createReview(UUID clientId, CreateReviewRequest request) {
@@ -87,9 +102,14 @@ public class ReviewService {
                             + "visit via POST /appointments/{id}/review");
         }
 
-        if (booking.getStatus() != BookingStatus.COMPLETED) {
+        // Locked product decision: a booking that entered the client's "Past" tab BY ELAPSED TIME
+        // is reviewable even when the provider never marked it COMPLETED — mirrors
+        // BookingService#canReview exactly (same BookingClosureRule#isReviewEligible call), so a
+        // client offered the canReview CTA can never land here and get rejected. NOT_COMPLETED /
+        // CANCELLED / DECLINED stay unreviewable regardless of endsAt — see that method's javadoc.
+        if (!BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), resolveNow())) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Review can only be submitted for completed bookings");
+                    "This booking is not yet eligible for a review");
         }
 
         if (reviewRepository.existsByBookingId(booking.getId())) {
@@ -131,11 +151,19 @@ public class ReviewService {
      * {@code /reviews/me}) keeps working unchanged. {@code master_id}/{@code salon_id} come from the
      * visit (single master; the header salon is the same value stamped on every item at create time).
      *
-     * <p>Authorization + status + duplicate handling mirror {@link #createReview} exactly: a missing
-     * visit is a 404, a foreign/guest visit collapses to the same 403 (no existence oracle), a
-     * non-COMPLETED visit is a 400 with the same message, and a second review is a 409 — the exact
-     * same envelopes the single-booking path returns (no new error shapes). {@code clientId} comes
-     * only from the authenticated principal, never the body.
+     * <p>Authorization + status/time + duplicate handling mirror {@link #createReview} exactly: a
+     * missing visit is a 404, a foreign/guest visit collapses to the same 403 (no existence
+     * oracle), a not-yet-eligible visit is a 400 with the same message, and a second review is a
+     * 409 — the exact same envelopes the single-booking path returns (no new error shapes).
+     * {@code clientId} comes only from the authenticated principal, never the body.
+     *
+     * <p><b>Eligibility mirrors the single-booking rule, lifted to the visit.</b> {@link
+     * Appointment} carries no time window of its own (see its class javadoc) — the visit's
+     * effective {@code endsAt} is {@code max(endsAt)} over its items, the same reduction {@code
+     * AppointmentDetailResponse#from} uses for the header window — so {@link
+     * BookingClosureRule#isReviewEligible} is evaluated against that derived instant. This is why
+     * the items load moved ahead of the eligibility check (unlike the pre-widening COMPLETED-only
+     * gate, which never needed the items at all to decide eligibility).
      */
     @Transactional
     public ReviewResponse createAppointmentReview(
@@ -150,24 +178,31 @@ public class ReviewService {
             throw new ForbiddenException("Not authorized to review this appointment");
         }
 
-        if (appointment.getStatus() != BookingStatus.COMPLETED) {
+        // Ordered, graph-hydrated items (master.user, master.salon, masterService.serviceDefinition
+        // all fetched) — needed for the master, the first-child booking_id, ReviewResponse.from's
+        // serviceName, AND (below) the visit's derived endsAt. Never empty for a real visit (≥1
+        // chained row); guard defensively.
+        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
+        if (items.isEmpty()) {
+            throw new NotFoundException("Appointment not found");
+        }
+        Booking first = items.get(0);
+
+        // Locked product decision: a visit that entered the client's "Past" tab BY ELAPSED TIME is
+        // reviewable even when the provider never marked it COMPLETED — see
+        // BookingClosureRule#isReviewEligible's javadoc. NOT_COMPLETED / CANCELLED / DECLINED stay
+        // unreviewable regardless of endsAt. The List<Booking> overload is the SAME derivation
+        // AppointmentService#computeCanReview uses for the read-side canReview flag — never
+        // re-derive max(items.endsAt) inline here, or the two can drift apart.
+        if (!BookingClosureRule.isReviewEligible(appointment.getStatus(), items, resolveNow())) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Review can only be submitted for completed bookings");
+                    "This visit is not yet eligible for a review");
         }
 
         if (reviewRepository.existsByAppointmentId(appointmentId)) {
             throw new BusinessException(HttpStatus.CONFLICT,
                     "Review already exists for this appointment");
         }
-
-        // Ordered, graph-hydrated items (master.user, master.salon, masterService.serviceDefinition
-        // all fetched) — needed for the master, the first-child booking_id, and ReviewResponse.from's
-        // serviceName. Never empty for a real visit (≥1 chained row); guard defensively.
-        List<Booking> items = bookingRepository.findByAppointmentIdWithGraph(appointmentId);
-        if (items.isEmpty()) {
-            throw new NotFoundException("Appointment not found");
-        }
-        Booking first = items.get(0);
 
         Review review = Review.builder()
                 .booking(first)

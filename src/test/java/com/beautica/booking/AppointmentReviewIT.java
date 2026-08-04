@@ -289,17 +289,43 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("reviewing a still-CONFIRMED (non-completed) visit is refused with 400, and no review "
-            + "row is written")
+    @DisplayName("reviewing a still-CONFIRMED (non-completed) visit whose endsAt is still in the "
+            + "FUTURE is refused with 400, and no review row is written — the important assertion "
+            + "the review-eligibility widening must preserve")
     void should_return400_when_reviewingNonCompletedVisit() throws Exception {
         Visit visit = createConfirmedTwoServiceVisit("notdone");
 
         ResponseEntity<String> resp = postAppointmentReview(visit.clientToken(), visit.id(), 5, null);
 
         assertThat(resp.getStatusCode())
-                .as("a CONFIRMED visit is not reviewable — must 400 — body: %s", resp.getBody())
+                .as("a CONFIRMED visit whose window has not elapsed is not reviewable — must 400 — "
+                        + "body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(visitReviewCount(visit.id())).isEqualTo(0L);
+    }
+
+    @Test
+    @DisplayName("reviewing a still-CONFIRMED visit whose endsAt has already ELAPSED succeeds with "
+            + "201 — the bug fix, lifted to a multi-service visit: a visit the provider never closed "
+            + "but that aged into Past by time must be reviewable")
+    void should_createVisitReview_when_visitIsConfirmedButElapsed() throws Exception {
+        String masterEmail = "appt-rev-elapsed-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID serviceA = fixtures.createIndependentMasterService(masterId);
+        UUID serviceB = fixtures.createIndependentMasterService(masterId);
+        String clientEmail = "appt-rev-elapsed-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        UUID appointmentId = insertElapsedConfirmedTwoServiceVisit(clientId, masterId, serviceA, serviceB);
+
+        ResponseEntity<String> resp = postAppointmentReview(clientToken, appointmentId, 5, "Пізно, але дякую");
+
+        assertThat(resp.getStatusCode())
+                .as("an elapsed-but-unclosed CONFIRMED visit must be reviewable — 201 — body: %s",
+                        resp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(visitReviewCount(appointmentId)).isEqualTo(1L);
     }
 
     @Test
@@ -449,6 +475,44 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
                         + "VALUES (?, NULL, NULL, 'COMPLETED', 'LINK', 'Guest', 'Visitor', '+380501234567', "
                         + "?, NOW(), NOW())",
                 appointmentId, UUID.randomUUID());
+        return appointmentId;
+    }
+
+    /**
+     * Inserts a real (APP, non-guest) CONFIRMED two-service visit header plus its two chained
+     * {@code bookings} rows directly via SQL, with both items' {@code ends_at} well in the past —
+     * exercising the review-eligibility widening's CONFIRMED-and-elapsed disjunct at the visit
+     * level. Mirrors {@link #insertCompletedSingleBooking} (past, non-overlapping window) and
+     * {@link #insertCompletedGuestAppointment} (direct appointment-row insert), combined: a
+     * registered client, real visit header, two back-to-back past bookings chained via {@code
+     * appointment_id}.
+     */
+    private UUID insertElapsedConfirmedTwoServiceVisit(
+            UUID clientId, UUID masterId, UUID masterServiceIdA, UUID masterServiceIdB) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO appointments (id, client_id, salon_id, status, booking_source, "
+                        + "created_at, updated_at) VALUES (?, ?, NULL, 'CONFIRMED', 'APP', NOW(), NOW())",
+                appointmentId, clientId);
+
+        UUID firstItemId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, appointment_id, "
+                        + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '4 hours', "
+                        + "NOW() - interval '3 hours', 500.00, 60, 0, 'APP', NOW(), NOW())",
+                firstItemId, clientId, masterId, masterServiceIdA, appointmentId);
+
+        UUID secondItemId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, appointment_id, "
+                        + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '3 hours', "
+                        + "NOW() - interval '2 hours', 500.00, 60, 0, 'APP', NOW(), NOW())",
+                secondItemId, clientId, masterId, masterServiceIdB, appointmentId);
+
         return appointmentId;
     }
 

@@ -145,6 +145,47 @@ class ReviewIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("POST /reviews — 201 when the booking is CONFIRMED but its endsAt has already "
+            + "elapsed — the bug fix: a booking the provider never closed but that aged into the "
+            + "client's Past tab by time must be reviewable")
+    void should_createReview_when_confirmedBookingHasElapsed() throws Exception {
+        UUID masterId        = createIndependentMaster("im-elapsed-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        String clientEmail   = "cli-elapsed-" + System.nanoTime() + "@beautica.test";
+        String clientToken   = createClientAndGetToken(clientEmail);
+        UUID clientId        = resolveUserIdByEmail(clientEmail);
+        UUID bookingId       = createElapsedConfirmedBooking(clientId, masterId, masterServiceId);
+
+        log.debug("Act: POST {} rating=5 for elapsed CONFIRMED bookingId={}", REVIEWS_URL, bookingId);
+        ResponseEntity<String> createResp = postReview(clientToken, bookingId, 5);
+
+        assertThat(createResp.getStatusCode())
+                .as("an elapsed-but-unclosed CONFIRMED booking must be reviewable — 201 — body: %s",
+                        createResp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+    }
+
+    @Test
+    @DisplayName("POST /reviews — 400 when the booking is CONFIRMED and its endsAt is still in the "
+            + "FUTURE — the important assertion the review-eligibility widening must preserve")
+    void should_return400_when_confirmedBookingHasNotElapsed() throws Exception {
+        UUID masterId        = createIndependentMaster("im-future-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        String clientEmail   = "cli-future-" + System.nanoTime() + "@beautica.test";
+        String clientToken   = createClientAndGetToken(clientEmail);
+        UUID clientId        = resolveUserIdByEmail(clientEmail);
+        UUID bookingId       = createFutureConfirmedBooking(clientId, masterId, masterServiceId);
+
+        log.debug("Act: POST {} rating=5 for not-yet-elapsed CONFIRMED bookingId={}", REVIEWS_URL, bookingId);
+        ResponseEntity<String> resp = postReview(clientToken, bookingId, 5);
+
+        assertThat(resp.getStatusCode())
+                .as("a CONFIRMED booking whose window has not elapsed must stay unreviewable — 400 — "
+                        + "body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     @DisplayName("POST /reviews — 409 when the same booking is reviewed a second time")
     void should_return409_when_duplicateReviewSubmitted() throws Exception {
         UUID masterId        = createIndependentMaster("im-dup-" + System.nanoTime() + "@beautica.test");
@@ -623,6 +664,44 @@ class ReviewIntegrationTest extends AbstractIntegrationTest {
                 "buffer_minutes_at_booking, created_at, updated_at) " +
                 "VALUES (?, ?, ?, ?, 'COMPLETED', " +
                 "NOW() - interval '2 hours', NOW() - interval '1 hour', " +
+                "500.00, 60, 0, NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId);
+        return bookingId;
+    }
+
+    /**
+     * Inserts a booking directly with status=CONFIRMED whose {@code ends_at} has already elapsed —
+     * the review-eligibility widening's CONFIRMED-and-elapsed disjunct. Mirrors {@link
+     * #createCompletedBooking}'s past, non-overlapping window; only the status differs.
+     */
+    private UUID createElapsedConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings " +
+                "(id, client_id, master_id, master_service_id, status, " +
+                "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, " +
+                "buffer_minutes_at_booking, created_at, updated_at) " +
+                "VALUES (?, ?, ?, ?, 'CONFIRMED', " +
+                "NOW() - interval '2 hours', NOW() - interval '1 hour', " +
+                "500.00, 60, 0, NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId);
+        return bookingId;
+    }
+
+    /**
+     * Inserts a booking directly with status=CONFIRMED whose {@code ends_at} is still in the
+     * future — the negative counterpart of {@link #createElapsedConfirmedBooking}, pinning that a
+     * still-open booking stays unreviewable.
+     */
+    private UUID createFutureConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings " +
+                "(id, client_id, master_id, master_service_id, status, " +
+                "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, " +
+                "buffer_minutes_at_booking, created_at, updated_at) " +
+                "VALUES (?, ?, ?, ?, 'CONFIRMED', " +
+                "NOW() + interval '1 hour', NOW() + interval '2 hours', " +
                 "500.00, 60, 0, NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId);
         return bookingId;

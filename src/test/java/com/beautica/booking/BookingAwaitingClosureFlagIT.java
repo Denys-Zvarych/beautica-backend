@@ -32,8 +32,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Phase 29.2 — full HTTP stack proof for the derived, never-persisted {@code awaitingClosure}
- * response flag on {@code BookingResponse}/{@code BookingDetailResponse}, and the "{@code
- * canReview} must stay byte-identical" gate.
+ * response flag on {@code BookingResponse}/{@code BookingDetailResponse}, and (since the
+ * review-eligibility widening) the {@code canReview} truth table matching {@code
+ * BookingClosureRule#isReviewEligible} end-to-end.
  *
  * <p>Real Postgres (Testcontainers) via {@link AbstractIntegrationTest}, real Spring Security.
  * Own class-local frozen {@link Clock} — deliberately NOT {@code BookingMyBookingsPartitionIT}'s
@@ -75,8 +76,9 @@ class BookingAwaitingClosureFlagIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("15-row status x endsAt-position matrix over GET /bookings/me — exactly one row "
-            + "(CONFIRMED, elapsed) serializes awaitingClosure:true; every AWAITING_CLOSURE row also "
-            + "carries canReview:false (an elapsed-unclosed CONFIRMED booking is never review-eligible)")
+            + "(CONFIRMED, elapsed) serializes awaitingClosure:true; that same AWAITING_CLOSURE row "
+            + "now ALSO carries canReview:true (locked decision: an elapsed-unclosed CONFIRMED "
+            + "booking with a registered client and no review is review-eligible)")
     void should_serializeTrueForExactlyOneRow_when_fifteenRowMatrixListedOverHttp() throws Exception {
         String masterEmail = "acflag-master-" + System.nanoTime() + "@beautica.test";
         UUID masterId = fixtures.createIndependentMaster(masterEmail);
@@ -96,52 +98,56 @@ class BookingAwaitingClosureFlagIT extends AbstractIntegrationTest {
             if (row.path("awaitingClosure").asBoolean()) {
                 flaggedIds.add(UUID.fromString(row.path("id").asText()));
                 assertThat(row.path("canReview").asBoolean())
-                        .as("an AWAITING_CLOSURE row must never be canReview:true")
-                        .isFalse();
+                        .as("an AWAITING_CLOSURE row (CONFIRMED, elapsed, registered client, no "
+                                + "review) must be canReview:true — the bug fix this suite pins")
+                        .isTrue();
             }
         }
         assertThat(flaggedIds).containsExactly(awaitingClosureId);
     }
 
     @Test
-    @DisplayName("canReview regression group — 30-cell matrix (5 statuses x 3 endsAt positions x "
-            + "review-exists/not); canReview is TRUE iff status==COMPLETED && no review exists, "
-            + "REGARDLESS of endsAt position — pinning the pre-29.2 truth table so a future widening "
-            + "of canReview to include AWAITING_CLOSURE rows fails here loudly")
-    void should_matchPrePhaseTruthTable_when_evaluatingThirtyCellCanReviewMatrix() throws Exception {
+    @DisplayName("canReview regression group — 20-cell matrix (5 statuses x 2 endsAt positions "
+            + "[past/elapsed, future/not-yet-elapsed] x review-exists/not); canReview is TRUE iff "
+            + "no review exists AND (status==COMPLETED OR (status==CONFIRMED AND endsAt elapsed)) — "
+            + "pinning BookingClosureRule#isReviewEligible's exact truth table end-to-end, and "
+            + "proving COMPLETED/DECLINED/CANCELLED/NOT_COMPLETED stay endsAt-independent while "
+            + "CONFIRMED alone flips on the elapsed boundary")
+    void should_matchReviewEligibilityTruthTable_when_evaluatingTwentyCellCanReviewMatrix() throws Exception {
         String masterEmail = "acflag-canreview-master-" + System.nanoTime() + "@beautica.test";
         UUID masterId = fixtures.createIndependentMaster(masterEmail);
         String clientEmail = "acflag-canreview-client-" + System.nanoTime() + "@beautica.test";
         UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
         UUID masterServiceId = fixtures.createIndependentMasterService(masterId);
 
-        // canReview does not depend on endsAt at all (BookingService#canReview is a pure function
-        // of status/reviewExists/hasClient) — so unlike the 15-row awaitingClosure matrix above,
-        // this fixture does not need every row's endsAt pinned to the exact NOW-1h/NOW/NOW+1h
-        // triple. Each of the 30 cells instead gets a fully independent, non-overlapping 1h window
-        // (3h apart, well before NOW) — the "3 endsAt positions" axis is preserved as 3 distinct
-        // temporal variants per status, proving canReview's independence from endsAt without
-        // needing to reuse a shared endsAt across statuses (which would trip the CONFIRMED-only
-        // no_overlapping_bookings EXCLUDE constraint for the two reviewExists variants).
-        record Cell(UUID id, BookingStatusFixture status, boolean reviewExists, boolean expectedCanReview) {}
+        // Each of the 20 cells gets a fully independent, non-overlapping 1h window (3h apart) so
+        // the CONFIRMED-only no_overlapping_bookings EXCLUDE constraint never fires. "past" windows
+        // sit well before NOW (elapsed); "future" windows sit well after NOW (not yet elapsed).
+        record Cell(UUID id, BookingStatusFixture status, boolean elapsed, boolean reviewExists,
+                    boolean expectedCanReview) {}
         List<Cell> cells = new ArrayList<>();
         int cellIndex = 0;
         for (var status : BookingStatusFixture.values()) {
-            for (int position = 0; position < 3; position++) {
+            for (boolean elapsed : new boolean[] {true, false}) {
                 for (boolean reviewExists : new boolean[] {false, true}) {
-                    OffsetDateTime startsAt = NOW.minusDays(200).plusHours(cellIndex * 3L);
+                    OffsetDateTime startsAt = elapsed
+                            ? NOW.minusDays(200).plusHours(cellIndex * 3L)
+                            : NOW.plusDays(200).plusHours(cellIndex * 3L);
                     OffsetDateTime endsAt = startsAt.plusHours(1);
                     UUID id = insertBooking(clientId, masterId, masterServiceId, status.name(), startsAt, endsAt);
                     if (reviewExists) {
                         insertReview(id);
                     }
-                    boolean expected = status == BookingStatusFixture.COMPLETED && !reviewExists;
-                    cells.add(new Cell(id, status, reviewExists, expected));
+                    boolean eligibleByStatusAndTime =
+                            status == BookingStatusFixture.COMPLETED
+                                    || (status == BookingStatusFixture.CONFIRMED && elapsed);
+                    boolean expected = eligibleByStatusAndTime && !reviewExists;
+                    cells.add(new Cell(id, status, elapsed, reviewExists, expected));
                     cellIndex++;
                 }
             }
         }
-        assertThat(cells).hasSize(30);
+        assertThat(cells).hasSize(20);
 
         String clientToken = fixtures.tokenFor(clientEmail);
         JsonNode resp = callMyBookings(clientToken);
@@ -149,16 +155,18 @@ class BookingAwaitingClosureFlagIT extends AbstractIntegrationTest {
         for (JsonNode row : toRowList(resp)) {
             byId.put(UUID.fromString(row.path("id").asText()), row);
         }
-        assertThat(byId).hasSize(30);
+        assertThat(byId).hasSize(20);
 
         for (Cell cell : cells) {
             JsonNode row = byId.get(cell.id());
             assertThat(row)
-                    .as("row for status=%s reviewExists=%s must be present", cell.status(), cell.reviewExists())
+                    .as("row for status=%s elapsed=%s reviewExists=%s must be present",
+                            cell.status(), cell.elapsed(), cell.reviewExists())
                     .isNotNull();
             assertThat(row.path("canReview").asBoolean())
-                    .as("status=%s, reviewExists=%s — canReview must equal the pre-29.2 truth table",
-                            cell.status(), cell.reviewExists())
+                    .as("status=%s, elapsed=%s, reviewExists=%s — canReview must equal "
+                                    + "BookingClosureRule#isReviewEligible's truth table",
+                            cell.status(), cell.elapsed(), cell.reviewExists())
                     .isEqualTo(cell.expectedCanReview());
         }
     }

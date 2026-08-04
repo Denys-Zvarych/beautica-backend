@@ -49,7 +49,9 @@ public class ReviewController {
     }
 
     /**
-     * Creates the ONE review a client may leave for a COMPLETED multi-service visit (BE-6).
+     * Creates the ONE review a client may leave for an eligible multi-service visit (BE-6) —
+     * {@code COMPLETED}, or still {@code CONFIRMED} with an already-elapsed end (see {@code
+     * BookingClosureRule#isReviewEligible}).
      *
      * <p>Kept in the review feature (not {@code AppointmentController}) so all review-creation logic
      * lives in one package — the visit-scoped path {@code /appointments/{appointmentId}/review} is
