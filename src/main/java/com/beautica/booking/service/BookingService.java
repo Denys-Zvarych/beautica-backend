@@ -184,7 +184,7 @@ public class BookingService {
                 && eligibleByStatusAndTime
                 && canReview(booking.getStatus(), booking.getEndsAt(), now,
                         reviewRepository.existsByBookingId(bookingId), hasClient);
-        boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking);
+        boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking, now);
         return enrichSingle(booking, canReview, providerCanReviewClient, now);
     }
 
@@ -198,15 +198,22 @@ public class BookingService {
      * reject: (1) the actor has provider review-authority over this booking, via
      * {@link AuthorizationService#hasProviderAuthorityOverBooking} — the same predicate
      * {@code enforceCanReviewClient} throws on, reused non-throwing here rather than
-     * re-derived; (2) {@code status == COMPLETED}; (3) the booking has a real client (a guest/LINK
-     * booking has none — V89 {@code chk_bookings_guest_fields}); (4) no {@link
-     * com.beautica.review.entity.ClientReview} already exists for this booking. A CLIENT or
-     * SALON_MASTER viewer always fails condition (1), so this correctly reads {@code false} for
-     * them without any special-casing here.
+     * re-derived; (2) {@link BookingClosureRule#isReviewEligible} — {@code status == COMPLETED}
+     * OR an elapsed-but-unclosed {@code CONFIRMED} booking (the SAME predicate the client-side
+     * {@code canReview} flag and {@code ClientReviewService.create}'s write gate both use, so a
+     * booking that aged into Past by elapsed time is never falsely withheld here even though the
+     * provider never closed it — mirrors the fix already applied to the client review path); (3)
+     * the booking has a real client (a guest/LINK booking has none — V89 {@code
+     * chk_bookings_guest_fields}); (4) no {@link com.beautica.review.entity.ClientReview} already
+     * exists for this booking. A CLIENT or SALON_MASTER viewer always fails condition (1), so this
+     * correctly reads {@code false} for them without any special-casing here.
+     *
+     * @param now the SAME already-resolved instant {@link #getBooking} uses for {@code canReview}
+     *            and {@code awaitingClosure} — never a second, independently-resolved instant.
      */
-    private boolean computeProviderCanReviewClient(UUID actorUserId, Booking booking) {
+    private boolean computeProviderCanReviewClient(UUID actorUserId, Booking booking, OffsetDateTime now) {
         return authz.hasProviderAuthorityOverBooking(actorUserId, booking)
-                && booking.getStatus() == BookingStatus.COMPLETED
+                && BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now)
                 && booking.getClient() != null
                 && !clientReviewRepository.existsByBookingId(booking.getId());
     }

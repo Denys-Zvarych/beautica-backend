@@ -145,7 +145,11 @@ import java.util.UUID;
  * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking} — the exact
  * predicate backing {@code @authz.canReviewClient}/{@code enforceCanReviewClient} on
  * {@code POST /client-reviews}, so this can never disagree with what the write endpoint will
- * actually accept; (2) {@code status == COMPLETED}; (3) the booking has a real client (not a
+ * actually accept; (2) {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} —
+ * {@code status == COMPLETED} OR an elapsed-but-unclosed {@code CONFIRMED} booking (mirrors the
+ * client-side {@code canReview} widening and {@code ClientReviewService.create}'s write gate, so
+ * a booking that aged into Past by elapsed time is offered here even before the provider closes
+ * it — see that method's javadoc for the full rationale); (3) the booking has a real client (not a
  * guest/LINK booking); (4) no {@code ClientReview} already exists for this booking. A CLIENT or
  * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
@@ -221,8 +225,9 @@ public record BookingDetailResponse(
         boolean canReview,
         @Schema(description = "TRUE only for the CURRENT authenticated viewer, and only on "
                 + "GET /bookings/{id}: the viewer has provider review-authority over this "
-                + "booking, its status is COMPLETED, it has a real (non-guest) client, and no "
-                + "ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
+                + "booking, the booking is COMPLETED or an elapsed-but-unclosed CONFIRMED "
+                + "booking (BookingClosureRule#isReviewEligible), it has a real (non-guest) "
+                + "client, and no ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
                 + "unauthorized provider, or any row served by GET /bookings/me (both the "
                 + "CLIENT and provider listing paths hardcode false — see "
                 + "BookingDetailResponse's class javadoc). Gates the \"Залишити відгук про "

@@ -92,10 +92,34 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("400 when the booking is not COMPLETED")
-    void should_return400_when_bookingNotCompleted() throws Exception {
+    @DisplayName("400 when the booking is CONFIRMED and its endsAt has NOT yet elapsed — the "
+            + "important assertion the review-eligibility widening below must preserve: a still-open "
+            + "booking stays unreviewable")
+    void should_return400_when_bookingConfirmedAndNotYetElapsed() throws Exception {
         Salon salon = createSalon("clirev-notcompleted-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-notcompleted-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertFutureBooking(clientId, salon.masterId, salon.salonId, "CONFIRMED");
+
+        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("reviewing the client of a still-open, non-elapsed CONFIRMED booking must be "
+                        + "rejected with 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("201 when the booking is CONFIRMED but its endsAt has already ELAPSED — the bug "
+            + "fix: a booking the provider never closed but that aged into Past by time must be "
+            + "reviewable, mirroring the client-side ReviewService widening")
+    void should_return201_when_bookingConfirmedButElapsed() throws Exception {
+        Salon salon = createSalon("clirev-elapsed-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("clirev-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "CONFIRMED");
 
         String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
@@ -103,7 +127,27 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("reviewing the client of a non-COMPLETED booking must be rejected with 400")
+                .as("an elapsed-but-unclosed CONFIRMED booking must be reviewable — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
+                .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("400 when the booking is NOT_COMPLETED (no-show), even with an elapsed endsAt — "
+            + "guards against over-widening the eligibility check beyond CONFIRMED")
+    void should_return400_when_bookingNotCompletedNoShow() throws Exception {
+        Salon salon = createSalon("clirev-noshow-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("clirev-noshow-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "NOT_COMPLETED");
+
+        String body = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4}";
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("NOT_COMPLETED is an explicit no-show marking, never reviewable regardless of endsAt")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
@@ -299,6 +343,21 @@ class ClientReviewIT extends AbstractIntegrationTest {
                         + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
                         + "booking_source, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, NOW() - interval '2 hours', NOW() - interval '1 hour', "
+                        + "500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, salonId, status);
+        return bookingId;
+    }
+
+    /** Same shape as {@link #insertBooking}, but with a FUTURE starts_at/ends_at — for the
+     * still-open, not-yet-elapsed CONFIRMED case that must stay unreviewable. */
+    private UUID insertFutureBooking(UUID clientId, UUID masterId, UUID salonId, String status) {
+        UUID masterServiceId = createSalonService(salonId, masterId);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, NOW() + interval '1 hour', NOW() + interval '2 hours', "
                         + "500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, salonId, status);
         return bookingId;

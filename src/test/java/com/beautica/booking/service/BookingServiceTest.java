@@ -3146,8 +3146,15 @@ class BookingServiceTest {
     // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5) ──
     //
     // providerCanReviewClient = authz.hasProviderAuthorityOverBooking(actor, booking)
-    //     && status == COMPLETED && booking.getClient() != null
+    //     && BookingClosureRule.isReviewEligible(status, endsAt, now)
+    //     && booking.getClient() != null
     //     && !clientReviewRepository.existsByBookingId(booking.getId())
+    //
+    // isReviewEligible = (status == COMPLETED) OR (status == CONFIRMED && endsAt.isBefore(now)) —
+    // widened by the same fix already applied to the client-side canReview/ReviewService path
+    // (mirrored bug: a booking that ages into Past by elapsed time but is never closed by the
+    // provider must still be reviewable). See the dedicated ELAPSED-true / FUTURE-false /
+    // NOT_COMPLETED-still-false cases below.
     //
     // ProviderCanReviewClientIT already pins this end-to-end through real HTTP + role/authority
     // resolution. These cases isolate BookingService#computeProviderCanReviewClient itself via a
@@ -3189,11 +3196,14 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("providerCanReviewClient is false for a CONFIRMED (not COMPLETED) booking, even with provider authority — and the review-existence check is never reached")
-    void should_returnProviderCanReviewClientFalse_when_bookingNotCompleted() {
+    @DisplayName("providerCanReviewClient is false for a CONFIRMED booking whose endsAt has NOT "
+            + "yet elapsed (not COMPLETED, not awaiting closure), even with provider authority — "
+            + "and the review-existence check is never reached")
+    void should_returnProviderCanReviewClientFalse_when_bookingConfirmedAndNotYetElapsed() {
+        // buildBooking pins startsAt = now+2h / endsAt = now+3h — a genuinely FUTURE booking.
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        // CONFIRMED (not COMPLETED) short-circuits canReview before its own review-existence
+        // Not review-eligible short-circuits canReview before its own review-existence
         // query too — no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
@@ -3201,6 +3211,49 @@ class BookingServiceTest {
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
         assertThat(result.providerCanReviewClient()).isFalse();
+        verify(clientReviewRepository, never()).existsByBookingId(any());
+        verify(reviewRepository, never()).existsByBookingId(any());
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is true for a CONFIRMED booking whose endsAt has already "
+            + "ELAPSED, even though the provider never marked it COMPLETED — the bug fix mirrored "
+            + "from the client-side canReview/ReviewService widening")
+    void should_returnProviderCanReviewClientTrue_when_bookingConfirmedButElapsed() {
+        // buildBookingStartingAt with a past startsAt yields endsAt = startsAt + 1h, still
+        // strictly before "now" (clock is fixed at Instant.now() in setUp) for a 3h-ago start.
+        Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.CONFIRMED,
+                ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+        when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient())
+                .as("an elapsed-but-unclosed CONFIRMED booking must offer the provider-review CTA, "
+                        + "same as the client-side canReview flag already does for this row shape")
+                .isTrue();
+        verify(clientReviewRepository).existsByBookingId(bookingId);
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient stays false for a NOT_COMPLETED (no-show) booking even "
+            + "with an elapsed endsAt and provider authority — guards against over-widening "
+            + "isReviewEligible beyond CONFIRMED")
+    void should_returnProviderCanReviewClientFalse_when_bookingNotCompletedNoShow() {
+        Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.NOT_COMPLETED,
+                ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient())
+                .as("NOT_COMPLETED is an explicit no-show marking, never reviewable regardless of endsAt")
+                .isFalse();
         verify(clientReviewRepository, never()).existsByBookingId(any());
         verify(reviewRepository, never()).existsByBookingId(any());
     }
