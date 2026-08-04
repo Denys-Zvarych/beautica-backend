@@ -144,6 +144,40 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.bulk-service-setup-capacity:10}")
     private long bulkServiceSetupCapacity;
 
+    // Per-IP cap for the SINGLE-item service write endpoints on ServiceController
+    // (60-second window):
+    //   - POST   /api/v1/independent-masters/me/services
+    //   - POST   /api/v1/salons/{salonId}/services
+    //   - POST   /api/v1/salons/{salonId}/masters/{masterId}/services
+    //   - PATCH  /api/v1/services/{serviceDefId}
+    //   - PATCH  /api/v1/services/{serviceDefId}/photo
+    //   - DELETE /api/v1/services/{serviceDefId}
+    //
+    // Every one of these fell through to the unmatched else/non-POST branch of
+    // AuthRateLimitFilter with NO bucket at all, which undercut bulkServiceSetupCapacity's own
+    // stated rationale: the bulk bucket is capped to bound service_definitions row growth, but an
+    // attacker wanting that growth simply looped the unthrottled single-create instead — the
+    // strictly better lever, since it also skipped the per-master advisory lock the bulk path
+    // takes. Closing it makes bulk the tighter path again, as intended.
+    //
+    // SEPARATE bucket from bulkServiceSetupCapacity, deliberately: a bulk request does up to 100
+    // items of work, a single write does one. Sharing the bulk bucket would either impose its
+    // tight 10/min on legitimate per-item usage, or force that cap up and re-loosen exactly the
+    // DoS amplifier the bulk bucket exists to bound. Each is sized for its own unit of work.
+    //
+    // Sizing (60/min). The bulk endpoint already accepts a 100-item catalogue in ONE request, so
+    // a provider who works through the per-item forms instead — building out a menu service by
+    // service, or sweeping prices across an existing one with PATCH, each service costing a
+    // create plus a photo PATCH — must not be throttled into a 60-second stall for preferring
+    // that UX. 60/min covers a 30-service build-out (create + photo per service) in one sitting
+    // with no 429, well past the realistic per-master catalogue size, while still capping
+    // sustained row growth at 60 rows/min — 16x BELOW what the already-accepted bulk ceiling
+    // permits (10 req/min x 100 items = 1000 rows/min). IP-keyed for consistency with every other
+    // bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs). Configurable so
+    // integration tests on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.service-write-capacity:60}")
+    private long serviceWriteCapacity;
+
     // Per-IP cap for POST /api/v1/support/contact (60-minute window).
     // Each successful call sends an email to the support inbox, so this is an
     // email-bomb / outbound-quota DoS surface — kept low (5/hr) to mirror the
@@ -538,6 +572,25 @@ public class RateLimitConfig {
     @Bean
     public LoadingCache<String, Bucket> bulkServiceSetupBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, bulkServiceSetupCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-IP bucket for the SINGLE-item service write endpoints on
+     * {@code ServiceController} — the create/update/delete/photo routes that are not the
+     * {@code /bulk} pair (see {@link #serviceWriteCapacity}'s javadoc for the full route list,
+     * why this is not shared with {@link #bulkServiceSetupBuckets()}, and the 60/min arithmetic).
+     *
+     * <p>Cap: 60 requests per 60-second window per source IP. Before this bucket these routes had
+     * no throttle at all, which made single-create a strictly better row-growth lever than the
+     * bulk endpoint the {@link #bulkServiceSetupBuckets()} cap was sized to bound.
+     *
+     * <p>IP-keyed (not user-keyed) for consistency with every other bucket in this filter: JWT
+     * parsing happens in {@link com.beautica.auth.JwtAuthenticationFilter}, which runs after
+     * {@code AuthRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> serviceWriteBuckets() {
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, serviceWriteCapacity, ONE_MINUTE);
     }
 
     /**

@@ -35,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>This drives the <i>real</i> filter through {@code doFilterInternal} and asserts only
  * observable HTTP behaviour. The remove-admin bucket is built internally (like
  * {@code salonInviteBuckets} / {@code logoutBuckets}), so this test references no new constructor
- * arg; the 18 positional permissive caches mirror the public 18-{@code @Qualifier} constructor
+ * arg; the 19 positional permissive caches mirror the public 19-{@code @Qualifier} constructor
  * (see {@code SalonInvitePostRateLimitRegressionTest}).
  */
 @DisplayName("AuthRateLimitFilter — DELETE /salons/{salonId}/admins/{userId} per-IP throttle (Phase 21.2 SEC-fix regression net)")
@@ -60,7 +60,7 @@ class RemoveAdminRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
         // constructor. The remove-admin-DELETE throttle is internal to the filter (built like
         // salonInviteBuckets), so this test references no new constructor arg beyond the count.
         return new AuthRateLimitFilter(
@@ -68,7 +68,7 @@ class RemoveAdminRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive());
+                permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest deleteAdmin(UUID salonId, UUID userId) {

@@ -55,7 +55,7 @@ class InvitePostRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
         // constructor (now includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets,
         // Phase A5). The invite-POST throttle is internal to the filter (built like
         // otpVerifyBuckets), so this test references no new constructor arg beyond the count.
@@ -64,7 +64,7 @@ class InvitePostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive());
+                permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postInvite() {

@@ -112,10 +112,20 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * {@link #findByMasterIdAndIsActiveTrueWithGraph} so a soft-deleted definition does not
      * count as an active service.
      *
-     * <p><b>No production caller as of the additive-bulk change.</b> This backed the old
-     * "bulk setup is first-time only" precondition, which was removed when bulk create became
-     * additive; the query is retained (with its repository test) as a menu-emptiness predicate
-     * for callers that need one. Delete it if it is still unused when next reviewed.
+     * <p><b>No production caller — RETAINED DELIBERATELY. Do not delete as "dead code".</b> This
+     * backed the old "bulk setup is first-time only" precondition, removed when bulk create became
+     * additive. It is kept because it is the SUBJECT of the regression pins that assert the
+     * precondition stays gone:
+     * {@code ServiceCatalogServiceBulkCreateTest#should_createBatch_when_salonMasterAlreadyHasActiveServices}
+     * and {@code #should_createBatch_when_masterAlreadyHasActiveServices} both assert
+     * {@code verify(masterServiceRepository, never()).existsActiveServiceForMaster(any())}. Those
+     * verifications name this method, so deleting it does not merely delete a query — it deletes
+     * the guard, and the precondition could be reintroduced with nothing failing. The method's own
+     * repository tests ({@code MasterServiceRepositoryTest}) keep the JPQL itself honest so the
+     * pins verify a method that still works.
+     *
+     * <p>Remove it only together with a replacement guard that proves the same thing without
+     * naming the method (there is currently no such guard), never as an interface tidy-up.
      */
     @Query("""
             SELECT COUNT(msa) > 0
@@ -194,12 +204,23 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * lock for the duration of a 100-item batch and push that master's concurrent bookers into the
      * booking path's own 3s timeout. A dedicated salt removes the cross-feature coupling outright.
      *
-     * <p><b>Deadlock freedom.</b> Trivially preserved: a bulk-setup transaction takes the salt-2
-     * lock and NO other advisory lock, and no other code path takes salt {@code 2} at all — so no
-     * session can hold a salt-2 lock while waiting on salt 0/1, nor the reverse, and the two-lock
-     * cycle precondition never arises. (It also held before this change, because bulk took only
-     * salt 0 while booking always acquires client-then-master; the argument no longer depends on
-     * booking's internal ordering.)
+     * <p><b>Deadlock freedom (ADVISORY locks).</b> Trivially preserved: a bulk-setup transaction
+     * takes the salt-2 lock and NO other advisory lock, and no other code path takes salt
+     * {@code 2} at all — so no session can hold a salt-2 lock while waiting on salt 0/1, nor the
+     * reverse, and the two-lock cycle precondition never arises among advisory locks. (It also
+     * held before this change, because bulk took only salt 0 while booking always acquires
+     * client-then-master; the argument no longer depends on booking's internal ordering.)
+     *
+     * <p><b>Deadlock freedom (ROW locks) — why the advisory argument above is not the whole
+     * story.</b> Verified separately, because a cycle needs only ONE advisory edge and one row-lock
+     * edge: after taking this lock, the bulk transaction writes {@code service_definitions},
+     * {@code master_service_assignments} and {@code masters.min_effective_price} — and no booking
+     * path writes {@code masters} at all, so no booking transaction can be holding a conflicting
+     * {@code masters} row lock while waiting on anything bulk holds. The one place the two paths
+     * meet a shared row is that {@code masters} UPDATE itself: {@code idx_masters_min_effective_price}
+     * is non-unique, so the UPDATE takes {@code FOR NO KEY UPDATE}, which is compatible with the
+     * {@code FOR KEY SHARE} a booking insert's FK reference to {@code masters} takes — the two do
+     * not block each other, so no wait edge forms in either direction.
      *
      * <p>Hash collision risk WITHIN salt {@code 2}: {@code hashtextextended} produces a 64-bit hash
      * of the UUID text. Birthday-paradox probability is negligible for current master counts, and a

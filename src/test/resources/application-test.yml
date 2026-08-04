@@ -59,6 +59,16 @@ app:
     # hand-built buckets (bypassing this property entirely), so the override does not neuter the
     # bulk-endpoint throttling coverage.
     bulk-service-setup-capacity: 100000
+    # High for the SAME reason as bulk-service-setup-capacity directly above, and it is not
+    # optional: ServicesIntegrationTest / ServiceSecurityTest / FlexiblePricingContractIT and
+    # friends each fire many POST/PATCH/DELETE service writes from 127.0.0.1, all sharing one
+    # per-IP bucket, and the production default is only 60/60s. Left unraised, the 429s would be
+    # MASKED rather than surfaced — Apache HC5's default retry strategy honours Retry-After, so
+    # TestRestTemplate sleeps the full 60s window and retries, turning a throttle hit into a
+    # 60-second-long PASS (the exact trap bulk-service-setup-capacity was added to fix).
+    # ServiceWriteRateLimitRegressionTest builds the filter directly against hand-built buckets
+    # (bypassing this property entirely), so the override does not neuter the throttling coverage.
+    service-write-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.

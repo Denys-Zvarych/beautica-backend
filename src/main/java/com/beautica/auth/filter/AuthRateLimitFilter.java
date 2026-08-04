@@ -67,6 +67,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
     private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
+    // SINGLE-item service write routes (ServiceController), all sharing serviceWriteBuckets.
+    // Three shapes:
+    //   1. exact  POST   /api/v1/independent-masters/me/services            (IM single-create)
+    //   2. prefix+suffix POST /api/v1/salons/{salonId}/services  AND
+    //                    POST /api/v1/salons/{salonId}/masters/{masterId}/services
+    //      — both carry path variables and both end in the literal "/services", so one
+    //        prefix+suffix rule covers the salon-side single-creates (same technique as
+    //        BULK_SALON_SERVICES above). It cannot collide with the bulk route, which ends in
+    //        "/services/bulk", nor with the salon-invite route, which ends in "/invite".
+    //   3. prefix PATCH/DELETE /api/v1/services/{serviceDefId} and .../{serviceDefId}/photo
+    //      — one prefix covers the update, photo-update and deactivate routes. It cannot collide
+    //        with /api/v1/service-categories/** or /api/v1/service-types/**, which do not start
+    //        with the literal "services/" segment.
+    private static final String IM_SINGLE_SERVICE_PATH = "/api/v1/independent-masters/me/services";
+    private static final String SALON_SINGLE_SERVICE_PREFIX = "/api/v1/salons/";
+    private static final String SALON_SINGLE_SERVICE_SUFFIX = "/services";
+    private static final String SERVICE_DEF_WRITE_PATH_PREFIX = "/api/v1/services/";
     // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
     // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
     // This is the actual HTTP path SalonController.inviteMaster exposes to SALON_OWNER and
@@ -319,6 +336,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rejects a repeat caller), so an authenticated token-holder is a DoS amplifier
     // without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
+    // Per-IP bucket for the SINGLE-item service write routes (create / update / photo / delete).
+    // Every one of them was previously unthrottled, which made single-create a strictly BETTER
+    // service_definitions row-growth lever than the bulk endpoint bulkServiceSetupBuckets caps —
+    // and one that skips the per-master advisory lock too. 60/min; see
+    // RateLimitConfig#serviceWriteCapacity for the sizing arithmetic and for why this is a
+    // separate bucket rather than a share of bulkServiceSetupBuckets.
+    private final LoadingCache<String, Bucket> serviceWriteBuckets;
     // Per-IP bucket for POST /api/v1/support/contact — every successful request emails
     // the support inbox, so this is an email-bomb / outbound-quota surface (5/hr).
     private final LoadingCache<String, Bucket> supportContactBuckets;
@@ -398,7 +422,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
             @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
             @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
-            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets) {
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -417,6 +442,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.otpSendBuckets = otpSendBuckets;
         this.verifyPasswordResetOtpBuckets = verifyPasswordResetOtpBuckets;
         this.changePasswordOtpBuckets = changePasswordOtpBuckets;
+        this.serviceWriteBuckets = serviceWriteBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -613,6 +639,37 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         || (path.startsWith(BULK_SALON_SERVICES_PREFIX)
                                 && path.endsWith(BULK_SALON_SERVICES_SUFFIX)))) {
             applyRateLimit(request, response, filterChain, bulkServiceSetupBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Single-service-CREATE rate-limit: POST on any of the three non-bulk create routes —
+        // /api/v1/independent-masters/me/services (exact) and the two salon-side routes matched by
+        // prefix + the literal "/services" suffix. Placed AFTER the bulk branch above so ordering
+        // is self-evidently safe, though the two rules are disjoint anyway (bulk ends in
+        // "/services/bulk", never "/services"). Cap: 60 / 60 s per IP (serviceWriteBuckets).
+        //
+        // Why this branch exists: without it these creates fell through to the unmatched else
+        // branch with NO throttle, so an attacker chasing service_definitions row growth just
+        // looped single-create instead of the rate-limited bulk endpoint — the strictly better
+        // lever, and one that skips the per-master advisory lock as well.
+        if (HttpMethod.POST.matches(method)
+                && (IM_SINGLE_SERVICE_PATH.equals(path)
+                        || (path.startsWith(SALON_SINGLE_SERVICE_PREFIX)
+                                && path.endsWith(SALON_SINGLE_SERVICE_SUFFIX)))) {
+            applyRateLimit(request, response, filterChain, serviceWriteBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Service-definition MUTATE rate-limit: PATCH /api/v1/services/{serviceDefId},
+        // PATCH /api/v1/services/{serviceDefId}/photo and DELETE /api/v1/services/{serviceDefId} —
+        // matched by prefix, which covers all three and cannot reach the sibling
+        // /api/v1/service-categories/** or /api/v1/service-types/** namespaces. Checked before the
+        // POST-only guard below so these PATCH/DELETE routes are covered; without this branch they
+        // fell through to it entirely unthrottled, the same gap as the creates above. They share
+        // ONE bucket with the creates by design — same class of single-item catalogue write.
+        if ((HttpMethod.PATCH.matches(method) || HttpMethod.DELETE.matches(method))
+                && path.startsWith(SERVICE_DEF_WRITE_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, serviceWriteBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
