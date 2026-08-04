@@ -3,6 +3,7 @@ package com.beautica.service;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
@@ -43,15 +44,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
- * Full-stack integration tests for the first-time bulk service-setup flow
+ * Full-stack integration tests for the bulk service-create flow
  * (HTTP → controller → service → real PostgreSQL).
+ *
+ * <p>The flow is <em>additive</em>: one multi-select screen serves both initial catalogue
+ * setup and later "add more services" passes, so there is no menu-emptiness precondition.
+ * The only state-conflict a caller can hit is a per-service {@code DUPLICATE_SERVICE} 409.
  *
  * <p>These tests pin the behaviours that only a real transaction + database can prove:
  * <ul>
  *   <li>Both endpoints persist the whole batch and derive name/category from the seeded
  *       service types server-side.</li>
- *   <li>409 first-time precondition: a second bulk call is rejected once the master has
- *       active services, and the existing rows are untouched.</li>
+ *   <li>Additive: a second bulk call for a master who already has services succeeds and
+ *       appends to the catalogue rather than being rejected — leaving the pre-existing
+ *       definitions untouched (same ids, still active, price unchanged), on BOTH entry
+ *       points.</li>
+ *   <li>Append bookkeeping: {@code masters.min_effective_price} (the search-facing V58
+ *       column) moves down for a cheaper appended service, holds for a dearer one, and
+ *       follows a RANGE item's priceMin floor; the master's cached browse list is evicted.</li>
+ *   <li>Append conflict: a second batch mixing a fresh type with an ALREADY-OWNED one is
+ *       rejected whole, with the first batch surviving intact.</li>
  *   <li>Transactional all-or-nothing: a batch containing one bad item rolls back ZERO
  *       rows — the failed item does not leak a partial definition.</li>
  *   <li>SALON_ADMIN may bulk-create on behalf of a salon master (intentional
@@ -62,7 +74,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * APPROVED+active platform category) so the derived category passes the server-side gate.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Bulk first-time service setup — full-flow integration")
+@DisplayName("Additive bulk service create — full-flow integration")
 class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(BulkServiceSetupIntegrationTest.class);
@@ -72,6 +84,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     @Autowired private JdbcTemplate jdbcTemplate;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private ServiceCatalogService serviceCatalogService;
+    @Autowired private org.springframework.cache.CacheManager cacheManager;
 
     private ServiceTestFixtures fixtures;
     private List<ServiceTestFixtures.SeededServiceType> seededTypes;
@@ -95,6 +108,45 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         return new BulkServiceItemRequest(serviceTypeId, duration, PriceType.RANGE, null, new BigDecimal(min), new BigDecimal(max));
     }
 
+    /** POSTs a batch to the authenticated master's own bulk endpoint. */
+    private ResponseEntity<String> postSelfBulk(String token, BulkCreateServicesRequest request) {
+        return restTemplate.exchange(
+                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+    }
+
+    /** POSTs a batch to the salon on-behalf bulk endpoint. */
+    private ResponseEntity<String> postSalonBulk(
+            String token, UUID salonId, UUID masterId, BulkCreateServicesRequest request) {
+        return restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+    }
+
+    private List<MasterServiceResponse> createdFrom(ResponseEntity<String> resp) throws Exception {
+        return objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<List<MasterServiceResponse>>>() {}).data();
+    }
+
+    private DuplicateServiceResponse duplicateBodyFrom(ResponseEntity<String> resp) throws Exception {
+        return objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<DuplicateServiceResponse>>() {}).data();
+    }
+
+    /** Active {@code service_definitions} ids owned by the master, so append tests can prove identity, not just count. */
+    private List<UUID> activeDefinitionIdsForMaster(UUID masterId) {
+        return jdbcTemplate.queryForList(
+                "SELECT id FROM service_definitions WHERE owner_id = ? AND is_active = TRUE ORDER BY created_at",
+                UUID.class, masterId);
+    }
+
+    private long activeAssignmentCountForMaster(UUID masterId) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ? AND is_active = TRUE",
+                Long.class, masterId);
+        return count == null ? 0L : count;
+    }
+
     // ── Self endpoint happy path ───────────────────────────────────────────────
 
     @Test
@@ -111,14 +163,10 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 range(rangeType.id(), 120, "800.00", "1500.00")));
 
         log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with a mixed 2-item batch");
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+        ResponseEntity<String> resp = postSelfBulk(token, request);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        var parsed = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<List<MasterServiceResponse>>>() {});
-        List<MasterServiceResponse> created = parsed.data();
+        List<MasterServiceResponse> created = createdFrom(resp);
 
         assertThat(created).as("one response entry per created service").hasSize(2);
 
@@ -138,35 +186,327 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(2L);
     }
 
-    // ── 409 first-time precondition ────────────────────────────────────────────
+    // ── Additive: repeat calls append to the catalogue ─────────────────────────
 
+    /**
+     * The bulk endpoint used to be first-time-only: a second call for a master who already had
+     * an active service was rejected 409, which is why the app needed a separate single-service
+     * form for "add one more". That precondition is gone, so the multi-select screen is now the
+     * single way to add services at any point in a master's life.
+     *
+     * <p>Asserting the 201 alone would be weak — it would pass even if the second batch silently
+     * persisted nothing — so the decisive assertion is the row count: the second batch must
+     * APPEND, leaving both services in the catalogue.
+     */
     @Test
-    @DisplayName("second bulk call returns 409 and leaves the existing services untouched")
-    void should_return409AndNotMutate_when_masterAlreadyHasServices() throws Exception {
+    @DisplayName("second bulk call for a master who already has services succeeds and appends to the catalogue")
+    void should_appendToCatalogue_when_masterAlreadyHasServices() throws Exception {
         String email = "indep-twice-" + System.nanoTime() + "@beautica.test";
         String token = fixtures.createIndependentMasterAndGetToken(email);
         UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
 
         var firstRequest = new BulkCreateServicesRequest(List.of(
                 fixed(seededTypes.get(0).id(), 60, "350.00")));
-        ResponseEntity<String> first = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(firstRequest, fixtures.bearerHeaders(token)), String.class);
+        ResponseEntity<String> first = postSelfBulk(token, firstRequest);
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
-        // Second bulk call — the master now has an active service.
+        // Second bulk call — the master now has an active service, and a DIFFERENT service type
+        // is requested, so nothing collides with the V121 (owner, service_type) uniqueness.
         var secondRequest = new BulkCreateServicesRequest(List.of(
                 fixed(seededTypes.get(1).id(), 90, "500.00")));
 
-        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk a SECOND time — must be 409");
-        ResponseEntity<String> second = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(secondRequest, fixtures.bearerHeaders(token)), String.class);
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk a SECOND time — must be 201");
+        ResponseEntity<String> second = postSelfBulk(token, secondRequest);
+
+        assertThat(second.getStatusCode())
+                .as("bulk create is additive — an existing catalogue no longer blocks the call")
+                .isEqualTo(HttpStatus.CREATED);
+
+        assertThat(createdFrom(second))
+                .extracting(r -> r.serviceDefinition().name())
+                .as("the response describes the newly added service, not the pre-existing one")
+                .containsExactly(seededTypes.get(1).nameUk());
+
+        assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
+                .as("the second batch APPENDS: both the original and the added service persist")
+                .isEqualTo(2L);
+    }
+
+    /**
+     * Row count alone proves the appended service arrived; it does NOT prove the pre-existing
+     * ones survived <em>as they were</em>. A "replace the catalogue" regression (deactivate the
+     * old rows, insert the new batch) would keep a plausible count while silently wiping the
+     * master's menu — so this pins IDENTITY: the exact definition ids created by the first batch
+     * are still there, still active, still carrying an active assignment, still priced the same.
+     */
+    @Test
+    @DisplayName("appending leaves the pre-existing definitions untouched — same ids, still active, price unchanged")
+    void should_leavePreExistingServicesUntouched_when_secondBatchAppends() throws Exception {
+        String email = "indep-untouched-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        ResponseEntity<String> first = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "350.00"))));
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID originalDefId = createdFrom(first).get(0).serviceDefinition().id();
+
+        log.debug("Act: append a second, different service type to a catalogue that already holds one");
+        ResponseEntity<String> second = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(1).id(), 90, "500.00"))));
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID appendedDefId = createdFrom(second).get(0).serviceDefinition().id();
+
+        assertThat(activeDefinitionIdsForMaster(masterId))
+                .as("the ORIGINAL definition id survives alongside the appended one — an append "
+                        + "that replaced the catalogue would keep the count but change the ids")
+                .containsExactlyInAnyOrder(originalDefId, appendedDefId);
+        assertThat(activeAssignmentCountForMaster(masterId))
+                .as("both definitions still carry an ACTIVE master_services assignment — a "
+                        + "deactivated assignment would hide the original from the master's menu "
+                        + "while leaving its definition row in place")
+                .isEqualTo(2L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT base_price FROM service_definitions WHERE id = ?", BigDecimal.class, originalDefId))
+                .as("the appended batch must not rewrite the pre-existing service's price")
+                .isEqualByComparingTo("350.00");
+    }
+
+    // ── Append: masters.min_effective_price (search-facing denormalised column) ─
+    //
+    // min_effective_price (V58) is read by search/browse ordering, and appending is a BRAND-NEW
+    // way to change it — under the old first-time-only precondition the column could only ever be
+    // written once per master by this endpoint. refreshMinEffectivePrice recomputes it from
+    // MIN(COALESCE(price_override, base_price)) over the master's ACTIVE services, so the append
+    // must move the floor DOWN when the new service is cheaper and leave it alone when it is not.
+
+    @Test
+    @DisplayName("appending a CHEAPER service lowers masters.min_effective_price to the new floor")
+    void should_lowerMinEffectivePrice_when_appendedServiceIsCheaper() throws Exception {
+        String email = "indep-minprice-down-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "500.00"))));
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("precondition: the first batch established 500.00 as the master's floor")
+                .isEqualByComparingTo("500.00");
+
+        log.debug("Act: append a 150.00 service to a catalogue whose current floor is 500.00");
+        ResponseEntity<String> resp = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(1).id(), 30, "150.00"))));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("the cheaper appended service becomes the new search-facing floor; a stale "
+                        + "500.00 would rank this master above their real starting price")
+                .isEqualByComparingTo("150.00");
+    }
+
+    @Test
+    @DisplayName("appending a MORE EXPENSIVE service leaves masters.min_effective_price at the existing floor")
+    void should_keepMinEffectivePrice_when_appendedServiceIsMoreExpensive() throws Exception {
+        String email = "indep-minprice-up-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "200.00"))));
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("precondition: the first batch established 200.00 as the master's floor")
+                .isEqualByComparingTo("200.00");
+
+        log.debug("Act: append a 900.00 service to a catalogue whose current floor is 200.00");
+        ResponseEntity<String> resp = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(1).id(), 90, "900.00"))));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("min_effective_price is a MIN, not a last-write-wins column — the dearer "
+                        + "append must not raise the master's advertised starting price")
+                .isEqualByComparingTo("200.00");
+    }
+
+    /**
+     * A RANGE service's {@code base_price} IS its {@code priceMin} (the canonical floor — locked
+     * product decision), so appending a RANGE whose MIN undercuts the current floor must lower
+     * {@code min_effective_price} to that min, never to its max. Distinct from the FIXED case
+     * above: this is the branch where the column's input is the range floor, and getting it wrong
+     * yields a master whose advertised "from" price is their most expensive range ceiling.
+     */
+    @Test
+    @DisplayName("appending a RANGE service lowers masters.min_effective_price to its priceMin, not its priceMax")
+    void should_useAppendedRangeFloor_when_appendedRangeMinUndercutsExistingFloor() throws Exception {
+        String email = "indep-minprice-range-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "400.00"))));
+
+        log.debug("Act: append a RANGE 250.00–1200.00 service to a catalogue whose floor is 400.00");
+        ResponseEntity<String> resp = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                range(seededTypes.get(1).id(), 120, "250.00", "1200.00"))));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("RANGE base_price = priceMin, so the appended range's FLOOR (250.00) is the "
+                        + "new minimum — picking priceMax would advertise 1200.00 instead")
+                .isEqualByComparingTo("250.00");
+    }
+
+    // ── Append: masterServices cache eviction ──────────────────────────────────
+
+    /**
+     * {@code getMasterServices} is {@code @Cacheable("masterServices")} and backs the permitAll
+     * browse route, so a catalogue read after the FIRST batch parks a one-entry list in the
+     * cache. The append then has to evict it (after commit), otherwise a client browsing this
+     * master keeps seeing the pre-append menu for the whole 10-minute TTL.
+     *
+     * <p>Asserted behaviourally, not by counting annotations: the cache entry is proven present
+     * before the append, absent immediately after, and the next read returns BOTH services.
+     */
+    @Test
+    @DisplayName("appending evicts the master's cached services list — the next browse sees both services")
+    void should_evictMasterServicesCache_when_secondBatchAppends() throws Exception {
+        String email = "indep-cache-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "350.00"))));
+
+        // Populate the cache through the real @Cacheable proxy.
+        assertThat(serviceCatalogService.getMasterServices(masterId))
+                .as("precondition: the browse read returns the first batch's single service")
+                .hasSize(1);
+        var cache = cacheManager.getCache("masterServices");
+        assertThat(cache).as("the masterServices cache must be configured for this test to mean anything").isNotNull();
+        assertThat(cache.get(masterId))
+                .as("precondition: the browse read populated the cache for this master")
+                .isNotNull();
+
+        log.debug("Act: append a second service while the master's browse list is sitting in the cache");
+        ResponseEntity<String> resp = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(1).id(), 90, "500.00"))));
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        assertThat(cache.get(masterId))
+                .as("the append's afterCommit eviction must clear the stale one-service entry; "
+                        + "without it a browsing client sees the pre-append menu until the TTL expires")
+                .isNull();
+        assertThat(serviceCatalogService.getMasterServices(masterId))
+                .as("the repopulated browse list carries both the original and the appended service")
+                .hasSize(2);
+    }
+
+    // ── Append: partial collision rolls the WHOLE second batch back ────────────
+
+    /**
+     * The append-specific rollback case, and the one the old first-time-only precondition made
+     * unreachable: a second batch mixing a NEW service type with one the master ALREADY offers.
+     * The whole second batch must be rejected 409 {@code DUPLICATE_SERVICE} — and, critically,
+     * the FIRST batch must survive intact. A rollback that reached too far (or an append
+     * implemented as replace-then-insert) would leave the master with a broken or empty menu
+     * after a request that only ever should have been a no-op.
+     *
+     * <p>Unlike the existing duplicate tests, the collision here is with a NORMAL service created
+     * through the endpoint (definition + active assignment), not a hand-seeded assignmentless
+     * definition — i.e. the exact shape a real "add more services" mis-tap produces.
+     */
+    @Test
+    @DisplayName("a second batch mixing a new type with an ALREADY-OWNED one is fully rejected 409 — the first batch survives intact")
+    void should_rollBackWholeSecondBatch_when_appendPartiallyCollidesWithExistingCatalogue() throws Exception {
+        List<ServiceTestFixtures.SeededServiceType> types = fixtures.activeSelectableServiceTypes(3);
+        assertThat(types)
+                .as("this test needs three selectable types: two for the first batch, one fresh "
+                        + "type to pair with the colliding one in the second")
+                .hasSize(3);
+
+        String email = "indep-append-collide-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        ResponseEntity<String> first = postSelfBulk(token, new BulkCreateServicesRequest(List.of(
+                fixed(types.get(0).id(), 60, "350.00"),
+                fixed(types.get(1).id(), 45, "275.00"))));
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        List<UUID> firstBatchDefIds = activeDefinitionIdsForMaster(masterId);
+        UUID collidingDefId = createdFrom(first).stream()
+                .filter(r -> r.serviceDefinition().name().equals(types.get(0).nameUk()))
+                .findFirst().orElseThrow()
+                .serviceDefinition().id();
+        BigDecimal floorBeforeAppend = fixtures.minEffectivePriceForMaster(masterId);
+
+        // Fresh type FIRST, already-owned type SECOND: a guard that stopped at the first item
+        // would let the fresh one through.
+        var secondRequest = new BulkCreateServicesRequest(List.of(
+                fixed(types.get(2).id(), 90, "500.00"),
+                fixed(types.get(0).id(), 30, "199.00")));
+
+        log.debug("Act: append a 2-item batch whose second item re-requests a service type the master already offers");
+        ResponseEntity<String> second = postSelfBulk(token, secondRequest);
 
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
-                .as("the rejected second batch must NOT add any rows — only the first service remains")
-                .isEqualTo(1L);
+        assertThat(duplicateBodyFrom(second))
+                .extracting(DuplicateServiceResponse::code, DuplicateServiceResponse::existingServiceDefId)
+                .as("the client branches on DUPLICATE_SERVICE and deep-links to the service it "
+                        + "already owns — here the definition the FIRST batch created")
+                .containsExactly("DUPLICATE_SERVICE", collidingDefId);
+
+        assertThat(activeDefinitionIdsForMaster(masterId))
+                .as("all-or-nothing across the append: the fresh item must NOT slip through, and "
+                        + "the first batch's services must remain exactly as they were")
+                .containsExactlyInAnyOrderElementsOf(firstBatchDefIds);
+        assertThat(activeAssignmentCountForMaster(masterId))
+                .as("no assignment leaks from the rejected batch either")
+                .isEqualTo(2L);
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("the rejected batch's cheaper 199.00 item must not move the search-facing "
+                        + "floor — a floor written before the rollback would survive the rollback "
+                        + "only if it escaped the transaction")
+                .isEqualByComparingTo(floorBeforeAppend);
+    }
+
+    // ── Append parity: salon on-behalf entry point ─────────────────────────────
+
+    /**
+     * {@code bulkCreateSalonMasterServices} is the second entry point into the same additive core,
+     * and it carries its own authorization prologue. Parity is not free: the removed precondition
+     * lived in the shared core, but only the independent path had append coverage. This pins that
+     * an owner can keep adding to a salon master's menu, and that the shared post-write bookkeeping
+     * (min_effective_price) runs on this path too.
+     */
+    @Test
+    @DisplayName("salon on-behalf bulk create is additive too — a second owner batch appends to the salon master's catalogue")
+    void should_appendToSalonMasterCatalogue_when_ownerBulkCreatesTwice() throws Exception {
+        String ownerEmail = "owner-append-" + System.nanoTime() + "@beautica.test";
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(ownerEmail);
+        UUID salonId = fixtures.createSalon(ownerToken, "Append Bulk Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        ResponseEntity<String> first = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "600.00"))));
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID originalDefId = createdFrom(first).get(0).serviceDefinition().id();
+
+        log.debug("Act: owner POSTs a SECOND on-behalf batch for the same salon master — must append, not 409");
+        ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(1).id(), 30, "180.00"))));
+
+        assertThat(second.getStatusCode())
+                .as("the on-behalf path shares the additive core — an existing catalogue no longer blocks it")
+                .isEqualTo(HttpStatus.CREATED);
+        UUID appendedDefId = createdFrom(second).get(0).serviceDefinition().id();
+
+        assertThat(activeDefinitionIdsForMaster(masterId))
+                .as("the salon master's menu keeps both batches")
+                .containsExactlyInAnyOrder(originalDefId, appendedDefId);
+        assertThat(fixtures.minEffectivePriceForMaster(masterId))
+                .as("the shared post-write bookkeeping runs on the on-behalf path too — the "
+                        + "cheaper appended service is the salon master's new floor")
+                .isEqualByComparingTo("180.00");
     }
 
     // ── Transactional all-or-nothing ───────────────────────────────────────────
@@ -184,9 +524,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 fixed(UUID.randomUUID(), 90, "500.00")));
 
         log.debug("Act: POST a 2-item bulk batch where item 2 has an unknown serviceTypeId — expect rollback");
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+        ResponseEntity<String> resp = postSelfBulk(token, request);
 
         assertThat(resp.getStatusCode())
                 .as("a non-existent serviceTypeId surfaces as 404")
@@ -213,9 +551,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 fixed(seededTypes.get(0).id(), 60, "350.00")));
 
         log.debug("Act: SALON_ADMIN POST /api/v1/salons/{}/masters/{}/services/bulk — on-behalf within own salon", salonId, masterId);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(adminToken)), String.class);
+        ResponseEntity<String> resp = postSalonBulk(adminToken, salonId, masterId, request);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
@@ -244,9 +580,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // Owner A targets a master that lives in salon B, but addresses it via salon A's path.
         log.debug("Act: owner A POST /api/v1/salons/{}/masters/{}/services/bulk targeting a salon-B master — must be 403", salonAId, masterInSalonB);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/salons/" + salonAId + "/masters/" + masterInSalonB + "/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(ownerAToken)), String.class);
+        ResponseEntity<String> resp = postSalonBulk(ownerAToken, salonAId, masterInSalonB, request);
 
         assertThat(resp.getStatusCode())
                 .as("masterBelongsToSalon(masterInSalonB, salonA) is false → 403")
@@ -273,32 +607,34 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     // mock-covered by design, not by omission.
 
     /**
-     * The case {@code ServiceCatalogService#assertNoActiveDuplicatesInBatch}'s javadoc cites as the
-     * reason it is NOT redundant with the caller's {@code existsActiveServiceForMaster}
-     * precondition, quoted: "A definition owned by this master that is active but carries no active
-     * assignment passes the bulk precondition and still collides with the index — this check turns
-     * that into a clean 409 instead of a 500 at flush."
+     * The awkward state {@code ServiceCatalogService#assertNoActiveDuplicatesInBatch} exists to
+     * catch: an ACTIVE definition owned by this master that carries no active assignment. It is
+     * invisible in the master's menu, yet the definition-level V121 index still rejects a batch
+     * re-requesting its service type. The guard turns that into a clean 409 instead of a 500 at
+     * flush. It is reachable in production whenever an assignment is deactivated without its
+     * definition (the two are separate rows with separate lifecycles).
      *
-     * <p>That claim had no test at any layer. It is reachable in production whenever an assignment
-     * is deactivated without its definition (the assignment and the definition are separate rows
-     * with separate lifecycles), and the difference it makes is a branchable 409 versus an
-     * unhandled constraint violation.
+     * <p>The decisive assertion is not merely "409" but that the body carries
+     * {@code code = DUPLICATE_SERVICE} <em>and</em> names the surviving definition in
+     * {@code existingServiceDefId}. Those two fields are what the mobile client branches and
+     * deep-links on, and they distinguish this guard from the flush-time index translation, which
+     * cannot name the row it lost to (its {@code existingServiceDefId} is null).
      *
-     * <p>The decisive assertion is not merely "409" — the first-time precondition ALSO returns 409
-     * — but that the body carries {@code code = DUPLICATE_SERVICE}. If the precondition had fired
-     * instead, the body would carry no {@code data.code} at all, and this test would fail.
+     * <p>Historical note: this endpoint used to have a second 409 source — a "master already has
+     * services" precondition — and this test's original job was proving the two apart. Bulk create
+     * is additive now, so {@code DUPLICATE_SERVICE} is the only 409 the endpoint emits; the
+     * assertion is kept unchanged because it still pins the payload the client depends on.
      */
     @Test
-    @DisplayName("bulk setup returns 409 DUPLICATE_SERVICE — not the first-time-precondition 409 "
-            + "— when an item collides with an ACTIVE definition that carries no active assignment")
+    @DisplayName("bulk create returns 409 DUPLICATE_SERVICE naming the existing definition "
+            + "when an item collides with an ACTIVE definition that carries no active assignment")
     void should_return409_when_bulkCollidesWithAnAssignmentlessActiveDefinition() throws Exception {
         String email = "indep-orphan-def-" + System.nanoTime() + "@beautica.test";
         String token = fixtures.createIndependentMasterAndGetToken(email);
         UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
 
-        // An ACTIVE definition with NO master_services row at all. existsActiveServiceForMaster is
-        // assignment-level, so it reads false here and the first-time gate lets the request through
-        // — while the definition-level V121 index would still reject the insert.
+        // An ACTIVE definition with NO master_services row at all: nothing shows in the master's
+        // menu, yet the definition-level V121 index would still reject an insert for this type.
         UUID orphanDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
 
         var request = new BulkCreateServicesRequest(List.of(
@@ -306,19 +642,15 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: bulk setup for a master whose only existing service is an ACTIVE definition "
                 + "with no active assignment, re-requesting that same service type");
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+        ResponseEntity<String> resp = postSelfBulk(token, request);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
-        var body = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<DuplicateServiceResponse>>() {});
-        assertThat(body.data())
+        assertThat(duplicateBodyFrom(resp))
                 .extracting(DuplicateServiceResponse::code, DuplicateServiceResponse::existingServiceDefId)
-                .as("a DUPLICATE_SERVICE code proves assertNoActiveDuplicatesInBatch caught this, "
-                        + "not the first-time precondition (which returns a 409 with no data.code) "
-                        + "and not the flush (which cannot name the surviving row, so its "
+                .as("a DUPLICATE_SERVICE code plus a named existingServiceDefId proves "
+                        + "assertNoActiveDuplicatesInBatch caught this, not the flush-time index "
+                        + "translation (which cannot name the surviving row, so its "
                         + "existingServiceDefId would be null)")
                 .containsExactly("DUPLICATE_SERVICE", orphanDefId);
 
@@ -351,8 +683,8 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         String token = fixtures.createIndependentMasterAndGetToken(email);
         UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
 
-        // Assignmentless again — the only way past the first-time precondition into the duplicate
-        // check (see the test above); the property under test here is the ROLLBACK, not the route.
+        // Assignmentless again, mirroring the test above; the property under test here is the
+        // ROLLBACK, not the route into the duplicate check.
         UUID existingDefId = insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
 
         var request = new BulkCreateServicesRequest(List.of(
@@ -362,9 +694,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: POST a 3-item bulk batch whose THIRD item duplicates an existing active "
                 + "definition — expect 409 DUPLICATE_SERVICE and a full rollback");
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/independent-masters/me/services/bulk", HttpMethod.POST,
-                new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);
+        ResponseEntity<String> resp = postSelfBulk(token, request);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
@@ -396,8 +726,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
      * <p>Direct SQL is required, not a bug: no endpoint can produce this state in one call, because
      * every create path writes the definition and its assignment together. It arises in production
      * over time — an assignment deactivated while its definition stays active — and it is precisely
-     * the state that separates the assignment-level first-time precondition from the
-     * definition-level V121 index.
+     * the state where a master's visible menu disagrees with the definition-level V121 index.
      *
      * <p>{@code owner_type = 'INDEPENDENT_MASTER'} with {@code owner_id = masters.id} mirrors what
      * {@code bulkCreateForMaster} itself persists for BOTH entry points ("services are owned by the
@@ -421,21 +750,27 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     /**
      * True-concurrency regression for the {@code pg_advisory_xact_lock} TOCTOU guard.
      *
-     * <p>Before the fix, two concurrent first-time bulk POSTs for the SAME master both passed
-     * the {@code existsActiveServiceForMaster} read-then-write check and both committed,
-     * doubling the menu. This test fires two {@link ServiceCatalogService#bulkCreateIndependentMasterServices}
+     * <p>The lock outlived the "first-time only" precondition it was originally added for, because
+     * the hazard it closes is not that precondition but
+     * {@code assertNoActiveDuplicatesInBatch} — still a read-then-write check. Two concurrent
+     * batches naming the SAME service types can both read "this type is free" and both proceed;
+     * without serialization one of them reaches the V121 index and the menu doubles or the loser
+     * gets an unhelpful constraint error.
+     *
+     * <p>This test fires two {@link ServiceCatalogService#bulkCreateIndependentMasterServices}
      * calls on the Spring proxy — each runs in its OWN {@code @Transactional}, so each holds a
      * per-transaction advisory lock keyed by the master id. A {@link CyclicBarrier} releases both
      * threads into lock acquisition together (no {@code Thread.sleep}). The lock serializes them:
-     * the winner commits its batch, the loser's re-check under the lock sees the now-existing
-     * services and rejects with a 409 {@link BusinessException}.
+     * the winner commits its batch, and the loser — now running its duplicate guard against
+     * COMMITTED rows — rejects with the clean 409 {@link DuplicateServiceException}.
      *
-     * <p>The decisive assertion is the final DB count: exactly ONE batch survives — proving the
-     * race can no longer double the menu. Calling the service bean (not HTTP) is what gives each
-     * thread its own transaction-scoped lock with deterministic barrier coordination.
+     * <p>Both assertions matter. The exception type proves the loser took the guarded path rather
+     * than tripping the index at flush (which is what an unserialized race produces); the final DB
+     * count proves exactly ONE batch survives. Calling the service bean (not HTTP) is what gives
+     * each thread its own transaction-scoped lock with deterministic barrier coordination.
      */
     @Test
-    @DisplayName("two concurrent first-time bulk setups for one master serialize on the advisory lock — exactly one 201, one 409, NO menu doubling")
+    @DisplayName("two concurrent bulk creates for one master serialize on the advisory lock — exactly one 201, one 409 DUPLICATE_SERVICE, NO menu doubling")
     void should_serializeAndRejectSecond_when_twoConcurrentBulkSetupsRaceForSameMaster() throws Exception {
         String email = "indep-race-" + System.nanoTime() + "@beautica.test";
         fixtures.createIndependentMasterAndGetToken(email);
@@ -465,15 +800,30 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
             Throwable errA = a.get(30, TimeUnit.SECONDS);
             Throwable errB = b.get(30, TimeUnit.SECONDS);
 
-            // Whichever thread lost must have failed with a 409 BusinessException — never any
-            // other error (a deadlock, lock-timeout or constraint violation would be a real bug).
+            // Whichever thread lost must have failed with a 409 DUPLICATE_SERVICE — never a
+            // deadlock, lock-timeout or raw DataIntegrityViolation.
+            //
+            // The decisive field is existingServiceDefId. It is NON-NULL only on the pre-check
+            // route (assertNoActiveDuplicatesInBatch, which knows which row it collided with) and
+            // NULL on the flush route (the V121 index reports a constraint, not a row). Remove the
+            // advisory lock and this test still sees one success + one CONFLICT + two rows — the
+            // unique index alone delivers that — but the loser arrives via the flush and its
+            // existingServiceDefId is null. So this assertion, and only this assertion, is what
+            // proves the lock actually serialized the two transactions.
             assertThat(List.of(java.util.Optional.ofNullable(errA), java.util.Optional.ofNullable(errB)))
                     .filteredOn(java.util.Optional::isPresent)
                     .extracting(java.util.Optional::get)
-                    .as("the only allowed failure is the 409 first-time-violation; got %s / %s", errA, errB)
+                    .as("the only allowed failure is the guarded 409 DUPLICATE_SERVICE; got %s / %s", errA, errB)
                     .allSatisfy(t -> assertThat(t)
-                            .isInstanceOf(BusinessException.class)
-                            .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT)));
+                            .isInstanceOf(DuplicateServiceException.class)
+                            .satisfies(ex -> {
+                                assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT);
+                                assertThat(((DuplicateServiceException) ex).getExistingServiceDefId())
+                                        .as("the loser must reach the duplicate PRE-CHECK against the "
+                                                + "winner's committed rows (named row), not the flush-time "
+                                                + "index translation (null row) — i.e. the lock serialized them")
+                                        .isNotNull();
+                            }));
         } finally {
             pool.shutdownNow();
         }
@@ -482,7 +832,8 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .as("exactly one concurrent caller wins the lock and commits its batch")
                 .isEqualTo(1);
         assertThat(conflictCount.get())
-                .as("the loser's re-check under the lock sees existing services and gets a 409")
+                .as("the loser's duplicate guard, running under the lock against the winner's "
+                        + "COMMITTED rows, gets a clean 409")
                 .isEqualTo(1);
         assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
                 .as("the decisive guard: only ONE batch (2 rows) survives — the race can no longer double the menu")

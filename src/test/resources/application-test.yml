@@ -50,6 +50,15 @@ app:
     # directly against a hand-built single-slot LoadingCache (bypassing this property entirely),
     # so this override does not neuter that coverage.
     booking-decline-capacity: 100000
+    # High so BulkServiceSetupIntegrationTest (every test fires 1-2 POST .../services/bulk from
+    # 127.0.0.1, all sharing one per-IP bucket) is not itself rate-limited — production default
+    # stays the tight 10/60s in RateLimitConfig. Without this the class silently exceeded the cap
+    # and the 429s were MASKED, not surfaced: Apache HC5's default retry strategy honours
+    # Retry-After, so TestRestTemplate slept the full 60s window and retried, turning a throttle
+    # hit into a 60-second-long PASS. AuthRateLimitFilterTest builds the filter directly against
+    # hand-built buckets (bypassing this property entirely), so the override does not neuter the
+    # bulk-endpoint throttling coverage.
+    bulk-service-setup-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.

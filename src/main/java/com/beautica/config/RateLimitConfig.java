@@ -132,11 +132,12 @@ public class RateLimitConfig {
 
     private static final Duration SUGGEST_SERVICE_TYPE_WINDOW = Duration.ofMinutes(60);
 
-    // Per-IP cap for the two first-time bulk-service-setup endpoints (60-second window):
+    // Per-IP cap for the two bulk-service-create endpoints (60-second window):
     //   - POST /api/v1/independent-masters/me/services/bulk
     //   - POST /api/v1/salons/{salonId}/masters/{masterId}/services/bulk
-    // Even the 409 (first-time-only) path runs full 100-item validation, so this is an
-    // authenticated DoS-amplifier surface — kept low (10/min) to match the other write
+    // Every call runs full 100-item validation + persistence, and the path is additive (no
+    // cheap precondition rejects repeat calls), so this is an authenticated DoS-amplifier
+    // surface — kept low (10/min) to match the other write
     // buckets (media, profile-update, device-token). IP-keyed for consistency with every
     // other bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs).
     // Configurable so integration tests on 127.0.0.1 can raise the cap.
@@ -518,16 +519,17 @@ public class RateLimitConfig {
     }
 
     /**
-     * Per-IP bucket for the two first-time bulk-service-setup endpoints
+     * Per-IP bucket for the two bulk-service-create endpoints
      * ({@code POST .../services/bulk}).
      *
      * <p>Cap: 10 requests per 60-second window per source IP — matching the other
      * authenticated write buckets ({@link #mediaUploadBuckets()},
      * {@link #profileUpdateBuckets()}, {@link #deviceTokenBuckets()}). Each request can
      * carry up to 100 items whose validation (type resolution, category checks,
-     * persistence) runs even on the 409 first-time-only path, so an unthrottled
-     * token-holder is a DoS amplifier; the low cap removes that lever while staying
-     * generous for a legitimate retry.
+     * persistence) runs in full on every call — the path is additive, so no cheap
+     * precondition short-circuits a repeat caller. An unthrottled token-holder is
+     * therefore a DoS amplifier; the low cap removes that lever while staying generous
+     * for a legitimate retry.
      *
      * <p>IP-keyed (not user-keyed) for consistency with every other bucket in this
      * filter: JWT parsing happens in

@@ -61,7 +61,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String MASTERS_ME_PROFILE_PATH = "/api/v1/masters/me/profile";
     private static final String CATEGORY_REQUEST_PATH = "/api/v1/service-categories/requests";
     private static final String SUGGEST_SERVICE_TYPE_PATH = "/api/v1/service-types/suggest";
-    // First-time bulk-service-setup endpoints. The independent path is an exact match;
+    // Bulk-service-create endpoints. The independent path is an exact match;
     // the salon path carries {salonId}/{masterId} variables, so it is matched by prefix +
     // suffix (same technique as the parameterized SLOTS_PATH below).
     private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
@@ -314,9 +314,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP bucket for POST /api/v1/service-types/suggest — every successful
     // suggestion emails the admin, so this is an inbox-flood surface (5/hr).
     private final LoadingCache<String, Bucket> suggestServiceTypeBuckets;
-    // Per-IP bucket for the two first-time bulk-service-setup endpoints. Even the 409
-    // first-time-only path runs full 100-item validation, so an authenticated token-holder
-    // is a DoS amplifier without this guard (10/min).
+    // Per-IP bucket for the two bulk-service-create endpoints. Every call runs full
+    // 100-item validation + persistence (the path is additive — no cheap precondition
+    // rejects a repeat caller), so an authenticated token-holder is a DoS amplifier
+    // without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
     // Per-IP bucket for POST /api/v1/support/contact — every successful request emails
     // the support inbox, so this is an email-bomb / outbound-quota surface (5/hr).

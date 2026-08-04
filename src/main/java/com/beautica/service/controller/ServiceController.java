@@ -55,6 +55,29 @@ public class ServiceController {
                     + "(owner, service type); price and duration are irrelevant. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
 
+    /**
+     * Description attached to the {@code 503} declaration on the two BULK endpoints — the only
+     * paths that can raise it. {@code ServiceCatalogService#acquireBulkSetupLockWithTimeout}
+     * translates a Postgres {@code 55P03 lock_not_available} (the fused 3s {@code lock_timeout}
+     * elapsing on the per-master bulk-setup advisory lock) into a
+     * {@code BusinessException(SERVICE_UNAVAILABLE)}.
+     *
+     * <p>Declared for the same reason as {@link #DUPLICATE_SERVICE_409}: springdoc scans
+     * controller signatures, not {@code @RestControllerAdvice} handlers, so an undeclared status
+     * is simply absent from {@code /api-docs} — and the mobile Dio client, regenerated from that
+     * spec, has no branch for it.
+     *
+     * <p>No {@code content} schema is declared (matching the existing {@code 429} idiom in
+     * {@code AppointmentController}): {@code GlobalExceptionHandler#handleBusiness} deliberately
+     * replaces the message with generic copy for this status and sends {@code data: null}, so
+     * there is nothing branchable in the body — the client keys on the status code alone.
+     */
+    private static final String BULK_LOCK_TIMEOUT_503 =
+            "Transient: another bulk service-setup for this master is in flight and held the "
+                    + "per-master lock past the 3s ceiling. Safe to retry after a short backoff — "
+                    + "the batch is all-or-nothing, so nothing was written. Branch on the status "
+                    + "code; the body carries no machine-readable code and `message` is generic.";
+
     private final ServiceCatalogService serviceCatalogService;
 
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
@@ -178,18 +201,21 @@ public class ServiceController {
     }
 
     /**
-     * First-time bulk service setup for the authenticated INDEPENDENT_MASTER.
+     * Bulk service creation for the authenticated INDEPENDENT_MASTER.
      *
      * <p>Self-scoped: the acting master is resolved from the principal, never a path/query
-     * parameter — mirroring {@link #addIndependentMasterService}. Valid only when the master
-     * currently has ZERO active services; otherwise the service returns 409 (first-time-only
-     * product rule, enforced server-side). The whole batch is created in one transaction
+     * parameter — mirroring {@link #addIndependentMasterService}. Additive: callable whether the
+     * master's catalogue is empty or already populated, so one screen serves both initial setup
+     * and later "add more services" passes. The whole batch is created in one transaction
      * (all-or-nothing) and the response is the same {@link MasterServiceResponse} list shape
      * the single-create endpoint returns.
+     *
+     * <p>The only 409 this endpoint returns is {@code DUPLICATE_SERVICE} — a batch item whose
+     * service type the master already offers.
      */
-    @Operation(summary = "Bulk-create my services (first-time setup)",
-            description = "Creates every selected service in one transaction. Only valid when "
-                    + "the master has no active services yet (409 otherwise).")
+    @Operation(summary = "Bulk-create my services",
+            description = "Creates every selected service in one transaction (all-or-nothing). "
+                    + "Additive — callable whether or not the master already has services.")
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
             // COMPLETE response set — without this it drops the auto-derived typed body and
@@ -203,7 +229,9 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "503", description = BULK_LOCK_TIMEOUT_503)
     })
     @PostMapping("/independent-masters/me/services/bulk")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
@@ -218,7 +246,7 @@ public class ServiceController {
     }
 
     /**
-     * First-time bulk service setup performed on behalf of a master in a salon.
+     * Bulk service creation performed on behalf of a master in a salon.
      *
      * <p>Authorized for the salon's SALON_OWNER and SALON_ADMIN via {@code canManageSalon},
      * with {@code masterBelongsToSalon} closing the timing-oracle IDOR (same guard pair as
@@ -227,13 +255,15 @@ public class ServiceController {
      * The owner-operated master row resolves through the same path (its {@code salon_id}
      * equals {@code salonId}).
      *
-     * <p>Valid only when the target master has ZERO active services (409 otherwise). The
-     * whole batch is created in one transaction (all-or-nothing).
+     * <p>Additive: callable whether the target master's catalogue is empty or already populated.
+     * The whole batch is created in one transaction (all-or-nothing). The only 409 this endpoint
+     * returns is {@code DUPLICATE_SERVICE} — a batch item whose service type the master already
+     * offers.
      */
-    @Operation(summary = "Bulk-create a salon master's services (first-time setup)",
+    @Operation(summary = "Bulk-create a salon master's services",
             description = "Creates every selected service for the given master in one "
-                    + "transaction. Only valid when the master has no active services yet "
-                    + "(409 otherwise).")
+                    + "transaction (all-or-nothing). Additive — callable whether or not the "
+                    + "master already has services.")
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
             // COMPLETE response set — without this it drops the auto-derived typed body and
@@ -247,7 +277,9 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "503", description = BULK_LOCK_TIMEOUT_503)
     })
     @PostMapping("/salons/{salonId}/masters/{masterId}/services/bulk")
     @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")

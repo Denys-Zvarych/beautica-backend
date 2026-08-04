@@ -722,9 +722,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * round trip removes a network hop from every booking write (perf finding; measurable on
      * Neon's serverless proxy, which is a real network hop per statement, not a local call).
      *
-     * <p>Postgres evaluates a SELECT target list left-to-right per row, so
-     * {@code set_config(...)} is guaranteed to run before {@code pg_advisory_xact_lock(...)} on
-     * the same row — the 3s ceiling is already in force for THIS lock acquisition. Because the
+     * <p>Postgres does NOT formally guarantee subexpression evaluation order (docs §4.2.14 leaves
+     * it undefined), but the executor's {@code ExecProject} evaluates target-list entries in
+     * order, so in every current implementation {@code set_config(...)} runs before
+     * {@code pg_advisory_xact_lock(...)} on the same row — the 3s ceiling is already in force for
+     * THIS lock acquisition. Were that ever to change, only this one acquisition would wait
+     * unbounded (the pre-fix behaviour); the GUC would still bound the rest. Because the
      * GUC is transaction-scoped (not just statement-scoped), it also remains in force for the
      * rest of the transaction, so it still bounds the subsequent per-master
      * {@link #acquireAdvisoryLock(UUID)} wait in {@code BookingService.doCreateBooking} /

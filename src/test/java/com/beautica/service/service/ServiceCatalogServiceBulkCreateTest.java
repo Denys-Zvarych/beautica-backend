@@ -26,6 +26,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -46,8 +47,13 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Unit tests for the first-time bulk service-setup paths in {@link ServiceCatalogService}
+ * Unit tests for the bulk service-create paths in {@link ServiceCatalogService}
  * ({@code bulkCreateIndependentMasterServices} + {@code bulkCreateSalonMasterServices}).
+ *
+ * <p>The flow is <em>additive</em>: it is callable whether or not the master already has
+ * services, so one multi-select screen covers both initial catalogue setup and later
+ * additions. There is no menu-emptiness precondition; the only state-conflict left is a
+ * per-service {@code DUPLICATE_SERVICE} 409.
  *
  * <p>Covers — at the service layer, with all collaborators mocked — the behaviour the
  * controller slice and integration test cannot observe cheaply:
@@ -55,8 +61,14 @@ import static org.mockito.Mockito.when;
  *   <li>Happy path: a mixed FIXED + RANGE batch persists one ServiceDefinition +
  *       MasterServiceAssignment per item, with name/category derived from the ServiceType
  *       and {@code base_price = priceMin} for RANGE items.</li>
- *   <li>409 first-time precondition: an existing active service aborts the batch before
- *       anything is resolved or persisted.</li>
+ *   <li>Additive contract: a master with an existing catalogue is not blocked, and no
+ *       menu-emptiness predicate is consulted at all.</li>
+ *   <li>Advisory lock: taken per master to serialise concurrent additive batches against the
+ *       read-then-write duplicate guard. The serialised window is narrow — global
+ *       reference-data reads (type resolution, category validation) run BEFORE it; the
+ *       duplicate guard and the inserts run inside it. A failed acquisition aborts the batch
+ *       (500), and a wait exceeding the fused 3s {@code lock_timeout} becomes a retryable
+ *       503 rather than a raw data-access 500.</li>
  *   <li>Duplicate {@code serviceTypeId} in the batch → 400, nothing persisted.</li>
  *   <li>Unknown {@code serviceTypeId} → 404; inactive type → 400; both abort the batch.</li>
  *   <li>Unknown derived category → 400, nothing persisted.</li>
@@ -69,7 +81,7 @@ import static org.mockito.Mockito.when;
  * pre-persist guards fire and {@code serviceRepository.save} is never reached.
  */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("ServiceCatalogService — bulk first-time setup")
+@DisplayName("ServiceCatalogService — additive bulk service create")
 class ServiceCatalogServiceBulkCreateTest {
 
     @Mock private ServiceRepository serviceRepository;
@@ -160,7 +172,6 @@ class ServiceCatalogServiceBulkCreateTest {
                 rangeItem(rangeTypeId, 120, "800.00", "1500.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(fixedType, rangeType));
         when(platformCategoryRepository.findSelectableNamesIn(any()))
                 .thenReturn(List.of("NAIL_SERVICE", "HAIR"));
@@ -237,7 +248,6 @@ class ServiceCatalogServiceBulkCreateTest {
         var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 45, "250.00")));
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("HAIR"));
         stubSaveEchoesEntities();
@@ -253,30 +263,229 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isEqualTo(OwnerType.INDEPENDENT_MASTER);
         assertThat(defCaptor.getValue().getOwnerId()).isEqualTo(masterId);
         assertThat(result).hasSize(1);
+
+        // Parity with the self path: the shared additive core's post-write bookkeeping must run
+        // for the on-behalf entry point too. Now that the endpoint is additive, this is reachable
+        // on every later "add more services" pass — a stale min_effective_price would misprice the
+        // salon master in search on every one of them, not just at first setup.
+        verify(masterRepository).refreshMinEffectivePrice(masterId);
     }
 
-    // ── 409 first-time precondition ────────────────────────────────────────────
-
+    /**
+     * The removed precondition lived in the shared core, so the on-behalf path became additive at
+     * the same moment the self path did — but only the self path had an explicit pin. Consulting
+     * the menu-emptiness predicate at all is what the old behaviour did, so its absence is the
+     * contract.
+     */
     @Test
-    @DisplayName("409 + nothing persisted when the master already has an active service (self path)")
-    void should_throwConflictAndPersistNothing_when_masterAlreadyHasActiveService() {
+    @DisplayName("salon on-behalf adds to an existing catalogue — no menu-emptiness precondition is consulted")
+    void should_createBatch_when_salonMasterAlreadyHasActiveServices() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+
+        Salon salon = org.mockito.Mockito.mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = org.mockito.Mockito.mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceType type = serviceType(typeId, "Стрижка", "HAIR", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 45, "250.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("HAIR"));
+        stubSaveEchoesEntities();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        assertThat(result).hasSize(1);
+        verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
+    }
+
+    // ── Additive: no "first-time only" precondition ────────────────────────────
+
+    /**
+     * Pins the additive contract. The bulk path used to reject any master who already had an
+     * active service with a 409, which forced a second single-create screen in the app; that
+     * precondition is gone, so a master with a populated menu can keep adding through the same
+     * multi-select screen. Only a per-service {@code DUPLICATE_SERVICE} collision can 409 now.
+     *
+     * <p>The assertion is deliberately at the collaborator level — the service must never ask
+     * whether the master already has services, because merely consulting that predicate is what
+     * the removed precondition did.
+     */
+    @Test
+    @DisplayName("adds to an existing catalogue — no menu-emptiness precondition is consulted")
+    void should_createBatch_when_masterAlreadyHasActiveServices() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
         Master master = independentMaster(masterId);
 
-        var request = new BulkCreateServicesRequest(List.of(fixedItem(UUID.randomUUID(), 60, "350.00")));
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(true);
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        assertThat(result).hasSize(1);
+        verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
+    }
+
+    /**
+     * The advisory lock survived the precondition removal, and its purpose shifted rather than
+     * lapsed: {@code assertNoActiveDuplicatesInBatch} is still read-then-write, so two concurrent
+     * additive batches for one master must serialize or both can read "type is free" and race to
+     * the V121 index.
+     *
+     * <p><b>Ordering was deliberately INVERTED (backend-perf finding 2).</b> Type resolution and
+     * category validation read GLOBAL reference data ({@code service_types},
+     * {@code platform_categories}) — no owner-scoped state — so serializing them bought nothing
+     * while holding the contended per-master lock across ~2 extra DB round-trips on every call.
+     * They now run BEFORE the lock. What must stay inside the lock is the read-then-write span
+     * the lock exists for, which starts at {@code assertNoActiveDuplicatesInBatch} — that is the
+     * boundary this test now pins.
+     */
+    @Test
+    @DisplayName("resolves service types BEFORE the lock, but takes the lock before the duplicate guard reads owner state")
+    void should_acquireAdvisoryLockAfterResolvingTypesButBeforeDuplicateGuard_when_bulkCreating() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+
+        InOrder inOrder = org.mockito.Mockito.inOrder(
+                serviceTypeRepository, masterServiceRepository, serviceRepository);
+        // Global reference-data reads happen OUTSIDE the lock…
+        inOrder.verify(serviceTypeRepository).findAllById(anyList());
+        // …then the lock opens the serialized window…
+        inOrder.verify(masterServiceRepository).acquireBulkSetupLockWithTimeout(masterId);
+        // …and the read-then-write duplicate guard runs strictly inside it. This last edge is the
+        // one that must never regress: the guard reads owner-scoped state and then inserts, so it
+        // is exactly what the lock has to serialize.
+        inOrder.verify(serviceRepository).findActiveDuplicateTypeIds(any(), any(), any());
+    }
+
+    /**
+     * A lock the DB refuses to confirm must abort the batch rather than proceed unserialized —
+     * otherwise the failure mode is silent loss of the concurrency guarantee.
+     */
+    @Test
+    @DisplayName("500 + nothing persisted when the advisory lock cannot be acquired")
+    void should_abortBatch_when_advisoryLockAcquisitionFails() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        when(masterServiceRepository.acquireBulkSetupLockWithTimeout(masterId)).thenReturn(null);
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(BusinessException.class)
                 .extracting(ex -> ((BusinessException) ex).getStatus())
-                .isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
+                .isEqualTo(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR);
 
+        // Type resolution now precedes the lock (perf finding 2), so it is no longer a "never".
+        // What must still hold is that a lock the DB refuses to confirm stops the batch BEFORE
+        // the guarded critical section — no duplicate guard, no inserts.
+        verify(serviceRepository, never()).findActiveDuplicateTypeIds(any(), any(), any());
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
-        verify(masterServiceRepository, never()).save(any());
-        verify(serviceTypeRepository, never()).findAllById(any());
+    }
+
+    /**
+     * A lock wait that blows past the fused 3s {@code lock_timeout} aborts with Postgres
+     * {@code 55P03 lock_not_available}, which Spring/Hibernate exception translation surfaces as
+     * {@link org.springframework.dao.CannotAcquireLockException}. It must become a clean,
+     * retryable 503 rather than escaping as a raw data-access exception (which the generic
+     * handler would render a 500).
+     *
+     * <p>503 — not the 409 {@code GlobalExceptionHandler#handlePessimisticLockingFailure} gives
+     * every other lock site — is deliberate HERE: on this endpoint 409 is semantically reserved
+     * for {@code DUPLICATE_SERVICE}, whose body carries {@code existingServiceDefId} for the
+     * mobile deep-link. Surfacing "master is busy" as a second, payload-less 409 would make the
+     * two indistinguishable to the client by status alone.
+     */
+    @Test
+    @DisplayName("503 + nothing persisted when the lock wait exceeds lock_timeout (Postgres 55P03)")
+    void should_return503AndPersistNothing_when_lockWaitTimesOut() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        when(masterServiceRepository.acquireBulkSetupLockWithTimeout(masterId))
+                .thenThrow(new org.springframework.dao.CannotAcquireLockException(
+                        "could not obtain lock on row",
+                        new java.sql.SQLException("ERROR: canceling statement due to lock timeout", "55P03")));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE);
+
+        verify(serviceRepository, never()).findActiveDuplicateTypeIds(any(), any(), any());
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+    }
+
+    /**
+     * The 503 body must not leak the SQL state, the driver's cause text, or the timeout value —
+     * an operational detail oracle (§I/§N). Pins the sanitised message.
+     */
+    @Test
+    @DisplayName("the lock-timeout 503 never echoes the SQL state, timeout value, or driver cause")
+    void should_notEchoDriverDetail_when_lockWaitTimesOut() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        when(masterServiceRepository.acquireBulkSetupLockWithTimeout(masterId))
+                .thenThrow(new org.springframework.dao.CannotAcquireLockException(
+                        "could not obtain lock on row",
+                        new java.sql.SQLException("ERROR: canceling statement due to lock timeout", "55P03")));
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageNotContaining("55P03")
+                .hasMessageNotContaining("lock_timeout")
+                .hasMessageNotContaining("3s")
+                .hasMessageNotContaining("canceling statement");
     }
 
     // ── Duplicate serviceTypeId in batch ───────────────────────────────────────
@@ -294,7 +503,6 @@ class ServiceCatalogServiceBulkCreateTest {
                 fixedItem(dupTypeId, 90, "500.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(BusinessException.class)
@@ -324,10 +532,10 @@ class ServiceCatalogServiceBulkCreateTest {
                 fixedItem(takenTypeId, 90, "500.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        // The batch precondition is ASSIGNMENT-level and passes: the master has no active
-        // assignment. The V121 index is DEFINITION-level, so an active definition owned by this
-        // master with no active assignment still collides — exactly the gap this guard closes.
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
+        // Bulk create is additive, so nothing about the master's existing menu blocks the call —
+        // this DEFINITION-level guard is the only thing standing between the batch and the V121
+        // index, including for an active definition that carries no active assignment (invisible
+        // in the menu, still a collision at INSERT).
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(freshType, takenType));
         when(platformCategoryRepository.findSelectableNamesIn(any()))
                 .thenReturn(List.of("NAIL_SERVICE"));
@@ -378,7 +586,6 @@ class ServiceCatalogServiceBulkCreateTest {
                 fixedItem(secondTakenTypeId, 90, "500.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(firstTaken, secondTaken));
         when(platformCategoryRepository.findSelectableNamesIn(any()))
                 .thenReturn(List.of("NAIL_SERVICE"));
@@ -411,7 +618,6 @@ class ServiceCatalogServiceBulkCreateTest {
         var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         stubSaveEchoesEntities();
@@ -442,7 +648,6 @@ class ServiceCatalogServiceBulkCreateTest {
         var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         stubSaveEchoesEntities();
@@ -474,7 +679,6 @@ class ServiceCatalogServiceBulkCreateTest {
                 fixedItem(missingTypeId, 90, "500.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         // findAllById returns only the existing type — the missing one is absent from the map.
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(goodType));
 
@@ -502,7 +706,6 @@ class ServiceCatalogServiceBulkCreateTest {
                 fixedItem(inactiveTypeId, 90, "500.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(activeType, inactiveType));
 
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
@@ -525,7 +728,6 @@ class ServiceCatalogServiceBulkCreateTest {
         var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
 
         when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.existsActiveServiceForMaster(masterId)).thenReturn(false);
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         // Category lookup returns empty — the requested category is unknown/inactive.
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of());
@@ -553,7 +755,9 @@ class ServiceCatalogServiceBulkCreateTest {
         assertThatThrownBy(() -> serviceCatalogService.bulkCreateIndependentMasterServices(userId, request))
                 .isInstanceOf(ForbiddenException.class);
 
-        verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
+        // The role check precedes the advisory lock: an unauthorized caller must not be able to
+        // hold a per-master lock and stall the legitimate owner's batch.
+        verify(masterServiceRepository, never()).acquireBulkSetupLockWithTimeout(any());
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
@@ -578,7 +782,9 @@ class ServiceCatalogServiceBulkCreateTest {
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("Access denied");
 
-        verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
+        // Salon-membership is checked before the advisory lock, so a cross-salon probe cannot
+        // stall the real owner's batch on a lock it had no right to take.
+        verify(masterServiceRepository, never()).acquireBulkSetupLockWithTimeout(any());
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 

@@ -108,10 +108,14 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * definition is <em>also</em> active — i.e. at least one service visible in the
      * master's menu and the public browse.
      *
-     * <p>Used by the first-time bulk-setup precondition: the bulk endpoint is valid only
-     * when a master currently has zero active services. The {@code sd.isActive = true}
-     * predicate mirrors {@link #findByMasterIdAndIsActiveTrueWithGraph} so a soft-deleted
-     * definition does not count as an active service and does not block the first-time flow.
+     * <p>The {@code sd.isActive = true} predicate mirrors
+     * {@link #findByMasterIdAndIsActiveTrueWithGraph} so a soft-deleted definition does not
+     * count as an active service.
+     *
+     * <p><b>No production caller as of the additive-bulk change.</b> This backed the old
+     * "bulk setup is first-time only" precondition, which was removed when bulk create became
+     * additive; the query is retained (with its repository test) as a menu-emptiness predicate
+     * for callers that need one. Delete it if it is still unused when next reviewed.
      */
     @Query("""
             SELECT COUNT(msa) > 0
@@ -124,28 +128,91 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
 
     /**
      * Acquires a transaction-scoped Postgres advisory lock keyed by the master id so that
-     * concurrent first-time bulk-setup calls for the same master serialize.
+     * concurrent bulk service-create calls for the same master serialize.
      *
-     * <p>Phase 16.x (TOCTOU): {@link #existsActiveServiceForMaster} is a read-then-write
-     * check with no DB-level unique/idempotency backstop, so two concurrent bulk POSTs from
-     * the same principal could both pass the "no active services" precondition and both
-     * commit, doubling the master's menu. Taking this lock before the precondition (re-)check
-     * — inside the same {@code @Transactional} — forces the second caller to wait until the
-     * first commits, after which its re-check sees the now-existing services and rejects (409).
+     * <p>Phase 16.x (TOCTOU): the bulk path's per-item duplicate guard
+     * ({@code ServiceCatalogService#assertNoActiveDuplicatesInBatch}) reads the owner's
+     * already-taken service types and then inserts, so two concurrent bulk POSTs for the same
+     * master could both read "this type is free" and race. Taking this lock at the top of the
+     * bulk transaction forces the second caller to wait for the first to commit, after which
+     * its guard sees the committed rows and returns the clean, item-naming 409
+     * {@code DUPLICATE_SERVICE} rather than tripping the V121 unique index at flush.
      *
      * <p>The lock is held until the surrounding transaction commits or rolls back
-     * ({@code pg_advisory_xact_lock} — no manual unlock needed). Mirrors the booking
-     * overlap-guard lock in {@code BookingRepository#acquireAdvisoryLock}.
+     * ({@code pg_advisory_xact_lock} — no manual unlock needed). Mirrors the SHAPE of the booking
+     * overlap-guard lock in {@code BookingRepository#acquireAdvisoryLock} but deliberately not its
+     * KEY — see the salt-allocation section below.
      *
-     * <p>Hash collision risk: {@code hashtextextended} produces a 64-bit hash of the UUID
-     * text. Birthday-paradox probability is negligible for current master counts; a collision
-     * would only cause two unrelated masters' bulk setups to serialize, never a correctness
-     * bug.
+     * <p><b>{@code lock_timeout} (bulk-additive audit finding 1).</b> Fuses
+     * {@code set_config('lock_timeout', '3s', true)} into the SAME statement/round-trip, mirroring
+     * {@code BookingRepository#acquireClientAdvisoryLockWithTimeout}'s exact shape. The
+     * {@code is_local=true} third argument makes it functionally identical to
+     * {@code SET LOCAL lock_timeout = '3s'} — transaction-scoped, reset automatically at
+     * commit/rollback, never leaking onto the next borrower of the pooled connection. Postgres
+     * does NOT formally guarantee the evaluation order of subexpressions (docs §4.2.14 leaves it
+     * undefined), but the executor's {@code ExecProject} evaluates target-list entries in order,
+     * so in every current implementation {@code set_config(...)} runs before
+     * {@code pg_advisory_xact_lock(...)} on the same row and the 3s ceiling is already in force
+     * for THIS acquisition. Were that ever to change, the GUC would still take effect for the rest
+     * of the transaction; only this one acquisition would wait unbounded — i.e. it would degrade
+     * to the pre-fix behaviour, not to a correctness bug.
+     *
+     * <p>Why it is required: bulk create became ADDITIVE (the "first-time only" precondition was
+     * removed), so every add now contends on this lock instead of short-circuiting on a trivial
+     * {@code EXISTS}. Unbounded, a caller firing their full rate-limit burst at one masterId with
+     * DISJOINT service-type sets (nothing 409s them early) would run N full batches strictly in
+     * series, each parking one of only 10 Hikari connections for the full 20s connection-timeout
+     * and starving the pool app-wide. A wait exceeding 3s now aborts with Postgres
+     * {@code 55P03 lock_not_available} instead.
+     *
+     * <p>Ordinary contention is unaffected: the loser waits (well under 3s), acquires, re-runs its
+     * duplicate guard against the winner's COMMITTED rows and returns the clean 409
+     * {@code DUPLICATE_SERVICE} carrying a populated {@code existingServiceDefId} — the contract
+     * {@code BulkServiceSetupIntegrationTest} pins and the mobile screen deep-links on. This is
+     * precisely why a bounded wait was chosen over {@code pg_try_advisory_xact_lock}, which would
+     * fail the loser instantly and null out that field.
+     *
+     * <p><b>Advisory-lock salt allocation.</b> The {@code hashtextextended} salt partitions the
+     * single, process-wide 64-bit advisory-lock key space by lock PURPOSE. Allocation across the
+     * codebase — grep {@code hashtextextended} in {@code src/main} before claiming a new one:
+     * <ul>
+     *   <li>{@code 0} — booking per-MASTER overlap lock
+     *       ({@code BookingRepository#acquireAdvisoryLock},
+     *       {@code BookingRepository#acquireAdvisoryLockWithTimeout})</li>
+     *   <li>{@code 1} — booking per-CLIENT conflict lock
+     *       ({@code BookingRepository#acquireClientAdvisoryLockWithTimeout})</li>
+     *   <li>{@code 2} — this bulk service-setup lock</li>
+     * </ul>
+     *
+     * <p>Salt {@code 2} replaced an earlier salt {@code 0} (bulk-additive re-audit). Keyed on the
+     * same {@code masterId} with the same salt, this lock was not merely at risk of a
+     * birthday-paradox hash collision with the booking master lock — it WAS that lock, exactly, so
+     * every bulk add serialized against every booking create / reschedule / guest-booking for that
+     * master. That was negligible while bulk setup ran once per master ever; the additive rewrite
+     * makes it routine traffic the mobile "add services" screen issues on demand, at which point a
+     * SALON_OWNER/SALON_ADMIN could (10×/min, per the endpoint rate limit) hold a master's BOOKING
+     * lock for the duration of a 100-item batch and push that master's concurrent bookers into the
+     * booking path's own 3s timeout. A dedicated salt removes the cross-feature coupling outright.
+     *
+     * <p><b>Deadlock freedom.</b> Trivially preserved: a bulk-setup transaction takes the salt-2
+     * lock and NO other advisory lock, and no other code path takes salt {@code 2} at all — so no
+     * session can hold a salt-2 lock while waiting on salt 0/1, nor the reverse, and the two-lock
+     * cycle precondition never arises. (It also held before this change, because bulk took only
+     * salt 0 while booking always acquires client-then-master; the argument no longer depends on
+     * booking's internal ordering.)
+     *
+     * <p>Hash collision risk WITHIN salt {@code 2}: {@code hashtextextended} produces a 64-bit hash
+     * of the UUID text. Birthday-paradox probability is negligible for current master counts, and a
+     * genuine collision would only cause two unrelated masters' bulk setups to serialize, never a
+     * correctness bug.
      */
     @Query(value = """
-            SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
+            SELECT 1 FROM (
+                SELECT set_config('lock_timeout', '3s', true),
+                       pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 2))
+            ) sub
             """, nativeQuery = true)
-    Integer acquireBulkSetupLock(@Param("masterId") UUID masterId);
+    Integer acquireBulkSetupLockWithTimeout(@Param("masterId") UUID masterId);
 
     /**
      * Booking-selection candidates (Phase 23.x): the active {@link MasterServiceAssignment}s for

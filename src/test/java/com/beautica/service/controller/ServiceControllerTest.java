@@ -1366,7 +1366,7 @@ class ServiceControllerTest {
 
     // ── POST /api/v1/independent-masters/me/services/bulk ──────────────────────
     //
-    // First-time bulk setup, self path. The @WebMvcTest slice pins the HTTP contract:
+    // Additive bulk create, self path. The @WebMvcTest slice pins the HTTP contract:
     // role gate (INDEPENDENT_MASTER), bean-validation of the batch envelope + per-item
     // price mode, and the GlobalExceptionHandler rendering of the service-layer 409.
     // The service-layer behaviour (derivation, all-or-nothing) is covered by
@@ -1402,25 +1402,37 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data[1].id").value(secondId.toString()));
     }
 
+    /**
+     * Negative half of the bulk 409 contract, paired with
+     * {@code should_return409WithDuplicateServiceCode_when_bulkItemDuplicatesExistingService}.
+     * A handler that stamped {@code DUPLICATE_SERVICE} onto every 409 from this route would still
+     * pass the positive test; only this one catches it. The setup screen branches on
+     * {@code data.code}, so a codeless generic conflict must stay codeless.
+     *
+     * <p>This route previously had a second 409 source — a "master already has services"
+     * precondition — which is exactly the ambiguity this test guarded. Bulk create is additive
+     * now, so a generic conflict here is some other BusinessException; the envelope contract it
+     * pins is unchanged.
+     */
     @Test
-    @DisplayName("POST /independent-masters/me/services/bulk — 409 envelope when the master already has active services")
-    void should_return409_when_bulkSetupAndMasterAlreadyHasServices() throws Exception {
+    @DisplayName("POST /independent-masters/me/services/bulk — a generic conflict 409 carries NO data.code")
+    void should_return409WithoutCode_when_bulkConflictIsNotADuplicateService() throws Exception {
         var userId = UUID.randomUUID();
         var request = new BulkCreateServicesRequest(List.of(
                 new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
 
         when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any()))
-                .thenThrow(new BusinessException(HttpStatus.CONFLICT,
-                        "Bulk setup is only available for a master with no active services"));
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Some other conflict"));
 
-        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk when master already has services — expect 409 envelope");
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk when the service raises an unrelated 409");
         mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.success").value(false));
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.data").value(org.hamcrest.Matchers.nullValue()));
     }
 
     @Test
@@ -1783,8 +1795,8 @@ class ServiceControllerTest {
                 .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
                         "Манікюр", existingServiceDefId));
 
-        // The bulk path is the first-time-setup screen; it must get the SAME branchable shape as
-        // the single create, not the 409 envelope used for "master already has services".
+        // The bulk path backs the multi-select add-services screen; a collision there must get the
+        // SAME branchable shape as the single create, never a codeless generic 409 envelope.
         log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with an item the master already offers");
         mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))

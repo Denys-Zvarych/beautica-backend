@@ -17,7 +17,7 @@ import java.util.UUID;
  * A single item in a {@link BulkCreateServicesRequest}.
  *
  * <h2>Why no {@code name} or {@code category} here</h2>
- * Unlike {@link CreateServiceDefinitionRequest}, the first-time bulk setup flow is
+ * Unlike {@link CreateServiceDefinitionRequest}, the bulk setup flow is
  * service-type driven: the mobile picker presents platform categories, expands each to
  * its service types, and the master toggles individual types on. The persisted service
  * <em>name</em> is therefore always derived from the chosen {@link com.beautica.service.entity.ServiceType}'s
