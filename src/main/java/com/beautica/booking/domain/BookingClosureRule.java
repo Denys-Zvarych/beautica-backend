@@ -6,9 +6,7 @@ import com.beautica.booking.repository.BookingSpecifications;
 import org.springframework.data.jpa.domain.Specification;
 
 import java.time.OffsetDateTime;
-import java.util.Comparator;
 import java.util.EnumSet;
-import java.util.List;
 
 /**
  * Phase 29.1 — the SINGLE canonical, read-time-derived definition of "an elapsed {@code
@@ -136,43 +134,17 @@ public final class BookingClosureRule {
      *
      * <p><b>This is the STATUS+TIME half only.</b> The HAS-CLIENT and NO-EXISTING-REVIEW checks
      * are review-domain concerns, not closure-domain ones, and stay in the caller ({@code
-     * BookingService#canReview}, {@code AppointmentService#computeCanReview}, {@code
-     * ReviewService#createReview}/{@code #createAppointmentReview}) — every one of those call
+     * BookingService#canReview}, {@code ReviewService#createReview}) — every one of those call
      * sites composes {@code hasClient && !reviewExists && isReviewEligible(...)}, so this method
-     * is the single canonical definition shared between the read-side {@code canReview} DTO flags
+     * is the single canonical definition shared between the read-side {@code canReview} DTO flag
      * and the write-side gate, and the two can never disagree.
      *
-     * @param status the booking's/appointment's current status
-     * @param endsAt the absolute-instant end of the booking (or, for a multi-service visit, the
-     *               {@code max(endsAt)} over its items — the visit's own header carries no time
-     *               window, see {@code Appointment}'s class javadoc)
+     * @param status the booking's current status
+     * @param endsAt the absolute-instant end of the booking
      * @param now    an already-resolved absolute instant, same contract as {@link
      *               #isAwaitingClosure}'s {@code now}
      */
     public static boolean isReviewEligible(BookingStatus status, OffsetDateTime endsAt, OffsetDateTime now) {
         return status == BookingStatus.COMPLETED || isAwaitingClosure(status, endsAt, now);
-    }
-
-    /**
-     * Visit-level overload of {@link #isReviewEligible(BookingStatus, OffsetDateTime,
-     * OffsetDateTime)} — the SINGLE canonical derivation of a multi-service visit's effective
-     * {@code endsAt} ({@code max(endsAt)} over its chained items, since {@code Appointment} itself
-     * carries no time window — see that entity's class javadoc). Both {@code
-     * AppointmentService#computeCanReview} (the read-side {@code canReview} flag) and {@code
-     * ReviewService#createAppointmentReview} (the write-path gate) call this overload instead of
-     * each re-deriving {@code items.stream().map(Booking::getEndsAt).max(...)} independently — two
-     * independent reductions over the same {@code items} list can only ever compute the same
-     * value, but keeping the expression in exactly one place is what makes that a guarantee rather
-     * than an invariant someone has to remember to preserve by hand on every future edit.
-     *
-     * @param items the visit's ordered, chained booking rows — MUST be non-empty (a real visit
-     *              always has &ge;1 item; callers guard this before reaching here)
-     */
-    public static boolean isReviewEligible(BookingStatus status, List<Booking> items, OffsetDateTime now) {
-        OffsetDateTime visitEndsAt = items.stream()
-                .map(Booking::getEndsAt)
-                .max(Comparator.naturalOrder())
-                .orElseThrow(); // non-empty by this method's documented precondition
-        return isReviewEligible(status, visitEndsAt, now);
     }
 }

@@ -3,6 +3,7 @@ package com.beautica.review;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
+import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -25,6 +26,8 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -265,6 +268,72 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  Multi-service visit — master→client cardinality (locked rule: the master
+    //  leaves ONE client-rating PER CHILD BOOKING, never one per visit, mirroring
+    //  the client→provider 1-booking-1-feedback rule pinned in AppointmentReviewIT).
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("a 3-service visit yields THREE independent client reviews — the master rating all "
+            + "three children returns three 201s, three distinct client_reviews rows keyed on "
+            + "distinct booking_id, and the client's aggregate (users.avg_rating/review_count) "
+            + "reflects all three samples")
+    void should_allowOneClientReviewPerChildBooking_when_theVisitHasThreeServices() throws Exception {
+        BookingTestFixtures fixtures =
+                new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("clirev-visit3", 3);
+        completeVisit(visit);
+        List<UUID> children = childIdsOf(visit.id());
+        assertThat(children).hasSize(3);
+        int[] ratings = {5, 3, 4};
+
+        for (int i = 0; i < children.size(); i++) {
+            String body = "{\"bookingId\":\"" + children.get(i) + "\",\"rating\":" + ratings[i] + "}";
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    URL, HttpMethod.POST,
+                    new HttpEntity<>(body, bearerHeaders(visit.masterToken())), String.class);
+            assertThat(resp.getStatusCode())
+                    .as("reviewing child %s must succeed — body: %s", children.get(i), resp.getBody())
+                    .isEqualTo(HttpStatus.CREATED);
+        }
+
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT booking_id FROM client_reviews WHERE booking_id = ANY(?)",
+                (Object) children.toArray(new UUID[0]));
+        assertThat(rows).as("exactly one client review row per child booking").hasSize(3);
+        assertThat(rows.stream().map(r -> r.get("booking_id")).distinct().count())
+                .as("all three client reviews are keyed on distinct booking_id").isEqualTo(3L);
+
+        BigDecimal avgRating = jdbcTemplate.queryForObject(
+                "SELECT avg_rating FROM users WHERE id = ?", BigDecimal.class, visit.clientId());
+        Integer reviewCount = jdbcTemplate.queryForObject(
+                "SELECT review_count FROM users WHERE id = ?", Integer.class, visit.clientId());
+        assertThat(reviewCount)
+                .as("review_count must reflect all three per-booking client reviews").isEqualTo(3);
+        assertThat(avgRating)
+                .as("avg_rating must be the mean of 5, 3, 4").isEqualByComparingTo(new BigDecimal("4"));
+    }
+
+    /** Ordered child booking ids of a visit — mirrors {@code AppointmentReviewIT#childIdsOf}. */
+    private List<UUID> childIdsOf(UUID appointmentId) {
+        return jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at", UUID.class, appointmentId);
+    }
+
+    /**
+     * Provider completes the whole visit (no elapse guard on complete) so its children become
+     * reviewable — mirrors {@code AppointmentReviewIT#completeVisit(VisitFixture)}.
+     */
+    private void completeVisit(BookingTestFixtures.VisitFixture visit) {
+        ResponseEntity<String> completed = restTemplate.exchange(
+                "/api/v1/appointments/" + visit.id() + "/complete", HttpMethod.PATCH,
+                new HttpEntity<>(bearerHeaders(visit.masterToken())), String.class);
+        assertThat(completed.getStatusCode())
+                .as("visit completion must succeed — body: %s", completed.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
     }
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────────

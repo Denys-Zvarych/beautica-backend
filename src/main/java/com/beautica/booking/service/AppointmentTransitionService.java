@@ -457,10 +457,12 @@ public class AppointmentTransitionService {
      * {@link AuthorizationService#enforceCanCompleteBooking}); no note, no cancellation reason. Also
      * evicts the actor's revenue dashboard after commit (COMPLETED feeds revenue).
      *
-     * <p>Enqueues EXACTLY ONE review prompt for the whole visit (BE-6) — the client may leave ONE
-     * review per completed visit (via {@code POST /appointments/{id}/review}), so the prompt fires
-     * once, referencing the FIRST item (never one per service), mirroring how the single status-changed
-     * notification is enqueued. The drain worker rehydrates that booking → its client (= the visit
+     * <p>Enqueues EXACTLY ONE review-requested notification for the whole visit (BE-6) — the prompt
+     * fires once, referencing the FIRST item (never one per service), mirroring how the single
+     * status-changed notification is enqueued. Reviews themselves are created per-booking via
+     * {@code POST /api/v1/reviews} with a {@code bookingId} (locked rule: 1 booking = 1 feedback;
+     * there is no visit-level review endpoint) — this single prompt only nudges the client toward the
+     * visit's first booking. The drain worker rehydrates that booking → its client (= the visit
      * client) as the recipient. Skipped for a guest (LINK) visit with no registered account to review
      * with, exactly as {@code BookingService#completeBooking} skips it.
      */

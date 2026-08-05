@@ -73,16 +73,6 @@ public record AppointmentDetailResponse(
         String clientComment,
         OffsetDateTime createdAt,
         List<AppointmentItemResponse> items,
-        @Schema(description = "True iff this visit has a registered client, no review exists yet, "
-                + "and the visit is either COMPLETED or still CONFIRMED with an already-elapsed "
-                + "endsAt (max(endsAt) over its items — the visit header carries no time window "
-                + "of its own) — the CLIENT's one-review-per-visit CTA gate (BE-6). Computed by "
-                + "the service via BookingClosureRule#isReviewEligible, the same canonical "
-                + "predicate the write endpoint (POST /appointments/{id}/review) re-checks, "
-                + "mirroring BookingDetailResponse.canReview lifted to the visit. Locked product "
-                + "decision: a visit that entered the client's Past tab by elapsed time is "
-                + "reviewable even before the provider closes it.")
-        boolean canReview,
         // ── BE-5 visit-detail enrichment (mirrors BookingDetailResponse) ─────────────
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Written by the provider on the visit /decline or /not-complete. Shown "
@@ -129,7 +119,7 @@ public record AppointmentDetailResponse(
      * locked invariant).
      */
     public static AppointmentDetailResponse from(
-            Appointment appointment, List<Booking> orderedItems, boolean canReview,
+            Appointment appointment, List<Booking> orderedItems,
             String cityLabel, String districtLabel) {
         Booking first = orderedItems.get(0);
         Master master = first.getMaster();
@@ -202,7 +192,6 @@ public record AppointmentDetailResponse(
                 appointment.getClientComment(),
                 appointment.getCreatedAt().atOffset(ZoneOffset.UTC),
                 items,
-                canReview,
                 // Notes are read from the HEADER (mutually visible), never the child items.
                 appointment.getProviderComment(),
                 appointment.getClientCancellationNote(),

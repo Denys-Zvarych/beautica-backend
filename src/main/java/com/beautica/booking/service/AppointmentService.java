@@ -1,7 +1,6 @@
 package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
-import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.entity.Appointment;
@@ -20,7 +19,6 @@ import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
-import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
@@ -36,7 +34,6 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -85,7 +82,6 @@ public class AppointmentService {
     private final BookingRepository bookingRepository;
     private final MasterRepository masterRepository;
     private final UserRepository userRepository;
-    private final ReviewRepository reviewRepository;
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -173,7 +169,7 @@ public class AppointmentService {
      *
      * <p>Package-private (not {@code private}) so {@code AppointmentTransitionService.rescheduleAppointment}
      * (BE-4) can reuse it verbatim to build the re-planned visit's response, instead of
-     * duplicating the discovery-label lookup + {@code canReview} computation a second time.
+     * duplicating the discovery-label lookup a second time.
      */
     AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
         Master master = items.get(0).getMaster();
@@ -187,44 +183,7 @@ public class AppointmentService {
                 districtId == null ? List.of() : List.of(districtId));
 
         return AppointmentDetailResponse.from(
-                appointment, items, computeCanReview(appointment, items),
-                labels.cityLabel(cityId), labels.districtLabel(districtId));
-    }
-
-    /**
-     * The visit-level {@code canReview} gate (BE-6, widened by the review-eligibility fix) —
-     * mirrors {@code BookingService#canReview} lifted to the visit: a registered client, no
-     * existing visit review, and the visit is either {@code COMPLETED} or still {@code CONFIRMED}
-     * with an already-elapsed end. {@link Appointment} carries no time window of its own (see its
-     * class javadoc), so the visit's effective {@code endsAt} is {@code max(endsAt)} over {@code
-     * items} — the same reduction {@code AppointmentDetailResponse#from} uses for the header
-     * window. The {@code existsByAppointmentId} probe is short-circuited to run ONLY when the
-     * status+time half is already eligible, so a just-created visit (CONFIRMED, future endsAt —
-     * {@code BookingStartsAtValidator}'s lead-time floor guarantees this) never issues it and
-     * always resolves {@code false}.
-     *
-     * <p>Delegates the status+time half to the {@code List<Booking>} overload of {@link
-     * BookingClosureRule#isReviewEligible} — the SAME canonical predicate AND the SAME
-     * {@code max(endsAt)} derivation {@code ReviewService#createAppointmentReview}'s write-path
-     * gate uses, so this CTA flag and the write endpoint can never disagree, and neither call site
-     * re-derives the visit's effective {@code endsAt} independently.
-     */
-    private boolean computeCanReview(Appointment appointment, List<Booking> items) {
-        if (appointment.getClient() == null) {
-            return false;
-        }
-        boolean eligibleByStatusAndTime =
-                BookingClosureRule.isReviewEligible(appointment.getStatus(), items, resolveNow());
-        return eligibleByStatusAndTime && !reviewRepository.existsByAppointmentId(appointment.getId());
-    }
-
-    /**
-     * Absolute-instant "now" for {@link BookingClosureRule#isReviewEligible} — same idiom as
-     * {@code BookingService#resolveNow} / {@code ReviewService#resolveNow} (Anti-Bug §G: never a
-     * second, divergent clock idiom for the same rule).
-     */
-    private OffsetDateTime resolveNow() {
-        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+                appointment, items, labels.cityLabel(cityId), labels.districtLabel(districtId));
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {

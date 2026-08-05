@@ -15,8 +15,6 @@ import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
@@ -30,21 +28,24 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
- * Full-HTTP-stack smoke suite for BE-6 — the ONE-review-per-completed-visit contract over real
- * Postgres. Proves: a client leaves exactly one review for a completed multi-service visit (201, one
- * {@code reviews} row carrying {@code appointment_id} + {@code booking_id} = the first item); a second
- * visit review is rejected (409); a review submitted against an individual child booking of the visit
- * is rejected (409, directing to the visit endpoint); the legacy single-booking review path is
- * unaffected (201); and visit completion enqueues EXACTLY ONE {@code REVIEW_REQUESTED} prompt, never
- * one per item.
+ * Full-HTTP-stack smoke suite for the review path over real Postgres.
+ *
+ * <p><b>1 booking = 1 feedback (locked product decision).</b> The visit-level ("appointment")
+ * review write path — {@code POST /appointments/{id}/review} — is RETIRED: {@code createReview}'s
+ * old visit-child guard was removed (commit {@code 17e604c}), so every booking, including a child
+ * of a multi-service visit, is reviewed individually via {@code POST /reviews}. The N1-N5 group
+ * below is the regression net for that change: mobile routes EVERY booking creation through
+ * {@code POST /appointments} (even single-service ones), so every booking carries a non-null
+ * {@code appointment_id} — proving the per-booking path is reviewable regardless of how the
+ * booking was created. A smoke test at the bottom pins that the retired visit-review ROUTE itself
+ * is now unmapped (404), not merely unreachable through application logic.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("BE-6 — appointment(visit)-level reviews")
+@DisplayName("Booking reviews — 1 booking = 1 feedback (visit-level review endpoint retired)")
 class AppointmentReviewIT extends AbstractIntegrationTest {
 
     private static final String APPOINTMENTS_URL = "/api/v1/appointments";
     private static final String REVIEWS_URL = "/api/v1/reviews";
-    private static final String MASTERS_URL = "/api/v1/masters";
     private static final String BOOKINGS_URL = "/api/v1/bookings";
 
     @Autowired
@@ -66,49 +67,6 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("client leaves ONE review for a completed 2-service visit — 201, a single reviews "
-            + "row with appointment_id set and booking_id = the first item, and completion enqueued "
-            + "exactly ONE REVIEW_REQUESTED prompt (never one per item)")
-    void should_createOneVisitReview_when_clientReviewsCompletedVisit() throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("ok");
-
-        ResponseEntity<String> resp = postAppointmentReview(visit.clientToken(), visit.id(), 5, "Чудовий візит");
-
-        assertThat(resp.getStatusCode())
-                .as("first visit review must return 201 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.CREATED);
-        Map<String, Object> row = jdbcTemplate.queryForMap(
-                "SELECT appointment_id, booking_id, rating FROM reviews WHERE appointment_id = ?",
-                visit.id());
-        assertThat(row.get("appointment_id")).as("review is mapped to the visit").isEqualTo(visit.id());
-        assertThat(row.get("booking_id"))
-                .as("booking_id points at the visit's first child booking")
-                .isEqualTo(firstItemId(visit.id()));
-        assertThat(((Number) row.get("rating")).intValue()).isEqualTo(5);
-        assertThat(reviewRequestedCount(visit.id()))
-                .as("exactly ONE REVIEW_REQUESTED per visit completion, not one per item")
-                .isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("a second review for the same completed visit is rejected with 409 and no second "
-            + "reviews row is written")
-    void should_return409_when_secondVisitReviewSubmitted() throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("dup");
-        assertThat(postAppointmentReview(visit.clientToken(), visit.id(), 5, null).getStatusCode())
-                .isEqualTo(HttpStatus.CREATED);
-
-        ResponseEntity<String> second = postAppointmentReview(visit.clientToken(), visit.id(), 4, null);
-
-        assertThat(second.getStatusCode())
-                .as("a duplicate visit review must return 409 — same envelope as the single-booking path")
-                .isEqualTo(HttpStatus.CONFLICT);
-        assertThat(visitReviewCount(visit.id()))
-                .as("still exactly one review for the visit")
-                .isEqualTo(1L);
-    }
-
-    @Test
     @DisplayName("reviewing an individual child booking of a visit via POST /reviews now succeeds with "
             + "201 — 1 booking = 1 feedback (locked product decision): each booking card in the "
             + "client's Past tab gets its own review, the retired multi-service-visit 409 never fires")
@@ -122,14 +80,12 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
                 .as("a per-booking review of a visit child must succeed — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
         Map<String, Object> row = jdbcTemplate.queryForMap(
-                "SELECT appointment_id, booking_id FROM reviews WHERE booking_id = ?", childBookingId);
+                "SELECT booking_id FROM reviews WHERE booking_id = ?", childBookingId);
         assertThat(row.get("booking_id"))
                 .as("the review is keyed to the specific child booking reviewed")
                 .isEqualTo(childBookingId);
-        assertThat(row.get("appointment_id"))
-                .as("a per-booking review carries NO appointment_id — it can never collide with "
-                        + "ux_reviews_appointment (V127), which only constrains non-null rows")
-                .isNull();
+        // reviews.appointment_id was dropped (V133) — the column no longer exists at all, so there
+        // is no visit-review coexistence shape left to assert against.
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -160,8 +116,8 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("N2: a 3-service visit yields THREE independent feedbacks — reviewing all three "
-            + "children returns three 201s, three distinct reviews rows keyed on distinct booking_id, "
-            + "all with appointment_id NULL")
+            + "children returns three 201s, three distinct reviews rows keyed on distinct booking_id "
+            + "(reviews.appointment_id no longer exists at all — V133)")
     void should_createThreeIndependentReviews_when_reviewingAllChildrenOfAThreeServiceVisit() throws Exception {
         BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("n2-three", 3);
         completeVisit(visit);
@@ -176,13 +132,11 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
         }
 
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(
-                "SELECT booking_id, appointment_id FROM reviews WHERE booking_id = ANY(?)",
+                "SELECT booking_id FROM reviews WHERE booking_id = ANY(?)",
                 (Object) children.toArray(new UUID[0]));
         assertThat(rows).as("exactly one review row per child booking").hasSize(3);
         assertThat(rows.stream().map(r -> r.get("booking_id")).distinct().count())
                 .as("all three reviews are keyed on distinct booking_id").isEqualTo(3L);
-        assertThat(rows).allSatisfy(r -> assertThat(r.get("appointment_id"))
-                .as("no per-booking review carries an appointment_id").isNull());
     }
 
     @Test
@@ -261,7 +215,7 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("legacy single-booking review still works — POST /reviews on a standalone completed "
-            + "booking returns 201 with appointment_id NULL (byte-for-byte unchanged)")
+            + "booking returns 201 (byte-for-byte unchanged)")
     void should_createLegacyReview_when_reviewingSingleBooking() throws Exception {
         String masterEmail = "appt-rev-legacy-master-" + System.nanoTime() + "@beautica.test";
         UUID masterId = fixtures.createIndependentMaster(masterEmail);
@@ -278,60 +232,13 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
                 .as("legacy single-booking review must still return 201 — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
         Map<String, Object> row = jdbcTemplate.queryForMap(
-                "SELECT appointment_id, booking_id FROM reviews WHERE booking_id = ?", bookingId);
-        assertThat(row.get("appointment_id"))
-                .as("a legacy review carries no appointment_id")
-                .isNull();
+                "SELECT booking_id FROM reviews WHERE booking_id = ?", bookingId);
         assertThat(row.get("booking_id")).isEqualTo(bookingId);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  Point 1 (render + aggregate) — the visit review is visible on the master's
-    //  public reviews list and recomputes the master's persisted aggregate rating.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    @Test
-    @DisplayName("a completed-visit review renders in the master's public reviews list (INNER-JOIN "
-            + "graph path survives with booking_id = the first item) AND recomputes the master's "
-            + "persisted aggregate rating / review_count")
-    void should_renderInMasterListAndRecomputeAggregate_when_clientReviewsCompletedVisit() throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("render");
-
-        ResponseEntity<String> resp = postAppointmentReview(visit.clientToken(), visit.id(), 5, "Топ сервіс");
-        assertThat(resp.getStatusCode())
-                .as("visit review must return 201 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.CREATED);
-        UUID reviewId = UUID.fromString(
-                objectMapper.readTree(resp.getBody()).path("data").path("id").asText());
-
-        // Render: the visit review appears on GET /masters/{id}/reviews (public, no auth). This is the
-        // load-bearing INNER-JOIN assertion — under the rejected XOR shape a null-booking_id visit
-        // review would be silently DROPPED by the JOIN FETCH r.booking hydrate query and vanish here.
-        JsonNode list = objectMapper.readTree(
-                restTemplate.getForEntity(MASTERS_URL + "/" + visit.masterId() + "/reviews", String.class)
-                        .getBody());
-        JsonNode rows = list.path("data").path("data");
-        assertThat(rows).as("the master's review list must contain exactly the one visit review").hasSize(1);
-        assertThat(rows.get(0).path("id").asText())
-                .as("the rendered row is the review just created for the visit")
-                .isEqualTo(reviewId.toString());
-        assertThat(rows.get(0).path("rating").asInt()).isEqualTo(5);
-        assertThat(rows.get(0).path("serviceName").asText())
-                .as("serviceName hydrates from the first child booking's service definition")
-                .isEqualTo("Test Service");
-
-        // Aggregate: recomputed synchronously by ReviewEventListener (AFTER_COMMIT, not @Async).
-        Map<String, Object> agg = jdbcTemplate.queryForMap(
-                "SELECT avg_rating, review_count FROM masters WHERE id = ?", visit.masterId());
-        assertThat(((Number) agg.get("review_count")).intValue())
-                .as("the master's review_count must reflect the one visit review").isEqualTo(1);
-        assertThat(((Number) agg.get("avg_rating")).doubleValue())
-                .as("the master's avg_rating must equal the single 5-star visit review").isEqualTo(5.0);
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Point 3 (foreign booking) — the per-item guard sits AFTER ownership, so a
-    //  foreign single booking still 403s (no existence oracle from the 409 path).
+    //  Foreign booking — a foreign single booking still 403s (no existence
+    //  oracle from the 409 path).
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
@@ -361,172 +268,25 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  Point 4 (canReview lifecycle) — GET /appointments/{id}.canReview is false
-    //  while CONFIRMED, true after COMPLETED with no review, false once reviewed.
+    //  Retired-endpoint smoke — the visit-level review ROUTE itself is gone.
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("GET /appointments/{id}.canReview transitions false (CONFIRMED) → true (COMPLETED, no "
-            + "review yet) → false (after a review exists)")
-    void should_reflectCanReviewLifecycle_when_visitProgresses() throws Exception {
-        Visit visit = createConfirmedTwoServiceVisit("canreview");
+    @DisplayName("POST /api/v1/appointments/{id}/review is now UNMAPPED — 404, Spring's natural "
+            + "response to a route with no handler (the visit-level review endpoint was deleted, not "
+            + "merely disabled)")
+    void should_return404_when_postingToRetiredVisitReviewEndpoint() throws Exception {
+        Visit visit = createCompletedTwoServiceVisit("retired-route");
+        HttpHeaders headers = fixtures.bearerHeaders(visit.clientToken());
+        headers.setContentType(MediaType.APPLICATION_JSON);
 
-        assertThat(getCanReview(visit.clientToken(), visit.id()))
-                .as("a freshly-created CONFIRMED visit is not yet reviewable").isFalse();
-
-        completeVisit(visit);
-        assertThat(getCanReview(visit.clientToken(), visit.id()))
-                .as("a COMPLETED visit with no review is reviewable").isTrue();
-
-        assertThat(postAppointmentReview(visit.clientToken(), visit.id(), 5, null).getStatusCode())
-                .isEqualTo(HttpStatus.CREATED);
-        assertThat(getCanReview(visit.clientToken(), visit.id()))
-                .as("once a review exists the visit is no longer reviewable").isFalse();
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Point 5 (authZ / status) — every rejection collapses to a uniform envelope.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    @Test
-    @DisplayName("a client who does not own the completed visit is refused with 403, and no review row "
-            + "is written")
-    void should_return403_when_nonOwningClientReviewsVisit() throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("nonowner");
-        String otherClientEmail = "appt-rev-nonowner-other-" + System.nanoTime() + "@beautica.test";
-        fixtures.createUser(otherClientEmail, "CLIENT", null);
-        String otherToken = fixtures.tokenFor(otherClientEmail);
-
-        ResponseEntity<String> resp = postAppointmentReview(otherToken, visit.id(), 5, null);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + visit.id() + "/review", HttpMethod.POST,
+                new HttpEntity<>("{\"rating\":5}", headers), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("a foreign visit must 403 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(visitReviewCount(visit.id()))
-                .as("no review may be written for a non-owned visit").isEqualTo(0L);
-    }
-
-    @Test
-    @DisplayName("reviewing a guest (account-less) completed visit is refused with 403 (client_id NULL "
-            + "collapses to the same 403 a foreign visit gets)")
-    void should_return403_when_reviewingGuestVisit() throws Exception {
-        UUID guestAppointmentId = insertCompletedGuestAppointment();
-        String clientEmail = "appt-rev-guest-client-" + System.nanoTime() + "@beautica.test";
-        fixtures.createUser(clientEmail, "CLIENT", null);
-        String clientToken = fixtures.tokenFor(clientEmail);
-
-        ResponseEntity<String> resp = postAppointmentReview(clientToken, guestAppointmentId, 5, null);
-
-        assertThat(resp.getStatusCode())
-                .as("a guest visit has no owning account — must 403 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.FORBIDDEN);
-        assertThat(visitReviewCount(guestAppointmentId)).isEqualTo(0L);
-    }
-
-    @Test
-    @DisplayName("reviewing a still-CONFIRMED (non-completed) visit whose endsAt is still in the "
-            + "FUTURE is refused with 400, and no review row is written — the important assertion "
-            + "the review-eligibility widening must preserve")
-    void should_return400_when_reviewingNonCompletedVisit() throws Exception {
-        Visit visit = createConfirmedTwoServiceVisit("notdone");
-
-        ResponseEntity<String> resp = postAppointmentReview(visit.clientToken(), visit.id(), 5, null);
-
-        assertThat(resp.getStatusCode())
-                .as("a CONFIRMED visit whose window has not elapsed is not reviewable — must 400 — "
-                        + "body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(visitReviewCount(visit.id())).isEqualTo(0L);
-    }
-
-    @Test
-    @DisplayName("reviewing a still-CONFIRMED visit whose endsAt has already ELAPSED succeeds with "
-            + "201 — the bug fix, lifted to a multi-service visit: a visit the provider never closed "
-            + "but that aged into Past by time must be reviewable")
-    void should_createVisitReview_when_visitIsConfirmedButElapsed() throws Exception {
-        String masterEmail = "appt-rev-elapsed-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterId = fixtures.createIndependentMaster(masterEmail);
-        UUID serviceA = fixtures.createIndependentMasterService(masterId);
-        UUID serviceB = fixtures.createIndependentMasterService(masterId);
-        String clientEmail = "appt-rev-elapsed-client-" + System.nanoTime() + "@beautica.test";
-        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
-        String clientToken = fixtures.tokenFor(clientEmail);
-
-        UUID appointmentId = insertElapsedConfirmedTwoServiceVisit(clientId, masterId, serviceA, serviceB);
-
-        ResponseEntity<String> resp = postAppointmentReview(clientToken, appointmentId, 5, "Пізно, але дякую");
-
-        assertThat(resp.getStatusCode())
-                .as("an elapsed-but-unclosed CONFIRMED visit must be reviewable — 201 — body: %s",
-                        resp.getBody())
-                .isEqualTo(HttpStatus.CREATED);
-        assertThat(visitReviewCount(appointmentId)).isEqualTo(1L);
-    }
-
-    @Test
-    @DisplayName("reviewing a missing visit id returns 404")
-    void should_return404_when_reviewingMissingVisit() throws Exception {
-        String clientEmail = "appt-rev-missing-client-" + System.nanoTime() + "@beautica.test";
-        fixtures.createUser(clientEmail, "CLIENT", null);
-        String clientToken = fixtures.tokenFor(clientEmail);
-
-        ResponseEntity<String> resp = postAppointmentReview(clientToken, UUID.randomUUID(), 5, null);
-
-        assertThat(resp.getStatusCode())
-                .as("an unknown visit id must 404 — body: %s", resp.getBody())
+                .as("the retired visit-review route must be unmapped — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.NOT_FOUND);
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Point 8 (validation) — same DTO constraints as the legacy single-booking body.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    @ParameterizedTest(name = "rating={0}")
-    @ValueSource(ints = {0, 6})
-    @DisplayName("a rating outside 1..5 is rejected with 400 before any review row is written")
-    void should_return400_when_ratingOutOfBounds(int rating) throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("rating" + rating);
-
-        ResponseEntity<String> resp = postAppointmentReviewRaw(
-                visit.clientToken(), visit.id(), "{\"rating\":" + rating + "}");
-
-        assertThat(resp.getStatusCode())
-                .as("rating %d is out of bounds — must 400 — body: %s", rating, resp.getBody())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(visitReviewCount(visit.id())).isEqualTo(0L);
-    }
-
-    @Test
-    @DisplayName("a comment carrying a control character is rejected with 400 (same @Pattern as the "
-            + "legacy body)")
-    void should_return400_when_commentHasControlChar() throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("ctrl");
-
-        //  is a valid JSON escape on the wire (well-formed body — this exercises the DTO's
-        // @Pattern, not Jackson's parser), decoded to a BEL control char the pattern must reject.
-        ResponseEntity<String> resp = postAppointmentReviewRaw(
-                visit.clientToken(), visit.id(), "{\"rating\":5,\"comment\":\"bad\\u0007text\"}");
-
-        assertThat(resp.getStatusCode())
-                .as("a control-char comment must 400 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(visitReviewCount(visit.id())).isEqualTo(0L);
-    }
-
-    @Test
-    @DisplayName("an oversized comment (>2000 chars) is rejected with 400")
-    void should_return400_when_commentOversized() throws Exception {
-        Visit visit = createCompletedTwoServiceVisit("oversize");
-        String oversized = "a".repeat(2001);
-
-        ResponseEntity<String> resp = postAppointmentReviewRaw(
-                visit.clientToken(), visit.id(),
-                objectMapper.writeValueAsString(Map.of("rating", 5, "comment", oversized)));
-
-        assertThat(resp.getStatusCode())
-                .as("a 2001-char comment must 400 — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(visitReviewCount(visit.id())).isEqualTo(0L);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -646,93 +406,6 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
         return result;
     }
 
-    /** Reads {@code canReview} off {@code GET /appointments/{id}} as the given actor. */
-    private boolean getCanReview(String token, UUID appointmentId) throws Exception {
-        ResponseEntity<String> resp = restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId, HttpMethod.GET,
-                new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
-        assertThat(resp.getStatusCode())
-                .as("the owning client must read the visit — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.OK);
-        return objectMapper.readTree(resp.getBody()).path("data").path("canReview").asBoolean();
-    }
-
-    /**
-     * Inserts a standalone COMPLETED guest (LINK) visit header with {@code client_id = NULL} — enough
-     * to exercise the review path's null-owner guard, which fires before any item lookup. The FK-less
-     * header alone is sufficient (the guard 403s before the visit's items are read).
-     */
-    private UUID insertCompletedGuestAppointment() {
-        UUID appointmentId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO appointments "
-                        + "(id, client_id, salon_id, status, booking_source, guest_name, guest_surname, "
-                        + "guest_phone, cancel_token, created_at, updated_at) "
-                        + "VALUES (?, NULL, NULL, 'COMPLETED', 'LINK', 'Guest', 'Visitor', '+380501234567', "
-                        + "?, NOW(), NOW())",
-                appointmentId, UUID.randomUUID());
-        return appointmentId;
-    }
-
-    /**
-     * Inserts a real (APP, non-guest) CONFIRMED two-service visit header plus its two chained
-     * {@code bookings} rows directly via SQL, with both items' {@code ends_at} well in the past —
-     * exercising the review-eligibility widening's CONFIRMED-and-elapsed disjunct at the visit
-     * level. Mirrors {@link #insertCompletedSingleBooking} (past, non-overlapping window) and
-     * {@link #insertCompletedGuestAppointment} (direct appointment-row insert), combined: a
-     * registered client, real visit header, two back-to-back past bookings chained via {@code
-     * appointment_id}.
-     */
-    private UUID insertElapsedConfirmedTwoServiceVisit(
-            UUID clientId, UUID masterId, UUID masterServiceIdA, UUID masterServiceIdB) {
-        UUID appointmentId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO appointments (id, client_id, salon_id, status, booking_source, "
-                        + "created_at, updated_at) VALUES (?, ?, NULL, 'CONFIRMED', 'APP', NOW(), NOW())",
-                appointmentId, clientId);
-
-        UUID firstItemId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, appointment_id, "
-                        + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
-                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '4 hours', "
-                        + "NOW() - interval '3 hours', 500.00, 60, 0, 'APP', NOW(), NOW())",
-                firstItemId, clientId, masterId, masterServiceIdA, appointmentId);
-
-        UUID secondItemId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, appointment_id, "
-                        + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
-                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', NOW() - interval '3 hours', "
-                        + "NOW() - interval '2 hours', 500.00, 60, 0, 'APP', NOW(), NOW())",
-                secondItemId, clientId, masterId, masterServiceIdB, appointmentId);
-
-        return appointmentId;
-    }
-
-    private ResponseEntity<String> postAppointmentReview(
-            String token, UUID appointmentId, int rating, String comment) throws Exception {
-        String body = comment == null
-                ? "{\"rating\":%d}".formatted(rating)
-                : "{\"rating\":%d,\"comment\":\"%s\"}".formatted(rating, comment);
-        HttpHeaders headers = fixtures.bearerHeaders(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId + "/review", HttpMethod.POST,
-                new HttpEntity<>(body, headers), String.class);
-    }
-
-    /** POSTs a caller-supplied raw JSON body to the visit-review endpoint (for validation cases). */
-    private ResponseEntity<String> postAppointmentReviewRaw(String token, UUID appointmentId, String rawBody) {
-        HttpHeaders headers = fixtures.bearerHeaders(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return restTemplate.exchange(
-                APPOINTMENTS_URL + "/" + appointmentId + "/review", HttpMethod.POST,
-                new HttpEntity<>(rawBody, headers), String.class);
-    }
-
     private ResponseEntity<String> postSingleBookingReview(String token, UUID bookingId, int rating) {
         String body = "{\"bookingId\":\"%s\",\"rating\":%d}".formatted(bookingId, rating);
         HttpHeaders headers = fixtures.bearerHeaders(token);
@@ -745,18 +418,6 @@ class AppointmentReviewIT extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at LIMIT 1",
                 UUID.class, appointmentId);
-    }
-
-    private Long visitReviewCount(UUID appointmentId) {
-        return jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM reviews WHERE appointment_id = ?", Long.class, appointmentId);
-    }
-
-    private Long reviewRequestedCount(UUID appointmentId) {
-        return jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'REVIEW_REQUESTED' "
-                        + "AND aggregate_id IN (SELECT id FROM bookings WHERE appointment_id = ?)",
-                Long.class, appointmentId);
     }
 
     private UUID userIdOf(String email) {

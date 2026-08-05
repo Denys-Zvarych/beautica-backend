@@ -126,7 +126,7 @@ class AppointmentControllerTest {
                 java.time.ZonedDateTime.now().plusDays(1),
                 java.time.ZonedDateTime.now().plusDays(1).plusHours(2),
                 120, new java.math.BigDecimal("1400.00"), null,
-                null, java.time.OffsetDateTime.now(), List.of(), false,
+                null, java.time.OffsetDateTime.now(), List.of(),
                 null, null, "Kyiv", null, null, null, null);
     }
 
