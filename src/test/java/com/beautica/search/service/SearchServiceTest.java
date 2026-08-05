@@ -315,6 +315,80 @@ class SearchServiceTest {
         verify(discoveryLocationResolver, times(1)).resolveLabels(any(), any());
     }
 
+    // ── zero-review rating normalisation (Phase 240 audit, Finding 3) ─────────
+    //
+    // masters.avg_rating is NOT NULL DEFAULT 0.00 (V4), so the native projection hands this
+    // mapper a literal 0.00 for a master nobody has rated. Search used to pass that straight
+    // through while GET /masters/{id} and the booking payload served null for the SAME master —
+    // the discovery list rendered «0.0» beside a profile that said «no reviews yet».
+
+    @Test
+    @DisplayName("nulls avgRating for a zero-review master rather than passing the stored 0.00 through")
+    void should_nullAvgRating_when_rowCarriesZeroReviewCount() {
+        Object[] row = new Object[]{
+                UUID.randomUUID(), "Nova", "Maistrynia",
+                new BigDecimal("0.00"), 0, null,
+                CITY_ID, DISTRICT_ID, new BigDecimal("250.00")
+        };
+        stubNativeQueries(List.<Object[]>of(row), 1L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        MasterSearchResult mapped = result.getContent().get(0);
+        assertThat(mapped.avgRating())
+                .as("a brand-new master must not be rendered as a 0.0-star provider in discovery")
+                .isNull();
+        assertThat(mapped.reviewCount())
+                .as("zero reviews is a true fact and stays 0 — only the average is suppressed, "
+                    + "actual=%s", mapped.reviewCount())
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("keeps a genuine 1.00 average when the master has exactly one review")
+    void should_keepAvgRating_when_rowCarriesOneReview() {
+        // The boundary that separates the suppressed storage artefact from a real bad rating.
+        // A suppression keyed off the VALUE (0.00 / null) instead of the COUNT would be
+        // indetectable at 4.85 above but would wrongly hide this genuine one-star provider.
+        Object[] row = new Object[]{
+                UUID.randomUUID(), "Odna", "Zirka",
+                new BigDecimal("1.00"), 1, null,
+                CITY_ID, DISTRICT_ID, new BigDecimal("250.00")
+        };
+        stubNativeQueries(List.<Object[]>of(row), 1L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getContent().get(0).avgRating())
+                .as("a real one-star average must survive the zero-review normalisation")
+                .isEqualTo(1.0);
+    }
+
+    @Test
+    @DisplayName("passes the raw average through when review_count is null — unknown is not zero")
+    void should_passRawAvgRatingThrough_when_rowCarriesNullReviewCount() {
+        // Defensive branch, pinned because the two claims differ: "this master has zero reviews"
+        // licenses suppressing the average; "the count is unknown" does not. A future refactor
+        // that folded null into the zero case would silently blank real ratings.
+        Object[] row = new Object[]{
+                UUID.randomUUID(), "Nevidoma", "Kilkist",
+                new BigDecimal("3.50"), null, null,
+                CITY_ID, DISTRICT_ID, new BigDecimal("250.00")
+        };
+        stubNativeQueries(List.<Object[]>of(row), 1L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        MasterSearchResult mapped = result.getContent().get(0);
+        assertThat(mapped.avgRating())
+                .as("an unknown review count must not blank a stored average, actual=%s",
+                        mapped.avgRating())
+                .isEqualTo(3.5);
+        assertThat(mapped.reviewCount())
+                .as("the unknown count is reported as null, not coerced to 0")
+                .isNull();
+    }
+
     @Test
     @DisplayName("returns an empty page with totalElements 0 when no rows match")
     void should_returnEmptyPage_when_noResultsFound() {

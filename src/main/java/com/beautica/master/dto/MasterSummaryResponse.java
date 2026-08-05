@@ -1,5 +1,6 @@
 package com.beautica.master.dto;
 
+import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 
@@ -12,6 +13,12 @@ public record MasterSummaryResponse(
         String lastName,
         String professionalTitle,
         String avatarUrl,
+        /**
+         * {@code null} when {@link #reviewCount} is 0 — see
+         * {@link BookingDetailResponse#masterAvgRatingOrNull}. The salon roster must not render
+         * a phantom "0.0" for a master the booking screen renders as "no reviews yet"
+         * (Phase 240 audit, Finding 3).
+         */
         BigDecimal avgRating,
         int reviewCount,
         MasterType masterType
@@ -25,7 +32,8 @@ public record MasterSummaryResponse(
                 // dereferenced above for firstName/lastName, so no new N+1 is introduced.
                 master.getUser().getProfessionalTitle(),
                 null, // TODO: map from user.avatarUrl once Phase 2-B adds it to User
-                master.getAvgRating(),
+                BookingDetailResponse.masterAvgRatingOrNull(
+                        master.getReviewCount(), master.getAvgRating()),
                 master.getReviewCount(),
                 master.getMasterType()
         );

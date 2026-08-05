@@ -138,7 +138,11 @@ class BookingControllerTest {
                 // tomorrow (CONFIRMED, not yet elapsed), so false is the only correct value; the
                 // real derivation is exercised by BookingResponseTest/BookingDetailResponseTest
                 // and the booking ITs, not this controller-slice stub.
-                false
+                false,
+                // masterAvgRating / masterReviewCount (Phase B1 additive) — BookingService is
+                // mocked in this slice, so these are literal stub values; the zero-review
+                // normalisation itself is pinned by BookingDetailResponseTest.
+                new BigDecimal("4.75"), 12
         );
     }
 

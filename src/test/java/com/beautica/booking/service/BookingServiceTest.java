@@ -2154,7 +2154,10 @@ class BookingServiceTest {
                 null,
                 null,
                 // clientAvatarUrl — the CLIENT projection path's own photo column.
-                "https://cdn.test/client-avatar.png");
+                "https://cdn.test/client-avatar.png",
+                // Phase B1 — a REVIEWED master (count > 0), so the zero-review normalisation is
+                // not the branch under test here; the null case has its own test below.
+                new BigDecimal("4.75"), 12);
     }
 
     @Test
@@ -2219,7 +2222,9 @@ class BookingServiceTest {
                 priceMaxAtBooking,
                 null,
                 // clientAvatarUrl — irrelevant to this fixture's price-ceiling assertions.
-                null);
+                null,
+                // Phase B1 masterAvgRating/masterReviewCount — irrelevant here too.
+                new BigDecimal("4.20"), 3);
     }
 
     private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
@@ -2257,6 +2262,52 @@ class BookingServiceTest {
         assertThat(booking.priceMaxAtBooking()).isNull();
     }
 
+    // ── Phase B1 — master rating on the CLIENT projection path ────────────────────────────────
+    //    The projection selects masters.avg_rating RAW; the service must apply the SAME
+    //    zero-review-to-null rule the entity path applies, via the one shared helper, so
+    //    GET /bookings/me and GET /bookings/{id} can never disagree about a master's rating.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithRating(
+            java.math.BigDecimal masterAvgRating, int masterReviewCount) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false,
+                null,
+                null,
+                null,
+                masterAvgRating, masterReviewCount);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) surfaces the master's stored avgRating/reviewCount from the projection")
+    void should_surfaceMasterRating_when_clientProjectionRowHasReviews() {
+        var booking = firstClientRowFor(clientProjectionRowWithRating(new BigDecimal("4.75"), 12));
+
+        assertThat(booking.masterAvgRating()).isEqualByComparingTo(new BigDecimal("4.75"));
+        assertThat(booking.masterReviewCount()).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) nulls the master's avgRating when reviewCount is 0 — the "
+            + "0.00 the column stores for an unreviewed master must never reach the wire")
+    void should_returnNullMasterAvgRating_when_clientProjectionRowHasNoReviews() {
+        var booking = firstClientRowFor(clientProjectionRowWithRating(new BigDecimal("0.00"), 0));
+
+        assertThat(booking.masterAvgRating()).isNull();
+        assertThat(booking.masterReviewCount()).isZero();
+    }
+
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
             UUID id, String serviceName) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -2276,7 +2327,9 @@ class BookingServiceTest {
                 null,
                 null,
                 // clientAvatarUrl — irrelevant to this fixture's ordering assertions.
-                null);
+                null,
+                // Phase B1 masterAvgRating/masterReviewCount — irrelevant to ordering.
+                new BigDecimal("4.20"), 3);
     }
 
     // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no

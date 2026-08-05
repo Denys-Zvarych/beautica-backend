@@ -1,5 +1,6 @@
 package com.beautica.search.service;
 
+import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.location.DiscoveryLocationKey;
 import com.beautica.location.DiscoveryLocationResolver;
@@ -2527,8 +2528,27 @@ public class SearchService {
         UUID masterId = (UUID) row[0];
         String firstName = (String) row[1];
         String lastName = (String) row[2];
-        Double avgRating = row[3] == null ? null : ((BigDecimal) row[3]).doubleValue();
         Integer reviewCount = row[4] == null ? null : ((Number) row[4]).intValue();
+        // Phase 240 audit (Finding 3, follow-up): suppress the stored 0.00 for a master with no
+        // reviews, so search agrees with GET /masters/{id} and the booking payload instead of
+        // rendering «0.0» for the same brand-new master the profile renders as «—».
+        //
+        // Payload-only, by construction. The RATING_DESC ordering (:1212 / :1229) and the
+        // minRating filter (:1358) are SQL predicates over masters.avg_rating and are fully
+        // resolved by the database before this mapper ever runs; nothing downstream re-sorts or
+        // re-filters on MasterSearchResult#avgRating (verified: the only reader of that accessor
+        // in src/main/java is the record's own withoutStreetAddress copy). A zero-review master
+        // therefore still sorts last under RATING_DESC (ORDER BY ... DESC NULLS LAST) and is
+        // still excluded by minRating >= 1 — it merely renders as "no reviews yet".
+        //
+        // Routed through the same single rule as every other master-rating surface. Guarded for a
+        // null count: reviewCount unknown is NOT the same claim as "zero reviews", so the raw
+        // value passes through rather than being silently nulled.
+        BigDecimal rawAvgRating = (BigDecimal) row[3];
+        BigDecimal normalisedAvgRating = reviewCount == null
+                ? rawAvgRating
+                : BookingDetailResponse.masterAvgRatingOrNull(reviewCount, rawAvgRating);
+        Double avgRating = normalisedAvgRating == null ? null : normalisedAvgRating.doubleValue();
         String avatarUrl = (String) row[5];
         UUID cityId = (UUID) row[6];
         UUID districtId = (UUID) row[7];

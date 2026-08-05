@@ -161,6 +161,16 @@ import java.util.UUID;
  * yet), the CLIENT projection path's viewer is always CLIENT (structurally excluded), and the
  * provider listing was out of scope for the CTA this field backs. See each hardcoding site's own
  * comment before "optimising" this away.
+ *
+ * <p><b>Phase B1 — {@code masterAvgRating}/{@code masterReviewCount}.</b> The master's public
+ * rating aggregate, surfaced so the client's booking-detail and leave-feedback screens can render
+ * the provider's score without a second round-trip to {@code GET /masters/{id}} or
+ * {@code /reviews/summary}. Both are read STRAIGHT OFF the already-loaded master row — the
+ * denormalized {@code masters.avg_rating} / {@code masters.review_count} columns (V4), maintained
+ * on write by {@code ReviewRepository#recalculateMasterRating} under the project's standing
+ * "recalculate on write, read persisted on read" contract. Neither is aggregated at read time, so
+ * neither adds a query, a join, or an N+1 on any path — see {@link #masterAvgRatingOrNull} for the
+ * zero-review normalisation both mapper paths share.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -279,8 +289,71 @@ public record BookingDetailResponse(
                 + "reviewable even before the provider closes it — see BookingClosureRule#"
                 + "isReviewEligible). The same for every row of GET /bookings/me and for GET "
                 + "/bookings/{id} — a pure function of the booking, not of the viewer.")
-        boolean awaitingClosure
+        boolean awaitingClosure,
+        // Phase B1. Appended LAST for the same reason as priceMaxAtBooking / appointmentId /
+        // clientAvatarUrl above (see their comments): a pure append shifts no existing positional
+        // argument at any of the three construction sites, and the pair sits behind a boolean with
+        // two mutually distinct types (BigDecimal, Integer), so no reordering slip can survive
+        // compilation.
+        @Schema(types = {"number", "null"}, nullable = true,
+                description = "The master's public average rating, 1.00-5.00, read off the "
+                        + "denormalized masters.avg_rating column — the SAME value served by GET "
+                        + "/masters/{id} and GET /masters/{id}/reviews/summary, never independently "
+                        + "re-aggregated. Agreement across those three endpoints is exact, not "
+                        + "eventual: GET /masters/{id} is served from the 5-minute 'master-detail' "
+                        + "cache, and ReviewEventListener#onReviewCreated evicts that entry by "
+                        + "masterId once the rating recalculation commits, so a client that leaves "
+                        + "a review sees the new average on the booking AND on the profile on the "
+                        + "very next request. NULL when masterReviewCount is 0: the column stores "
+                        + "0.00 for an unreviewed master (V4 NOT NULL DEFAULT 0.00, and "
+                        + "recalculateMasterRating's COALESCE(AVG(...), 0)), which is a storage "
+                        + "artefact, not a rating — rendering it would show a brand-new master a "
+                        + "damning zero stars. Render the 'no reviews yet' state when null; never "
+                        + "substitute 0.")
+        BigDecimal masterAvgRating,
+        @Schema(types = {"integer", "null"}, nullable = true,
+                description = "How many reviews the master's average is computed from. 0 for an "
+                        + "unreviewed master (a true fact, unlike a 0.00 average) and non-null on "
+                        + "every path that serves this DTO today; typed nullable so a client "
+                        + "treats an absent value as 'unknown' rather than 'zero reviews'.")
+        Integer masterReviewCount
 ) {
+
+    /**
+     * The single zero-review normalisation for {@code masterAvgRating}, shared verbatim by BOTH
+     * mapper paths (the entity {@link #from} below and {@code BookingService#toDetailResponse}'s
+     * CLIENT projection path) so the two independently maintained mappers cannot compute this
+     * field differently — the exact divergence class {@code BookingDetailContractIT}'s reflective
+     * parity loop exists to catch, and which once leaked a master's personal {@code locationNote}.
+     *
+     * <p>The rule mirrors {@code ReviewService#getMasterReviewSummary}'s
+     * {@code master.getReviewCount() == 0 ? null : master.getAvgRating()} exactly, so a client
+     * reading a master's rating on a booking and on {@code /reviews/summary} can never see two
+     * different values.
+     *
+     * <p>Phase 240 audit (Findings 2/3): the master-side response DTOs call this same method
+     * rather than re-implementing the branch — {@link com.beautica.master.dto.MasterDetailResponse},
+     * {@link com.beautica.master.dto.MasterSummaryResponse} and {@link BookableMasterResponse} all
+     * used to emit the raw stored {@code 0.00}, so an unreviewed master rendered "no reviews yet"
+     * on a booking and a phantom "0.0 stars" on their own profile. One method, one branch, every
+     * master-rating surface. Not moved to {@code common/} because the projection path needs the
+     * {@code (int, BigDecimal)} primitive form, which is what this signature already is.
+     *
+     * <p>It is needed because {@code masters.avg_rating} is {@code NOT NULL DEFAULT
+     * 0.00} (V4) and {@code recalculateMasterRating} writes {@code COALESCE(AVG(...), 0)} — so an
+     * unreviewed master stores a literal {@code 0.00} that must NOT reach the wire as a rating.
+     *
+     * <p>Deliberately NOT expressed as a JPQL {@code CASE WHEN} inside the projection query: the
+     * projection selects the raw column pair and normalises here, in Java, so both paths run the
+     * same branch rather than a JPQL copy and a Java copy that can drift apart.
+     *
+     * @param reviewCount the master's persisted {@code review_count}
+     * @param storedAvgRating the master's persisted {@code avg_rating} (never null in the DB)
+     * @return {@code null} when the master has no reviews, else the stored average
+     */
+    public static BigDecimal masterAvgRatingOrNull(int reviewCount, BigDecimal storedAvgRating) {
+        return reviewCount == 0 ? null : storedAvgRating;
+    }
 
     /**
      * Builds the enriched detail view for the single-entity path. The caller (the service)
@@ -371,7 +444,15 @@ public record BookingDetailResponse(
                 // name reads above, so avatarUrl is a scalar off an already-materialised User row
                 // — no extra statement, no widening of either fetch graph.
                 client != null ? client.getAvatarUrl() : null,
-                BookingClosureRule.isAwaitingClosure(booking.getStatus(), booking.getEndsAt(), now)
+                BookingClosureRule.isAwaitingClosure(booking.getStatus(), booking.getEndsAt(), now),
+                // Phase B1 — both are scalars off the SAME `master` row already materialised above
+                // for master.getId()/getUser()/getSalon(). Every caller of this factory hydrates the
+                // booking through findByIdWithFullGraph / findAllByIdsWithGraph, both of which carry
+                // `JOIN FETCH b.master m`, so these two reads add no statement and require no
+                // widening of either fetch graph. They are denormalized columns (V4), NOT a live
+                // aggregate — do not "fix" this into a count/avg query.
+                masterAvgRatingOrNull(master.getReviewCount(), master.getAvgRating()),
+                master.getReviewCount()
         );
     }
 }

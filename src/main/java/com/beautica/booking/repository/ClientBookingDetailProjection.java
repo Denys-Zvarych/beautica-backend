@@ -97,6 +97,17 @@ public record ClientBookingDetailProjection(
         // CALLER's role rather than the data. On this CLIENT-scoped path the value is simply the
         // caller's own photo. Appended last, after the UUID appointmentId, for the same
         // compile-time-slip-detection reason as priceMaxAtBooking above.
-        String clientAvatarUrl
+        String clientAvatarUrl,
+        // Phase B1: the master's denormalized rating aggregate, selected as `m.avgRating` /
+        // `m.reviewCount` off the ALREADY-PRESENT `JOIN b.master m` — no additional join, no
+        // additional query, no live aggregation (the columns are maintained on write by
+        // ReviewRepository#recalculateMasterRating). Selected RAW, on purpose: the
+        // zero-review-to-null normalisation lives in BookingDetailResponse#masterAvgRatingOrNull
+        // so this path and the entity path run the SAME branch rather than a JPQL CASE WHEN here
+        // and a Java ternary there, which is precisely how two mappers drift. Appended last, after
+        // the String clientAvatarUrl, for the same compile-time-slip-detection reason as
+        // priceMaxAtBooking above.
+        BigDecimal masterAvgRating,
+        int masterReviewCount
 ) {
 }

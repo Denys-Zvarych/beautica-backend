@@ -234,8 +234,19 @@ public class SalonService {
         return result;
     }
 
+    /**
+     * {@code sync = true} (Phase 240 audit, item A) mirrors
+     * {@link com.beautica.master.service.MasterService#getMasterDetail(UUID)}. Required because
+     * {@code ReviewEventListener#onReviewCreated} now evicts this entry by key on every review of
+     * a salon-affiliated master, so the cache misses on a real WRITE path and not only on TTL
+     * expiry — without collapsing, N concurrent readers of a popular salon each run the
+     * {@code findByIdAndIsActiveTrueWithOwner} graph query (Anti-Bug §F-7).
+     *
+     * <p>Compatible: this {@code @Cacheable} names ONE cache and carries no {@code unless} /
+     * {@code condition}, both of which {@code sync = true} forbids.
+     */
     @Transactional(readOnly = true)
-    @Cacheable(value = "salon-detail", key = "#salonId")
+    @Cacheable(value = "salon-detail", key = "#salonId", sync = true)
     public Salon getSalonEntity(UUID salonId) {
         return salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));

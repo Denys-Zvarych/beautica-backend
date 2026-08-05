@@ -374,7 +374,13 @@ public class BookingService {
                 // projection is CLIENT-scoped via `JOIN b.client`, so a guest booking cannot
                 // appear here at all. A client with no uploaded photo yields null naturally.
                 p.clientAvatarUrl(),
-                BookingClosureRule.isAwaitingClosure(p.status(), p.endsAt(), now));
+                BookingClosureRule.isAwaitingClosure(p.status(), p.endsAt(), now),
+                // Phase B1 — the SAME normalisation the entity path applies, called from the one
+                // shared helper rather than re-inlined here, so the two mappers cannot disagree
+                // about what a zero-review master's rating is (BookingDetailContractIT's reflective
+                // parity loop covers this field automatically).
+                BookingDetailResponse.masterAvgRatingOrNull(p.masterReviewCount(), p.masterAvgRating()),
+                p.masterReviewCount());
     }
 
     /**

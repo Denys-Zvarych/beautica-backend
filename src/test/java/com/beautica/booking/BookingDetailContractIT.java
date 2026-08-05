@@ -23,6 +23,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.lang.reflect.RecordComponent;
+import java.math.BigDecimal;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -152,6 +153,20 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .as("sibling field sanity — proves the master's avatar is genuinely a different "
                         + "seeded value, not absent, so the inequality above is meaningful")
                 .isEqualTo(MASTER_AVATAR_URL);
+
+        // masterAvgRating/masterReviewCount non-vacuity (Phase B1), same reasoning as the
+        // clientAvatarUrl block above: the reflective loop already compares both fields, but the
+        // column defaults (0.00 / 0) normalise to null on BOTH paths, so without a seeded rating
+        // the comparison would be null == null. The entity path reads master.getAvgRating(); the
+        // CLIENT projection path reads the JPQL `m.avgRating` select — physically different reads.
+        assertThat(new BigDecimal(single.get("masterAvgRating").asText()))
+                .as("entity path (GET /bookings/{id}) must serve the seeded master rating")
+                .isEqualByComparingTo(MASTER_AVG_RATING);
+        assertThat(new BigDecimal(listItem.get("masterAvgRating").asText()))
+                .as("CLIENT projection path (GET /bookings/me) must serve the same real value")
+                .isEqualByComparingTo(MASTER_AVG_RATING);
+        assertThat(single.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
+        assertThat(listItem.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
     }
 
     /**
@@ -295,6 +310,16 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
             "https://cdn.beautica.test/avatars/contract-master-likeness.jpg";
 
     /**
+     * Phase B1 — the seeded master's rating aggregate. Non-default on purpose (the columns default
+     * to {@code 0.00}/{@code 0}, which both mapper paths normalise to {@code null}/{@code 0}), so
+     * the reflective parity loop compares a REAL value on both sides instead of {@code null ==
+     * null}. The average is deliberately not a round number so a mapper that fabricated one would
+     * not coincidentally match.
+     */
+    private static final BigDecimal MASTER_AVG_RATING = new BigDecimal("4.75");
+    private static final int MASTER_REVIEW_COUNT = 12;
+
+    /**
      * Keys that must never appear in a denied booking read. {@code guestName}/{@code guestSurname}
      * are not {@link BookingDetailResponse} components today — they fold into
      * {@code clientFirstName}/{@code clientLastName} for guest (LINK) bookings — and are listed
@@ -372,9 +397,15 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
 
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
+                // Phase B1: avg_rating/review_count are seeded to a REVIEWED master on purpose.
+                // The reflective parity loop picks up masterAvgRating/masterReviewCount
+                // automatically, but "both sides agree" is worthless while both sides are the
+                // column defaults (0.00 / 0, which the mapper normalises to null / 0 on BOTH
+                // paths) — that would compare null == null and pass vacuously.
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, "
+                        + "avg_rating, review_count, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, ?, ?, NOW(), NOW())",
+                masterId, masterUserId, salonId, MASTER_AVG_RATING, MASTER_REVIEW_COUNT);
 
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(

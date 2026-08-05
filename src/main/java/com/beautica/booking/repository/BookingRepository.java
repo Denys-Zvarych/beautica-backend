@@ -294,6 +294,13 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * the same {@code JOIN m.user mu} already used for {@code mu.firstName}/{@code mu.lastName}
      * — no additional join, and the column is nullable (a master may never have set a title).
      *
+     * <p>Phase B1's {@code m.avgRating}/{@code m.reviewCount} likewise ride the {@code JOIN
+     * b.master m} alias this query has always carried (it already selects {@code m.id}) — two more
+     * scalars on the same {@code masters} row, so no additional join and no aggregate subquery.
+     * They are selected RAW; the zero-review-to-null rule is applied once, in Java, by {@code
+     * BookingDetailResponse#masterAvgRatingOrNull}, shared with the entity mapper path so the two
+     * cannot drift.
+     *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
      * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
@@ -387,7 +394,9 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END,
                 b.priceMaxAtBooking,
                 b.appointment.id,
-                b.client.avatarUrl
+                b.client.avatarUrl,
+                m.avgRating,
+                m.reviewCount
             )
             FROM Booking b
             JOIN b.client

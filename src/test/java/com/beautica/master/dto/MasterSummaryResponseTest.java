@@ -72,4 +72,39 @@ class MasterSummaryResponseTest {
                 .as("a provider with no headline projects a null professionalTitle, never a placeholder")
                 .isNull();
     }
+
+    // ── Zero-review rating normalisation (Phase 240 audit, Finding 3) ─────────────────
+
+    @Test
+    @DisplayName("from nulls avgRating when the master has no reviews")
+    void should_returnNullAvgRating_when_masterHasNoReviews() {
+        User user = mock(User.class);
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(user);
+        when(master.getReviewCount()).thenReturn(0);
+        // Persisted-but-meaningless value: masters.avg_rating is NOT NULL DEFAULT 0.00 (V4),
+        // so the suppression must key off the count, not off the rating being null.
+        when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
+
+        MasterSummaryResponse summary = MasterSummaryResponse.from(master);
+
+        assertThat(summary.avgRating())
+                .as("the salon roster must render 'no reviews yet', not a phantom 0.0")
+                .isNull();
+        assertThat(summary.reviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("from surfaces the persisted avgRating once the master has reviews")
+    void should_surfacePersistedAvgRating_when_masterHasReviews() {
+        User user = mock(User.class);
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(user);
+        when(master.getReviewCount()).thenReturn(7);
+        when(master.getAvgRating()).thenReturn(new BigDecimal("4.50"));
+
+        MasterSummaryResponse summary = MasterSummaryResponse.from(master);
+
+        assertThat(summary.avgRating()).isEqualByComparingTo("4.50");
+    }
 }

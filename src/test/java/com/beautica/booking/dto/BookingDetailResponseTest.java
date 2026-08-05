@@ -45,6 +45,7 @@ class BookingDetailResponseTest {
     // Separate User mocks so the test can verify traversal for client vs. master
     private User clientUser;
     private User masterUser;
+    private Master master;
     private Booking booking;
 
     @BeforeEach
@@ -65,7 +66,7 @@ class BookingDetailResponseTest {
         when(masterUser.getProfessionalTitle()).thenReturn("Перукар-стиліст");
         when(masterUser.getLocationNote()).thenReturn("3-й поверх, код 1234");
 
-        var master = mock(Master.class);
+        master = mock(Master.class);
         when(master.getId()).thenReturn(masterId);
         when(master.getUser()).thenReturn(masterUser);
 
@@ -458,5 +459,46 @@ class BookingDetailResponseTest {
 
         assertThat(beforeElapse.awaitingClosure()).isFalse();
         assertThat(afterElapse.awaitingClosure()).isTrue();
+    }
+
+    // ── Phase B1 — master rating aggregate ────────────────────────────────────────────────────
+    //    masters.avg_rating is NOT NULL DEFAULT 0.00 (V4) and recalculateMasterRating writes
+    //    COALESCE(AVG(...), 0), so an unreviewed master stores a literal 0.00. That is a storage
+    //    artefact, not a rating, and must never reach the wire — same rule as
+    //    ReviewService#getMasterReviewSummary.
+
+    @Test
+    @DisplayName("masterAvgRating/masterReviewCount are read off the already-loaded Master row when "
+            + "the master has reviews")
+    void should_mapMasterRating_when_masterHasReviews() {
+        when(master.getAvgRating()).thenReturn(new BigDecimal("4.75"));
+        when(master.getReviewCount()).thenReturn(12);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.masterAvgRating()).isEqualByComparingTo(new BigDecimal("4.75"));
+        assertThat(response.masterReviewCount()).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("masterAvgRating is NULL — never 0.00 — for a master with zero reviews, while "
+            + "masterReviewCount stays 0 (a true fact, unlike a fabricated zero-star average)")
+    void should_returnNullAvgRating_when_masterHasNoReviews() {
+        when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
+        when(master.getReviewCount()).thenReturn(0);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.masterAvgRating()).isNull();
+        assertThat(response.masterReviewCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("masterAvgRatingOrNull suppresses the stored average only at reviewCount == 0 — "
+            + "a single review with a genuine 1.00 average is still surfaced")
+    void should_surfaceGenuineLowRating_when_masterHasExactlyOneReview() {
+        assertThat(BookingDetailResponse.masterAvgRatingOrNull(0, new BigDecimal("0.00"))).isNull();
+        assertThat(BookingDetailResponse.masterAvgRatingOrNull(1, new BigDecimal("1.00")))
+                .isEqualByComparingTo(new BigDecimal("1.00"));
     }
 }

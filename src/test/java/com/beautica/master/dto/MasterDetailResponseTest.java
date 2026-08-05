@@ -166,4 +166,61 @@ class MasterDetailResponseTest {
                 .as("MasterDetailResponse.from reads professionalTitle off the linked User")
                 .isEqualTo("Візажист");
     }
+
+    // ── Zero-review rating normalisation (Phase 240 audit, Finding 3) ─────────────────
+    //
+    // masters.avg_rating is NOT NULL DEFAULT 0.00 (V4), so an unreviewed master persists a
+    // literal 0.00. GET /masters/{id} used to serve that raw while GET /bookings/{id} served
+    // null for the same master — the app rendered «—» on the booking and «0.0» on the profile.
+
+    @Test
+    @DisplayName("from nulls avgRating when the master has no reviews")
+    void should_returnNullAvgRating_when_masterHasNoReviews() {
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getReviewCount()).thenReturn(0);
+        // A persisted value that must STILL be suppressed — proves the branch keys off the
+        // count, not off a null/zero check on the rating itself.
+        when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
+
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+
+        assertThat(response.avgRating())
+                .as("an unreviewed master must not be served a fabricated 0.00 rating")
+                .isNull();
+        assertThat(response.reviewCount())
+                .as("zero reviews is a true fact and stays 0, unlike the average")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("from surfaces a genuine 1.00 average from a single review")
+    void should_surfaceGenuineAvgRating_when_masterHasExactlyOneReview() {
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getReviewCount()).thenReturn(1);
+        when(master.getAvgRating()).thenReturn(new BigDecimal("1.00"));
+
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+
+        assertThat(response.avgRating())
+                .as("suppression triggers on count == 0 only — a real low rating must survive")
+                .isEqualByComparingTo("1.00");
+    }
+
+    @Test
+    @DisplayName("fromPublic passes the already-normalised null through unchanged")
+    void should_keepNullAvgRating_when_maskingForPublicCaller() {
+        MasterDetailResponse full = new MasterDetailResponse(
+                UUID.randomUUID(), "Oksana", "Kovalenko", "+380671234567", "Київ",
+                "вул. Хрещатик", "1A", "green door", "Nail artist", "@oksana.nails",
+                PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
+                null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null);
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.avgRating())
+                .as("the public masking copy must not resurrect a 0.00 from a null average")
+                .isNull();
+    }
 }

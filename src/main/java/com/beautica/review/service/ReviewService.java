@@ -123,7 +123,16 @@ public class ReviewService {
         // from master.getSalon() — booking.salon is the source of truth for "which salon
         // owned this booking at completion time"). null for an INDEPENDENT_MASTER booking.
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
-        eventPublisher.publishEvent(new ReviewCreatedEvent(booking.getMaster().getId(), salonId));
+        // masterUserId (Phase 240 re-audit, Finding 1) addresses the userId-keyed
+        // "master-detail-by-user" cache behind GET /masters/me, which masterId cannot reach.
+        // Costs nothing: findByIdWithFullGraph above JOIN FETCHes `m.user`, so getMaster() and
+        // getUser() are both fully hydrated entities in this persistence context — not proxies —
+        // and getId() reads an in-memory field. No lazy initialisation, no extra statement on the
+        // review-create path.
+        eventPublisher.publishEvent(new ReviewCreatedEvent(
+                booking.getMaster().getId(),
+                booking.getMaster().getUser().getId(),
+                salonId));
         return ReviewResponse.from(saved);
     }
 

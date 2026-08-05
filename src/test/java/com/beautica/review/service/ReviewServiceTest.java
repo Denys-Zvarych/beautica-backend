@@ -85,6 +85,10 @@ class ReviewServiceTest {
     private static final UUID CLIENT_ID  = UUID.randomUUID();
     private static final UUID BOOKING_ID = UUID.randomUUID();
     private static final UUID MASTER_ID  = UUID.randomUUID();
+    // users.id of the reviewed master — key of the userId-keyed "master-detail-by-user" cache
+    // (Phase 240 re-audit, Finding 1). Deliberately distinct from MASTER_ID: the two caches live
+    // in separate key spaces, so a test that reused one UUID for both could not catch a swap.
+    private static final UUID MASTER_USER_ID = UUID.randomUUID();
     private static final UUID REVIEW_ID  = UUID.randomUUID();
     // Fixed "now" for the review-eligibility (BookingClosureRule#isReviewEligible) checks —
     // lenient because most tests below never reach a branch that reads the clock at all (e.g.
@@ -122,6 +126,11 @@ class ReviewServiceTest {
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(MASTER_ID);
+        // findByIdWithFullGraph JOIN FETCHes m.user, so createReview reads the master's userId
+        // off a hydrated entity to populate ReviewCreatedEvent.masterUserId.
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(MASTER_USER_ID);
+        when(master.getUser()).thenReturn(masterUser);
 
         Booking booking = mock(Booking.class);
         when(booking.getId()).thenReturn(BOOKING_ID);
@@ -160,7 +169,7 @@ class ReviewServiceTest {
         assertThat(response.comment()).isEqualTo("Great service");
         assertThat(response.clientDisplayName()).isEqualTo("Anna K.");
         verify(reviewRepository).saveAndFlush(any(Review.class));
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, null));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null));
     }
 
     @Test
@@ -173,6 +182,11 @@ class ReviewServiceTest {
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(MASTER_ID);
+        // findByIdWithFullGraph JOIN FETCHes m.user, so createReview reads the master's userId
+        // off a hydrated entity to populate ReviewCreatedEvent.masterUserId.
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(MASTER_USER_ID);
+        when(master.getUser()).thenReturn(masterUser);
 
         Salon salon = mock(Salon.class);
         when(salon.getId()).thenReturn(salonId);
@@ -206,7 +220,7 @@ class ReviewServiceTest {
 
         reviewService.createReview(CLIENT_ID, request);
 
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, salonId));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, salonId));
     }
 
     @ParameterizedTest
@@ -274,6 +288,11 @@ class ReviewServiceTest {
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(MASTER_ID);
+        // findByIdWithFullGraph JOIN FETCHes m.user, so createReview reads the master's userId
+        // off a hydrated entity to populate ReviewCreatedEvent.masterUserId.
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(MASTER_USER_ID);
+        when(master.getUser()).thenReturn(masterUser);
 
         Booking booking = mock(Booking.class);
         when(booking.getId()).thenReturn(BOOKING_ID);
@@ -308,7 +327,7 @@ class ReviewServiceTest {
         assertThat(response).isNotNull();
         assertThat(response.id()).isEqualTo(REVIEW_ID);
         verify(reviewRepository).saveAndFlush(any(Review.class));
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, null));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null));
     }
 
     @Test
