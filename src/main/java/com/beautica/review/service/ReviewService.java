@@ -91,17 +91,6 @@ public class ReviewService {
             throw new ForbiddenException("Not authorized to review this booking");
         }
 
-        // BE-6 per-item review guard (checked AFTER ownership so a foreign booking still 403s — no
-        // existence oracle). A booking that is one item of a multi-service visit carries a non-null
-        // appointment FK; a review must be left ONCE for the WHOLE visit, never per child, or the
-        // visit would collect N reviews. Mirrors BookingService#assertNotAppointmentChild (409, same
-        // envelope). The FK id is on the booking row itself, so getAppointment() needs no query.
-        if (booking.getAppointment() != null) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "This booking is part of a multi-service visit; leave one review for the whole "
-                            + "visit via POST /appointments/{id}/review");
-        }
-
         // Locked product decision: a booking that entered the client's "Past" tab BY ELAPSED TIME
         // is reviewable even when the provider never marked it COMPLETED — mirrors
         // BookingService#canReview exactly (same BookingClosureRule#isReviewEligible call), so a
