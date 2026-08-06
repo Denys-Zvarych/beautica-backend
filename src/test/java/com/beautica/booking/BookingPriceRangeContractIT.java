@@ -38,6 +38,7 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
@@ -1307,6 +1308,27 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
                 new BigDecimal("300.00"), new BigDecimal("500.00"), null);
         stampSalonLocality(salon.salonId());
+
+        // Phase-242 QA audit, finding 3 — the salon and the master's PERSONAL users row carry
+        // DISTINCT, non-null values. Once masters.salon_id is NULL, a mapper that resolved the
+        // block off master.getSalon() does not merely lose the salon name: it falls straight
+        // through the salon-vs-independent ternary to THESE values and serves a past salon
+        // client the now-solo master's home address and door code. That is the sharpest form of
+        // this leak, and an isNotNull() on salonName alone cannot see it.
+        String salonName = "Booked Salon (gone-indep) " + System.nanoTime();
+        String salonStreet = "вул. Заброньована-" + System.nanoTime();
+        String salonNote = "A: 3-й поверх, код 1234";
+        jdbcTemplate.update(
+                "UPDATE salons SET name = ?, street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = ?",
+                salonName, salonStreet, "11-A", salonNote, salon.salonId());
+        String masterPersonalStreet = "вул-Домашня-СЕКРЕТ-" + System.nanoTime();
+        String masterPersonalNote = "домашній код 8765 — не показувати";
+        jdbcTemplate.update(
+                "UPDATE users SET street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                masterPersonalStreet, "88-ДІМ", masterPersonalNote, salon.masterId());
+
         UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
                 new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
 
@@ -1332,8 +1354,20 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         assertThat(detail.salonName())
                 .as("correctness — the visit WAS at a salon, so its name must still be served; a "
                         + "master going solo does not retroactively turn a past salon visit into a "
-                        + "home-studio one")
-                .isNotNull();
+                        + "home-studio one. NULL here means the block was resolved off "
+                        + "master.getSalon(), the pre-242 source.")
+                .isEqualTo(salonName);
+        assertThat(detail.street())
+                .as("the booked salon's street, never the now-solo master's personal one")
+                .isEqualTo(salonStreet)
+                .isNotEqualTo(masterPersonalStreet);
+        assertThat(detail.locationNote())
+                .as("THE security assertion on this shape — a master going independent must not "
+                        + "hand every past client of theirs the door code to their HOME. The "
+                        + "negative is explicit so it cannot pass on two fixtures that happen to "
+                        + "agree.")
+                .isEqualTo(salonNote)
+                .isNotEqualTo(masterPersonalNote);
         assertThat(statements)
                 .as("this is the ONLY shape that can tell findByIdWithFullGraph's LEFT JOIN FETCH "
                         + "b.salon apart from the m.salon it replaced. In both the aligned and the "
@@ -1344,6 +1378,106 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                         + "lazy-load the booked salon — %s instead of %s.",
                         OWNER_DETAIL_STATEMENTS_ALIGNED + 1, OWNER_DETAIL_STATEMENTS_ALIGNED)
                 .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED);
+    }
+
+    /**
+     * Phase-242 QA audit, finding 2 — the {@code enforceCanViewBooking} reorder buys the owning
+     * CLIENT <b>nothing on this surface</b>, and the audit-fix batch's javadoc must not be read as
+     * though it did.
+     *
+     * <p>That reorder hoisted the client probe above {@code isAuthorizedToManageBooking} so the
+     * owning client no longer pays its {@code master.getSalon().getOwner()} proxy-initialising
+     * walk. On {@code GET /appointments/&#123;id&#125;} that is a genuine saving —
+     * {@code AppointmentReadIT.VISIT_DETAIL_STATEMENTS} dropped 5 &rarr; 4 because of it.
+     * {@code GET /bookings/&#123;id&#125;} does <b>not</b> get it: {@code BookingService#getBooking}
+     * re-enters the identical walk a few statements later through
+     * {@code computeProviderCanReviewClient} &rarr;
+     * {@code AuthorizationService#hasProviderAuthorityOverBooking}, unconditionally, for every
+     * viewer class including a CLIENT (that predicate reads {@code master.getSalon()} then
+     * {@code salon.getOwner()} before it can conclude "not a provider"). So a client reading a
+     * booking whose salon diverges from its master's live salon still pays exactly one standalone
+     * {@code SELECT ... FROM salons}.
+     *
+     * <p>Asserted as a DIFFERENCE against the aligned shape rather than as a second absolute
+     * constant, so it needs no separately derived number and cannot drift out of step with
+     * {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}. Both directions are meaningful:
+     * <ul>
+     *   <li>more than one extra statement is a new regression;</li>
+     *   <li>EQUAL means the walk was finally taken off the client path — genuinely good news, but
+     *       it also invalidates {@link #OWNER_DETAIL_STATEMENTS_ROTATED}. Re-derive both rather
+     *       than deleting this gate, or the improvement lands with no gate watching it.</li>
+     * </ul>
+     *
+     * <p>The two reads are warmed first: {@code DiscoveryLocationResolver}'s label lookups are
+     * cached, so whichever read ran first would otherwise absorb them and the difference under
+     * test would be a caching artefact rather than the salon walk.
+     */
+    @Test
+    @DisplayName("GET /bookings/{id} read by the OWNING CLIENT still costs one extra statement when "
+            + "the booking's salon diverges from the master's live one — the client fast path in "
+            + "enforceCanViewBooking does not save it, computeProviderCanReviewClient re-enters "
+            + "the same getSalon().getOwner() walk")
+    void should_stillPayTheLiveSalonWalk_when_theOwningClientReadsADivergentSalonBooking() {
+        var salon = fixtures.createSalon("bprc-client-rot-" + System.nanoTime() + "@beautica.test");
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID clientId = fixtures.createUser(
+                "bprc-client-rot-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+
+        UUID bookedElsewhereSalonId = insertBareSalonUnderOwner(
+                ownerId, "bprc-client-rot-booked-" + System.nanoTime());
+        assertThat(bookedElsewhereSalonId)
+                .as("premise — the second salon must be a DIFFERENT row from the master's live "
+                        + "one, or both reads measure the aligned shape and the comparison below "
+                        + "is between a value and itself")
+                .isNotEqualTo(salon.salonId());
+
+        // Same client, same master, same service, same locality — the ONLY difference between the
+        // two rows is which salon bookings.salon_id points at.
+        UUID alignedBookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+        UUID rotatedBookingId = insertBooking(clientId, salon.masterId(), serviceId,
+                ANCHOR.plusDays(1), new BigDecimal("300.00"), new BigDecimal("500.00"),
+                "CONFIRMED", bookedElsewhereSalonId);
+
+        SecurityContextHolder.getContext().setAuthentication(authFor(Role.CLIENT));
+        try {
+            // Warm the discovery-label cache for both rows before measuring anything.
+            bookingService.getBooking(clientId, alignedBookingId);
+            bookingService.getBooking(clientId, rotatedBookingId);
+
+            Statistics statistics = statistics();
+            statistics.clear();
+            var aligned = bookingService.getBooking(clientId, alignedBookingId);
+            long alignedStatements = statistics.getPrepareStatementCount();
+
+            statistics.clear();
+            var rotated = bookingService.getBooking(clientId, rotatedBookingId);
+            long rotatedStatements = statistics.getPrepareStatementCount();
+
+            assertThat(aligned.salonId())
+                    .as("premise — the aligned row's snapshot IS the master's live salon, so "
+                            + "master.getSalon() resolves off the already-materialised entity")
+                    .isEqualTo(salon.salonId());
+            assertThat(rotated.salonId())
+                    .as("premise — the rotated row's snapshot is the OTHER salon, so "
+                            + "master.getSalon() is a genuine uninitialised proxy on that read")
+                    .isEqualTo(bookedElsewhereSalonId)
+                    .isNotEqualTo(salon.salonId());
+            assertThat(rotatedStatements)
+                    .as("aligned=%s, rotated=%s. Exactly one more, and that one is the master's "
+                            + "LIVE salons row opened by hasProviderAuthorityOverBooking's "
+                            + "getSalon().getOwner() property read inside "
+                            + "computeProviderCanReviewClient — NOT by enforceCanViewBooking, "
+                            + "which the audit-fix batch already short-circuits for this viewer.",
+                            alignedStatements, rotatedStatements)
+                    .isEqualTo(alignedStatements + 1);
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
     }
 
     @Test

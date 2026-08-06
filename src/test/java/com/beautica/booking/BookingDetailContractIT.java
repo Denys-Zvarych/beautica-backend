@@ -335,11 +335,20 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         UUID bookingId = insertConfirmedBooking(fx);
 
         Locality localityA = resolveLocality(0);
-        Locality localityB = resolveLocality(1);
+        // Phase-242 QA audit, finding 4: selected so BOTH labels differ, not just the city one.
+        // District names repeat across Ukrainian cities, so an offset-based pick could hand back
+        // two localities whose districtLabel happens to coincide and quietly defang the
+        // districtLabel assertions below.
+        Locality localityB = resolveLocalityWithBothLabelsDifferentFrom(localityA);
         assertThat(localityB.cityLabel())
                 .as("premise — the two seeded localities must differ, or the label assertions "
                         + "below compare a value against itself and prove nothing")
                 .isNotEqualTo(localityA.cityLabel());
+        assertThat(localityB.districtLabel())
+                .as("premise — same, for the district half. discoveryDistrictId is a SEPARATE "
+                        + "line from discoveryCityId on every one of the three paths, so it needs "
+                        + "its own non-degenerate pair")
+                .isNotEqualTo(localityA.districtLabel());
 
         // Salon A — where the visit was booked. bookings.salon_id already points here.
         String salonAStreet = "вул. Заброньована-A";
@@ -414,6 +423,14 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                             + "(enrichSingle / the projection's CASE WHEN / discoveryCityId), so "
                             + "all three have to be re-pointed together.", where)
                     .isEqualTo(localityA.cityLabel()).isNotEqualTo(localityB.cityLabel());
+            assertThat(row.get("districtLabel").asText())
+                    .as("%s — districtLabel rides discoveryDistrictId, which is a SEPARATE "
+                            + "re-pointed line from discoveryCityId in every one of the three "
+                            + "resolvers. Reverting only that line leaves cityLabel correct and "
+                            + "routes the client to salon A's street in salon B's district — the "
+                            + "cityLabel assertion above is blind to it.", where)
+                    .isEqualTo(localityA.districtLabel())
+                    .isNotEqualTo(localityB.districtLabel());
             // THE security assertion, with the negative stated explicitly: a positive-only check
             // would still pass if both salons happened to carry the same note.
             assertThat(row.get("locationNote").asText())
@@ -604,6 +621,24 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
                         rs.getString(3), rs.getString(4)),
                 index);
+    }
+
+    /**
+     * A locality whose city label AND district label both differ from {@code other}. Deterministic
+     * by construction rather than by hoping two offsets land on distinct names — Ukrainian district
+     * names («Центральний», «Соборний», …) recur across cities, so an offset-based second pick can
+     * silently produce a pair with an identical {@code districtLabel} and make every
+     * {@code isNotEqualTo(localityB.districtLabel())} below pass vacuously.
+     */
+    private Locality resolveLocalityWithBothLabelsDifferentFrom(Locality other) {
+        return jdbcTemplate.queryForObject(
+                "SELECT d.id, c.id, c.name_uk, d.name_uk "
+                        + "FROM city_districts d JOIN cities c ON c.id = d.city_id "
+                        + "WHERE c.name_uk <> ? AND d.name_uk <> ? "
+                        + "ORDER BY c.id, d.id LIMIT 1",
+                (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
+                        rs.getString(3), rs.getString(4)),
+                other.cityLabel(), other.districtLabel());
     }
 
     private record Locality(UUID districtId, UUID cityId, String cityLabel, String districtLabel) {

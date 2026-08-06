@@ -256,12 +256,24 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * identifier-only read, which was free. Leaving the fetch on {@code m.salon} would therefore
      * cost one extra SELECT per distinct booked salon per page, exactly the N+1 this query exists
      * to prevent. Consequence to keep in mind: {@code master.getSalon()} is no longer fetch-joined
-     * here. Every remaining dereference of it on this path is an identifier read
-     * ({@code AuthorizationService}'s {@code getSalon().getId()} /
-     * {@code getSalon().getOwner().getId()}), which Hibernate serves off the uninitialised proxy —
-     * and in the ordinary (un-rotated) case the FK values coincide, so the proxy resolves to the
-     * already-materialised {@code b.salon} entity in the persistence context and costs nothing at
-     * all.
+     * here.
+     *
+     * <p><b>Why that consequence is free on this path — and what would make it not free.</b> Be
+     * precise about which dereferences are actually cheap, because the two look alike:
+     * {@code getSalon().getId()} is an identifier read Hibernate serves off an UNINITIALISED
+     * proxy without a statement, but {@code getSalon().getOwner()} — {@code AuthorizationService}'s
+     * ownership walk — is a PROPERTY read that INITIALISES the {@code Salon} proxy (only the
+     * trailing {@code .getId()} on the resulting {@code User} proxy is free). The reason it still
+     * costs nothing here is NOT proxy-avoidance, it is FK coincidence: in the ordinary (un-rotated)
+     * shape {@code bookings.salon_id == masters.salon_id}, so {@code master.getSalon()} resolves to
+     * the {@code Salon} this query already materialised from {@code b.salon} in the persistence
+     * context and there is no proxy left to initialise. When the two FKs DIVERGE — the master has
+     * rotated salons since the booking, or gone independent — that walk issues a real
+     * {@code SELECT ... FROM salons}, measured at 3 &rarr; 4 statements on the detail read
+     * ({@code BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ROTATED}). The conclusion (free
+     * on the aligned shape, which is what this list path serves) is unchanged; the stated reason
+     * is. Since the phase-242 audit's finding 1, {@code AuthorizationService#enforceCanViewBooking}
+     * no longer runs that walk at all for the owning CLIENT.
      *
      * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — as with
      * {@link #findByIdWithFullGraph}.
@@ -275,18 +287,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * included — hydrated per distinct salon on every provider booking-list and master-calendar
      * page. {@link #findByIdWithFullGraph} does not fetch {@code s.owner} either, for the same
      * reason: the {@code AuthorizationService} ownership checks its callers feed read
-     * {@code master.getSalon().getOwner().getId()}, and an identifier is served off the
-     * uninitialised proxy without a statement — so the fetch bought nothing there and was removed
-     * alongside this one.
+     * {@code master.getSalon().getOwner().getId()}, whose FINAL hop — the {@code User} identifier —
+     * is served off the uninitialised {@code User} proxy without a statement, so the fetch bought
+     * nothing there and was removed alongside this one. (The EARLIER hop, {@code getOwner()}
+     * itself, does initialise the {@code Salon}; fetching {@code s.owner} would not have avoided
+     * that, it would only have added the {@code users} row on top.)
      *
      * <p>The "no caller dereferences it" half of that claim is now enforced, not merely asserted:
      * {@code BookingPriceRangeContractIT#should_notScaleStatementCount_when_salonMasterPageHasManyBookings}
      * pins the statement count of a provider page whose rows carry a REAL salon — the only fixture
      * shape in which a {@code Salon.owner} proxy exists at all — so a regression that starts walking
      * it shows up as 6 -&gt; 7 there. Note the gate detects a dereference of a non-identifier
-     * property; {@code getOwner().getId()} is served off the uninitialised proxy and costs nothing,
-     * which is why {@code AuthorizationService}'s id-only checks would not have needed this fetch
-     * even if they did run here.
+     * property on the {@code Salon}; the {@code User} identifier at the end of
+     * {@code getOwner().getId()} is served off the uninitialised {@code User} proxy and costs
+     * nothing, which is why {@code AuthorizationService}'s checks would not have needed
+     * {@code s.owner} fetched even if they did run here.
      */
     @Query("""
             SELECT b FROM Booking b

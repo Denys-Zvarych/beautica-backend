@@ -194,6 +194,18 @@ import java.util.UUID;
  * projection's {@code LEFT JOIN b.salon s}), so {@code salonId != null} and
  * {@code salonName != null} are now the same predicate.
  *
+ * <p><b>Scope of that fix — it closed the SALON branch of the ternary only (phase-242 audit,
+ * finding 5).</b> Do not read the paragraph above as "the divergence is gone" outright; the same
+ * defect class still exists on the OTHER half. When {@code booking.getSalon()} is {@code null} —
+ * an independent-master booking — both mapper paths fall through to the master's LIVE {@code users}
+ * row ({@link #from}'s {@code masterUser.getStreet()} / {@code getBuildingNo()} /
+ * {@code getLocationNote()}, and the projection's {@code ELSE mu.X}). A solo master who moves house
+ * therefore serves their NEW street and NEW door code on every OLD booking, exactly as a rotating
+ * salon master used to. There is no per-booking address snapshot for that case to read instead:
+ * {@code bookings} carries {@code salon_id} but no denormalised address columns, so closing it
+ * would need a schema change and a product decision about what an old booking should show. It is
+ * pre-existing, was NOT in scope of phase 242, and is recorded here rather than silently implied to
+ * be handled. If you are auditing this DTO for the rotation leak, this is the residual.
  * <p><b>What did NOT change, and must not:</b> the salon-vs-independent precedence is still a
  * strict {@code salon != null ? salon.getX() : masterUser.getX()} ternary (and its
  * {@code CASE WHEN s.id IS NOT NULL} twin in the projection) — never {@code COALESCE(s.X, mu.X)}.

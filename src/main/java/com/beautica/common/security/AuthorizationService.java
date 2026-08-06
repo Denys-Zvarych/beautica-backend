@@ -398,20 +398,37 @@ public class AuthorizationService {
      * Entity-based wrapper of {@link #hasProviderAuthorityOverBooking} for the {@code enforce*}
      * guards.
      *
-     * <p><b>Perf finding 5 (track 24.7 audit):</b> every caller of this overload loads the
-     * booking via {@code BookingRepository#findByIdWithFullGraph}, which {@code LEFT JOIN FETCH}es
+     * <p><b>Perf finding 5 (track 24.7 audit), CORRECTED by the phase-242 audit.</b> The original
+     * text claimed every caller loads the booking via
+     * {@code BookingRepository#findByIdWithFullGraph}, "which {@code LEFT JOIN FETCH}es
      * {@code m.salon s} — so a {@code SALON_OWNER} actor can be authorized purely in memory, with
-     * zero extra round trip. Only the {@code SALON_ADMIN} case falls back to
-     * {@link #hasManagementAccess}, a real DB query, because the admin's assigned-salon id
-     * genuinely is not present in the loaded graph.
+     * zero extra round trip". <b>That is no longer true.</b> Phase 242 re-pointed that fetch join
+     * to {@code b.salon} (the booking's own salon snapshot, which is what the detail response
+     * renders), so {@code m.salon} — the association {@code master.getSalon()} below resolves — is
+     * NOT fetched by any caller's graph.
+     *
+     * <p>What actually holds now: the in-memory shortcut survives only while
+     * {@code bookings.salon_id == masters.salon_id}, the production-normal shape. There the FKs
+     * coincide, so {@code master.getSalon()} resolves to the {@code Salon} the graph already
+     * materialised from {@code b.salon} in the persistence context and costs nothing. The moment
+     * they diverge — the master has rotated to another salon since the booking, or has gone
+     * independent — {@code master.getSalon()} is an uninitialised proxy and the {@code getOwner()}
+     * PROPERTY read below initialises it with a standalone {@code SELECT ... FROM salons}. That is
+     * a real load on an authorization path, measured at 3 &rarr; 4 statements
+     * ({@code BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ROTATED}). Do NOT read the
+     * paragraph below as licence to "optimise away" a load that is genuinely being paid.
+     * The {@code SALON_ADMIN} case falls back to {@link #hasManagementAccess}, a further DB query,
+     * because the admin's assigned-salon id genuinely is not present in any loaded graph.
      *
      * <p><b>{@code s.owner} is deliberately NOT fetched</b>, and this check does not need it to be.
-     * The owner comparison below reads {@code getOwner().getId()} only; Hibernate serves an
-     * identifier off an uninitialised proxy without issuing a statement, and {@code Salon.owner} is
-     * a {@code nullable = false} {@code @ManyToOne(LAZY)} so the proxy always exists. Fetching the
-     * owner would hydrate a full {@code User} row ({@code password_hash} included) to answer a
-     * question already answered by the FK sitting in the {@code salons} row. Do not "restore" the
-     * fetch join for this method's benefit — see {@code BookingRepository#findByIdWithFullGraph}.
+     * Note precisely what is free and what is not: {@code getSalon().getOwner()} is a property read
+     * that INITIALISES the {@code Salon} proxy; only the trailing {@code .getId()} on the resulting
+     * {@code User} proxy is the identifier read Hibernate serves without a statement. Since
+     * {@code Salon.owner} is a {@code nullable = false} {@code @ManyToOne(LAZY)} that proxy always
+     * exists. So fetching {@code s.owner} would hydrate a full {@code User} row
+     * ({@code password_hash} included) to answer a question already answered by the FK sitting in
+     * the {@code salons} row that has to be materialised anyway. Do not "restore" the fetch join
+     * for this method's benefit — see {@code BookingRepository#findByIdWithFullGraph}.
      *
      * <p>Evaluation is branch-local: the in-memory owner comparison runs first and short-circuits
      * on a match; {@link #hasManagementAccess} is invoked only when it does not, so this never
@@ -668,29 +685,71 @@ public class AuthorizationService {
         }
     }
 
+    /**
+     * View-authorization guard for {@code GET /bookings/{id}} and {@code GET /appointments/{id}}.
+     * Admits the union of three predicates: the booking's own CLIENT, the assigned
+     * {@code SALON_MASTER}, and {@link #isAuthorizedToManageBooking} (the booking's
+     * {@code INDEPENDENT_MASTER} or the owner of its master's salon).
+     *
+     * <p><b>Phase 242 audit, finding 1 (MEDIUM) — the client fast path runs FIRST, and that
+     * ordering is load-bearing for cost, not for the decision.</b>
+     * {@link #isAuthorizedToManageBooking} walks {@code master.getSalon().getOwner()} on every
+     * non-{@code INDEPENDENT_MASTER} booking. {@code getOwner()} is a PROPERTY read, so it
+     * INITIALISES the {@code Salon} proxy (only the subsequent {@code getId()} on the resulting
+     * {@code User} proxy is the free identifier read). Phase 242 re-pointed
+     * {@code BookingRepository#findByIdWithFullGraph} /
+     * {@code #findByAppointmentIdWithGraph} to fetch {@code b.salon} instead of {@code m.salon},
+     * so on a booking whose master has since rotated salons that walk now issues a standalone
+     * {@code SELECT ... FROM salons WHERE id = ?}. Calling it unconditionally therefore charged the
+     * OWNING CLIENT — the highest-volume viewer class of both endpoints — for hydrating the
+     * master's LIVE salon, a row a client response never renders. The phase-242 commit message
+     * described this as an owner-only cost; that was wrong.
+     *
+     * <p><b>Why reordering cannot change any authorization decision.</b> The admitted set is a
+     * plain OR of three side-effect-free predicates over an already-loaded entity, so it is
+     * order-independent by construction — no role gains or loses access, whatever the DB says
+     * about it. The check that survives the reorder is the ROLE gate: a viewer who happens to sit
+     * in {@code bookings.client_id} but does not carry {@code ROLE_CLIENT} is still not admitted
+     * by this branch, exactly as before, and must earn access through
+     * {@link #isAuthorizedToManageBooking} below.
+     *
+     * <p><b>Why the {@code SALON_MASTER} branch deliberately stays BELOW the manage check.</b>
+     * Its identity probe ({@code master.getUser().getId() == actorUserId}) is the same probe
+     * {@link #isAuthorizedToManageBooking}'s {@code INDEPENDENT_MASTER} arm makes, so hoisting it
+     * would force {@link #roleFromCurrentAuthentication} to run for an actor that today returns
+     * from the manage arm without ever touching the {@code SecurityContext} — turning the direct
+     * (non-HTTP) service calls in {@code BookingPriceRangeContractIT} into a
+     * {@code ForbiddenException("Not authenticated")}. A {@code SALON_MASTER} viewer is orders of
+     * magnitude rarer than a client, and their booking is salon-bound anyway, so the hoist would
+     * buy little and widen the contract. The client probe carries no such overlap: it reads
+     * {@code bookings.client_id}, which no manage predicate consults.
+     */
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
+        // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) — a CLIENT can
+        // never own one, so null-guard rather than dereference getId() on null (regression: NPE'd
+        // into a 500 instead of the correct 403 here). getId() on an unfetched b.client proxy is
+        // an identifier read and issues no statement, so this probe is free even where the graph
+        // does not fetch the client (findByAppointmentIdWithGraph).
+        var client = booking.getClient();
+        if (client != null
+                && client.getId().equals(actorUserId)
+                // Finding 3: role is derived from the SecurityContext instead of a userRepository
+                // round-trip. The booking entity is already loaded by the caller, so all
+                // ownership fields are available in memory — no additional DB call is needed.
+                && roleFromCurrentAuthentication() == Role.CLIENT) {
+            return;
+        }
         if (isAuthorizedToManageBooking(actorUserId, booking)) {
             return;
         }
-        // Finding 3: role is derived from the SecurityContext instead of a userRepository
-        // round-trip. The booking entity is already loaded by the caller, so all
-        // ownership fields are available in memory — no additional DB call is needed.
-        Role actorRole = roleFromCurrentAuthentication();
-        boolean allowed = false;
-        if (actorRole == Role.CLIENT) {
-            // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) — a
-            // CLIENT can never own one, so null-guard rather than dereference getId() on null
-            // (regression: NPE'd into a 500 instead of the correct 403 here).
-            allowed = booking.getClient() != null && booking.getClient().getId().equals(actorUserId);
-        } else if (actorRole == Role.SALON_MASTER) {
-            // Fix M1: SALON_MASTER may only view their own bookings, not all bookings
-            // at the salon — the previous salon-scoped check leaked other masters'
-            // client names and prices to every master at the same salon.
-            allowed = booking.getMaster().getUser().getId().equals(actorUserId);
+        // Fix M1: SALON_MASTER may only view their own bookings, not all bookings at the salon —
+        // the previous salon-scoped check leaked other masters' client names and prices to every
+        // master at the same salon.
+        if (roleFromCurrentAuthentication() == Role.SALON_MASTER
+                && booking.getMaster().getUser().getId().equals(actorUserId)) {
+            return;
         }
-        if (!allowed) {
-            throw new ForbiddenException("Access denied");
-        }
+        throw new ForbiddenException("Access denied");
     }
 
     /**
