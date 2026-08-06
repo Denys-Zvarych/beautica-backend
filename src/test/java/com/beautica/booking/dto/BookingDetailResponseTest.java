@@ -551,6 +551,15 @@ class BookingDetailResponseTest {
         // The salon the master works at TODAY (masters.salon_id) — a different row.
         var currentSalon = mock(Salon.class);
         when(currentSalon.getName()).thenReturn("Glamour Studio");
+        // QA (B2 audit): getId() is stubbed even though the CORRECT implementation never calls it.
+        // Without it a `master.getSalon().getId()` regression fails here with `null` — the same
+        // failure a mapper that dropped the field entirely would produce — and the
+        // `.isNotEqualTo(currentSalonId)` assertion below is dead, comparing against a UUID no
+        // code path can return. Stubbing makes the wrong-source mutation fail with the wrong
+        // SALON's id, which is both the diagnostic message a reader needs and the only thing that
+        // gives that assertion power. Safe to stub unused: this class uses plain mock() with no
+        // MockitoExtension, so strict stubs are not in force.
+        when(currentSalon.getId()).thenReturn(currentSalonId);
         when(master.getSalon()).thenReturn(currentSalon);
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
