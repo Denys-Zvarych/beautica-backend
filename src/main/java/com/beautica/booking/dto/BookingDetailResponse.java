@@ -116,9 +116,10 @@ import java.util.UUID;
  * <p><b>{@code locationNote} (client mobile phase 14.3 enrichment)</b> is the provider's
  * free-text arrival hint ("3-й поверх, код 1234"). It follows the EXACT SAME salon-vs-
  * independent resolution rule as {@code street}/{@code buildingNo} above — never a second,
- * parallel rule: a salon-employed master surfaces the salon's own {@code locationNote}, an
- * independent master surfaces their own user row's {@code locationNote}. Nullable — most
- * providers never write one.
+ * parallel rule: a booking made AT A SALON surfaces that salon's own {@code locationNote}, a
+ * booking made with an independent master surfaces the master's own user row's
+ * {@code locationNote}. Since phase 242 the salon in question is the BOOKING's snapshot, not the
+ * master's live affiliation. Nullable — most providers never write one.
  *
  * <p><b>Track 25.x — note visibility is MUTUAL, by locked product decision.</b>
  * {@code providerComment} (written by the provider on {@code /decline} or {@code /not-complete})
@@ -181,13 +182,29 @@ import java.util.UUID;
  * whose {@code avg_rating}/{@code review_count} actually moved. A {@code master.salon}-derived id
  * would point at the wrong salon for any booking made before a salon rotation.
  *
- * <p><b>Consequence, deliberate and not to be "fixed" opportunistically:</b> {@code salonId} and
- * {@code salonName} have DIFFERENT sources. {@code salonName} — and with it the whole
- * {@code street}/{@code buildingNo}/{@code locationNote} precedence block — resolves off
- * {@code master.getSalon()} on both mapper paths ({@link #from} below, and the projection's
- * {@code LEFT JOIN m.salon s}). The two can disagree after a master moves salons. That block is a
- * documented PII contract with its own tests; re-sourcing it onto {@code booking.salon} is a separate
- * decision with its own blast radius, not a side effect of this field.
+ * <p><b>Phase 242 — {@code salonId} and the whole address block now share ONE source, and cannot
+ * disagree.</b> B2 originally left {@code salonName} plus the
+ * {@code street}/{@code buildingNo}/{@code locationNote}/{@code cityLabel}/{@code districtLabel}
+ * block resolving off {@code master.getSalon()} — the master's LIVE affiliation — while
+ * {@code salonId} came from the booking. That divergence was a PII leak, not a nuance: after a
+ * master rotates salons, a client opening an OLD booking was served the NEW salon's
+ * {@code locationNote}, which by its own {@code @Schema} contract holds premises-access
+ * information («3-й поверх, код 1234») for a salon the client has never booked at. Both mapper
+ * paths now resolve the entire block from {@code booking.getSalon()} ({@link #from} below, and the
+ * projection's {@code LEFT JOIN b.salon s}), so {@code salonId != null} and
+ * {@code salonName != null} are now the same predicate.
+ *
+ * <p><b>What did NOT change, and must not:</b> the salon-vs-independent precedence is still a
+ * strict {@code salon != null ? salon.getX() : masterUser.getX()} ternary (and its
+ * {@code CASE WHEN s.id IS NOT NULL} twin in the projection) — never {@code COALESCE(s.X, mu.X)}.
+ * {@code COALESCE} falls through to the master's PERSONAL row whenever the salon's own column is
+ * {@code NULL}, which is the HIGH regression this block already guards against (see
+ * {@code ClientBookingDetailProjection}'s javadoc). Phase 242 changed only WHICH salon the
+ * predicate keys off, never the predicate. A booking made at a salon always carries a non-null
+ * {@code bookings.salon_id} (the column has existed since {@code V18__create_bookings.sql:8}, and
+ * every write site stamps it at creation), so the fallthrough to the master's own row fires
+ * exactly when the visit genuinely was at the master's own address — an independent-master
+ * booking, including one made before the master later joined a salon.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -244,9 +261,11 @@ public record BookingDetailResponse(
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "The provider's free-text arrival hint (e.g. \"3-й поверх, код "
                         + "1234\", \"вхід з двору, дзвонити двічі\"). Resolved by the identical "
-                        + "salon-vs-independent rule as street/buildingNo: a salon booking "
-                        + "surfaces the salon's own note, an independent master surfaces their "
-                        + "own note. Nullable — most providers never set one.")
+                        + "salon-vs-independent rule as street/buildingNo, against the salon THIS "
+                        + "BOOKING was made at (bookings.salon_id): a salon booking surfaces that "
+                        + "salon's own note — never the master's current salon's, should the "
+                        + "master have moved since — and an independent-master booking surfaces "
+                        + "the master's own note. Nullable — most providers never set one.")
         String locationNote,
         String categoryName,
         boolean canReview,
@@ -344,13 +363,13 @@ public record BookingDetailResponse(
                         + "so a client can invalidate its own salon-scoped caches after leaving a "
                         + "review: ReviewService#createReview stamps the review with "
                         + "booking.getSalon() and ReviewEventListener recalculates THAT salon's "
-                        + "avg_rating/review_count, so this is the id whose aggregates moved. NOT "
-                        + "interchangeable with salonName: this comes from the BOOKING's snapshot "
-                        + "while salonName and the street/buildingNo/locationNote block come from "
-                        + "the master's LIVE salon, so the two can disagree after a master rotates "
-                        + "salons. Do NOT use salonId != null to decide whether a booking is 'at a "
-                        + "salon' and do NOT use it to link to a salon profile — salonName != null "
-                        + "remains that predicate.")
+                        + "avg_rating/review_count, so this is the id whose aggregates moved. As "
+                        + "of phase 242 salonName and the street/buildingNo/locationNote/cityLabel/"
+                        + "districtLabel block are resolved from this SAME booking snapshot, so "
+                        + "salonId != null and salonName != null are one predicate and the id "
+                        + "always identifies the premises whose address is displayed alongside it. "
+                        + "(Before 242 the address block came from the master's LIVE salon and the "
+                        + "two could disagree after a rotation — that divergence is gone.)")
         UUID salonId
 ) {
 
@@ -400,7 +419,7 @@ public record BookingDetailResponse(
      * an already-resolved {@code clock.instant()}, never re-derived here and never {@link
      * java.time.OffsetDateTime#now()}.
      *
-     * <p>The caller MUST have hydrated the full graph (client, master.user, master.salon,
+     * <p>The caller MUST have hydrated the full graph (client, master.user, <b>booking.salon</b>,
      * masterService.serviceDefinition) — e.g. via {@code BookingRepository.findByIdWithFullGraph}
      * or {@code findAllByIdsWithGraph}, both of which carry
      * {@code JOIN FETCH b.masterService ms JOIN FETCH ms.serviceDefinition} — so the field reads
@@ -411,9 +430,14 @@ public record BookingDetailResponse(
      * requirement — since V119 it is a frozen column on the booking row itself, not a walk into
      * the current service definition.
      *
-     * <p>The master's discovery address (salon vs own-user) is resolved by the salon-primary
-     * rule: a salon-employed master surfaces the salon's name + street/building; an independent
-     * master surfaces no salon name and the master's own street/building.
+     * <p>The discovery address (salon vs own-user) is resolved by the salon-primary rule against
+     * the BOOKING's own salon snapshot (phase 242): a booking made at a salon surfaces that
+     * salon's name + street/building/note; an independent-master booking surfaces no salon name
+     * and the master's own street/building/note. {@code booking.salon} — not {@code master.salon}
+     * — is therefore the association the fetch graph must carry, and both graph queries above were
+     * re-pointed to {@code LEFT JOIN FETCH b.salon} in the same change: these are real property
+     * reads ({@code getName()}, {@code getStreet()}, {@code getLocationNote()}) that INITIALISE
+     * the proxy, unlike the identifier-only read {@code salonId} used to be.
      */
     public static BookingDetailResponse from(
             Booking booking,
@@ -425,7 +449,11 @@ public record BookingDetailResponse(
     ) {
         Master master = booking.getMaster();
         User masterUser = master.getUser();
-        Salon salon = master.getSalon();
+        // Phase 242 — the BOOKING's own salon snapshot (bookings.salon_id), NEVER
+        // master.getSalon() (the master's LIVE affiliation). See this class's javadoc: after a
+        // salon rotation the master's current salon is a different premises the client never
+        // booked at, and its locationNote is by contract a door code.
+        Salon salon = booking.getSalon();
         User client = booking.getClient();
 
         String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
@@ -488,14 +516,12 @@ public record BookingDetailResponse(
                 // aggregate — do not "fix" this into a count/avg query.
                 masterAvgRatingOrNull(master.getReviewCount(), master.getAvgRating()),
                 master.getReviewCount(),
-                // Phase B2 — `booking.getSalon()`, NOT the `salon` local above (which is
-                // `master.getSalon()`, the master's LIVE affiliation). The review is stamped with
-                // booking.salon by ReviewService#createReview, so that is the id whose aggregates
-                // the client must invalidate. Same cost shape as appointmentId: `salon` is a LAZY
-                // @ManyToOne on a nullable FK, and Hibernate serves an identifier off an
-                // uninitialised proxy, so this reads with no extra SELECT and requires no widening
-                // of findByIdWithFullGraph / findAllByIdsWithGraph.
-                booking.getSalon() != null ? booking.getSalon().getId() : null
+                // Phase B2 introduced this field off `booking.getSalon()` while `salon` above was
+                // still `master.getSalon()`; phase 242 re-pointed the whole address block onto the
+                // same booking snapshot, so this is now simply the id of the `salon` local. Kept as
+                // its own expression rather than folded into `salon` only because the null-guard
+                // reads clearer here; the two can no longer disagree.
+                salon != null ? salon.getId() : null
         );
     }
 }

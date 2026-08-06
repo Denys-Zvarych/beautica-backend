@@ -249,7 +249,22 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Always called with the result of an ID-only page query, so the IN list size
      * equals the configured page size (default 20) — never unbounded.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — as with {@link #findByIdWithFullGraph}.
+     * <p><b>Phase 242 — the fetched salon is {@code b.salon}, NOT {@code m.salon}.</b> The address
+     * block {@code BookingDetailResponse#from} renders is the BOOKING's snapshot (see that class's
+     * javadoc), and it reads real properties ({@code getName()}, {@code getStreet()},
+     * {@code getLocationNote()}) which INITIALISE the proxy — unlike {@code salonId}'s
+     * identifier-only read, which was free. Leaving the fetch on {@code m.salon} would therefore
+     * cost one extra SELECT per distinct booked salon per page, exactly the N+1 this query exists
+     * to prevent. Consequence to keep in mind: {@code master.getSalon()} is no longer fetch-joined
+     * here. Every remaining dereference of it on this path is an identifier read
+     * ({@code AuthorizationService}'s {@code getSalon().getId()} /
+     * {@code getSalon().getOwner().getId()}), which Hibernate serves off the uninitialised proxy —
+     * and in the ordinary (un-rotated) case the FK values coincide, so the proxy resolves to the
+     * already-materialised {@code b.salon} entity in the persistence context and costs nothing at
+     * all.
+     *
+     * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — as with
+     * {@link #findByIdWithFullGraph}.
      * {@code Salon.owner} is {@code LAZY}, so the fetch join was never an EAGER mitigation, and
      * none of this method's three callers dereferences it: {@code BookingDetailResponse#from}
      * (via {@code BookingService#listProviderBookings}) reads only the salon's name / street /
@@ -278,7 +293,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id IN :ids
@@ -301,22 +316,26 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * BookingDetailResponse#masterAvgRatingOrNull}, shared with the entity mapper path so the two
      * cannot drift.
      *
-     * <p>Phase B2's {@code b.salon.id} is an implicit identifier path on a {@code @ManyToOne}: it
-     * reads the {@code salon_id} FK column already present on the {@code bookings} row and adds NO
-     * join — the same shape as {@code b.appointment.id} above. It is deliberately NOT {@code s.id}
-     * off the {@code LEFT JOIN m.salon s} below: that alias is the master's LIVE salon, while the
-     * review (and therefore the salon aggregate a client must invalidate) is stamped with
-     * {@code booking.salon}. The two diverge for any booking made before a salon rotation.
+     * <p><b>Phase 242 — {@code s} is {@code LEFT JOIN b.salon}, the BOOKING's own snapshot, not
+     * {@code LEFT JOIN m.salon}.</b> That is a one-line RE-POINT of an alias this query has always
+     * carried, not an added join: {@code s} is referenced ONLY by {@code s.name} and the five
+     * {@code CASE WHEN} columns below, all of which are display fields describing the premises the
+     * client is travelling to. Keying them off the master's LIVE affiliation served a rotated
+     * master's NEW salon's {@code locationNote} — a door code for premises the client never booked
+     * at — on every OLD booking. {@code b.salon.id} (Phase B2) now resolves through the very same
+     * alias, so {@code salonId} and {@code salonName} can no longer disagree.
      *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
      * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
      * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from} exactly: {@code salon
-     * != null ? salon.getX() : masterUser.getX()}. <b>Do not use {@code COALESCE(s.X, mu.X)}
+     * != null ? salon.getX() : masterUser.getX()}, with {@code salon = booking.getSalon()} on both
+     * sides. <b>Do not use {@code COALESCE(s.X, mu.X)}
      * here</b> — {@code COALESCE} falls through to the master's own value whenever the salon's
-     * column is {@code NULL}, which for a salon-employed master leaks the master's personal
-     * data (e.g. their home door code) onto a salon booking. Riding the same
-     * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
+     * column is {@code NULL}, which for a salon booking leaks the master's personal
+     * data (e.g. their home door code). Phase 242 changed WHICH salon the predicate keys off and
+     * nothing about the predicate itself. Riding the {@code LEFT JOIN b.salon s} /
+     * {@code JOIN m.user mu} aliases — no additional join (still 7).
      *
      * <p><b>Phase 26.7.1 — the sentinel is gone; this is now a pure {@code IN :ids} hydrate.</b>
      * Prior to this phase the {@code WHERE} clause carried {@code b.client.id = :clientId} plus
@@ -410,7 +429,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN b.client
             JOIN b.master m
             JOIN m.user mu
-            LEFT JOIN m.salon s
+            LEFT JOIN b.salon s
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
             LEFT JOIN Review r ON r.booking = b
@@ -429,8 +448,16 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
      * {@link #findAllByIdsWithGraph} for the sibling batch-hydrate query with the same fix.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — the third and last removal of this
-     * dead fetch, after {@link #findAllByIdsWithGraph} and
+     * <p><b>Phase 242 — {@code LEFT JOIN FETCH b.salon}, not {@code m.salon}</b>, for the reason
+     * spelled out on {@link #findAllByIdsWithGraph}: {@code BookingDetailResponse#from} now reads
+     * real properties off the BOOKING's salon snapshot, so that is the association this graph must
+     * materialise. {@code AuthorizationService#isAuthorizedToManageBooking} /
+     * {@code #hasProviderAuthorityOverBooking} still walk {@code master.getSalon()}, but only to
+     * an identifier ({@code getOwner().getId()}), and for an un-rotated master the FK matches the
+     * fetched {@code b.salon} row so the persistence context answers without a statement.
+     *
+     * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — the third and last removal
+     * of this dead fetch, after {@link #findAllByIdsWithGraph} and
      * {@code findActiveByClientIdAndIdempotencyKey}. It was dead for two independent reasons:
      * <ol>
      *   <li>Every {@code getOwner()} in {@code src/main/java} is either a null check or
@@ -456,7 +483,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id = :id
@@ -473,9 +500,13 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * <p>Naturally bounded — a visit holds at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT}
      * (10) rows — so no {@code Pageable} is needed (§E-3). Rides the partial index
      * {@code idx_bookings_appointment} (V125, {@code WHERE appointment_id IS NOT NULL}). Hydrates the
-     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, {@code master.salon},
+     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, <b>{@code booking.salon}</b>,
      * {@code masterService.serviceDefinition}) so {@code AppointmentDetailResponse.from} reads the
-     * master summary + per-item service name with no lazy load or N+1. {@code b.client} is deliberately
+     * master summary + per-item service name with no lazy load or N+1. Phase 242 re-pointed the
+     * salon fetch from {@code m.salon} to {@code b.salon}: the visit's address block is resolved
+     * from the ITEM's own salon snapshot ({@code AppointmentDetailResponse#from} reads
+     * {@code first.getSalon()}), which is real-property access and would otherwise lazy-load.
+     * {@code b.client} is deliberately
      * NOT fetched — the appointment header carries the client, and the item projection does not read
      * it.
      */
@@ -483,7 +514,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.appointment.id = :appointmentId

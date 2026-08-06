@@ -25,8 +25,22 @@ import java.util.UUID;
  * salon's own column is {@code NULL} — reusing the already-joined {@code s}/{@code mu} aliases, no
  * extra join. <b>Do not use {@code COALESCE(s.locationNote, mu.locationNote)} here</b> — {@code
  * COALESCE} falls through to the master's own value whenever the salon's column is {@code NULL},
- * which for a salon-employed master leaks the master's personal data (e.g. their home door code)
- * onto a salon booking. Nullable — most providers never set one.
+ * which for a salon booking leaks the master's personal data (e.g. their home door code).
+ * Nullable — most providers never set one.
+ *
+ * <p><b>Phase 242 — {@code s} is {@code LEFT JOIN b.salon}, the BOOKING's own salon snapshot.</b>
+ * It used to be {@code LEFT JOIN m.salon} (the master's LIVE affiliation), which meant that after
+ * a master rotated salons a client opening an OLD booking was served the NEW salon's
+ * {@code locationNote} — premises-access information for a salon they never booked at. The alias
+ * was re-pointed, not added: {@code s} is referenced only by {@code s.name} and the five
+ * {@code CASE WHEN} columns, so the query still carries 7 joins. The {@code CASE WHEN} /
+ * ternary shape above is untouched and must stay — only the salon it keys off changed. A booking
+ * made at a salon always carries a non-null {@code bookings.salon_id} (the column dates from
+ * {@code V18__create_bookings.sql:8}), so {@code s.id IS NULL} means "this visit genuinely was at
+ * the master's own address", which is when the master's own row is the correct answer.
+ *
+ * <p>{@code salonId} ({@code b.salon.id}, Phase B2) therefore now resolves through this same
+ * alias: it and {@code salonName} share one source and can no longer disagree.
  *
  * <p><b>Locality is FK ids, not labels.</b> JPQL cannot resolve the taxonomy {@code name_uk}
  * labels — that is the {@code DiscoveryLocationResolver} M2 seam's job (§E: batch-resolved in
@@ -113,11 +127,10 @@ public record ClientBookingDetailProjection(
         // identifier path on a @ManyToOne, which reads the FK column already on the `bookings` row
         // and adds NO join (the same SELECT-only shape as appointmentId above; a null FK yields
         // null here and the row is NOT filtered out, so an independent master's booking still
-        // appears). Deliberately NOT `s.id` off the existing `LEFT JOIN m.salon s`: that alias is
-        // the master's LIVE salon, whereas the review — and therefore the salon aggregate the
-        // client must invalidate — is stamped with booking.salon (ReviewService#createReview).
-        // The two differ for any booking made before a master rotated salons; see
-        // BookingDetailResponse's class javadoc.
+        // appears). It is the salon the review is stamped with (ReviewService#createReview), hence
+        // the salon aggregate a client must invalidate. Since phase 242 the `s` alias is itself
+        // `LEFT JOIN b.salon`, so `s.id` would now give the same answer — the explicit `b.salon.id`
+        // is kept because it needs no join at all and states the intent at the point of use.
         UUID salonId
 ) {
 }

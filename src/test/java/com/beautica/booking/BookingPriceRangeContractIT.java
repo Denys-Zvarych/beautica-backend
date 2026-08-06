@@ -796,14 +796,18 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         UUID clientId = fixtures.createUser(
                 "bprc-owner-multi-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
 
+        // Each booking is stamped with the salon it was made at, exactly as every production write
+        // site does (BookingService:1794, AppointmentService:253/267). Phase 242: salonName is
+        // resolved from bookings.salon_id, so a fixture that leaves the column NULL renders both
+        // rows' salonName as null and the "different salons" premise below degrades to null == null.
         UUID serviceInFirst = createRangeService("SALON", firstSalon.salonId(), firstSalon.masterId(),
                 new BigDecimal("300.00"), new BigDecimal("500.00"), null);
         insertBooking(clientId, firstSalon.masterId(), serviceInFirst, ANCHOR,
-                new BigDecimal("300.00"), new BigDecimal("500.00"));
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", firstSalon.salonId());
         UUID serviceInSecond = createRangeService("SALON", secondSalonId, secondMasterId,
                 new BigDecimal("700.00"), new BigDecimal("900.00"), null);
         insertBooking(clientId, secondMasterId, serviceInSecond, ANCHOR.plusDays(1),
-                new BigDecimal("700.00"), new BigDecimal("900.00"));
+                new BigDecimal("700.00"), new BigDecimal("900.00"), "CONFIRMED", secondSalonId);
 
         var page = bookingService.getMyBookings(
                 ownerId, authFor(Role.SALON_OWNER), null, null, null, null, PageRequest.of(0, 20));
@@ -987,8 +991,13 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * <p>Expected to equal {@link #PROVIDER_PAGE_STATEMENTS}: the role branch is shared
      * ({@code case SALON_MASTER, INDEPENDENT_MASTER} in {@code listProviderBookings}), so the six
      * statements are the identical six, and the extra {@code salons} row rides along on
-     * {@code findAllByIdsWithGraph}'s existing {@code LEFT JOIN FETCH m.salon} rather than costing
-     * a statement of its own. The two constants are kept SEPARATE rather than collapsed into one,
+     * {@code findAllByIdsWithGraph}'s {@code LEFT JOIN FETCH b.salon} (phase 242 — re-pointed from
+     * {@code m.salon}; see that query's javadoc) rather than costing a statement of its own. Note
+     * that the list path does NOT pay the rotated-case penalty the detail path does
+     * ({@link #OWNER_DETAIL_STATEMENTS_ROTATED}): nothing on it walks
+     * {@code master.getSalon()} — the per-row authorization is done upstream, on the ID page — so
+     * the master's live {@code Salon} proxy is never opened even when it diverges. The two
+     * constants are kept SEPARATE rather than collapsed into one,
      * because a future change that makes the salon path cost more must show up as a diff on THIS
      * line, not silently re-point a shared constant.
      *
@@ -1051,18 +1060,25 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * {@code bookings.salon_id}, so every row on this page had {@code booking.salon == null} and
      * there was no proxy to dereference at all. The gate was structurally blind, not passing.
      *
-     * <p>The fixture now books at a salon DISTINCT from {@code masters.salon_id}. Divergence is the
-     * load-bearing part: an ALIGNED id resolves off the L1 entry that {@code LEFT JOIN FETCH
-     * m.salon} already materialised, so no proxy is created and the read stays free for the wrong
-     * reason. With a divergent id the page carries a genuine uninitialised proxy, and 19 asserts
-     * that Hibernate never materialises it. The extra {@code Salon} row is NOT among the 19.
+     * <p>The fixture books at a salon DISTINCT from {@code masters.salon_id}. Divergence is the
+     * load-bearing part: with the two ids ALIGNED, both {@code b.salon} and {@code m.salon} resolve
+     * to the same row and the gate cannot tell which of them the page actually materialised.
      *
-     * <p><b>Mutation-verified (Phase B2 QA):</b> forcing the proxy open with
-     * {@code Hibernate.initialize(booking.getSalon())} on the provider read path moves this count
+     * <p><b>Phase 242 — 19 is UNCHANGED, but the ONE {@code Salon} among them swapped identity.</b>
+     * The fetch join moved from {@code m.salon} to {@code b.salon}, so the hydrated salon is now
+     * the BOOKED one and it is the master's LIVE salon that is left as an untouched proxy. The
+     * count is the same because the page needs exactly one salon either way: nothing on the
+     * provider list path walks {@code master.getSalon()} (per-row authorization happens upstream,
+     * on the ID page), so the live-salon proxy is never opened. A rise to 20 means something
+     * started walking it — or that {@code s.owner} was fetch-joined back on.
+     *
+     * <p><b>Mutation-verified (Phase B2 QA):</b> forcing a proxy open with
+     * {@code Hibernate.initialize(...)} on the provider read path moves this count
      * 19 -&gt; 20 while {@link #SALON_MASTER_PAGE_STATEMENTS} moves 6 -&gt; 7. This gate is also the
      * one that would go red if {@code hibernate.jpa.compliance.proxy=true} were ever set: under JPA
-     * proxy compliance Hibernate must initialise the proxy to answer {@code getId()}, so the
-     * optimisation B2 relies on would silently stop applying and land here as 20.
+     * proxy compliance Hibernate must initialise a proxy to answer {@code getId()}, so the
+     * optimisation the remaining identifier-only reads rely on would silently stop applying and
+     * land here as 20.
      */
     private static final long SALON_MASTER_PAGE_ENTITIES = 19L;
 
@@ -1228,21 +1244,156 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * Do not adjust the constant to make a failing run pass without first establishing which
      * association the extra entity belongs to.
      *
-     * <p><b>Phase B2 (QA, 2026-08-06) — divergent-salon seed here too, and 7 is UNCHANGED.</b>
-     * Same argument as {@link #SALON_MASTER_PAGE_ENTITIES}: this fixture previously left
-     * {@code bookings.salon_id} NULL, so it had no {@code booking.salon} proxy for
-     * {@code BookingDetailResponse.from}'s {@code getSalon().getId()} to be measured against. The
-     * booking is now made at a salon distinct from {@code masters.salon_id}, and 7 asserts the
-     * resulting proxy is never materialised. This gate is NOT redundant with the list-path one:
-     * they pin two different queries, and {@code findByIdWithFullGraph} can grow a
-     * {@code LEFT JOIN FETCH b.salon} entirely independently of {@code findAllByIdsWithGraph}.
+     * <p><b>Phase 242 — this gate SPLIT into two, and the constants below are why.</b> B2 read only
+     * {@code booking.getSalon().getId()}, an identifier served off an uninitialised proxy for free.
+     * Phase 242 re-pointed the whole display block onto that same snapshot and reads real
+     * properties off it ({@code getName()}, {@code getStreet()}, {@code getLocationNote()}), which
+     * INITIALISE the proxy — so {@code findByIdWithFullGraph} now fetch-joins {@code b.salon}
+     * instead of {@code m.salon}. The two cases genuinely diverge from here:
+     * <ul>
+     *   <li><b>Aligned</b> ({@link #OWNER_DETAIL_ENTITIES_ALIGNED} = 7) — the production-normal
+     *       shape: {@code bookings.salon_id == masters.salon_id}, so the ONE fetched {@code Salon}
+     *       answers both the display block and {@code AuthorizationService}'s
+     *       {@code master.getSalon().getOwner().getId()} walk (the persistence context resolves
+     *       {@code m.salon} to the already-materialised row rather than minting a proxy). 7 is
+     *       therefore unchanged from before the re-point, and this is the count that matters for
+     *       real traffic.</li>
+     *   <li><b>Rotated</b> ({@link #OWNER_DETAIL_ENTITIES_ROTATED} = 8) — the deliberately
+     *       divergent fixture: the request now genuinely needs TWO salon rows, the booking's (to
+     *       display) and the master's live one (for the owner authorization check), and no fetch
+     *       strategy can serve both from one row. The extra entity is a {@code Salon}, NOT the
+     *       owner's {@code User} — the {@code s.owner} drop this gate was created for still holds,
+     *       which is exactly why the two constants sit one apart and not two.</li>
+     * </ul>
+     * Keeping both is the point: a single constant would have had to pick one shape and go blind
+     * to the other, and collapsing the pair is how a real {@code s.owner} re-fetch would later hide
+     * inside a number that had already been bumped once.
+     *
+     * <p>7 = 1 {@code Booking} + 1 {@code Master} + 1 master {@code User} + 1 {@code Salon}
+     * + 1 client {@code User} + 1 {@code MasterServiceAssignment} + 1 {@code ServiceDefinition}.
+     * The salon owner's {@code User} is conspicuously NOT among them, in either case.
      */
-    private static final long OWNER_DETAIL_ENTITIES = 7L;
+    private static final long OWNER_DETAIL_ENTITIES_ALIGNED = 7L;
+
+    /**
+     * Statement counts for the same two shapes — {@code findByIdWithFullGraph} plus the two
+     * {@code DiscoveryLocationResolver} label {@code IN} queries, and in the rotated case one
+     * further {@code salons} SELECT. Both DERIVED FROM A RUN, never predicted.
+     *
+     * <p>Phase 242 before/after: the ALIGNED count is unchanged at 3 — the production-normal shape
+     * pays nothing for the re-point. The ROTATED count moved 3 -&gt; 4, because a booking whose
+     * salon differs from its master's live salon genuinely needs both rows (one to display, one to
+     * authorize) and no fetch strategy can serve both from one. Restoring
+     * {@code LEFT JOIN FETCH m.salon} ALONGSIDE {@code b.salon} would trade that SELECT for a
+     * second {@code salons} join on every read, aligned or not, and still hydrate two entities in
+     * the rotated case — strictly worse. Do not "fix" it that way.
+     */
+    private static final long OWNER_DETAIL_STATEMENTS_ALIGNED = 3L;
+
+    /** See {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}. */
+    private static final long OWNER_DETAIL_STATEMENTS_ROTATED = 4L;
+
+    /** See {@link #OWNER_DETAIL_ENTITIES_ALIGNED} — the post-rotation shape. Derived from a run. */
+    private static final long OWNER_DETAIL_ENTITIES_ROTATED = 8L;
+
+    @Test
+    @DisplayName("GET /bookings/{id} for a booking whose master has since gone INDEPENDENT still "
+            + "serves the booked salon's name, and fetches it in the main query rather than "
+            + "lazy-loading it — the one shape that pins WHICH salon findByIdWithFullGraph fetches")
+    void should_notLazyLoadTheBookedSalon_when_theMasterHasSinceGoneIndependent() {
+        var salon = fixtures.createSalon("bprc-detail-gone-indep-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = fixtures.createUser(
+                "bprc-detail-gone-indep-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+        UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+
+        // The master leaves the salon and goes solo AFTER the booking. masters.salon_id becomes
+        // NULL; bookings.salon_id is a snapshot and keeps pointing at the salon the client booked.
+        jdbcTemplate.update(
+                "UPDATE masters SET salon_id = NULL, master_type = 'INDEPENDENT_MASTER' WHERE id = ?",
+                salon.masterId());
+        jdbcTemplate.update(
+                "UPDATE users SET salon_id = NULL WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                salon.masterId());
+
+        // Read as the master's OWN user: isAuthorizedToManageBooking's INDEPENDENT_MASTER branch
+        // settles it in memory, so this measures the read itself and not a SecurityContext walk.
+        UUID masterUserId = jdbcTemplate.queryForObject(
+                "SELECT user_id FROM masters WHERE id = ?", UUID.class, salon.masterId());
+
+        Statistics statistics = statistics();
+        statistics.clear();
+        var detail = bookingService.getBooking(masterUserId, bookingId);
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(detail.salonName())
+                .as("correctness — the visit WAS at a salon, so its name must still be served; a "
+                        + "master going solo does not retroactively turn a past salon visit into a "
+                        + "home-studio one")
+                .isNotNull();
+        assertThat(statements)
+                .as("this is the ONLY shape that can tell findByIdWithFullGraph's LEFT JOIN FETCH "
+                        + "b.salon apart from the m.salon it replaced. In both the aligned and the "
+                        + "rotated fixture the two graphs happen to cost the same (aligned: one "
+                        + "row serves both; rotated: one is fetched and the other lazy-loaded, "
+                        + "either way 1 + 1). Here m.salon is NULL, so a graph still fetching it "
+                        + "materialises nothing and the mapper's booking.getSalon() property reads "
+                        + "lazy-load the booked salon — %s instead of %s.",
+                        OWNER_DETAIL_STATEMENTS_ALIGNED + 1, OWNER_DETAIL_STATEMENTS_ALIGNED)
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED);
+    }
+
+    @Test
+    @DisplayName("GET /bookings/{id} as the salon OWNER — production-normal shape (the booking's "
+            + "salon IS the master's live salon): ONE Salon row serves both the address block and "
+            + "the ownership walk, and the owner's User is still never hydrated")
+    void should_hydrateExactlyOneSalon_when_bookingSalonMatchesTheMastersLiveSalon() {
+        var salon = fixtures.createSalon("bprc-detail-aligned-" + System.nanoTime() + "@beautica.test");
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID clientId = fixtures.createUser(
+                "bprc-detail-aligned-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+        UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+
+        Statistics statistics = statistics();
+        statistics.clear();
+        var detail = bookingService.getBooking(ownerId, bookingId);
+        long entities = statistics.getEntityLoadCount();
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(statements)
+                .as("absolute JDBC statement count for the production-normal detail read: the "
+                        + "single findByIdWithFullGraph + the two DiscoveryLocationResolver label "
+                        + "IN queries. A rise means an association the mapper reads stopped being "
+                        + "fetch-joined and is being lazily initialised.")
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED);
+        assertThat(detail.salonId())
+                .as("premise — this gate is the ALIGNED case; the booking's snapshot and the "
+                        + "master's live salon must be the SAME row or it measures the other case")
+                .isEqualTo(salon.salonId());
+        assertThat(detail.salonName())
+                .as("premise — a real salon must be on the row, or there is no Salon.owner proxy")
+                .isNotNull();
+        assertThat(entities)
+                .as("absolute HYDRATED-ENTITY count for the production-normal detail read. This is "
+                        + "the number that must not move when the salon fetch is re-pointed: one "
+                        + "Salon row answers the address block AND the ownership walk. A rise to %s "
+                        + "means s.owner (or another association) was fetch-joined back on.",
+                        OWNER_DETAIL_ENTITIES_ALIGNED + 1)
+                .isEqualTo(OWNER_DETAIL_ENTITIES_ALIGNED);
+    }
 
     @Test
     @DisplayName("GET /bookings/{id} as the salon OWNER authorizes off the uninitialised Salon.owner "
-            + "proxy and hydrates no User row for it, nor for the booking's own divergent Salon — "
-            + "pins two proxy drops a statement count cannot see")
+            + "proxy and hydrates no User row for it — with a DIVERGENT booking salon the request "
+            + "needs both salon rows and no more")
     void should_notHydrateTheSalonOwner_when_loadingABookingDetail() {
         var salon = fixtures.createSalon("bprc-detail-owner-" + System.nanoTime() + "@beautica.test");
         UUID ownerId = jdbcTemplate.queryForObject(
@@ -1251,12 +1402,13 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 "bprc-detail-owner-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
                 new BigDecimal("300.00"), new BigDecimal("500.00"), null);
-        // Phase B2: booked at a DIFFERENT salon from the master's live one, so booking.getSalon()
-        // is a real uninitialised proxy rather than an L1 hit on the fetch-joined m.salon.
+        // Phase B2/242: booked at a DIFFERENT salon from the master's live one — the post-rotation
+        // shape. booking.getSalon() is the fetched row; master.getSalon() is a real uninitialised
+        // proxy that AuthorizationService's getOwner() walk must open.
         UUID bookedSalonId = insertBareSalonUnderOwner(
                 ownerId, "bprc-detail-booked-salon-" + System.nanoTime());
         assertThat(bookedSalonId)
-                .as("premise — divergent from the master's live salon, or no proxy is created")
+                .as("premise — divergent from the master's live salon, or this is the aligned case")
                 .isNotEqualTo(salon.salonId());
         UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
                 new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", bookedSalonId);
@@ -1265,6 +1417,16 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         statistics.clear();
         var detail = bookingService.getBooking(ownerId, bookingId);
         long entities = statistics.getEntityLoadCount();
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(statements)
+                .as("absolute JDBC statement count for a POST-ROTATION detail read — exactly one "
+                        + "more than the aligned case (%s), and that one is the master's live Salon "
+                        + "row, opened by AuthorizationService's getSalon().getOwner() walk. It is "
+                        + "irreducible: the request needs the booking's salon to display and the "
+                        + "master's live salon to authorize, and they are different rows. A rise "
+                        + "beyond this is a real regression.", OWNER_DETAIL_STATEMENTS_ALIGNED)
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ROTATED);
 
         // The authorization walk itself is the premise: reaching a response at all means
         // getOwner().getId() resolved off the proxy rather than throwing.
@@ -1277,15 +1439,18 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .isNotNull();
         assertThat(detail.salonId())
                 .as("premise — the booking's own salon snapshot must be the DIVERGENT row, or "
-                        + "there is no b.salon proxy for this gate to measure either")
+                        + "there is no second Salon for this gate to account for either")
                 .isEqualTo(bookedSalonId)
                 .isNotEqualTo(salon.salonId());
         assertThat(entities)
-                .as("absolute HYDRATED-ENTITY count for one owner-served booking detail. A rise to "
-                        + "%s means s.owner (or another association) was fetch-joined back onto "
-                        + "findByIdWithFullGraph — invisible to any statement count, which is "
-                        + "precisely why this gate counts entities.", OWNER_DETAIL_ENTITIES + 1)
-                .isEqualTo(OWNER_DETAIL_ENTITIES);
+                .as("absolute HYDRATED-ENTITY count for one owner-served booking detail whose "
+                        + "salon DIVERGES from the master's live one: the booking's Salon (fetched) "
+                        + "plus the master's live Salon (opened by the ownership walk), and nothing "
+                        + "else. A rise to %s means s.owner — or another association — was "
+                        + "fetch-joined back onto findByIdWithFullGraph, invisible to any statement "
+                        + "count, which is precisely why this gate counts entities.",
+                        OWNER_DETAIL_ENTITIES_ROTATED + 1)
+                .isEqualTo(OWNER_DETAIL_ENTITIES_ROTATED);
     }
 
     @Test
@@ -1649,11 +1814,20 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     }
 
     /**
-     * A second, bare {@code salons} row under an EXISTING owner — the "salon the booking was made
-     * at" for the divergent-salon gate. Deliberately leaner than {@link #addSalonUnderOwner}: no
-     * master is attached, because nothing must ever put this salon on the page under test. It has
-     * to exist ONLY as the target of {@code bookings.salon_id}, so that {@code booking.getSalon()}
-     * yields an uninitialised proxy rather than an L1-cache hit on the master's live salon.
+     * A second {@code salons} row under an EXISTING owner — the "salon the booking was made at"
+     * for the divergent-salon gates. Deliberately leaner than {@link #addSalonUnderOwner}: no
+     * master is attached, because nothing must ever put this salon on the page under test via the
+     * master graph. It exists as the target of {@code bookings.salon_id} alone.
+     *
+     * <p><b>Phase 242 — it is stamped with a locality, and that is load-bearing.</b> Since the
+     * display block (including {@code cityLabel}/{@code districtLabel}) is resolved from
+     * {@code booking.getSalon()}, a locality-less booked salon makes
+     * {@code DiscoveryLocationResolver.resolveLabels} short-circuit on two empty id sets and the
+     * page silently drops from six statements to four. The gates would then be pinning a number
+     * produced by what the fixture OMITS rather than by the production path — and would go blind
+     * to a regression in the label queries. Both salons carry the SAME locality on purpose: the
+     * divergence that matters to these gates is the salon ROW identity (which decides whether a
+     * proxy exists at all), not the locality values.
      */
     private UUID insertBareSalonUnderOwner(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
@@ -1661,6 +1835,7 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, true, NOW(), NOW())",
                 salonId, ownerId, name);
+        stampSalonLocality(salonId);
         return salonId;
     }
 

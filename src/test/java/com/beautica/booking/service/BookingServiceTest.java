@@ -2319,7 +2319,8 @@ class BookingServiceTest {
     //    The projection selects b.salon.id (the BOOKING's own FK), not s.id off the master's live
     //    salon join. The service must pass it through untouched so GET /bookings/me and
     //    GET /bookings/{id} carry the same key the mobile client uses to invalidate its
-    //    salon-scoped review caches.
+    //    salon-scoped review caches. Phase 242: salonName now rides the SAME b.salon alias, so
+    //    the "two independent salon sources" framing these tests were written around is retired.
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithSalon(
             UUID salonId, String salonName) {
@@ -2344,14 +2345,29 @@ class BookingServiceTest {
                 salonId);
     }
 
+    /**
+     * Phase 242 retired the "the two can disagree" case. This test used to have a sibling,
+     * {@code should_keepSalonIdAndSalonNameIndependent_when_theyDisagree}, built on the premise
+     * that {@code salonId} came from {@code b.salon} while {@code salonName} came from
+     * {@code m.salon}, so a post-rotation row carried two different salons. Both now ride the same
+     * {@code LEFT JOIN b.salon} alias and cannot disagree — the premise is gone, and with it the
+     * only thing that distinguished the two tests (they were already flagged as near-duplicates by
+     * backend-qa on phase 241). One passthrough test remains: the SERVICE must hand both fields
+     * through untouched, deriving neither from the other.
+     *
+     * <p>Whether the QUERY selects the right salon is not this test's job — that is
+     * {@code ClientBookingDetailProjectionTest}'s rotation test, against real Postgres.
+     */
     @Test
-    @DisplayName("getMyBookings (CLIENT) surfaces the booking's salonId from the projection")
+    @DisplayName("getMyBookings (CLIENT) passes the projection's salonId AND salonName through "
+            + "untouched, deriving neither from the other")
     void should_surfaceSalonId_when_clientProjectionRowCarriesSalon() {
         UUID salonId = UUID.randomUUID();
 
         var booking = firstClientRowFor(clientProjectionRowWithSalon(salonId, "Salon Bookings"));
 
         assertThat(booking.salonId()).isEqualTo(salonId);
+        assertThat(booking.salonName()).isEqualTo("Salon Bookings");
     }
 
     @Test
@@ -2362,24 +2378,6 @@ class BookingServiceTest {
 
         assertThat(booking.salonId()).isNull();
         assertThat(booking.id()).isEqualTo(bookingId);
-    }
-
-    @Test
-    @DisplayName("getMyBookings (CLIENT) keeps salonId and salonName independent — the projection's "
-            + "two salon sources (b.salon vs m.salon) are passed through separately, never derived "
-            + "from one another")
-    void should_keepSalonIdAndSalonNameIndependent_when_theyDisagree() {
-        UUID bookingSalonId = UUID.randomUUID();
-
-        // The row a post-rotation booking produces: b.salon.id is the salon the visit was booked
-        // at, while s.name comes from the master's CURRENT salon.
-        var booking = firstClientRowFor(
-                clientProjectionRowWithSalon(bookingSalonId, "Master's current salon"));
-
-        assertThat(booking.salonId())
-                .as("salonId must be the booking's own snapshot, not re-derived from salonName")
-                .isEqualTo(bookingSalonId);
-        assertThat(booking.salonName()).isEqualTo("Master's current salon");
     }
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
@@ -3484,7 +3482,8 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("getBooking surfaces the salon name and salon-primary address/labels for a salon-employed master")
+    @DisplayName("getBooking surfaces the BOOKED salon's name and address/labels — never the "
+            + "master's own row, and never the salon the master has since rotated to")
     void should_populateSalonFields_when_salonEmployedMasterBooking() {
         UUID salonCityId = UUID.randomUUID();
         UUID salonDistrictId = UUID.randomUUID();
@@ -3503,9 +3502,23 @@ class BookingServiceTest {
                 .locationNote("3rd floor, door code 1234")
                 .isActive(true)
                 .build();
-        setField(enriched, "salon", salon);
+        // Phase 242 — the master has SINCE ROTATED to another salon, whose address and door code
+        // must not surface anywhere. masters.salon_id moves; bookings.salon_id is a snapshot and
+        // does not. Stamping only master.salon (as this fixture used to) would let a
+        // master.getSalon()-sourced implementation pass.
+        com.beautica.salon.entity.Salon rotatedToSalon = com.beautica.salon.entity.Salon.builder()
+                .name("Rotated-To Studio - must NOT surface")
+                .cityId(UUID.randomUUID())
+                .districtId(UUID.randomUUID())
+                .street("RotatedStreet - must NOT surface")
+                .buildingNo("77")
+                .locationNote("Rotated-to door code 9999 - must NOT surface")
+                .isActive(true)
+                .build();
+        setField(enriched, "salon", rotatedToSalon);
         MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
         Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.CONFIRMED);
+        setField(booking, "salon", salon);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         // CONFIRMED (not COMPLETED) short-circuits canReview before the review-existence query —
         // no reviewRepository stub needed here.
@@ -3532,6 +3545,15 @@ class BookingServiceTest {
                         "Volodymyrska",
                         "55",
                         "3rd floor, door code 1234");
+        // The negatives, explicitly: neither the rotated-to salon nor the master's personal row
+        // may reach any of these fields. A positive-only check passes on a wrong-source
+        // implementation whenever two fixtures happen to agree.
+        assertThat(result.locationNote())
+                .isNotEqualTo("Rotated-to door code 9999 - must NOT surface")
+                .isNotEqualTo("Master's own note - must NOT surface");
+        assertThat(result.salonName()).isNotEqualTo("Rotated-To Studio - must NOT surface");
+        assertThat(result.street()).isNotEqualTo("RotatedStreet - must NOT surface")
+                .isNotEqualTo("OwnStreet");
     }
 
     @Test

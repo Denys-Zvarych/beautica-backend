@@ -160,8 +160,8 @@ public class AppointmentService {
     }
 
     /**
-     * Resolves the district-primary discovery locality labels (salon when salon-employed, else the
-     * master's own user row — the same {@code COALESCE(salon, user)} rule {@code BookingService} and
+     * Resolves the district-primary discovery locality labels (the BOOKED salon when the visit was
+     * made at one, else the master's own user row — the same rule {@code BookingService} and
      * {@code SearchService} use) and builds the enriched {@link AppointmentDetailResponse}. The
      * street/building/locationNote resolution and the header-note reads live inside
      * {@link AppointmentDetailResponse#from}; only the FK→label lookup is not derivable from the
@@ -173,7 +173,11 @@ public class AppointmentService {
      */
     AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
         Master master = items.get(0).getMaster();
-        Salon salon = master.getSalon();
+        // Phase 242 — the visit's own salon snapshot, the SAME source
+        // AppointmentDetailResponse#from resolves street/buildingNo/locationNote from. These ids
+        // feed cityLabel/districtLabel; splitting them off master.getSalon() would pair the booked
+        // salon's street with the master's current salon's city after a rotation.
+        Salon salon = items.get(0).getSalon();
         User masterUser = master.getUser();
         UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
         UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();

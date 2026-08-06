@@ -490,22 +490,28 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 .isEqualTo(salon.getId());
     }
 
-    // ── Phase B2 — salonId comes from b.salon, NOT from the master's live salon join ─
+    // ── Phase B2 + 242 — the whole salon block comes from b.salon, never the master's live one ─
     //
     // Every other fixture in this class books a master at the salon they still work at, so
-    // `b.salon.id` and `s.id` are the same value and no existing assertion can tell an
-    // implementation that selects the wrong one apart. This test is the only place where the
-    // two diverge. It matters because ReviewService#createReview stamps the review with
-    // `booking.getSalon()` and publishes that id on ReviewCreatedEvent — so `b.salon.id` is the
-    // salon whose avg_rating/review_count actually moved, and the id a client must use to
-    // invalidate its salon-scoped caches. Selecting `s.id` here would silently point a rotated
-    // master's past bookings at the wrong salon.
+    // `b.salon.id` and the master's `masters.salon_id` are the same value and no existing
+    // assertion can tell an implementation that reads the wrong one apart. This test is the only
+    // place where the two diverge.
+    //
+    // B2 established it for `salonId` (the review is stamped with booking.getSalon(), so that is
+    // the salon whose avg_rating/review_count moved). Phase 242 extended it to the DISPLAY block:
+    // `salonName` and the five CASE WHEN columns used to key off `LEFT JOIN m.salon`, so a client
+    // opening an OLD booking after the master rotated was served the NEW salon's locationNote —
+    // free text that by contract holds door codes. Both salons below therefore carry DISTINCT,
+    // NON-NULL street/buildingNo/locationNote/cityId/districtId: a null on either side would make
+    // the isNotEqualTo assertions pass vacuously.
 
     @Test
-    @DisplayName("salonId is the BOOKING's own salon_id, never the master's CURRENT salon — after a "
-            + "salon rotation the projection's salonId and salonName deliberately disagree")
+    @DisplayName("the whole salon block is the BOOKING's own snapshot, never the master's CURRENT "
+            + "salon — after a rotation the client gets salon A's door code and never salon B's")
     void should_projectBookingSalonId_when_masterHasSinceRotatedToAnotherSalon() {
         UUID[] tax = persistTaxonomy();
+        UUID[] bookedTax = persistTaxonomy();
+        UUID[] currentTax = persistTaxonomy();
 
         User ownerUser = new User(
                 "owner-" + UUID.randomUUID() + "@test.com",
@@ -513,14 +519,23 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.persist(ownerUser);
 
         Salon bookedSalon = Salon.builder()
-                .owner(ownerUser).name("Booked Salon").isActive(true).build();
+                .owner(ownerUser).name("Booked Salon").isActive(true)
+                .cityId(bookedTax[0]).districtId(bookedTax[1])
+                .street("BookedStreet").buildingNo("11")
+                .locationNote("A: 3rd floor, door code 1234")
+                .build();
         em.persist(bookedSalon);
         Salon currentSalon = Salon.builder()
-                .owner(ownerUser).name("Current Salon").isActive(true).build();
+                .owner(ownerUser).name("Current Salon").isActive(true)
+                .cityId(currentTax[0]).districtId(currentTax[1])
+                .street("CurrentStreet").buildingNo("22")
+                .locationNote("B: 5th floor, door code 9999")
+                .build();
         em.persist(currentSalon);
 
         User masterUser = persistMasterUser(
                 Role.SALON_MASTER, tax[0], tax[1], "OwnStreet", "99", "https://cdn.test/m.png");
+        masterUser.setLocationNote("Master's own note - must NOT surface for a salon booking");
         Master master = persistMaster(masterUser, bookedSalon, MasterType.SALON_MASTER);
         MasterServiceAssignment msa = persistService(
                 master, OwnerType.SALON, bookedSalon.getId(), "Pedicure", "PEDICURE");
@@ -540,13 +555,27 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         assertThat(page.getContent()).hasSize(1);
         ClientBookingDetailProjection p = page.getContent().get(0);
         assertThat(p.salonId())
-                .as("must be b.salon.id (the booking's snapshot); selecting s.id off the "
-                        + "LEFT JOIN m.salon would yield the master's CURRENT salon instead")
+                .as("must be b.salon.id (the booking's snapshot); selecting the master's live "
+                        + "salon would yield the CURRENT salon instead")
                 .isEqualTo(bookedSalon.getId())
                 .isNotEqualTo(currentSalon.getId());
         assertThat(p.salonName())
-                .as("salonName is unchanged by B2 — it still resolves off the master's live salon")
-                .isEqualTo("Current Salon");
+                .as("phase 242 INVERTED this: salonName used to resolve off LEFT JOIN m.salon and "
+                        + "now rides the same b.salon alias as salonId — they cannot disagree")
+                .isEqualTo("Booked Salon")
+                .isNotEqualTo("Current Salon");
+        assertThat(p.street()).isEqualTo("BookedStreet").isNotEqualTo("CurrentStreet");
+        assertThat(p.buildingNo()).isEqualTo("11").isNotEqualTo("22");
+        assertThat(p.discoveryCityId()).isEqualTo(bookedTax[0]).isNotEqualTo(currentTax[0]);
+        assertThat(p.discoveryDistrictId()).isEqualTo(bookedTax[1]).isNotEqualTo(currentTax[1]);
+        // THE security assertion — the negative is explicit on purpose. locationNote holds door
+        // codes; a positive-only check would still pass if both salons happened to share a note.
+        assertThat(p.locationNote())
+                .as("the client booked at salon A — they must get A's door code, never B's, and "
+                        + "never the master's personal one (the COALESCE-fallthrough guard)")
+                .isEqualTo("A: 3rd floor, door code 1234")
+                .isNotEqualTo("B: 5th floor, door code 9999")
+                .isNotEqualTo("Master's own note - must NOT surface for a salon booking");
     }
 
     // ── salon-employed master, salon has NO note (COALESCE-fallthrough regression) ─

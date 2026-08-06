@@ -25,6 +25,8 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.lang.reflect.RecordComponent;
 import java.math.BigDecimal;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -303,6 +305,137 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .isEqualTo(MASTER_AVATAR_URL);
     }
 
+    /**
+     * Phase 242 — the address block follows the BOOKING's salon, end-to-end, on BOTH mapper paths.
+     *
+     * <p>The leak this closes: {@code salonName}/{@code street}/{@code buildingNo}/
+     * {@code locationNote}/{@code cityLabel}/{@code districtLabel} used to resolve off
+     * {@code master.getSalon()} — the master's LIVE affiliation — so once a master rotated salons,
+     * a client opening an OLD booking was served the NEW salon's {@code locationNote}. That field
+     * is by its own {@code @Schema} contract the provider's arrival hint and holds door codes
+     * («3-й поверх, код 1234»), i.e. premises-access information for a salon the client has never
+     * booked at.
+     *
+     * <p>Both salons carry DISTINCT, NON-NULL street / buildingNo / locationNote / city / district.
+     * A null on either side would make every {@code isNotEqualTo} below pass vacuously — the trap
+     * this suite's own history is full of. The premise assertions guard exactly that.
+     *
+     * <p>Runs against the client's TWO read paths, which are physically different queries and
+     * independently maintained mappers: {@code GET /bookings/{id}} (entity path,
+     * {@code findByIdWithFullGraph} → {@code BookingDetailResponse#from}) and
+     * {@code GET /bookings/me} (projection path, {@code hydrateClientBookingDetails}). A fix
+     * applied to only one of them is the exact divergence class the reflective parity loop above
+     * exists for.
+     */
+    @Test
+    @DisplayName("after the master rotates salons, BOTH client read paths still serve the BOOKED "
+            + "salon's address and door code — the new salon's note never reaches the client")
+    void should_serveTheBookedSalonsAddress_when_theMasterHasSinceRotatedToAnotherSalon() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        Locality localityA = resolveLocality(0);
+        Locality localityB = resolveLocality(1);
+        assertThat(localityB.cityLabel())
+                .as("premise — the two seeded localities must differ, or the label assertions "
+                        + "below compare a value against itself and prove nothing")
+                .isNotEqualTo(localityA.cityLabel());
+
+        // Salon A — where the visit was booked. bookings.salon_id already points here.
+        String salonAStreet = "вул. Заброньована-A";
+        String salonABuildingNo = "11-A";
+        String salonANote = "A: 3-й поверх, код 1234";
+        jdbcTemplate.update(
+                "UPDATE salons SET name = ?, city_id = ?, district_id = ?, street = ?, "
+                        + "building_no = ?, location_note = ? WHERE id = ?",
+                "Booked Salon A", localityA.cityId(), localityA.districtId(),
+                salonAStreet, salonABuildingNo, salonANote, fx.salonId());
+
+        // Salon B — a second salon of the SAME owner (rotateMasterSalon only permits same-owner
+        // moves), with a wholly different address and door code.
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, fx.salonId());
+        String salonBStreet = "вул. Поточна-B";
+        String salonBBuildingNo = "22-B";
+        String salonBNote = "B: 5-й поверх, код 9999";
+        UUID salonBId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city_id, district_id, street, building_no, "
+                        + "location_note, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonBId, ownerId, "Current Salon B", localityB.cityId(), localityB.districtId(),
+                salonBStreet, salonBBuildingNo, salonBNote);
+
+        // The rotation itself — AFTER the booking exists. masters.salon_id moves;
+        // bookings.salon_id is a snapshot and does not.
+        jdbcTemplate.update("UPDATE masters SET salon_id = ? WHERE id = ?", salonBId, fx.masterId());
+        jdbcTemplate.update("UPDATE users SET salon_id = ? WHERE id = ?", salonBId, fx.masterUserId());
+
+        String clientToken = tokenFor(fx.clientEmail());
+        String masterEmail = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId());
+        JsonNode detail = getBookingDetail(bookingId, clientToken);
+        JsonNode listRow = findInMyBookings(bookingId, clientToken);
+        // The provider list is a THIRD physical path: listProviderBookings + findAllByIdsWithGraph
+        // + BookingService#discoveryCityId/discoveryDistrictId (its own locality resolution, NOT
+        // enrichSingle's and NOT the projection's). Without it, re-pointing only two of the three
+        // would still pass.
+        JsonNode providerRow = findInMyBookings(bookingId, tokenFor(masterEmail));
+
+        assertThat(listRow).as("the client's own booking must appear on GET /bookings/me").isNotNull();
+        assertThat(providerRow)
+                .as("the booking's own master must see it on their provider timeline").isNotNull();
+
+        for (var path : List.of(
+                Map.entry("GET /bookings/{id} (entity path)", detail),
+                Map.entry("GET /bookings/me (projection path)", listRow),
+                Map.entry("GET /bookings/me (provider entity path)", providerRow))) {
+            String where = path.getKey();
+            JsonNode row = path.getValue();
+
+            assertThat(row.get("salonId").asText())
+                    .as("%s — salonId is the booking's own snapshot", where)
+                    .isEqualTo(fx.salonId().toString())
+                    .isNotEqualTo(salonBId.toString());
+            assertThat(row.get("salonName").asText())
+                    .as("%s — salonName now shares salonId's source; before phase 242 it tracked "
+                            + "the master's LIVE salon and the two disagreed here", where)
+                    .isEqualTo("Booked Salon A")
+                    .isNotEqualTo("Current Salon B");
+            assertThat(row.get("street").asText())
+                    .as("%s — street", where).isEqualTo(salonAStreet).isNotEqualTo(salonBStreet);
+            assertThat(row.get("buildingNo").asText())
+                    .as("%s — buildingNo", where)
+                    .isEqualTo(salonABuildingNo).isNotEqualTo(salonBBuildingNo);
+            assertThat(row.get("cityLabel").asText())
+                    .as("%s — cityLabel must describe the same premises as street, or the client "
+                            + "is sent to salon A's street in salon B's city. Each of the three "
+                            + "paths resolves this through a DIFFERENT piece of code "
+                            + "(enrichSingle / the projection's CASE WHEN / discoveryCityId), so "
+                            + "all three have to be re-pointed together.", where)
+                    .isEqualTo(localityA.cityLabel()).isNotEqualTo(localityB.cityLabel());
+            // THE security assertion, with the negative stated explicitly: a positive-only check
+            // would still pass if both salons happened to carry the same note.
+            assertThat(row.get("locationNote").asText())
+                    .as("%s — the client booked at salon A, so they must receive A's door code and "
+                            + "NEVER B's premises-access information", where)
+                    .isEqualTo(salonANote)
+                    .isNotEqualTo(salonBNote);
+        }
+
+        // Nothing about salon B may be smuggled into any other field of either body.
+        for (JsonNode row : List.of(detail, listRow)) {
+            assertThat(row.toString())
+                    .as("no field anywhere in the response may carry the rotated-to salon's "
+                            + "address or door code")
+                    .doesNotContain(salonBNote)
+                    .doesNotContain(salonBStreet)
+                    .doesNotContain(salonBBuildingNo)
+                    .doesNotContain("Current Salon B")
+                    .doesNotContain("Master's home door code");
+        }
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private static final String CLIENT_FIRST_NAME = "Оксана";
@@ -453,6 +586,27 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                         + "NOW() + interval '1 day 1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, fx.clientId(), fx.masterId(), fx.masterServiceId(), fx.salonId());
         return bookingId;
+    }
+
+    /**
+     * A real seeded district + its city, together with the Ukrainian labels the
+     * {@code DiscoveryLocationResolver} will resolve them to.
+     *
+     * @param index 0-based; distinct indices yield localities in DIFFERENT cities, so
+     *              {@code cityLabel} genuinely differs between them (the premise the phase-242
+     *              rotation test asserts before relying on it).
+     */
+    private Locality resolveLocality(int index) {
+        return jdbcTemplate.queryForObject(
+                "SELECT DISTINCT ON (c.id) d.id, c.id, c.name_uk, d.name_uk "
+                        + "FROM city_districts d JOIN cities c ON c.id = d.city_id "
+                        + "ORDER BY c.id, d.id OFFSET ? LIMIT 1",
+                (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
+                        rs.getString(3), rs.getString(4)),
+                index);
+    }
+
+    private record Locality(UUID districtId, UUID cityId, String cityLabel, String districtLabel) {
     }
 
     /** A real, occupied-territory-excluded (V53 seed) city/district pair — {@code [districtId, cityId]}. */

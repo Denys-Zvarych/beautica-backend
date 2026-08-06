@@ -231,7 +231,10 @@ public class BookingService {
      */
     private BookingDetailResponse enrichSingle(
             Booking booking, boolean canReview, boolean providerCanReviewClient, OffsetDateTime now) {
-        Salon salon = booking.getMaster().getSalon();
+        // Phase 242 — the BOOKING's salon snapshot, matching BookingDetailResponse#from. These two
+        // ids feed cityLabel/districtLabel, so keeping them on master.getSalon() would pair salon
+        // A's street with salon B's city on any booking made before a rotation.
+        Salon salon = booking.getSalon();
         User masterUser = booking.getMaster().getUser();
         UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
         UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
@@ -279,15 +282,19 @@ public class BookingService {
         return hasClient && !reviewExists && BookingClosureRule.isReviewEligible(status, endsAt, now);
     }
 
-    /** Discovery city id: salon's when salon-employed, else the master's own user row. */
+    /**
+     * Discovery city id: the BOOKED salon's when the visit was made at a salon, else the master's
+     * own user row (phase 242 — {@code booking.getSalon()}, never {@code master.getSalon()}; must
+     * move together with the address block or the labels describe a different premises).
+     */
     private static UUID discoveryCityId(Booking booking) {
-        Salon salon = booking.getMaster().getSalon();
+        Salon salon = booking.getSalon();
         return salon != null ? salon.getCityId() : booking.getMaster().getUser().getCityId();
     }
 
-    /** Discovery district id: salon's when salon-employed, else the master's own user row. */
+    /** Discovery district id: same rule and same source as {@link #discoveryCityId}. */
     private static UUID discoveryDistrictId(Booking booking) {
-        Salon salon = booking.getMaster().getSalon();
+        Salon salon = booking.getSalon();
         return salon != null ? salon.getDistrictId() : booking.getMaster().getUser().getDistrictId();
     }
 

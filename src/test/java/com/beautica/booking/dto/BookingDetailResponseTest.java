@@ -208,10 +208,17 @@ class BookingDetailResponseTest {
     // ── locationNote — salon-vs-independent resolution (mirrors street/buildingNo) ────
 
     @Test
-    @DisplayName("locationNote resolves from the master's OWN user row when the master has no salon (independent master)")
+    @DisplayName("locationNote resolves from the master's OWN user row when the BOOKING carries no "
+            + "salon (independent-master visit) — and still does after the master later joins one")
     void should_resolveLocationNoteFromMaster_when_masterIsIndependent() {
         when(masterUser.getLocationNote()).thenReturn("Дзвонити двічі");
-        // master.getSalon() is unstubbed on this mock -> null, exercising the independent branch.
+        // booking.getSalon() is unstubbed on this mock -> null, exercising the independent branch.
+        // The master HAS since joined a salon (phase 242's four-case table, row 3): the visit was
+        // genuinely at the master's own address, so the salon must not be consulted at all.
+        var laterSalon = mock(Salon.class);
+        lenient().when(laterSalon.getName()).thenReturn("Joined-Later Studio");
+        lenient().when(laterSalon.getLocationNote()).thenReturn("Later salon note — must NOT surface");
+        when(master.getSalon()).thenReturn(laterSalon);
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
 
@@ -220,15 +227,15 @@ class BookingDetailResponseTest {
     }
 
     @Test
-    @DisplayName("locationNote resolves from the SALON, never the master's own note, when the master is salon-employed")
+    @DisplayName("locationNote resolves from the BOOKED salon, never the master's own note, when "
+            + "the visit was made at a salon")
     void should_resolveLocationNoteFromSalon_when_masterIsSalonEmployed() {
         // The master's own note is set to a DIFFERENT value to prove the salon wins.
         when(masterUser.getLocationNote()).thenReturn("Master's own note — must NOT surface");
         var salon = mock(Salon.class);
         when(salon.getName()).thenReturn("Glamour Studio");
         when(salon.getLocationNote()).thenReturn("3-й поверх, код 1234");
-        var master = booking.getMaster();
-        when(master.getSalon()).thenReturn(salon);
+        when(booking.getSalon()).thenReturn(salon);
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
 
@@ -536,31 +543,50 @@ class BookingDetailResponseTest {
                 .isNull();
     }
 
+    /**
+     * Phase 242 — the whole address block follows the BOOKING's salon.
+     *
+     * <p>Both salon mocks stub EVERY read the mapper makes, with DISTINCT non-null values. That is
+     * load-bearing, not thoroughness: an unstubbed getter returns {@code null} on both sides, which
+     * makes {@code isNotEqualTo(salonB…)} pass vacuously and turns the security assertion into a
+     * no-op — the exact trap this DTO's test history is full of.
+     */
     @Test
-    @DisplayName("salonId follows the BOOKING's salon, not the master's current one — after a salon "
-            + "rotation the two disagree and salonName tracks the master while salonId does not")
+    @DisplayName("the whole address block follows the BOOKING's salon after a rotation — salonName, "
+            + "street, buildingNo and locationNote are salon A's, and NEVER salon B's")
     void should_useBookingSalon_when_masterHasRotatedToADifferentSalon() {
         UUID bookedSalonId = UUID.randomUUID();
         UUID currentSalonId = UUID.randomUUID();
 
-        // The salon the visit was actually booked at (bookings.salon_id).
+        // Salon A — where the visit was actually booked (bookings.salon_id).
         var bookedSalon = mock(Salon.class);
         when(bookedSalon.getId()).thenReturn(bookedSalonId);
+        when(bookedSalon.getName()).thenReturn("Booked Studio A");
+        when(bookedSalon.getStreet()).thenReturn("Volodymyrska");
+        when(bookedSalon.getBuildingNo()).thenReturn("55");
+        when(bookedSalon.getLocationNote()).thenReturn("A: 3-й поверх, код 1234");
         when(booking.getSalon()).thenReturn(bookedSalon);
 
-        // The salon the master works at TODAY (masters.salon_id) — a different row.
+        // Salon B — where the master works TODAY (masters.salon_id), a different row with a
+        // different door code. Nothing about it may reach the response.
         var currentSalon = mock(Salon.class);
-        when(currentSalon.getName()).thenReturn("Glamour Studio");
-        // QA (B2 audit): getId() is stubbed even though the CORRECT implementation never calls it.
-        // Without it a `master.getSalon().getId()` regression fails here with `null` — the same
-        // failure a mapper that dropped the field entirely would produce — and the
-        // `.isNotEqualTo(currentSalonId)` assertion below is dead, comparing against a UUID no
-        // code path can return. Stubbing makes the wrong-source mutation fail with the wrong
-        // SALON's id, which is both the diagnostic message a reader needs and the only thing that
-        // gives that assertion power. Safe to stub unused: this class uses plain mock() with no
+        // Every getter is stubbed even though the CORRECT implementation calls none of them: a
+        // wrong-source regression then fails with salon B's actual value (a readable diagnostic),
+        // and the isNotEqualTo assertions below compare against values a code path can really
+        // return instead of being dead. Safe to stub unused — this class uses plain mock() with no
         // MockitoExtension, so strict stubs are not in force.
-        when(currentSalon.getId()).thenReturn(currentSalonId);
+        lenient().when(currentSalon.getId()).thenReturn(currentSalonId);
+        lenient().when(currentSalon.getName()).thenReturn("Glamour Studio B");
+        lenient().when(currentSalon.getStreet()).thenReturn("Khreshchatyk");
+        lenient().when(currentSalon.getBuildingNo()).thenReturn("22");
+        lenient().when(currentSalon.getLocationNote()).thenReturn("B: 5-й поверх, код 9999");
         when(master.getSalon()).thenReturn(currentSalon);
+
+        // The master's own personal row differs again — it must not surface either, because the
+        // booking DOES carry a salon (the COALESCE-fallthrough guard, unchanged by phase 242).
+        when(masterUser.getStreet()).thenReturn("Master's own street — must NOT surface");
+        when(masterUser.getBuildingNo()).thenReturn("MASTER-99");
+        when(masterUser.getLocationNote()).thenReturn("Master's own note — must NOT surface");
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
 
@@ -570,7 +596,24 @@ class BookingDetailResponseTest {
                 .isEqualTo(bookedSalonId)
                 .isNotEqualTo(currentSalonId);
         assertThat(response.salonName())
-                .as("salonName is unchanged by B2 — it still resolves off master.getSalon()")
-                .isEqualTo("Glamour Studio");
+                .as("phase 242 INVERTED this: salonName used to track master.getSalon() and now "
+                        + "shares salonId's source — the two can no longer disagree")
+                .isEqualTo("Booked Studio A")
+                .isNotEqualTo("Glamour Studio B");
+        assertThat(response.street())
+                .isEqualTo("Volodymyrska")
+                .isNotEqualTo("Khreshchatyk");
+        assertThat(response.buildingNo())
+                .isEqualTo("55")
+                .isNotEqualTo("22");
+        // THE security assertion. locationNote holds door codes by its own @Schema contract, so
+        // serving salon B's to a client who only ever booked at salon A hands out premises access
+        // they were never granted. The negative is asserted explicitly: a positive-only check
+        // would pass even if both fixtures happened to carry the same note.
+        assertThat(response.locationNote())
+                .as("the client booked at salon A — they must get A's door code and NEVER B's")
+                .isEqualTo("A: 3-й поверх, код 1234")
+                .isNotEqualTo("B: 5-й поверх, код 9999")
+                .isNotEqualTo("Master's own note — must NOT surface");
     }
 }

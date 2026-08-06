@@ -57,7 +57,10 @@ public record AppointmentDetailResponse(
         String masterAvatarUrl,
         Role masterType,
         @Schema(types = {"string", "null"}, nullable = true,
-                description = "The salon name, or null for an independent master.")
+                description = "The name of the salon THIS VISIT was booked at (the visit's own "
+                        + "salon snapshot), or null when the visit was with an independent master. "
+                        + "Not the master's current affiliation — a master who has since moved "
+                        + "salons does not rewrite a past visit's premises.")
         String salonName,
         ZonedDateTime startsAt,
         ZonedDateTime endsAt,
@@ -97,16 +100,20 @@ public record AppointmentDetailResponse(
                 description = "Discovery district label (Ukrainian). Same resolution as cityLabel.")
         String districtLabel,
         @Schema(types = {"string", "null"}, nullable = true,
-                description = "Arrival street — the salon's when salon-employed, else the master's "
-                        + "own. Same salon-vs-independent rule as BookingDetailResponse.street; a "
-                        + "salon-employed master's PERSONAL street never leaks onto a salon visit.")
+                description = "Arrival street — the BOOKED salon's when the visit was made at a "
+                        + "salon, else the master's own. Same salon-vs-independent rule as "
+                        + "BookingDetailResponse.street, resolved against the visit's own salon "
+                        + "snapshot: a salon-employed master's PERSONAL street never leaks onto a "
+                        + "salon visit, AND a master who has since moved salons cannot cause this "
+                        + "visit to display the address of premises it was never booked at.")
         String street,
         @Schema(types = {"string", "null"}, nullable = true, description = "Arrival building number.")
         String buildingNo,
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Provider's free-text arrival hint (e.g. \"3-й поверх, код 1234\"). "
-                        + "Same salon-vs-independent resolution as street/buildingNo — a salon "
-                        + "booking surfaces the salon's own note, never the master's personal one.")
+                        + "Same salon-vs-independent resolution as street/buildingNo, against the "
+                        + "salon THIS VISIT was booked at — never the master's personal note, and "
+                        + "never a salon the master merely works at today.")
         String locationNote
 ) {
 
@@ -114,9 +121,11 @@ public record AppointmentDetailResponse(
      * Builds the visit view from the appointment header and its ordered, fully-hydrated chained
      * booking rows. {@code orderedItems} MUST be non-empty and sorted by {@code startsAt} ascending
      * (as {@code BookingRepository#findByAppointmentIdWithGraph} returns them), and each row MUST
-     * carry its {@code master.user}, {@code master.salon} and {@code masterService.serviceDefinition}
-     * graph hydrated. The master summary is read off the first item (single master per visit — a
-     * locked invariant).
+     * carry its {@code master.user}, <b>{@code booking.salon}</b> and
+     * {@code masterService.serviceDefinition} graph hydrated. The master summary is read off the
+     * first item (single master per visit — a locked invariant), and so is the address block,
+     * which since phase 242 comes from that item's own salon snapshot rather than
+     * {@code master.getSalon()}.
      */
     public static AppointmentDetailResponse from(
             Appointment appointment, List<Booking> orderedItems,
@@ -124,11 +133,17 @@ public record AppointmentDetailResponse(
         Booking first = orderedItems.get(0);
         Master master = first.getMaster();
         User masterUser = master.getUser();
-        Salon salon = master.getSalon();
+        // Phase 242 — the ITEM's own salon snapshot (bookings.salon_id), NEVER master.getSalon().
+        // Every item of a visit is stamped with the same salon at creation (AppointmentService/
+        // GuestBookingService both write master.getSalon() onto the header AND each row), and a
+        // per-item reschedule never rewrites it, so item 0's snapshot IS the visit's salon —
+        // reading it off the already-fetched item costs nothing, whereas appointment.getSalon()
+        // would lazy-load a proxy off the un-graphed appointmentRepository.findById.
+        Salon salon = first.getSalon();
 
-        // Same salon-vs-independent PII rule as BookingDetailResponse#from — the salon's own values
-        // win outright when salon-employed (even when null), so a salon-master's personal address
-        // never leaks onto a salon visit.
+        // Same salon-vs-independent PII rule as BookingDetailResponse#from — the booked salon's own
+        // values win outright when the visit was at a salon (even when null), so a salon-master's
+        // personal address never leaks onto a salon visit.
         String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
         String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
         String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
