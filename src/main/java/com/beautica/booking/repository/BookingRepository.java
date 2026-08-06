@@ -301,6 +301,13 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * BookingDetailResponse#masterAvgRatingOrNull}, shared with the entity mapper path so the two
      * cannot drift.
      *
+     * <p>Phase B2's {@code b.salon.id} is an implicit identifier path on a {@code @ManyToOne}: it
+     * reads the {@code salon_id} FK column already present on the {@code bookings} row and adds NO
+     * join — the same shape as {@code b.appointment.id} above. It is deliberately NOT {@code s.id}
+     * off the {@code LEFT JOIN m.salon s} below: that alias is the master's LIVE salon, while the
+     * review (and therefore the salon aggregate a client must invalidate) is stamped with
+     * {@code booking.salon}. The two diverge for any booking made before a salon rotation.
+     *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
      * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
@@ -396,7 +403,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.appointment.id,
                 b.client.avatarUrl,
                 m.avgRating,
-                m.reviewCount
+                m.reviewCount,
+                b.salon.id
             )
             FROM Booking b
             JOIN b.client

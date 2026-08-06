@@ -346,6 +346,10 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         "Ring the bell twice",
                         "MANICURE",
                         false);
+        assertThat(p.salonId())
+                .as("Phase B2 — an independent master's booking has a NULL salon_id, and the "
+                        + "SELECT-only FK path must leave the row in the result, not filter it out")
+                .isNull();
     }
 
     // ── masterProfessionalTitle round-trip (Anti-Bug audit LOW-2) ────────────────
@@ -481,6 +485,68 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         "55",
                         "3rd floor, door code 1234",
                         "PEDICURE");
+        assertThat(p.salonId())
+                .as("Phase B2 — the booking's own salon_id, selected as the b.salon.id FK")
+                .isEqualTo(salon.getId());
+    }
+
+    // ── Phase B2 — salonId comes from b.salon, NOT from the master's live salon join ─
+    //
+    // Every other fixture in this class books a master at the salon they still work at, so
+    // `b.salon.id` and `s.id` are the same value and no existing assertion can tell an
+    // implementation that selects the wrong one apart. This test is the only place where the
+    // two diverge. It matters because ReviewService#createReview stamps the review with
+    // `booking.getSalon()` and publishes that id on ReviewCreatedEvent — so `b.salon.id` is the
+    // salon whose avg_rating/review_count actually moved, and the id a client must use to
+    // invalidate its salon-scoped caches. Selecting `s.id` here would silently point a rotated
+    // master's past bookings at the wrong salon.
+
+    @Test
+    @DisplayName("salonId is the BOOKING's own salon_id, never the master's CURRENT salon — after a "
+            + "salon rotation the projection's salonId and salonName deliberately disagree")
+    void should_projectBookingSalonId_when_masterHasSinceRotatedToAnotherSalon() {
+        UUID[] tax = persistTaxonomy();
+
+        User ownerUser = new User(
+                "owner-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash", Role.SALON_OWNER, "Owner", "Person", "+380503333333");
+        em.persist(ownerUser);
+
+        Salon bookedSalon = Salon.builder()
+                .owner(ownerUser).name("Booked Salon").isActive(true).build();
+        em.persist(bookedSalon);
+        Salon currentSalon = Salon.builder()
+                .owner(ownerUser).name("Current Salon").isActive(true).build();
+        em.persist(currentSalon);
+
+        User masterUser = persistMasterUser(
+                Role.SALON_MASTER, tax[0], tax[1], "OwnStreet", "99", "https://cdn.test/m.png");
+        Master master = persistMaster(masterUser, bookedSalon, MasterType.SALON_MASTER);
+        MasterServiceAssignment msa = persistService(
+                master, OwnerType.SALON, bookedSalon.getId(), "Pedicure", "PEDICURE");
+        persistBooking(master, msa, bookedSalon, BookingStatus.CONFIRMED,
+                OffsetDateTime.of(2026, 6, 3, 12, 0, 0, 0, ZoneOffset.UTC));
+
+        // The master moves salons AFTER the booking was made. bookings.salon_id is a snapshot and
+        // does not follow; masters.salon_id does.
+        master.setSalon(currentSalon);
+        em.persist(master);
+        em.flush();
+        em.clear();
+
+        Page<ClientBookingDetailProjection> page = findClientBookingDetails(
+                clientUser.getId(), null, null, null, null, PageRequest.of(0, 20));
+
+        assertThat(page.getContent()).hasSize(1);
+        ClientBookingDetailProjection p = page.getContent().get(0);
+        assertThat(p.salonId())
+                .as("must be b.salon.id (the booking's snapshot); selecting s.id off the "
+                        + "LEFT JOIN m.salon would yield the master's CURRENT salon instead")
+                .isEqualTo(bookedSalon.getId())
+                .isNotEqualTo(currentSalon.getId());
+        assertThat(p.salonName())
+                .as("salonName is unchanged by B2 — it still resolves off the master's live salon")
+                .isEqualTo("Current Salon");
     }
 
     // ── salon-employed master, salon has NO note (COALESCE-fallthrough regression) ─

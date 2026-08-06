@@ -108,6 +108,16 @@ public record ClientBookingDetailProjection(
         // the String clientAvatarUrl, for the same compile-time-slip-detection reason as
         // priceMaxAtBooking above.
         BigDecimal masterAvgRating,
-        int masterReviewCount
+        int masterReviewCount,
+        // Phase B2: the booking's OWN salon snapshot, selected as `b.salon.id` — an implicit
+        // identifier path on a @ManyToOne, which reads the FK column already on the `bookings` row
+        // and adds NO join (the same SELECT-only shape as appointmentId above; a null FK yields
+        // null here and the row is NOT filtered out, so an independent master's booking still
+        // appears). Deliberately NOT `s.id` off the existing `LEFT JOIN m.salon s`: that alias is
+        // the master's LIVE salon, whereas the review — and therefore the salon aggregate the
+        // client must invalidate — is stamped with booking.salon (ReviewService#createReview).
+        // The two differ for any booking made before a master rotated salons; see
+        // BookingDetailResponse's class javadoc.
+        UUID salonId
 ) {
 }

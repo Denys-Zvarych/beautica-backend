@@ -167,6 +167,19 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo(MASTER_AVG_RATING);
         assertThat(single.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
         assertThat(listItem.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
+
+        // salonId non-vacuity (Phase B2). The reflective loop above already compares the field,
+        // but it would compare null == null for an independent master's booking; this fixture
+        // seeds bookings.salon_id explicitly (see insertConfirmedBooking). The two paths read it
+        // physically differently — the entity path walks booking.getSalon().getId(), the CLIENT
+        // projection path selects the `b.salon.id` FK in JPQL — so this also pins that the JPQL
+        // identifier path resolves at all.
+        assertThat(single.get("salonId").asText())
+                .as("entity path (GET /bookings/{id}) must serve the booking's own salon_id")
+                .isEqualTo(fx.salonId().toString());
+        assertThat(listItem.get("salonId").asText())
+                .as("CLIENT projection path (GET /bookings/me) must serve the same salon_id")
+                .isEqualTo(fx.salonId().toString());
     }
 
     /**

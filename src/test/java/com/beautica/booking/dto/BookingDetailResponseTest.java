@@ -501,4 +501,67 @@ class BookingDetailResponseTest {
         assertThat(BookingDetailResponse.masterAvgRatingOrNull(1, new BigDecimal("1.00")))
                 .isEqualByComparingTo(new BigDecimal("1.00"));
     }
+
+    // ── Phase B2 — the booking's salon snapshot ───────────────────────────────────────────────
+    //    salonId must come from booking.getSalon() — the row ReviewService#createReview stamps
+    //    onto the review and publishes on ReviewCreatedEvent — and NOT from master.getSalon(),
+    //    which is the master's LIVE affiliation. The two diverge after a salon rotation, and a
+    //    master-derived id would have the mobile client invalidate the wrong salon's caches.
+
+    @Test
+    @DisplayName("salonId is read from the BOOKING's own salon when the booking was made at a salon")
+    void should_mapSalonId_when_bookingCarriesSalon() {
+        UUID salonId = UUID.randomUUID();
+        var bookingSalon = mock(Salon.class);
+        when(bookingSalon.getId()).thenReturn(salonId);
+        when(booking.getSalon()).thenReturn(bookingSalon);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.salonId()).isEqualTo(salonId);
+    }
+
+    @Test
+    @DisplayName("salonId is NULL for an independent master's booking, and the booking still maps "
+            + "cleanly (no NPE, nothing dropped)")
+    void should_returnNullSalonId_when_bookingHasNoSalon() {
+        // booking.getSalon() is unstubbed — Mockito returns null, exactly like an
+        // INDEPENDENT_MASTER row whose salon_id is NULL.
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.salonId()).isNull();
+        assertThat(response.id()).isEqualTo(bookingId);
+        assertThat(response.salonName())
+                .as("master has no salon either, so the display name is null too")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("salonId follows the BOOKING's salon, not the master's current one — after a salon "
+            + "rotation the two disagree and salonName tracks the master while salonId does not")
+    void should_useBookingSalon_when_masterHasRotatedToADifferentSalon() {
+        UUID bookedSalonId = UUID.randomUUID();
+        UUID currentSalonId = UUID.randomUUID();
+
+        // The salon the visit was actually booked at (bookings.salon_id).
+        var bookedSalon = mock(Salon.class);
+        when(bookedSalon.getId()).thenReturn(bookedSalonId);
+        when(booking.getSalon()).thenReturn(bookedSalon);
+
+        // The salon the master works at TODAY (masters.salon_id) — a different row.
+        var currentSalon = mock(Salon.class);
+        when(currentSalon.getName()).thenReturn("Glamour Studio");
+        when(master.getSalon()).thenReturn(currentSalon);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.salonId())
+                .as("the review is stamped with booking.salon, so that is the id whose aggregates "
+                        + "moved and the one the client must invalidate")
+                .isEqualTo(bookedSalonId)
+                .isNotEqualTo(currentSalonId);
+        assertThat(response.salonName())
+                .as("salonName is unchanged by B2 — it still resolves off master.getSalon()")
+                .isEqualTo("Glamour Studio");
+    }
 }

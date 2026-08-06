@@ -142,7 +142,10 @@ class BookingControllerTest {
                 // masterAvgRating / masterReviewCount (Phase B1 additive) — BookingService is
                 // mocked in this slice, so these are literal stub values; the zero-review
                 // normalisation itself is pinned by BookingDetailResponseTest.
-                new BigDecimal("4.75"), 12
+                new BigDecimal("4.75"), 12,
+                // salonId (Phase B2 additive) — this stub's master is INDEPENDENT_MASTER (see
+                // masterType above), so null is the consistent value.
+                null
         );
     }
 

@@ -171,6 +171,23 @@ import java.util.UUID;
  * "recalculate on write, read persisted on read" contract. Neither is aggregated at read time, so
  * neither adds a query, a join, or an N+1 on any path — see {@link #masterAvgRatingOrNull} for the
  * zero-review normalisation both mapper paths share.
+ *
+ * <p><b>Phase B2 — {@code salonId}.</b> The booking's own {@code salon_id} snapshot, exposed so the
+ * mobile client can invalidate its salon-scoped review caches once a review lands (the salon half of
+ * the master fan-out shipped in mobile {@code 848e8929}). It is deliberately read from
+ * {@code booking.getSalon()} and NOT from {@code master.getSalon()}: {@code ReviewService#createReview}
+ * stamps the review with {@code .salon(booking.getSalon())} and publishes {@code ReviewCreatedEvent}
+ * with that same id, so the booking's snapshot — not the master's current affiliation — is the salon
+ * whose {@code avg_rating}/{@code review_count} actually moved. A {@code master.salon}-derived id
+ * would point at the wrong salon for any booking made before a salon rotation.
+ *
+ * <p><b>Consequence, deliberate and not to be "fixed" opportunistically:</b> {@code salonId} and
+ * {@code salonName} have DIFFERENT sources. {@code salonName} — and with it the whole
+ * {@code street}/{@code buildingNo}/{@code locationNote} precedence block — resolves off
+ * {@code master.getSalon()} on both mapper paths ({@link #from} below, and the projection's
+ * {@code LEFT JOIN m.salon s}). The two can disagree after a master moves salons. That block is a
+ * documented PII contract with its own tests; re-sourcing it onto {@code booking.salon} is a separate
+ * decision with its own blast radius, not a side effect of this field.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -316,7 +333,25 @@ public record BookingDetailResponse(
                         + "unreviewed master (a true fact, unlike a 0.00 average) and non-null on "
                         + "every path that serves this DTO today; typed nullable so a client "
                         + "treats an absent value as 'unknown' rather than 'zero reviews'.")
-        Integer masterReviewCount
+        Integer masterReviewCount,
+        // Phase B2. Appended LAST for the same reason as every field above it. NOTE the type
+        // adjacency: this UUID follows an Integer and a BigDecimal, so a transposition with either
+        // fails to compile — but if a future field of type UUID is appended alongside it, that
+        // protection lapses and the pair must be checked by hand.
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "The salon this booking was made AT, as snapshotted on the booking "
+                        + "row (bookings.salon_id). NULL for an INDEPENDENT_MASTER booking. Exists "
+                        + "so a client can invalidate its own salon-scoped caches after leaving a "
+                        + "review: ReviewService#createReview stamps the review with "
+                        + "booking.getSalon() and ReviewEventListener recalculates THAT salon's "
+                        + "avg_rating/review_count, so this is the id whose aggregates moved. NOT "
+                        + "interchangeable with salonName: this comes from the BOOKING's snapshot "
+                        + "while salonName and the street/buildingNo/locationNote block come from "
+                        + "the master's LIVE salon, so the two can disagree after a master rotates "
+                        + "salons. Do NOT use salonId != null to decide whether a booking is 'at a "
+                        + "salon' and do NOT use it to link to a salon profile — salonName != null "
+                        + "remains that predicate.")
+        UUID salonId
 ) {
 
     /**
@@ -452,7 +487,15 @@ public record BookingDetailResponse(
                 // widening of either fetch graph. They are denormalized columns (V4), NOT a live
                 // aggregate — do not "fix" this into a count/avg query.
                 masterAvgRatingOrNull(master.getReviewCount(), master.getAvgRating()),
-                master.getReviewCount()
+                master.getReviewCount(),
+                // Phase B2 — `booking.getSalon()`, NOT the `salon` local above (which is
+                // `master.getSalon()`, the master's LIVE affiliation). The review is stamped with
+                // booking.salon by ReviewService#createReview, so that is the id whose aggregates
+                // the client must invalidate. Same cost shape as appointmentId: `salon` is a LAZY
+                // @ManyToOne on a nullable FK, and Hibernate serves an identifier off an
+                // uninitialised proxy, so this reads with no extra SELECT and requires no widening
+                // of findByIdWithFullGraph / findAllByIdsWithGraph.
+                booking.getSalon() != null ? booking.getSalon().getId() : null
         );
     }
 }

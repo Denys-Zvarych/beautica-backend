@@ -380,7 +380,10 @@ public class BookingService {
                 // about what a zero-review master's rating is (BookingDetailContractIT's reflective
                 // parity loop covers this field automatically).
                 BookingDetailResponse.masterAvgRatingOrNull(p.masterReviewCount(), p.masterAvgRating()),
-                p.masterReviewCount());
+                p.masterReviewCount(),
+                // Phase B2 — the booking's own salon snapshot (b.salon.id), NOT p.salonName()'s
+                // source (m.salon). Nullable for an independent master's booking.
+                p.salonId());
     }
 
     /**

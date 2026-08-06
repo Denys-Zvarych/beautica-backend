@@ -2157,7 +2157,10 @@ class BookingServiceTest {
                 "https://cdn.test/client-avatar.png",
                 // Phase B1 — a REVIEWED master (count > 0), so the zero-review normalisation is
                 // not the branch under test here; the null case has its own test below.
-                new BigDecimal("4.75"), 12);
+                new BigDecimal("4.75"), 12,
+                // Phase B2 salonId — this fixture is an INDEPENDENT_MASTER row, so null is the
+                // correct value; the salon case has its own fixture below.
+                null);
     }
 
     @Test
@@ -2224,7 +2227,9 @@ class BookingServiceTest {
                 // clientAvatarUrl — irrelevant to this fixture's price-ceiling assertions.
                 null,
                 // Phase B1 masterAvgRating/masterReviewCount — irrelevant here too.
-                new BigDecimal("4.20"), 3);
+                new BigDecimal("4.20"), 3,
+                // Phase B2 salonId — irrelevant to price-ceiling assertions.
+                null);
     }
 
     private com.beautica.booking.dto.BookingDetailResponse firstClientRowFor(
@@ -2286,7 +2291,9 @@ class BookingServiceTest {
                 null,
                 null,
                 null,
-                masterAvgRating, masterReviewCount);
+                masterAvgRating, masterReviewCount,
+                // Phase B2 salonId — irrelevant to the rating normalisation.
+                null);
     }
 
     @Test
@@ -2306,6 +2313,73 @@ class BookingServiceTest {
 
         assertThat(booking.masterAvgRating()).isNull();
         assertThat(booking.masterReviewCount()).isZero();
+    }
+
+    // ── Phase B2 — the booking's salon snapshot on the CLIENT projection path ──────────────────
+    //    The projection selects b.salon.id (the BOOKING's own FK), not s.id off the master's live
+    //    salon join. The service must pass it through untouched so GET /bookings/me and
+    //    GET /bookings/{id} carry the same key the mobile client uses to invalidate its
+    //    salon-scoped review caches.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithSalon(
+            UUID salonId, String salonName) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.SALON_MASTER, salonName,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false,
+                null,
+                null,
+                null,
+                new BigDecimal("4.20"), 3,
+                salonId);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) surfaces the booking's salonId from the projection")
+    void should_surfaceSalonId_when_clientProjectionRowCarriesSalon() {
+        UUID salonId = UUID.randomUUID();
+
+        var booking = firstClientRowFor(clientProjectionRowWithSalon(salonId, "Salon Bookings"));
+
+        assertThat(booking.salonId()).isEqualTo(salonId);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) leaves salonId null for an independent master's booking — "
+            + "the row is still returned, never filtered out")
+    void should_returnNullSalonId_when_clientProjectionRowHasNoSalon() {
+        var booking = firstClientRowFor(clientProjectionRowWithSalon(null, null));
+
+        assertThat(booking.salonId()).isNull();
+        assertThat(booking.id()).isEqualTo(bookingId);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) keeps salonId and salonName independent — the projection's "
+            + "two salon sources (b.salon vs m.salon) are passed through separately, never derived "
+            + "from one another")
+    void should_keepSalonIdAndSalonNameIndependent_when_theyDisagree() {
+        UUID bookingSalonId = UUID.randomUUID();
+
+        // The row a post-rotation booking produces: b.salon.id is the salon the visit was booked
+        // at, while s.name comes from the master's CURRENT salon.
+        var booking = firstClientRowFor(
+                clientProjectionRowWithSalon(bookingSalonId, "Master's current salon"));
+
+        assertThat(booking.salonId())
+                .as("salonId must be the booking's own snapshot, not re-derived from salonName")
+                .isEqualTo(bookingSalonId);
+        assertThat(booking.salonName()).isEqualTo("Master's current salon");
     }
 
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
@@ -2329,7 +2403,9 @@ class BookingServiceTest {
                 // clientAvatarUrl — irrelevant to this fixture's ordering assertions.
                 null,
                 // Phase B1 masterAvgRating/masterReviewCount — irrelevant to ordering.
-                new BigDecimal("4.20"), 3);
+                new BigDecimal("4.20"), 3,
+                // Phase B2 salonId — irrelevant to ordering.
+                null);
     }
 
     // ── Phase 26.7.1 security finding (LOW): the CLIENT branch's order re-imposition had no
