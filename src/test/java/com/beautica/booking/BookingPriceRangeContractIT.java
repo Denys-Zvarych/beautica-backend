@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
+import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
@@ -1381,43 +1382,53 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Phase-242 QA audit, finding 2 — the {@code enforceCanViewBooking} reorder buys the owning
-     * CLIENT <b>nothing on this surface</b>, and the audit-fix batch's javadoc must not be read as
-     * though it did.
+     * Phase-242 QA audit, finding 2 — <b>INVERTED</b> once the walk was actually removed. This gate
+     * was authored asserting {@code rotated == aligned + 1}, i.e. that the owning CLIENT still paid
+     * the live-salon load on this surface; it now asserts the opposite, on the same fixture.
      *
-     * <p>That reorder hoisted the client probe above {@code isAuthorizedToManageBooking} so the
-     * owning client no longer pays its {@code master.getSalon().getOwner()} proxy-initialising
-     * walk. On {@code GET /appointments/&#123;id&#125;} that is a genuine saving —
-     * {@code AppointmentReadIT.VISIT_DETAIL_STATEMENTS} dropped 5 &rarr; 4 because of it.
-     * {@code GET /bookings/&#123;id&#125;} does <b>not</b> get it: {@code BookingService#getBooking}
-     * re-enters the identical walk a few statements later through
-     * {@code computeProviderCanReviewClient} &rarr;
+     * <p>History, because the direction is the whole point. The phase-242 audit-fix batch hoisted
+     * the owning-client probe above {@code isAuthorizedToManageBooking} in
+     * {@code AuthorizationService#enforceCanViewBooking}, so the client no longer paid its
+     * {@code master.getSalon().getOwner()} proxy-initialising walk. That fixed
+     * {@code GET /appointments/&#123;id&#125;} ({@code AppointmentReadIT.VISIT_DETAIL_STATEMENTS}
+     * dropped 5 &rarr; 4) and <b>nothing else</b>: {@code BookingService#getBooking} re-entered the
+     * identical walk a few statements later through {@code computeProviderCanReviewClient} &rarr;
      * {@code AuthorizationService#hasProviderAuthorityOverBooking}, unconditionally, for every
-     * viewer class including a CLIENT (that predicate reads {@code master.getSalon()} then
-     * {@code salon.getOwner()} before it can conclude "not a provider"). So a client reading a
-     * booking whose salon diverges from its master's live salon still pays exactly one standalone
-     * {@code SELECT ... FROM salons}.
+     * viewer class including a CLIENT. That method now gates on
+     * {@code AuthorizationService#isOwningClientViewer} — the SAME classification
+     * {@code enforceCanViewBooking} already computed, so no extra {@code SecurityContext} read and
+     * no extra query — and the client pays nothing.
      *
-     * <p>Asserted as a DIFFERENCE against the aligned shape rather than as a second absolute
+     * <p>Still asserted as a DIFFERENCE against the aligned shape rather than as an absolute
      * constant, so it needs no separately derived number and cannot drift out of step with
-     * {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}. Both directions are meaningful:
-     * <ul>
-     *   <li>more than one extra statement is a new regression;</li>
-     *   <li>EQUAL means the walk was finally taken off the client path — genuinely good news, but
-     *       it also invalidates {@link #OWNER_DETAIL_STATEMENTS_ROTATED}. Re-derive both rather
-     *       than deleting this gate, or the improvement lands with no gate watching it.</li>
-     * </ul>
+     * {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}. Any excess is a regression: the only statement that
+     * could reappear here is the master's LIVE {@code salons} row, a row this response never
+     * renders. {@link #OWNER_DETAIL_STATEMENTS_ROTATED} is NOT affected and must not be
+     * re-derived from this — the salon OWNER genuinely still needs that row to authorize, and pays
+     * for it in {@code enforceCanViewBooking} before {@code computeProviderCanReviewClient} is ever
+     * reached.
+     *
+     * <p><b>The fixture is COMPLETED on purpose.</b> On a future {@code CONFIRMED} booking
+     * {@code BookingClosureRule#isReviewEligible} is false, so a later reordering of
+     * {@code computeProviderCanReviewClient}'s conjuncts could suppress the walk for a reason that
+     * has nothing to do with the viewer, and this gate would pass vacuously. {@code COMPLETED}
+     * makes every other conjunct true, so the viewer gate is the only thing that can keep the count
+     * flat.
+     *
+     * <p>The {@code providerCanReviewClient} assertions are the behaviour half: the flag the gate
+     * protects must read {@code false} for this viewer on BOTH shapes, exactly as it did before the
+     * gate existed. A cost fix that flipped a CTA would be a product bug, not an optimisation.
      *
      * <p>The two reads are warmed first: {@code DiscoveryLocationResolver}'s label lookups are
      * cached, so whichever read ran first would otherwise absorb them and the difference under
      * test would be a caching artefact rather than the salon walk.
      */
     @Test
-    @DisplayName("GET /bookings/{id} read by the OWNING CLIENT still costs one extra statement when "
-            + "the booking's salon diverges from the master's live one — the client fast path in "
-            + "enforceCanViewBooking does not save it, computeProviderCanReviewClient re-enters "
-            + "the same getSalon().getOwner() walk")
-    void should_stillPayTheLiveSalonWalk_when_theOwningClientReadsADivergentSalonBooking() {
+    @DisplayName("GET /bookings/{id} read by the OWNING CLIENT costs the SAME whether or not the "
+            + "booking's salon diverges from the master's live one — computeProviderCanReviewClient "
+            + "no longer re-enters the getSalon().getOwner() walk that enforceCanViewBooking "
+            + "already short-circuits for this viewer")
+    void should_notPayTheLiveSalonWalk_when_theOwningClientReadsADivergentSalonBooking() {
         var salon = fixtures.createSalon("bprc-client-rot-" + System.nanoTime() + "@beautica.test");
         UUID ownerId = jdbcTemplate.queryForObject(
                 "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
@@ -1435,13 +1446,14 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                         + "is between a value and itself")
                 .isNotEqualTo(salon.salonId());
 
-        // Same client, same master, same service, same locality — the ONLY difference between the
-        // two rows is which salon bookings.salon_id points at.
-        UUID alignedBookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
-                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+        // Same client, same master, same service, same locality, same COMPLETED status — the ONLY
+        // difference between the two rows is which salon bookings.salon_id points at.
+        UUID alignedBookingId = insertBooking(clientId, salon.masterId(), serviceId,
+                ANCHOR.minusYears(4), new BigDecimal("300.00"), new BigDecimal("500.00"),
+                "COMPLETED", salon.salonId());
         UUID rotatedBookingId = insertBooking(clientId, salon.masterId(), serviceId,
-                ANCHOR.plusDays(1), new BigDecimal("300.00"), new BigDecimal("500.00"),
-                "CONFIRMED", bookedElsewhereSalonId);
+                ANCHOR.minusYears(4).plusDays(1), new BigDecimal("300.00"), new BigDecimal("500.00"),
+                "COMPLETED", bookedElsewhereSalonId);
 
         SecurityContextHolder.getContext().setAuthentication(authFor(Role.CLIENT));
         try {
@@ -1467,14 +1479,26 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                             + "master.getSalon() is a genuine uninitialised proxy on that read")
                     .isEqualTo(bookedElsewhereSalonId)
                     .isNotEqualTo(salon.salonId());
+            assertThat(rotated.status())
+                    .as("premise — COMPLETED, so isReviewEligible is true and the viewer gate is "
+                            + "the ONLY conjunct that can keep computeProviderCanReviewClient off "
+                            + "the salon walk (see this test's javadoc)")
+                    .isEqualTo(BookingStatus.COMPLETED);
+            assertThat(rotated.providerCanReviewClient())
+                    .as("behaviour half — the CLIENT viewer never gets the provider-review CTA, "
+                            + "before or after the cost gate")
+                    .isFalse();
+            assertThat(aligned.providerCanReviewClient())
+                    .as("behaviour half — same on the aligned shape, which never paid the walk")
+                    .isFalse();
             assertThat(rotatedStatements)
-                    .as("aligned=%s, rotated=%s. Exactly one more, and that one is the master's "
-                            + "LIVE salons row opened by hasProviderAuthorityOverBooking's "
-                            + "getSalon().getOwner() property read inside "
-                            + "computeProviderCanReviewClient — NOT by enforceCanViewBooking, "
-                            + "which the audit-fix batch already short-circuits for this viewer.",
+                    .as("aligned=%s, rotated=%s. Equal: the master's LIVE salons row is no longer "
+                            + "opened for this viewer. One more would mean "
+                            + "hasProviderAuthorityOverBooking's getSalon().getOwner() property "
+                            + "read is back on the client path inside "
+                            + "computeProviderCanReviewClient.",
                             alignedStatements, rotatedStatements)
-                    .isEqualTo(alignedStatements + 1);
+                    .isEqualTo(alignedStatements);
         } finally {
             SecurityContextHolder.clearContext();
         }

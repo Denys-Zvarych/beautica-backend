@@ -273,7 +273,11 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * ({@code BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ROTATED}). The conclusion (free
      * on the aligned shape, which is what this list path serves) is unchanged; the stated reason
      * is. Since the phase-242 audit's finding 1, {@code AuthorizationService#enforceCanViewBooking}
-     * no longer runs that walk at all for the owning CLIENT.
+     * no longer runs that walk at all for the owning CLIENT; since its finding 2, neither does
+     * {@code BookingService#computeProviderCanReviewClient}, which used to re-enter the identical
+     * walk on {@code GET /bookings/&#123;id&#125;} a few statements later and cancelled out the
+     * first fix on that surface. The walk survives for the salon OWNER, who genuinely needs the
+     * row to authorize.
      *
      * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — as with
      * {@link #findByIdWithFullGraph}.

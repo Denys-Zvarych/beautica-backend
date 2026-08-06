@@ -711,7 +711,9 @@ public class AuthorizationService {
      * about it. The check that survives the reorder is the ROLE gate: a viewer who happens to sit
      * in {@code bookings.client_id} but does not carry {@code ROLE_CLIENT} is still not admitted
      * by this branch, exactly as before, and must earn access through
-     * {@link #isAuthorizedToManageBooking} below.
+     * {@link #isAuthorizedToManageBooking} below. That probe now lives in
+     * {@link #isOwningClientViewer} — extracted verbatim, same conjunct order, so
+     * {@code BookingService} can reuse the identical classification instead of re-deriving it.
      *
      * <p><b>Why the {@code SALON_MASTER} branch deliberately stays BELOW the manage check.</b>
      * Its identity probe ({@code master.getUser().getId() == actorUserId}) is the same probe
@@ -725,18 +727,7 @@ public class AuthorizationService {
      * {@code bookings.client_id}, which no manage predicate consults.
      */
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
-        // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) — a CLIENT can
-        // never own one, so null-guard rather than dereference getId() on null (regression: NPE'd
-        // into a 500 instead of the correct 403 here). getId() on an unfetched b.client proxy is
-        // an identifier read and issues no statement, so this probe is free even where the graph
-        // does not fetch the client (findByAppointmentIdWithGraph).
-        var client = booking.getClient();
-        if (client != null
-                && client.getId().equals(actorUserId)
-                // Finding 3: role is derived from the SecurityContext instead of a userRepository
-                // round-trip. The booking entity is already loaded by the caller, so all
-                // ownership fields are available in memory — no additional DB call is needed.
-                && roleFromCurrentAuthentication() == Role.CLIENT) {
+        if (isOwningClientViewer(actorUserId, booking)) {
             return;
         }
         if (isAuthorizedToManageBooking(actorUserId, booking)) {
@@ -750,6 +741,54 @@ public class AuthorizationService {
             return;
         }
         throw new ForbiddenException("Access denied");
+    }
+
+    /**
+     * Viewer classification: {@code true} iff the actor is the booking's OWN registered client,
+     * reading it as a {@code CLIENT}. This is the exact probe {@link #enforceCanViewBooking}
+     * hoisted to its first branch — extracted, not duplicated, so the two can never drift.
+     *
+     * <p><b>Free.</b> {@code getId()} on an unfetched {@code b.client} proxy is an identifier read
+     * that issues no statement, so this costs nothing even where the caller's graph does not fetch
+     * the client ({@code findByAppointmentIdWithGraph}). The role comes from the SecurityContext
+     * (already resolved by {@code JwtAuthenticationFilter}), never a {@code userRepository}
+     * round-trip.
+     *
+     * <p><b>Guest (LINK) bookings have a null client</b> (V89 {@code chk_bookings_guest_fields}) —
+     * a CLIENT can never own one, so the null guard comes first rather than dereferencing
+     * {@code getId()} on null (regression: that NPE'd into a 500 instead of the correct 403).
+     *
+     * <p><b>Conjunct order is load-bearing for the authentication contract, not for the result.</b>
+     * {@link #roleFromCurrentAuthentication} throws {@code ForbiddenException("Not authenticated")}
+     * when there is no {@code SecurityContext}, and it is evaluated LAST — only once the actor has
+     * already been shown to sit in {@code bookings.client_id}. Any caller for whom this method
+     * could throw is therefore a caller for whom {@link #enforceCanViewBooking} — which every
+     * consumer runs first, on the same booking, with the same actor — has already thrown. Direct
+     * (non-HTTP) service calls made by a provider actor with no {@code SecurityContext} (see
+     * {@code BookingPriceRangeContractIT}) short-circuit on the id comparison and never reach the
+     * role read, exactly as they do today.
+     *
+     * <p><b>Second consumer (phase-242 audit follow-up):</b>
+     * {@code BookingService#computeProviderCanReviewClient} uses it as a negative gate, so an
+     * owning-CLIENT viewer of {@code GET /bookings/{id}} no longer enters
+     * {@link #hasProviderAuthorityOverBooking(UUID, Booking)} and no longer pays its
+     * {@code master.getSalon().getOwner()} proxy-initialising walk. That gate cannot change the
+     * flag's value: when this method is {@code true} the actor is {@code bookings.client_id}, a
+     * row {@code BookingService}/{@code AppointmentService} assert to be a {@code Role.CLIENT} user
+     * at insert time and {@code User} exposes no {@code setRole} to change afterwards, so the actor
+     * is neither {@code masters.user_id} (INDEPENDENT_MASTER/SALON_MASTER/SALON_OWNER only) nor
+     * {@code salons.owner_id} (SALON_OWNER only) — both in-memory identity arms of that predicate
+     * are structurally false — and its remaining arm,
+     * {@link #hasManagementAccess(UUID, UUID, Role)} with {@code Role.CLIENT}, returns false
+     * unconditionally. {@code SALON_MASTER} is deliberately NOT gated here for the same reason
+     * {@link #enforceCanViewBooking} does not hoist its branch: doing so would force the role read
+     * for actors that today never touch the {@code SecurityContext}.
+     */
+    public boolean isOwningClientViewer(UUID actorUserId, Booking booking) {
+        var client = booking.getClient();
+        return client != null
+                && client.getId().equals(actorUserId)
+                && roleFromCurrentAuthentication() == Role.CLIENT;
     }
 
     /**

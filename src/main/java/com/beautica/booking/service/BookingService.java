@@ -208,11 +208,36 @@ public class BookingService {
      * exists for this booking. A CLIENT or SALON_MASTER viewer always fails condition (1), so this
      * correctly reads {@code false} for them without any special-casing here.
      *
+     * <p><b>Phase-242 QA audit, finding 2 (MEDIUM) — the leading
+     * {@link AuthorizationService#isOwningClientViewer} gate is a COST gate, not a decision.</b>
+     * Condition (1) reads {@code master.getSalon()} then {@code salon.getOwner()} before it can
+     * conclude "not a provider". {@code getOwner()} is a PROPERTY read, so it INITIALISES the
+     * {@code Salon} proxy, and since phase 242 re-pointed {@code findByIdWithFullGraph} to fetch
+     * {@code b.salon} instead of {@code m.salon} that walk issues a standalone
+     * {@code SELECT ... FROM salons} on any booking whose master has rotated salons since. The
+     * phase-242 audit-fix batch hoisted the same client probe inside
+     * {@code AuthorizationService#enforceCanViewBooking}, which fixed {@code GET /appointments/{id}}
+     * — but this method re-entered the identical walk a few statements later, so the owning CLIENT,
+     * the highest-volume viewer class of {@code GET /bookings/{id}}, kept paying it. Gating on the
+     * SAME classification {@code enforceCanViewBooking} already computed (no new
+     * {@code SecurityContext} read, no new query) takes it off the client path for good.
+     *
+     * <p>Sound because an owning-CLIENT viewer can never satisfy condition (1) — see
+     * {@link AuthorizationService#isOwningClientViewer}'s javadoc for the full argument
+     * ({@code bookings.client_id} is a {@code Role.CLIENT} row asserted at insert and immutable
+     * afterwards, so it is neither {@code masters.user_id} nor {@code salons.owner_id}, and the
+     * management-access arm is unconditionally false for {@code Role.CLIENT}). The gate can only
+     * ever remove a {@code true} the WRITE endpoint would have rejected anyway:
+     * {@code POST /client-reviews} is guarded by
+     * {@code @PreAuthorize @authz.canReviewClient(...)}, which denies {@code ROLE_CLIENT} outright
+     * with no DB hit. {@code SALON_MASTER} is deliberately not gated — see the same javadoc.
+     *
      * @param now the SAME already-resolved instant {@link #getBooking} uses for {@code canReview}
      *            and {@code awaitingClosure} — never a second, independently-resolved instant.
      */
     private boolean computeProviderCanReviewClient(UUID actorUserId, Booking booking, OffsetDateTime now) {
-        return authz.hasProviderAuthorityOverBooking(actorUserId, booking)
+        return !authz.isOwningClientViewer(actorUserId, booking)
+                && authz.hasProviderAuthorityOverBooking(actorUserId, booking)
                 && BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now)
                 && booking.getClient() != null
                 && !clientReviewRepository.existsByBookingId(booking.getId());
