@@ -19,5 +19,13 @@ import java.util.UUID;
  *                     master is an {@code INDEPENDENT_MASTER} with no salon. Drives the
  *                     symmetric salon-rating recalculation branch in
  *                     {@link ReviewEventListener#onReviewCreated}.
+ * @param clientId     the {@code users.id} of the review's AUTHOR — the client, not the reviewed
+ *                     provider. Added by the 2026-08 perf audit (F3) so
+ *                     {@link com.beautica.client.event.ClientPassportCacheEvictor} can drop that
+ *                     one client's cached BEAUTY PASSPORT, whose {@code reviewsWritten} line this
+ *                     write changes. Free at the publisher: {@code ReviewService#createReview}
+ *                     already receives the authenticated client id as its first argument.
+ *                     Distinct from {@code ClientReviewCreatedEvent}, which announces a review
+ *                     written ABOUT a client.
  */
-public record ReviewCreatedEvent(UUID masterId, UUID masterUserId, UUID salonId) {}
+public record ReviewCreatedEvent(UUID masterId, UUID masterUserId, UUID salonId, UUID clientId) {}

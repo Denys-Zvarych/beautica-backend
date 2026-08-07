@@ -81,7 +81,7 @@ class ReviewEventListenerTest {
     void should_logError_when_recalculateMasterRatingThrows() {
         // Arrange
         UUID masterId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
                 .when(reviewRepository).recalculateMasterRating(masterId);
@@ -110,7 +110,7 @@ class ReviewEventListenerTest {
     void should_notLogError_when_recalculateMasterRatingSucceeds() {
         // Arrange
         UUID masterId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null);
         // No stub for reviewRepository.recalculateMasterRating — default Mockito void stub is fine.
         // No stub for cacheManager — the afterCompletion callback only fires on real TX completion.
 
@@ -129,7 +129,7 @@ class ReviewEventListenerTest {
     void should_callRecalculateSalonRating_when_eventCarriesSalonId() {
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId, null);
 
         reviewEventListener.onReviewCreated(event);
 
@@ -140,7 +140,7 @@ class ReviewEventListenerTest {
     @DisplayName("should_notCallRecalculateSalonRating_when_eventSalonIdIsNull")
     void should_notCallRecalculateSalonRating_when_eventSalonIdIsNull() {
         UUID masterId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null);
 
         reviewEventListener.onReviewCreated(event);
 
@@ -152,7 +152,7 @@ class ReviewEventListenerTest {
     void should_logError_when_recalculateSalonRatingThrows() {
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
                 .when(reviewRepository).recalculateSalonRating(salonId);
@@ -177,7 +177,7 @@ class ReviewEventListenerTest {
         // the two are independent try/catch blocks.
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId);
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
                 .when(reviewRepository).recalculateSalonRating(salonId);
@@ -263,7 +263,7 @@ class ReviewEventListenerTest {
             // Call evictMasterReviewPages indirectly via onReviewCreated.
             // The listener calls reviewRepository.recalculateMasterRating (which we ignore)
             // then calls evictMasterReviewPages(masterA).
-            fireReviewCreated(new ReviewCreatedEvent(masterA, UUID.randomUUID(), null));
+            fireReviewCreated(new ReviewCreatedEvent(masterA, UUID.randomUUID(), null, null));
 
             // Assert — masterA's entry is gone; masterB's entry is intact
             assertThat(nativeCache.getIfPresent(keyA))
@@ -302,7 +302,7 @@ class ReviewEventListenerTest {
             assertThat(nativeCache.getIfPresent(keyB)).isNotNull();
 
             // Act — fire a ReviewCreatedEvent carrying salonA only
-            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), salonA));
+            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), salonA, null));
 
             // Assert — salonA's entry is gone; salonB's entry is intact
             assertThat(nativeCache.getIfPresent(keyA))
@@ -328,7 +328,7 @@ class ReviewEventListenerTest {
             nativeCache.put(keyA, "page-content-for-A");
 
             // Act — an INDEPENDENT_MASTER booking review (no salon)
-            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), null));
+            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), null, null));
 
             // Assert — unrelated salon entry is untouched
             assertThat(nativeCache.getIfPresent(keyA))
@@ -359,7 +359,7 @@ class ReviewEventListenerTest {
             detail.put(bystanderMaster, "cached-profile-of-bystander");
 
             // Act
-            fireReviewCreated(new ReviewCreatedEvent(reviewedMaster, UUID.randomUUID(), null));
+            fireReviewCreated(new ReviewCreatedEvent(reviewedMaster, UUID.randomUUID(), null, null));
 
             // Assert
             assertThat(detail.get(reviewedMaster))
@@ -393,7 +393,7 @@ class ReviewEventListenerTest {
             byUser.put(reviewedMasterId, "wrong-key-space-canary");
 
             // Act
-            fireReviewCreated(new ReviewCreatedEvent(reviewedMasterId, reviewedMasterUserId, null));
+            fireReviewCreated(new ReviewCreatedEvent(reviewedMasterId, reviewedMasterUserId, null, null));
 
             // Assert
             assertThat(byUser.get(reviewedMasterUserId))
@@ -430,7 +430,7 @@ class ReviewEventListenerTest {
             byUser.put(bystanderUserId, "cached-self-view-of-bystander");
             masterDetail.put(masterId, "cached-public-profile");
 
-            fireReviewCreated(new ReviewCreatedEvent(masterId, null, null));
+            fireReviewCreated(new ReviewCreatedEvent(masterId, null, null, null));
 
             assertThat(listAppender.list)
                     .as("a null key must be reported and skipped by evictKey's own guard, not "
@@ -458,7 +458,7 @@ class ReviewEventListenerTest {
             detail.put(reviewedSalon, "cached-salon-entity");
             detail.put(bystanderSalon, "cached-bystander-salon-entity");
 
-            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), reviewedSalon));
+            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), reviewedSalon, null));
 
             assertThat(detail.get(reviewedSalon))
                     .as("recalculateSalonRating updated salons.avg_rating — the cached Salon "
@@ -479,7 +479,7 @@ class ReviewEventListenerTest {
             detail.put(salonId, "cached-salon-entity");
 
             // An INDEPENDENT_MASTER review carries no salon — the salon branch must not run.
-            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), null));
+            fireReviewCreated(new ReviewCreatedEvent(UUID.randomUUID(), UUID.randomUUID(), null, null));
 
             assertThat(detail.get(salonId))
                     .as("a null-salonId event must not evict any salon-detail entry")
@@ -500,7 +500,7 @@ class ReviewEventListenerTest {
             doThrow(new RuntimeException("simulated DB timeout"))
                     .when(reviewRepository).recalculateMasterRating(masterId);
 
-            fireReviewCreated(new ReviewCreatedEvent(masterId, UUID.randomUUID(), null));
+            fireReviewCreated(new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null));
 
             assertThat(detail.get(masterId))
                     .as("a failed recalc must not leave the pre-review average cached")

@@ -66,12 +66,14 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
     private User otherClient;
     private final AtomicInteger slotCounter = new AtomicInteger();
     private List<UUID> seededDistrictIds;
+    private List<UUID> seededCityIds;
 
     @BeforeEach
     void setUp() {
         client = persistUser(Role.CLIENT, "client");
         otherClient = persistUser(Role.CLIENT, "other-client");
         seededDistrictIds = realDistrictIds(4);
+        seededCityIds = realCityIds(4);
     }
 
     /**
@@ -82,6 +84,19 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
     private List<UUID> realDistrictIds(int n) {
         return em.getEntityManager()
                 .createNativeQuery("SELECT id FROM city_districts ORDER BY katotth_code LIMIT :n")
+                .setParameter("n", n)
+                .getResultList();
+    }
+
+    /**
+     * City twin of {@link #realDistrictIds(int)} — real {@code cities} ids from the
+     * Flyway-seeded (already occupied-territory-filtered) taxonomy, so
+     * {@code fk_users_city_id} / {@code fk_salons_city_id} hold. Ids only, no names.
+     */
+    @SuppressWarnings("unchecked")
+    private List<UUID> realCityIds(int n) {
+        return em.getEntityManager()
+                .createNativeQuery("SELECT id FROM cities ORDER BY katotth_code LIMIT :n")
                 .setParameter("n", n)
                 .getResultList();
     }
@@ -129,6 +144,48 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         em.persist(salon);
         User masterUser = persistUser(Role.SALON_MASTER, "salon-master");
         masterUser.setDistrictId(masterUserDistrictId);
+        em.persist(masterUser);
+        Master m = Master.builder()
+                .user(masterUser)
+                .salon(salon)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(m);
+        return m;
+    }
+
+    /** City twin of {@link #persistIndependentMaster}: no salon, so the user row carries the city. */
+    private Master persistIndependentMasterWithCity(UUID masterCityId) {
+        User masterUser = persistUser(Role.INDEPENDENT_MASTER, "master");
+        masterUser.setCityId(masterCityId);
+        em.persist(masterUser);
+        Master m = Master.builder()
+                .user(masterUser)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(m);
+        return m;
+    }
+
+    /** City twin of {@link #persistSalonMaster}: the salon carries the city (CASE WHEN salon-presence). */
+    private Master persistSalonMasterWithCity(UUID salonCityId, UUID masterUserCityId) {
+        User owner = persistUser(Role.SALON_OWNER, "owner");
+        em.persist(owner);
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Salon " + UUID.randomUUID())
+                .cityId(salonCityId)
+                .isActive(true)
+                .build();
+        em.persist(salon);
+        User masterUser = persistUser(Role.SALON_MASTER, "salon-master");
+        masterUser.setCityId(masterUserCityId);
         em.persist(masterUser);
         Master m = Master.builder()
                 .user(masterUser)
@@ -342,6 +399,110 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
                 .hasSize(1);
         assertThat(top.get(0).districtId()).isEqualTo(indepDistrict);
         assertThat(top).extracting(DistrictCount::districtId).doesNotContain(masterUserDistrict);
+    }
+
+    // ── findTopCities ────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("findTopCities — ranks discovery cities by COMPLETED count desc; non-COMPLETED and "
+            + "another client's bookings excluded")
+    void should_rankByCompletedCount_when_multipleCities() {
+        UUID salonCity = seededCityIds.get(0);
+        UUID indepCity = seededCityIds.get(1);
+
+        Master salonMaster = persistSalonMasterWithCity(salonCity, seededCityIds.get(2));
+        MasterServiceAssignment salonService = persistService(salonMaster, "Salon Manicure", "MANICURE", "500");
+        Master indepMaster = persistIndependentMasterWithCity(indepCity);
+        MasterServiceAssignment indepService = persistService(indepMaster, "Indep Manicure", "MANICURE", "300");
+
+        // salonCity x3, indepCity x1.
+        persistBooking(client, salonMaster, salonService, BookingStatus.COMPLETED, "500", slot());
+        persistBooking(client, salonMaster, salonService, BookingStatus.COMPLETED, "500", slot());
+        persistBooking(client, salonMaster, salonService, BookingStatus.COMPLETED, "500", slot());
+        persistBooking(client, indepMaster, indepService, BookingStatus.COMPLETED, "300", slot());
+        // Noise: non-COMPLETED, and another client's COMPLETED booking.
+        persistBooking(client, indepMaster, indepService, BookingStatus.CANCELLED, "300", slot());
+        persistBooking(otherClient, indepMaster, indepService, BookingStatus.COMPLETED, "300", slot());
+        em.flush();
+        em.clear();
+
+        List<CityCount> top = repository.findTopCities(client.getId(), TOP_3);
+
+        assertThat(top).hasSize(2);
+        assertThat(top.get(0).cityId()).as("most-visited city is the salon city").isEqualTo(salonCity);
+        assertThat(top.get(0).count()).isEqualTo(3L);
+        assertThat(top.get(1).cityId()).as("master-user city when no salon").isEqualTo(indepCity);
+        assertThat(top.get(1).count()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("findTopCities — salon presence wins outright even when the salon's own city is NULL: "
+            + "must NOT fall through to the salon master's (possibly stale) personal user-row city "
+            + "— CASE WHEN, not COALESCE")
+    void should_preferSalonCity_when_masterUserCityIsStale() {
+        UUID staleMasterUserCity = seededCityIds.get(1);
+        UUID indepCity = seededCityIds.get(2);
+
+        // The salon row exists (LEFT JOIN matches) but carries city_id = NULL, while the
+        // salon-employed master's own user row still mirrors a city from salon-creation time.
+        Master salonMaster = persistSalonMasterWithCity(null, staleMasterUserCity);
+        MasterServiceAssignment salonService = persistService(salonMaster, "Salon Manicure", "MANICURE", "500");
+        // Control: an independent master with a real city still counts normally.
+        Master indepMaster = persistIndependentMasterWithCity(indepCity);
+        MasterServiceAssignment indepService = persistService(indepMaster, "Indep Manicure", "MANICURE", "300");
+
+        persistBooking(client, salonMaster, salonService, BookingStatus.COMPLETED, "500", slot());
+        persistBooking(client, indepMaster, indepService, BookingStatus.COMPLETED, "300", slot());
+        em.flush();
+        em.clear();
+
+        List<CityCount> top = repository.findTopCities(client.getId(), TOP_3);
+
+        assertThat(top)
+                .as("the cityless-salon booking is dropped (null resolved city), never attributed to "
+                        + "the master's own stale personal city")
+                .hasSize(1);
+        assertThat(top.get(0).cityId()).isEqualTo(indepCity);
+        assertThat(top).extracting(CityCount::cityId).doesNotContain(staleMasterUserCity);
+    }
+
+    @Test
+    @DisplayName("findTopCities — a booking whose master has no salon and no user city is excluded")
+    void should_excludeNullCity_when_neitherSalonNorUserHasOne() {
+        Master cityless = persistIndependentMasterWithCity(null);
+        MasterServiceAssignment service = persistService(cityless, "Manicure", "MANICURE", "300");
+
+        persistBooking(client, cityless, service, BookingStatus.COMPLETED, "300", slot());
+        em.flush();
+        em.clear();
+
+        List<CityCount> top = repository.findTopCities(client.getId(), TOP_3);
+
+        assertThat(top).as("no resolvable city → no row at all").isEmpty();
+    }
+
+    @Test
+    @DisplayName("findTopCities — bounded by the Pageable: a size-3 page returns the top 3 of 4 cities, "
+            + "cut in SQL not in memory")
+    void should_limitToThree_when_pageableIsTopThree() {
+        // Four distinct cities with strictly descending COMPLETED counts 4/3/2/1.
+        int[] counts = {4, 3, 2, 1};
+        for (int i = 0; i < counts.length; i++) {
+            Master master = persistIndependentMasterWithCity(seededCityIds.get(i));
+            MasterServiceAssignment service = persistService(master, "Manicure " + i, "MANICURE", "300");
+            for (int n = 0; n < counts[i]; n++) {
+                persistBooking(client, master, service, BookingStatus.COMPLETED, "300", slot());
+            }
+        }
+        em.flush();
+        em.clear();
+
+        List<CityCount> top = repository.findTopCities(client.getId(), TOP_3);
+
+        assertThat(top).as("SQL LIMIT 3 — the 4th city never comes back").hasSize(3);
+        assertThat(top).extracting(CityCount::count).containsExactly(4L, 3L, 2L);
+        assertThat(top).extracting(CityCount::cityId)
+                .containsExactly(seededCityIds.get(0), seededCityIds.get(1), seededCityIds.get(2));
     }
 
     // ── aggregateBudget ──────────────────────────────────────────────────────────

@@ -149,8 +149,11 @@ public class GuestBookingService {
         if (date.isAfter(today.plusDays(smsProperties.getAvailabilityMaxDays()))) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date too far ahead");
         }
+        // No .filter(Master::isActive) here: findByBookingSlugWithUser's own JPQL already carries
+        // `AND m.isActive = true AND (s IS NULL OR s.isActive = true)` — the full MasterBookability
+        // rule — so the Optional is either empty or holds a bookable master. The filter was a
+        // strictly weaker duplicate of half that predicate. Guarded by MasterRepositoryBookingSlugTest.
         return masterRepository.findByBookingSlugWithUser(slug)
-                .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
     }
 
@@ -176,8 +179,9 @@ public class GuestBookingService {
         // kyivClock and the injected clock share an Instant, so the zone is irrelevant here.
         BookingStartsAtValidator.validate(req.startsAt(), kyivClock);
 
+        // See resolveMasterForDate: the liveness + salon-active rule lives in the finder's JPQL,
+        // so no redundant .filter(Master::isActive) is applied on top of it.
         Master master = masterRepository.findByBookingSlugWithUser(slug)
-                .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
 
         // BE-7: a masterServiceIds list (even a single element) is a multi-service VISIT — ONE Appointment

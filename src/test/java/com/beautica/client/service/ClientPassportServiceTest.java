@@ -3,10 +3,13 @@ package com.beautica.client.service;
 import com.beautica.client.dto.PassportResponse;
 import com.beautica.client.dto.TimelineItemResponse;
 import com.beautica.client.repository.BudgetAggregate;
+import com.beautica.client.repository.CityCount;
 import com.beautica.client.repository.ClientAggregationRepository;
+import com.beautica.client.repository.ClientStanding;
 import com.beautica.client.repository.DistrictCount;
 import com.beautica.client.repository.TimelineItemProjection;
 import com.beautica.common.PageResponse;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import org.junit.jupiter.api.DisplayName;
@@ -27,17 +30,22 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -66,11 +74,25 @@ class ClientPassportServiceTest {
 
     private final UUID clientId = UUID.randomUUID();
 
+    /** Registration instant used by every passport test unless the test pins its own. */
+    private static final Instant REGISTERED_AT = Instant.parse("2024-03-04T10:00:00Z");
+
     private ClientPassportService service() {
         if (service == null) {
-            service = new ClientPassportService(aggregationRepository, discoveryLocationResolver, clock);
+            service = new ClientPassportService(
+                    aggregationRepository, discoveryLocationResolver, clock);
         }
         return service;
+    }
+
+    /**
+     * Stubs the SINGLE identity-standing read {@code getPassport} always performs. Two separate
+     * repository round trips were merged into one query by the 2026-08 perf audit (F2), so this
+     * helper now stubs one call — that collapse is itself part of the contract under test.
+     */
+    private void stubIdentity(long reviewsWritten, Instant createdAt) {
+        when(aggregationRepository.findStanding(clientId))
+                .thenReturn(Optional.of(new ClientStanding(createdAt, reviewsWritten)));
     }
 
     private static BudgetAggregate budget(String avg, String min, String max, long total) {
@@ -85,8 +107,9 @@ class ClientPassportServiceTest {
 
     @Test
     @DisplayName("getPassport — empty state (no COMPLETED): empty lists, null budget, considered 0; "
-            + "the ranking + district queries are never run")
+            + "the ranking + locality queries are never run")
     void should_returnEmptyState_when_noCompletedBookings() {
+        stubIdentity(0L, REGISTERED_AT);
         // aggregateBudget over an empty set returns total=0 and null amounts.
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget(null, null, null, 0));
 
@@ -94,13 +117,78 @@ class ClientPassportServiceTest {
 
         assertThat(result.favoriteProcedures()).as("empty-state procedures").isEmpty();
         assertThat(result.favoriteDistricts()).as("empty-state districts").isEmpty();
+        assertThat(result.favoriteCities()).as("empty-state cities").isEmpty();
         assertThat(result.budget()).as("empty-state budget is null, not a band of nulls").isNull();
         assertThat(result.bookingsConsidered()).as("considered count").isZero();
 
-        // Short-circuit: no ranking query, no district query, no label resolution.
+        // Short-circuit: no ranking query, no locality queries, no label resolution.
         verify(aggregationRepository, never()).findTopServiceTypes(any(), any());
         verify(aggregationRepository, never()).findTopDistricts(any(), any());
+        verify(aggregationRepository, never()).findTopCities(any(), any());
         verifyNoInteractions(discoveryLocationResolver);
+    }
+
+    // ── passport: identity standing (Phase 245) ────────────────────────────────
+
+    @Test
+    @DisplayName("getPassport — the identity strip is populated in the EMPTY state too: a brand-new "
+            + "client still has a real registration year and may already have written reviews")
+    void should_populateIdentityFields_when_noCompletedBookings() {
+        stubIdentity(4L, Instant.parse("2023-08-09T07:15:00Z"));
+        when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget(null, null, null, 0));
+
+        PassportResponse result = service().getPassport(clientId);
+
+        assertThat(result.bookingsConsidered()).as("precondition: this IS the empty state").isZero();
+        assertThat(result.reviewsWritten())
+                .as("reviews written are NOT gated behind having COMPLETED bookings")
+                .isEqualTo(4);
+        assertThat(result.memberSinceYear())
+                .as("real registration year, never the current year")
+                .isEqualTo(2023);
+    }
+
+    @Test
+    @DisplayName("getPassport — reviewsWritten counts only the principal's own reviews (the repository "
+            + "is queried with the principal id, never a wider scope)")
+    void should_countOnlyThisClientsReviews_when_otherClientsHaveReviews() {
+        // The mock answers 9 ONLY for this client id; any other id would fall through to 0.
+        stubIdentity(9L, REGISTERED_AT);
+        when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget(null, null, null, 0));
+
+        PassportResponse result = service().getPassport(clientId);
+
+        assertThat(result.reviewsWritten()).isEqualTo(9);
+        // Scoped to the principal: the mock answers only for this client id.
+        verify(aggregationRepository).findStanding(clientId);
+    }
+
+    @Test
+    @DisplayName("getPassport — memberSinceYear is the Kyiv calendar year: a 2025-12-31T22:30Z "
+            + "registration is already 2026 in Kyiv (UTC+2 winter)")
+    void should_deriveMemberSinceYearInKyiv_when_createdAtIsNewYearUtcBoundary() {
+        stubIdentity(0L, Instant.parse("2025-12-31T22:30:00Z"));
+        when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget(null, null, null, 0));
+
+        PassportResponse result = service().getPassport(clientId);
+
+        assertThat(result.memberSinceYear())
+                .as("Kyiv wall-clock year (2026), not the UTC year (2025) — and independent of the "
+                        + "JVM default zone, so this holds under TZ=UTC and TZ=Europe/Kyiv alike")
+                .isEqualTo(2026);
+    }
+
+    @Test
+    @DisplayName("getPassport — a client row that cannot be resolved raises NotFoundException rather "
+            + "than fabricating a year")
+    void should_throwNotFound_when_clientRowMissing() {
+        when(aggregationRepository.findStanding(clientId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service().getPassport(clientId))
+                .isInstanceOf(NotFoundException.class);
+
+        // No fabricated year, and no booking aggregation attempted for a user that does not exist.
+        verify(aggregationRepository, never()).aggregateBudget(any());
     }
 
     // ── passport: happy path (top-N + budget math + UAH + district labels) ──────
@@ -111,16 +199,21 @@ class ClientPassportServiceTest {
     void should_buildPassport_when_completedBookingsExist() {
         UUID districtA = UUID.randomUUID();
         UUID districtB = UUID.randomUUID();
+        UUID cityA = UUID.randomUUID();
+        UUID cityB = UUID.randomUUID();
 
+        stubIdentity(12L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId))
                 .thenReturn(budget("325.50", "150.00", "600.00", 7));
         when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of("MANICURE", "PEDICURE", "HAIRCUT"));
         when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of(new DistrictCount(districtA, 5), new DistrictCount(districtB, 2)));
+        when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of(new CityCount(cityA, 6), new CityCount(cityB, 1)));
         when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                 .thenReturn(new DiscoveryLabels(
-                        Map.of(),
+                        Map.of(cityA, "Kyiv", cityB, "Lviv"),
                         Map.of(districtA, "Pechersk", districtB, "Shevchenkivskyi")));
 
         PassportResponse result = service().getPassport(clientId);
@@ -131,7 +224,12 @@ class ClientPassportServiceTest {
         assertThat(result.favoriteDistricts())
                 .as("district ids resolved to labels in count order")
                 .containsExactly("Pechersk", "Shevchenkivskyi");
+        assertThat(result.favoriteCities())
+                .as("city ids resolved to labels in count order")
+                .containsExactly("Kyiv", "Lviv");
         assertThat(result.bookingsConsidered()).as("considered = budget total").isEqualTo(7);
+        assertThat(result.reviewsWritten()).as("identity standing on the non-empty branch too").isEqualTo(12);
+        assertThat(result.memberSinceYear()).isEqualTo(2024);
 
         assertThat(result.budget()).isNotNull();
         assertThat(result.budget().avg()).as("avg").isEqualByComparingTo("325.50");
@@ -143,10 +241,13 @@ class ClientPassportServiceTest {
     @Test
     @DisplayName("getPassport — top-N queries are bounded to a size-3 page (top-3 contract)")
     void should_requestTopThreePage_when_buildingPassport() {
+        stubIdentity(0L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("100", "100", "100", 1));
         when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of("MANICURE"));
         when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of());
+        when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of());
         when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                 .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
@@ -155,12 +256,16 @@ class ClientPassportServiceTest {
 
         ArgumentCaptor<Pageable> procPage = ArgumentCaptor.forClass(Pageable.class);
         ArgumentCaptor<Pageable> distPage = ArgumentCaptor.forClass(Pageable.class);
+        ArgumentCaptor<Pageable> cityPage = ArgumentCaptor.forClass(Pageable.class);
         verify(aggregationRepository).findTopServiceTypes(eq(clientId), procPage.capture());
         verify(aggregationRepository).findTopDistricts(eq(clientId), distPage.capture());
+        verify(aggregationRepository).findTopCities(eq(clientId), cityPage.capture());
 
         assertThat(procPage.getValue().getPageSize()).as("procedures page size").isEqualTo(3);
         assertThat(procPage.getValue().getPageNumber()).isZero();
         assertThat(distPage.getValue().getPageSize()).as("districts page size").isEqualTo(3);
+        assertThat(cityPage.getValue().getPageSize()).as("cities page size").isEqualTo(3);
+        assertThat(cityPage.getValue().getPageNumber()).isZero();
     }
 
     @Test
@@ -169,6 +274,7 @@ class ClientPassportServiceTest {
         UUID resolvable = UUID.randomUUID();
         UUID unresolvable = UUID.randomUUID();
 
+        stubIdentity(0L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("200", "200", "200", 3));
         when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of("MANICURE"));
@@ -183,6 +289,63 @@ class ClientPassportServiceTest {
         assertThat(result.favoriteDistricts())
                 .as("unresolved district dropped — no raw UUID leaks")
                 .containsExactly("Obolonskyi");
+    }
+
+    @Test
+    @DisplayName("getPassport — city ids whose label fails to resolve are dropped, never surfaced as raw ids "
+            + "(occupied-territory ban enforcement point)")
+    void should_dropUnresolvableCity_when_labelMissing() {
+        UUID resolvable = UUID.randomUUID();
+        UUID unresolvable = UUID.randomUUID();
+
+        stubIdentity(0L, REGISTERED_AT);
+        when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("200", "200", "200", 3));
+        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of("MANICURE"));
+        when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of(new CityCount(resolvable, 2), new CityCount(unresolvable, 1)));
+        // Only the first id resolves; the second yields no label (e.g. filtered out of the taxonomy).
+        when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                .thenReturn(new DiscoveryLabels(Map.of(resolvable, "Kyiv"), Map.of()));
+
+        PassportResponse result = service().getPassport(clientId);
+
+        assertThat(result.favoriteCities())
+                .as("unresolved city dropped — no raw UUID leaks")
+                .containsExactly("Kyiv");
+    }
+
+    @Test
+    @DisplayName("getPassport — label resolution is ONE batched call carrying both id sets (no N+1, "
+            + "no second trip through the M2 seam)")
+    void should_batchLabelResolution_when_buildingPassport() {
+        UUID districtA = UUID.randomUUID();
+        UUID cityA = UUID.randomUUID();
+        UUID cityB = UUID.randomUUID();
+
+        stubIdentity(0L, REGISTERED_AT);
+        when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("200", "200", "200", 3));
+        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of("MANICURE"));
+        when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of(new DistrictCount(districtA, 2)));
+        when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
+                .thenReturn(List.of(new CityCount(cityA, 2), new CityCount(cityB, 1)));
+        when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                .thenReturn(new DiscoveryLabels(Map.of(cityA, "Kyiv", cityB, "Lviv"), Map.of(districtA, "Pechersk")));
+
+        service().getPassport(clientId);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Collection<UUID>> cityIds = ArgumentCaptor.forClass(Collection.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Collection<UUID>> districtIds = ArgumentCaptor.forClass(Collection.class);
+        // times(1) is the assertion: two separate resolveDistrictLabels/resolveCityLabels calls would fail here.
+        verify(discoveryLocationResolver, times(1)).resolveLabels(cityIds.capture(), districtIds.capture());
+        verifyNoMoreInteractions(discoveryLocationResolver);
+
+        assertThat(cityIds.getValue()).containsExactly(cityA, cityB);
+        assertThat(districtIds.getValue()).containsExactly(districtA);
     }
 
     // ── timeline: ordering preserved, Kyiv date, category key slug ──────────────

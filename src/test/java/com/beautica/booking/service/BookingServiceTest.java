@@ -137,6 +137,9 @@ class BookingServiceTest {
     private ServiceDefinition serviceDef;
     private MasterServiceAssignment msa;
 
+    @Mock
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
+
     @BeforeEach
     void setUp() {
         clock = Clock.fixed(Instant.now(), KYIV);
@@ -161,7 +164,8 @@ class BookingServiceTest {
                 salonCatalogCacheEvictor,
                 dateMath,
                 appointmentTransitionService,
-                appointmentRepository
+                appointmentRepository,
+                eventPublisher
         );
 
         clientId = UUID.randomUUID();
@@ -491,6 +495,90 @@ class BookingServiceTest {
         // Act + Assert — the filter(Master::isActive) turns the Optional empty
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(NotFoundException.class);
+    }
+
+    // ── salon-active guard on the booking write path (2026-08 security re-audit MEDIUM) ────────
+    //
+    // SalonService.deactivateSalon flips salons.is_active but does NOT cascade to
+    // masters.is_active, so a closed salon's masters all still pass Master::isActive. Before this
+    // guard, a client holding a masterServiceId (stale wish-list card, bookmarked deep link,
+    // cached catalogue page) could still create a CONFIRMED booking against a salon the owner had
+    // closed. The three tests below pin the guard AND both directions of its disjunction.
+
+    @Test
+    @DisplayName("404 NotFoundException is thrown when the master's salon was deactivated, even "
+            + "though the master row itself is still active")
+    void should_return404_when_bookingMasterOfDeactivatedSalon() {
+        // Arrange — the ONLY false flag is the salon's. masters.is_active stays true, exactly the
+        // state deactivateSalon leaves behind (it does not cascade).
+        Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
+        salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID())
+                .isActive(false)
+                .build());
+        assertThat(salonMaster.isActive())
+                .as("precondition: the master row is NOT deactivated — otherwise this test would "
+                        + "be re-testing the pre-existing Master::isActive filter")
+                .isTrue();
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster));
+
+        // Act + Assert
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(NotFoundException.class);
+
+        // No booking may be written, and the master service must not even be looked up — the
+        // guard is part of the same filter chain as the existence check.
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verifyNoInteractions(masterServiceRepository);
+    }
+
+    @Test
+    @DisplayName("booking still succeeds for a salon master whose salon is ACTIVE — the guard must "
+            + "not reject every salon-employed master")
+    void should_createBooking_when_masterSalonIsActive() {
+        Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
+        salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID())
+                .isActive(true)
+                .build());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        Booking saved = buildBooking(bookingId, client, salonMaster, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("booking still succeeds for an INDEPENDENT_MASTER, who has no salon at all — the "
+            + "null branch of the guard is load-bearing, not defensive")
+    void should_createBooking_when_masterHasNoSalon() {
+        // `master` (the shared fixture) is an INDEPENDENT_MASTER with salon == null. A guard
+        // written as `m.getSalon().isActive()` would NPE here; one written as
+        // `sal.isActive() == true` would 404 every independent master in the platform.
+        assertThat(master.getSalon()).as("precondition: no salon").isNull();
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).saveAndFlush(any());
     }
 
     @Test

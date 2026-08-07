@@ -7,6 +7,7 @@ import com.beautica.favorite.dto.AddFavoriteRequest;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
+import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.service.FavoriteService;
 import jakarta.validation.Valid;
@@ -43,7 +44,9 @@ import java.util.UUID;
  *   <li>{@code DELETE /favorites?targetType=&targetId=} — idempotent unlike,
  *       {@code 204}.</li>
  *   <li>{@code GET /favorites/masters} / {@code GET /favorites/salons} — the two
- *       read lists.</li>
+ *       original read lists.</li>
+ *   <li>{@code GET /favorites/services} — the BEAUTY WISH LIST (Phase 31.4); same
+ *       shape, same auth, same {@code @PageableDefault(size = 20)}.</li>
  * </ul>
  */
 @Validated
@@ -91,6 +94,16 @@ public class FavoriteController {
             Authentication auth) {
         Page<FavoriteSalonResponse> page =
                 favoriteService.listSalonFavorites(AuthenticationUtils.userId(auth), pageable);
+        return ApiResponse.ok(toPageResponse(page));
+    }
+
+    @PreAuthorize("hasRole('CLIENT')")
+    @GetMapping("/services")
+    public ApiResponse<PageResponse<FavoriteServiceResponse>> listServiceFavorites(
+            @PageableDefault(size = 20) Pageable pageable,
+            Authentication auth) {
+        Page<FavoriteServiceResponse> page =
+                favoriteService.listServiceFavorites(AuthenticationUtils.userId(auth), pageable);
         return ApiResponse.ok(toPageResponse(page));
     }
 

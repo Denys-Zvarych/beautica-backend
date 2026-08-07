@@ -68,28 +68,31 @@ public record MasterServiceResponse(
         String serviceTypeSlug
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
+        // ServiceDefinitionResponse.from already runs ServicePricing.ofDefinition internally, so
+        // sdResponse ALREADY carries the derived display band.
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
 
-        // effectivePrice is null when both priceOverride and basePrice are null (no @NotNull on basePrice entity field).
-        // All API-created ServiceDefinitions have a non-null basePrice, but callers mapping this DTO must null-check.
-        // base_price is the canonical RANGE floor, so COALESCE(priceOverride, base_price) = minimum effective price
-        // for both modes. masters.min_effective_price (V58) uses the same formula — no change required there.
-        var effectivePrice = msa.getPriceOverride() != null
-                ? msa.getPriceOverride()
-                : msa.getServiceDefinition().getBasePrice();
-
-        var effectiveDuration = msa.getDurationOverrideMinutes() != null
-                ? msa.getDurationOverrideMinutes()
-                : msa.getServiceDefinition().getBaseDurationMinutes();
-
+        // Money and duration are derived in exactly one place — ServicePricing (Phase 31.4 D2) —
+        // so this menu DTO and the BEAUTY WISH LIST (FavoriteServiceResponse) can never print
+        // different prices for the same service. effectivePrice = COALESCE(priceOverride,
+        // base_price) (null when both are null — no @NotNull on the basePrice entity field, so
+        // callers must still null-check).
+        //
+        // The band below is lifted from sdResponse rather than re-derived via
+        // ServicePricing.ofAssignment. The two are identical BY CONSTRUCTION — ofAssignment
+        // sources priceType/priceMin/priceMax/priceDisplay wholly from the definition and applies
+        // the override only to effectivePrice — so calling it here would run
+        // PriceDisplayFormatter.format a second time per row and discard the result (2026-08 perf
+        // audit F4). effectivePriceOf/effectiveDurationMinutesOf are the same formulas ServicePricing
+        // .derive itself calls, not a second implementation.
         return new MasterServiceResponse(
                 msa.getId(),
                 msa.getMaster().getId(),
                 sdResponse,
                 msa.getPriceOverride(),
                 msa.getDurationOverrideMinutes(),
-                effectivePrice,
-                effectiveDuration,
+                ServicePricing.effectivePriceOf(msa),
+                ServicePricing.effectiveDurationMinutesOf(msa),
                 msa.isActive(),
                 sdResponse.priceType(),
                 sdResponse.priceMin(),

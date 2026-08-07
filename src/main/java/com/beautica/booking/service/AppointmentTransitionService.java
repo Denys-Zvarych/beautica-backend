@@ -10,6 +10,7 @@ import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.event.BookingCompletedEvent;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
@@ -25,6 +26,7 @@ import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -85,6 +87,7 @@ public class AppointmentTransitionService {
     private final MasterCachePrefixEvictor cachePrefixEvictor;
     private final VisitPlanner visitPlanner;
     private final AppointmentService appointmentService;
+    private final ApplicationEventPublisher eventPublisher;
     private final Clock clock;
 
     /**
@@ -494,6 +497,16 @@ public class AppointmentTransitionService {
         if (ctx.appointment().getClient() != null) {
             outboxService.enqueueReviewRequested(ctx.firstItem().getId());
         }
+
+        // Announce the completion as a domain fact so other feature packages can react without
+        // importing this one. Consumed by ClientPassportCacheEvictor (AFTER_COMMIT, per key) —
+        // a completed visit moves bookingsConsidered, the district/city rankings and the budget
+        // band on the client's BEAUTY PASSPORT. Published INSIDE the transaction; Spring holds it
+        // until commit because the listener is @TransactionalEventListener(AFTER_COMMIT), so a
+        // rolled-back completion evicts nothing. Guest visits carry a null client — the event
+        // records that faithfully and the listener skips it.
+        eventPublisher.publishEvent(new BookingCompletedEvent(
+                ctx.appointment().getClient() != null ? ctx.appointment().getClient().getId() : null));
     }
 
     /**

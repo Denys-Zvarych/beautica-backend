@@ -6,14 +6,18 @@ import com.beautica.client.dto.BudgetBand;
 import com.beautica.client.dto.PassportResponse;
 import com.beautica.client.dto.TimelineItemResponse;
 import com.beautica.client.repository.BudgetAggregate;
+import com.beautica.client.repository.CityCount;
 import com.beautica.client.repository.ClientAggregationRepository;
+import com.beautica.client.repository.ClientStanding;
 import com.beautica.client.repository.DistrictCount;
 import com.beautica.client.repository.TimelineItemProjection;
 import com.beautica.common.PageResponse;
 import com.beautica.common.TimeZones;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -21,10 +25,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.time.ZoneId;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Derives the read-only BEAUTI PASSPORT and BEAUTY TIMELINE for the signed-in client
@@ -34,6 +42,12 @@ import java.util.UUID;
 @Service
 @RequiredArgsConstructor
 public class ClientPassportService {
+
+    /**
+     * Caffeine cache backing {@link #getPassport}. Registered in {@code CacheConfig}; evicted
+     * per key by {@link com.beautica.client.event.ClientPassportCacheEvictor}.
+     */
+    public static final String CLIENT_PASSPORT_CACHE = "client-passport";
 
     private static final String CURRENCY_UAH = "UAH";
     private static final String UNKNOWN_CATEGORY_KEY = "UNKNOWN";
@@ -45,25 +59,91 @@ public class ClientPassportService {
     private final Clock clock;
 
     /**
-     * Builds the passport from the three SQL aggregations. Empty-state contract: when no
-     * COMPLETED bookings exist ({@code bookingsConsidered == 0}) the lists are empty and
-     * the budget is {@code null}.
+     * Builds the passport from the SQL aggregations.
+     *
+     * <p><b>Two empty-state contracts, deliberately different.</b> The booking-derived values
+     * (procedures / districts / cities / budget / considered) short-circuit to empty when the
+     * client has no COMPLETED bookings. The identity-standing values
+     * ({@code reviewsWritten}, {@code memberSinceYear}) are resolved BEFORE that
+     * short-circuit and populated on both branches — a brand-new client still has a real
+     * registration year and may already have written reviews, and the «Паспорт — без історії»
+     * state is a first-class approved state, not an edge case. Gating them behind
+     * {@code considered > 0} would ship a zero and force the client to fabricate a year.
+     *
+     * <h3>Caching (2026-08 perf audit F3)</h3>
+     * A pure derived read costing 5 statements on a miss — {@code findStanding},
+     * {@code aggregateBudget}, {@code findTopServiceTypes}, {@code findTopDistricts},
+     * {@code findTopCities} — 4 of them aggregations over the client's <em>entire</em> COMPLETED
+     * booking history. The empty-state short-circuit below costs 2. (Both figures dropped by one
+     * when the two identity lookups were folded into a single {@code findStanding}; earlier
+     * revisions of this javadoc said 7.) Cached in {@code client-passport} under the caller's own
+     * principal id.
+     *
+     * <p><b>{@code key = "#clientUserId"} is the whole IDOR story.</b> The argument is the
+     * authenticated principal's id, extracted by the controller from
+     * {@code Authentication.getDetails()} — never a path variable or a body field — so a cache
+     * entry is reachable only by the client who owns it. Do not widen this key, and do not add
+     * an overload that takes a caller-supplied id.
+     *
+     * <p>{@code sync = true} because this is a per-client hot key: without it, N concurrent
+     * requests for the same client after a TTL expiry each run the full 5-statement derivation
+     * (§F-7).
+     *
+     * <p><b>The {@code NotFoundException} path is never cached.</b> Spring's cache abstraction
+     * stores only normal returns; a thrown exception leaves the cache untouched, so a missing
+     * user row keeps raising 404 on every call rather than being papered over by a cached
+     * fabricated standing.
+     *
+     * <p>Invalidation is per-key and {@code AFTER_COMMIT} — see
+     * {@link com.beautica.client.event.ClientPassportCacheEvictor}.
      */
+    @Cacheable(value = CLIENT_PASSPORT_CACHE, key = "#clientUserId", sync = true)
     @Transactional(readOnly = true)
     public PassportResponse getPassport(UUID clientUserId) {
+        // ONE statement for both identity-strip values (perf audit F2): they are single-row
+        // lookups on the same principal, and were previously two serial round trips issued
+        // unconditionally — including on the empty-state path, where they were 2 of 3 statements.
+        ClientStanding standing = aggregationRepository.findStanding(clientUserId)
+                .orElseThrow(() -> new NotFoundException("User not found"));
+        int reviewsWritten = (int) standing.reviewsWritten();
+        int memberSinceYear = memberSinceYear(standing.registeredAt());
+
         BudgetAggregate budget = aggregationRepository.aggregateBudget(clientUserId);
         int considered = (int) budget.total();
         if (considered == 0) {
-            return new PassportResponse(List.of(), List.of(), null, 0);
+            return new PassportResponse(
+                    List.of(), List.of(), List.of(), null, 0, reviewsWritten, memberSinceYear);
         }
 
         List<String> favoriteProcedures =
                 aggregationRepository.findTopServiceTypes(clientUserId, TOP_N_PAGE);
-        List<String> favoriteDistricts = resolveDistrictLabels(
-                aggregationRepository.findTopDistricts(clientUserId, TOP_N_PAGE));
+        List<DistrictCount> districtRows = aggregationRepository.findTopDistricts(clientUserId, TOP_N_PAGE);
+        List<CityCount> cityRows = aggregationRepository.findTopCities(clientUserId, TOP_N_PAGE);
+        DiscoveryLabels labels = resolveLocalityLabels(cityRows, districtRows);
 
         BudgetBand band = new BudgetBand(budget.avg(), budget.min(), budget.max(), CURRENCY_UAH);
-        return new PassportResponse(favoriteProcedures, favoriteDistricts, band, considered);
+        return new PassportResponse(
+                favoriteProcedures,
+                toLabels(districtRows, DistrictCount::districtId, labels::districtLabel),
+                toLabels(cityRows, CityCount::cityId, labels::cityLabel),
+                band,
+                considered,
+                reviewsWritten,
+                memberSinceYear);
+    }
+
+    /**
+     * Calendar year of {@code users.created_at}, in {@link TimeZones#KYIV}.
+     *
+     * <p><b>Kyiv is correct here and is not a breach of the partition-phase rule.</b> Phase
+     * 216's invariant forbids a Kyiv zone inside <em>instant-ordering predicates</em> (where
+     * it silently shifts which rows fall on which side of a boundary). This is the opposite
+     * case: a wall-clock calendar-year <em>display</em> value, which is exactly what the
+     * user's own civil timezone governs. Do not "fix" this to UTC — a client who registered
+     * at {@code 2025-12-31T22:30:00Z} joined in <b>2026</b> as far as they are concerned.
+     */
+    private static int memberSinceYear(Instant registeredAt) {
+        return registeredAt.atZone(TimeZones.KYIV).getYear();
     }
 
     /**
@@ -100,18 +180,36 @@ public class ClientPassportService {
     }
 
     /**
-     * Resolves district FK ids to display labels through the {@code DiscoveryLocationResolver}
-     * M2 seam (one batched query, no per-row lookup). Labels come only from the joined,
-     * pre-filtered taxonomy — never a literal — so no occupied-territory label can appear.
-     * Ids whose label fails to resolve are dropped rather than surfaced as a raw id.
+     * Resolves the city AND district FK ids of one passport to display labels in a SINGLE
+     * pass through the {@code DiscoveryLocationResolver} M2 seam. The seam already takes both
+     * id sets and issues at most one query per set, so folding the two rankings into one call
+     * keeps the passport at exactly one {@code resolveLabels} invocation per request — never
+     * a per-row lookup, and never a second round trip through the seam (§E).
      */
-    private List<String> resolveDistrictLabels(List<DistrictCount> rows) {
-        Set<UUID> districtIds = rows.stream()
-                .map(DistrictCount::districtId)
-                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
-        DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(Set.of(), districtIds);
+    private DiscoveryLabels resolveLocalityLabels(List<CityCount> cityRows, List<DistrictCount> districtRows) {
+        return discoveryLocationResolver.resolveLabels(
+                distinctIds(cityRows, CityCount::cityId),
+                distinctIds(districtRows, DistrictCount::districtId));
+    }
+
+    private static <T> Set<UUID> distinctIds(List<T> rows, Function<T, UUID> idAccessor) {
         return rows.stream()
-                .map(r -> labels.districtLabel(r.districtId()))
+                .map(idAccessor)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    /**
+     * Maps ranked FK rows to display labels, preserving the SQL rank order. Labels come only
+     * from the joined, pre-filtered taxonomy — never a literal — so no occupied-territory
+     * label can appear; an id whose label fails to resolve (or resolves blank) is
+     * <b>dropped</b> rather than surfaced as a raw UUID. That drop is the ban's enforcement
+     * point for this endpoint.
+     */
+    private static <T> List<String> toLabels(
+            List<T> rows, Function<T, UUID> idAccessor, Function<UUID, String> labelResolver) {
+        return rows.stream()
+                .map(idAccessor)
+                .map(labelResolver)
                 .filter(label -> label != null && !label.isBlank())
                 .toList();
     }

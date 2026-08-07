@@ -169,7 +169,7 @@ class ReviewServiceTest {
         assertThat(response.comment()).isEqualTo("Great service");
         assertThat(response.clientDisplayName()).isEqualTo("Anna K.");
         verify(reviewRepository).saveAndFlush(any(Review.class));
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null, CLIENT_ID));
     }
 
     @Test
@@ -220,7 +220,7 @@ class ReviewServiceTest {
 
         reviewService.createReview(CLIENT_ID, request);
 
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, salonId));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, salonId, CLIENT_ID));
     }
 
     @ParameterizedTest
@@ -327,7 +327,7 @@ class ReviewServiceTest {
         assertThat(response).isNotNull();
         assertThat(response.id()).isEqualTo(REVIEW_ID);
         verify(reviewRepository).saveAndFlush(any(Review.class));
-        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null));
+        verify(eventPublisher).publishEvent(new ReviewCreatedEvent(MASTER_ID, MASTER_USER_ID, null, CLIENT_ID));
     }
 
     @Test

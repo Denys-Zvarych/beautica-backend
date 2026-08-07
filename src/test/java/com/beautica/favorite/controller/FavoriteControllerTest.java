@@ -10,12 +10,15 @@ import com.beautica.favorite.dto.AddFavoriteRequest;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
+import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.service.FavoriteService;
+import com.beautica.service.entity.PriceType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -37,6 +40,7 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -298,5 +302,111 @@ class FavoriteControllerTest {
                 .andExpect(status().isForbidden());
 
         verify(favoriteService, never()).listSalonFavorites(any(), any(Pageable.class));
+    }
+
+    // ── GET /favorites/services — the BEAUTY WISH LIST (Phase 31.4) ─────────────
+
+    private static FavoriteServiceResponse wishListRow() {
+        return new FavoriteServiceResponse(
+                UUID.randomUUID(), UUID.randomUUID(), "Manicure",
+                "Maria", "Levchenko", "https://cdn/avatar.png",
+                90, PriceType.RANGE,
+                new BigDecimal("600.00"), new BigDecimal("900.00"), "vid 600 do 900");
+    }
+
+    @Test
+    @DisplayName("GET /favorites/services — 200 paged wish list bound to the principal id")
+    void should_return200ServicePage_when_listServices() throws Exception {
+        var row = wishListRow();
+        when(favoriteService.listServiceFavorites(eq(clientId), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(row)));
+
+        mockMvc.perform(get("/api/v1/favorites/services").with(asClient()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.data.length()").value(1))
+                .andExpect(jsonPath("$.data.data[0].masterServiceId").value(row.masterServiceId().toString()))
+                .andExpect(jsonPath("$.data.data[0].masterId").value(row.masterId().toString()))
+                .andExpect(jsonPath("$.data.data[0].serviceName").value("Manicure"))
+                .andExpect(jsonPath("$.data.data[0].durationMinutes").value(90))
+                .andExpect(jsonPath("$.data.data[0].priceType").value("RANGE"))
+                .andExpect(jsonPath("$.data.data[0].priceMax").value(900.00))
+                .andExpect(jsonPath("$.data.totalElements").value(1));
+
+        verify(favoriteService).listServiceFavorites(eq(clientId), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("GET /favorites/services — honours @PageableDefault(size = 20) when no params are sent")
+    void should_useDefaultPageSize_when_noPageableParams() throws Exception {
+        when(favoriteService.listServiceFavorites(eq(clientId), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        mockMvc.perform(get("/api/v1/favorites/services").with(asClient()))
+                .andExpect(status().isOk());
+
+        var captor = ArgumentCaptor.forClass(Pageable.class);
+        verify(favoriteService).listServiceFavorites(eq(clientId), captor.capture());
+        assertThat(captor.getValue().getPageSize()).isEqualTo(20);
+        assertThat(captor.getValue().getPageNumber()).isZero();
+    }
+
+    @Test
+    @DisplayName("GET /favorites/services — 401 when unauthenticated")
+    void should_return401_when_listServicesUnauthenticated() throws Exception {
+        mockMvc.perform(get("/api/v1/favorites/services"))
+                .andExpect(status().isUnauthorized());
+
+        verify(favoriteService, never()).listServiceFavorites(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("GET /favorites/services — 403 for a SALON_OWNER")
+    void should_return403_when_listServicesAsSalonOwner() throws Exception {
+        mockMvc.perform(get("/api/v1/favorites/services")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER)))
+                .andExpect(status().isForbidden());
+
+        verify(favoriteService, never()).listServiceFavorites(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("GET /favorites/services — 403 for a SALON_MASTER")
+    void should_return403_when_listServicesAsSalonMaster() throws Exception {
+        mockMvc.perform(get("/api/v1/favorites/services")
+                        .with(authenticatedAs(UUID.randomUUID(), "staff@beautica.test", Role.SALON_MASTER)))
+                .andExpect(status().isForbidden());
+
+        verify(favoriteService, never()).listServiceFavorites(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("POST /favorites — accepts targetType=SERVICE and binds the principal id")
+    void should_return200_when_favoritingAService() throws Exception {
+        when(favoriteService.addFavorite(eq(clientId), eq(FavoriteTargetType.SERVICE), eq(targetId)))
+                .thenReturn(new FavoriteResponse(
+                        UUID.randomUUID(), FavoriteTargetType.SERVICE, targetId,
+                        Instant.parse("2026-08-07T10:00:00Z")));
+
+        mockMvc.perform(post("/api/v1/favorites")
+                        .with(asClient()).with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(addBody(FavoriteTargetType.SERVICE)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.targetType").value("SERVICE"));
+
+        verify(favoriteService).addFavorite(eq(clientId), eq(FavoriteTargetType.SERVICE), eq(targetId));
+    }
+
+    @Test
+    @DisplayName("DELETE /favorites — 204 idempotent for targetType=SERVICE")
+    void should_return204_when_unfavoritingAService() throws Exception {
+        mockMvc.perform(delete("/api/v1/favorites")
+                        .with(asClient()).with(csrf())
+                        .param("targetType", "SERVICE")
+                        .param("targetId", targetId.toString()))
+                .andExpect(status().isNoContent());
+
+        verify(favoriteService).removeFavorite(eq(clientId), eq(FavoriteTargetType.SERVICE), eq(targetId));
     }
 }

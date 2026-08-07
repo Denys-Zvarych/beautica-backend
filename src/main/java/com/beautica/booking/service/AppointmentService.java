@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.entity.Appointment;
@@ -191,8 +192,20 @@ public class AppointmentService {
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {
+        // SALON-ACTIVE GUARD (2026-08 security re-audit HIGH). This path takes a client-supplied
+        // request.masterId() exactly like BookingService#doCreateBooking, so it needs the identical
+        // gate — a closed salon's master still passes Master::isActive (deactivateSalon does not
+        // cascade), and without this term a caller could create a CONFIRMED multi-service visit
+        // against a salon the owner had closed by replaying the single-service attack one endpoint
+        // over. See MasterBookability for the canonical rule and the full list of enforcing sites.
+        //
+        // Rejection is folded into the same filter chain as the existence check so both surface the
+        // identical "Master not found or inactive" 404 — a distinct message would hand the caller an
+        // oracle separating "no such master" from "that master's salon was closed".
+        //
+        // No extra query: findByIdWithUserAndSalon already LEFT JOIN FETCHes the salon.
         Master master = masterRepository.findByIdWithUserAndSalon(request.masterId())
-                .filter(Master::isActive)
+                .filter(MasterBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 
         OffsetDateTime firstStart = request.startsAt().toOffsetDateTime();

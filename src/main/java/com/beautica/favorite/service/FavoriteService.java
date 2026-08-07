@@ -3,11 +3,13 @@ package com.beautica.favorite.service;
 import org.springframework.data.domain.Sort;
 import com.beautica.common.web.SortWhitelist;
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
+import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.Favorite;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
@@ -16,6 +18,8 @@ import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.repository.MasterServiceRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -47,6 +51,10 @@ import java.util.UUID;
  * A {@code MASTER} target must be an {@code INDEPENDENT_MASTER}-owned master
  * ({@code 404} if no such master; {@code 400} when the master is salon-employed,
  * i.e. role {@code SALON_MASTER}). A {@code SALON} target must exist ({@code 404}).
+ * A {@code SERVICE} target must be an active {@code master_services} row whose service
+ * definition is also active ({@code 404} unknown; {@code 400} inactive) — with
+ * <b>no role check</b>: a salon-employed master's service IS wish-listable, deliberately
+ * asymmetric to the {@code MASTER} rule above (see {@link FavoriteTargetType}'s javadoc).
  *
  * <h3>Locality labels (§E no N+1, §I no raw FK ids leaked)</h3>
  * The list reads return raw projection rows carrying discovery city/district FK ids;
@@ -62,6 +70,7 @@ public class FavoriteService {
     private final FavoriteRepository favoriteRepository;
     private final MasterRepository masterRepository;
     private final SalonRepository salonRepository;
+    private final MasterServiceRepository masterServiceRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
 
     /**
@@ -171,15 +180,64 @@ public class FavoriteService {
         return results;
     }
 
+    /**
+     * One bounded page of this client's BEAUTY WISH LIST — favorited services, newest
+     * favorite first (Phase 31.4).
+     *
+     * <p>Each row carries what the card renders (service name, master name + avatar,
+     * duration, price band) and the two ids {@code POST /bookings} needs, so «Записатись»
+     * costs no extra call. Money is derived by the shared {@code ServicePricing} path, so the
+     * wish list and the master's own menu can never print different prices.
+     *
+     * <p>Rows whose assignment, service definition <b>or performing master</b> went inactive are
+     * filtered out by the query, not deleted: the favourite row survives (consistent with
+     * MASTER/SALON, Phase 31.3 D4), it simply stops appearing rather than offering a dead CTA.
+     * The repository's {@code JOIN FETCH} graph initialises everything the DTO traverses, so the
+     * mapping below runs inside this read-only transaction with no lazy loads (§E-2).
+     */
+    @Transactional(readOnly = true)
+    public Page<FavoriteServiceResponse> listServiceFavorites(UUID clientUserId, Pageable pageable) {
+        Page<Object[]> rows = favoriteRepository.findFavoriteServiceRows(
+                clientUserId, SortWhitelist.stripSort(pageable));
+        return rows.map(FavoriteService::mapWishListRow);
+    }
+
+    /**
+     * Maps one wish-list projection row — {@code [assignment, firstName, lastName, avatarUrl]},
+     * the layout pinned in {@code FavoriteRepository.findFavoriteServiceRows}. The master's
+     * identity arrives as scalars rather than through {@code msa.getMaster().getUser()} so no
+     * credential-bearing {@code users} row is hydrated for the page (§I).
+     */
+    private static FavoriteServiceResponse mapWishListRow(Object[] row) {
+        return FavoriteServiceResponse.from(
+                (MasterServiceAssignment) row[0],
+                (String) row[1],
+                (String) row[2],
+                (String) row[3]);
+    }
+
     // ── target validation ─────────────────────────────────────────────────────
 
     private void validateTarget(FavoriteTargetType targetType, UUID targetId) {
+        // Exhaustive switch over the enum with NO default: adding a FavoriteTargetType value
+        // must fail compilation here rather than silently persist an unvalidated target.
+        // Do not add a default branch to silence it.
         switch (targetType) {
             case MASTER -> validateMasterTarget(targetId);
             case SALON -> validateSalonTarget(targetId);
+            case SERVICE -> validateServiceTarget(targetId);
         }
     }
 
+    /**
+     * Validates a {@code MASTER} target: the master must exist, be independent, and be ACTIVE.
+     *
+     * <p>The active check was added by the 2026-08 security audit alongside the read query's
+     * {@code m.is_active = true} predicate — favoriting a deactivated master would write a row
+     * the list then hides, which is merely useless; but leaving the write open also lets a
+     * client heart a provider who can never be booked. It costs no extra query: the master is
+     * already loaded here. Same rule, same 400, as the SERVICE arm.
+     */
     private void validateMasterTarget(UUID masterId) {
         Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
@@ -190,11 +248,80 @@ public class FavoriteService {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Only independent masters can be favorited");
         }
+        if (!master.isActive()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Only an active master can be favorited");
+        }
     }
 
+    /**
+     * Validates a {@code SALON} target — it must exist AND be active.
+     *
+     * <p>{@code existsByIdAndIsActiveTrue} rather than {@code existsById} (2026-08 security
+     * audit): {@code salons.is_active} is a soft-delete flag, and the read query now filters on
+     * it, so admitting an inactive salon here would write a favourite that can never render.
+     * A deactivated salon is indistinguishable from a missing one for an unprivileged client,
+     * so this stays a {@code 404} rather than leaking the salon's continued existence.
+     */
     private void validateSalonTarget(UUID salonId) {
-        if (!salonRepository.existsById(salonId)) {
+        if (!salonRepository.existsByIdAndIsActiveTrue(salonId)) {
             throw new NotFoundException("Salon not found");
+        }
+    }
+
+    /**
+     * Validates a {@code SERVICE} target — {@code targetId} is a {@code master_services.id}
+     * (a master+service pair), never a {@code service_definitions.id}.
+     *
+     * <p><b>No role check, deliberately.</b> Unlike {@link #validateMasterTarget}, a
+     * salon-employed {@code SALON_MASTER}'s service IS wish-listable. A wish-list entry is a
+     * rebook shortcut, not an endorsement of a person; applying the MASTER identity rule here
+     * would make most of the catalogue un-wish-listable. Locked user decision, 2026-08-07 —
+     * see {@link FavoriteTargetType}'s javadoc for the full asymmetry note. Do not "fix" this
+     * into consistency with the MASTER arm.
+     *
+     * <p>All THREE {@code isActive} flags are checked because they are independent:
+     * {@code ServiceCatalogService.deactivateServiceDefinition} soft-deletes the definition
+     * without touching the assignment row, so an inactive definition can carry an active
+     * assignment; and a master can deactivate themself while both of their service rows stay
+     * active. The master flag was added by the 2026-08 security audit — without it a
+     * deactivated master's service could be wish-listed with a live «Записатись» that
+     * {@code BookingService.doCreateBooking} then rejects with 404. It costs no extra query:
+     * {@code findByIdWithServiceDefinitionAndMaster} already {@code JOIN FETCH}es the master.
+     * Rejecting at write time keeps a dead «Записатись» out of the list; the read query filters
+     * the same three flags for rows that went inactive afterwards.
+     *
+     * <p><b>A FOURTH flag — the owning salon's</b> (2026-08 security re-audit MEDIUM).
+     * {@code SalonService.deactivateSalon} flips {@code salons.is_active} but does NOT cascade to
+     * {@code masters.is_active}, so a closed salon's masters all still report
+     * {@code isActive() == true}. Because this arm deliberately admits {@code SALON_MASTER}
+     * services (unlike {@link #validateMasterTarget}), it is the one write path that can attach a
+     * closed salon to a client's wish list. Mirrors the read query's
+     * {@code (m.salon IS NULL OR sal.isActive = true)} predicate and the booking path's guard, so
+     * write-time, read-time and booking-time now agree on one rule. The master + salon halves are
+     * evaluated by {@link com.beautica.booking.domain.MasterBookability#isBookable} itself rather
+     * than re-derived here, so this site cannot drift from the rule it mirrors.
+     *
+     * <p><b>{@code salon == null} must pass.</b> An {@code INDEPENDENT_MASTER} has no salon and
+     * stays fully wish-listable — a bare {@code getSalon().isActive()} would both NPE and lock out
+     * every independent master. Costs no extra query: the finder {@code LEFT JOIN FETCH}es the
+     * salon.
+     */
+    private void validateServiceTarget(UUID masterServiceId) {
+        MasterServiceAssignment assignment = masterServiceRepository
+                .findByIdWithServiceDefinitionAndMaster(masterServiceId)
+                .orElseThrow(() -> new NotFoundException("Service not found"));
+
+        Master master = assignment.getMaster();
+
+        // The master + salon terms are NOT hand-rolled here: MasterBookability.isBookable is the
+        // single canonical definition (see that class's javadoc), so a change to the rule reaches
+        // this write path automatically instead of silently diverging from the booking paths.
+        if (!assignment.isActive()
+                || !assignment.getServiceDefinition().isActive()
+                || !MasterBookability.isBookable(master)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Only an active service can be favorited");
         }
     }
 

@@ -20,15 +20,55 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     @Deprecated(since = "phase-3", forRemoval = false)
     Optional<MasterServiceAssignment> findByMasterIdAndId(UUID masterId, UUID id);
 
+    /**
+     * <p>{@code LEFT JOIN FETCH m.salon} (2026-08 re-audit) initialises the salon that
+     * {@link com.beautica.booking.domain.MasterBookability#isBookable} dereferences in
+     * {@code SlotCalculationService}, so the salon-active gate costs no lazy load. It MUST stay
+     * {@code LEFT}: an {@code INDEPENDENT_MASTER} has no salon and an INNER join would drop every
+     * one of them from the slot and booking paths. Both fetches are to-one — they add columns, not
+     * rows, so this single-row lookup carries no cartesian risk.
+     */
     @Query("""
             SELECT ms FROM MasterServiceAssignment ms
             LEFT JOIN FETCH ms.serviceDefinition
-            JOIN FETCH ms.master
-            WHERE ms.master.id = :masterId AND ms.id = :id
+            JOIN FETCH ms.master m
+            LEFT JOIN FETCH m.salon
+            WHERE m.id = :masterId AND ms.id = :id
             """)
     Optional<MasterServiceAssignment> findByMasterIdAndIdWithGraph(
             @Param("masterId") UUID masterId,
             @Param("id") UUID id);
+
+    /**
+     * Loads one assignment by its own id with {@code serviceDefinition} and {@code master}
+     * initialised — the master-unscoped counterpart of
+     * {@link #findByMasterIdAndIdWithGraph} (Phase 31.3).
+     *
+     * <p><b>Unscoped by design (§E-4).</b> A {@code SERVICE} favourite is looked up by
+     * {@code master_services.id} alone: the favouriting CLIENT is not the owner of the row and
+     * has no {@code masterId} to scope by. There is nothing to enforce — the row is public
+     * catalogue data already served by {@code GET /masters/&#123;id&#125;/services} — but do not
+     * reuse this finder on a provider write path, where ownership scoping IS required.
+     *
+     * <p>All THREE fetches are load-bearing for {@code FavoriteService.validateServiceTarget},
+     * which reads {@code msa.isActive()}, {@code msa.getServiceDefinition().isActive()},
+     * {@code msa.getMaster().isActive()} and — since the 2026-08 security re-audit —
+     * {@code msa.getMaster().getSalon()}. {@code Master.salon} is {@code FetchType.LAZY}, so
+     * without the {@code LEFT JOIN FETCH} the salon-active guard would fire an extra SELECT per
+     * validation; with it the whole check stays a single statement.
+     *
+     * <p>The salon fetch is a {@code LEFT} join specifically: an {@code INDEPENDENT_MASTER} has
+     * {@code salon_id = NULL}, and an inner {@code JOIN FETCH} would make this finder return
+     * empty for every independent master's service — turning a valid wish-list target into a 404.
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.serviceDefinition
+            JOIN FETCH msa.master m
+            LEFT JOIN FETCH m.salon
+            WHERE msa.id = :id
+            """)
+    Optional<MasterServiceAssignment> findByIdWithServiceDefinitionAndMaster(@Param("id") UUID id);
 
     boolean existsByMasterIdAndServiceDefinitionId(UUID masterId, UUID serviceDefinitionId);
 
@@ -248,6 +288,16 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * transaction). The DB {@code UNIQUE (master_id, service_def_id)} constraint (V7) guarantees
      * at most one row per (master, service), so no {@code DISTINCT} is needed.
      *
+     * <p>{@code JOIN FETCH m.salon s} (2026-08 re-audit) replaces the former implicit
+     * {@code WHERE m.salon.id = :salonId} path predicate. It is semantically identical — that
+     * predicate already required a non-null salon, so this stays INNER, unlike the {@code LEFT}
+     * fetch on the master-scoped finders that must keep independent masters — but it additionally
+     * initialises {@code salon} for the
+     * {@link com.beautica.booking.domain.MasterBookability#isBookable} gate in
+     * {@code SlotCalculationService#hasBookableFutureSlot}, which this query's rows reach as the
+     * {@code preloaded} argument from {@code BookingMasterService}. Without the fetch that gate
+     * would trigger a lazy salon load on the catalogue path.
+     *
      * <p><strong>Bookability is intentionally NOT filtered here.</strong> Whether a candidate has a
      * free future slot is resolved in-memory by
      * {@code com.beautica.booking.service.BookingMasterService}, which delegates to
@@ -259,7 +309,8 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
             SELECT msa FROM MasterServiceAssignment msa
             JOIN FETCH msa.master m
             JOIN FETCH m.user
-            WHERE m.salon.id = :salonId
+            JOIN FETCH m.salon s
+            WHERE s.id = :salonId
               AND m.isActive = true
               AND msa.serviceDefinition.id = :serviceDefId
               AND msa.isActive = true

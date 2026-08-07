@@ -129,10 +129,14 @@ public class ReviewService {
         // getUser() are both fully hydrated entities in this persistence context — not proxies —
         // and getId() reads an in-memory field. No lazy initialisation, no extra statement on the
         // review-create path.
+        // clientId is the AUTHOR (this method's authenticated principal argument), carried so
+        // ClientPassportCacheEvictor can drop that client's cached BEAUTY PASSPORT — its
+        // reviewsWritten line just changed. Costs nothing: it is already a parameter.
         eventPublisher.publishEvent(new ReviewCreatedEvent(
                 booking.getMaster().getId(),
                 booking.getMaster().getUser().getId(),
-                salonId));
+                salonId,
+                clientId));
         return ReviewResponse.from(saved);
     }
 

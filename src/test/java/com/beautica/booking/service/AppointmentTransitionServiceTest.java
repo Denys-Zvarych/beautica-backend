@@ -6,6 +6,7 @@ import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.dto.AppointmentRescheduleRequest;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.entity.Appointment;
+import com.beautica.booking.event.BookingCompletedEvent;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
@@ -26,10 +27,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -99,6 +102,9 @@ class AppointmentTransitionServiceTest {
     @Mock
     private AppointmentService appointmentService;
 
+    @Mock
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
+
     private Clock clock;
     private AppointmentTransitionService appointmentTransitionService;
 
@@ -117,6 +123,7 @@ class AppointmentTransitionServiceTest {
                 cachePrefixEvictor,
                 visitPlanner,
                 appointmentService,
+                eventPublisher,
                 clock
         );
         appointmentId = UUID.randomUUID();
@@ -283,6 +290,85 @@ class AppointmentTransitionServiceTest {
         verify(appointmentRepository, never()).lockHeaderRegardlessOfStatus(any());
         verify(appointmentRepository, never()).findById(any());
         verify(bookingRepository, never()).findByAppointmentIdWithGraph(any());
+    }
+
+    // ── BookingCompletedEvent carries a CLIENT id, never an appointment id ───────────────────────
+    //
+    // 2026-08 security re-audit LOW. The event used to carry a `bookingId` that this path filled
+    // with `appointment.getId()` (appointments.id) while BookingService filled it with
+    // `booking.getId()` (bookings.id) — two disjoint id spaces behind one field name, so any
+    // future `bookingRepository.findById(event.bookingId())` would silently return empty for every
+    // multi-service visit. The field is gone; these tests pin what the single remaining component
+    // actually means, so it cannot be re-populated from the wrong entity.
+
+    @Test
+    @DisplayName("completeAppointment publishes BookingCompletedEvent carrying the visit CLIENT's "
+            + "user id — never the appointment id and never an item's booking id")
+    void should_publishClientUserId_when_appointmentCompleted() {
+        UUID clientUserId = UUID.randomUUID();
+        UUID itemBookingId = UUID.randomUUID();
+        User visitClient = new User("visit-client@beautica.test", "hash", Role.CLIENT,
+                "Олена", "Коваль", "+380501110000");
+        ReflectionTestUtils.setField(visitClient, "id", clientUserId);
+
+        Appointment appointment = confirmedAppointmentFor(visitClient);
+        Booking item = confirmedItemOf(itemBookingId);
+        when(appointmentRepository.lockHeaderRegardlessOfStatus(appointmentId))
+                .thenReturn(Optional.of(appointmentId));
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(item));
+
+        appointmentTransitionService.completeAppointment(UUID.randomUUID(), appointmentId);
+
+        ArgumentCaptor<Object> published = ArgumentCaptor.forClass(Object.class);
+        verify(eventPublisher).publishEvent(published.capture());
+        assertThat(published.getValue())
+                .isInstanceOf(BookingCompletedEvent.class)
+                .extracting("clientUserId")
+                .as("the passport cache is keyed on users.id — publishing appointments.id or "
+                        + "bookings.id here would evict nothing and fail silently")
+                .isEqualTo(clientUserId)
+                .isNotEqualTo(appointmentId)
+                .isNotEqualTo(itemBookingId);
+    }
+
+    @Test
+    @DisplayName("completeAppointment publishes a null clientUserId for a GUEST visit — the event "
+            + "records the absence faithfully rather than substituting an id")
+    void should_publishNullClientUserId_when_guestVisitCompleted() {
+        Appointment appointment = confirmedAppointmentFor(null);
+        when(appointmentRepository.lockHeaderRegardlessOfStatus(appointmentId))
+                .thenReturn(Optional.of(appointmentId));
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId))
+                .thenReturn(List.of(confirmedItemOf(UUID.randomUUID())));
+
+        appointmentTransitionService.completeAppointment(UUID.randomUUID(), appointmentId);
+
+        verify(eventPublisher).publishEvent(new BookingCompletedEvent(null));
+        // A guest visit has no account to review with, so no review prompt is enqueued either.
+        verify(outboxService, never()).enqueueReviewRequested(any());
+    }
+
+    private Appointment confirmedAppointmentFor(User client) {
+        return Appointment.builder()
+                .id(appointmentId)
+                .client(client)
+                .status(BookingStatus.CONFIRMED)
+                .build();
+    }
+
+    /** A CONFIRMED item with the minimal graph {@code registerEviction} indexes into. */
+    private Booking confirmedItemOf(UUID bookingId) {
+        return Booking.builder()
+                .id(bookingId)
+                .master(Master.builder().id(UUID.randomUUID()).isActive(true).build())
+                .masterService(MasterServiceAssignment.builder()
+                        .id(UUID.randomUUID()).isActive(true).build())
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(OffsetDateTime.parse("2026-07-26T09:00:00Z"))
+                .endsAt(OffsetDateTime.parse("2026-07-26T10:00:00Z"))
+                .build();
     }
 
     @Test

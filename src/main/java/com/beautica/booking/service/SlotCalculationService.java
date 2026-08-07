@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.common.BookingWindow;
 import com.beautica.common.TimeZones;
@@ -167,11 +168,26 @@ public class SlotCalculationService {
         // on the slot endpoint and on the availability-aware working-days endpoint.
         List<MasterServiceAssignment> assignments = loadBookableAssignments(masterId, masterServiceIds);
 
-        // Guard: master must be active to expose any bookable slots. All chained assignments share the same
+        // Guard: master must be BOOKABLE to expose any slots. All chained assignments share the same
         // master (they are loaded master-scoped), so the first one's master carries the liveness flag.
         // deactivateOwnerMaster (and the general deactivateMaster) sets masters.is_active = false
         // but leaves master_services rows intact — check the master entity itself here.
-        if (!assignments.get(0).getMaster().isActive()) {
+        //
+        // The salon term (MasterBookability, 2026-08 re-audit LOW) stops a closed salon's master from
+        // listing slots the create path would then reject: an empty list beats a live CTA that 404s on
+        // tap.
+        //
+        // For the CREATE paths this guard is only that dead-CTA fix — they re-check MasterBookability
+        // themselves. For the three RESCHEDULE routes it IS the security boundary, and the only one:
+        // BookingService#rescheduleBooking, AppointmentTransitionService#rescheduleAppointment and
+        // #rescheduleAppointmentItem all authorize a start time by requiring it to MATCH a slot this
+        // method returns, and never call MasterBookability directly. Returning an empty list here is
+        // what stops a client moving a live booking onto a master whose salon has since closed —
+        // so do NOT weaken or relocate this check without giving those three their own guard
+        // (MasterBookability's javadoc, "Derivative enforcers").
+        //
+        // Free: findByMasterIdAndIdWithGraph LEFT JOIN FETCHes salon.
+        if (!MasterBookability.isBookable(assignments.get(0).getMaster())) {
             return List.of();
         }
 
@@ -340,7 +356,9 @@ public class SlotCalculationService {
 
         List<EffectiveDayResponse> days = masterScheduleService.resolveEffectiveRange(masterId, from, to);
 
-        if (!assignments.get(0).getMaster().isActive()) {
+        // Same MasterBookability gate as getAvailableSlots (2026-08 re-audit LOW) — a closed salon's
+        // master reports every day non-working rather than advertising days whose slots cannot be booked.
+        if (!MasterBookability.isBookable(assignments.get(0).getMaster())) {
             return days.stream()
                     .map(day -> new MasterWorkingDayResponse(day.date(), false))
                     .toList();
@@ -447,7 +465,15 @@ public class SlotCalculationService {
      * {@code MIN_MINUTES_AHEAD}.
      */
     boolean hasBookableFutureSlot(MasterServiceAssignment msa, LocalDate from, LocalDate to) {
-        if (msa == null || !msa.isActive() || !msa.getMaster().isActive()) {
+        // MasterBookability folds in the salon term (2026-08 re-audit LOW): a closed salon's master is
+        // not bookable, so the catalogue/master-list gate must not advertise it. Both finders that
+        // produce an `msa` for this method initialise the salon, so the deref costs no lazy load on
+        // either path: findByMasterIdAndIdWithGraph LEFT JOIN FETCHes it (master-scoped — it must
+        // keep salon-less independent masters), while findBookableAssignmentsBySalonAndServiceDef,
+        // the `preloaded` caller BookingMasterService's finder, uses an INNER JOIN FETCH — that one
+        // is salon-scoped (WHERE s.id = :salonId), so a non-null salon was already required and the
+        // inner join drops nothing.
+        if (msa == null || !msa.isActive() || !MasterBookability.isBookable(msa.getMaster())) {
             return false;
         }
         UUID masterId = msa.getMaster().getId();

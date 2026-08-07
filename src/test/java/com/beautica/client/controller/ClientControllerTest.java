@@ -106,9 +106,12 @@ class ClientControllerTest {
         var passport = new PassportResponse(
                 List.of("MANICURE", "PEDICURE"),
                 List.of("Pechersk"),
+                List.of("Kyiv", "Lviv"),
                 new BudgetBand(new BigDecimal("325.50"), new BigDecimal("150.00"),
                         new BigDecimal("600.00"), "UAH"),
-                7);
+                7,
+                12,
+                2024);
         when(clientPassportService.getPassport(clientId)).thenReturn(passport);
 
         mockMvc.perform(get("/api/v1/clients/me/passport").with(asClient()))
@@ -116,25 +119,34 @@ class ClientControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.favoriteProcedures[0]").value("MANICURE"))
                 .andExpect(jsonPath("$.data.favoriteDistricts[0]").value("Pechersk"))
+                .andExpect(jsonPath("$.data.favoriteCities[0]").value("Kyiv"))
+                .andExpect(jsonPath("$.data.favoriteCities[1]").value("Lviv"))
                 .andExpect(jsonPath("$.data.budget.avg").value(325.50))
                 .andExpect(jsonPath("$.data.budget.currency").value("UAH"))
-                .andExpect(jsonPath("$.data.bookingsConsidered").value(7));
+                .andExpect(jsonPath("$.data.bookingsConsidered").value(7))
+                .andExpect(jsonPath("$.data.reviewsWritten").value(12))
+                .andExpect(jsonPath("$.data.memberSinceYear").value(2024));
 
         // The id resolved from the principal — there is no clientId path/query parameter.
         verify(clientPassportService).getPassport(eq(clientId));
     }
 
     @Test
-    @DisplayName("GET /passport — 200 empty-state shape (empty lists, null budget)")
+    @DisplayName("GET /passport — 200 empty-state shape: empty lists and null budget, but the "
+            + "identity standing fields still serialized (never a fabricated year)")
     void should_return200EmptyState_when_noCompletedBookings() throws Exception {
         when(clientPassportService.getPassport(clientId))
-                .thenReturn(new PassportResponse(List.of(), List.of(), null, 0));
+                .thenReturn(new PassportResponse(List.of(), List.of(), List.of(), null, 0, 3, 2025));
 
         mockMvc.perform(get("/api/v1/clients/me/passport").with(asClient()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.favoriteProcedures.length()").value(0))
+                .andExpect(jsonPath("$.data.favoriteDistricts.length()").value(0))
+                .andExpect(jsonPath("$.data.favoriteCities.length()").value(0))
                 .andExpect(jsonPath("$.data.budget").doesNotExist())
-                .andExpect(jsonPath("$.data.bookingsConsidered").value(0));
+                .andExpect(jsonPath("$.data.bookingsConsidered").value(0))
+                .andExpect(jsonPath("$.data.reviewsWritten").value(3))
+                .andExpect(jsonPath("$.data.memberSinceYear").value(2025));
     }
 
     @Test

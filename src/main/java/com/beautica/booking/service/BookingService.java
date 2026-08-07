@@ -2,6 +2,7 @@ package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.domain.BookingClosureRule;
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
@@ -14,6 +15,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.AppointmentRepository;
+import com.beautica.booking.event.BookingCompletedEvent;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingSpecifications;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
@@ -41,6 +43,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -101,6 +104,7 @@ public class BookingService {
     // (BookingService → AppointmentTransitionService → BookingService). See that method's own
     // Javadoc (phase 30.6 D1) — do not "move this to where it looks like it belongs".
     private final AppointmentRepository appointmentRepository;
+    private final ApplicationEventPublisher eventPublisher;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -1153,6 +1157,16 @@ public class BookingService {
         }
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit(actorUserId);
+        // Announce the completion as a domain fact so other feature packages can react without
+        // importing this one. Consumed by ClientPassportCacheEvictor (AFTER_COMMIT, per key) — a
+        // completed booking moves bookingsConsidered, the district/city rankings and the budget
+        // band on the client's BEAUTY PASSPORT. Published INSIDE the transaction; Spring holds it
+        // until commit because the listener is @TransactionalEventListener(AFTER_COMMIT), so a
+        // rolled-back completion evicts nothing. Guest (LINK) bookings carry a null client — the
+        // event records that faithfully and the listener skips it, exactly as the review-prompt
+        // enqueue above does.
+        eventPublisher.publishEvent(new BookingCompletedEvent(
+                saved.getClient() != null ? saved.getClient().getId() : null));
         return BookingResponse.from(saved, resolveNow());
     }
 
@@ -1759,12 +1773,56 @@ public class BookingService {
         // Master kind is irrelevant to bookability — SALON_MASTER, INDEPENDENT_MASTER,
         // and SALON_OWNER masters are all bookable when active with working hours + a
         // matching master_services row.
+        //
+        // SALON-ACTIVE GUARD (2026-08 security re-audit HIGH). SalonService.deactivateSalon
+        // sets salons.is_active = false but does NOT cascade to masters.is_active, so every
+        // master of a closed salon still passes Master::isActive. Without this predicate a client
+        // holding a masterServiceId (from a stale wish-list card, a bookmarked deep link, or a
+        // cached catalogue page) could still create a CONFIRMED booking against a salon the owner
+        // had closed — the salon's own read surfaces hide it, but the write path admitted it.
+        //
+        // This is ONE OF THREE booking-create gates, not "the" gate. An earlier revision of this
+        // comment claimed sole authority while two sibling create paths were still unguarded; the
+        // follow-up audit found both. The complete set of write paths that mint a booking is:
+        //   1. here — POST /bookings                (authenticated, single service)
+        //   2. AppointmentService#doCreateAppointment — POST /appointments (authenticated visit)
+        //   3. GuestBookingService#createGuestBooking — POST /book/{slug}/booking (permitAll),
+        //      guarded in the finder itself: MasterRepository#findByBookingSlugWithUser
+        // The canonical rule and the full enforcement map live in
+        // com.beautica.booking.domain.MasterBookability — change the rule there, not here.
+        //
+        // The favourites/catalogue/slot predicates only stop a dead CTA being rendered; they
+        // cannot stop a hand-crafted request. These three can.
+        //
+        // `getSalon() == null` MUST pass: an INDEPENDENT_MASTER has no salon and stays bookable.
+        // No extra query — findByIdWithUserAndSalon already LEFT JOIN FETCHes the salon.
+        //
+        // Folded into the same filter chain as isActive so BOTH rejections surface the identical
+        // "Master not found or inactive" 404. Splitting it into a distinct message/status would
+        // hand an unauthenticated caller an oracle distinguishing "this master does not exist"
+        // from "this master's salon was closed" — a business-state leak about another party.
         Master master = masterRepository.findByIdWithUserAndSalon(request.masterId())
-                .filter(Master::isActive)
+                .filter(MasterBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 
+        // `.filter(isActive)` (Phase 249 QA gate, 2026-08-07). findByMasterIdAndIdWithGraph carries no
+        // is_active predicate, and this was the ONLY one of the four master-service resolution paths
+        // that did not apply one on top of it:
+        //   VisitPlanner#planChainedItems              (POST /appointments)        — filters
+        //   GuestBookingService#createGuestBooking     (POST /book/{slug}/booking) — filters
+        //   SlotCalculationService#loadBookableAssignment (GET .../slots)          — filters
+        //   here                                       (POST /bookings)           — did NOT
+        // So a client holding a masterServiceId for a service the provider had unassigned from their
+        // menu — a stale BEAUTY WISH LIST card is the documented way to hold one (Phase 248) — could
+        // still create a CONFIRMED booking for it, while the identical guest request 404'd. Every
+        // read surface that filters `master_services.is_active` justifies itself with "the booking
+        // path then rejects it"; until this filter existed, that claim was false for POST /bookings.
+        // Same 404 message as the missing-row case: splitting them would hand a caller an oracle
+        // distinguishing "no such service" from "this provider retired that service".
+        // Pinned by FavoriteServiceIT#should_return404_when_bookingAFavoritedServiceThatWasDeactivated.
         MasterServiceAssignment msa = masterServiceRepository
                 .findByMasterIdAndIdWithGraph(request.masterId(), request.masterServiceId())
+                .filter(MasterServiceAssignment::isActive)
                 .orElseThrow(() -> new NotFoundException("Master service not found"));
 
         OffsetDateTime startsAt = request.startsAt().toOffsetDateTime();

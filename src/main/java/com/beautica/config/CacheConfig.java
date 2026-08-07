@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.client.service.ClientPassportService;
 import com.beautica.search.service.SearchCacheNames;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -12,6 +13,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -72,6 +74,17 @@ public class CacheConfig {
      */
     private static final int SEARCH_TOTAL_MAX_ENTRIES = 1000;
     private static final long SEARCH_TOTAL_TTL_SECONDS = 60;
+
+    /**
+     * BEAUTY PASSPORT sizing. Named constants (not inline literals) so
+     * {@code ClientPassportCacheIT} can assert the LIVE cache's {@code maximumSize} /
+     * {@code expireAfterWrite} against the same symbols this config applies — a test asserting
+     * hard-coded 2000/10 would pass against a cache built by Caffeine's default (unbounded,
+     * never-expiring) builder only by coincidence, so the shared constant is what makes that
+     * assertion meaningful.
+     */
+    public static final int CLIENT_PASSPORT_MAX_ENTRIES = 2000;
+    public static final long CLIENT_PASSPORT_TTL_MINUTES = 10;
 
     /**
      * Per-cache TTL configuration using individual Caffeine caches.
@@ -147,6 +160,34 @@ public class CacheConfig {
     @Bean
     public CacheManager cacheManager(ObjectProvider<MeterRegistry> meterRegistryProvider) {
         CaffeineCacheManager manager = new CaffeineCacheManager();
+        // DYNAMIC CACHE CREATION OFF (2026-08 security audit LOW — client-passport).
+        //
+        // A bare `new CaffeineCacheManager()` leaves `dynamic = true`: getCache(name) for an
+        // UNREGISTERED name silently mints a cache from Caffeine's DEFAULT builder — no
+        // maximumSize, no expireAfterWrite. Every registration below deliberately picks both, so
+        // that default is never a correct answer here; it is an unbounded retained-heap leak that
+        // fails silently. The specific trigger the audit raised: `client-passport` holds per-client
+        // PII-derived aggregates, and if its registration were renamed or dropped, @Cacheable
+        // would keep working against an unbounded, never-expiring cache while
+        // ClientPassportCacheEvictor's getCache() returned that SAME cache — so nothing would fail
+        // loudly and per-user data would be retained for the life of the JVM.
+        //
+        // Passing an EMPTY collection sets `dynamic = false` without pre-creating anything (Spring
+        // iterates the collection, then flips the flag), so it composes with registerCustomCache:
+        // every name registered below stays available, and only unregistered names change
+        // behaviour — from "silent unbounded cache" to a hard `IllegalArgumentException: Cannot
+        // find cache named 'X'` from Spring's cache interceptor.
+        //
+        // VERIFIED SAFE FOR THE EXISTING CACHES: every cache name declared by any
+        // @Cacheable/@CacheEvict/@CachePut in src/main (resolving the constants —
+        // SearchCacheNames.*, ClientPassportService.CLIENT_PASSPORT_CACHE, PORTFOLIO_CACHE,
+        // APPROVED_CATEGORIES_CACHE, BOOKABLE_CACHE, BOOKABLE_DAYS_CACHE, the location CACHE_*,
+        // PlatformCategoryOrderLookup.CACHE_NAME) and every name reaching a runtime
+        // cacheManager.getCache(...) call site (SearchService, SearchCacheResolver,
+        // SalonService/UserService via SearchCacheNames.MASTERS_ALL/SALONS_ALL, ReviewEventListener,
+        // MediaService, MasterService, ServiceCatalogService, MasterCachePrefixEvictor) is
+        // registered below. @WebMvcTest slices are unaffected — they do not load this class.
+        manager.setCacheNames(List.of());
         // Optional so pure @WebMvcTest slices (no actuator/metrics context) still wire the cache
         // manager; when a MeterRegistry is present the hot slot caches export hit-rate / eviction
         // gauges (Perf #5). getIfAvailable() returns the actuator-autoconfigured primary registry.
@@ -391,6 +432,23 @@ public class CacheConfig {
                         .maximumSize(500)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
+        // Phase 31.x / 2026-08 perf audit F3 — BEAUTY PASSPORT per client, keyed on the caller's
+        // OWN principal id (ClientPassportService#getPassport, @Cacheable(key = "#clientUserId",
+        // sync = true)). A miss costs 7 statements, 3 of them aggregations over the client's
+        // entire COMPLETED booking history, so this is the most expensive per-user read in the app.
+        // Evicted PER KEY, AFTER_COMMIT, by ClientPassportCacheEvictor on booking completion and
+        // review creation; the 10-minute TTL is only the backstop for a dropped eviction, not the
+        // primary invalidation path. 2000 entries covers the active client base at current scale.
+        //
+        // Registered under the CONSTANT, never a duplicated "client-passport" literal (2026-08
+        // security audit LOW): the @Cacheable, the evictor's getCache() and this registration are
+        // then the same symbol, so a rename cannot leave the registration behind pointing at a
+        // dead name. Sizing is asserted end-to-end by ClientPassportCacheIT.
+        manager.registerCustomCache(ClientPassportService.CLIENT_PASSPORT_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(CLIENT_PASSPORT_MAX_ENTRIES)
+                        .expireAfterWrite(CLIENT_PASSPORT_TTL_MINUTES, TimeUnit.MINUTES)
+                        .build());
         // Phase 10.4 — KATOTTH locality taxonomy (~370 static reference rows, written
         // only by Flyway seed migrations). Long 24-hour TTL with NO @CacheEvict path:
         // the data cannot change at runtime, so the only invalidation is JVM restart
@@ -459,7 +517,36 @@ public class CacheConfig {
                         .maximumSize(200)
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
+        assertCustomRegistration(manager, ClientPassportService.CLIENT_PASSPORT_CACHE);
         return manager;
+    }
+
+    /**
+     * Fails application startup if {@code cacheName} was not registered above as a CUSTOM cache
+     * (2026-08 security audit LOW).
+     *
+     * <p>Read together with the {@code setCacheNames(List.of())} call at the top of
+     * {@link #cacheManager}: that turns off dynamic creation, so an unregistered name resolves to
+     * {@code null} instead of an unbounded default cache — and this check converts that
+     * {@code null} into an {@code IllegalStateException} at context refresh rather than a lazy
+     * {@code IllegalArgumentException} on whichever request first touches the cache. Only names
+     * put into the manager's map by {@code registerCustomCache} can be present at this point,
+     * because nothing else has been able to create one.
+     *
+     * <p>Applied to {@code client-passport} specifically because it is the only cache here holding
+     * per-user PII-derived data — silently losing its sizing/TTL is a data-retention defect, not
+     * just a performance one. It is deliberately a targeted assertion rather than a reflective
+     * sweep of every {@code @Cacheable}: the {@code setCacheNames} flag already makes every OTHER
+     * missing registration fail loudly at first use.
+     */
+    private static void assertCustomRegistration(CaffeineCacheManager manager, String cacheName) {
+        if (!manager.getCacheNames().contains(cacheName)) {
+            throw new IllegalStateException(
+                    "Cache '" + cacheName + "' is not registered in CacheConfig. Dynamic cache "
+                            + "creation is disabled, so @Cacheable on this name would fail at "
+                            + "runtime; re-register it with an explicit maximumSize and "
+                            + "expireAfterWrite.");
+        }
     }
 
     /**

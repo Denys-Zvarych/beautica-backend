@@ -2,7 +2,6 @@ package com.beautica.service.dto;
 
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
-import com.beautica.service.util.PriceDisplayFormatter;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
@@ -45,10 +44,10 @@ public record ServiceDefinitionResponse(
         String priceDisplay
 ) {
     public static ServiceDefinitionResponse from(ServiceDefinition sd) {
-        String priceDisplay = null;
-        if (sd.getPriceType() != null && sd.getBasePrice() != null) {
-            priceDisplay = PriceDisplayFormatter.format(sd.getPriceType(), sd.getBasePrice(), sd.getPriceMax());
-        }
+        // Money is derived in exactly one place (Phase 31.4 D2) so that this DTO, the
+        // master's service menu and the BEAUTY WISH LIST can never print different prices
+        // for the same service. Behaviour is identical to the previous inline derivation.
+        ServicePricing pricing = ServicePricing.ofDefinition(sd);
 
         return new ServiceDefinitionResponse(
                 sd.getId(),
@@ -62,10 +61,10 @@ public record ServiceDefinitionResponse(
                 sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
                 sd.getServiceType() != null ? sd.getServiceType().getSlug() : null,
                 sd.getPhotoUrl(),
-                sd.getPriceType(),
-                sd.getBasePrice(),
-                sd.getPriceMax(),
-                priceDisplay
+                pricing.priceType(),
+                pricing.priceMin(),
+                pricing.priceMax(),
+                pricing.priceDisplay()
         );
     }
 }
