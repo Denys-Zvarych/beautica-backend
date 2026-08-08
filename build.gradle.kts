@@ -150,6 +150,38 @@ tasks.withType<Test> {
         "-Xshare:off"
     )
 
+    // PR #105 (2026-08-08): `./gradlew test` was killed mid-run by
+    // TestSuiteExecutionException ("Could not complete execution for Gradle Test
+    // Executor 1") — a forked test-JVM death, not an assertion failure. No
+    // OutOfMemoryError was logged because the OS SIGKILLed the process before the
+    // JVM could report one. Cause: with no maxHeapSize and the Gradle default
+    // forkEvery = 0, the entire suite (397 test classes / ~949 test methods,
+    // dozens of them @SpringBootTest + Testcontainers ITs booting 7+ Postgres
+    // containers) ran in a single never-restarted worker JVM, so Spring's
+    // ContextCache and Testcontainers state accumulated for the whole run. This
+    // was the branch's first-ever full-suite CI run (24 commits, never CI'd), so
+    // the suite had simply outgrown an untuned default.
+    //
+    // maxHeapSize: gives the worker JVM an explicit ceiling so a future overrun
+    // produces a real OutOfMemoryError with a stack trace instead of a silent OS
+    // SIGKILL. 3g is sized against the ubuntu-latest runner's ~7 GB: the Gradle
+    // daemon already claims -Xmx2g (org.gradle.jvmargs in gradle.properties),
+    // maxParallelForks is left at its default of 1 (so only one worker JVM is
+    // ever alive at a time), and 3g + 2g leaves ~2 GB of headroom for the OS,
+    // Docker Engine, and the Testcontainers Postgres containers.
+    //
+    // forkEvery: restarts the worker JVM periodically to release accumulated
+    // ContextCache / Testcontainers state before it can reach the memory
+    // pressure that killed PR #105. Gradle counts forkEvery in test CLASSES, not
+    // test methods — with 397 test classes on this branch, forkEvery = 100 yields
+    // 4 forks (3 restarts) spread across the run. Each restart re-boots whatever
+    // Spring contexts the next chunk needs, which is real wall-clock cost, so
+    // this intentionally stays well short of restarting every class: 3 restarts
+    // buys several chances to release memory across the suite without paying for
+    // a cold Spring context boot on every single test class.
+    maxHeapSize = "3g"
+    forkEvery = 100
+
     val testLogLevel = (project.findProperty("testLogLevel") as String?) ?: "TRACE"
     val testRootLogLevel = (project.findProperty("testRootLogLevel") as String?) ?: "INFO"
     systemProperty("test.log.level", testLogLevel)
