@@ -219,7 +219,6 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
         PassportResponse passport = getPassport(clientId);
 
         assertThat(passport.bookingsConsidered()).isZero();
-        assertThat(passport.favoriteProcedures()).isEmpty();
         assertThat(passport.favoriteDistricts()).isEmpty();
         assertThat(passport.favoriteCities()).isEmpty();
         assertThat(passport.budget())
@@ -252,6 +251,24 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
                 .as("the correlated subquery is scoped to u.id — a foreign review must not count")
                 .isEqualTo(1);
         assertThat(getPassport(other).reviewsWritten()).isEqualTo(2);
+    }
+
+    // ── Phase 250: favoriteProcedures retired ─────────────────────────────────────
+
+    @Test
+    @DisplayName("GET passport — the favoriteProcedures key is absent from the response body "
+            + "(Phase 250 retirement; a re-introduction must fail this test)")
+    void should_omitFavoriteProceduresKey_when_retiredByPhase250() throws Exception {
+        UUID clientId = createClient("passport-no-favprocs-client@beautica.test");
+        UUID master = createIndependentMasterAt("passport-no-favprocs-master@beautica.test", null);
+        UUID masterService = createMasterService(master);
+        insertCompletedBooking(clientId, master, masterService, new BigDecimal("500.00"));
+
+        String rawBody = getPassportRaw(clientId);
+
+        assertThat(rawBody)
+                .as("favoriteProcedures must never reappear in the passport payload")
+                .doesNotContain("favoriteProcedures");
     }
 
     // ── the budget band: avg is real data, and Phase 251 must not drop it silently ─

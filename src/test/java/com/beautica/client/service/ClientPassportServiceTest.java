@@ -115,14 +115,12 @@ class ClientPassportServiceTest {
 
         PassportResponse result = service().getPassport(clientId);
 
-        assertThat(result.favoriteProcedures()).as("empty-state procedures").isEmpty();
         assertThat(result.favoriteDistricts()).as("empty-state districts").isEmpty();
         assertThat(result.favoriteCities()).as("empty-state cities").isEmpty();
         assertThat(result.budget()).as("empty-state budget is null, not a band of nulls").isNull();
         assertThat(result.bookingsConsidered()).as("considered count").isZero();
 
         // Short-circuit: no ranking query, no locality queries, no label resolution.
-        verify(aggregationRepository, never()).findTopServiceTypes(any(), any());
         verify(aggregationRepository, never()).findTopDistricts(any(), any());
         verify(aggregationRepository, never()).findTopCities(any(), any());
         verifyNoInteractions(discoveryLocationResolver);
@@ -194,7 +192,7 @@ class ClientPassportServiceTest {
     // ── passport: happy path (top-N + budget math + UAH + district labels) ──────
 
     @Test
-    @DisplayName("getPassport — maps top-N procedures, batched district labels, and the UAH budget "
+    @DisplayName("getPassport — maps batched district labels and the UAH budget "
             + "band straight from the aggregates")
     void should_buildPassport_when_completedBookingsExist() {
         UUID districtA = UUID.randomUUID();
@@ -205,8 +203,6 @@ class ClientPassportServiceTest {
         stubIdentity(12L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId))
                 .thenReturn(budget("325.50", "150.00", "600.00", 7));
-        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
-                .thenReturn(List.of("MANICURE", "PEDICURE", "HAIRCUT"));
         when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of(new DistrictCount(districtA, 5), new DistrictCount(districtB, 2)));
         when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
@@ -218,9 +214,6 @@ class ClientPassportServiceTest {
 
         PassportResponse result = service().getPassport(clientId);
 
-        assertThat(result.favoriteProcedures())
-                .as("top-N service types pass through in repo order")
-                .containsExactly("MANICURE", "PEDICURE", "HAIRCUT");
         assertThat(result.favoriteDistricts())
                 .as("district ids resolved to labels in count order")
                 .containsExactly("Pechersk", "Shevchenkivskyi");
@@ -243,8 +236,6 @@ class ClientPassportServiceTest {
     void should_requestTopThreePage_when_buildingPassport() {
         stubIdentity(0L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("100", "100", "100", 1));
-        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
-                .thenReturn(List.of("MANICURE"));
         when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of());
         when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
@@ -254,15 +245,11 @@ class ClientPassportServiceTest {
 
         service().getPassport(clientId);
 
-        ArgumentCaptor<Pageable> procPage = ArgumentCaptor.forClass(Pageable.class);
         ArgumentCaptor<Pageable> distPage = ArgumentCaptor.forClass(Pageable.class);
         ArgumentCaptor<Pageable> cityPage = ArgumentCaptor.forClass(Pageable.class);
-        verify(aggregationRepository).findTopServiceTypes(eq(clientId), procPage.capture());
         verify(aggregationRepository).findTopDistricts(eq(clientId), distPage.capture());
         verify(aggregationRepository).findTopCities(eq(clientId), cityPage.capture());
 
-        assertThat(procPage.getValue().getPageSize()).as("procedures page size").isEqualTo(3);
-        assertThat(procPage.getValue().getPageNumber()).isZero();
         assertThat(distPage.getValue().getPageSize()).as("districts page size").isEqualTo(3);
         assertThat(cityPage.getValue().getPageSize()).as("cities page size").isEqualTo(3);
         assertThat(cityPage.getValue().getPageNumber()).isZero();
@@ -276,8 +263,6 @@ class ClientPassportServiceTest {
 
         stubIdentity(0L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("200", "200", "200", 3));
-        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
-                .thenReturn(List.of("MANICURE"));
         when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of(new DistrictCount(resolvable, 2), new DistrictCount(unresolvable, 1)));
         // Only the first id resolves; the second yields no label.
@@ -300,8 +285,6 @@ class ClientPassportServiceTest {
 
         stubIdentity(0L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("200", "200", "200", 3));
-        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
-                .thenReturn(List.of("MANICURE"));
         when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of(new CityCount(resolvable, 2), new CityCount(unresolvable, 1)));
         // Only the first id resolves; the second yields no label (e.g. filtered out of the taxonomy).
@@ -325,8 +308,6 @@ class ClientPassportServiceTest {
 
         stubIdentity(0L, REGISTERED_AT);
         when(aggregationRepository.aggregateBudget(clientId)).thenReturn(budget("200", "200", "200", 3));
-        when(aggregationRepository.findTopServiceTypes(eq(clientId), any(Pageable.class)))
-                .thenReturn(List.of("MANICURE"));
         when(aggregationRepository.findTopDistricts(eq(clientId), any(Pageable.class)))
                 .thenReturn(List.of(new DistrictCount(districtA, 2)));
         when(aggregationRepository.findTopCities(eq(clientId), any(Pageable.class)))

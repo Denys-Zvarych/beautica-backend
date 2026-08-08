@@ -70,14 +70,14 @@ public class ClientPassportService {
      * state is a first-class approved state, not an edge case. Gating them behind
      * {@code considered > 0} would ship a zero and force the client to fabricate a year.
      *
-     * <h3>Caching (2026-08 perf audit F3)</h3>
-     * A pure derived read costing 5 statements on a miss — {@code findStanding},
-     * {@code aggregateBudget}, {@code findTopServiceTypes}, {@code findTopDistricts},
-     * {@code findTopCities} — 4 of them aggregations over the client's <em>entire</em> COMPLETED
-     * booking history. The empty-state short-circuit below costs 2. (Both figures dropped by one
-     * when the two identity lookups were folded into a single {@code findStanding}; earlier
-     * revisions of this javadoc said 7.) Cached in {@code client-passport} under the caller's own
-     * principal id.
+     * <h3>Caching (2026-08 perf audit F3; Phase 250 retired {@code findTopServiceTypes})</h3>
+     * A pure derived read costing 4 statements on a miss — {@code findStanding},
+     * {@code aggregateBudget}, {@code findTopDistricts}, {@code findTopCities} — 3 of them
+     * aggregations over the client's <em>entire</em> COMPLETED booking history. The empty-state
+     * short-circuit below costs 2. (Both figures dropped by one when the two identity lookups
+     * were folded into a single {@code findStanding}, and again when Phase 250 retired
+     * {@code favoriteProcedures}/{@code findTopServiceTypes}; earlier revisions of this javadoc
+     * said 7, then 5.) Cached in {@code client-passport} under the caller's own principal id.
      *
      * <p><b>{@code key = "#clientUserId"} is the whole IDOR story.</b> The argument is the
      * authenticated principal's id, extracted by the controller from
@@ -86,7 +86,7 @@ public class ClientPassportService {
      * an overload that takes a caller-supplied id.
      *
      * <p>{@code sync = true} because this is a per-client hot key: without it, N concurrent
-     * requests for the same client after a TTL expiry each run the full 5-statement derivation
+     * requests for the same client after a TTL expiry each run the full 4-statement derivation
      * (§F-7).
      *
      * <p><b>The {@code NotFoundException} path is never cached.</b> Spring's cache abstraction
@@ -112,18 +112,15 @@ public class ClientPassportService {
         int considered = (int) budget.total();
         if (considered == 0) {
             return new PassportResponse(
-                    List.of(), List.of(), List.of(), null, 0, reviewsWritten, memberSinceYear);
+                    List.of(), List.of(), null, 0, reviewsWritten, memberSinceYear);
         }
 
-        List<String> favoriteProcedures =
-                aggregationRepository.findTopServiceTypes(clientUserId, TOP_N_PAGE);
         List<DistrictCount> districtRows = aggregationRepository.findTopDistricts(clientUserId, TOP_N_PAGE);
         List<CityCount> cityRows = aggregationRepository.findTopCities(clientUserId, TOP_N_PAGE);
         DiscoveryLabels labels = resolveLocalityLabels(cityRows, districtRows);
 
         BudgetBand band = new BudgetBand(budget.avg(), budget.min(), budget.max(), CURRENCY_UAH);
         return new PassportResponse(
-                favoriteProcedures,
                 toLabels(districtRows, DistrictCount::districtId, labels::districtLabel),
                 toLabels(cityRows, CityCount::cityId, labels::cityLabel),
                 band,

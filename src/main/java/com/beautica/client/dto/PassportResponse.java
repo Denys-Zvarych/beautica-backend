@@ -10,9 +10,9 @@ import java.util.List;
  * user-editable. Two groups of fields with <b>different</b> empty-state contracts:
  *
  * <ul>
- *   <li><b>Derived from COMPLETED bookings</b> — {@code favoriteProcedures},
- *       {@code favoriteDistricts}, {@code favoriteCities}, {@code budget},
- *       {@code bookingsConsidered}. When {@code bookingsConsidered == 0} the three lists
+ *   <li><b>Derived from COMPLETED bookings</b> — {@code favoriteDistricts},
+ *       {@code favoriteCities}, {@code budget},
+ *       {@code bookingsConsidered}. When {@code bookingsConsidered == 0} the two lists
  *       are empty and {@code budget} is {@code null} (never a band of nulls); the mobile
  *       client renders the «Паспорт — без історії» state.</li>
  *   <li><b>Identity standing</b> — {@code reviewsWritten} and {@code memberSinceYear}.
@@ -28,7 +28,6 @@ import java.util.List;
  * name — so no occupied-territory label can appear (occupied-territory data ban). An id
  * whose label does not resolve is dropped, never surfaced as a raw UUID.
  *
- * @param favoriteProcedures top-3 most-booked service-type names (by COMPLETED count)
  * @param favoriteDistricts  top-3 most-visited district labels (by COMPLETED count);
  *                           never null, rank-ordered most-frequent first
  * @param favoriteCities     top-3 most-visited city labels (by COMPLETED count);
@@ -46,7 +45,6 @@ import java.util.List;
  *                           fallback and must never substitute the current year.
  */
 public record PassportResponse(
-        List<String> favoriteProcedures,
         List<String> favoriteDistricts,
         List<String> favoriteCities,
         BudgetBand budget,

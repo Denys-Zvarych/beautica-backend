@@ -68,25 +68,6 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
     Optional<ClientStanding> findStanding(@Param("userId") UUID userId);
 
     /**
-     * Top service-type (category) names by COMPLETED-booking count, most-booked first.
-     * The category string is the platform service-type classifier on
-     * {@code ServiceDefinition}. Null categories are excluded. Bound the result with
-     * {@code PageRequest.of(0, 3)} for the top-3 contract (SQL LIMIT — no in-memory cut).
-     */
-    @Query("""
-            SELECT sd.category
-            FROM Booking b
-            JOIN b.masterService ms
-            JOIN ms.serviceDefinition sd
-            WHERE b.client.id = :clientId
-              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
-              AND sd.category IS NOT NULL
-            GROUP BY sd.category
-            ORDER BY COUNT(b) DESC, sd.category ASC
-            """)
-    List<String> findTopServiceTypes(@Param("clientId") UUID clientId, Pageable pageable);
-
-    /**
      * Top discovery districts by COMPLETED-booking count, most-visited first, as
      * {@link DistrictCount} rows carrying the FK id only (the service resolves the label
      * via the taxonomy join — occupied-territory ban). Discovery district is

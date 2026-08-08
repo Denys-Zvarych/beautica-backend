@@ -104,7 +104,6 @@ class ClientControllerTest {
     @DisplayName("GET /passport — 200 shape; client id taken from the principal, not a parameter")
     void should_return200PassportAndUsePrincipalId_when_authenticatedClient() throws Exception {
         var passport = new PassportResponse(
-                List.of("MANICURE", "PEDICURE"),
                 List.of("Pechersk"),
                 List.of("Kyiv", "Lviv"),
                 new BudgetBand(new BigDecimal("325.50"), new BigDecimal("150.00"),
@@ -117,7 +116,7 @@ class ClientControllerTest {
         mockMvc.perform(get("/api/v1/clients/me/passport").with(asClient()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.favoriteProcedures[0]").value("MANICURE"))
+                .andExpect(jsonPath("$.data.favoriteProcedures").doesNotExist())
                 .andExpect(jsonPath("$.data.favoriteDistricts[0]").value("Pechersk"))
                 .andExpect(jsonPath("$.data.favoriteCities[0]").value("Kyiv"))
                 .andExpect(jsonPath("$.data.favoriteCities[1]").value("Lviv"))
@@ -136,11 +135,11 @@ class ClientControllerTest {
             + "identity standing fields still serialized (never a fabricated year)")
     void should_return200EmptyState_when_noCompletedBookings() throws Exception {
         when(clientPassportService.getPassport(clientId))
-                .thenReturn(new PassportResponse(List.of(), List.of(), List.of(), null, 0, 3, 2025));
+                .thenReturn(new PassportResponse(List.of(), List.of(), null, 0, 3, 2025));
 
         mockMvc.perform(get("/api/v1/clients/me/passport").with(asClient()))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.favoriteProcedures.length()").value(0))
+                .andExpect(jsonPath("$.data.favoriteProcedures").doesNotExist())
                 .andExpect(jsonPath("$.data.favoriteDistricts.length()").value(0))
                 .andExpect(jsonPath("$.data.favoriteCities.length()").value(0))
                 .andExpect(jsonPath("$.data.budget").doesNotExist())

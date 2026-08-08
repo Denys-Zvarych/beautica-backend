@@ -277,58 +277,6 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
                 .plusHours(2L * slotCounter.getAndIncrement());
     }
 
-    // ── findTopServiceTypes ──────────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("findTopServiceTypes — ranks categories by COMPLETED count desc, tie broken by name asc, "
-            + "non-COMPLETED excluded, null category excluded")
-    void should_rankServiceTypes_when_completedBookingsExist() {
-        Master master = persistIndependentMaster(seededDistrictIds.get(0));
-        MasterServiceAssignment manicure = persistService(master, "Manicure", "MANICURE", "300");
-        MasterServiceAssignment pedicure = persistService(master, "Pedicure", "PEDICURE", "350");
-        MasterServiceAssignment haircut = persistService(master, "Haircut", "HAIRCUT", "400");
-        MasterServiceAssignment uncategorized = persistService(master, "Mystery", null, "100");
-
-        // MANICURE x3, then a PEDICURE/HAIRCUT tie at 2 each → name asc: HAIRCUT before PEDICURE.
-        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", slot());
-        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", slot());
-        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", slot());
-        persistBooking(client, master, pedicure, BookingStatus.COMPLETED, "350", slot());
-        persistBooking(client, master, pedicure, BookingStatus.COMPLETED, "350", slot());
-        persistBooking(client, master, haircut, BookingStatus.COMPLETED, "400", slot());
-        persistBooking(client, master, haircut, BookingStatus.COMPLETED, "400", slot());
-        // Noise: non-COMPLETED and null-category never count.
-        persistBooking(client, master, pedicure, BookingStatus.CONFIRMED, "350", slot());
-        persistBooking(client, master, uncategorized, BookingStatus.COMPLETED, "100", slot());
-        em.flush();
-        em.clear();
-
-        List<String> top = repository.findTopServiceTypes(client.getId(), TOP_3);
-
-        assertThat(top)
-                .as("MANICURE(3) > HAIRCUT(2) = PEDICURE(2) with HAIRCUT first by name asc")
-                .containsExactly("MANICURE", "HAIRCUT", "PEDICURE");
-    }
-
-    @Test
-    @DisplayName("findTopServiceTypes — excludes another client's COMPLETED bookings")
-    void should_excludeOtherClient_when_rankingServiceTypes() {
-        Master master = persistIndependentMaster(seededDistrictIds.get(0));
-        MasterServiceAssignment manicure = persistService(master, "Manicure", "MANICURE", "300");
-        MasterServiceAssignment pedicure = persistService(master, "Pedicure", "PEDICURE", "350");
-
-        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", slot());
-        // otherClient has many PEDICUREs — must not influence client's ranking.
-        persistBooking(otherClient, master, pedicure, BookingStatus.COMPLETED, "350", slot());
-        persistBooking(otherClient, master, pedicure, BookingStatus.COMPLETED, "350", slot());
-        em.flush();
-        em.clear();
-
-        List<String> top = repository.findTopServiceTypes(client.getId(), TOP_3);
-
-        assertThat(top).containsExactly("MANICURE");
-    }
-
     // ── findTopDistricts ─────────────────────────────────────────────────────────
 
     @Test
@@ -365,6 +313,34 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         assertThat(top.get(1).count()).isEqualTo(1L);
         // The master-user district behind the salon must NOT appear — CASE WHEN picked the salon.
         assertThat(top).extracting(DistrictCount::districtId).doesNotContain(masterUserDistrict);
+    }
+
+    @Test
+    @DisplayName("findTopDistricts — excludes another client's COMPLETED bookings (cross-client isolation; "
+            + "regression test authored during the Phase 250 audit — this query never had one)")
+    void should_excludeOtherClient_when_rankingDistricts() {
+        UUID clientDistrict = seededDistrictIds.get(0);
+        UUID otherClientDistrict = seededDistrictIds.get(1);
+
+        Master master = persistIndependentMaster(clientDistrict);
+        MasterServiceAssignment service = persistService(master, "Manicure", "MANICURE", "300");
+        Master otherMaster = persistIndependentMaster(otherClientDistrict);
+        MasterServiceAssignment otherService = persistService(otherMaster, "Pedicure", "PEDICURE", "350");
+
+        persistBooking(client, master, service, BookingStatus.COMPLETED, "300", slot());
+        // otherClient has many COMPLETED bookings in a different district — must not bleed in.
+        persistBooking(otherClient, otherMaster, otherService, BookingStatus.COMPLETED, "350", slot());
+        persistBooking(otherClient, otherMaster, otherService, BookingStatus.COMPLETED, "350", slot());
+        em.flush();
+        em.clear();
+
+        List<DistrictCount> top = repository.findTopDistricts(client.getId(), TOP_3);
+
+        assertThat(top)
+                .as("only the requesting client's own district row surfaces, despite otherClient "
+                        + "having a higher COMPLETED count in a different district")
+                .hasSize(1);
+        assertThat(top.get(0).districtId()).isEqualTo(clientDistrict);
     }
 
     @Test
@@ -527,6 +503,28 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         assertThat(budget.avg()).as("(200+400+600)/3").isEqualByComparingTo("400.00");
         assertThat(budget.min()).as("min").isEqualByComparingTo("200.00");
         assertThat(budget.max()).as("max").isEqualByComparingTo("600.00");
+    }
+
+    @Test
+    @DisplayName("aggregateBudget — excludes another client's COMPLETED bookings (cross-client isolation; "
+            + "regression test authored during the Phase 250 audit — this query never had one)")
+    void should_excludeOtherClient_when_aggregatingBudget() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment service = persistService(master, "Manicure", "MANICURE", "300");
+
+        persistBooking(client, master, service, BookingStatus.COMPLETED, "300.00", slot());
+        // otherClient's much larger COMPLETED spend must not drag this client's AVG/MIN/MAX/COUNT.
+        persistBooking(otherClient, master, service, BookingStatus.COMPLETED, "5000.00", slot());
+        persistBooking(otherClient, master, service, BookingStatus.COMPLETED, "9000.00", slot());
+        em.flush();
+        em.clear();
+
+        BudgetAggregate budget = repository.aggregateBudget(client.getId());
+
+        assertThat(budget.total()).as("only this client's COMPLETED count").isEqualTo(1L);
+        assertThat(budget.avg()).as("unaffected by otherClient's spend").isEqualByComparingTo("300.00");
+        assertThat(budget.min()).isEqualByComparingTo("300.00");
+        assertThat(budget.max()).isEqualByComparingTo("300.00");
     }
 
     @Test
