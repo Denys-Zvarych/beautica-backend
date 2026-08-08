@@ -65,7 +65,27 @@ public record MasterServiceResponse(
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Stable slug of the chosen platform service type (matches the "
                         + "search filter's service-type key); null when none was selected.")
-        String serviceTypeSlug
+        String serviceTypeSlug,
+        /**
+         * Whether the authenticated CLIENT caller has this row in their wish list
+         * ({@code favorites}, {@link com.beautica.favorite.entity.FavoriteTargetType#SERVICE}).
+         *
+         * <p><b>{@code null} means "not applicable", never "not favourited".</b> It is
+         * {@code null} for an anonymous caller, a non-CLIENT caller, and — most importantly —
+         * every instance held in the {@code masterServices} cache (Phase 32.1 D1/D4): that cache
+         * is keyed by {@code masterId} alone and shared across every caller including anonymous
+         * guests, so this field must never be populated inside
+         * {@code ServiceCatalogService.getMasterServices}. It is decorated per-request, AFTER the
+         * cache read, by {@code MasterServiceFavoriteDecorator} — a separate bean the controller
+         * composes in, never a method the cached service self-invokes. {@code false} is reserved
+         * for "this CLIENT genuinely has not favourited this row", so any {@code true}/{@code false}
+         * found inside the cache is unambiguously a leak (see {@code ServiceCatalogFavoriteCacheIT}).
+         */
+        @Schema(types = {"boolean", "null"}, nullable = true,
+                description = "true/false only for an authenticated CLIENT caller; null for "
+                        + "anonymous/non-CLIENT callers and always null inside the masterServices "
+                        + "cache — decorated per-request, after the cache read.")
+        Boolean isFavorite
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         // ServiceDefinitionResponse.from already runs ServicePricing.ofDefinition internally, so
@@ -100,8 +120,23 @@ public record MasterServiceResponse(
                 sdResponse.priceDisplay(),
                 sdResponse.serviceTypeId(),
                 sdResponse.serviceTypeNameUk(),
-                sdResponse.serviceTypeSlug()
+                sdResponse.serviceTypeSlug(),
+                null    // isFavorite — decorated per-request, outside this factory (Phase 32.1)
         );
+    }
+
+    /**
+     * Returns a new instance with {@code isFavorite} set — the ONLY way to populate the field,
+     * since a record has no setter. Used exclusively by {@code MasterServiceFavoriteDecorator},
+     * never by {@code ServiceCatalogService} (Phase 32.1 D2.1): the cached method must never call
+     * this, or the cache would start holding client-specific data.
+     */
+    public MasterServiceResponse withIsFavorite(boolean favorite) {
+        return new MasterServiceResponse(
+                id, masterId, serviceDefinition, priceOverride, durationOverrideMinutes,
+                effectivePrice, effectiveDurationMinutes, isActive, priceType, priceMin,
+                priceMax, priceDisplay, serviceTypeId, serviceTypeNameUk, serviceTypeSlug,
+                favorite);
     }
 
     /**
@@ -142,7 +177,8 @@ public record MasterServiceResponse(
                 full.priceDisplay(),
                 full.serviceTypeId(),
                 full.serviceTypeNameUk(),
-                full.serviceTypeSlug()
+                full.serviceTypeSlug(),
+                full.isFavorite()   // passed through verbatim, never hardcoded — see field javadoc
         );
     }
 }

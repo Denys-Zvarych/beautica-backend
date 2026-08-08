@@ -236,6 +236,39 @@ class MasterServiceResponseTest {
                 .isNull();
     }
 
+    // ── Phase 32.1: isFavorite — never populated by the factories, passed through by fromPublic ──
+
+    @Test
+    @DisplayName("isFavorite is always null when built from a MasterServiceAssignment — the cached "
+            + "factory must never know a caller's identity")
+    void should_leaveIsFavoriteNull_when_builtFromAssignment() {
+        var msa = buildAssignment(null, null);
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.isFavorite())
+                .as("from() backs the cached ServiceCatalogService.getMasterServices method; "
+                        + "isFavorite is decorated per-request by a separate bean, never here")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("fromPublic carries isFavorite through verbatim rather than hardcoding null — proven "
+            + "with a non-null input so the passthrough is genuinely exercised, not merely null-to-null")
+    void should_carryIsFavoriteThrough_when_fromPublicApplied() {
+        var msa = buildAssignment(null, null);
+        // Manually promoted to a non-null value, standing in for the shape AFTER decoration — in
+        // production fromPublic always sees null here, but the passthrough must survive regardless
+        // of value, so a rearranged masking order can never silently start invented isFavorite.
+        var decorated = MasterServiceResponse.from(msa).withIsFavorite(true);
+
+        var masked = MasterServiceResponse.fromPublic(decorated);
+
+        assertThat(masked.isFavorite())
+                .as("fromPublic must pass isFavorite() through verbatim, never hardcode it")
+                .isTrue();
+    }
+
     // --- helpers ---
 
     private MasterServiceAssignment buildAssignmentWithType(ServiceType serviceType) {

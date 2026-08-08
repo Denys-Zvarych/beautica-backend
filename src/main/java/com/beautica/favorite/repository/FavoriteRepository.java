@@ -9,9 +9,12 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -387,4 +390,47 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
             """)
     Page<Object[]> findFavoriteServiceRows(@Param("clientId") UUID clientId,
                                            Pageable pageable);
+
+    /**
+     * Membership test for {@code masterServices.id} values a CLIENT has favourited — backs the
+     * per-request {@code isFavorite} decoration on {@code GET /masters/{masterId}/services}
+     * (Phase 32.1 D5), NOT the wish-list page above.
+     *
+     * <p><b>One statement, membership tested in memory</b> against the returned {@link Set} —
+     * deliberately not {@code existsBy…} per row (N+1) and not {@link #findFavoriteServiceRows}
+     * (which fetch-joins the whole assignment graph for a 20-row wish-list page — far more work
+     * than a set of ids, and capped at 20 so it would also be the wrong shape for a 200-row menu).
+     *
+     * <p><b>Index: {@code uq_favorite UNIQUE (client_id, target_type, target_id)}
+     * ({@code V92__create_favorites.sql}) — no new migration.</b> Equality on {@code client_id}
+     * and {@code target_type}, an {@code IN} on {@code target_id}, and {@code target_id} is the
+     * only column selected: a covering, left-prefix-exact, index-only scan.
+     * {@code idx_favorites_client_created} (V135) is the ORDERING index the three per-client list
+     * queries ride and is not what this predicate uses.
+     *
+     * <p><b>{@code targetType = SERVICE} is load-bearing, not decorative.</b> {@code target_id} is
+     * polymorphic with no FK — a {@code MASTER} or {@code SALON} favourite can carry a
+     * {@code target_id} that happens to collide with an unrelated {@code master_services.id}.
+     * Dropping this predicate would flag that master/salon favourite as a favourited SERVICE too.
+     *
+     * <p>Callers MUST short-circuit on an empty {@code targetIds} collection — a master with no
+     * active services must never reach this method with an empty {@code IN} list.
+     *
+     * <p><b>{@code @Transactional(readOnly = true)}</b> (audit-fix, P9 checklist): without it,
+     * Spring Data opens a plain read-write transaction for this custom {@code @Query} method. No
+     * measurable perf delta here — it returns scalar {@code UUID}s, no managed entities — but it
+     * is added for correctness/consistency with the read-only contract this method actually has.
+     * Deliberately NOT swept across the sibling {@code @Query} methods in this file (none of them
+     * annotate either) — that is a pre-existing pattern predating this change and out of this
+     * diff's locus; sweeping it would widen an audit-fix into an unrelated file-wide change.
+     */
+    @Transactional(readOnly = true)
+    @Query("""
+            SELECT f.targetId FROM Favorite f
+            WHERE f.clientId = :clientId
+              AND f.targetType = com.beautica.favorite.entity.FavoriteTargetType.SERVICE
+              AND f.targetId IN :targetIds
+            """)
+    Set<UUID> findFavoritedServiceIds(@Param("clientId") UUID clientId,
+                                       @Param("targetIds") Collection<UUID> targetIds);
 }

@@ -16,9 +16,11 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -121,6 +123,21 @@ class ServiceControllerTest {
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
+    @MockBean
+    private MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
+
+    /**
+     * Default passthrough stub for every test that does not care about {@code isFavorite}
+     * decoration — the vast majority of the {@code GET /masters/{id}/services} tests below
+     * predate Phase 32.1 and assert on fields the decorator never touches. Individual tests that
+     * DO care about decoration override this stub explicitly.
+     */
+    @BeforeEach
+    void stubFavoriteDecoratorAsPassthrough() {
+        when(masterServiceFavoriteDecorator.decorate(any(), any()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static RequestPostProcessor authenticatedAs(UUID userId, String email, Role role) {
@@ -140,7 +157,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
-                null, null, null);
+                null, null, null, null);
     }
 
     /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
@@ -153,7 +170,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
-                serviceTypeId, serviceTypeNameUk, null);
+                serviceTypeId, serviceTypeNameUk, null, null);
     }
 
     /**
@@ -169,7 +186,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
-                serviceTypeId, serviceTypeNameUk, serviceTypeSlug);
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null);
     }
 
     /** Leaf ServiceDefinitionResponse carrying a serviceTypeSlug, for the salon-catalogue read path. */
@@ -381,6 +398,78 @@ class ServiceControllerTest {
                         .param("size", "10")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk());
+    }
+
+    // ── Phase 32.1: isFavorite decoration — the CONTROLLER composes the decorator AFTER the
+    // cached call; here the decorator itself is a mock, so these tests pin only the WIRING
+    // (the controller passes the cached list + Authentication through and returns whatever the
+    // decorator hands back), never the decoration logic itself — that belongs to
+    // MasterServiceFavoriteDecoratorTest. ─────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 anonymous caller: isFavorite stays null on every row "
+            + "(the decorator's own null-for-anonymous behaviour, exercised through the default passthrough stub)")
+    void should_return200WithNullFlags_when_anonymousBrowsesMasterServices() throws Exception {
+        var masterId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(stub);
+        // Relies on the class-wide @BeforeEach passthrough stub — an anonymous caller must see
+        // exactly the cached (all-null) shape the controller received, untouched.
+
+        log.debug("Act: GET /api/v1/masters/{}/services anonymously — isFavorite must be null", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].isFavorite").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 CLIENT caller: the controller returns exactly what "
+            + "the decorator hands back (true/false per row), proving the decorate() call is wired in "
+            + "with the request's Authentication")
+    void should_return200WithFlags_when_clientBrowsesMasterServices() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var rowId = UUID.randomUUID();
+        var cachedStub = List.of(stubMasterServiceResponse(rowId, masterId, "Gel Nails"));
+        var decoratedStub = List.of(cachedStub.get(0).withIsFavorite(true));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(cachedStub);
+        when(masterServiceFavoriteDecorator.decorate(eq(cachedStub), any())).thenReturn(decoratedStub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services as CLIENT — isFavorite must reflect the decorator's output", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].isFavorite").value(true));
+
+        verify(masterServiceFavoriteDecorator).decorate(eq(cachedStub), any());
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 CLIENT caller, row NOT favourited: the wire carries "
+            + "the literal JSON boolean false, never absent/null — pins the null-vs-false distinction "
+            + "on the DESERIALIZED response body, not just on the Java DTO (a Jackson NON_NULL/coercion "
+            + "bug on this field would collapse false to the same wire shape as null and slip past a "
+            + "Java-object-only assertion)")
+    void should_return200WithFalseFlag_when_clientBrowsesMasterServices_notFavorited() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var rowId = UUID.randomUUID();
+        var cachedStub = List.of(stubMasterServiceResponse(rowId, masterId, "Gel Nails"));
+        var decoratedStub = List.of(cachedStub.get(0).withIsFavorite(false));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(cachedStub);
+        when(masterServiceFavoriteDecorator.decorate(eq(cachedStub), any())).thenReturn(decoratedStub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services as CLIENT who has NOT favourited this row", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "client-nofav@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].isFavorite").value(false))
+                .andExpect(jsonPath("$.data[0].isFavorite").isBoolean());
+
+        verify(masterServiceFavoriteDecorator).decorate(eq(cachedStub), any());
     }
 
     @Test

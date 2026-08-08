@@ -11,6 +11,7 @@ import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
+import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -104,6 +105,7 @@ public class ServiceController {
                     + "machine-readable code.";
 
     private final ServiceCatalogService serviceCatalogService;
+    private final MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
 
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
@@ -163,11 +165,20 @@ public class ServiceController {
      * Unauthenticated clients browse a master's service menu before deciding to book.
      * No {@code @PreAuthorize} guard is intentional; adding one would break the
      * discovery flow for anonymous users.
+     *
+     * <p><strong>{@code isFavorite} decoration (Phase 32.1).</strong> {@code
+     * serviceCatalogService.getMasterServices} is cached per-{@code masterId} and shared across
+     * every caller, so it can never know who is asking. This method composes the cached, caller-
+     * agnostic list with {@link MasterServiceFavoriteDecorator#decorate}, a SEPARATE bean invoked
+     * here — lexically outside the {@code @Cacheable} method — so the per-client flag is applied
+     * fresh on every request and never enters the cache. An authenticated CLIENT sees {@code true}/
+     * {@code false} per row; every other caller (anonymous, or any other role) sees {@code null}.
      */
     @GetMapping("/masters/{masterId}/services")
     public ApiResponse<List<MasterServiceResponse>> getMasterServices(
-            @PathVariable UUID masterId) {
-        return ApiResponse.ok(serviceCatalogService.getMasterServices(masterId));
+            @PathVariable UUID masterId, Authentication authentication) {
+        List<MasterServiceResponse> services = serviceCatalogService.getMasterServices(masterId);
+        return ApiResponse.ok(masterServiceFavoriteDecorator.decorate(services, authentication));
     }
 
     /**
