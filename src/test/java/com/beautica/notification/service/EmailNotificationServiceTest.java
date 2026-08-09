@@ -2,6 +2,7 @@ package com.beautica.notification.service;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingStatus;
 import com.beautica.master.entity.Master;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -27,6 +28,7 @@ import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Properties;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -116,7 +118,7 @@ class EmailNotificationServiceTest {
         ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
-        service.sendNewBookingEmail("client@example.com", booking);
+        service.sendNewBookingEmail("client@example.com", BookingVisit.single(booking));
 
         verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
         verify(mailSender).send(realMessage);
@@ -126,8 +128,13 @@ class EmailNotificationServiceTest {
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
         assertThat(captured.getVariable("masterName")).isEqualTo("Майстер Іванов");
+        // A single-service booking must still produce the exact one-service shape the template
+        // rendered before visits existed: a one-element list, the singular label, and NO duration
+        // row (visitDuration null suppresses it) — that is what keeps the render byte-identical.
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
+        assertThat(captured.getVariable("visitDuration")).isNull();
     }
 
     @Test
@@ -141,7 +148,7 @@ class EmailNotificationServiceTest {
         Booking booking = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга", utcTime);
         ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
-        service.sendNewBookingEmail("client@example.com", booking);
+        service.sendNewBookingEmail("client@example.com", BookingVisit.single(booking));
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
 
@@ -160,11 +167,63 @@ class EmailNotificationServiceTest {
         Booking booking = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга", utcTime);
         ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
-        service.sendNewBookingEmail("client@example.com", booking);
+        service.sendNewBookingEmail("client@example.com", BookingVisit.single(booking));
 
         verify(templateEngine).process(anyString(), contextCaptor.capture());
         assertThat((String) ((Context) contextCaptor.getValue()).getVariable("startsAt"))
                 .isEqualTo("12:00, 15 листопада 2025");
+    }
+
+    @Test
+    @DisplayName("sendNewBookingEmail passes EVERY service of a multi-service visit into the template "
+            + "context, with the plural label and the visit-level duration")
+    void should_passEveryServiceAndVisitTotals_when_sendNewBookingEmailCalledForVisit() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>visit</html>");
+        // 10:00 UTC = 13:00 Kyiv (summer). 60 + 90 minutes of service time, last item ends 13:00 UTC.
+        OffsetDateTime start = OffsetDateTime.of(2025, 6, 15, 10, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Стрижка", start);
+        lenient().when(lead.getEndsAt()).thenReturn(start.plusMinutes(60));
+        lenient().when(lead.getDurationMinutesAtBooking()).thenReturn(60);
+        Booking second = buildVisitItemMock("Фарбування", start.plusMinutes(60), 90);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendNewBookingEmail("master@example.com", BookingVisit.of(lead, List.of(lead, second)));
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("serviceNames"))
+                .as("the sibling service must reach the template — this is the defect under test")
+                .isEqualTo(List.of("Стрижка", "Фарбування"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("13:00, 15 червня 2025");
+        assertThat((String) captured.getVariable("visitDuration"))
+                .as("60+90 min of service time; last item runs 11:00–12:30 UTC = 15:30 Kyiv")
+                .isEqualTo("2 год 30 хв (до 15:30)");
+    }
+
+    @Test
+    @DisplayName("sendBookingConfirmedEmail passes EVERY service of a multi-service visit into the "
+            + "client-facing template context")
+    void should_passEveryService_when_sendBookingConfirmedEmailCalledForVisit() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>visit</html>");
+        OffsetDateTime start = OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Манікюр", start);
+        lenient().when(lead.getEndsAt()).thenReturn(start.plusMinutes(45));
+        lenient().when(lead.getDurationMinutesAtBooking()).thenReturn(45);
+        Booking second = buildVisitItemMock("Педикюр", start.plusMinutes(45), 45);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendBookingConfirmedEmail("client@example.com", BookingVisit.of(lead, List.of(lead, second)));
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
+        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
     }
 
     // -------------------------------------------------------------------------
@@ -184,7 +243,7 @@ class EmailNotificationServiceTest {
         ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
 
-        service.sendBookingConfirmedEmail("client@example.com", booking);
+        service.sendBookingConfirmedEmail("client@example.com", BookingVisit.single(booking));
 
         verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
         verify(mailSender).send(realMessage);
@@ -194,7 +253,9 @@ class EmailNotificationServiceTest {
 
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
+        assertThat(captured.getVariable("visitDuration")).isNull();
         // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date
         assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
     }
@@ -378,7 +439,37 @@ class EmailNotificationServiceTest {
         Context captured = (Context) contextCaptor.getValue();
         assertThat(captured.getVariable("comment")).isEqualTo("На жаль, майстер недоступний");
         assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
-        assertThat(captured.getVariable("serviceName")).isEqualTo("Тест послуга");
+        // A per-item decline cancels exactly ONE service line, so the list the template loops over
+        // carries exactly that one name and the singular label — the pre-visit rendered shape.
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
+    }
+
+    @Test
+    @DisplayName("Sends the WHOLE-VISIT declined email naming every cancelled service, with the "
+            + "plural label and the lead booking's provider note")
+    void should_nameEveryCancelledService_when_sendVisitDeclinedEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>declined</html>");
+        OffsetDateTime start = OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Стрижка", start);
+        // Minimal sibling: this e-mail reads nothing off a non-lead item but its ordering key and
+        // its service name, so a full fixture would only add stubs the path never touches.
+        Booking second = buildVisitItemMock("Фарбування", start.plusHours(1), 60);
+        when(lead.getProviderComment()).thenReturn("Майстер захворів");
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendVisitDeclinedEmail("client@example.com",
+                BookingVisit.of(lead, List.of(lead, second), BookingStatus.DECLINED));
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        // The defect: ONE STATUS_CHANGED row describes the whole visit, so naming only the lead
+        // left the client believing the second service was still on.
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Стрижка", "Фарбування"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
+        assertThat(captured.getVariable("comment")).isEqualTo("Майстер захворів");
     }
 
     // -------------------------------------------------------------------------
@@ -962,6 +1053,25 @@ class EmailNotificationServiceTest {
         when(booking.getMasterService()).thenReturn(masterService);
         lenient().when(booking.getStartsAt()).thenReturn(startsAt);
 
+        return booking;
+    }
+
+    /**
+     * A sibling booking of a multi-service visit — only the fields {@link BookingVisit} reads are
+     * stubbed (service name, start, end, frozen duration). Recipient/master data lives on the lead.
+     */
+    private Booking buildVisitItemMock(String serviceName, OffsetDateTime startsAt, int durationMinutes) {
+        ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
+        lenient().when(serviceDefinition.getName()).thenReturn(serviceName);
+        MasterServiceAssignment masterService = mock(MasterServiceAssignment.class);
+        lenient().when(masterService.getServiceDefinition()).thenReturn(serviceDefinition);
+
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(java.util.UUID.randomUUID());
+        lenient().when(booking.getMasterService()).thenReturn(masterService);
+        lenient().when(booking.getStartsAt()).thenReturn(startsAt);
+        lenient().when(booking.getEndsAt()).thenReturn(startsAt.plusMinutes(durationMinutes));
+        lenient().when(booking.getDurationMinutesAtBooking()).thenReturn(durationMinutes);
         return booking;
     }
 

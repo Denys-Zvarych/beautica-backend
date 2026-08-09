@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.notification.service.BookingVisit;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.entity.Booking;
@@ -130,7 +131,7 @@ class GuestBookingNewBookingDrainIT extends AbstractIntegrationTest {
 
         // Proves the master-facing email dispatch was actually reached — i.e. clientName
         // resolution (booking.getClient() -> guest fallback) did not throw before this call.
-        verify(emailNotificationService).sendNewBookingEmail(anyString(), any(Booking.class));
+        verify(emailNotificationService).sendNewBookingEmail(anyString(), any(BookingVisit.class));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

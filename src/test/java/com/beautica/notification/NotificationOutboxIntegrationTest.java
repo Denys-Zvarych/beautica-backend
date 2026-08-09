@@ -1,5 +1,6 @@
 package com.beautica.notification;
 
+import com.beautica.notification.service.BookingVisit;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -227,7 +228,7 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
         assertThat(reloaded.getStatus()).isEqualTo(OutboxStatus.SENT);
         assertThat(reloaded.getAttempts()).isZero();
         assertThat(reloaded.getLastError()).isNull();
-        verify(notificationService, times(1)).notifyNewBooking(any(Booking.class));
+        verify(notificationService, times(1)).notifyNewBooking(any(BookingVisit.class));
     }
 
     @Test
@@ -408,7 +409,7 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
 
             // Sanity — Phase 2 (no DB) succeeded for all 3, including the soon-to-be-poisoned
             // entry: its SENT outcome was already decided in memory before the DB fault occurs.
-            verify(notificationService, times(3)).notifyNewBooking(any(Booking.class));
+            verify(notificationService, times(3)).notifyNewBooking(any(BookingVisit.class));
 
             // Phase 3 — must not blow up even though the poison entry's persistOne() will throw.
             drainWorker.persistResults(results);

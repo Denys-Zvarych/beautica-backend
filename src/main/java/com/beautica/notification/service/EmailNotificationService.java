@@ -18,6 +18,7 @@ import org.thymeleaf.context.Context;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
 import java.io.IOException;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
@@ -36,6 +37,9 @@ public class EmailNotificationService {
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
     private static final DateTimeFormatter DATE_FMT =
             DateTimeFormatter.ofPattern("HH:mm, d MMMM yyyy", Locale.forLanguageTag("uk"));
+    /** Visit end time in the «(до HH:mm)» suffix — same Kyiv zone as {@link #DATE_FMT}. */
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
+    private static final int MINUTES_PER_HOUR = 60;
     private static final String LOGO_CID = "beauticaLogo";
 
     /**
@@ -107,12 +111,23 @@ public class EmailNotificationService {
         send(to, "Запрошення до салону", "email/invite-master", ctx);
     }
 
-    public void sendNewBookingEmail(String to, Booking booking) {
+    /**
+     * Sends the PROVIDER the "new booking" e-mail — for a whole multi-service visit, not just its
+     * lead service.
+     *
+     * <p>Takes a {@link BookingVisit} because exactly ONE {@code NEW_BOOKING} outbox row is
+     * enqueued per visit; {@code serviceNames} carries every chained service in visit order and the
+     * template loops over it. A single-service booking arrives as
+     * {@link BookingVisit#single(Booking)}, so {@code serviceNames} is a one-element list,
+     * {@code serviceLabel} is the singular «Послуга» and {@code visitDuration} is {@code null}
+     * (its row is suppressed) — the rendered e-mail is byte-identical to the pre-visit output.
+     */
+    public void sendNewBookingEmail(String to, BookingVisit visit) {
+        Booking booking = visit.lead();
         var ctx = new Context();
         ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
         ctx.setVariable("clientName", resolveClientName(booking));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
-        ctx.setVariable("startsAt", formatStartsAt(booking));
+        applyVisitVariables(ctx, visit);
         send(to, "Нове бронювання", "email/new-booking", ctx);
     }
 
@@ -139,11 +154,15 @@ public class EmailNotificationService {
         send(to, "Бронювання перенесено", "email/booking-rescheduled-client", ctx);
     }
 
-    public void sendBookingConfirmedEmail(String to, Booking booking) {
+    /**
+     * Sends the CLIENT the "booking confirmed" e-mail — the client-facing twin of
+     * {@link #sendNewBookingEmail(String, BookingVisit)}, and visit-aware for the same reason and
+     * with the same single-service guarantee.
+     */
+    public void sendBookingConfirmedEmail(String to, BookingVisit visit) {
         var ctx = new Context();
-        ctx.setVariable("clientName", fullName(booking.getClient()));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
-        ctx.setVariable("startsAt", formatStartsAt(booking));
+        ctx.setVariable("clientName", fullName(visit.lead().getClient()));
+        applyVisitVariables(ctx, visit);
         send(to, "Бронювання підтверджено", "email/booking-confirmed", ctx);
     }
 
@@ -196,11 +215,46 @@ public class EmailNotificationService {
         send(to, "Візит завершився — позначте його статус", "email/closure-reminder", ctx);
     }
 
+    /**
+     * Sends the CLIENT the "one service line was cancelled" e-mail — the PER-ITEM decline
+     * ({@code AppointmentTransitionService#declineAppointmentItem}, and every legacy single-service
+     * decline). Exactly one service is named, because exactly one was cancelled; the rest of the
+     * visit is still on. See {@link #sendVisitDeclinedEmail(String, BookingVisit)} for the
+     * whole-visit twin, and {@code NotificationService#isWholeVisitDecline} for how the two routes
+     * are told apart.
+     */
     public void sendBookingDeclinedEmail(String to, Booking booking) {
+        sendDeclined(to, BookingVisit.single(booking), booking.getProviderComment());
+    }
+
+    /**
+     * Sends the CLIENT the "the whole visit was cancelled" e-mail — the provider declined the
+     * appointment header and every service line with it
+     * ({@code AppointmentTransitionService#declineAppointment}).
+     *
+     * <p>Naming every service is the point: one {@code STATUS_CHANGED} row is enqueued for the whole
+     * visit, keyed to the lead booking, so this e-mail previously named ONE service out of N and the
+     * client turned up for the others.
+     *
+     * <p>The note is read off {@link BookingVisit#lead()}, exactly as the per-item path reads it off
+     * its booking. <b>On this route it is in practice always {@code null}</b>:
+     * {@code AppointmentTransitionService#declineAppointment} writes the provider's reason onto the
+     * APPOINTMENT header, not onto any item row, so {@code lead().getProviderComment()} has nothing
+     * to render and the e-mail goes out reason-less. That is a known product gap awaiting a decision
+     * — do not "fix" it by reaching into the header here; the whole-visit reason has to be threaded
+     * through {@link BookingVisit} deliberately, or the header write has to fan out to the items.
+     */
+    public void sendVisitDeclinedEmail(String to, BookingVisit visit) {
+        sendDeclined(to, visit, visit.lead().getProviderComment());
+    }
+
+    /** The one renderer both decline routes share, so their markup can never drift. */
+    private void sendDeclined(String to, BookingVisit visit, String comment) {
         var ctx = new Context();
-        ctx.setVariable("clientName", fullName(booking.getClient()));
-        ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
-        ctx.setVariable("comment", booking.getProviderComment());
+        ctx.setVariable("clientName", fullName(visit.lead().getClient()));
+        ctx.setVariable("serviceNames", visit.serviceNames());
+        ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
+        ctx.setVariable("comment", comment);
         send(to, "Бронювання скасовано", "email/booking-declined", ctx);
     }
 
@@ -358,6 +412,55 @@ public class EmailNotificationService {
     }
 
     private static String formatStartsAt(Booking booking) {
-        return booking.getStartsAt().atZoneSameInstant(KYIV).format(DATE_FMT);
+        return formatStartsAt(booking.getStartsAt());
+    }
+
+    private static String formatStartsAt(OffsetDateTime startsAt) {
+        return startsAt.atZoneSameInstant(KYIV).format(DATE_FMT);
+    }
+
+    /**
+     * Sets the three visit-shaped template variables the two visit-aware templates share, so
+     * {@code new-booking.html} and {@code booking-confirmed.html} can never disagree about how a
+     * multi-service visit is described:
+     *
+     * <ul>
+     *   <li>{@code serviceNames} — every chained service name, in visit order; the template's
+     *       {@code th:each} emits one table row per entry.</li>
+     *   <li>{@code serviceLabel} — «Послуга» for one service, «Послуги» for several. Resolved in
+     *       Java, not in Thymeleaf, so the wording is unit-testable and shared.</li>
+     *   <li>{@code visitDuration} — total duration + visit end time, e.g. «2 год 30 хв (до 13:15)».
+     *       <b>{@code null} for a single-service booking</b>, which suppresses the row entirely
+     *       ({@code th:if}) and is what keeps the legacy single-service render byte-identical.</li>
+     * </ul>
+     *
+     * <p>{@code startsAt} is taken from the visit ({@code items[0]}), not from {@code lead} — the
+     * two are the same row for every create-time notification, but ordering by {@code startsAt}
+     * survives a later per-item reschedule while "the row the outbox points at" does not.
+     *
+     * <p>No note field ({@code clientComment} / {@code clientCancellationNote} /
+     * {@code providerComment}) is read here or passed into either context — locked track-25 rule.
+     */
+    private static void applyVisitVariables(Context ctx, BookingVisit visit) {
+        ctx.setVariable("serviceNames", visit.serviceNames());
+        ctx.setVariable("serviceLabel", visit.isMultiService() ? "Послуги" : "Послуга");
+        ctx.setVariable("startsAt", formatStartsAt(visit.startsAt()));
+        ctx.setVariable("visitDuration", visit.isMultiService() ? formatVisitDuration(visit) : null);
+    }
+
+    /** «2 год 30 хв (до 13:15)» — total service time (buffers excluded) plus the visit's end. */
+    private static String formatVisitDuration(BookingVisit visit) {
+        return formatDuration(visit.totalDurationMinutes())
+                + " (до " + visit.endsAt().atZoneSameInstant(KYIV).format(TIME_FMT) + ")";
+    }
+
+    /** «45 хв» / «2 год» / «2 год 30 хв». */
+    private static String formatDuration(int totalMinutes) {
+        int hours = totalMinutes / MINUTES_PER_HOUR;
+        int minutes = totalMinutes % MINUTES_PER_HOUR;
+        if (hours == 0) {
+            return minutes + " хв";
+        }
+        return minutes == 0 ? hours + " год" : hours + " год " + minutes + " хв";
     }
 }

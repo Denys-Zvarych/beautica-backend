@@ -54,6 +54,15 @@ public class NotificationOutboxDrainWorker {
     private static final int MAX_ERROR_LENGTH = 500;
 
     /**
+     * The event types whose dispatch consumes a {@link BookingVisit} — the ones {@link #dispatch}
+     * routes through {@link #getVisit}. Kept beside the switch it mirrors: adding a visit-aware
+     * case there without adding it here would leave that case resolving every visit to its lead
+     * booking alone, which is the exact defect the visit resolver exists to fix.
+     */
+    private static final Set<OutboxEventType> VISIT_AWARE_EVENTS =
+            Set.of(OutboxEventType.NEW_BOOKING, OutboxEventType.STATUS_CHANGED);
+
+    /**
      * Redacts URL query strings, JWT-shaped values, and Bearer header values from
      * exception messages before persisting them to last_error. Compiled once at class
      * load — never per invocation (Fix M3 / Security MEDIUM).
@@ -67,6 +76,7 @@ public class NotificationOutboxDrainWorker {
     private final NotificationOutboxRepository outboxRepository;
     private final NotificationService notificationService;
     private final BookingRepository bookingRepository;
+    private final BookingVisitResolver visitResolver;
     private final ObjectMapper objectMapper;
     private final OutboxPayloadCipher cipher;
 
@@ -179,6 +189,19 @@ public class NotificationOutboxDrainWorker {
      * SMTP/push I/O runs here; connections are never held during this phase.
      * Returns the same entry objects annotated with their dispatch outcomes so
      * that Phase 3 can persist them without a second DB round-trip per entry.
+     *
+     * <p><b>Every DB read this phase makes ON THE DRAIN THREAD happens in the pre-load block below,
+     * before the dispatch loop starts.</b> (Dispatch itself is not read-free end to end:
+     * {@code PushNotificationService} looks a recipient's device tokens up per push. That read runs
+     * on {@code pushExecutor}, never on this thread, so it cannot extend the drain thread's
+     * connection hold — batching it is tracked separately.)
+     * That is the whole point of the phase: once the loop begins, each iteration
+     * can block for ~40 s on SMTP + FCM, and holding (or re-acquiring) a Hikari connection across
+     * that window is what the three-phase split exists to prevent. The visit hydration was briefly
+     * done per entry, inside the loop — up to 50 connection check-outs interleaved with the SMTP
+     * calls, and two of them per created visit, since a visit enqueues both {@code NEW_BOOKING} and
+     * {@code STATUS_CHANGED} against the same lead booking. It is batched here for the same reason
+     * the booking cache is: one statement for the whole batch, none after dispatch begins.
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public List<EntryResult> dispatchAll(List<NotificationOutboxEntry> batch) {
@@ -193,10 +216,15 @@ public class NotificationOutboxDrainWorker {
                 .stream()
                 .collect(Collectors.toMap(Booking::getId, b -> b));
 
+        // Second (and last) pre-load: the chained sibling rows of every visit this batch touches,
+        // in ONE query — see BookingVisitResolver#hydrate. Keyed by appointment id, so the two
+        // outbox rows of one visit share a single hydration instead of querying twice.
+        Map<UUID, List<Booking>> visitSiblings = visitResolver.hydrate(visitAwareLeads(batch, bookingCache));
+
         List<EntryResult> results = new ArrayList<>(batch.size());
         for (NotificationOutboxEntry entry : batch) {
             try {
-                dispatch(entry, bookingCache);
+                dispatch(entry, bookingCache, visitSiblings);
                 results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts(), null));
             } catch (Exception e) {
                 int next = entry.getAttempts() + 1;
@@ -284,10 +312,28 @@ public class NotificationOutboxDrainWorker {
         log.info("Outbox TTL purge complete (cutoff={})", cutoff);
     }
 
-    private void dispatch(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache) {
+    /**
+     * The lead bookings of the batch's visit-aware entries — the input to
+     * {@link BookingVisitResolver#hydrate(java.util.Collection)}. An entry whose booking is missing
+     * from the cache is skipped silently here; {@link #getBooking} raises the real error for it
+     * inside the loop, where the failure is attributed to that one entry rather than to the batch.
+     */
+    private List<Booking> visitAwareLeads(List<NotificationOutboxEntry> batch, Map<UUID, Booking> bookingCache) {
+        return batch.stream()
+                .filter(e -> VISIT_AWARE_EVENTS.contains(e.getEventType()))
+                .map(e -> bookingCache.get(e.getAggregateId()))
+                .filter(Objects::nonNull)
+                .toList();
+    }
+
+    private void dispatch(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache,
+                          Map<UUID, List<Booking>> visitSiblings) {
         switch (entry.getEventType()) {
-            case NEW_BOOKING      -> notificationService.notifyNewBooking(getBooking(entry, bookingCache));
-            case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(getBooking(entry, bookingCache));
+            // The two visit-aware events: one outbox row describes the WHOLE visit, so the sibling
+            // booking rows are hydrated here (see BookingVisitResolver) and threaded through every
+            // channel. Cardinality is untouched — still one row, one notification, N services named.
+            case NEW_BOOKING      -> notificationService.notifyNewBooking(getVisit(entry, bookingCache, visitSiblings));
+            case STATUS_CHANGED   -> notificationService.notifyBookingStatusChanged(getVisit(entry, bookingCache, visitSiblings));
             case CLIENT_CANCELLED -> notificationService.notifyClientCancelled(getBooking(entry, bookingCache));
             case BOOKING_RESCHEDULED -> {
                 Booking booking = getBooking(entry, bookingCache);
@@ -333,6 +379,16 @@ public class NotificationOutboxDrainWorker {
             return false;
         }
         return "PROVIDER".equals(readJson(payload).get("initiatedBy"));
+    }
+
+    /**
+     * Resolves the cached lead booking into the full {@link BookingVisit}, purely in memory: both
+     * the booking and its chained siblings were loaded by the phase-2 pre-load block, so this issues
+     * no statement and takes no connection while dispatch is in flight.
+     */
+    private BookingVisit getVisit(NotificationOutboxEntry entry, Map<UUID, Booking> cache,
+                                  Map<UUID, List<Booking>> visitSiblings) {
+        return visitResolver.resolve(getBooking(entry, cache), visitSiblings);
     }
 
     private Booking getBooking(NotificationOutboxEntry entry, Map<UUID, Booking> cache) {

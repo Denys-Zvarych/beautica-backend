@@ -28,6 +28,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -235,6 +236,75 @@ class GuestBookingServiceTest {
         verifyNoInteractions(guestTokenProvider, masterRepository, bookingRepository);
     }
 
+    // ── multi-service visit (BE-7) — ONE SMS naming the whole visit ───────────
+
+    @Test
+    @DisplayName("should name the visit as «<first> та ще N послуги» in the ONE guest confirmation SMS "
+            + "when a multi-service visit is booked")
+    void should_nameTheWholeVisitInOneSms_when_guestBooksMultipleServices() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        UUID secondServiceId = UUID.randomUUID();
+        UUID thirdServiceId = UUID.randomUUID();
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(masterService()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, secondServiceId))
+                .thenReturn(Optional.of(masterService(secondServiceId, "Педикюр")));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, thirdServiceId))
+                .thenReturn(Optional.of(masterService(thirdServiceId, "Брови")));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId, secondServiceId, thirdServiceId),
+                        startsAt, "Олена", "Коваль"));
+
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        assertThat(textCaptor.getValue())
+                .as("the guest must learn the visit covers more than the lead service")
+                .isEqualTo("Beautica: Запис підтверджено!\n"
+                        + "Марія Левченко, Манікюр та ще 2 послуги\n"
+                        + "10.06.2026 о 12:00\n\n"
+                        + "Скасувати: " + response.cancelUrl());
+        // Exactly ONE SMS and ONE outbox row for the whole visit — cardinality is unchanged.
+        verify(smsService).send(anyString(), anyString());
+        verify(outboxService).enqueueNewBooking(any());
+    }
+
+    @Test
+    @DisplayName("should send the bare service name — no «та ще» suffix — when a one-item "
+            + "masterServiceIds visit is booked")
+    void should_sendBareServiceName_when_guestVisitCarriesASingleService() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(masterService()));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(null, List.of(serviceId), startsAt, "Олена", "Коваль"));
+
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        // CHAR-EXACT on purpose: this is the dominant production shape, and the whole point of the
+        // visit refactor is that it did not touch it. A `contains` assertion would tolerate the
+        // «та ще 0 послуг» / stray-separator class of regression the new branch can introduce.
+        assertThat(textCaptor.getValue())
+                .as("a one-item visit must render the pre-visit SMS byte for byte")
+                .isEqualTo("Beautica: Запис підтверджено!\n"
+                        + "Марія Левченко, Манікюр\n"
+                        + "10.06.2026 о 12:00\n\n"
+                        + "Скасувати: " + response.cancelUrl());
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private void stubHappyPath(OffsetDateTime startsAt) {
@@ -252,15 +322,60 @@ class GuestBookingServiceTest {
         return Master.builder().id(masterId).user(user).isActive(true).build();
     }
 
+    @Test
+    @DisplayName("a provider-chosen service name containing a template placeholder is emitted "
+            + "LITERALLY — it must not steer the guest SMS or duplicate the cancel link")
+    void should_notExpandAPlaceholderInsideAServiceName_when_theConfirmationSmsIsBuilt() {
+        // The service name is provider-controlled free text. Chained String.replace substituted
+        // {serviceName} BEFORE {date}/{time}/{cancelUrl}, so each later replace re-scanned the name
+        // it had just written in — a service called "Манікюр {cancelUrl}" got the guest's one-time
+        // cancellation link expanded a second time, in a position the provider chose, inside a
+        // message the guest reads as platform copy.
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
+        when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
+                .thenReturn(Optional.of(masterService(serviceId, "Манікюр {cancelUrl} {date}")));
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        GuestBookingResponse response = service.createGuestBooking(
+                "Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
+
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        String sms = textCaptor.getValue();
+        assertThat(sms)
+                .as("the braces that arrived as DATA must survive as text")
+                .contains("Манікюр {cancelUrl} {date}");
+        assertThat(countOccurrences(sms, response.cancelUrl()))
+                .as("the cancel link appears exactly once, where the TEMPLATE puts it")
+                .isEqualTo(1);
+    }
+
+    private static int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        for (int i = haystack.indexOf(needle); i >= 0; i = haystack.indexOf(needle, i + needle.length())) {
+            count++;
+        }
+        return count;
+    }
+
     private MasterServiceAssignment masterService() {
+        return masterService(serviceId, "Манікюр");
+    }
+
+    private MasterServiceAssignment masterService(UUID id, String name) {
         ServiceDefinition def = ServiceDefinition.builder()
-                .name("Манікюр")
+                .name(name)
                 .baseDurationMinutes(60)
                 .bufferMinutesAfter(0)
                 .basePrice(new BigDecimal("350.00"))
                 .build();
         return MasterServiceAssignment.builder()
-                .id(serviceId)
+                .id(id)
                 .master(master())
                 .serviceDefinition(def)
                 .isActive(true)
