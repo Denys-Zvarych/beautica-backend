@@ -1,7 +1,16 @@
 <!DOCTYPE html>
 <!--
   Template: email/booking-declined
-  Variables: clientName (String), serviceName (String), comment (String, nullable)
+  Variables: clientName (String),
+             serviceNames (List<String> — the cancelled service lines, in visit order),
+             serviceLabel (String — «Послуга» / «Послуги», resolved in Java),
+             comment (String, nullable — the provider's note)
+
+  Two decline routes render this template (EmailNotificationService#sendBookingDeclinedEmail /
+  #sendVisitDeclinedEmail). A PER-ITEM decline cancels one service line and passes a one-element
+  list — one row labelled «Послуга», the pre-visit markup. A WHOLE-VISIT decline cancels every
+  line and passes them all, so the client cannot be left believing the rest of the visit still
+  stands; the first row carries the «Послуги» label and the rest a blank label cell.
 -->
 <html xmlns:th="http://www.thymeleaf.org" lang="uk">
 <head>
@@ -53,15 +62,18 @@
             <tr><td style="padding-bottom:28px;">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
                      style="border:1px solid #D4C5B5;border-radius:10px;overflow:hidden;">
-                <tr>
+                <tr th:each="visitService,visitIter : ${serviceNames}">
                   <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
                              color:#0D0906;font-size:14px;width:40%;
-                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                      th:attrappend="style=${visitIter.first} ? '' : 'border-top:1px solid #D4C5B5;'"
+                      th:text="${visitIter.first} ? ${serviceLabel} : ''">
                     Послуга
                   </td>
                   <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
-                      th:text="${serviceName}">
+                      th:attrappend="style=${visitIter.first} ? '' : 'border-top:1px solid #D4C5B5;'"
+                      th:text="${visitService}">
                     Назва послуги
                   </td>
                 </tr>

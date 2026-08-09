@@ -11,6 +11,8 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.Placeholders;
+import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
@@ -40,6 +42,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -388,7 +391,7 @@ public class GuestBookingService {
      */
     private void registerVisitAfterCommit(Master master, List<VisitPlanner.PlannedItem> items,
                                           Booking firstSaved, String guestPhone, String cancelUrl) {
-        String smsText = buildConfirmationSms(master, items.get(0).masterService(), firstSaved, cancelUrl);
+        String smsText = buildConfirmationSms(master, visitSmsServiceName(items), firstSaved, cancelUrl);
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
         Set<SlotKey> slotKeys = new LinkedHashSet<>();
         for (VisitPlanner.PlannedItem item : items) {
@@ -430,13 +433,50 @@ public class GuestBookingService {
 
     private String buildConfirmationSms(Master master, MasterServiceAssignment msa,
                                         Booking saved, String cancelUrl) {
+        return buildConfirmationSms(master, msa.getServiceDefinition().getName(), saved, cancelUrl);
+    }
+
+    /**
+     * Renders the guest confirmation SMS in ONE pass over the template — see
+     * {@link Placeholders#format}.
+     *
+     * <p>Chained {@link String#replace} was a template-injection vector here: {@code {serviceName}}
+     * was substituted BEFORE {@code {date}}, {@code {time}} and {@code {cancelUrl}}, so each later
+     * {@code replace} re-scanned the service name it had just written in. A provider who named a
+     * service {@code "Манікюр {cancelUrl}"} therefore got the guest's one-time cancellation link
+     * expanded a second time, in a position of their choosing, inside a message the guest reads as
+     * platform copy — and with {@code {date}}/{@code {time}} could rearrange the layout around it.
+     * A single pass copies substituted values out verbatim, so data can never become markup.
+     */
+    private String buildConfirmationSms(Master master, String serviceName,
+                                        Booking saved, String cancelUrl) {
         OffsetDateTime kyiv = saved.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return smsProperties.getSms().getConfirmation()
-                .replace("{masterName}", masterName(master))
-                .replace("{serviceName}", msa.getServiceDefinition().getName())
-                .replace("{date}", DATE_FMT.format(kyiv))
-                .replace("{time}", TIME_FMT.format(kyiv))
-                .replace("{cancelUrl}", cancelUrl);
+        return Placeholders.format(smsProperties.getSms().getConfirmation(), Map.of(
+                "masterName", masterName(master),
+                "serviceName", serviceName,
+                "date", DATE_FMT.format(kyiv),
+                "time", TIME_FMT.format(kyiv),
+                "cancelUrl", cancelUrl));
+    }
+
+    /**
+     * The {@code {serviceName}} substitution for a multi-service visit's ONE confirmation SMS:
+     * the first service plus «та ще N послуг(и)» — e.g. «Стрижка та ще 2 послуги».
+     *
+     * <p>Deliberately NOT the full list. This SMS already carries the master name, date, time and a
+     * cancel URL; a Cyrillic segment is ~70 characters, so concatenating up to ten service names
+     * would push a routine booking several segments past the budget (and risk provider-side
+     * truncation of the cancel link, the one part of the message the guest cannot do without).
+     * A single-service visit ({@code items.size() == 1}) returns the bare service name — the
+     * pre-visit text, unchanged.
+     */
+    private static String visitSmsServiceName(List<VisitPlanner.PlannedItem> items) {
+        String first = items.get(0).masterService().getServiceDefinition().getName();
+        int remaining = items.size() - 1;
+        if (remaining <= 0) {
+            return first;
+        }
+        return first + " та ще " + UkrainianPlurals.servicesPhrase(remaining);
     }
 
     private GuestBookingResponse buildResponse(Master master, MasterServiceAssignment msa,

@@ -19,6 +19,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -101,13 +102,27 @@ public class BookingTestFixtures {
     }
 
     public UUID createIndependentMasterService(UUID masterId) {
+        return createIndependentMasterService(masterId, "Test Service");
+    }
+
+    /**
+     * Same as {@link #createIndependentMasterService(UUID)} but with a caller-chosen service NAME.
+     *
+     * <p>Added for {@code com.beautica.notification.MultiServiceNotificationIT}: the no-arg variant
+     * hardcodes {@code 'Test Service'}, so a three-service visit seeded through it gives all three
+     * items the SAME name — an assertion that "every service of the visit is named in the e-mail"
+     * would then pass verbatim against the very bug it exists to catch (only the lead service is
+     * rendered, three times over). A fixture value that cannot move the assertion is not a fixture,
+     * it is a false pass. Every other caller keeps the old constant through the delegate above.
+     */
+    public UUID createIndependentMasterService(UUID masterId, String serviceName) {
         UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, userId, serviceName, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
@@ -240,13 +255,25 @@ public class BookingTestFixtures {
      *                    users unique index
      */
     public VisitFixture createConfirmedVisit(String emailPrefix, int serviceCount) throws Exception {
+        return createConfirmedVisit(
+                emailPrefix, Collections.nCopies(serviceCount, "Test Service"));
+    }
+
+    /**
+     * Same as {@link #createConfirmedVisit(String, int)} but with one caller-chosen service NAME per
+     * chained item — see {@link #createIndependentMasterService(UUID, String)} for why a
+     * notification test cannot use the shared {@code 'Test Service'} constant. The visit is chained
+     * in list order, and {@code POST /appointments} preserves that order, so
+     * {@code serviceNames.get(0)} is the visit's lead service.
+     */
+    public VisitFixture createConfirmedVisit(String emailPrefix, List<String> serviceNames) throws Exception {
         String masterEmail = emailPrefix + "-master-" + System.nanoTime() + "@beautica.test";
         UUID masterId = createIndependentMaster(masterEmail);
         String clientEmail = emailPrefix + "-client-" + System.nanoTime() + "@beautica.test";
         UUID clientId = createUser(clientEmail, "CLIENT", null);
-        List<UUID> serviceIds = new ArrayList<>(serviceCount);
-        for (int i = 0; i < serviceCount; i++) {
-            serviceIds.add(createIndependentMasterService(masterId));
+        List<UUID> serviceIds = new ArrayList<>(serviceNames.size());
+        for (String serviceName : serviceNames) {
+            serviceIds.add(createIndependentMasterService(masterId, serviceName));
         }
         addWorkingHoursForEveryDay(masterId);
         String clientToken = tokenFor(clientEmail);
@@ -271,6 +298,28 @@ public class BookingTestFixtures {
 
         return new VisitFixture(
                 UUID.fromString(data.path("id").asText()), clientToken, clientId, masterId, masterToken);
+    }
+
+    /**
+     * Drops the outbox rows a visit CREATE enqueues, so a transition suite's STATUS_CHANGED
+     * assertions measure only what the TRANSITION under test enqueued.
+     *
+     * <p>Creating a visit enqueues two rows against its lead booking — {@code NEW_BOOKING} for the
+     * provider and {@code STATUS_CHANGED} for the client's «Бронювання підтверджено» — exactly the
+     * pair the single-service create path has always enqueued
+     * ({@code BookingService#doCreateBooking}). Create-time cardinality is owned by
+     * {@code AppointmentCreateIT} and {@code MultiServiceNotificationIT}, which assert it directly;
+     * counting it in a transition suite would silently inflate every assertion there.
+     *
+     * <p>Extracted here (Q4 two-occurrence threshold) from the byte-identical private copies
+     * {@code AppointmentTransitionIT} and {@code BookingAppointmentChildTransitionGuardIT} each
+     * grew in the same commit — a third copy is exactly how these drift.
+     */
+    public void dropCreateTimeNotifications(UUID appointmentId) {
+        jdbcTemplate.update(
+                "DELETE FROM notification_outbox WHERE aggregate_id IN "
+                        + "(SELECT id FROM bookings WHERE appointment_id = ?)",
+                appointmentId);
     }
 
     /**

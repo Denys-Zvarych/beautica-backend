@@ -3,6 +3,7 @@ package com.beautica.booking.job;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
+import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.notification.sms.SmsService;
 import lombok.extern.slf4j.Slf4j;
@@ -119,12 +120,24 @@ public class BookingReminderJob {
         }
     }
 
+    /**
+     * Renders the guest reminder SMS in ONE pass over the template — see
+     * {@link Placeholders#format}.
+     *
+     * <p>Chained {@link String#replace} was a template-injection vector here: {@code {serviceName}}
+     * was substituted BEFORE {@code {time}}, so the later {@code replace} re-scanned the service
+     * name it had just written in. A provider who named a service {@code "Манікюр {time}"}
+     * therefore got a second, fabricated time expanded inside a message the guest reads as platform
+     * copy — SMS is a guest's only channel. This template carries no {@code {cancelUrl}}, so there
+     * is no link to duplicate, but the layout-steering vector is the same. A single pass copies
+     * substituted values out verbatim, so data can never become markup.
+     */
     private String buildReminderSms(Booking booking) {
         OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return smsProperties.getSms().getReminder()
-                .replace("{serviceName}", booking.getMasterService().getServiceDefinition().getName())
-                .replace("{masterName}", masterName(booking))
-                .replace("{time}", TIME_FMT.format(kyiv));
+        return Placeholders.format(smsProperties.getSms().getReminder(), Map.of(
+                "serviceName", booking.getMasterService().getServiceDefinition().getName(),
+                "masterName", masterName(booking),
+                "time", TIME_FMT.format(kyiv)));
     }
 
     private static String masterName(Booking booking) {

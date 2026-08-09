@@ -459,7 +459,9 @@ class AppointmentTransitionIT extends AbstractIntegrationTest {
                 .as("visit setup must succeed — body: %s", created.getBody())
                 .isEqualTo(HttpStatus.CREATED);
         JsonNode data = objectMapper.readTree(created.getBody()).path("data");
-        return new Visit(UUID.fromString(data.path("id").asText()), clientToken, masterToken);
+        UUID appointmentId = UUID.fromString(data.path("id").asText());
+        fixtures.dropCreateTimeNotifications(appointmentId);
+        return new Visit(appointmentId, clientToken, masterToken);
     }
 
     private ResponseEntity<String> patch(String token, UUID appointmentId, String action, String body) {

@@ -1,7 +1,18 @@
 <!DOCTYPE html>
 <!--
   Template: email/booking-confirmed
-  Variables: clientName (String), serviceName (String), startsAt (String — pre-formatted)
+  Variables: clientName (String),
+             serviceNames (List<String> — one entry per service of the visit, in visit order),
+             serviceLabel (String — «Послуга» / «Послуги», resolved in Java),
+             startsAt (String — pre-formatted),
+             visitDuration (String, NULLABLE — «2 год 30 хв (до 13:15)»; null for a
+                            single-service booking, which suppresses the whole row)
+
+  Client-facing twin of email/new-booking — same th:each over serviceNames, same «Послуга»/«Послуги»
+  labelling, same suppressed-for-single-service duration row. The only structural difference is that
+  the service block is the FIRST row of this table, so its top border is appended only from the
+  second service onwards (th:attrappend) — a one-service render keeps the original borderless first
+  row exactly as it was.
 -->
 <html xmlns:th="http://www.thymeleaf.org" lang="uk">
 <head>
@@ -53,15 +64,18 @@
             <tr><td style="padding-bottom:28px;">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
                      style="border:1px solid #D4C5B5;border-radius:10px;overflow:hidden;">
-                <tr>
+                <tr th:each="visitService,visitIter : ${serviceNames}">
                   <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
                              color:#0D0906;font-size:14px;width:40%;
-                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                      th:attrappend="style=${visitIter.first} ? '' : 'border-top:1px solid #D4C5B5;'"
+                      th:text="${visitIter.first} ? ${serviceLabel} : ''">
                     Послуга
                   </td>
                   <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
-                      th:text="${serviceName}">
+                      th:attrappend="style=${visitIter.first} ? '' : 'border-top:1px solid #D4C5B5;'"
+                      th:text="${visitService}">
                     Назва послуги
                   </td>
                 </tr>
@@ -75,6 +89,18 @@
                              font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
                       th:text="${startsAt}">
                     10:00, 20 травня 2026
+                  </td>
+                </tr>
+                <tr th:if="${visitDuration != null}">
+                  <td style="padding:12px 16px;background:#EDE4D7;font-weight:700;
+                             color:#0D0906;font-size:14px;border-top:1px solid #D4C5B5;
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;">
+                    Тривалість
+                  </td>
+                  <td style="padding:12px 16px;color:#3D2B1A;font-size:14px;border-top:1px solid #D4C5B5;
+                             font-family:'Nunito','Trebuchet MS',Arial,sans-serif;"
+                      th:text="${visitDuration}">
+                    2 год 30 хв (до 13:15)
                   </td>
                 </tr>
               </table>

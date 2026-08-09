@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -72,11 +73,38 @@ class BookingReminderJobTest {
         verify(bookingRepository, times(0)).saveAll(any());
     }
 
+    @Test
+    @DisplayName("the reminder SMS must not expand a {time} placeholder that arrived inside the service name")
+    void should_notExpandAPlaceholderThatArrivedAsAValue_when_aServiceNameContainsOne() {
+        // buildReminderSms substituted {serviceName} BEFORE {time} with chained String.replace, so
+        // the later replace re-scanned the name it had just written in. The service name is
+        // provider-controlled free text, so a provider naming a service "Манікюр {time}" rendered a
+        // SECOND, provider-positioned time inside copy the guest reads as platform text — and SMS is
+        // the only channel a guest has.
+        Booking due = guestBooking("+380501111111", "Манікюр {time}");
+        when(bookingRepository.findGuestBookingsForReminder(any(), any())).thenReturn(List.of(due));
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+
+        job.sendReminders();
+
+        verify(smsService).send(eq("+380501111111"), textCaptor.capture());
+        assertThat(textCaptor.getValue())
+                .as("the literal braces from the DATA must survive as text, never be expanded")
+                .contains("Манікюр {time}")
+                .as("the real time appears exactly once, where the TEMPLATE puts it — a provider must "
+                        + "not be able to fabricate a second appointment time")
+                .containsOnlyOnce("10:00");
+    }
+
     private Booking guestBooking(String phone) {
+        return guestBooking(phone, "Манікюр");
+    }
+
+    private Booking guestBooking(String phone, String serviceName) {
         User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER, "Марія", "Левченко", null);
         Master master = Master.builder().user(user).isActive(true).build();
         ServiceDefinition def = ServiceDefinition.builder()
-                .name("Манікюр").baseDurationMinutes(60).bufferMinutesAfter(0)
+                .name(serviceName).baseDurationMinutes(60).bufferMinutesAfter(0)
                 .basePrice(new BigDecimal("350.00")).build();
         MasterServiceAssignment msa = MasterServiceAssignment.builder()
                 .master(master).serviceDefinition(def).isActive(true).build();

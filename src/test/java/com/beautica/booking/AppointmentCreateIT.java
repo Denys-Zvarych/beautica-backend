@@ -125,6 +125,29 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
         assertThat(newBookingEvents)
                 .as("exactly ONE NEW_BOOKING notification is enqueued per visit, not N")
                 .isEqualTo(1L);
+
+        // …and exactly ONE client-facing STATUS_CHANGED beside it, keyed to the SAME lead booking —
+        // the pairing the single-service create path has always enqueued (BookingService
+        // #doCreateBooking). Its absence was why a multi-service visit sent the client no
+        // «Бронювання підтверджено» e-mail at all. Still one row per visit, not one per service.
+        Long statusChangedEvents = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM notification_outbox nb "
+                        + "WHERE nb.event_type = 'STATUS_CHANGED' AND nb.aggregate_id IN "
+                        + "(SELECT id FROM bookings WHERE appointment_id = ?)",
+                Long.class, appointmentId);
+        assertThat(statusChangedEvents)
+                .as("exactly ONE client-facing STATUS_CHANGED notification is enqueued per visit")
+                .isEqualTo(1L);
+
+        Long distinctAggregates = jdbcTemplate.queryForObject(
+                "SELECT COUNT(DISTINCT nb.aggregate_id) FROM notification_outbox nb "
+                        + "WHERE nb.event_type IN ('NEW_BOOKING','STATUS_CHANGED') AND nb.aggregate_id IN "
+                        + "(SELECT id FROM bookings WHERE appointment_id = ?)",
+                Long.class, appointmentId);
+        assertThat(distinctAggregates)
+                .as("both create-time events key to the same lead booking — the drain worker "
+                        + "re-hydrates the siblings from it")
+                .isEqualTo(1L);
     }
 
     @Test

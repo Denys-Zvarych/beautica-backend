@@ -541,6 +541,63 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<Booking> findByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
 
+    /**
+     * The chained booking rows of SEVERAL visits at once — the notification-drain counterpart of
+     * {@link #findByAppointmentIdWithGraph}, which resolves ONE visit.
+     *
+     * <p><b>Why a batch variant rather than a loop over the single-id query.</b>
+     * {@code NotificationOutboxDrainWorker} claims up to {@code BATCH_SIZE} (50) outbox rows per
+     * drain, and a single created visit contributes TWO visit-aware rows ({@code NEW_BOOKING} +
+     * {@code STATUS_CHANGED}, both keyed to the same lead booking), so resolving per entry issued
+     * the same visit query twice per visit and up to 50 times per batch. Worse, those queries ran
+     * DURING phase 2, which is contractually connection-free (see the drain worker's class javadoc)
+     * — each one checked a Hikari connection back out in between ~25 s SMTP calls. This method
+     * hydrates every visit in the batch in ONE statement, inside the phase-2 pre-load block that
+     * already bulk-loads the lead bookings, so phase 2 takes no connection after dispatch begins.
+     *
+     * <p><b>{@code JOIN FETCH b.appointment} is load-bearing, not decoration.</b> The header's
+     * status is what distinguishes a WHOLE-visit transition from a PER-ITEM one (
+     * {@code AppointmentTransitionService#declineAppointment} vs {@code #declineAppointmentItem}),
+     * which the item rows alone cannot express. The drain runs with {@code open-in-view: false} and
+     * no transaction, so an unfetched {@code Appointment} would be an uninitialised proxy on a
+     * detached row and reading {@code getStatus()} would throw {@code LazyInitializationException}
+     * — this fetch is the only reason it is safe.
+     *
+     * <p><b>The graph is scoped to exactly what a SIBLING row is read for, and no wider.</b> These
+     * rows feed {@code BookingVisitResolver} → {@code BookingVisit} only, whose consumers touch
+     * {@code masterService.serviceDefinition.name}, booking scalars, {@code appointment.getStatus()}
+     * and the {@code master}/{@code client} IDENTIFIERS used by the resolver's tenancy filter.
+     * Identifiers resolve off the uninitialised LAZY proxy without a statement (pinned by
+     * {@code MultiServiceNotificationIT#should_takeNoFurtherStatement_when_theResolverReadsSiblingPartyIdsOffDetachedProxies}),
+     * so {@code b.master}, {@code m.user} and {@code b.salon} are deliberately NOT fetched: they
+     * bought nothing and cost three extra joins plus a full {@code users} row — {@code password_hash}
+     * and client PII included — per sibling, resident in the phase-2 working set for the whole
+     * dispatch loop. Same defect class as the one {@link #findAllByIdsWithGraph} documents. Do NOT
+     * re-add a fetch here without a consumer that dereferences a NON-identifier property.
+     *
+     * <p>Bounded by construction: at most {@code BATCH_SIZE} distinct appointment ids, each holding
+     * at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT} (10) rows, so no
+     * {@code Pageable} is needed (§E-3). Rides the partial index {@code idx_bookings_appointment}
+     * (V125, {@code WHERE appointment_id IS NOT NULL}).
+     *
+     * <p>The {@code ORDER BY} carries the {@code appointment.id} leg ONLY, to keep the
+     * {@code groupingBy} bucket contents deterministic across runs. The former trailing
+     * {@code b.startsAt} leg was dead weight: {@code BookingVisit#of} re-sorts every bucket into
+     * {@code startsAt, id} order regardless (item order must survive a later per-item reschedule, so
+     * that sort cannot be delegated to SQL), and nothing between the two reads positionally except
+     * {@code items.get(0).getAppointment()}, whose header status is identical for every row of a
+     * bucket.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.appointment a
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id IN :appointmentIds
+            ORDER BY b.appointment.id ASC
+            """)
+    List<Booking> findByAppointmentIdsWithGraph(@Param("appointmentIds") List<UUID> appointmentIds);
+
     // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
     // ── Idempotency lookup — partial-index aligned (Fix M5) ───────────────────

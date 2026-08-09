@@ -310,8 +310,30 @@ public class AppointmentService {
 
         // EXACTLY ONE new-visit notification for the whole appointment — the master is notified once,
         // referencing the first chained booking (NOT one per service). Notes are never logged nor put
-        // in the outbox payload (CLAUDE.md booking-notes contract).
+        // in the outbox payload (CLAUDE.md booking-notes contract). The drain worker re-hydrates the
+        // sibling rows from that one aggregateId (BookingVisitResolver), so ONE row still describes
+        // every service in the visit — do not add a second NEW_BOOKING row per item.
+        //
+        // Two rows, two distinct recipients — the exact pairing the single-service create path uses
+        // (BookingService#doCreateBooking): NEW_BOOKING → the master, STATUS_CHANGED → the client,
+        // whose CONFIRMED branch dispatches «Бронювання підтверджено». A visit is auto-confirmed at
+        // creation just like a single booking, so the second row is the client-facing half of the
+        // same create event, not a genuine transition. Its omission was why a multi-service visit
+        // sent the client no confirmation e-mail at all while a one-service booking did.
+        //
+        // <b>Lock-window note (backend-perf audit, P5).</b> Both INSERTs run while the per-master
+        // advisory lock is still held, and that is not removable: the lock is
+        // pg_advisory_xact_lock, which releases only at COMMIT/ROLLBACK — there is no
+        // mid-transaction unlock to move these calls past. Nor can they be deferred to an
+        // afterCommit hook: the transactional-outbox pattern requires the outbox rows to commit
+        // ATOMICALLY with the bookings they describe (that is why enqueue* is Propagation.MANDATORY
+        // — an outbox write outside the write transaction can be lost when the transaction rolls
+        // back, or fire for a visit that was never persisted). Two single-row INSERTs against an
+        // append-only table are also negligible next to the flush that precedes them. This mirrors
+        // the single-service create path (BookingService#doCreateBooking) exactly, so the two paths
+        // hold their lock for the same shape of work.
         outboxService.enqueueNewBooking(savedBookings.get(0).getId());
+        outboxService.enqueueStatusChanged(savedBookings.get(0).getId());
 
         registerSlotEviction(master.getId(), salonIdOf(master), items);
 
