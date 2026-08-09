@@ -173,8 +173,12 @@ public class AsyncConfig implements AsyncConfigurer {
      * <p>Shutdown truncation is reported by {@link ReminderLossReportingTaskExecutor}, independently of the
      * send pool: a task abandoned HERE is an entire un-fanned-out batch, which is why the report carries
      * the bean name.
+     *
+     * <p>{@code @Profile("!test")}: the test profile registers a synchronous stand-in under the SAME bean
+     * name — see {@link #syncSmsReminderDispatchExecutor()} for why.
      */
     @Bean(name = "smsReminderDispatchExecutor")
+    @Profile("!test")
     public TaskExecutor smsReminderDispatchExecutor() {
         ThreadPoolTaskExecutor executor =
                 new ReminderLossReportingTaskExecutor("smsReminderDispatchExecutor", REMINDER_SHUTDOWN_GRACE_SECONDS);
@@ -241,8 +245,12 @@ public class AsyncConfig implements AsyncConfigurer {
      * <p>No {@link DelegatingSecurityContextTaskExecutor} wrapper: the publisher is a
      * {@code @Scheduled} sweep with no {@code SecurityContext}, and the dispatcher reads none — it takes a
      * phone and a fully-rendered body, nothing principal-derived.
+     *
+     * <p>{@code @Profile("!test")}: the test profile registers a synchronous stand-in under the SAME bean
+     * name — see {@link #syncSmsReminderExecutor()} for why.
      */
     @Bean(name = "smsReminderExecutor")
+    @Profile("!test")
     public TaskExecutor smsReminderExecutor() {
         ThreadPoolTaskExecutor executor =
                 new ReminderLossReportingTaskExecutor("smsReminderExecutor", REMINDER_SHUTDOWN_GRACE_SECONDS);
@@ -255,6 +263,49 @@ public class AsyncConfig implements AsyncConfigurer {
         executor.setRejectedExecutionHandler(new CallerBlocksPolicy());
         executor.initialize();
         return executor;
+    }
+
+    /**
+     * Test-profile counterparts of {@link #smsReminderDispatchExecutor()} and
+     * {@link #smsReminderExecutor()}: both stages of the guest-reminder hand-off run INLINE on the calling
+     * thread, so an integration test that calls {@code BookingReminderJob#sendReminders()} observes the
+     * resulting {@code SmsService} calls deterministically instead of racing two pool threads
+     * (Anti-Bug §M — no {@code Thread.sleep}, no timing-dependent assertions).
+     *
+     * <h4>The regression these close</h4>
+     * <p>Moving the sends off the committing thread turned every {@code verify(smsService, times(1))} that
+     * follows a {@code sendReminders()} call in an integration test into a coin flip: the assertion runs on
+     * the test thread the instant the sweep's transaction commits, while the sends are still queued on
+     * {@code sms-reminder-dispatch-0} and then on {@code sms-reminder-*}. Two such assertions in
+     * {@code GuestVisitLinkParityIT} went red in CI while a third, structurally identical one stayed green —
+     * the signature of a race, not of a broken contract.
+     *
+     * <h4>Why bean-name + profile, and not {@code @Primary}</h4>
+     * <p>{@code GuestReminderDispatcher} injects both pools by {@code @Qualifier}, and an explicit qualifier
+     * outranks {@code @Primary} — a {@code @Primary} override in a {@code @TestConfiguration} would be
+     * silently ignored and the tests would still race. These beans instead carry the SAME bean name as the
+     * production ones with mutually exclusive profiles, so exactly one is ever registered and the qualifier
+     * resolves to it in every profile. {@code ReminderExecutorProfileOverrideTest} pins that, per profile,
+     * through a qualifier-injected probe.
+     *
+     * <h4>What is NOT weakened</h4>
+     * <p>Production keeps the two-stage async hand-off unchanged: the O(1) after-commit body, the
+     * single-thread dispatch pool, the 8-wide send pool, {@link CallerBlocksPolicy} and the shutdown loss
+     * report. Those are pinned by {@code AsyncConfigTest}, which instantiates {@link AsyncConfig} directly
+     * and therefore reads the production factory methods regardless of the active profile, and by
+     * {@code GuestReminderDispatcherTest}, which drives the dispatcher against real pools.
+     */
+    @Bean(name = "smsReminderDispatchExecutor")
+    @Profile("test")
+    public TaskExecutor syncSmsReminderDispatchExecutor() {
+        return new SyncTaskExecutor();
+    }
+
+    /** Test-profile counterpart of {@link #smsReminderExecutor()} — see {@link #syncSmsReminderDispatchExecutor()}. */
+    @Bean(name = "smsReminderExecutor")
+    @Profile("test")
+    public TaskExecutor syncSmsReminderExecutor() {
+        return new SyncTaskExecutor();
     }
 
     /**
