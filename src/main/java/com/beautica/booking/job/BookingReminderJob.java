@@ -1,12 +1,14 @@
 package com.beautica.booking.job;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.event.GuestRemindersDueEvent;
+import com.beautica.booking.event.GuestRemindersDueEvent.GuestReminderSms;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
-import com.beautica.notification.sms.SmsService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -38,6 +40,13 @@ import java.util.UUID;
  * (its earliest item) while marking EVERY item {@code reminderSent = true} so the visit never re-reminds.
  * Legacy single guest bookings ({@code appointment_id} NULL) each get their own reminder, unchanged. The
  * reminder query fetch-joins the appointment header, so grouping reads its id with no extra query / N+1.
+ *
+ * <p><b>No SMS is sent from this transaction (backend-perf MEDIUM).</b> The sweep only selects, renders and
+ * flags; the rendered batch is published as a {@link GuestRemindersDueEvent} and delivered by
+ * {@code GuestReminderDispatcher} after commit, on {@code smsReminderExecutor}. Sending in-transaction made
+ * the sweep's duration N × provider RTT (Turbosms: 3 s connect / 5 s read) while pinning a Hikari
+ * connection — ~100 s at N=1000, far worse against a stalling provider, every hour on the hour. See that
+ * class for the at-most-once rationale behind flagging BEFORE dispatch.
  */
 @Component
 @Slf4j
@@ -48,18 +57,18 @@ public class BookingReminderJob {
     private static final Duration WINDOW_END = Duration.ofHours(25);
 
     private final BookingRepository bookingRepository;
-    private final SmsService smsService;
     private final BookingSmsProperties smsProperties;
+    private final ApplicationEventPublisher events;
     private final Clock clock;
 
     public BookingReminderJob(
             BookingRepository bookingRepository,
-            SmsService smsService,
             BookingSmsProperties smsProperties,
+            ApplicationEventPublisher events,
             Clock clock) {
         this.bookingRepository = bookingRepository;
-        this.smsService = smsService;
         this.smsProperties = smsProperties;
+        this.events = events;
         this.clock = clock;
     }
 
@@ -89,16 +98,23 @@ public class BookingReminderJob {
             }
         }
 
+        // Render every message HERE, while the Hibernate session is still open, and collect them —
+        // buildReminderSms walks two lazy association chains (masterService → serviceDefinition, master →
+        // user), so it cannot run in the after-commit dispatcher. Only Strings cross the boundary.
+        List<GuestReminderSms> reminders = new ArrayList<>();
+
         for (Booking booking : singles) {
-            sendReminderSafely(booking);
+            collectReminder(reminders, booking);
             booking.setReminderSent(true);
         }
-        bookingRepository.saveAll(singles);
+        // No saveAll: these rows were loaded by findGuestBookingsForReminder INSIDE this transaction, so
+        // they are managed and Hibernate's dirty check flushes reminderSent at commit regardless. The
+        // explicit saveAll only added a merge pass over entities already in the persistence context.
 
         for (List<Booking> items : visits.values()) {
             // Remind on the earliest item; the SMS renders that item's service/time as the visit summary.
             items.sort(Comparator.comparing(Booking::getStartsAt));
-            sendReminderSafely(items.get(0));
+            collectReminder(reminders, items.get(0));
         }
         if (!visits.isEmpty()) {
             // Mark EVERY item of each reminded visit — including any tail item whose own startsAt sits
@@ -106,17 +122,38 @@ public class BookingReminderJob {
             // so a later sweep can never re-remind the visit's tail. One bulk UPDATE, no extra load.
             bookingRepository.markVisitRemindersSentByAppointmentIds(visits.keySet());
         }
-        log.info("Guest booking reminders processed: {} rows across {} visits and {} single bookings",
-                due.size(), visits.size(), singles.size());
+
+        // Hand the batch to GuestReminderDispatcher, which fires only once THIS transaction commits and
+        // immediately moves every blocking Turbosms call onto smsReminderExecutor. Nothing below this
+        // point does network I/O, so the transaction now closes in query time rather than in N × provider
+        // RTT (backend-perf MEDIUM). The flags above are committed by the same commit that releases the
+        // event, giving at-most-once delivery: a crash in between loses a reminder, never duplicates one.
+        if (!reminders.isEmpty()) {
+            events.publishEvent(new GuestRemindersDueEvent(reminders));
+        }
+        // The DISPATCHED count leads, and is what an incident is read against. `due.size()` is a row
+        // count inflated by BE-7 dedup (an N-item visit contributes N rows but ONE reminder), and a
+        // render failure drops a reminder without changing it either — so a line reporting only rows
+        // reads identically whether the batch went out whole or half of it never left. Pairing the two
+        // makes a short batch visible in the log alone: dispatched < rows − (rows − visits − singles).
+        log.info("Guest booking reminders: {} dispatched from {} due rows across {} visits and {} single bookings",
+                reminders.size(), due.size(), visits.size(), singles.size());
     }
 
-    private void sendReminderSafely(Booking booking) {
+    /**
+     * Renders one reminder into the outgoing batch. A render failure for one booking must not abort the
+     * sweep or the {@code reminderSent} flush — same containment the old in-loop {@code sendReminderSafely}
+     * gave, kept because {@code buildReminderSms} now runs inside the transaction. Logs the cause class
+     * only (never the phone or the text).
+     *
+     * <p>The booking is still marked reminded when rendering fails: the cause is a deterministic data
+     * problem that would fail identically on the next sweep, so retrying it hourly would only re-log.
+     */
+    private void collectReminder(List<GuestReminderSms> reminders, Booking booking) {
         try {
-            smsService.send(booking.getGuestPhone(), buildReminderSms(booking));
+            reminders.add(new GuestReminderSms(booking.getGuestPhone(), buildReminderSms(booking)));
         } catch (RuntimeException e) {
-            // A provider failure for one recipient must not abort the whole sweep or the
-            // reminderSent flush. Log the cause class only (never the phone or text).
-            log.warn("Guest reminder SMS failed: {}", e.getClass().getSimpleName());
+            log.warn("Guest reminder SMS could not be rendered: {}", e.getClass().getSimpleName());
         }
     }
 
