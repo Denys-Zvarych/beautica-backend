@@ -9,6 +9,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -28,6 +29,7 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -225,13 +227,26 @@ public class GuestVisitCancellationService {
         }
     }
 
+    /**
+     * Renders the guest visit-cancellation SMS in ONE pass over the template — see
+     * {@link Placeholders#format}.
+     *
+     * <p>Chained {@link String#replace} was a template-injection vector here: {@code {serviceName}}
+     * was substituted BEFORE {@code {date}} and {@code {time}}, so each later {@code replace}
+     * re-scanned the service name it had just written in. A provider who named a service
+     * {@code "Манікюр {date}"} therefore got a second, fabricated date/time line expanded inside a
+     * message the guest reads as platform copy — SMS is a guest's only channel. This template
+     * carries no {@code {cancelUrl}}, so there is no link to duplicate, but the layout-steering
+     * vector is the same. A single pass copies substituted values out verbatim, so data can never
+     * become markup.
+     */
     private String buildCancellationSms(Booking first) {
         OffsetDateTime kyiv = first.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return smsProperties.getSms().getCancellation()
-                .replace("{serviceName}", first.getMasterService().getServiceDefinition().getName())
-                .replace("{masterName}", masterName(first.getMaster()))
-                .replace("{date}", DATE_FMT.format(kyiv))
-                .replace("{time}", TIME_FMT.format(kyiv));
+        return Placeholders.format(smsProperties.getSms().getCancellation(), Map.of(
+                "serviceName", first.getMasterService().getServiceDefinition().getName(),
+                "masterName", masterName(first.getMaster()),
+                "date", DATE_FMT.format(kyiv),
+                "time", TIME_FMT.format(kyiv)));
     }
 
     private static String masterName(Master master) {
