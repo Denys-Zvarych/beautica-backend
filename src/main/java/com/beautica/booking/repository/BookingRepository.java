@@ -1179,9 +1179,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * (Anti-Bug §E-3: not unbounded), and aligned with the partial index
      * {@code idx_bookings_reminder} (LINK + reminder_sent = FALSE).
      *
-     * <p>The fetched rows are mutated ({@code reminderSent = true}) and saved by the
-     * job inside its transaction, so the {@code masterService}/{@code serviceDefinition}
-     * graph is joined to render the reminder text without a lazy load.
+     * <p>The fetched rows are mutated ({@code reminderSent = true}) by the job inside its
+     * transaction and flushed by dirty checking (no explicit save — they are managed), so the
+     * {@code masterService}/{@code serviceDefinition} graph is joined to render the reminder text
+     * without a lazy load.
      */
     // {@code LEFT JOIN FETCH b.appointment} (BE-7): a multi-service guest visit's N item rows share one
     // appointment_id, so the reminder sweep groups by it to send ONE reminder per visit (not one per
