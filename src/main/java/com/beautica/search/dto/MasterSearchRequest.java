@@ -47,15 +47,27 @@ import java.util.Objects;
  *       {@link LocationFilter}. {@code @Valid} cascades Bean Validation into
  *       the nested record. Optional: a {@code null} location means "no
  *       location filter".</li>
- *   <li>{@code q} — free-text name / service-name query. Matched
- *       case-insensitively ({@code ILIKE %term%}) against the master's first
- *       name, last name, and the (custom-preferred) service-definition names.
- *       Capped at 100 chars; the same control-char / HTML-special
- *       {@code @Pattern} as {@code category} blocks injection on this
- *       {@code permitAll} endpoint. The service escapes the {@code LIKE}
- *       wildcards ({@code %}, {@code _}, {@code \}) in the supplied term, so a
- *       literal {@code %} matches a literal {@code %}. Optional: {@code null} /
- *       blank means "no text filter".</li>
+ *   <li>{@code q} — free-text name / service-name query. Whitespace-tokenised
+ *       and matched case-insensitively ({@code ILIKE %token%}) against the
+ *       master's first name, last name, and the (custom-preferred)
+ *       service-definition names — every token must match at least one of those
+ *       columns, so "Вікторія Руденко" finds the master whose first name is
+ *       "Вікторія" and last name "Руденко".
+ *       <p><b>The {@code @Pattern} bans control characters ONLY.</b> It
+ *       deliberately does <em>not</em> ban {@code < > " '}: Ukrainian
+ *       orthography requires the apostrophe constantly (В'ячеслав, Мар'яна,
+ *       Дар'я), and banning U+0027 turned every such name into an HTTP 400. The
+ *       ban bought no security — the term is bound as a JDBC parameter
+ *       ({@code :q0…:q3}), never interpolated into SQL, and the response is
+ *       JSON that never reflects {@code q} into HTML. The service additionally
+ *       escapes the {@code LIKE} wildcards ({@code %}, {@code _}, {@code \}) in
+ *       the supplied term, so a literal {@code %} matches a literal {@code %},
+ *       and folds the curly apostrophe U+2019 onto U+0027 so both keyboard
+ *       variants match the same rows.
+ *       <p>Capped at 100 chars. Optional: {@code null} / blank means "no text
+ *       filter". A term whose longest token is shorter than 3 characters is NOT
+ *       a validation error — the endpoint returns an explicit empty page plus a
+ *       helper {@code message} (see {@code NormalizedSearchQuery}).</li>
  *   <li>{@code sort} — allow-listed ordering; see {@link SearchSort}. Bound to
  *       an enum so caller text never reaches the {@code ORDER BY}. A
  *       {@code null} (or unbindable) value falls back to
@@ -93,13 +105,43 @@ public record MasterSearchRequest(
         @Valid
         LocationFilter location,
 
+        // Java's \p{Cntrl} without UNICODE_CHARACTER_CLASS covers only ASCII
+        // 0x00–0x1F and 0x7F, so U+0085 NEL, the C1 block, U+200B ZERO WIDTH SPACE,
+        // U+2028/U+2029 line/paragraph separators and U+202E RIGHT-TO-LEFT OVERRIDE
+        // all passed. Since the `< > " '` ban was (correctly) dropped for Ukrainian
+        // apostrophe names, this @Pattern is the ONLY character filter on q, so it
+        // is widened to the Unicode categories: Cc (control), Cf (format — bidi
+        // overrides, ZWJ/ZWNJ), Zl, Zp. Deliberately NOT a bare \p{C}: that also
+        // matches Cn (unassigned), which would 400 every code point Unicode has not
+        // allocated yet — i.e. future emoji in a salon name.
+        //
+        // Defence-in-depth only: q is bound as a JDBC parameter (:q0…:q3), never
+        // interpolated into SQL, never logged, reflected, persisted, exported or
+        // templated. No exploit path exists today; this keeps it that way.
         @Size(max = 100, message = "q must be at most 100 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
-                 message = "q must not contain control characters or HTML special characters")
+        @Pattern(regexp = "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]*$",
+                 message = "q must not contain control characters")
         String q,
 
+        // Same ASCII-only \p{Cntrl} gap that was closed on `q` above: without
+        // UNICODE_CHARACTER_CLASS it covers only 0x00–0x1F and 0x7F, so U+0085 NEL,
+        // the C1 block, U+200B ZERO WIDTH SPACE, U+2028/U+2029 and U+202E
+        // RIGHT-TO-LEFT OVERRIDE all passed. Widened to the same Unicode categories
+        // (Cc, Cf, Zl, Zp) — again NOT a bare \p{C}, which would also match Cn
+        // (unassigned) and reject every not-yet-allocated code point.
+        //
+        // Unlike `q` this field KEEPS the `< > " '` ban: category is a fixed
+        // vocabulary (a ServiceCategory enum name, upper-cased and compared to
+        // service_definitions.category), so no legitimate value contains an
+        // apostrophe or an angle bracket — the ban that had to be dropped from `q`
+        // for Ukrainian names (В'ячеслав, Мар'яна) costs nothing here. So this
+        // pattern is strictly stricter than q's.
+        //
+        // Defence-in-depth only: category is bound as a JDBC parameter, never
+        // interpolated into SQL and never reflected into HTML. No exploit path
+        // exists today; this keeps the control consistent across both filters.
         @Size(max = 100, message = "category must be at most 100 characters")
-        @Pattern(regexp = "^[^\\p{Cntrl}<>\"']*$",
+        @Pattern(regexp = "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}<>\"']*$",
                  message = "category must not contain control characters or HTML special characters")
         String category,
 
@@ -119,11 +161,11 @@ public record MasterSearchRequest(
         BigDecimal minRating,
 
         @PositiveOrZero(message = "page must be zero or positive")
-        @Max(value = 500, message = "page must be at most 500")
+        @Max(value = SearchResultWindow.MAX_PAGE_INDEX, message = "page must be at most 500")
         Integer page,
 
         @Positive(message = "size must be a positive number")
-        @Max(value = 100, message = "size must be at most 100")
+        @Max(value = SearchResultWindow.MAX_PAGE_SIZE, message = "size must be at most 100")
         Integer size,
 
         @Size(max = 20, message = "serviceTypeSlugs must contain at most 20 entries")
@@ -132,7 +174,7 @@ public record MasterSearchRequest(
                 @Pattern(regexp = "^[a-z0-9]+(?:-[a-z0-9]+)*$",
                          message = "each serviceTypeSlug must be a lowercase hyphenated slug")
                 String> serviceTypeSlugs
-) {
+) implements FreeTextSearchRequest {
 
     /**
      * Compact constructor — normalizes the scale of every {@code @Digits}-bound
@@ -182,6 +224,25 @@ public record MasterSearchRequest(
             return true;
         }
         return minPrice.compareTo(maxPrice) <= 0;
+    }
+
+    /**
+     * Reachable-result-window guard: {@code page * size + size} must not exceed
+     * {@link SearchResultWindow#MAX_RESULT_WINDOW} (10 000 rows).
+     *
+     * <p>Bounds the <b>product</b> of the two per-field caps rather than either cap
+     * alone — {@code page=500&size=100} would otherwise ask for a 50 000-row offset,
+     * uncached (pages ≥ 5 skip the cache) and costing two statements when out of
+     * range. See {@link SearchResultWindow} for the 10 000 figure, why a 400 and not
+     * a silent clamp, and why keyset pagination is the long-term answer.</p>
+     *
+     * <p><b>Method name contract:</b> Jakarta Validation requires an
+     * {@link AssertTrue} target to start with {@code is}.</p>
+     */
+    @AssertTrue(message = "page and size together request results beyond the 10000-result window "
+            + "(page * size + size must not exceed 10000); narrow your filters or request a lower page")
+    public boolean isWithinResultWindow() {
+        return SearchResultWindow.isWithinWindow(page, size);
     }
 
     /**

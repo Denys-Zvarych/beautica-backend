@@ -1,5 +1,6 @@
 package com.beautica.master.dto;
 
+import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
@@ -22,6 +23,14 @@ public record MasterDetailResponse(
         String instagram,
         String professionalTitle,
         String avatarUrl,
+        /**
+         * {@code null} when {@link #reviewCount} is 0 — never the stored {@code 0.00}.
+         * {@code masters.avg_rating} is {@code NOT NULL DEFAULT 0.00} (V4), so an unreviewed
+         * master persists a literal zero that is a storage artefact, not a rating. Normalised
+         * through {@link BookingDetailResponse#masterAvgRatingOrNull} so this endpoint and
+         * {@code GET /bookings/{id}} / {@code GET /masters/{id}/reviews/summary} cannot disagree
+         * about the same master (Phase 240 audit, Finding 3).
+         */
         BigDecimal avgRating,
         int reviewCount,
         MasterType masterType,
@@ -55,7 +64,8 @@ public record MasterDetailResponse(
                 master.getUser().getInstagram(),
                 master.getUser().getProfessionalTitle(),
                 master.getUser().getAvatarUrl(),
-                master.getAvgRating(),
+                BookingDetailResponse.masterAvgRatingOrNull(
+                        master.getReviewCount(), master.getAvgRating()),
                 master.getReviewCount(),
                 master.getMasterType(),
                 master.getSalon() != null ? PublicSalonResponse.from(master.getSalon()) : null,

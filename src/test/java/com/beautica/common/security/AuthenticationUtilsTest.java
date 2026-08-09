@@ -93,6 +93,47 @@ class AuthenticationUtilsTest {
     }
 
     @Nested
+    @DisplayName("userIdOrNull(Authentication)")
+    class UserIdOrNull {
+
+        @Test
+        @DisplayName("userIdOrNull — returns the UUID stored as token details on a UPAT")
+        void should_returnUuid_when_upatCarriesUuidDetails() {
+            UUID expected = UUID.randomUUID();
+            UsernamePasswordAuthenticationToken token = tokenWith(expected, authority(Role.CLIENT));
+
+            assertThat(AuthenticationUtils.userIdOrNull(token)).isEqualTo(expected);
+        }
+
+        @Test
+        @DisplayName("userIdOrNull — returns null (never throws) when authentication is null")
+        void should_returnNull_when_authenticationIsNull() {
+            assertThat(AuthenticationUtils.userIdOrNull(null)).isNull();
+        }
+
+        @Test
+        @DisplayName("userIdOrNull — returns null when principal is not a UPAT (AnonymousAuthenticationToken)")
+        void should_returnNull_when_principalIsNotUpat() {
+            AnonymousAuthenticationToken anonymous = new AnonymousAuthenticationToken(
+                    "key", "anonymousUser",
+                    List.of(new SimpleGrantedAuthority("ROLE_ANONYMOUS")));
+
+            assertThat(AuthenticationUtils.userIdOrNull(anonymous)).isNull();
+        }
+
+        @Test
+        @DisplayName("userIdOrNull — returns null when UPAT details is not a UUID (a String)")
+        void should_returnNull_when_detailsIsNotUuid() {
+            UsernamePasswordAuthenticationToken token =
+                    new UsernamePasswordAuthenticationToken("principal", "credentials",
+                            List.of(authority(Role.CLIENT)));
+            token.setDetails("not-a-uuid");
+
+            assertThat(AuthenticationUtils.userIdOrNull(token)).isNull();
+        }
+    }
+
+    @Nested
     @DisplayName("role(Authentication)")
     class RoleResolution {
 

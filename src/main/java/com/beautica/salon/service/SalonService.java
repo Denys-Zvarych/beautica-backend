@@ -21,6 +21,7 @@ import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.search.service.SearchCacheNames;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -155,7 +156,13 @@ public class SalonService {
     }
 
     /**
-     * Evicts the entire {@code search:salons} cache after commit.
+     * Evicts <b>both halves</b> of the salon discovery cache after commit —
+     * {@code search:salons:browse} and {@code search:salons:q}.
+     *
+     * <p>Iterates {@link SearchCacheNames#SALONS_ALL} rather than naming the caches
+     * inline: the population split (browse vs free-text) is a caching-layer concern
+     * and clearing only one half would leave the deactivated salon reachable through
+     * the other, which no test on this path would notice.</p>
      *
      * <p>Blanket eviction (not per-key) is intentional: search results are a filtered subset of
      * all active salons. When a salon is deactivated the cached page may contain it, and the only
@@ -170,9 +177,11 @@ public class SalonService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                Cache cache = cacheManager.getCache("search:salons");
-                if (cache != null) {
-                    cache.clear();
+                for (String cacheName : SearchCacheNames.SALONS_ALL) {
+                    Cache cache = cacheManager.getCache(cacheName);
+                    if (cache != null) {
+                        cache.clear();
+                    }
                 }
             }
         });
@@ -225,8 +234,19 @@ public class SalonService {
         return result;
     }
 
+    /**
+     * {@code sync = true} (Phase 240 audit, item A) mirrors
+     * {@link com.beautica.master.service.MasterService#getMasterDetail(UUID)}. Required because
+     * {@code ReviewEventListener#onReviewCreated} now evicts this entry by key on every review of
+     * a salon-affiliated master, so the cache misses on a real WRITE path and not only on TTL
+     * expiry — without collapsing, N concurrent readers of a popular salon each run the
+     * {@code findByIdAndIsActiveTrueWithOwner} graph query (Anti-Bug §F-7).
+     *
+     * <p>Compatible: this {@code @Cacheable} names ONE cache and carries no {@code unless} /
+     * {@code condition}, both of which {@code sync = true} forbids.
+     */
     @Transactional(readOnly = true)
-    @Cacheable(value = "salon-detail", key = "#salonId")
+    @Cacheable(value = "salon-detail", key = "#salonId", sync = true)
     public Salon getSalonEntity(UUID salonId) {
         return salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));

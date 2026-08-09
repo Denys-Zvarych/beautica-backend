@@ -15,6 +15,7 @@ import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
@@ -248,7 +249,38 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Always called with the result of an ID-only page query, so the IN list size
      * equals the configured page size (default 20) — never unbounded.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — as with {@link #findByIdWithFullGraph}.
+     * <p><b>Phase 242 — the fetched salon is {@code b.salon}, NOT {@code m.salon}.</b> The address
+     * block {@code BookingDetailResponse#from} renders is the BOOKING's snapshot (see that class's
+     * javadoc), and it reads real properties ({@code getName()}, {@code getStreet()},
+     * {@code getLocationNote()}) which INITIALISE the proxy — unlike {@code salonId}'s
+     * identifier-only read, which was free. Leaving the fetch on {@code m.salon} would therefore
+     * cost one extra SELECT per distinct booked salon per page, exactly the N+1 this query exists
+     * to prevent. Consequence to keep in mind: {@code master.getSalon()} is no longer fetch-joined
+     * here.
+     *
+     * <p><b>Why that consequence is free on this path — and what would make it not free.</b> Be
+     * precise about which dereferences are actually cheap, because the two look alike:
+     * {@code getSalon().getId()} is an identifier read Hibernate serves off an UNINITIALISED
+     * proxy without a statement, but {@code getSalon().getOwner()} — {@code AuthorizationService}'s
+     * ownership walk — is a PROPERTY read that INITIALISES the {@code Salon} proxy (only the
+     * trailing {@code .getId()} on the resulting {@code User} proxy is free). The reason it still
+     * costs nothing here is NOT proxy-avoidance, it is FK coincidence: in the ordinary (un-rotated)
+     * shape {@code bookings.salon_id == masters.salon_id}, so {@code master.getSalon()} resolves to
+     * the {@code Salon} this query already materialised from {@code b.salon} in the persistence
+     * context and there is no proxy left to initialise. When the two FKs DIVERGE — the master has
+     * rotated salons since the booking, or gone independent — that walk issues a real
+     * {@code SELECT ... FROM salons}, measured at 3 &rarr; 4 statements on the detail read
+     * ({@code BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ROTATED}). The conclusion (free
+     * on the aligned shape, which is what this list path serves) is unchanged; the stated reason
+     * is. Since the phase-242 audit's finding 1, {@code AuthorizationService#enforceCanViewBooking}
+     * no longer runs that walk at all for the owning CLIENT; since its finding 2, neither does
+     * {@code BookingService#computeProviderCanReviewClient}, which used to re-enter the identical
+     * walk on {@code GET /bookings/&#123;id&#125;} a few statements later and cancelled out the
+     * first fix on that surface. The walk survives for the salon OWNER, who genuinely needs the
+     * row to authorize.
+     *
+     * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — as with
+     * {@link #findByIdWithFullGraph}.
      * {@code Salon.owner} is {@code LAZY}, so the fetch join was never an EAGER mitigation, and
      * none of this method's three callers dereferences it: {@code BookingDetailResponse#from}
      * (via {@code BookingService#listProviderBookings}) reads only the salon's name / street /
@@ -259,25 +291,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * included — hydrated per distinct salon on every provider booking-list and master-calendar
      * page. {@link #findByIdWithFullGraph} does not fetch {@code s.owner} either, for the same
      * reason: the {@code AuthorizationService} ownership checks its callers feed read
-     * {@code master.getSalon().getOwner().getId()}, and an identifier is served off the
-     * uninitialised proxy without a statement — so the fetch bought nothing there and was removed
-     * alongside this one.
+     * {@code master.getSalon().getOwner().getId()}, whose FINAL hop — the {@code User} identifier —
+     * is served off the uninitialised {@code User} proxy without a statement, so the fetch bought
+     * nothing there and was removed alongside this one. (The EARLIER hop, {@code getOwner()}
+     * itself, does initialise the {@code Salon}; fetching {@code s.owner} would not have avoided
+     * that, it would only have added the {@code users} row on top.)
      *
      * <p>The "no caller dereferences it" half of that claim is now enforced, not merely asserted:
      * {@code BookingPriceRangeContractIT#should_notScaleStatementCount_when_salonMasterPageHasManyBookings}
      * pins the statement count of a provider page whose rows carry a REAL salon — the only fixture
      * shape in which a {@code Salon.owner} proxy exists at all — so a regression that starts walking
      * it shows up as 6 -&gt; 7 there. Note the gate detects a dereference of a non-identifier
-     * property; {@code getOwner().getId()} is served off the uninitialised proxy and costs nothing,
-     * which is why {@code AuthorizationService}'s id-only checks would not have needed this fetch
-     * even if they did run here.
+     * property on the {@code Salon}; the {@code User} identifier at the end of
+     * {@code getOwner().getId()} is served off the uninitialised {@code User} proxy and costs
+     * nothing, which is why {@code AuthorizationService}'s checks would not have needed
+     * {@code s.owner} fetched even if they did run here.
      */
     @Query("""
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id IN :ids
@@ -293,15 +328,33 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * the same {@code JOIN m.user mu} already used for {@code mu.firstName}/{@code mu.lastName}
      * — no additional join, and the column is nullable (a master may never have set a title).
      *
+     * <p>Phase B1's {@code m.avgRating}/{@code m.reviewCount} likewise ride the {@code JOIN
+     * b.master m} alias this query has always carried (it already selects {@code m.id}) — two more
+     * scalars on the same {@code masters} row, so no additional join and no aggregate subquery.
+     * They are selected RAW; the zero-review-to-null rule is applied once, in Java, by {@code
+     * BookingDetailResponse#masterAvgRatingOrNull}, shared with the entity mapper path so the two
+     * cannot drift.
+     *
+     * <p><b>Phase 242 — {@code s} is {@code LEFT JOIN b.salon}, the BOOKING's own snapshot, not
+     * {@code LEFT JOIN m.salon}.</b> That is a one-line RE-POINT of an alias this query has always
+     * carried, not an added join: {@code s} is referenced ONLY by {@code s.name} and the five
+     * {@code CASE WHEN} columns below, all of which are display fields describing the premises the
+     * client is travelling to. Keying them off the master's LIVE affiliation served a rotated
+     * master's NEW salon's {@code locationNote} — a door code for premises the client never booked
+     * at — on every OLD booking. {@code b.salon.id} (Phase B2) now resolves through the very same
+     * alias, so {@code salonId} and {@code salonName} can no longer disagree.
+     *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
      * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
      * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from} exactly: {@code salon
-     * != null ? salon.getX() : masterUser.getX()}. <b>Do not use {@code COALESCE(s.X, mu.X)}
+     * != null ? salon.getX() : masterUser.getX()}, with {@code salon = booking.getSalon()} on both
+     * sides. <b>Do not use {@code COALESCE(s.X, mu.X)}
      * here</b> — {@code COALESCE} falls through to the master's own value whenever the salon's
-     * column is {@code NULL}, which for a salon-employed master leaks the master's personal
-     * data (e.g. their home door code) onto a salon booking. Riding the same
-     * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
+     * column is {@code NULL}, which for a salon booking leaks the master's personal
+     * data (e.g. their home door code). Phase 242 changed WHICH salon the predicate keys off and
+     * nothing about the predicate itself. Riding the {@code LEFT JOIN b.salon s} /
+     * {@code JOIN m.user mu} aliases — no additional join (still 7).
      *
      * <p><b>Phase 26.7.1 — the sentinel is gone; this is now a pure {@code IN :ids} hydrate.</b>
      * Prior to this phase the {@code WHERE} clause carried {@code b.client.id = :clientId} plus
@@ -386,13 +439,16 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END,
                 b.priceMaxAtBooking,
                 b.appointment.id,
-                b.client.avatarUrl
+                b.client.avatarUrl,
+                m.avgRating,
+                m.reviewCount,
+                b.salon.id
             )
             FROM Booking b
             JOIN b.client
             JOIN b.master m
             JOIN m.user mu
-            LEFT JOIN m.salon s
+            LEFT JOIN b.salon s
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
             LEFT JOIN Review r ON r.booking = b
@@ -411,8 +467,16 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
      * {@link #findAllByIdsWithGraph} for the sibling batch-hydrate query with the same fix.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — the third and last removal of this
-     * dead fetch, after {@link #findAllByIdsWithGraph} and
+     * <p><b>Phase 242 — {@code LEFT JOIN FETCH b.salon}, not {@code m.salon}</b>, for the reason
+     * spelled out on {@link #findAllByIdsWithGraph}: {@code BookingDetailResponse#from} now reads
+     * real properties off the BOOKING's salon snapshot, so that is the association this graph must
+     * materialise. {@code AuthorizationService#isAuthorizedToManageBooking} /
+     * {@code #hasProviderAuthorityOverBooking} still walk {@code master.getSalon()}, but only to
+     * an identifier ({@code getOwner().getId()}), and for an un-rotated master the FK matches the
+     * fetched {@code b.salon} row so the persistence context answers without a statement.
+     *
+     * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — the third and last removal
+     * of this dead fetch, after {@link #findAllByIdsWithGraph} and
      * {@code findActiveByClientIdAndIdempotencyKey}. It was dead for two independent reasons:
      * <ol>
      *   <li>Every {@code getOwner()} in {@code src/main/java} is either a null check or
@@ -438,7 +502,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id = :id
@@ -446,15 +510,22 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
 
     /**
-     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt} so the
-     * items read back in the exact back-to-back order they were performed.
+     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt}
+     * ascending. That ordering is retained unconditionally, but "back-to-back" is NOT: once any
+     * item has been rescheduled individually (phase 30.1's relaxed contiguity —
+     * {@code AppointmentTransitionService#rescheduleAppointmentItem}), consecutive rows may be
+     * separated by a legal gap. Callers must not assume adjacency from this ordering alone.
      *
      * <p>Naturally bounded — a visit holds at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT}
      * (10) rows — so no {@code Pageable} is needed (§E-3). Rides the partial index
      * {@code idx_bookings_appointment} (V125, {@code WHERE appointment_id IS NOT NULL}). Hydrates the
-     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, {@code master.salon},
+     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, <b>{@code booking.salon}</b>,
      * {@code masterService.serviceDefinition}) so {@code AppointmentDetailResponse.from} reads the
-     * master summary + per-item service name with no lazy load or N+1. {@code b.client} is deliberately
+     * master summary + per-item service name with no lazy load or N+1. Phase 242 re-pointed the
+     * salon fetch from {@code m.salon} to {@code b.salon}: the visit's address block is resolved
+     * from the ITEM's own salon snapshot ({@code AppointmentDetailResponse#from} reads
+     * {@code first.getSalon()}), which is real-property access and would otherwise lazy-load.
+     * {@code b.client} is deliberately
      * NOT fetched — the appointment header carries the client, and the item projection does not read
      * it.
      */
@@ -462,7 +533,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.appointment.id = :appointmentId
@@ -718,9 +789,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * round trip removes a network hop from every booking write (perf finding; measurable on
      * Neon's serverless proxy, which is a real network hop per statement, not a local call).
      *
-     * <p>Postgres evaluates a SELECT target list left-to-right per row, so
-     * {@code set_config(...)} is guaranteed to run before {@code pg_advisory_xact_lock(...)} on
-     * the same row — the 3s ceiling is already in force for THIS lock acquisition. Because the
+     * <p>Postgres does NOT formally guarantee subexpression evaluation order (docs §4.2.14 leaves
+     * it undefined), but the executor's {@code ExecProject} evaluates target-list entries in
+     * order, so in every current implementation {@code set_config(...)} runs before
+     * {@code pg_advisory_xact_lock(...)} on the same row — the 3s ceiling is already in force for
+     * THIS lock acquisition. Were that ever to change, only this one acquisition would wait
+     * unbounded (the pre-fix behaviour); the GUC would still bound the rest. Because the
      * GUC is transaction-scoped (not just statement-scoped), it also remains in force for the
      * rest of the transaction, so it still bounds the subsequent per-master
      * {@link #acquireAdvisoryLock(UUID)} wait in {@code BookingService.doCreateBooking} /
@@ -851,6 +925,84 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<BookingCompletionAccess> findAllCompletionAccessByAppointmentId(
             @Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Scalar, entity-manager-bypassing projection of the CONFIRMED subset of an appointment's
+     * chained items — the post-lock freshness re-check
+     * {@code AppointmentTransitionService#rescheduleAppointment} runs immediately after acquiring
+     * the header lock (cycle-5 audit finding 1, 2026-08-03) and BEFORE mutating its own target
+     * items, whose entities were necessarily loaded (by {@code resolveVisitForClientReschedule}/
+     * {@code resolveVisitForProviderReschedule}) BEFORE that lock existed to protect the read.
+     *
+     * <p><b>Why a bare {@code b.id} projection, never {@code SELECT b}.</b> The caller's target
+     * items are already managed in the SAME persistence context. An entity-returning query for the
+     * same ids would hand back those SAME cached Java instances from the identity map rather than
+     * fresh column values — Hibernate never overwrites an already-managed entity's fields from a
+     * later query's resultset — mirroring {@link #findAllCompletionAccessByAppointmentId}'s and
+     * {@code AppointmentRepository#findClientIdById}'s identical non-poisoning rationale. A scalar
+     * projection never touches the entity manager, so it cannot be poisoned by (or poison) an
+     * earlier or later load of the same rows.
+     *
+     * <p>{@code Booking} now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so a
+     * plain {@code save()} of a stale, still-{@code CONFIRMED}-in-memory item no longer risks
+     * writing back a concurrently-committed terminal status — Hibernate only includes the columns
+     * this call's own transaction actually dirtied. This check therefore no longer exists to
+     * prevent a silent resurrection; it exists so a stale item is rejected with a clean, retryable
+     * 409 INSTEAD OF proceeding to move an item whose CONFIRMED precondition already lapsed — the
+     * caller compares this result against its own target ids and aborts on any mismatch rather
+     * than silently completing a transition the caller no longer has authority to make (the
+     * concurrent write already resolved this item to a different terminal state).
+     *
+     * @return the ids of {@code appointmentId}'s chained items that are, AS OF THIS CALL,
+     *         genuinely still {@code CONFIRMED} — empty if the appointment has no such items
+     */
+    @Query("""
+            SELECT b.id FROM Booking b
+             WHERE b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    Set<UUID> findConfirmedIdsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Scalar, entity-manager-bypassing CONFIRMED-status probe for exactly ONE booking id — the
+     * per-ITEM counterpart of {@link #findConfirmedIdsByAppointmentId}, used by the three per-item
+     * write paths that mutate a single already-loaded child row after taking the appointment
+     * header lock: {@code AppointmentTransitionService#rescheduleAppointmentItem},
+     * {@code AppointmentTransitionService#declineAppointmentItem}, and
+     * {@code BookingService#cancelBooking(UUID, Booking, CancelBookingRequest)} (F1, HIGH, cycle-6
+     * audit 2026-08-03 — closes the entity-staleness/terminal-state-resurrection defect class
+     * {@code rescheduleAppointment}'s own post-lock recheck already closed for the whole-visit
+     * path).
+     *
+     * <p><b>Why a bare boolean, never {@code SELECT b}.</b> Same non-poisoning rationale as
+     * {@link #findConfirmedIdsByAppointmentId}: each of the three callers' target {@code Booking}
+     * is already managed in the SAME persistence context, loaded (necessarily) BEFORE the header
+     * lock existed to protect that read. An entity-returning query for the same id would hand back
+     * that SAME cached instance from the identity map rather than fresh column values — Hibernate
+     * never overwrites an already-managed entity's fields from a later query's resultset. A scalar
+     * projection never touches the entity manager, so it cannot be poisoned by, or poison, an
+     * earlier or later load of the same row.
+     *
+     * <p>{@code Booking} now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so a
+     * plain {@code save()}/{@code saveAndFlush()} of a stale, still-{@code CONFIRMED}-in-memory
+     * target only writes the columns THIS transaction actually dirtied — e.g. a per-item cancel
+     * and a per-item reschedule of the SAME leg racing each other (both observing the header stay
+     * CONFIRMED because a sibling remains) can no longer clobber each other's disjoint columns
+     * (status vs. starts_at/ends_at). This check's job is therefore narrower than it used to be:
+     * it no longer prevents column-level corruption, it prevents a caller from completing a
+     * transition whose CONFIRMED precondition already lapsed — e.g. a reschedule silently
+     * "succeeding" (new time persisted) on a leg the other racer already declined, which would be
+     * a confusing state even though no column was corrupted. Each caller compares this result and
+     * aborts with a clean 409 on {@code false} rather than let that stale transition through.
+     *
+     * @return {@code true} iff {@code bookingId} exists and is, AS OF THIS CALL, still CONFIRMED
+     */
+    @Query("""
+            SELECT CASE WHEN COUNT(b) > 0 THEN true ELSE false END
+            FROM Booking b
+            WHERE b.id = :bookingId AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    boolean existsConfirmedById(@Param("bookingId") UUID bookingId);
 
     // ── Schedule-override conflict check (2026-07-26 design) ──────────────────
 

@@ -69,6 +69,35 @@ class PublicBookingControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("GET /book/{slug}/info — 404 when the master's SALON was deactivated (salon-active guard)")
+    void should_return404_when_slugInfoRequestedForInactiveMaster() {
+        String slug = "closed-salon-master-gh78";
+        // masters.is_active stays TRUE — only the salon is closed, exactly what deactivateSalon
+        // leaves behind. Before the guard, findBySlug applied NO active filter whatsoever, so this
+        // page kept rendering the master's name, avatar and full service menu with a live CTA.
+        seedSalonMaster(slug, false);
+
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                "/api/v1/book/" + slug + "/info", String.class);
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    @DisplayName("GET /book/{slug}/info — 200 when the master's salon is ACTIVE (guard is not over-broad)")
+    void should_return200_when_slugInfoRequestedForMasterOfActiveSalon() {
+        String slug = "open-salon-master-ij90";
+        seedSalonMaster(slug, true);
+
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                "/api/v1/book/" + slug + "/info", String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("a salon-employed master of an OPEN salon must keep a working booking page")
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
     @DisplayName("V86 partial unique index — rejects a duplicate booking_slug across master types")
     void should_rejectDuplicateSlug_acrossMasterTypes() {
         String slug = "shared-slug-ef56";
@@ -108,6 +137,40 @@ class PublicBookingControllerIT extends AbstractIntegrationTest {
                         + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
                         + "ORDER BY st.name_uk LIMIT 1",
                 UUID.class);
+    }
+
+    /**
+     * Seeds an ACTIVE {@code SALON_MASTER} (with the given slug) employed by a salon whose
+     * {@code is_active} carries {@code salonActive}. Mirrors
+     * {@code MasterService#createMasterFromInvite}, which mints a booking slug for every invited
+     * salon master — which is exactly why a closed salon's staff would otherwise keep live public
+     * booking links.
+     */
+    private void seedSalonMaster(String slug, boolean salonActive) {
+        UUID ownerId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                INSERT INTO users (id, email, password_hash, role, first_name, last_name, is_active, email_verified)
+                VALUES (?, ?, 'x', 'SALON_OWNER', 'Salon', 'Owner', true, true)
+                """, ownerId, "owner-" + System.nanoTime() + "@beautica.test");
+
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at)
+                VALUES (?, ?, 'Test Salon', ?, NOW(), NOW())
+                """, salonId, ownerId, salonActive);
+
+        UUID staffUserId = UUID.randomUUID();
+        jdbcTemplate.update("""
+                INSERT INTO users (id, email, password_hash, role, first_name, last_name,
+                                   avatar_url, bio, is_active, email_verified)
+                VALUES (?, ?, 'x', 'SALON_MASTER', 'Тест', 'Майстер',
+                        'https://cdn.example/a.jpg', 'bio', true, true)
+                """, staffUserId, "staff-" + System.nanoTime() + "@beautica.test");
+
+        jdbcTemplate.update("""
+                INSERT INTO masters (id, user_id, salon_id, master_type, booking_slug, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, 'SALON_MASTER', ?, true, NOW(), NOW())
+                """, UUID.randomUUID(), staffUserId, salonId, slug);
     }
 
     /** Seeds a user + a {@code masters} row with the given slug, type, and active flag; returns the master id. */

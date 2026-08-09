@@ -1,6 +1,7 @@
 package com.beautica.booking.dto;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
@@ -102,12 +103,23 @@ import java.util.UUID;
  * primary via the salon link when the master is salon-employed, else the master's own user
  * row — mirroring {@code SearchService}'s {@code COALESCE(salon, user)} rule.
  *
+ * <p><b>{@code canReview}</b> is TRUE for an unreviewed booking that is either {@code COMPLETED}
+ * or {@code CONFIRMED} with an already-elapsed {@code endsAt} — the STATUS+TIME half is {@link
+ * com.beautica.booking.domain.BookingClosureRule#isReviewEligible}, the single canonical
+ * definition shared with the write-path gate ({@code ReviewService#createReview}) so a client
+ * offered this CTA can never get a 400 from {@code POST /reviews}. Locked product decision: a
+ * booking that entered the client's "Past" tab BY ELAPSED TIME is reviewable even when the
+ * provider never marked it {@code COMPLETED} — see {@code BookingClosureRule#isReviewEligible}'s
+ * javadoc for the full rationale. Computed by the service, never derivable from the entity graph
+ * alone.
+ *
  * <p><b>{@code locationNote} (client mobile phase 14.3 enrichment)</b> is the provider's
  * free-text arrival hint ("3-й поверх, код 1234"). It follows the EXACT SAME salon-vs-
  * independent resolution rule as {@code street}/{@code buildingNo} above — never a second,
- * parallel rule: a salon-employed master surfaces the salon's own {@code locationNote}, an
- * independent master surfaces their own user row's {@code locationNote}. Nullable — most
- * providers never write one.
+ * parallel rule: a booking made AT A SALON surfaces that salon's own {@code locationNote}, a
+ * booking made with an independent master surfaces the master's own user row's
+ * {@code locationNote}. Since phase 242 the salon in question is the BOOKING's snapshot, not the
+ * master's live affiliation. Nullable — most providers never write one.
  *
  * <p><b>Track 25.x — note visibility is MUTUAL, by locked product decision.</b>
  * {@code providerComment} (written by the provider on {@code /decline} or {@code /not-complete})
@@ -134,7 +146,11 @@ import java.util.UUID;
  * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking} — the exact
  * predicate backing {@code @authz.canReviewClient}/{@code enforceCanReviewClient} on
  * {@code POST /client-reviews}, so this can never disagree with what the write endpoint will
- * actually accept; (2) {@code status == COMPLETED}; (3) the booking has a real client (not a
+ * actually accept; (2) {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} —
+ * {@code status == COMPLETED} OR an elapsed-but-unclosed {@code CONFIRMED} booking (mirrors the
+ * client-side {@code canReview} widening and {@code ClientReviewService.create}'s write gate, so
+ * a booking that aged into Past by elapsed time is offered here even before the provider closes
+ * it — see that method's javadoc for the full rationale); (3) the booking has a real client (not a
  * guest/LINK booking); (4) no {@code ClientReview} already exists for this booking. A CLIENT or
  * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
@@ -146,6 +162,61 @@ import java.util.UUID;
  * yet), the CLIENT projection path's viewer is always CLIENT (structurally excluded), and the
  * provider listing was out of scope for the CTA this field backs. See each hardcoding site's own
  * comment before "optimising" this away.
+ *
+ * <p><b>Phase B1 — {@code masterAvgRating}/{@code masterReviewCount}.</b> The master's public
+ * rating aggregate, surfaced so the client's booking-detail and leave-feedback screens can render
+ * the provider's score without a second round-trip to {@code GET /masters/{id}} or
+ * {@code /reviews/summary}. Both are read STRAIGHT OFF the already-loaded master row — the
+ * denormalized {@code masters.avg_rating} / {@code masters.review_count} columns (V4), maintained
+ * on write by {@code ReviewRepository#recalculateMasterRating} under the project's standing
+ * "recalculate on write, read persisted on read" contract. Neither is aggregated at read time, so
+ * neither adds a query, a join, or an N+1 on any path — see {@link #masterAvgRatingOrNull} for the
+ * zero-review normalisation both mapper paths share.
+ *
+ * <p><b>Phase B2 — {@code salonId}.</b> The booking's own {@code salon_id} snapshot, exposed so the
+ * mobile client can invalidate its salon-scoped review caches once a review lands (the salon half of
+ * the master fan-out shipped in mobile {@code 848e8929}). It is deliberately read from
+ * {@code booking.getSalon()} and NOT from {@code master.getSalon()}: {@code ReviewService#createReview}
+ * stamps the review with {@code .salon(booking.getSalon())} and publishes {@code ReviewCreatedEvent}
+ * with that same id, so the booking's snapshot — not the master's current affiliation — is the salon
+ * whose {@code avg_rating}/{@code review_count} actually moved. A {@code master.salon}-derived id
+ * would point at the wrong salon for any booking made before a salon rotation.
+ *
+ * <p><b>Phase 242 — {@code salonId} and the whole address block now share ONE source, and cannot
+ * disagree.</b> B2 originally left {@code salonName} plus the
+ * {@code street}/{@code buildingNo}/{@code locationNote}/{@code cityLabel}/{@code districtLabel}
+ * block resolving off {@code master.getSalon()} — the master's LIVE affiliation — while
+ * {@code salonId} came from the booking. That divergence was a PII leak, not a nuance: after a
+ * master rotates salons, a client opening an OLD booking was served the NEW salon's
+ * {@code locationNote}, which by its own {@code @Schema} contract holds premises-access
+ * information («3-й поверх, код 1234») for a salon the client has never booked at. Both mapper
+ * paths now resolve the entire block from {@code booking.getSalon()} ({@link #from} below, and the
+ * projection's {@code LEFT JOIN b.salon s}), so {@code salonId != null} and
+ * {@code salonName != null} are now the same predicate.
+ *
+ * <p><b>Scope of that fix — it closed the SALON branch of the ternary only (phase-242 audit,
+ * finding 5).</b> Do not read the paragraph above as "the divergence is gone" outright; the same
+ * defect class still exists on the OTHER half. When {@code booking.getSalon()} is {@code null} —
+ * an independent-master booking — both mapper paths fall through to the master's LIVE {@code users}
+ * row ({@link #from}'s {@code masterUser.getStreet()} / {@code getBuildingNo()} /
+ * {@code getLocationNote()}, and the projection's {@code ELSE mu.X}). A solo master who moves house
+ * therefore serves their NEW street and NEW door code on every OLD booking, exactly as a rotating
+ * salon master used to. There is no per-booking address snapshot for that case to read instead:
+ * {@code bookings} carries {@code salon_id} but no denormalised address columns, so closing it
+ * would need a schema change and a product decision about what an old booking should show. It is
+ * pre-existing, was NOT in scope of phase 242, and is recorded here rather than silently implied to
+ * be handled. If you are auditing this DTO for the rotation leak, this is the residual.
+ * <p><b>What did NOT change, and must not:</b> the salon-vs-independent precedence is still a
+ * strict {@code salon != null ? salon.getX() : masterUser.getX()} ternary (and its
+ * {@code CASE WHEN s.id IS NOT NULL} twin in the projection) — never {@code COALESCE(s.X, mu.X)}.
+ * {@code COALESCE} falls through to the master's PERSONAL row whenever the salon's own column is
+ * {@code NULL}, which is the HIGH regression this block already guards against (see
+ * {@code ClientBookingDetailProjection}'s javadoc). Phase 242 changed only WHICH salon the
+ * predicate keys off, never the predicate. A booking made at a salon always carries a non-null
+ * {@code bookings.salon_id} (the column has existed since {@code V18__create_bookings.sql:8}, and
+ * every write site stamps it at creation), so the fallthrough to the master's own row fires
+ * exactly when the visit genuinely was at the master's own address — an independent-master
+ * booking, including one made before the master later joined a salon.
  */
 public record BookingDetailResponse(
         UUID id,
@@ -202,16 +273,19 @@ public record BookingDetailResponse(
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "The provider's free-text arrival hint (e.g. \"3-й поверх, код "
                         + "1234\", \"вхід з двору, дзвонити двічі\"). Resolved by the identical "
-                        + "salon-vs-independent rule as street/buildingNo: a salon booking "
-                        + "surfaces the salon's own note, an independent master surfaces their "
-                        + "own note. Nullable — most providers never set one.")
+                        + "salon-vs-independent rule as street/buildingNo, against the salon THIS "
+                        + "BOOKING was made at (bookings.salon_id): a salon booking surfaces that "
+                        + "salon's own note — never the master's current salon's, should the "
+                        + "master have moved since — and an independent-master booking surfaces "
+                        + "the master's own note. Nullable — most providers never set one.")
         String locationNote,
         String categoryName,
         boolean canReview,
         @Schema(description = "TRUE only for the CURRENT authenticated viewer, and only on "
                 + "GET /bookings/{id}: the viewer has provider review-authority over this "
-                + "booking, its status is COMPLETED, it has a real (non-guest) client, and no "
-                + "ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
+                + "booking, the booking is COMPLETED or an elapsed-but-unclosed CONFIRMED "
+                + "booking (BookingClosureRule#isReviewEligible), it has a real (non-guest) "
+                + "client, and no ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
                 + "unauthorized provider, or any row served by GET /bookings/me (both the "
                 + "CLIENT and provider listing paths hardcode false — see "
                 + "BookingDetailResponse's class javadoc). Gates the \"Залишити відгук про "
@@ -248,17 +322,116 @@ public record BookingDetailResponse(
                         + "every row of GET /bookings/me, for a provider and for the client "
                         + "themselves alike; a client reading their own booking sees their own "
                         + "photo. Safe to cache by booking id across both endpoints.")
-        String clientAvatarUrl
+        String clientAvatarUrl,
+        @Schema(description = "Derived, read-time-only (Phase 29.1/29.2) — TRUE when this "
+                + "booking's status is still CONFIRMED but its endsAt has already elapsed: no "
+                + "scheduled job ever transitions such a booking to a terminal state, so this "
+                + "flags the ones the provider still needs to close via /complete, "
+                + "/not-complete or /decline. NEVER persisted, NEVER cached — recomputed on "
+                + "every read from (status, endsAt, the current instant). NOT orthogonal to "
+                + "canReview since the review-eligibility widening: an elapsed-but-unclosed "
+                + "CONFIRMED booking reads TRUE here AND (when it has a registered client and no "
+                + "existing review) TRUE for canReview too — closure-awaiting and review-eligible "
+                + "now deliberately overlap for exactly this row shape, by locked product "
+                + "decision (a booking that entered the client's Past tab by elapsed time is "
+                + "reviewable even before the provider closes it — see BookingClosureRule#"
+                + "isReviewEligible). The same for every row of GET /bookings/me and for GET "
+                + "/bookings/{id} — a pure function of the booking, not of the viewer.")
+        boolean awaitingClosure,
+        // Phase B1. Appended LAST for the same reason as priceMaxAtBooking / appointmentId /
+        // clientAvatarUrl above (see their comments): a pure append shifts no existing positional
+        // argument at any of the three construction sites, and the pair sits behind a boolean with
+        // two mutually distinct types (BigDecimal, Integer), so no reordering slip can survive
+        // compilation.
+        @Schema(types = {"number", "null"}, nullable = true,
+                description = "The master's public average rating, 1.00-5.00, read off the "
+                        + "denormalized masters.avg_rating column — the SAME value served by GET "
+                        + "/masters/{id} and GET /masters/{id}/reviews/summary, never independently "
+                        + "re-aggregated. Agreement across those three endpoints is exact, not "
+                        + "eventual: GET /masters/{id} is served from the 5-minute 'master-detail' "
+                        + "cache, and ReviewEventListener#onReviewCreated evicts that entry by "
+                        + "masterId once the rating recalculation commits, so a client that leaves "
+                        + "a review sees the new average on the booking AND on the profile on the "
+                        + "very next request. NULL when masterReviewCount is 0: the column stores "
+                        + "0.00 for an unreviewed master (V4 NOT NULL DEFAULT 0.00, and "
+                        + "recalculateMasterRating's COALESCE(AVG(...), 0)), which is a storage "
+                        + "artefact, not a rating — rendering it would show a brand-new master a "
+                        + "damning zero stars. Render the 'no reviews yet' state when null; never "
+                        + "substitute 0.")
+        BigDecimal masterAvgRating,
+        @Schema(types = {"integer", "null"}, nullable = true,
+                description = "How many reviews the master's average is computed from. 0 for an "
+                        + "unreviewed master (a true fact, unlike a 0.00 average) and non-null on "
+                        + "every path that serves this DTO today; typed nullable so a client "
+                        + "treats an absent value as 'unknown' rather than 'zero reviews'.")
+        Integer masterReviewCount,
+        // Phase B2. Appended LAST for the same reason as every field above it. NOTE the type
+        // adjacency: this UUID follows an Integer and a BigDecimal, so a transposition with either
+        // fails to compile — but if a future field of type UUID is appended alongside it, that
+        // protection lapses and the pair must be checked by hand.
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "The salon this booking was made AT, as snapshotted on the booking "
+                        + "row (bookings.salon_id). NULL for an INDEPENDENT_MASTER booking. Exists "
+                        + "so a client can invalidate its own salon-scoped caches after leaving a "
+                        + "review: ReviewService#createReview stamps the review with "
+                        + "booking.getSalon() and ReviewEventListener recalculates THAT salon's "
+                        + "avg_rating/review_count, so this is the id whose aggregates moved. As "
+                        + "of phase 242 salonName and the street/buildingNo/locationNote/cityLabel/"
+                        + "districtLabel block are resolved from this SAME booking snapshot, so "
+                        + "salonId != null and salonName != null are one predicate and the id "
+                        + "always identifies the premises whose address is displayed alongside it. "
+                        + "(Before 242 the address block came from the master's LIVE salon and the "
+                        + "two could disagree after a rotation — that divergence is gone.)")
+        UUID salonId
 ) {
 
     /**
+     * The single zero-review normalisation for {@code masterAvgRating}, shared verbatim by BOTH
+     * mapper paths (the entity {@link #from} below and {@code BookingService#toDetailResponse}'s
+     * CLIENT projection path) so the two independently maintained mappers cannot compute this
+     * field differently — the exact divergence class {@code BookingDetailContractIT}'s reflective
+     * parity loop exists to catch, and which once leaked a master's personal {@code locationNote}.
+     *
+     * <p>The rule mirrors {@code ReviewService#getMasterReviewSummary}'s
+     * {@code master.getReviewCount() == 0 ? null : master.getAvgRating()} exactly, so a client
+     * reading a master's rating on a booking and on {@code /reviews/summary} can never see two
+     * different values.
+     *
+     * <p>Phase 240 audit (Findings 2/3): the master-side response DTOs call this same method
+     * rather than re-implementing the branch — {@link com.beautica.master.dto.MasterDetailResponse},
+     * {@link com.beautica.master.dto.MasterSummaryResponse} and {@link BookableMasterResponse} all
+     * used to emit the raw stored {@code 0.00}, so an unreviewed master rendered "no reviews yet"
+     * on a booking and a phantom "0.0 stars" on their own profile. One method, one branch, every
+     * master-rating surface. Not moved to {@code common/} because the projection path needs the
+     * {@code (int, BigDecimal)} primitive form, which is what this signature already is.
+     *
+     * <p>It is needed because {@code masters.avg_rating} is {@code NOT NULL DEFAULT
+     * 0.00} (V4) and {@code recalculateMasterRating} writes {@code COALESCE(AVG(...), 0)} — so an
+     * unreviewed master stores a literal {@code 0.00} that must NOT reach the wire as a rating.
+     *
+     * <p>Deliberately NOT expressed as a JPQL {@code CASE WHEN} inside the projection query: the
+     * projection selects the raw column pair and normalises here, in Java, so both paths run the
+     * same branch rather than a JPQL copy and a Java copy that can drift apart.
+     *
+     * @param reviewCount the master's persisted {@code review_count}
+     * @param storedAvgRating the master's persisted {@code avg_rating} (never null in the DB)
+     * @return {@code null} when the master has no reviews, else the stored average
+     */
+    public static BigDecimal masterAvgRatingOrNull(int reviewCount, BigDecimal storedAvgRating) {
+        return reviewCount == 0 ? null : storedAvgRating;
+    }
+
+    /**
      * Builds the enriched detail view for the single-entity path. The caller (the service)
-     * must supply {@code canReview} (the COMPLETED + no-existing-review predicate),
+     * must supply {@code canReview} (see this class's javadoc for the full predicate),
      * {@code providerCanReviewClient} (the viewer-aware provider-side mirror — see this class's
      * javadoc), and the resolved discovery locality labels — none of the three is derivable from
-     * the entity graph alone.
+     * the entity graph alone. {@code now} is the request-scoped absolute instant (Phase 29.2)
+     * threaded down to {@link com.beautica.booking.domain.BookingClosureRule#isAwaitingClosure} —
+     * an already-resolved {@code clock.instant()}, never re-derived here and never {@link
+     * java.time.OffsetDateTime#now()}.
      *
-     * <p>The caller MUST have hydrated the full graph (client, master.user, master.salon,
+     * <p>The caller MUST have hydrated the full graph (client, master.user, <b>booking.salon</b>,
      * masterService.serviceDefinition) — e.g. via {@code BookingRepository.findByIdWithFullGraph}
      * or {@code findAllByIdsWithGraph}, both of which carry
      * {@code JOIN FETCH b.masterService ms JOIN FETCH ms.serviceDefinition} — so the field reads
@@ -269,20 +442,30 @@ public record BookingDetailResponse(
      * requirement — since V119 it is a frozen column on the booking row itself, not a walk into
      * the current service definition.
      *
-     * <p>The master's discovery address (salon vs own-user) is resolved by the salon-primary
-     * rule: a salon-employed master surfaces the salon's name + street/building; an independent
-     * master surfaces no salon name and the master's own street/building.
+     * <p>The discovery address (salon vs own-user) is resolved by the salon-primary rule against
+     * the BOOKING's own salon snapshot (phase 242): a booking made at a salon surfaces that
+     * salon's name + street/building/note; an independent-master booking surfaces no salon name
+     * and the master's own street/building/note. {@code booking.salon} — not {@code master.salon}
+     * — is therefore the association the fetch graph must carry, and both graph queries above were
+     * re-pointed to {@code LEFT JOIN FETCH b.salon} in the same change: these are real property
+     * reads ({@code getName()}, {@code getStreet()}, {@code getLocationNote()}) that INITIALISE
+     * the proxy, unlike the identifier-only read {@code salonId} used to be.
      */
     public static BookingDetailResponse from(
             Booking booking,
             boolean canReview,
             boolean providerCanReviewClient,
             String cityLabel,
-            String districtLabel
+            String districtLabel,
+            OffsetDateTime now
     ) {
         Master master = booking.getMaster();
         User masterUser = master.getUser();
-        Salon salon = master.getSalon();
+        // Phase 242 — the BOOKING's own salon snapshot (bookings.salon_id), NEVER
+        // master.getSalon() (the master's LIVE affiliation). See this class's javadoc: after a
+        // salon rotation the master's current salon is a different premises the client never
+        // booked at, and its locationNote is by contract a door code.
+        Salon salon = booking.getSalon();
         User client = booking.getClient();
 
         String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
@@ -335,7 +518,22 @@ public record BookingDetailResponse(
                 // findAllByIdsWithGraph, both of which already LEFT JOIN FETCH b.client for the
                 // name reads above, so avatarUrl is a scalar off an already-materialised User row
                 // — no extra statement, no widening of either fetch graph.
-                client != null ? client.getAvatarUrl() : null
+                client != null ? client.getAvatarUrl() : null,
+                BookingClosureRule.isAwaitingClosure(booking.getStatus(), booking.getEndsAt(), now),
+                // Phase B1 — both are scalars off the SAME `master` row already materialised above
+                // for master.getId()/getUser()/getSalon(). Every caller of this factory hydrates the
+                // booking through findByIdWithFullGraph / findAllByIdsWithGraph, both of which carry
+                // `JOIN FETCH b.master m`, so these two reads add no statement and require no
+                // widening of either fetch graph. They are denormalized columns (V4), NOT a live
+                // aggregate — do not "fix" this into a count/avg query.
+                masterAvgRatingOrNull(master.getReviewCount(), master.getAvgRating()),
+                master.getReviewCount(),
+                // Phase B2 introduced this field off `booking.getSalon()` while `salon` above was
+                // still `master.getSalon()`; phase 242 re-pointed the whole address block onto the
+                // same booking snapshot, so this is now simply the id of the `salon` local. Kept as
+                // its own expression rather than folded into `salon` only because the null-guard
+                // reads clearer here; the two can no longer disagree.
+                salon != null ? salon.getId() : null
         );
     }
 }

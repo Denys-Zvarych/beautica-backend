@@ -5,6 +5,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.PageResponse;
+import com.beautica.common.RatingBucket;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.review.dto.CreateReviewRequest;
@@ -410,8 +411,8 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         assertThat(summary.ratingDistribution())
                 .as("distribution must always contain exactly 5 buckets (5-star down to 1-star), "
                         + "zero-filled for ratings with no reviews")
-                .extracting(SalonReviewSummaryResponse.RatingBucket::rating,
-                        SalonReviewSummaryResponse.RatingBucket::count)
+                .extracting(RatingBucket::rating,
+                        RatingBucket::count)
                 .containsExactly(
                         tuple(5, 1L),
                         tuple(4, 0L),

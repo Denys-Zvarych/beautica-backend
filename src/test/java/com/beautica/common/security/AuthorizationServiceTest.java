@@ -34,9 +34,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -1596,8 +1598,26 @@ class AuthorizationServiceTest {
                 .isInstanceOf(ForbiddenException.class);
     }
 
+    /**
+     * Phase-242 audit, finding 1 (MEDIUM) — the owning client is admitted WITHOUT the salon walk.
+     *
+     * <p>{@code isAuthorizedToManageBooking} reads {@code master.getSalon().getOwner()}, and
+     * {@code getOwner()} is a PROPERTY read that INITIALISES the {@code Salon} proxy. Since phase
+     * 242 stopped fetch-joining {@code m.salon}, running it ahead of the role branches charged the
+     * owning CLIENT — the highest-volume viewer of {@code GET /bookings/{id}} and
+     * {@code GET /appointments/{id}} — a standalone {@code SELECT ... FROM salons} for the
+     * master's LIVE salon on any booking whose master has since rotated. The client fast path now
+     * runs first.
+     *
+     * <p>The {@code verifyNoInteractions(salon)} below is the gate, not decoration: the salon and
+     * master mocks are wired {@code lenient()} precisely so a regression that reinstates the
+     * manage-check-first ordering finds them ready to answer, and is caught by the verification
+     * rather than by an unrelated NPE. Deleting them would make this test unable to notice.
+     */
     @Test
-    @DisplayName("enforceCanViewBooking does not throw when correct client views their own booking")
+    @DisplayName("enforceCanViewBooking does not throw when correct client views their own booking, "
+            + "and settles it without touching master/salon at all — no proxy-initialising "
+            + "getSalon().getOwner() walk on the highest-volume viewer path")
     void should_notThrow_when_enforceCanViewBookingCalledWithCorrectClient() {
         UUID actorId = UUID.randomUUID();
 
@@ -1605,17 +1625,17 @@ class AuthorizationServiceTest {
         when(client.getId()).thenReturn(actorId);
 
         User salonOwner = mock(User.class);
-        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(salonOwner.getId()).thenReturn(UUID.randomUUID());
 
         Salon salon = mock(Salon.class);
-        when(salon.getOwner()).thenReturn(salonOwner);
+        lenient().when(salon.getOwner()).thenReturn(salonOwner);
 
         Master master = mock(Master.class);
-        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
-        when(master.getSalon()).thenReturn(salon);
+        lenient().when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        lenient().when(master.getSalon()).thenReturn(salon);
 
         Booking booking = mock(Booking.class);
-        when(booking.getMaster()).thenReturn(master);
+        lenient().when(booking.getMaster()).thenReturn(master);
         when(booking.getClient()).thenReturn(client);
 
         // Populate SecurityContext with CLIENT role for the correct client
@@ -1623,6 +1643,71 @@ class AuthorizationServiceTest {
 
         assertThatCode(() -> authorizationService.enforceCanViewBooking(actorId, booking))
                 .doesNotThrowAnyException();
+
+        verifyNoInteractions(salon, salonOwner);
+        verify(booking, never()).getMaster();
+    }
+
+    /**
+     * Phase-242 QA audit, finding 2 — the client fast path's ROLE conjunct is load-bearing on its
+     * own, and nothing pinned it.
+     *
+     * <p>The audit-fix batch hoisted the client probe above
+     * {@code isAuthorizedToManageBooking} and rests its "reordering cannot change any
+     * authorization decision" argument entirely on the conjunct that survives:
+     * <em>"a viewer who happens to sit in {@code bookings.client_id} but does not carry
+     * {@code ROLE_CLIENT} is still not admitted by this branch"</em>. That claim had no test.
+     * Deleting {@code && roleFromCurrentAuthentication() == Role.CLIENT} left the whole
+     * {@code com.beautica.common.security} scope green, silently degrading a role-gated probe into
+     * a bare id comparison — i.e. turning {@code bookings.client_id} into a standalone capability
+     * that no longer cares what the presented token says.
+     *
+     * <p>The fixture is an ordinary account shape, not a contrived one: a provider who also books
+     * services as a customer has their own user id sitting in {@code bookings.client_id} on those
+     * rows, while their JWT carries {@code ROLE_SALON_MASTER}. The established contract (unchanged
+     * by phase 242 — the pre-reorder code gated the same branch on {@code actorRole == CLIENT}) is
+     * that such an actor is NOT admitted here and must earn access through the manage /
+     * {@code SALON_MASTER} predicates below, which in this fixture also deny them.
+     */
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException when the actor's id sits in "
+            + "bookings.client_id but their token carries ROLE_SALON_MASTER — the client fast path "
+            + "admits on id AND role, never on the id match alone")
+    void should_throwForbidden_when_actorIsTheBookingsClientButAuthenticatedAsSalonMaster() {
+        UUID actorId = UUID.randomUUID();
+
+        // The actor IS bookings.client_id — the id half of the fast path matches.
+        User client = mock(User.class);
+        when(client.getId()).thenReturn(actorId);
+
+        // ...but the booking belongs to a salon they neither own nor are the assigned master of,
+        // so neither predicate below the fast path can rescue them either.
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        User assignedMasterUser = mock(User.class);
+        when(assignedMasterUser.getId()).thenReturn(UUID.randomUUID());
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        when(master.getUser()).thenReturn(assignedMasterUser);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getClient()).thenReturn(client);
+        when(booking.getMaster()).thenReturn(master);
+
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(actorId, booking))
+                .as("the client branch must not admit on the id match alone — dropping its role "
+                        + "conjunct makes bookings.client_id a capability in its own right, "
+                        + "independent of the role the presented token actually carries")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
     }
 
     @Test

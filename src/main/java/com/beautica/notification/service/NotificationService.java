@@ -246,6 +246,37 @@ public class NotificationService {
         );
     }
 
+    /**
+     * Notifies the PROVIDER (master / salon-admin) — never the client — that an elapsed {@code
+     * CONFIRMED} booking is still awaiting closure (Phase 29.5/29.6). This is a work-queue nudge,
+     * not a status change: dispatched purely from the {@code CLOSURE_REMINDER} outbox row a
+     * separate, already-committed native claim wrote — this method (and everything it calls)
+     * must never read or write {@code booking.status}, never call {@link
+     * #notifyReviewRequested(Booking)}, and never call {@code
+     * BookingService#computeProviderCanReviewClient} — see {@code ClosureReminderArchitectureTest}.
+     *
+     * <p>A guest (LINK) booking still has a real master to nudge (guests only lack a client
+     * account — see {@link #notifyNewBooking(Booking)}), so unlike the client-facing notify
+     * methods above, there is no {@code booking.getClient() == null} guard to skip: the recipient
+     * here never depends on the client existing. {@link #resolveClientName(Booking)} already
+     * handles the guest case for the copy that names the client in the reminder.
+     */
+    public void notifyClosureReminder(Booking booking) {
+        String masterEmail = booking.getMaster().getUser().getEmail();
+        UUID masterUserId = booking.getMaster().getUser().getId();
+        String clientName = resolveClientName(booking);
+        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
+        String bookingId = booking.getId().toString();
+
+        emailService.sendClosureReminderEmail(masterEmail, booking, buildBookingUrl(bookingId));
+        pushService.sendToUser(
+                masterUserId,
+                "Позначте візит",
+                truncate("Візит з " + clientName + " на " + serviceName + " завершився — закрийте його"),
+                Map.of("type", "CLOSURE_REMINDER", "bookingId", bookingId)
+        );
+    }
+
     public void notifyClientCancelled(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
         UUID masterUserId = booking.getMaster().getUser().getId();
@@ -288,6 +319,19 @@ public class NotificationService {
                     "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
         }
         return frontendBaseUrl + "/bookings/" + bookingId + "/review";
+    }
+
+    /**
+     * Builds the booking-detail deep link for the closure-reminder email's CTA (Phase 29.5) —
+     * {@code {FRONTEND_BASE_URL}/bookings/{id}}, mirroring {@link #buildReviewUrl(String)}'s
+     * scheme guard. Mobile phase 230 handles the app-side routing for this link.
+     */
+    private String buildBookingUrl(String bookingId) {
+        if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
+            throw new IllegalStateException(
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+        }
+        return frontendBaseUrl + "/bookings/" + bookingId;
     }
 
     /**

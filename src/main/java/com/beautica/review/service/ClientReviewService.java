@@ -1,7 +1,7 @@
 package com.beautica.review.service;
 
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
-import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
@@ -18,6 +18,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.UUID;
 
 /**
@@ -26,6 +29,11 @@ import java.util.UUID;
  * ReviewService#createReview}'s validation order and after-commit rating-recalculation pattern,
  * swapping the authority direction: here the actor is the PROVIDER (with authority over the
  * booking) and the subject is the CLIENT.
+ *
+ * <p>The STATUS+TIME eligibility gate mirrors {@code ReviewService#createReview} exactly — the
+ * client-review path had the identical "Past-tab-by-elapsed-time but never COMPLETED" bug (see
+ * {@link BookingClosureRule#isReviewEligible}'s javadoc), fixed here by reusing the same
+ * canonical predicate rather than re-deriving {@code status == COMPLETED}.
  */
 @Service
 @RequiredArgsConstructor
@@ -35,6 +43,19 @@ public class ClientReviewService {
     private final BookingRepository bookingRepository;
     private final AuthorizationService authz;
     private final ApplicationEventPublisher eventPublisher;
+    private final Clock clock;
+
+    /**
+     * Absolute-instant "now" for {@link BookingClosureRule#isReviewEligible} — {@link
+     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, the SAME idiom {@code
+     * BookingService#resolveNow} / {@code ReviewService#resolveNow} / {@code
+     * AppointmentService#resolveNow} use for the identical purpose (Anti-Bug §G: never {@code
+     * Instant.now()} / {@code OffsetDateTime.now()} directly, and never a second, divergent clock
+     * idiom for the same rule).
+     */
+    private OffsetDateTime resolveNow() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+    }
 
     @Transactional
     public ClientReviewResponse create(UUID actorUserId, CreateClientReviewRequest request) {
@@ -50,10 +71,14 @@ public class ClientReviewService {
         // non-trivial shape decline/complete/reschedule already share via enforceCan*).
         authz.enforceCanReviewClient(actorUserId, booking);
 
-        // 3. 400 if the booking is not COMPLETED.
-        if (booking.getStatus() != BookingStatus.COMPLETED) {
+        // 3. 400 if the booking is neither COMPLETED nor an elapsed-but-unclosed CONFIRMED
+        // booking — locked product decision, same as ReviewService#createReview: a booking that
+        // aged into "Past" by elapsed time must be reviewable even when the provider never
+        // closed it out (see BookingClosureRule#isReviewEligible's javadoc). NOT_COMPLETED /
+        // CANCELLED / DECLINED stay unreviewable regardless of endsAt.
+        if (!BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), resolveNow())) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "A client can only be reviewed for a completed booking");
+                    "This booking is not yet eligible for a review");
         }
 
         // 4. 400 if the booking has no client (guest/LINK booking, V89 chk_bookings_guest_fields)

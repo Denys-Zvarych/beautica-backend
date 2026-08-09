@@ -893,7 +893,8 @@ class ServiceCatalogServiceTest {
                 "від 333.33 до 444.44 ₴",
                 UUID.randomUUID(),
                 "Манікюр",
-                "manicure"
+                "manicure",
+                null
         );
 
         MasterServiceResponse masked = MasterServiceResponse.fromPublic(full);

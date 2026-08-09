@@ -3,19 +3,24 @@ package com.beautica.booking;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.TimeZones;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -199,6 +204,91 @@ public class BookingTestFixtures {
                         + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
                 masterId, masterUserId, salonId);
         return new SalonFixture(salonId, ownerEmail, masterId, masterEmail);
+    }
+
+    // ── visit (appointment) fixtures ─────────────────────────────────────────
+    //
+    // Extracted here per the Q4 "extraction overdue" threshold: AppointmentReviewIT and
+    // AppointmentTransitionIT each carried a byte-identical addWorkingHoursForEveryDay plus a
+    // near-identical "create master + client + N services + post POST /appointments" block that
+    // differed only in the generated email prefix, the service count, and how many of the
+    // resulting ids each suite happened to keep. The record below is the UNION of the two local
+    // {@code Visit} records, so both call sites read the accessors they already used.
+    //
+    // NOT moved: each suite's own assertion/inspection helpers (childIdsOf, itemStatus,
+    // postVisitRaw, patchServiceDecline, …) — those are genuinely suite-specific and force-merging
+    // them would couple two unrelated test surfaces.
+
+    private static final String APPOINTMENTS_URL = "/api/v1/appointments";
+
+    /**
+     * A created CONFIRMED visit plus every id/token either caller needs to drive and inspect it —
+     * the union of the two local {@code Visit} records this replaces.
+     */
+    public record VisitFixture(UUID id, String clientToken, UUID clientId, UUID masterId, String masterToken) {}
+
+    /**
+     * Creates an INDEPENDENT_MASTER + CLIENT and posts a CONFIRMED visit of {@code serviceCount}
+     * chained services through the REAL {@code POST /appointments} endpoint — the one the mobile app
+     * uses for EVERY booking. {@code serviceCount == 1} is deliberately supported and is the
+     * dominant production shape: {@code CreateAppointmentRequest.masterServiceIds} is
+     * {@code @NotEmpty}, not {@code size > 1}, so a single-service booking still gets a full
+     * Appointment header with {@code bookings.appointment_id} set.
+     *
+     * @param emailPrefix per-suite, per-test discriminator woven into the generated emails (e.g.
+     *                    {@code "appt-rev-sibling"}) so concurrent suites never collide on the
+     *                    users unique index
+     */
+    public VisitFixture createConfirmedVisit(String emailPrefix, int serviceCount) throws Exception {
+        String masterEmail = emailPrefix + "-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createIndependentMaster(masterEmail);
+        String clientEmail = emailPrefix + "-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = createUser(clientEmail, "CLIENT", null);
+        List<UUID> serviceIds = new ArrayList<>(serviceCount);
+        for (int i = 0; i < serviceCount; i++) {
+            serviceIds.add(createIndependentMasterService(masterId));
+        }
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = tokenFor(clientEmail);
+        String masterToken = tokenFor(masterEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        // Body via ObjectMapper (§Q16) rather than string concatenation, so a fixture value can
+        // never silently corrupt the JSON.
+        String body = objectMapper.writeValueAsString(Map.of(
+                "masterId", masterId.toString(),
+                "masterServiceIds", serviceIds.stream().map(UUID::toString).toList(),
+                "startsAt", startsAt.toOffsetDateTime().toString()));
+        HttpHeaders headers = bearerHeaders(clientToken);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> created = restTemplate.exchange(
+                APPOINTMENTS_URL, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        assertThat(created.getStatusCode())
+                .as("visit setup must succeed — body: %s", created.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        JsonNode data = objectMapper.readTree(created.getBody()).path("data");
+
+        return new VisitFixture(
+                UUID.fromString(data.path("id").asText()), clientToken, clientId, masterId, masterToken);
+    }
+
+    /**
+     * Open-ended weekly schedule with all seven ISO weekdays 08:00–20:00 so a near-future visit can
+     * be booked on any day.
+     */
+    public void addWorkingHoursForEveryDay(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to) "
+                        + "VALUES (?, ?, DATE '2020-01-01', NULL)",
+                scheduleId, masterId);
+        for (int day = 1; day <= 7; day++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                            + "VALUES (?, ?, ?, '08:00', '20:00')",
+                    UUID.randomUUID(), scheduleId, day);
+        }
     }
 
     UUID createSalonService(UUID salonId, UUID masterId) {

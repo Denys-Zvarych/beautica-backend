@@ -1,6 +1,7 @@
 package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.entity.Appointment;
@@ -19,7 +20,6 @@ import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
-import com.beautica.review.repository.ReviewRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
@@ -61,7 +61,10 @@ import java.util.UUID;
  *       client-then-master order that keeps the two lock classes deadlock-free;</li>
  *   <li>client-conflict check over the WHOLE visit span {@code [firstStart, lastEnd)};</li>
  *   <li>ONE span overlap check against existing CONFIRMED bookings over {@code [firstStart, lastEnd)}
- *       (internal items are contiguous by construction, so their union equals the span; the
+ *       (AT CREATE TIME internal items are contiguous by construction, so their union equals the span — true
+     *       only at the moment of creation; a later per-item reschedule (phase 30.1) may separate
+     *       items with legal gaps, a read/mutation-time concern this create-time check never
+     *       observes; the
  *       {@code no_overlapping_bookings} GIST EXCLUDE still backstops each insert);</li>
  *   <li>persist the appointment + all N bookings atomically;</li>
  *   <li>enqueue EXACTLY ONE new-visit notification (referencing the first item, never one per
@@ -80,7 +83,6 @@ public class AppointmentService {
     private final BookingRepository bookingRepository;
     private final MasterRepository masterRepository;
     private final UserRepository userRepository;
-    private final ReviewRepository reviewRepository;
     private final NotificationOutboxService outboxService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -159,8 +161,8 @@ public class AppointmentService {
     }
 
     /**
-     * Resolves the district-primary discovery locality labels (salon when salon-employed, else the
-     * master's own user row — the same {@code COALESCE(salon, user)} rule {@code BookingService} and
+     * Resolves the district-primary discovery locality labels (the BOOKED salon when the visit was
+     * made at one, else the master's own user row — the same rule {@code BookingService} and
      * {@code SearchService} use) and builds the enriched {@link AppointmentDetailResponse}. The
      * street/building/locationNote resolution and the header-note reads live inside
      * {@link AppointmentDetailResponse#from}; only the FK→label lookup is not derivable from the
@@ -168,11 +170,15 @@ public class AppointmentService {
      *
      * <p>Package-private (not {@code private}) so {@code AppointmentTransitionService.rescheduleAppointment}
      * (BE-4) can reuse it verbatim to build the re-planned visit's response, instead of
-     * duplicating the discovery-label lookup + {@code canReview} computation a second time.
+     * duplicating the discovery-label lookup a second time.
      */
     AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
         Master master = items.get(0).getMaster();
-        Salon salon = master.getSalon();
+        // Phase 242 — the visit's own salon snapshot, the SAME source
+        // AppointmentDetailResponse#from resolves street/buildingNo/locationNote from. These ids
+        // feed cityLabel/districtLabel; splitting them off master.getSalon() would pair the booked
+        // salon's street with the master's current salon's city after a rotation.
+        Salon salon = items.get(0).getSalon();
         User masterUser = master.getUser();
         UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
         UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
@@ -182,26 +188,24 @@ public class AppointmentService {
                 districtId == null ? List.of() : List.of(districtId));
 
         return AppointmentDetailResponse.from(
-                appointment, items, computeCanReview(appointment),
-                labels.cityLabel(cityId), labels.districtLabel(districtId));
-    }
-
-    /**
-     * The visit-level {@code canReview} gate (BE-6) — mirrors {@code BookingService#canReview}
-     * ({@code hasClient && COMPLETED && !reviewExists}) lifted to the visit: a registered client,
-     * a COMPLETED visit, and no existing visit review. The {@code existsByAppointmentId} probe is
-     * short-circuited to run ONLY for a COMPLETED visit, so the create path (CONFIRMED) never issues
-     * it and always resolves {@code false} — a just-created visit is never reviewable.
-     */
-    private boolean computeCanReview(Appointment appointment) {
-        return appointment.getClient() != null
-                && appointment.getStatus() == BookingStatus.COMPLETED
-                && !reviewRepository.existsByAppointmentId(appointment.getId());
+                appointment, items, labels.cityLabel(cityId), labels.districtLabel(districtId));
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {
+        // SALON-ACTIVE GUARD (2026-08 security re-audit HIGH). This path takes a client-supplied
+        // request.masterId() exactly like BookingService#doCreateBooking, so it needs the identical
+        // gate — a closed salon's master still passes Master::isActive (deactivateSalon does not
+        // cascade), and without this term a caller could create a CONFIRMED multi-service visit
+        // against a salon the owner had closed by replaying the single-service attack one endpoint
+        // over. See MasterBookability for the canonical rule and the full list of enforcing sites.
+        //
+        // Rejection is folded into the same filter chain as the existence check so both surface the
+        // identical "Master not found or inactive" 404 — a distinct message would hand the caller an
+        // oracle separating "no such master" from "that master's salon was closed".
+        //
+        // No extra query: findByIdWithUserAndSalon already LEFT JOIN FETCHes the salon.
         Master master = masterRepository.findByIdWithUserAndSalon(request.masterId())
-                .filter(Master::isActive)
+                .filter(MasterBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
 
         OffsetDateTime firstStart = request.startsAt().toOffsetDateTime();
@@ -248,9 +252,11 @@ public class AppointmentService {
         }
 
         // Overlap against existing CONFIRMED bookings, checked ONCE over the whole visit span. The
-        // chained items are contiguous by construction (assertContiguous: item[i].startsAt ==
-        // item[i-1].endsAt, no gaps), so the union of all per-item intervals is EXACTLY
-        // [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
+        // chained items are contiguous by construction AT CREATE TIME (assertContiguous:
+        // item[i].startsAt == item[i-1].endsAt, no gaps) — assertContiguous is never re-run after
+        // creation, so this holds only for THIS transaction, not for the visit's lifetime; a later
+        // per-item reschedule (phase 30.1) legally separates items with gaps — so the union of all
+        // per-item intervals is EXACTLY [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
         // but holds the contended per-master advisory lock for one round-trip instead of N. The
         // per-row no_overlapping_bookings GIST EXCLUDE remains the authoritative backstop on each
         // insert (see the DataIntegrityViolation→409 mapping below), so an overlapping chain still

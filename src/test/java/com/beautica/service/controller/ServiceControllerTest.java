@@ -16,9 +16,11 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -121,6 +123,21 @@ class ServiceControllerTest {
     @MockBean
     private JwtTokenProvider jwtTokenProvider;
 
+    @MockBean
+    private MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
+
+    /**
+     * Default passthrough stub for every test that does not care about {@code isFavorite}
+     * decoration — the vast majority of the {@code GET /masters/{id}/services} tests below
+     * predate Phase 32.1 and assert on fields the decorator never touches. Individual tests that
+     * DO care about decoration override this stub explicitly.
+     */
+    @BeforeEach
+    void stubFavoriteDecoratorAsPassthrough() {
+        when(masterServiceFavoriteDecorator.decorate(any(), any()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static RequestPostProcessor authenticatedAs(UUID userId, String email, Role role) {
@@ -140,7 +157,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
-                null, null, null);
+                null, null, null, null);
     }
 
     /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
@@ -153,7 +170,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
-                serviceTypeId, serviceTypeNameUk, null);
+                serviceTypeId, serviceTypeNameUk, null, null);
     }
 
     /**
@@ -169,7 +186,7 @@ class ServiceControllerTest {
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
-                serviceTypeId, serviceTypeNameUk, serviceTypeSlug);
+                serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null);
     }
 
     /** Leaf ServiceDefinitionResponse carrying a serviceTypeSlug, for the salon-catalogue read path. */
@@ -381,6 +398,78 @@ class ServiceControllerTest {
                         .param("size", "10")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk());
+    }
+
+    // ── Phase 32.1: isFavorite decoration — the CONTROLLER composes the decorator AFTER the
+    // cached call; here the decorator itself is a mock, so these tests pin only the WIRING
+    // (the controller passes the cached list + Authentication through and returns whatever the
+    // decorator hands back), never the decoration logic itself — that belongs to
+    // MasterServiceFavoriteDecoratorTest. ─────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 anonymous caller: isFavorite stays null on every row "
+            + "(the decorator's own null-for-anonymous behaviour, exercised through the default passthrough stub)")
+    void should_return200WithNullFlags_when_anonymousBrowsesMasterServices() throws Exception {
+        var masterId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(stub);
+        // Relies on the class-wide @BeforeEach passthrough stub — an anonymous caller must see
+        // exactly the cached (all-null) shape the controller received, untouched.
+
+        log.debug("Act: GET /api/v1/masters/{}/services anonymously — isFavorite must be null", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].isFavorite").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 CLIENT caller: the controller returns exactly what "
+            + "the decorator hands back (true/false per row), proving the decorate() call is wired in "
+            + "with the request's Authentication")
+    void should_return200WithFlags_when_clientBrowsesMasterServices() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var rowId = UUID.randomUUID();
+        var cachedStub = List.of(stubMasterServiceResponse(rowId, masterId, "Gel Nails"));
+        var decoratedStub = List.of(cachedStub.get(0).withIsFavorite(true));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(cachedStub);
+        when(masterServiceFavoriteDecorator.decorate(eq(cachedStub), any())).thenReturn(decoratedStub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services as CLIENT — isFavorite must reflect the decorator's output", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].isFavorite").value(true));
+
+        verify(masterServiceFavoriteDecorator).decorate(eq(cachedStub), any());
+    }
+
+    @Test
+    @DisplayName("GET /masters/{id}/services — 200 CLIENT caller, row NOT favourited: the wire carries "
+            + "the literal JSON boolean false, never absent/null — pins the null-vs-false distinction "
+            + "on the DESERIALIZED response body, not just on the Java DTO (a Jackson NON_NULL/coercion "
+            + "bug on this field would collapse false to the same wire shape as null and slip past a "
+            + "Java-object-only assertion)")
+    void should_return200WithFalseFlag_when_clientBrowsesMasterServices_notFavorited() throws Exception {
+        var userId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var rowId = UUID.randomUUID();
+        var cachedStub = List.of(stubMasterServiceResponse(rowId, masterId, "Gel Nails"));
+        var decoratedStub = List.of(cachedStub.get(0).withIsFavorite(false));
+        when(serviceCatalogService.getMasterServices(masterId)).thenReturn(cachedStub);
+        when(masterServiceFavoriteDecorator.decorate(eq(cachedStub), any())).thenReturn(decoratedStub);
+
+        log.debug("Act: GET /api/v1/masters/{}/services as CLIENT who has NOT favourited this row", masterId);
+        mockMvc.perform(get("/api/v1/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "client-nofav@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].isFavorite").value(false))
+                .andExpect(jsonPath("$.data[0].isFavorite").isBoolean());
+
+        verify(masterServiceFavoriteDecorator).decorate(eq(cachedStub), any());
     }
 
     @Test
@@ -1366,7 +1455,7 @@ class ServiceControllerTest {
 
     // ── POST /api/v1/independent-masters/me/services/bulk ──────────────────────
     //
-    // First-time bulk setup, self path. The @WebMvcTest slice pins the HTTP contract:
+    // Additive bulk create, self path. The @WebMvcTest slice pins the HTTP contract:
     // role gate (INDEPENDENT_MASTER), bean-validation of the batch envelope + per-item
     // price mode, and the GlobalExceptionHandler rendering of the service-layer 409.
     // The service-layer behaviour (derivation, all-or-nothing) is covered by
@@ -1402,25 +1491,37 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data[1].id").value(secondId.toString()));
     }
 
+    /**
+     * Negative half of the bulk 409 contract, paired with
+     * {@code should_return409WithDuplicateServiceCode_when_bulkItemDuplicatesExistingService}.
+     * A handler that stamped {@code DUPLICATE_SERVICE} onto every 409 from this route would still
+     * pass the positive test; only this one catches it. The setup screen branches on
+     * {@code data.code}, so a codeless generic conflict must stay codeless.
+     *
+     * <p>This route previously had a second 409 source — a "master already has services"
+     * precondition — which is exactly the ambiguity this test guarded. Bulk create is additive
+     * now, so a generic conflict here is some other BusinessException; the envelope contract it
+     * pins is unchanged.
+     */
     @Test
-    @DisplayName("POST /independent-masters/me/services/bulk — 409 envelope when the master already has active services")
-    void should_return409_when_bulkSetupAndMasterAlreadyHasServices() throws Exception {
+    @DisplayName("POST /independent-masters/me/services/bulk — a generic conflict 409 carries NO data.code")
+    void should_return409WithoutCode_when_bulkConflictIsNotADuplicateService() throws Exception {
         var userId = UUID.randomUUID();
         var request = new BulkCreateServicesRequest(List.of(
                 new BulkServiceItemRequest(UUID.randomUUID(), 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
 
         when(serviceCatalogService.bulkCreateIndependentMasterServices(eq(userId), any()))
-                .thenThrow(new BusinessException(HttpStatus.CONFLICT,
-                        "Bulk setup is only available for a master with no active services"));
+                .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Some other conflict"));
 
-        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk when master already has services — expect 409 envelope");
+        log.debug("Act: POST /api/v1/independent-masters/me/services/bulk when the service raises an unrelated 409");
         mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.success").value(false));
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.data").value(org.hamcrest.Matchers.nullValue()));
     }
 
     @Test
@@ -1783,8 +1884,8 @@ class ServiceControllerTest {
                 .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
                         "Манікюр", existingServiceDefId));
 
-        // The bulk path is the first-time-setup screen; it must get the SAME branchable shape as
-        // the single create, not the 409 envelope used for "master already has services".
+        // The bulk path backs the multi-select add-services screen; a collision there must get the
+        // SAME branchable shape as the single create, never a codeless generic 409 envelope.
         log.debug("Act: POST /api/v1/independent-masters/me/services/bulk with an item the master already offers");
         mockMvc.perform(post("/api/v1/independent-masters/me/services/bulk")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))

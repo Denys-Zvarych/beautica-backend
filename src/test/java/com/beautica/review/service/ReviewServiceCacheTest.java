@@ -3,6 +3,7 @@ package com.beautica.review.service;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.config.CacheConfig;
+import com.beautica.config.ClockConfig;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.dto.ReviewResponse;
@@ -40,8 +41,13 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+// ClockConfig is part of the slice because ReviewService constructor-injects a Clock (the §G
+// review-eligibility instant). It is the real production bean, not a stub: nothing asserted here
+// depends on the value of "now" — the slice only exercises @Cacheable hit/miss behaviour — so a
+// pinned Clock would add a fixture with no assertion behind it. Without this the whole slice fails
+// to start with "Parameter 6 ... required a bean of type 'java.time.Clock'".
 @SpringBootTest(
-        classes = {ReviewService.class, CacheConfig.class},
+        classes = {ReviewService.class, CacheConfig.class, ClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ReviewService — @Cacheable cache-hit behaviour")

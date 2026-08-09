@@ -19,17 +19,25 @@ import java.util.UUID;
 
 /**
  * Resolves and chains the N services of a single-visit booking into contiguous, per-item priced/duration
- * windows — the ONE piece of the visit-create machinery shared verbatim by BOTH the authenticated APP
- * path ({@link AppointmentService}) and the guest LINK path ({@link GuestBookingService}, BE-7).
+ * windows AT CREATE TIME — the ONE piece of the visit-create machinery shared verbatim by BOTH the
+ * authenticated APP path ({@link AppointmentService}) and the guest LINK path
+ * ({@link GuestBookingService}, BE-7). "Contiguous" here scopes ONLY to {@link #planChainedItems} (the
+ * create path, below) — {@link #replanFromNewStart} (the whole-visit reschedule path) never calls
+ * {@link #assertContiguous}, and per-item moves (phase 30.1's relaxed contiguity —
+ * {@code AppointmentTransitionService#rescheduleAppointmentItem}) bypass this class entirely, moving
+ * exactly one child row directly. A visit's items are therefore contiguous only at the moment they are
+ * created; the invariant is NOT re-checked or maintained afterwards.
  *
  * <p>Extracted (BE-7) so the two create paths cannot drift on the parts that MUST stay identical:
  * per-item price/duration freeze (override beats base), the D4 buffer policy (each service's own
  * {@code bufferMinutesAfter} applied after it, so the summed block equals the slot BE-2 offered), the
  * {@link SlotCalculationService#MAX_TOTAL_DURATION_MINUTES} Σ-cap and the
- * {@link SlotCalculationService#MAX_SERVICES_PER_VISIT} list-size guard, and the contiguity invariant.
- * Only the parts that legitimately differ between the two paths — the advisory-lock ordering (APP takes
- * the client lock first, guest takes only the master lock), the idempotency/client-conflict checks (APP
- * only), and the header shape (APP vs LINK) — live in the two callers.
+ * {@link SlotCalculationService#MAX_SERVICES_PER_VISIT} list-size guard, and the CREATE-TIME contiguity
+ * invariant (never relaxed for {@link #planChainedItems} itself — only the visit's post-creation
+ * lifetime, per phase 30.1, allows gaps). Only the parts that legitimately differ between the two paths
+ * — the advisory-lock ordering (APP takes the client lock first, guest takes only the master lock), the
+ * idempotency/client-conflict checks (APP only), and the header shape (APP vs LINK) — live in the two
+ * callers.
  *
  * <p>Deliberately clock-free and lock-free: it performs only the master-scoped service resolution and
  * pure arithmetic. Lead-time / max-window validation ({@code BookingStartsAtValidator}) and all

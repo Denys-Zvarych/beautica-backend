@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>This drives the <i>real</i> filter through {@code doFilterInternal} and asserts only
  * observable HTTP behaviour. The rotate-staff bucket is built internally (like
  * {@code removeAdminBuckets} / {@code salonInviteBuckets}), so this test references no new
- * constructor arg; the 18 positional permissive caches mirror the public 18-{@code @Qualifier}
+ * constructor arg; the 19 positional permissive caches mirror the public 19-{@code @Qualifier}
  * constructor (see {@code SalonInvitePostRateLimitRegressionTest}).
  */
 @DisplayName("AuthRateLimitFilter — PATCH staff-rotation endpoints shared per-IP throttle (Phase 21.3 SEC-fix regression net)")
@@ -66,7 +66,7 @@ class RotateStaffRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
         // constructor. The rotate-staff-PATCH throttle is internal to the filter (built like
         // removeAdminBuckets), so this test references no new constructor arg beyond the count.
         return new AuthRateLimitFilter(
@@ -74,7 +74,7 @@ class RotateStaffRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive());
+                permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest rotateAdmin(UUID salonId, UUID userId) {

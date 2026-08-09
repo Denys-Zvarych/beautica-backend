@@ -1230,6 +1230,111 @@ class SlotCalculationServiceTest {
         verify(timeSlotCalculator, never()).hasAvailableSlot(any(), any(), any(), any(), any(), any(), any());
     }
 
+    // ── salon-active gate on the three slot surfaces (2026-08 re-audit LOW) ──────────────
+    //
+    // SalonService.deactivateSalon does not cascade to masters.is_active, so a closed salon's
+    // master still passes Master::isActive and used to keep advertising slots that the (now
+    // hardened) create paths reject. These pin MasterBookability's salon term on each surface —
+    // a dead-CTA fix; the security boundary is the create paths, tested in BookingServiceTest /
+    // AppointmentServiceTest / MasterRepositoryBookingSlugTest.
+
+    @Test
+    @DisplayName("should return no slots when the master's salon was deactivated, even though the "
+            + "master row itself is still active")
+    void should_returnNoSlots_when_masterSalonIsDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, masterServiceId, false);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+
+        List<AvailableSlotResponse> slots =
+                slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        assertThat(slots)
+                .as("a closed salon's master must not advertise bookable slots")
+                .isEmpty();
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should mark every day not-working when the master's salon was deactivated")
+    void should_markAllDaysNotWorking_when_masterSalonIsDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, masterServiceId, false);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+
+        List<MasterWorkingDayResponse> days = slotCalculationService.getBookableWorkingDays(
+                masterId, date, date, masterServiceId);
+
+        assertThat(days).containsExactly(new MasterWorkingDayResponse(date, false));
+        verify(timeSlotCalculator, never()).hasAvailableSlot(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("hasBookableFutureSlot is false when the master's salon was deactivated (catalogue gate)")
+    void should_returnNotBookable_when_masterSalonIsDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 20);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, UUID.randomUUID(), false);
+
+        boolean bookable = slotCalculationService.hasBookableFutureSlot(msa, from, from.plusDays(30));
+
+        assertThat(bookable)
+                .as("the catalogue/master-list gate must not surface a closed salon's master")
+                .isFalse();
+        // The verdict short-circuits before any schedule or booking load.
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("hasBookableFutureSlot still evaluates a master whose salon is ACTIVE — the salon "
+            + "term must not reject every salon-employed master")
+    void should_stillEvaluate_when_masterSalonIsActive() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 20);
+        LocalDate to = from.plusDays(30);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, UUID.randomUUID(), true);
+
+        when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
+
+        slotCalculationService.hasBookableFutureSlot(msa, from, to);
+
+        // Reaching the schedule resolver at all proves the guard let an OPEN salon's master through
+        // — the assertion that matters, since an over-broad guard would silently empty the catalogue.
+        verify(masterScheduleService).resolveEffectiveRange(masterId, from, to);
+    }
+
+    /** An ACTIVE salon-employed master's active assignment, with the salon's flag parameterised. */
+    private static MasterServiceAssignment assignmentOfSalonMaster(
+            UUID masterId, UUID masterServiceId, boolean salonActive) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        master.setSalon(com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID())
+                .isActive(salonActive)
+                .build());
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(master)
+                .isActive(true)
+                .build();
+    }
+
     @Test
     @DisplayName("should throw NotFound when the serviceId does not belong to the master")
     void should_throwNotFound_when_serviceDoesNotBelongToMaster() {

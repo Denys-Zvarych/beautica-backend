@@ -124,36 +124,55 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("clears the entire search:masters cache after a name change commits for an INDEPENDENT_MASTER — the discovery eviction branch fired")
+    @DisplayName("clears the entire search:masters:browse cache after a name change commits for an INDEPENDENT_MASTER — the discovery eviction branch fired")
     void should_clearSearchMastersCache_when_independentMasterNameChangeCommits() {
         log.debug("Arrange: seed an active INDEPENDENT_MASTER who is searchable in the discovery cache");
         UUID userId = UUID.randomUUID();
         seedIndependentMaster(userId, "search-evict@beautica.test", "Iryna", "Bondarenko", OLD_BIO);
 
         // ── 1. Warm the discovery cache — an unfiltered page-0 search stores one
-        //        entry under the real @Cacheable key in search:masters ──────────────
-        log.debug("Arrange: run an unfiltered discovery search to populate search:masters");
+        //        entry under the real @Cacheable key in search:masters:browse ──────────────
+        log.debug("Arrange: run an unfiltered discovery search to populate search:masters:browse");
         MasterSearchRequest searchRequest =
                 new MasterSearchRequest(null, null, null, null, null, null, null, null, null, null);
         transactionTemplate.execute(status ->
                 searchService.searchMasters(searchRequest, PageRequest.of(0, 20)));
 
-        Cache searchCache = cacheManager.getCache("search:masters");
+        // …and a FREE-TEXT search, which SearchCacheResolver routes to the other half of the
+        // split cache (search:masters:q). A renamed master must disappear from BOTH, so the
+        // eviction has to clear both — warming only the browse half would let a
+        // one-cache-only regression pass.
+        MasterSearchRequest freeTextRequest =
+                new MasterSearchRequest(null, "Bondarenko", null, null, null, null, null, null, null, null);
+        transactionTemplate.execute(status ->
+                searchService.searchMasters(freeTextRequest, PageRequest.of(0, 20)));
+
+        Cache searchCache = cacheManager.getCache("search:masters:browse");
         assertThat(searchCache)
-                .as("the search:masters cache must be registered by the real CacheConfig")
+                .as("the search:masters:browse cache must be registered by the real CacheConfig")
+                .isNotNull();
+        Cache searchQueryCache = cacheManager.getCache("search:masters:q");
+        assertThat(searchQueryCache)
+                .as("the search:masters:q cache must be registered by the real CacheConfig")
                 .isNotNull();
         com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeSearch =
                 ((CaffeineCache) searchCache).getNativeCache();
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeSearchQuery =
+                ((CaffeineCache) searchQueryCache).getNativeCache();
         nativeSearch.cleanUp();
+        nativeSearchQuery.cleanUp();
         assertThat(nativeSearch.estimatedSize())
                 .as("after the warm search the discovery cache must hold at least one entry — otherwise the eviction assertion would be vacuous")
+                .isPositive();
+        assertThat(nativeSearchQuery.estimatedSize())
+                .as("the free-text search must have landed in search:masters:q — otherwise the routing is wrong and the second eviction assertion would be vacuous")
                 .isPositive();
 
         // ── 2. Change the master's DISPLAY NAME in a COMMITTED transaction. firstName
         //        is a searchAffected field (UserService.updateMasterProfile:162), so the
         //        afterCommit callback hits the `searchAffected && INDEPENDENT_MASTER`
         //        branch (UserService.evictUserCachesAfterCommit:215) and calls clear(). ──
-        log.debug("Act: update firstName (a searchAffected field) inside a committed transaction — registers the afterCommit search:masters clear()");
+        log.debug("Act: update firstName (a searchAffected field) inside a committed transaction — registers the afterCommit search:masters:browse clear()");
         transactionTemplate.executeWithoutResult(status ->
                 userService.updateMasterProfile(
                         userId,
@@ -162,10 +181,14 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
         // ── 3. The whole discovery cache must now be empty. If the eviction branch were
         //        removed (or its role/searchAffected gate broke), this entry would survive
         //        and estimatedSize() would still be positive → the test fails. ───────────
-        log.debug("Assert: search:masters is empty after commit — proves the discovery-cache eviction branch fired");
+        log.debug("Assert: search:masters:browse is empty after commit — proves the discovery-cache eviction branch fired");
         nativeSearch.cleanUp();
+        nativeSearchQuery.cleanUp();
         assertThat(nativeSearch.estimatedSize())
-                .as("search:masters MUST be cleared after an INDEPENDENT_MASTER name change commits; a surviving entry means the searchAffected eviction branch did not fire")
+                .as("search:masters:browse MUST be cleared after an INDEPENDENT_MASTER name change commits; a surviving entry means the searchAffected eviction branch did not fire")
+                .isZero();
+        assertThat(nativeSearchQuery.estimatedSize())
+                .as("search:masters:q MUST be cleared too — the eviction iterates SearchCacheNames.MASTERS_ALL; a surviving entry means only one half of the split cache was cleared")
                 .isZero();
     }
 

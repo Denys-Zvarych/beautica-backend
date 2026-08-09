@@ -45,8 +45,10 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -73,6 +75,16 @@ public class MasterService {
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Phase 29.2 fallout: BookingResponse.from now needs an absolute-instant "now" to compute the
+    // derived awaitingClosure flag (see that record's javadoc). This cached endpoint is the one
+    // pre-existing BookingResponse.from caller outside the booking feature — its "now" is
+    // therefore subject to the SAME bounded ~30s master-calendar cache TTL as every other
+    // time-sensitive field already on this response (e.g. status, which the write paths evict
+    // on every actual mutation via cachePrefixEvictor; awaitingClosure's purely time-driven
+    // transition has no write to evict on, so it can lag by up to that TTL — a materially smaller
+    // and bounded gap than the "never cached" concern Phase 29.2 raises for the uncached
+    // GET /bookings/me family this DTO also backs).
+    private final Clock clock;
 
     @Transactional
     public Master createMasterForIndependentUser(UUID userId) {
@@ -807,9 +819,10 @@ public class MasterService {
         List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
         Map<UUID, Booking> byId = hydrated.stream()
                 .collect(Collectors.toMap(Booking::getId, Function.identity()));
+        OffsetDateTime now = OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
         List<BookingResponse> ordered = idPage.getContent().stream()
                 .map(byId::get)
-                .map(BookingResponse::from)
+                .map(b -> BookingResponse.from(b, now))
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
     }

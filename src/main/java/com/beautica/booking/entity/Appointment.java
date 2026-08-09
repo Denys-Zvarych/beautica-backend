@@ -41,7 +41,8 @@ import java.util.UUID;
  * {@code no_overlapping_bookings} EXCLUDE constraint stays on {@code bookings.master_id} and is not
  * duplicated on this table. The status / notes / source / guest-identity fields below are a
  * denormalization of the rows this header aggregates (locked design: single master per visit,
- * all-or-nothing visit status, one review per visit).
+ * all-or-nothing visit status; reviews are per-booking, not per-visit — locked rule: 1 booking = 1
+ * feedback).
  *
  * <p>Every column mirrors the equivalent {@link Booking} column type/length so the denormalized
  * values stay byte-compatible with the rows they group (see {@code V124__create_appointments.sql}).

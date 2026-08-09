@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
@@ -23,11 +24,16 @@ import java.util.UUID;
  * {@link BookingDetailResponse} — the same master-summary + Kyiv-zoned window fields — aggregated to
  * the visit level.
  *
- * <p><b>Header window.</b> {@code startsAt} is the first item's start and {@code endsAt} the last
- * item's end, so the pair spans the whole contiguous block (including every service's trailing
- * buffer). {@code totalDurationMinutes} is the block length ({@code endsAt − startsAt}), which by
- * construction equals Σ (item duration + item buffer) — the exact block BE-2 sized the offered slot
- * to.
+ * <p><b>Header window.</b> {@code startsAt} is {@code min(startsAt)} over every item (the loader
+ * orders by {@code startsAt} ascending, so this is item 0) and {@code endsAt} is {@code max(endsAt)}
+ * over every item — an explicit reduction, NOT {@code orderedItems.get(size-1).getEndsAt()} (phase
+ * 30.1/30.7): once a single item can be rescheduled independently of its siblings (relaxed
+ * contiguity — see {@code AppointmentTransitionService#rescheduleAppointmentItem}), the row with the
+ * greatest {@code startsAt} is no longer necessarily the row with the greatest {@code endsAt} — a
+ * terminal sibling (exempt from every overlap guard) may span past the last CONFIRMED item.
+ * {@code totalDurationMinutes} is the SUM of non-excluded PER-ITEM durations (see below) — it equals
+ * {@code endsAt − startsAt} only while the visit remains contiguous, and must never be derived from
+ * the header window.
  *
  * <p><b>Header price.</b> {@code totalPrice} is Σ of the item price floors. {@code totalPriceMax} is
  * Σ over all items of {@code priceMaxAtBooking ?? priceAtBooking}, but is emitted ONLY when at least
@@ -51,7 +57,10 @@ public record AppointmentDetailResponse(
         String masterAvatarUrl,
         Role masterType,
         @Schema(types = {"string", "null"}, nullable = true,
-                description = "The salon name, or null for an independent master.")
+                description = "The name of the salon THIS VISIT was booked at (the visit's own "
+                        + "salon snapshot), or null when the visit was with an independent master. "
+                        + "Not the master's current affiliation — a master who has since moved "
+                        + "salons does not rewrite a past visit's premises.")
         String salonName,
         ZonedDateTime startsAt,
         ZonedDateTime endsAt,
@@ -67,12 +76,6 @@ public record AppointmentDetailResponse(
         String clientComment,
         OffsetDateTime createdAt,
         List<AppointmentItemResponse> items,
-        @Schema(description = "True iff this visit is COMPLETED, has a registered client, and the "
-                + "client has not yet reviewed it — the CLIENT's one-review-per-visit CTA gate "
-                + "(BE-6). The COMPLETED + no-existing-review predicate, computed by the service, "
-                + "mirrors BookingDetailResponse.canReview lifted to the visit. A visit review is "
-                + "left via POST /appointments/{id}/review.")
-        boolean canReview,
         // ── BE-5 visit-detail enrichment (mirrors BookingDetailResponse) ─────────────
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Written by the provider on the visit /decline or /not-complete. Shown "
@@ -97,16 +100,20 @@ public record AppointmentDetailResponse(
                 description = "Discovery district label (Ukrainian). Same resolution as cityLabel.")
         String districtLabel,
         @Schema(types = {"string", "null"}, nullable = true,
-                description = "Arrival street — the salon's when salon-employed, else the master's "
-                        + "own. Same salon-vs-independent rule as BookingDetailResponse.street; a "
-                        + "salon-employed master's PERSONAL street never leaks onto a salon visit.")
+                description = "Arrival street — the BOOKED salon's when the visit was made at a "
+                        + "salon, else the master's own. Same salon-vs-independent rule as "
+                        + "BookingDetailResponse.street, resolved against the visit's own salon "
+                        + "snapshot: a salon-employed master's PERSONAL street never leaks onto a "
+                        + "salon visit, AND a master who has since moved salons cannot cause this "
+                        + "visit to display the address of premises it was never booked at.")
         String street,
         @Schema(types = {"string", "null"}, nullable = true, description = "Arrival building number.")
         String buildingNo,
         @Schema(types = {"string", "null"}, nullable = true,
                 description = "Provider's free-text arrival hint (e.g. \"3-й поверх, код 1234\"). "
-                        + "Same salon-vs-independent resolution as street/buildingNo — a salon "
-                        + "booking surfaces the salon's own note, never the master's personal one.")
+                        + "Same salon-vs-independent resolution as street/buildingNo, against the "
+                        + "salon THIS VISIT was booked at — never the master's personal note, and "
+                        + "never a salon the master merely works at today.")
         String locationNote
 ) {
 
@@ -114,22 +121,29 @@ public record AppointmentDetailResponse(
      * Builds the visit view from the appointment header and its ordered, fully-hydrated chained
      * booking rows. {@code orderedItems} MUST be non-empty and sorted by {@code startsAt} ascending
      * (as {@code BookingRepository#findByAppointmentIdWithGraph} returns them), and each row MUST
-     * carry its {@code master.user}, {@code master.salon} and {@code masterService.serviceDefinition}
-     * graph hydrated. The master summary is read off the first item (single master per visit — a
-     * locked invariant).
+     * carry its {@code master.user}, <b>{@code booking.salon}</b> and
+     * {@code masterService.serviceDefinition} graph hydrated. The master summary is read off the
+     * first item (single master per visit — a locked invariant), and so is the address block,
+     * which since phase 242 comes from that item's own salon snapshot rather than
+     * {@code master.getSalon()}.
      */
     public static AppointmentDetailResponse from(
-            Appointment appointment, List<Booking> orderedItems, boolean canReview,
+            Appointment appointment, List<Booking> orderedItems,
             String cityLabel, String districtLabel) {
         Booking first = orderedItems.get(0);
-        Booking last = orderedItems.get(orderedItems.size() - 1);
         Master master = first.getMaster();
         User masterUser = master.getUser();
-        Salon salon = master.getSalon();
+        // Phase 242 — the ITEM's own salon snapshot (bookings.salon_id), NEVER master.getSalon().
+        // Every item of a visit is stamped with the same salon at creation (AppointmentService/
+        // GuestBookingService both write master.getSalon() onto the header AND each row), and a
+        // per-item reschedule never rewrites it, so item 0's snapshot IS the visit's salon —
+        // reading it off the already-fetched item costs nothing, whereas appointment.getSalon()
+        // would lazy-load a proxy off the un-graphed appointmentRepository.findById.
+        Salon salon = first.getSalon();
 
-        // Same salon-vs-independent PII rule as BookingDetailResponse#from — the salon's own values
-        // win outright when salon-employed (even when null), so a salon-master's personal address
-        // never leaks onto a salon visit.
+        // Same salon-vs-independent PII rule as BookingDetailResponse#from — the booked salon's own
+        // values win outright when the visit was at a salon (even when null), so a salon-master's
+        // personal address never leaks onto a salon visit.
         String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
         String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
         String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
@@ -138,7 +152,8 @@ public record AppointmentDetailResponse(
         // owed total and total duration — the client must not be shown a price/duration that
         // includes a service they will not receive (LOCKED decision). CONFIRMED/COMPLETED/CANCELLED
         // lines are summed as before; a fully-CONFIRMED visit is byte-for-byte unchanged. The header
-        // time window (startsAt/endsAt below) deliberately still spans ALL items.
+        // time window (startsAt/endsAt below) deliberately still spans ALL items, INCLUDING excluded
+        // (terminal) ones — "owed total" and "visit window" are independent concepts.
         BigDecimal totalPrice = BigDecimal.ZERO;
         BigDecimal totalCeiling = BigDecimal.ZERO;
         boolean anyRange = false;
@@ -162,6 +177,18 @@ public record AppointmentDetailResponse(
                 .map(AppointmentItemResponse::from)
                 .toList();
 
+        // Header window spans ALL items (terminal included) — the intent stated above has always
+        // been this, but orderedItems.get(size-1).getEndsAt() only expressed it correctly while
+        // items were contiguous. Once a single item can be moved independently (phase 30.1), the row
+        // with the greatest startsAt is no longer necessarily the row with the greatest endsAt: a
+        // terminal sibling is exempt from every overlap guard and may span past the last CONFIRMED
+        // item. min(startsAt) is still item 0 (the loader orders by startsAt ASC — see this method's
+        // documented precondition above), so only the end needs an explicit reduction.
+        OffsetDateTime headerEndsAt = orderedItems.stream()
+                .map(Booking::getEndsAt)
+                .max(Comparator.naturalOrder())
+                .orElseThrow(); // orderedItems is non-empty by this method's documented precondition
+
         return new AppointmentDetailResponse(
                 appointment.getId(),
                 appointment.getStatus(),
@@ -173,14 +200,13 @@ public record AppointmentDetailResponse(
                 masterUser.getRole(),
                 salon != null ? salon.getName() : null,
                 first.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
-                last.getEndsAt().atZoneSameInstant(TimeZones.KYIV),
+                headerEndsAt.atZoneSameInstant(TimeZones.KYIV),
                 totalDurationMinutes,
                 totalPrice,
                 anyRange ? totalCeiling : null,
                 appointment.getClientComment(),
                 appointment.getCreatedAt().atOffset(ZoneOffset.UTC),
                 items,
-                canReview,
                 // Notes are read from the HEADER (mutually visible), never the child items.
                 appointment.getProviderComment(),
                 appointment.getClientCancellationNote(),

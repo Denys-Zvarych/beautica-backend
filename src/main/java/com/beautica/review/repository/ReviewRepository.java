@@ -18,12 +18,6 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     // Cheaper than findByBookingId(...).isPresent() — derived as SELECT COUNT(*) > 0.
     boolean existsByBookingId(UUID bookingId);
 
-    // BE-6 visit-review dedup + canReview probe. Derived as SELECT COUNT(*) > 0; the WHERE
-    // appointment_id = :id predicate implies appointment_id IS NOT NULL, so the partial unique
-    // index ux_reviews_appointment (V127) backs it. Legacy reviews (appointment_id NULL) are never
-    // matched.
-    boolean existsByAppointmentId(UUID appointmentId);
-
     /**
      * Batch existence check: returns the subset of the supplied booking ids that already
      * have a review. Used by {@code BookingService} to compute {@code canReview} for a page
@@ -155,6 +149,15 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             WHERE r.client.id = :clientId
             """)
     Page<MyReviewResponse> findMyReviews(@Param("clientId") UUID clientId, Pageable pageable);
+
+    // countByClientId (reviews AUTHORED by one client, for the BEAUTY PASSPORT identity strip)
+    // was removed by the 2026-08 perf audit (F2). Its only caller, ClientPassportService, now
+    // reads that count as a correlated subquery inside ClientAggregationRepository.findStanding,
+    // alongside the registration instant, so the passport pays one statement instead of two.
+    // It remains index-served by idx_reviews_client_created (V96) — note the actual index name;
+    // the javadoc removed with this method mis-spelled it "reviews_client_created_index" (F8).
+    // Still distinct from countByMasterIdGroupByRating / countBySalonIdGroupByRating, which are
+    // rating histograms of reviews RECEIVED.
 
     // Named to distinguish from the inherited JpaRepository.findById (which is lazy).
     // Use this method whenever ReviewResponse.from() will be called on the result.

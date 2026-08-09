@@ -57,6 +57,21 @@ import java.util.UUID;
  * across the anon/authenticated boundary. See {@code SearchController} for the
  * strip.</p>
  *
+ * <p><b>{@code matchedServiceNames} — match preview (Phase 20.3, extended to
+ * free text):</b> the capped ({@code SERVICE_NAME_CAP}), distinct list of the
+ * salon's <em>bookable</em> service names that actually explain this row, so the
+ * card can show <em>what</em> matched rather than the alphabetical top-3
+ * {@code serviceNames}. Populated for a {@code serviceTypeSlugs} filter (the
+ * services matching any selected slug), for a {@code q} query (the services
+ * whose own name satisfied at least one token while every token was satisfied
+ * through that same service — group-scoped, see {@link
+ * com.beautica.salon.repository.SalonSearchSql}), and for both together as their
+ * <b>intersection</b>. <b>Empty</b> (never {@code null}) when neither filter is
+ * active, when the salon's own name carried the whole {@code q} match, or when
+ * the two filters were satisfied by different services — the card then falls
+ * back to {@code serviceNames}. Mirrors the master contract exactly. Carries
+ * display strings only — safe on this {@code permitAll} endpoint (§I).</p>
+ *
  * <p>This is a response DTO only — no Bean Validation annotations
  * apply. Assembled by the search service from a projection query;
  * the JPA entity is never exposed directly.</p>

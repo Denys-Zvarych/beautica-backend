@@ -396,6 +396,28 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
+    // ── Test 10b: CLOSURE_REMINDER dispatches to notifyClosureReminder (Phase 29.5) ──
+
+    @Test
+    @DisplayName("notifyClosureReminder is called and status set to SENT when CLOSURE_REMINDER entry processed")
+    void should_callNotifyClosureReminder_when_closureReminderEntryProcessed() {
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.CLOSURE_REMINDER, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        worker.drain();
+
+        verify(notificationService, times(1)).notifyClosureReminder(booking);
+        // CLOSURE_REMINDER must never route through notifyReviewRequested — the mass-mail vector
+        // this whole track was designed to avoid coupling to.
+        verify(notificationService, never()).notifyReviewRequested(any());
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
     // ── Test 11: booking deleted between enqueue and drain → PENDING ──────────
 
     @Test

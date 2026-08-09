@@ -7,11 +7,14 @@ import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.EntityManagerFactory;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.UUID;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.hibernate.SessionFactory;
+import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -61,7 +64,36 @@ class AppointmentReadIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    @Autowired
+    private EntityManagerFactory emf;
+
     private BookingTestFixtures fixtures;
+
+    /**
+     * Absolute JDBC statement count for ONE {@code GET /appointments/{id}} served over the full
+     * HTTP stack, read by the OWNING CLIENT. Pins the phase-242 choice of {@code first.getSalon()}
+     * (item snapshot) over {@code appointment.getSalon()}: the items query already fetch-joins
+     * {@code b.salon}, so the address block costs nothing, whereas the appointment header is loaded
+     * by a plain {@code findById} and reading its salon would lazy-load one more row per visit. A
+     * rise here means the salon fetch was re-pointed away from {@code b.salon}, or the header's own
+     * salon is being dereferenced. DERIVED FROM A RUN, never predicted.
+     *
+     * <p><b>Phase-242 audit, finding 1 — this constant DROPPED 5 &rarr; 4, and that is the fix
+     * working, not a regression. Do not "restore" it to 5.</b> Before that fix
+     * {@code AuthorizationService#enforceCanViewBooking} called
+     * {@code isAuthorizedToManageBooking} unconditionally, ahead of its role branches, and that
+     * predicate walks {@code master.getSalon().getOwner()} — a PROPERTY read that INITIALISES the
+     * {@code Salon} proxy. Since phase 242 stopped fetching {@code m.salon}, an owning CLIENT
+     * reading a ROTATED visit paid one standalone {@code SELECT ... FROM salons} to load the
+     * master's LIVE salon: a row the client's response never renders. The client fast path now runs
+     * first, so that statement is gone for the highest-volume viewer class.
+     *
+     * <p>Shared by BOTH shape gates below ({@code masterHasSinceRotated} and
+     * {@code masterHasSinceGoneIndependent}) because the two genuinely cost the same for a CLIENT
+     * viewer — see {@link #should_notLazyLoadTheBookedSalon_when_theVisitsMasterHasSinceGoneIndependent}
+     * for why only the second of them can tell {@code b.salon} apart from {@code m.salon}.
+     */
+    private static final long VISIT_DETAIL_STATEMENTS = 4L;
 
     @BeforeEach
     void configureHttpClient() {
@@ -345,6 +377,259 @@ class AppointmentReadIT extends AbstractIntegrationTest {
                 .doesNotContain(masterPersonalNote);
     }
 
+    /**
+     * Phase 242, appointment surface — the visit's address block follows the VISIT's own salon
+     * snapshot, not the master's live affiliation.
+     *
+     * <p>The twin of {@code BookingDetailContractIT#should_serveTheBookedSalonsAddress_when_
+     * theMasterHasSinceRotatedToAnotherSalon}, for {@code GET /appointments/{id}}. Same leak, same
+     * sharp edge: {@code locationNote} holds door codes, so serving a rotated master's CURRENT
+     * salon's note hands a client premises access for somewhere they never booked.
+     *
+     * <p>Both salons carry DISTINCT, NON-NULL street / buildingNo / locationNote. A null on either
+     * side would make the {@code isNotEqualTo} assertions and the raw-body scan pass vacuously.
+     */
+    @Test
+    @DisplayName("GET /appointments/{id} keeps serving the BOOKED salon's address and door code "
+            + "after the master rotates to another salon — the new salon's note never reaches the client")
+    void should_returnBookedSalonAddress_when_masterHasSinceRotatedToAnotherSalon() throws Exception {
+        BookingTestFixtures.SalonFixture salon =
+                fixtures.createSalon("be5-rot-owner-" + System.nanoTime() + "@beautica.test");
+
+        // Distinct localities, so cityLabel/districtLabel — resolved by AppointmentService#enrich
+        // through a DIFFERENT code path from the address block in AppointmentDetailResponse#from —
+        // are covered too. Without them, re-pointing only the DTO would still pass.
+        Locality localityA = resolveLocality(0);
+        // Phase-242 QA audit, finding 4: selected so BOTH labels differ. District names recur
+        // across Ukrainian cities, so an offset-based second pick can hand back a pair whose
+        // districtLabel coincides and defang the districtLabel assertion below.
+        Locality localityB = resolveLocalityWithBothLabelsDifferentFrom(localityA);
+        assertThat(localityB.cityLabel())
+                .as("premise — the two seeded localities must differ, or the label assertion below "
+                        + "compares a value against itself")
+                .isNotEqualTo(localityA.cityLabel());
+        assertThat(localityB.districtLabel())
+                .as("premise — same, for the district half")
+                .isNotEqualTo(localityA.districtLabel());
+
+        // Salon A — where the visit is booked.
+        String salonAStreet = "вул. Заброньована-A-" + System.nanoTime();
+        String salonABuildingNo = "11-A";
+        String salonANote = "A: 3-й поверх, код 1234";
+        jdbcTemplate.update(
+                "UPDATE salons SET name = ?, street = ?, building_no = ?, location_note = ?, "
+                        + "city_id = ?, district_id = ? WHERE id = ?",
+                "Booked Salon A", salonAStreet, salonABuildingNo, salonANote,
+                localityA.cityId(), localityA.districtId(), salon.salonId());
+
+        // The master's personal row stays distinct too — the pre-existing COALESCE-fallthrough
+        // guard must survive this change untouched.
+        String masterPersonalNote = "приватний код дверей 4321 — не показувати";
+        jdbcTemplate.update(
+                "UPDATE users SET street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                "вул-Приватна-СЕКРЕТ-" + System.nanoTime(), "99-ПРИВАТ",
+                masterPersonalNote, salon.masterId());
+
+        UUID serviceA = fixtures.createSalonService(salon.salonId(), salon.masterId());
+        addWorkingHoursForEveryDay(salon.masterId());
+
+        String clientEmail = "be5-rot-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(6).withHour(12).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, salon.masterId(), startsAt, serviceA).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+
+        // Salon B — same owner (rotateMasterSalon permits same-owner moves only), created and
+        // rotated to AFTER the visit exists. appointments.salon_id / bookings.salon_id are
+        // snapshots and do not follow; masters.salon_id does.
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        String salonBStreet = "вул. Поточна-B-" + System.nanoTime();
+        String salonBBuildingNo = "22-B";
+        String salonBNote = "B: 5-й поверх, код 9999";
+        UUID salonBId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, street, building_no, location_note, "
+                        + "city_id, district_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonBId, ownerId, "Current Salon B", salonBStreet, salonBBuildingNo, salonBNote,
+                localityB.cityId(), localityB.districtId());
+        jdbcTemplate.update("UPDATE masters SET salon_id = ? WHERE id = ?", salonBId, salon.masterId());
+        jdbcTemplate.update(
+                "UPDATE users SET salon_id = ? WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                salonBId, salon.masterId());
+
+        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+        statistics.setStatisticsEnabled(true);
+        statistics.clear();
+        ResponseEntity<String> resp = getRaw(APPOINTMENTS_URL + "/" + appointmentId, clientToken);
+        long statements = statistics.getPrepareStatementCount();
+        assertThat(resp.getStatusCode())
+                .as("the owning client must still read their visit — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+
+        assertThat(statements)
+                .as("the address block must be served off the items query's LEFT JOIN FETCH "
+                        + "b.salon — a rise means the booked salon is being lazy-loaded, one extra "
+                        + "SELECT per visit read")
+                .isEqualTo(VISIT_DETAIL_STATEMENTS);
+        assertThat(data.path("salonName").asText())
+                .as("salonName is the visit's own salon snapshot, not the master's current one")
+                .isEqualTo("Booked Salon A").isNotEqualTo("Current Salon B");
+        assertThat(data.path("street").asText()).isEqualTo(salonAStreet).isNotEqualTo(salonBStreet);
+        assertThat(data.path("buildingNo").asText())
+                .isEqualTo(salonABuildingNo).isNotEqualTo(salonBBuildingNo);
+        assertThat(data.path("cityLabel").asText())
+                .as("cityLabel is resolved by AppointmentService#enrich, a separate site from the "
+                        + "address block — it must describe the SAME premises as street, or the "
+                        + "client is sent to salon A's street in salon B's city")
+                .isEqualTo(localityA.cityLabel()).isNotEqualTo(localityB.cityLabel());
+        assertThat(data.path("districtLabel").asText())
+                .as("Phase-242 QA audit, finding 4 — districtLabel rides AppointmentService#enrich's "
+                        + "districtId, a SEPARATE re-pointed line from cityId, and NOTHING asserted "
+                        + "its value anywhere in the suite: reverting just that line to "
+                        + "master.getSalon().getDistrictId() was a green mutation. There is no "
+                        + "AppointmentServiceTest and no AppointmentDetailResponseTest to catch it "
+                        + "either, so this assertion is the only gate on that site.")
+                .isEqualTo(localityA.districtLabel()).isNotEqualTo(localityB.districtLabel());
+        // THE security assertion — negative stated explicitly, so it cannot pass on two fixtures
+        // that happen to share a note.
+        assertThat(data.path("locationNote").asText())
+                .as("the client booked at salon A — they must get A's door code and NEVER B's")
+                .isEqualTo(salonANote)
+                .isNotEqualTo(salonBNote)
+                .isNotEqualTo(masterPersonalNote);
+
+        assertThat(resp.getBody())
+                .as("nothing about the rotated-to salon, nor the master's personal address, may "
+                        + "appear anywhere in the visit response")
+                .doesNotContain(salonBNote)
+                .doesNotContain(salonBStreet)
+                .doesNotContain(salonBBuildingNo)
+                .doesNotContain("Current Salon B")
+                .doesNotContain(masterPersonalNote);
+    }
+
+    /**
+     * Phase-242 audit, finding 4 — the ONE visit fixture that can tell
+     * {@code findByAppointmentIdWithGraph}'s {@code LEFT JOIN FETCH b.salon} apart from the
+     * {@code m.salon} it replaced.
+     *
+     * <p><b>Why the rotated gate above cannot.</b> There both salons exist, so either graph
+     * materialises exactly one {@code Salon} and leaves the other a proxy — the counts coincide and
+     * the statement assertion is blind to which one was fetched. Only the value assertions catch a
+     * re-point there, and only for the DTO, not for the query. Here {@code masters.salon_id} is
+     * {@code NULL} while {@code bookings.salon_id} still points at the booked salon, so a graph
+     * still fetching {@code m.salon} materialises NOTHING and
+     * {@code AppointmentDetailResponse#from}'s real-property reads off {@code first.getSalon()}
+     * ({@code getName()} / {@code getStreet()} / {@code getLocationNote()}) lazy-load the booked
+     * salon — one extra {@code SELECT}. This is the visit-side twin of
+     * {@code BookingPriceRangeContractIT#should_notLazyLoadTheBookedSalon_when_theMasterHasSinceGoneIndependent},
+     * which closed exactly this hole on the booking surface.
+     *
+     * <p>The correctness half is load-bearing too: a master going solo must not retroactively turn
+     * a past SALON visit into a home-studio one. Reverting the DTO's salon source to the pre-242
+     * {@code master.getSalon()} makes it {@code NULL} here, which the {@code salonName} assertion
+     * catches, and re-exposes the fallthrough to the master's PERSONAL address that the
+     * {@code locationNote} assertion pins.
+     */
+    @Test
+    @DisplayName("GET /appointments/{id} for a visit whose master has since gone INDEPENDENT still "
+            + "serves the BOOKED salon's address, and fetches it in the items query rather than "
+            + "lazy-loading it — the one shape that pins WHICH salon the visit graph fetches")
+    void should_notLazyLoadTheBookedSalon_when_theVisitsMasterHasSinceGoneIndependent() throws Exception {
+        BookingTestFixtures.SalonFixture salon =
+                fixtures.createSalon("be5-gone-indep-owner-" + System.nanoTime() + "@beautica.test");
+        Locality locality = resolveLocality(0);
+
+        String salonStreet = "вул. Залишкова-" + System.nanoTime();
+        String salonBuildingNo = "77-C";
+        String salonNote = "C: 2-й поверх, код 5678";
+        jdbcTemplate.update(
+                "UPDATE salons SET name = ?, street = ?, building_no = ?, location_note = ?, "
+                        + "city_id = ?, district_id = ? WHERE id = ?",
+                "Booked Salon C", salonStreet, salonBuildingNo, salonNote,
+                locality.cityId(), locality.districtId(), salon.salonId());
+
+        // Distinct personal row on the master's user: once masters.salon_id is NULL, a mapper that
+        // resolved the block off master.getSalon() would fall straight through to THESE values.
+        String masterPersonalNote = "домашній код 8765 — не показувати";
+        String masterPersonalStreet = "вул-Домашня-СЕКРЕТ-" + System.nanoTime();
+        jdbcTemplate.update(
+                "UPDATE users SET street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                masterPersonalStreet, "88-ДІМ", masterPersonalNote, salon.masterId());
+
+        UUID serviceA = fixtures.createSalonService(salon.salonId(), salon.masterId());
+        addWorkingHoursForEveryDay(salon.masterId());
+
+        String clientEmail = "be5-gone-indep-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(8).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        JsonNode visit = objectMapper.readTree(
+                postVisit(clientToken, salon.masterId(), startsAt, serviceA).getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visit.path("id").asText());
+
+        // The master leaves the salon and goes solo AFTER the visit. masters.salon_id becomes NULL;
+        // bookings.salon_id / appointments.salon_id are snapshots and keep pointing at the salon
+        // the client actually booked at.
+        jdbcTemplate.update(
+                "UPDATE masters SET salon_id = NULL, master_type = 'INDEPENDENT_MASTER' WHERE id = ?",
+                salon.masterId());
+        jdbcTemplate.update(
+                "UPDATE users SET salon_id = NULL WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                salon.masterId());
+
+        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+        statistics.setStatisticsEnabled(true);
+        statistics.clear();
+        ResponseEntity<String> resp = getRaw(APPOINTMENTS_URL + "/" + appointmentId, clientToken);
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(resp.getStatusCode())
+                .as("the owning client must still read their visit — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+
+        assertThat(data.path("salonName").asText(null))
+                .as("correctness — the visit WAS at a salon, so its name must still be served; a "
+                        + "master going solo does not retroactively turn a past salon visit into a "
+                        + "home-studio one. NULL here means the address block was resolved off "
+                        + "master.getSalon() (the pre-242 source) instead of the item snapshot.")
+                .isEqualTo("Booked Salon C");
+        assertThat(data.path("street").asText())
+                .as("the booked salon's street, never the now-solo master's personal one")
+                .isEqualTo(salonStreet).isNotEqualTo(masterPersonalStreet);
+        assertThat(data.path("locationNote").asText())
+                .as("THE security assertion — a master going independent must not hand every past "
+                        + "client of theirs the door code to their HOME")
+                .isEqualTo(salonNote).isNotEqualTo(masterPersonalNote);
+        assertThat(resp.getBody())
+                .as("nothing from the master's personal address row may appear anywhere in the "
+                        + "visit response")
+                .doesNotContain(masterPersonalNote)
+                .doesNotContain(masterPersonalStreet);
+
+        assertThat(statements)
+                .as("this is the ONLY visit shape that can tell findByAppointmentIdWithGraph's "
+                        + "LEFT JOIN FETCH b.salon apart from the m.salon it replaced. In the "
+                        + "rotated fixture both graphs cost the same (one salon fetched, the other "
+                        + "left a proxy — either way 1 + 1). Here m.salon is NULL, so a graph still "
+                        + "fetching it materialises nothing and AppointmentDetailResponse#from's "
+                        + "property reads lazy-load the booked salon — %s instead of %s.",
+                        VISIT_DETAIL_STATEMENTS + 1, VISIT_DETAIL_STATEMENTS)
+                .isEqualTo(VISIT_DETAIL_STATEMENTS);
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // 5. Partially-declined visit — per-item status surfaced, totals exclude the
     //    declined line, header time window unchanged
@@ -465,6 +750,40 @@ class AppointmentReadIT extends AbstractIntegrationTest {
                 .as("visit creation must succeed — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
         return resp;
+    }
+
+    /**
+     * A real seeded district + its city, plus the Ukrainian labels the
+     * {@code DiscoveryLocationResolver} resolves them to. Distinct indices yield localities in
+     * DIFFERENT cities, so {@code cityLabel} genuinely differs between them.
+     */
+    private Locality resolveLocality(int index) {
+        return jdbcTemplate.queryForObject(
+                "SELECT DISTINCT ON (c.id) d.id, c.id, c.name_uk, d.name_uk "
+                        + "FROM city_districts d JOIN cities c ON c.id = d.city_id "
+                        + "ORDER BY c.id, d.id OFFSET ? LIMIT 1",
+                (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
+                        rs.getString(3), rs.getString(4)),
+                index);
+    }
+
+    /**
+     * A locality whose city label AND district label both differ from {@code other} —
+     * deterministic, rather than hoping two offsets land on distinct district names (they recur
+     * across Ukrainian cities). See {@code BookingDetailContractIT}'s twin.
+     */
+    private Locality resolveLocalityWithBothLabelsDifferentFrom(Locality other) {
+        return jdbcTemplate.queryForObject(
+                "SELECT d.id, c.id, c.name_uk, d.name_uk "
+                        + "FROM city_districts d JOIN cities c ON c.id = d.city_id "
+                        + "WHERE c.name_uk <> ? AND d.name_uk <> ? "
+                        + "ORDER BY c.id, d.id LIMIT 1",
+                (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
+                        rs.getString(3), rs.getString(4)),
+                other.cityLabel(), other.districtLabel());
+    }
+
+    private record Locality(UUID districtId, UUID cityId, String cityLabel, String districtLabel) {
     }
 
     private ResponseEntity<String> getRaw(String url, String token) {

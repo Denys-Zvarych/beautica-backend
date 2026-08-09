@@ -11,6 +11,7 @@ import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
+import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -55,7 +56,56 @@ public class ServiceController {
                     + "(owner, service type); price and duration are irrelevant. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
 
+    /**
+     * Description attached to the {@code 503} declaration on the two BULK endpoints — the only
+     * paths that can raise it. {@code ServiceCatalogService#acquireBulkSetupLockWithTimeout}
+     * translates a Postgres {@code 55P03 lock_not_available} (the fused 3s {@code lock_timeout}
+     * elapsing on the per-master bulk-setup advisory lock) into a
+     * {@code BusinessException(SERVICE_UNAVAILABLE)}.
+     *
+     * <p>Declared for the same reason as {@link #DUPLICATE_SERVICE_409}: springdoc scans
+     * controller signatures, not {@code @RestControllerAdvice} handlers, so an undeclared status
+     * is simply absent from {@code /api-docs} — and the mobile Dio client, regenerated from that
+     * spec, has no branch for it.
+     *
+     * <p>No {@code content} schema is declared (matching the existing {@code 429} idiom in
+     * {@code AppointmentController}): {@code GlobalExceptionHandler#handleBusiness} deliberately
+     * replaces the message with generic copy for this status and sends {@code data: null}, so
+     * there is nothing branchable in the body — the client keys on the status code alone.
+     */
+    private static final String BULK_LOCK_TIMEOUT_503 =
+            "Transient: another bulk service-setup for this master is in flight and held the "
+                    + "per-master lock past the 3s ceiling. Safe to retry after a short backoff — "
+                    + "the batch is all-or-nothing, so nothing was written. Branch on the status "
+                    + "code; the body carries no machine-readable code and `message` is generic.";
+
+    /**
+     * Description attached to the {@code 429} declaration on every write endpoint in this
+     * controller. {@code AuthRateLimitFilter} throttles the single-item write routes
+     * (create / update / photo / deactivate) at {@code app.rate-limit.service-write-capacity}
+     * (60 / 60 s per IP) and the two {@code /bulk} routes at
+     * {@code app.rate-limit.bulk-service-setup-capacity} (10 / 60 s per IP) — two SEPARATE
+     * buckets, so exhausting one does not lock out the other.
+     *
+     * <p>Declared for the same reason as {@link #DUPLICATE_SERVICE_409} and
+     * {@link #BULK_LOCK_TIMEOUT_503}: springdoc scans controller signatures, and the throttle
+     * lives in a servlet filter it never sees, so an undeclared 429 is simply absent from
+     * {@code /api-docs} — and the mobile Dio client, regenerated from that spec, has no branch
+     * for it.
+     *
+     * <p>No {@code content} schema is declared (matching the existing {@code 429} idiom in
+     * {@code AppointmentController}): the filter writes a fixed
+     * {@code {"error":"Too many requests"}} body with nothing machine-readable to branch on, so
+     * the client keys on the status code and the {@code Retry-After} header alone.
+     */
+    private static final String RATE_LIMITED_429 =
+            "Per-IP rate limit exceeded. Honour the `Retry-After` header (seconds) and retry after "
+                    + "backoff — nothing was written. Single-item writes and the bulk routes use "
+                    + "separate buckets. Branch on the status code; the body carries no "
+                    + "machine-readable code.";
+
     private final ServiceCatalogService serviceCatalogService;
+    private final MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
 
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
@@ -70,7 +120,9 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/salons/{salonId}/services")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
@@ -85,6 +137,15 @@ public class ServiceController {
     // Also authorizes a SALON_OWNER assigning services to their OWN owner-operated
     // master row (master_type = SALON_OWNER): that row's salon_id equals #salonId, so
     // masterBelongsToSalon resolves true. No owner-specific branch is required.
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Same lone-@ApiResponse guard as every other write endpoint in this file: the 429
+            // alone would be read by springdoc as the COMPLETE response set and drop the
+            // auto-derived typed 200, regenerating the mobile client to Response<void>.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
     @PostMapping("/salons/{salonId}/masters/{masterId}/services")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> assignServiceToMaster(
@@ -104,11 +165,20 @@ public class ServiceController {
      * Unauthenticated clients browse a master's service menu before deciding to book.
      * No {@code @PreAuthorize} guard is intentional; adding one would break the
      * discovery flow for anonymous users.
+     *
+     * <p><strong>{@code isFavorite} decoration (Phase 32.1).</strong> {@code
+     * serviceCatalogService.getMasterServices} is cached per-{@code masterId} and shared across
+     * every caller, so it can never know who is asking. This method composes the cached, caller-
+     * agnostic list with {@link MasterServiceFavoriteDecorator#decorate}, a SEPARATE bean invoked
+     * here — lexically outside the {@code @Cacheable} method — so the per-client flag is applied
+     * fresh on every request and never enters the cache. An authenticated CLIENT sees {@code true}/
+     * {@code false} per row; every other caller (anonymous, or any other role) sees {@code null}.
      */
     @GetMapping("/masters/{masterId}/services")
     public ApiResponse<List<MasterServiceResponse>> getMasterServices(
-            @PathVariable UUID masterId) {
-        return ApiResponse.ok(serviceCatalogService.getMasterServices(masterId));
+            @PathVariable UUID masterId, Authentication authentication) {
+        List<MasterServiceResponse> services = serviceCatalogService.getMasterServices(masterId);
+        return ApiResponse.ok(masterServiceFavoriteDecorator.decorate(services, authentication));
     }
 
     /**
@@ -164,7 +234,9 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/independent-masters/me/services")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
@@ -178,18 +250,21 @@ public class ServiceController {
     }
 
     /**
-     * First-time bulk service setup for the authenticated INDEPENDENT_MASTER.
+     * Bulk service creation for the authenticated INDEPENDENT_MASTER.
      *
      * <p>Self-scoped: the acting master is resolved from the principal, never a path/query
-     * parameter — mirroring {@link #addIndependentMasterService}. Valid only when the master
-     * currently has ZERO active services; otherwise the service returns 409 (first-time-only
-     * product rule, enforced server-side). The whole batch is created in one transaction
+     * parameter — mirroring {@link #addIndependentMasterService}. Additive: callable whether the
+     * master's catalogue is empty or already populated, so one screen serves both initial setup
+     * and later "add more services" passes. The whole batch is created in one transaction
      * (all-or-nothing) and the response is the same {@link MasterServiceResponse} list shape
      * the single-create endpoint returns.
+     *
+     * <p>The only 409 this endpoint returns is {@code DUPLICATE_SERVICE} — a batch item whose
+     * service type the master already offers.
      */
-    @Operation(summary = "Bulk-create my services (first-time setup)",
-            description = "Creates every selected service in one transaction. Only valid when "
-                    + "the master has no active services yet (409 otherwise).")
+    @Operation(summary = "Bulk-create my services",
+            description = "Creates every selected service in one transaction (all-or-nothing). "
+                    + "Additive — callable whether or not the master already has services.")
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
             // COMPLETE response set — without this it drops the auto-derived typed body and
@@ -203,7 +278,11 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "503", description = BULK_LOCK_TIMEOUT_503),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/independent-masters/me/services/bulk")
     @PreAuthorize("hasRole('INDEPENDENT_MASTER')")
@@ -218,7 +297,7 @@ public class ServiceController {
     }
 
     /**
-     * First-time bulk service setup performed on behalf of a master in a salon.
+     * Bulk service creation performed on behalf of a master in a salon.
      *
      * <p>Authorized for the salon's SALON_OWNER and SALON_ADMIN via {@code canManageSalon},
      * with {@code masterBelongsToSalon} closing the timing-oracle IDOR (same guard pair as
@@ -227,13 +306,15 @@ public class ServiceController {
      * The owner-operated master row resolves through the same path (its {@code salon_id}
      * equals {@code salonId}).
      *
-     * <p>Valid only when the target master has ZERO active services (409 otherwise). The
-     * whole batch is created in one transaction (all-or-nothing).
+     * <p>Additive: callable whether the target master's catalogue is empty or already populated.
+     * The whole batch is created in one transaction (all-or-nothing). The only 409 this endpoint
+     * returns is {@code DUPLICATE_SERVICE} — a batch item whose service type the master already
+     * offers.
      */
-    @Operation(summary = "Bulk-create a salon master's services (first-time setup)",
+    @Operation(summary = "Bulk-create a salon master's services",
             description = "Creates every selected service for the given master in one "
-                    + "transaction. Only valid when the master has no active services yet "
-                    + "(409 otherwise).")
+                    + "transaction (all-or-nothing). Additive — callable whether or not the "
+                    + "master already has services.")
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
             // COMPLETE response set — without this it drops the auto-derived typed body and
@@ -247,7 +328,11 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "503", description = BULK_LOCK_TIMEOUT_503),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/salons/{salonId}/masters/{masterId}/services/bulk")
     @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
@@ -261,6 +346,16 @@ public class ServiceController {
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // useReturnTypeSchema=true on a ResponseEntity<Void> re-states exactly what springdoc
+            // already derives (an empty 200) — it is declared only so the 429 below is not the
+            // lone @ApiResponse, which springdoc would treat as the COMPLETE response set and use
+            // to drop the success response from the spec entirely.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
     @DeleteMapping("/services/{serviceDefId}")
     // Role-only fast gate here; ownership is enforced once inside the service against the
     // already-needed findOwnerUserId projection (anti-bug §D split — no duplicate SpEL
@@ -298,7 +393,9 @@ public class ServiceController {
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_409,
-                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class)))
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
     })
     @PatchMapping("/services/{serviceDefId}")
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
@@ -318,6 +415,14 @@ public class ServiceController {
      * enforces {@code https://} scheme and a 2048-character length cap at the DTO
      * boundary (anti-bug §A URL-field rule).
      */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Same lone-@ApiResponse guard as every other write endpoint in this file — see
+            // assignServiceToMaster above.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
     @PatchMapping("/services/{serviceDefId}/photo")
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServicePhoto(

@@ -661,6 +661,73 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // notifyClosureReminder (Phase 29.5)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("notifyClosureReminder targets the PROVIDER (email + push), never the client")
+    void should_targetProviderWithBookingUrl_when_notifyClosureReminderCalled() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+        String bookingId = booking.getId().toString();
+        String expectedUrl = FRONTEND_BASE_URL + "/bookings/" + bookingId;
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClosureReminder(booking);
+
+        // Email is addressed to the MASTER (provider), never the client — this is a work-queue
+        // nudge, not a customer-facing message.
+        verify(emailService).sendClosureReminderEmail(eq("master@example.com"), eq(booking), urlCaptor.capture());
+        assertThat(urlCaptor.getValue()).isEqualTo(expectedUrl);
+        assertThat(urlCaptor.getValue()).startsWith("https://");
+        // Never routed to the client-facing review email.
+        verify(emailService, never()).sendReviewRequestEmail(anyString(), any(), anyString());
+
+        // Push is delivered to the PROVIDER's user id with a CLOSURE_REMINDER payload.
+        verify(pushService).sendToUser(
+                eq(masterUserId),
+                eq("Позначте візит"),
+                anyString(),
+                eq(Map.of("type", "CLOSURE_REMINDER", "bookingId", bookingId))
+        );
+        verifyNoMoreInteractions(smsService);
+    }
+
+    @Test
+    @DisplayName("notifyClosureReminder falls back to the guest identity (no NPE) for a null-client guest booking")
+    void should_useGuestIdentity_when_notifyClosureReminderForGuestBooking() {
+        // A guest (LINK) booking still has a real master to nudge — only the client account is
+        // absent (V89 chk_bookings_guest_fields) — so unlike notifyReviewRequested this must NOT
+        // no-op; it must still notify the provider, using the guest's name in the copy.
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildGuestBookingMock(masterUserId, "Олена", "Коваль");
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClosureReminder(booking);
+
+        verify(emailService).sendClosureReminderEmail(anyString(), eq(booking), anyString());
+        verify(pushService).sendToUser(eq(masterUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .as("push body must carry the guest's name, not throw or read a null client")
+                .contains("Олена Коваль");
+    }
+
+    @Test
+    @DisplayName("notifyClosureReminder truncates the push body when the service name is very long")
+    void should_truncatePushBody_when_notifyClosureReminderServiceNameExceeds256Chars() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.CONFIRMED);
+        when(booking.getMasterService().getServiceDefinition().getName()).thenReturn("А".repeat(500));
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClosureReminder(booking);
+
+        verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
+        String body = bodyCaptor.getValue();
+        assertThat(body.length()).isLessThanOrEqualTo(256);
+        assertThat(body).endsWith("…");
+    }
+
+    // -------------------------------------------------------------------------
     // sendInviteEmail
     // -------------------------------------------------------------------------
 

@@ -235,12 +235,39 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * not on {@link Master}) without a lazy load or LazyInitializationException
      * (Anti-Bug §E). Filters {@code isActive = true} so a deactivated master's
      * public booking page returns 404.
+     *
+     * <p><b>SALON-ACTIVE GUARD (2026-08 security re-audit HIGH).</b> The
+     * {@code (s IS NULL OR s.isActive = true)} term is the JPQL mirror of
+     * {@link com.beautica.booking.domain.MasterBookability#isBookable(Master)} — see that class
+     * for the rule and why the two must never diverge. It is enforced HERE, in the finder, rather
+     * than in each caller, because BOTH public slug surfaces share this one query and each had a
+     * different gap: {@code GuestBookingService#createGuestBooking} ({@code POST /book/{slug}/booking},
+     * {@code permitAll}) filtered only {@code Master::isActive}, and {@code BookingSlugService#findBySlug}
+     * ({@code GET /book/{slug}/info}) filtered NOTHING at all. {@code MasterService#createMasterFromInvite}
+     * mints a booking slug for every {@code SALON_MASTER}, so a closed salon's staff otherwise keep
+     * live, publicly bookable links.
+     *
+     * <p><b>This query is now the SOLE enforcement point for both surfaces.</b>
+     * {@code GuestBookingService} has since dropped the {@code .filter(Master::isActive)} it
+     * applied on top — a strictly weaker duplicate of the {@code m.isActive} term below — so
+     * neither caller re-checks anything. Deleting either predicate here silently re-opens the
+     * corresponding public hole. Both terms are pinned by
+     * {@code MasterRepositoryBookingSlugTest}, which is a real query test precisely because a
+     * Mockito stub of this method cannot observe a WHERE clause.
+     *
+     * <p><b>The join MUST be {@code LEFT}.</b> Writing the predicate as the implicit path
+     * {@code m.salon.isActive = true} compiles to an INNER join on Hibernate 6 and would silently
+     * drop every {@code INDEPENDENT_MASTER} (who has no salon) from their own booking page. The
+     * fetch is a to-one join — it adds columns, never rows, so there is no cartesian risk on this
+     * single-row PK/slug lookup, and it initialises {@code salon} for the guard without a lazy load.
      */
     @Query("""
             SELECT m FROM Master m
             JOIN FETCH m.user
+            LEFT JOIN FETCH m.salon s
             WHERE m.bookingSlug = :slug
               AND m.isActive = true
+              AND (s IS NULL OR s.isActive = true)
             """)
     Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
 }

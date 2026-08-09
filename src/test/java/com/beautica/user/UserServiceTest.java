@@ -1,6 +1,7 @@
 package com.beautica.user;
 
 import com.beautica.auth.Role;
+import com.beautica.common.RatingBucket;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -12,6 +13,8 @@ import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
+import com.beautica.review.repository.ClientReviewRepository;
+import com.beautica.review.repository.RatingCountProjection;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
@@ -22,6 +25,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.math.BigDecimal;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -54,12 +59,16 @@ class UserServiceTest {
     @Mock
     private CacheManager cacheManager;
 
+    @Mock
+    private ClientReviewRepository clientReviewRepository;
+
     private UserService userService;
 
     @BeforeEach
     void setUp() {
         userService = new UserService(
-                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager);
+                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager,
+                clientReviewRepository);
     }
 
     @Test
@@ -216,6 +225,77 @@ class UserServiceTest {
                 .hasMessage("User not found");
 
         verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("getMyRating returns all-zero buckets and null avgRating when the caller has never been reviewed")
+    void should_returnAllZeroBuckets_when_userNeverReviewed() {
+        UUID userId = UUID.randomUUID();
+        UserRatingProjection projection = mock(UserRatingProjection.class);
+        when(projection.getAvgRating()).thenReturn(null);
+        when(projection.getReviewCount()).thenReturn(0);
+
+        when(userRepository.findRatingById(userId)).thenReturn(Optional.of(projection));
+        when(clientReviewRepository.countBySubjectClientIdGroupByRating(userId)).thenReturn(List.of());
+
+        UserRatingResponse response = userService.getMyRating(userId);
+
+        assertThat(response.avgRating()).isNull();
+        assertThat(response.reviewCount()).isZero();
+        assertThat(response.ratingDistribution())
+                .as("a never-reviewed user gets all 5 buckets present, each zero-filled — never an empty list")
+                .containsExactly(
+                        new RatingBucket(5, 0L),
+                        new RatingBucket(4, 0L),
+                        new RatingBucket(3, 0L),
+                        new RatingBucket(2, 0L),
+                        new RatingBucket(1, 0L));
+    }
+
+    @Test
+    @DisplayName("getMyRating zero-fills missing buckets and preserves 5-down-to-1 ordering when only some ratings exist")
+    void should_zeroFillMissingBuckets_when_someRatingsExist() {
+        UUID userId = UUID.randomUUID();
+        UserRatingProjection projection = mock(UserRatingProjection.class);
+        when(projection.getAvgRating()).thenReturn(new BigDecimal("4.50"));
+        when(projection.getReviewCount()).thenReturn(4);
+
+        RatingCountProjection fiveStar = mock(RatingCountProjection.class);
+        when(fiveStar.getRating()).thenReturn(5);
+        when(fiveStar.getCount()).thenReturn(3L);
+        RatingCountProjection threeStar = mock(RatingCountProjection.class);
+        when(threeStar.getRating()).thenReturn(3);
+        when(threeStar.getCount()).thenReturn(1L);
+
+        when(userRepository.findRatingById(userId)).thenReturn(Optional.of(projection));
+        when(clientReviewRepository.countBySubjectClientIdGroupByRating(userId))
+                .thenReturn(List.of(fiveStar, threeStar));
+
+        UserRatingResponse response = userService.getMyRating(userId);
+
+        assertThat(response.avgRating()).isEqualByComparingTo("4.50");
+        assertThat(response.reviewCount()).isEqualTo(4);
+        assertThat(response.ratingDistribution())
+                .containsExactly(
+                        new RatingBucket(5, 3L),
+                        new RatingBucket(4, 0L),
+                        new RatingBucket(3, 1L),
+                        new RatingBucket(2, 0L),
+                        new RatingBucket(1, 0L));
+    }
+
+    @Test
+    @DisplayName("getMyRating throws NotFoundException when user does not exist")
+    void should_throwNotFoundException_when_ratingUserNotFound() {
+        UUID userId = UUID.randomUUID();
+
+        when(userRepository.findRatingById(userId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> userService.getMyRating(userId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessage("User not found");
+
+        verify(clientReviewRepository, never()).countBySubjectClientIdGroupByRating(any());
     }
 
     @Test

@@ -140,6 +140,12 @@ class BookingServiceCacheTest {
     // leg of a multi-service visit. The eviction tests below all use single, appointment-less
     // bookings, so that branch short-circuits — this mock exists purely to satisfy the wiring.
     @MockBean AppointmentTransitionService appointmentTransitionService;
+    // Phase 30.6: AppointmentRepository entered the BookingService constructor (per-item
+    // reschedule). This sliced @SpringBootTest lists only BookingService + the prefix evictor as
+    // real beans, so every other constructor parameter must be supplied here — omitting it failed
+    // all four tests below at context load with NoSuchBeanDefinitionException, not on an assertion.
+    // The eviction paths exercised here use appointment-less bookings, so the mock is never called.
+    @MockBean com.beautica.booking.repository.AppointmentRepository appointmentRepository;
 
     /** Fixed so a test can seed a master-calendar key that really belongs to the booking's master. */
     private static final UUID MASTER_ID = UUID.randomUUID();
@@ -356,6 +362,15 @@ class BookingServiceCacheTest {
         when(booking.getPriceAtBooking()).thenReturn(new BigDecimal("200.00"));
         when(booking.getDurationMinutesAtBooking()).thenReturn(60);
         when(booking.getCreatedAt()).thenReturn(Instant.now());
+        // Freshness re-check seam (G4/G5): cancel/complete/decline/notComplete all re-probe the
+        // CURRENT row via existsConfirmedById immediately before mutating, because assertTransition
+        // only proves the status of the stale pre-load snapshot. An unstubbed mock returns false,
+        // which short-circuits to a 409 "Service changed concurrently" BEFORE any eviction runs —
+        // so without this stub these tests fail on the transition, never reaching the cache
+        // assertion they exist for. The row is declared still-CONFIRMED: no concurrent writer is
+        // being simulated here (that scenario belongs to BookingService's own concurrency tests).
+        when(bookingRepository.existsConfirmedById(bookingId))
+                .thenReturn(status == BookingStatus.CONFIRMED);
         return booking;
     }
 }

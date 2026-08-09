@@ -12,6 +12,7 @@ import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
@@ -74,8 +75,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -114,6 +117,8 @@ class BookingServiceTest {
     private ScheduleDateMath dateMath;
     @Mock
     private AppointmentTransitionService appointmentTransitionService;
+    @Mock
+    private AppointmentRepository appointmentRepository;
 
     private Clock clock;
 
@@ -131,6 +136,9 @@ class BookingServiceTest {
     private Master master;
     private ServiceDefinition serviceDef;
     private MasterServiceAssignment msa;
+
+    @Mock
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
 
     @BeforeEach
     void setUp() {
@@ -155,7 +163,9 @@ class BookingServiceTest {
                 new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 salonCatalogCacheEvictor,
                 dateMath,
-                appointmentTransitionService
+                appointmentTransitionService,
+                appointmentRepository,
+                eventPublisher
         );
 
         clientId = UUID.randomUUID();
@@ -167,6 +177,14 @@ class BookingServiceTest {
         master = buildMaster(masterId, MasterType.INDEPENDENT_MASTER);
         serviceDef = buildServiceDef(new BigDecimal("200.00"), 60, 0);
         msa = buildMsa(masterServiceId, master, serviceDef, null, null);
+
+        // G2/G4 (cycle-7 audit 2026-08-03): cancelBooking's and rescheduleBooking's freshness
+        // re-check (BookingRepository#existsConfirmedById) is now UNCONDITIONAL — it used to run
+        // only for an appointment child, so a standalone-booking test never reached it. Defaulting
+        // to "still CONFIRMED" here (lenient — most tests never touch this row, and MockitoExtension
+        // is STRICT_STUBS) keeps every pre-existing standalone-path test's intent unchanged; the
+        // dedicated negative tests for this recheck override it to false explicitly.
+        lenient().when(bookingRepository.existsConfirmedById(any())).thenReturn(true);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -479,6 +497,90 @@ class BookingServiceTest {
                 .isInstanceOf(NotFoundException.class);
     }
 
+    // ── salon-active guard on the booking write path (2026-08 security re-audit MEDIUM) ────────
+    //
+    // SalonService.deactivateSalon flips salons.is_active but does NOT cascade to
+    // masters.is_active, so a closed salon's masters all still pass Master::isActive. Before this
+    // guard, a client holding a masterServiceId (stale wish-list card, bookmarked deep link,
+    // cached catalogue page) could still create a CONFIRMED booking against a salon the owner had
+    // closed. The three tests below pin the guard AND both directions of its disjunction.
+
+    @Test
+    @DisplayName("404 NotFoundException is thrown when the master's salon was deactivated, even "
+            + "though the master row itself is still active")
+    void should_return404_when_bookingMasterOfDeactivatedSalon() {
+        // Arrange — the ONLY false flag is the salon's. masters.is_active stays true, exactly the
+        // state deactivateSalon leaves behind (it does not cascade).
+        Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
+        salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID())
+                .isActive(false)
+                .build());
+        assertThat(salonMaster.isActive())
+                .as("precondition: the master row is NOT deactivated — otherwise this test would "
+                        + "be re-testing the pre-existing Master::isActive filter")
+                .isTrue();
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster));
+
+        // Act + Assert
+        assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
+                .isInstanceOf(NotFoundException.class);
+
+        // No booking may be written, and the master service must not even be looked up — the
+        // guard is part of the same filter chain as the existence check.
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verifyNoInteractions(masterServiceRepository);
+    }
+
+    @Test
+    @DisplayName("booking still succeeds for a salon master whose salon is ACTIVE — the guard must "
+            + "not reject every salon-employed master")
+    void should_createBooking_when_masterSalonIsActive() {
+        Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
+        salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID())
+                .isActive(true)
+                .build());
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        Booking saved = buildBooking(bookingId, client, salonMaster, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).saveAndFlush(any());
+    }
+
+    @Test
+    @DisplayName("booking still succeeds for an INDEPENDENT_MASTER, who has no salon at all — the "
+            + "null branch of the guard is load-bearing, not defensive")
+    void should_createBooking_when_masterHasNoSalon() {
+        // `master` (the shared fixture) is an INDEPENDENT_MASTER with salon == null. A guard
+        // written as `m.getSalon().isActive()` would NPE here; one written as
+        // `sal.isActive() == true` would 404 every independent master in the platform.
+        assertThat(master.getSalon()).as("precondition: no salon").isNull();
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
+        Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).saveAndFlush(any());
+    }
+
     @Test
     @DisplayName("404 NotFoundException is thrown when the requested service does not belong to the master")
     void should_throwNotFoundException_when_serviceDoesNotBelongToMaster() {
@@ -712,6 +814,41 @@ class BookingServiceTest {
         verify(outboxService, never()).enqueueStatusChanged(bookingId);
     }
 
+    @Test
+    @DisplayName("declineBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
+            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
+            + "save, no mutation, no notification. Coverage gap (backend-qa, cycle-7 batch): G4 gave "
+            + "cancelBooking/rescheduleBooking a dedicated unit test for this exact false branch (see "
+            + "should_throw409AndNeverSave_when_cancelBookingFreshnessRecheckFailsForStandaloneBooking "
+            + "above) but G5 — the reverse direction, closed by routing declineBookingCore/"
+            + "completeBooking/notCompleteBooking through the SAME isStillConfirmed seam — had none; "
+            + "the only prior coverage was the real-DB, virtual-thread "
+            + "BookingProviderTransitionCancelRaceConcurrencyIT, with no fast deterministic signal.")
+    void should_throw409AndNeverSave_when_declineBookingFreshnessRecheckFailsForStandaloneBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, "Unavailable");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
+        // moved this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.declineBooking(actorId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
+                        + "client's cancellation")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(booking.getProviderComment())
+                .as("providerComment must never be written once the recheck aborts")
+                .isNull();
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+    }
+
     // ── declineBookingForBatch (2026-07-26 schedule-override-conflict perf fix) ──────────────────
     // Package-private batched-decline counterpart of declineBooking, used only by
     // ScheduleOverrideConflictService to decline many standalone bookings for the same master
@@ -848,6 +985,37 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("completeBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
+            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
+            + "save, no outbox events. Coverage gap (backend-qa, cycle-7 batch) — the completeBooking "
+            + "counterpart of declineBooking's identical new test above; see that test's Javadoc for "
+            + "why the real-DB concurrency IT alone is not a substitute for this fast, deterministic "
+            + "signal.")
+    void should_throw409AndNeverSave_when_completeBookingFreshnessRecheckFailsForStandaloneBooking() {
+        UUID actorId = UUID.randomUUID();
+        // Phase 27.1: assertElapsedForComplete requires now >= startsAt — an elapsed fixture, so the
+        // 409 below is proven to come from the freshness recheck, not the elapsed guard.
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
+        // moved this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.completeBooking(actorId, bookingId))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
+                        + "client's cancellation")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+        verify(outboxService, never()).enqueueReviewRequested(any());
+    }
+
+    @Test
     @DisplayName("revenue-dashboard cache is evicted for the actor when a booking is completed")
     void should_evictRevenueDashboardCache_when_bookingCompleted() {
         // Arrange
@@ -952,6 +1120,38 @@ class BookingServiceTest {
                 .as("status must remain unchanged after a rejected not-complete transition")
                 .isEqualTo(BookingStatus.DECLINED);
         verify(outboxService, never()).enqueueStatusChanged(bookingId);
+    }
+
+    @Test
+    @DisplayName("notCompleteBooking — G5 freshness re-check rejects a STANDALONE booking a concurrent "
+            + "client cancel already moved off CONFIRMED between the load and this recheck: 409, no "
+            + "save, no outbox events. Coverage gap (backend-qa, cycle-7 batch) — the "
+            + "notCompleteBooking counterpart of declineBooking's identical new test above; see that "
+            + "test's Javadoc for why the real-DB concurrency IT alone is not a substitute for this "
+            + "fast, deterministic signal.")
+    void should_throw409AndNeverSave_when_notCompleteBookingFreshnessRecheckFailsForStandaloneBooking() {
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent client cancel already
+        // moved this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.notCompleteBooking(actorId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite of the "
+                        + "client's cancellation")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        assertThat(booking.getProviderComment())
+                .as("providerComment must never be written once the recheck aborts")
+                .isNull();
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
     }
 
     @Test
@@ -1118,6 +1318,9 @@ class BookingServiceTest {
         when(bookingRepository.save(any())).thenReturn(booking);
         when(appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId))
                 .thenReturn(true);
+        // F1 freshness re-check (cycle-6 audit 2026-08-03) — this child is still CONFIRMED as of
+        // the post-lock scalar probe (no concurrent writer raced this test's single-threaded call).
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(true);
 
         bookingService.cancelBooking(clientId, bookingId, req);
 
@@ -1146,6 +1349,122 @@ class BookingServiceTest {
         bookingService.cancelBooking(clientId, bookingId, req);
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        verifyNoInteractions(appointmentTransitionService);
+    }
+
+    @Test
+    @DisplayName("cancelBooking — G4 freshness re-check rejects a STANDALONE booking that already left "
+            + "CONFIRMED between the load and this recheck: 409, no save, no mutation, no notification. "
+            + "Coverage gap (backend-qa, cycle-7 batch): every prior negative-freshness test exercised "
+            + "the appointment-child path only (e.g. AppointmentTransitionServiceTest's post-lock "
+            + "freshness-loss case) — this is the standalone counterpart for cancelBooking.")
+    void should_throw409AndNeverSave_when_cancelBookingFreshnessRecheckFailsForStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent writer already moved
+        // this row off CONFIRMED between the load above and this recheck.
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.cancelBooking(clientId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStatus())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+        verify(outboxService, never()).enqueueStatusChanged(any());
+        verifyNoInteractions(appointmentTransitionService);
+    }
+
+    // ── phase 30.2 — reschedule header lock (closes the latent lock-order defect) ──────────────
+    //
+    // rescheduleBooking already moved a single appointment child, but — unlike cancelBooking above
+    // — never locked the visit HEADER, inverting the canonical appointments-before-bookings lock
+    // order. These two tests are the executable form of the "zero extra statements on the legacy
+    // path" guard: an appointment-child reschedule MUST invoke the new header-lock seam, and a
+    // standalone (appointment == null) reschedule MUST NEVER invoke it.
+
+    @Test
+    @DisplayName("rescheduling an appointment CHILD locks the visit header via "
+            + "AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule BEFORE the "
+            + "client/master advisory locks — canonical appointments-before-bookings lock order "
+            + "(phase 30.2, cycle-2 audit finding 1)")
+    void should_lockAppointmentHeaderBeforeItemReschedule_when_reschedulingAppointmentChild() {
+        UUID appointmentId = UUID.randomUUID();
+        Appointment appointment = Appointment.builder().id(appointmentId).build();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        booking.setAppointment(appointment);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId))
+                .thenReturn(true);
+
+        bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        InOrder inOrder = inOrder(appointmentTransitionService, bookingRepository);
+        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(appointmentId);
+        inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        inOrder.verify(bookingRepository).saveAndFlush(any());
+        // No phase-2 collapse call exists for reschedule (phase 30.2 D2) — the item stays CONFIRMED.
+        verify(appointmentTransitionService, never())
+                .collapseAppointmentHeaderAfterClientItemCancel(any(), anyBoolean(), any());
+    }
+
+    @Test
+    @DisplayName("rescheduling a LEGACY standalone booking (appointment_id NULL) never touches "
+            + "AppointmentTransitionService — zero extra statements on the non-appointment path "
+            + "(phase 30.2 D3)")
+    void should_notInteractWithAppointmentTransitionService_when_reschedulingLegacyStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        bookingService.rescheduleBooking(clientId, bookingId, req);
+
+        assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
+        verifyNoInteractions(appointmentTransitionService);
+    }
+
+    @Test
+    @DisplayName("rescheduleBooking — G4 freshness re-check rejects a STANDALONE booking that already "
+            + "left CONFIRMED between the load and this recheck: 409, no advisory locks, no save, no "
+            + "mutation. Coverage gap (backend-qa, cycle-7 batch) — the standalone counterpart of "
+            + "cancelBooking's identical new test above; every prior negative-freshness test exercised "
+            + "the appointment-child path only.")
+    void should_throw409AndNeverAcquireLocksOrSave_when_rescheduleBookingFreshnessRecheckFailsForStandaloneBooking() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent writer already moved
+        // this row off CONFIRMED between the load above and this recheck (which runs BEFORE the
+        // client/master advisory locks and existsOverlapExcluding — see rescheduleBooking's Javadoc).
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .as("a lost freshness race must surface as a clean 409, not a silent overwrite")
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStartsAt())
+                .as("the in-memory entity must be left untouched — no partial mutation before the throw")
+                .isNotEqualTo(newStartsAt);
+        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
+        verify(bookingRepository, never()).acquireAdvisoryLock(any());
+        verify(bookingRepository, never()).saveAndFlush(any());
         verifyNoInteractions(appointmentTransitionService);
     }
 
@@ -1923,7 +2242,13 @@ class BookingServiceTest {
                 null,
                 null,
                 // clientAvatarUrl — the CLIENT projection path's own photo column.
-                "https://cdn.test/client-avatar.png");
+                "https://cdn.test/client-avatar.png",
+                // Phase B1 — a REVIEWED master (count > 0), so the zero-review normalisation is
+                // not the branch under test here; the null case has its own test below.
+                new BigDecimal("4.75"), 12,
+                // Phase B2 salonId — this fixture is an INDEPENDENT_MASTER row, so null is the
+                // correct value; the salon case has its own fixture below.
+                null);
     }
 
     @Test
@@ -1988,6 +2313,10 @@ class BookingServiceTest {
                 priceMaxAtBooking,
                 null,
                 // clientAvatarUrl — irrelevant to this fixture's price-ceiling assertions.
+                null,
+                // Phase B1 masterAvgRating/masterReviewCount — irrelevant here too.
+                new BigDecimal("4.20"), 3,
+                // Phase B2 salonId — irrelevant to price-ceiling assertions.
                 null);
     }
 
@@ -2026,6 +2355,119 @@ class BookingServiceTest {
         assertThat(booking.priceMaxAtBooking()).isNull();
     }
 
+    // ── Phase B1 — master rating on the CLIENT projection path ────────────────────────────────
+    //    The projection selects masters.avg_rating RAW; the service must apply the SAME
+    //    zero-review-to-null rule the entity path applies, via the one shared helper, so
+    //    GET /bookings/me and GET /bookings/{id} can never disagree about a master's rating.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithRating(
+            java.math.BigDecimal masterAvgRating, int masterReviewCount) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false,
+                null,
+                null,
+                null,
+                masterAvgRating, masterReviewCount,
+                // Phase B2 salonId — irrelevant to the rating normalisation.
+                null);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) surfaces the master's stored avgRating/reviewCount from the projection")
+    void should_surfaceMasterRating_when_clientProjectionRowHasReviews() {
+        var booking = firstClientRowFor(clientProjectionRowWithRating(new BigDecimal("4.75"), 12));
+
+        assertThat(booking.masterAvgRating()).isEqualByComparingTo(new BigDecimal("4.75"));
+        assertThat(booking.masterReviewCount()).isEqualTo(12);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) nulls the master's avgRating when reviewCount is 0 — the "
+            + "0.00 the column stores for an unreviewed master must never reach the wire")
+    void should_returnNullMasterAvgRating_when_clientProjectionRowHasNoReviews() {
+        var booking = firstClientRowFor(clientProjectionRowWithRating(new BigDecimal("0.00"), 0));
+
+        assertThat(booking.masterAvgRating()).isNull();
+        assertThat(booking.masterReviewCount()).isZero();
+    }
+
+    // ── Phase B2 — the booking's salon snapshot on the CLIENT projection path ──────────────────
+    //    The projection selects b.salon.id (the BOOKING's own FK), not s.id off the master's live
+    //    salon join. The service must pass it through untouched so GET /bookings/me and
+    //    GET /bookings/{id} carry the same key the mobile client uses to invalidate its
+    //    salon-scoped review caches. Phase 242: salonName now rides the SAME b.salon alias, so
+    //    the "two independent salon sources" framing these tests were written around is retired.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithSalon(
+            UUID salonId, String salonName) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.SALON_MASTER, salonName,
+                null, null, "Khreschatyk", "10",
+                null,
+                "MANICURE", false,
+                null,
+                null,
+                null,
+                new BigDecimal("4.20"), 3,
+                salonId);
+    }
+
+    /**
+     * Phase 242 retired the "the two can disagree" case. This test used to have a sibling,
+     * {@code should_keepSalonIdAndSalonNameIndependent_when_theyDisagree}, built on the premise
+     * that {@code salonId} came from {@code b.salon} while {@code salonName} came from
+     * {@code m.salon}, so a post-rotation row carried two different salons. Both now ride the same
+     * {@code LEFT JOIN b.salon} alias and cannot disagree — the premise is gone, and with it the
+     * only thing that distinguished the two tests (they were already flagged as near-duplicates by
+     * backend-qa on phase 241). One passthrough test remains: the SERVICE must hand both fields
+     * through untouched, deriving neither from the other.
+     *
+     * <p>Whether the QUERY selects the right salon is not this test's job — that is
+     * {@code ClientBookingDetailProjectionTest}'s rotation test, against real Postgres.
+     */
+    @Test
+    @DisplayName("getMyBookings (CLIENT) passes the projection's salonId AND salonName through "
+            + "untouched, deriving neither from the other")
+    void should_surfaceSalonId_when_clientProjectionRowCarriesSalon() {
+        UUID salonId = UUID.randomUUID();
+
+        var booking = firstClientRowFor(clientProjectionRowWithSalon(salonId, "Salon Bookings"));
+
+        assertThat(booking.salonId()).isEqualTo(salonId);
+        assertThat(booking.salonName()).isEqualTo("Salon Bookings");
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) leaves salonId null for an independent master's booking — "
+            + "the row is still returned, never filtered out")
+    void should_returnNullSalonId_when_clientProjectionRowHasNoSalon() {
+        var booking = firstClientRowFor(clientProjectionRowWithSalon(null, null));
+
+        assertThat(booking.salonId()).isNull();
+        assertThat(booking.id()).isEqualTo(bookingId);
+    }
+
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
             UUID id, String serviceName) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -2045,6 +2487,10 @@ class BookingServiceTest {
                 null,
                 null,
                 // clientAvatarUrl — irrelevant to this fixture's ordering assertions.
+                null,
+                // Phase B1 masterAvgRating/masterReviewCount — irrelevant to ordering.
+                new BigDecimal("4.20"), 3,
+                // Phase B2 salonId — irrelevant to ordering.
                 null);
     }
 
@@ -2915,8 +3361,15 @@ class BookingServiceTest {
     // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5) ──
     //
     // providerCanReviewClient = authz.hasProviderAuthorityOverBooking(actor, booking)
-    //     && status == COMPLETED && booking.getClient() != null
+    //     && BookingClosureRule.isReviewEligible(status, endsAt, now)
+    //     && booking.getClient() != null
     //     && !clientReviewRepository.existsByBookingId(booking.getId())
+    //
+    // isReviewEligible = (status == COMPLETED) OR (status == CONFIRMED && endsAt.isBefore(now)) —
+    // widened by the same fix already applied to the client-side canReview/ReviewService path
+    // (mirrored bug: a booking that ages into Past by elapsed time but is never closed by the
+    // provider must still be reviewable). See the dedicated ELAPSED-true / FUTURE-false /
+    // NOT_COMPLETED-still-false cases below.
     //
     // ProviderCanReviewClientIT already pins this end-to-end through real HTTP + role/authority
     // resolution. These cases isolate BookingService#computeProviderCanReviewClient itself via a
@@ -2958,11 +3411,14 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("providerCanReviewClient is false for a CONFIRMED (not COMPLETED) booking, even with provider authority — and the review-existence check is never reached")
-    void should_returnProviderCanReviewClientFalse_when_bookingNotCompleted() {
+    @DisplayName("providerCanReviewClient is false for a CONFIRMED booking whose endsAt has NOT "
+            + "yet elapsed (not COMPLETED, not awaiting closure), even with provider authority — "
+            + "and the review-existence check is never reached")
+    void should_returnProviderCanReviewClientFalse_when_bookingConfirmedAndNotYetElapsed() {
+        // buildBooking pins startsAt = now+2h / endsAt = now+3h — a genuinely FUTURE booking.
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        // CONFIRMED (not COMPLETED) short-circuits canReview before its own review-existence
+        // Not review-eligible short-circuits canReview before its own review-existence
         // query too — no reviewRepository stub needed here.
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
@@ -2970,6 +3426,49 @@ class BookingServiceTest {
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
         assertThat(result.providerCanReviewClient()).isFalse();
+        verify(clientReviewRepository, never()).existsByBookingId(any());
+        verify(reviewRepository, never()).existsByBookingId(any());
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is true for a CONFIRMED booking whose endsAt has already "
+            + "ELAPSED, even though the provider never marked it COMPLETED — the bug fix mirrored "
+            + "from the client-side canReview/ReviewService widening")
+    void should_returnProviderCanReviewClientTrue_when_bookingConfirmedButElapsed() {
+        // buildBookingStartingAt with a past startsAt yields endsAt = startsAt + 1h, still
+        // strictly before "now" (clock is fixed at Instant.now() in setUp) for a 3h-ago start.
+        Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.CONFIRMED,
+                ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+        when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient())
+                .as("an elapsed-but-unclosed CONFIRMED booking must offer the provider-review CTA, "
+                        + "same as the client-side canReview flag already does for this row shape")
+                .isTrue();
+        verify(clientReviewRepository).existsByBookingId(bookingId);
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient stays false for a NOT_COMPLETED (no-show) booking even "
+            + "with an elapsed endsAt and provider authority — guards against over-widening "
+            + "isReviewEligible beyond CONFIRMED")
+    void should_returnProviderCanReviewClientFalse_when_bookingNotCompletedNoShow() {
+        Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.NOT_COMPLETED,
+                ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
+
+        BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
+
+        assertThat(result.providerCanReviewClient())
+                .as("NOT_COMPLETED is an explicit no-show marking, never reviewable regardless of endsAt")
+                .isFalse();
         verify(clientReviewRepository, never()).existsByBookingId(any());
         verify(reviewRepository, never()).existsByBookingId(any());
     }
@@ -3071,7 +3570,8 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("getBooking surfaces the salon name and salon-primary address/labels for a salon-employed master")
+    @DisplayName("getBooking surfaces the BOOKED salon's name and address/labels — never the "
+            + "master's own row, and never the salon the master has since rotated to")
     void should_populateSalonFields_when_salonEmployedMasterBooking() {
         UUID salonCityId = UUID.randomUUID();
         UUID salonDistrictId = UUID.randomUUID();
@@ -3090,9 +3590,23 @@ class BookingServiceTest {
                 .locationNote("3rd floor, door code 1234")
                 .isActive(true)
                 .build();
-        setField(enriched, "salon", salon);
+        // Phase 242 — the master has SINCE ROTATED to another salon, whose address and door code
+        // must not surface anywhere. masters.salon_id moves; bookings.salon_id is a snapshot and
+        // does not. Stamping only master.salon (as this fixture used to) would let a
+        // master.getSalon()-sourced implementation pass.
+        com.beautica.salon.entity.Salon rotatedToSalon = com.beautica.salon.entity.Salon.builder()
+                .name("Rotated-To Studio - must NOT surface")
+                .cityId(UUID.randomUUID())
+                .districtId(UUID.randomUUID())
+                .street("RotatedStreet - must NOT surface")
+                .buildingNo("77")
+                .locationNote("Rotated-to door code 9999 - must NOT surface")
+                .isActive(true)
+                .build();
+        setField(enriched, "salon", rotatedToSalon);
         MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
         Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.CONFIRMED);
+        setField(booking, "salon", salon);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         // CONFIRMED (not COMPLETED) short-circuits canReview before the review-existence query —
         // no reviewRepository stub needed here.
@@ -3119,6 +3633,15 @@ class BookingServiceTest {
                         "Volodymyrska",
                         "55",
                         "3rd floor, door code 1234");
+        // The negatives, explicitly: neither the rotated-to salon nor the master's personal row
+        // may reach any of these fields. A positive-only check passes on a wrong-source
+        // implementation whenever two fixtures happen to agree.
+        assertThat(result.locationNote())
+                .isNotEqualTo("Rotated-to door code 9999 - must NOT surface")
+                .isNotEqualTo("Master's own note - must NOT surface");
+        assertThat(result.salonName()).isNotEqualTo("Rotated-To Studio - must NOT surface");
+        assertThat(result.street()).isNotEqualTo("RotatedStreet - must NOT surface")
+                .isNotEqualTo("OwnStreet");
     }
 
     @Test
@@ -3138,5 +3661,112 @@ class BookingServiceTest {
         assertThat(result.clientId()).isNull();
         assertThat(result.masterProfessionalTitle()).isNull();
         assertThat(result.locationNote()).isNull();
+    }
+
+    // ── cancelAppointmentItem (phase 30.6) — appointment-scoped per-item cancel ─────────────────
+    //
+    // Reached via PATCH /appointments/{appointmentId}/services/{bookingId}/cancel. Adds exactly
+    // two guards (visit ownership, path consistency) then delegates to cancelBooking VERBATIM —
+    // these tests pin the guard ordering and the non-forked delegation, never re-testing
+    // cancelBooking's own body (that is already covered above).
+
+    @Test
+    @DisplayName("cancelAppointmentItem — a foreign visit (client_id belongs to someone else) is "
+            + "a 403 and cancelBooking's own load is never reached")
+    void should_throwForbidden_when_cancelAppointmentItemCalledOnForeignVisit() {
+        UUID appointmentId = UUID.randomUUID();
+        UUID foreignClientId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(foreignClientId));
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        // Perf audit F2 (cross-batch): the dedicated existsByIdAndAppointmentId probe was removed —
+        // path consistency now folds into this SAME findByIdWithFullGraph call, so asserting it is
+        // never reached also proves the (now-deleted) exists probe's job never ran either.
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — a missing/guest appointment id collapses to the SAME "
+            + "uniform 403 as a foreign visit (no existence oracle)")
+    void should_throwForbidden_when_cancelAppointmentItemCalledWithMissingOrGuestAppointment() {
+        UUID appointmentId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(bookingRepository, never()).findByIdWithFullGraph(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — bookingId is not a child of appointmentId is a 404, "
+            + "reached only AFTER visit ownership is already established, and nothing is mutated "
+            + "(perf audit F2: path consistency is now checked in-memory on the SAME "
+            + "findByIdWithFullGraph load the mutation would have used, not a separate exists probe)")
+    void should_throwNotFound_when_cancelAppointmentItemTargetIsNotAChildOfAppointment() {
+        UUID appointmentId = UUID.randomUUID();
+        UUID otherAppointmentId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        Booking foreignChild = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        foreignChild.setAppointment(Appointment.builder().id(otherAppointmentId).build());
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(foreignChild));
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(NotFoundException.class);
+
+        assertThat(foreignChild.getStatus())
+                .as("a bookingId belonging to a DIFFERENT appointment must not be mutated")
+                .isEqualTo(BookingStatus.CONFIRMED);
+        verify(bookingRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — a bookingId that does not exist at all is the SAME 404 as "
+            + "one that exists under a different appointment (findByIdWithFullGraph empty)")
+    void should_throwNotFound_when_cancelAppointmentItemTargetDoesNotExist() {
+        UUID appointmentId = UUID.randomUUID();
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null);
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(bookingRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("cancelAppointmentItem — happy path reuses cancelBooking's shared mutation body with "
+            + "the ALREADY-loaded, path-verified Booking (perf audit F2: findByIdWithFullGraph is "
+            + "called exactly ONCE for the whole operation, not once for the exists-style check and "
+            + "once more inside cancelBooking) — outcome is byte-for-byte the same as before (phase "
+            + "30.6 D1/D6)")
+    void should_delegateToCancelBookingUnchanged_when_cancelAppointmentItemAuthorized() {
+        UUID appointmentId = UUID.randomUUID();
+        Appointment appointment = Appointment.builder().id(appointmentId).build();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        booking.setAppointment(appointment);
+        CancelBookingRequest req = new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, "не потрібно");
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+        when(appointmentTransitionService.lockAppointmentHeaderBeforeClientItemCancel(appointmentId))
+                .thenReturn(true);
+        // F1 freshness re-check (cycle-6 audit 2026-08-03) — this child is still CONFIRMED as of
+        // the post-lock scalar probe (no concurrent writer raced this test's single-threaded call).
+        when(bookingRepository.existsConfirmedById(bookingId)).thenReturn(true);
+
+        BookingResponse result = bookingService.cancelAppointmentItem(clientId, appointmentId, bookingId, req);
+
+        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+        assertThat(result.id()).isEqualTo(bookingId);
+        verify(appointmentTransitionService)
+                .collapseAppointmentHeaderAfterClientItemCancel(appointmentId, true, "не потрібно");
+        verify(bookingRepository, times(1)).findByIdWithFullGraph(bookingId);
     }
 }

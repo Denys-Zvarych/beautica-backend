@@ -65,7 +65,7 @@ class CancelPostRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
         // constructor (now includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets,
         // Phase A5). The cancel-POST throttle the fix adds is internal to the filter (built
         // like otpVerifyBuckets / guestBookingBuckets), so this test references no new constructor
@@ -76,7 +76,7 @@ class CancelPostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive());
+                permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postCancel() {

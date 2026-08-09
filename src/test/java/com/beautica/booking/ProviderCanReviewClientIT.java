@@ -158,17 +158,50 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("false — the booking is CONFIRMED, not COMPLETED")
-    void should_returnFalse_when_bookingIsConfirmedNotCompleted() throws Exception {
+    @DisplayName("false — the booking is CONFIRMED and its endsAt has NOT yet elapsed (not COMPLETED, not awaiting closure)")
+    void should_returnFalse_when_bookingIsConfirmedAndNotYetElapsed() throws Exception {
         Salon salon = createSalon("pcrc-confirmed-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("pcrc-confirmed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertFutureBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "CONFIRMED");
+
+        JsonNode detail = getBookingDetail(bookingId, tokenFor(salon.ownerEmail()));
+
+        assertThat(detail.path("providerCanReviewClient").asBoolean())
+                .as("a still-open, non-elapsed CONFIRMED booking can never be reviewed yet")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("true — the booking is CONFIRMED but its endsAt has already ELAPSED, even though the "
+            + "provider never marked it COMPLETED — the bug fix mirrored from the client-side "
+            + "canReview widening")
+    void should_returnTrue_when_bookingIsConfirmedButElapsed() throws Exception {
+        Salon salon = createSalon("pcrc-elapsed-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("pcrc-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
                 salon.salonId(), "CONFIRMED");
 
         JsonNode detail = getBookingDetail(bookingId, tokenFor(salon.ownerEmail()));
 
         assertThat(detail.path("providerCanReviewClient").asBoolean())
-                .as("a booking that has not reached COMPLETED can never be reviewed yet")
+                .as("an elapsed-but-unclosed CONFIRMED booking must offer the provider-review CTA")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("false — the booking is NOT_COMPLETED (no-show), even with an elapsed endsAt — "
+            + "guards against over-widening the eligibility check beyond CONFIRMED")
+    void should_returnFalse_when_bookingIsNotCompletedNoShow() throws Exception {
+        Salon salon = createSalon("pcrc-noshow-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("pcrc-noshow-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "NOT_COMPLETED");
+
+        JsonNode detail = getBookingDetail(bookingId, tokenFor(salon.ownerEmail()));
+
+        assertThat(detail.path("providerCanReviewClient").asBoolean())
+                .as("NOT_COMPLETED is an explicit no-show marking, never reviewable regardless of endsAt")
                 .isFalse();
     }
 
@@ -365,6 +398,20 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                         + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
                         + "booking_source, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, NOW() - interval '2 hours', NOW() - interval '1 hour', "
+                        + "500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, salonId, status);
+        return bookingId;
+    }
+
+    /** Same shape as {@link #insertBooking}, but with a FUTURE starts_at/ends_at — for the
+     * still-open, not-yet-elapsed CONFIRMED case that must stay unreviewable. */
+    private UUID insertFutureBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId, String status) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, NOW() + interval '1 hour', NOW() + interval '2 hours', "
                         + "500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, salonId, status);
         return bookingId;

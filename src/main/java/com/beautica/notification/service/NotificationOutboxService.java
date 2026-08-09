@@ -208,6 +208,31 @@ public class NotificationOutboxService {
         save(OutboxEventType.INVITE, inviteTokenId, payload);
     }
 
+    /**
+     * Enqueues a {@code CLOSURE_REMINDER} notification entry (Phase 29.5).
+     *
+     * <p>Writes exactly ONE row into {@code notification_outbox} and performs no other write —
+     * in particular, unlike {@link #enqueueReviewRequested(UUID)} (called from inside {@code
+     * BookingService#completeBooking}, i.e. from a transaction that has just mutated {@code
+     * booking.status}), this method is called from NO such place. It is invoked only by {@code
+     * com.beautica.booking.closure.ClosureReminderClaimService}, itself called only for booking
+     * ids an atomic native claim statement already {@code RETURNING}'d — this method never reads
+     * or writes {@code bookings.status}. See {@code ClosureReminderArchitectureTest}, the
+     * mechanical guard for that invariant.
+     *
+     * <p>Recipient resolution (the PROVIDER, never the client) lives in {@code
+     * NotificationService#notifyClosureReminder}, not here — this method only writes the outbox
+     * row; the drain worker re-hydrates the full {@link com.beautica.booking.entity.Booking}
+     * graph at send time, so no client PII is duplicated into the outbox payload.
+     *
+     * @param bookingId the UUID of the booking still awaiting provider closure
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueClosureReminder(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.CLOSURE_REMINDER, bookingId, null);
+    }
+
     // --- private helpers ---
 
     private void save(OutboxEventType eventType, UUID aggregateId, String payload) {

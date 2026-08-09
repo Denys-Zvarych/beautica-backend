@@ -32,6 +32,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -43,6 +44,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
@@ -89,6 +91,11 @@ class MasterServiceTest {
     // different question, and one a mock can never answer: it is proven against the live @Cacheable
     // proxies in CachePrefixEvictionKeyShapeTest.
     @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    // Phase 29.2 fallout: getMasterCalendar now resolves an absolute-instant "now" for
+    // BookingResponse.awaitingClosure. A real fixed-value Clock (not a bare @Mock, which would
+    // return null from #instant() and NPE) — the exact instant is irrelevant to every test in
+    // this class, none of which assert on awaitingClosure.
+    @Spy private Clock clock = Clock.systemUTC();
 
     @InjectMocks
     private MasterService masterService;

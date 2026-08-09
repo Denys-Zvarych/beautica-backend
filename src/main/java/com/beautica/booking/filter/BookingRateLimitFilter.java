@@ -25,11 +25,13 @@ import java.util.UUID;
  * /api/v1/bookings/{bookingId}/{reschedule,cancel}}, {@code PATCH
  * /api/v1/bookings/{bookingId}/{decline,not-complete}}, the WHOLE {@code PATCH
  * /api/v1/appointments/{appointmentId}/*} mutation family ({@code cancel}, {@code decline},
- * {@code services/{bookingId}/decline}, {@code complete}, {@code not-complete},
- * {@code reschedule}), and {@code PUT /api/v1/masters/{masterId}/overrides/{date}} (the
- * schedule-override write, which can bulk-decline every conflicting booking on a date). These map
- * to THREE independent buckets with different capacities, because they close different threat
- * models:
+ * {@code complete}, {@code not-complete}, {@code reschedule}) PLUS its per-item counterparts
+ * (track 30.x) at {@code services/{bookingId}/{decline,reschedule,cancel}} — all three per-item
+ * verbs are matched by the identical {@code endsWith} suffix checks as their whole-visit siblings
+ * and bucketed with them, never on a dedicated per-item budget — and {@code PUT
+ * /api/v1/masters/{masterId}/overrides/{date}} (the schedule-override write, which can bulk-decline
+ * every conflicting booking on a date). These map to THREE independent buckets with different
+ * capacities, because they close different threat models:
  *
  * <ul>
  *   <li><b>{@code bookingWriteBuckets}:</b> create/appointment-create/reschedule (both paths),
@@ -246,6 +248,16 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      * correctly. {@code /not-complete} cannot be mis-matched by the {@code "/complete"} check below:
      * the character immediately before {@code "complete"} in {@code ".../not-complete"} is a hyphen,
      * not a slash, so {@code endsWith("/complete")} is {@code false} for it.
+     *
+     * <p><b>Track 30.x — the per-item reschedule/cancel routes need no change here either.</b>
+     * {@code .../services/{bookingId}/reschedule} and {@code .../services/{bookingId}/cancel} are
+     * two-segment siblings of the {@code /decline} shape above, and the SAME {@code endsWith} logic
+     * that already bucketed the per-service decline with its whole-visit sibling buckets these two
+     * with {@code bookingWriteBuckets} alongside {@code .../{appointmentId}/reschedule} and
+     * {@code .../{appointmentId}/cancel} — no new constant, no new branch. All THREE per-item verbs
+     * ({@code /services/{bookingId}/{decline,reschedule,cancel}}) are therefore matched by the
+     * identical suffix checks as their whole-visit counterparts and are intentionally bucketed with
+     * them, never on a dedicated per-item budget.
      */
     private BucketRoute selectAppointmentPatchRoute(String path) {
         if (path.endsWith(DECLINE_SUFFIX) || path.endsWith(NOT_COMPLETE_SUFFIX)) {

@@ -599,6 +599,70 @@ class AppointmentTransitionMatrixIT extends AbstractIntegrationTest {
             assertAllItemsStatus(v.id(), "NOT_COMPLETED", 2);
             assertThat(statusChangedCount(v.id())).isEqualTo(1L);
         }
+
+        /**
+         * Regression test for {@code AppointmentTransitionService#assertVisitNotElapsedForClient}'s
+         * {@code max(endsAt)} reduction over ALL items, terminal included (phase 30.1/30.7 "the
+         * endsAt defect") — pinned here at the CLIENT whole-visit CANCEL guard specifically.
+         * {@code AppointmentItemRescheduleIT#should_reportHeaderEndsAtAsTerminalSibling_when_terminalSiblingEndsLast}
+         * already pins this reduction for the READ-side {@code AppointmentDetailResponse} projection,
+         * but nothing previously exercised it for this WRITE-side elapsed guard, which is a distinct
+         * code path ({@code assertVisitNotElapsedForClient}, not the response mapper) that could
+         * regress independently — e.g. a future refactor that narrows the guard's stream to only
+         * still-CONFIRMED items (a natural-looking "simplification" that would silently start
+         * rejecting exactly the case below).
+         */
+        @Test
+        @DisplayName("cancel — a terminal (DECLINED) sibling whose window still extends into the "
+                + "future keeps the WHOLE visit reported as NOT elapsed, even though the only "
+                + "remaining CONFIRMED item's own window already ended — max(endsAt) is computed over "
+                + "ALL items, terminal included, not just the CONFIRMED ones")
+        void should_allowClientCancel_when_terminalSiblingOutlastsTheOnlyRemainingConfirmedItem()
+                throws Exception {
+            // Both items start elapsed: item0 [-3h,-2h), item1 [-2h,-1h).
+            IndependentVisit v = seedIndependentVisit("terminal-outlasts", 2, pastStart());
+            UUID item0 = firstChildOf(v.id());
+            UUID item1 = secondChildOf(v.id());
+
+            // Push item1 — the later item — into the FUTURE (bypassing HTTP, mirrors the
+            // markOngoing/markElapsed precedent elsewhere in this package): its OWN endsAt is now
+            // ahead of "now" while item0 stays elapsed at -2h. Once item1 is declined below, it is
+            // the ONLY item whose endsAt is still in the future, yet it is no longer CONFIRMED —
+            // exactly the "terminal sibling outlasts the last CONFIRMED item" shape.
+            OffsetDateTime futureWindow = OffsetDateTime.now(ZoneOffset.UTC).plusHours(1);
+            jdbcTemplate.update(
+                    "UPDATE bookings SET starts_at = ?, ends_at = ? WHERE id = ?",
+                    futureWindow, futureWindow.plusHours(1), item1);
+
+            ResponseEntity<String> declineResp = patchServiceDecline(v.masterToken(), v.id(), item1, null);
+            assertThat(declineResp.getStatusCode())
+                    .as("provider decline of item1 must succeed — body: %s", declineResp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(childStatus(item1)).isEqualTo("DECLINED");
+            // item0 remains CONFIRMED, so the header never collapses to DECLINED.
+            assertVisitStatus(v.id(), "CONFIRMED");
+
+            // item0 (the ONLY remaining CONFIRMED item) already ended two hours ago. A regression
+            // that reduced max(endsAt) over only still-CONFIRMED items would report this visit as
+            // elapsed and reject the cancel below with 409. The locked design includes the
+            // now-DECLINED item1 — whose endsAt is still an hour in the future — in that max, so the
+            // visit must NOT be considered elapsed.
+            ResponseEntity<String> cancelResp = patch(v.clientToken(), v.id(), "cancel", "{}");
+
+            assertThat(cancelResp.getStatusCode())
+                    .as("the visit must NOT be reported as elapsed — the terminal sibling's future "
+                            + "endsAt keeps max(endsAt) in the future even though the sole CONFIRMED "
+                            + "item already ended — body: %s", cancelResp.getBody())
+                    .isEqualTo(HttpStatus.NO_CONTENT);
+            assertThat(childStatus(item0))
+                    .as("the client cancel must actually apply to the still-CONFIRMED item0")
+                    .isEqualTo("CANCELLED");
+            assertThat(childStatus(item1))
+                    .as("the already-terminal item1 is untouched by the cancel — transitionItems "
+                            + "only moves still-CONFIRMED items")
+                    .isEqualTo("DECLINED");
+            assertVisitStatus(v.id(), "CANCELLED");
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════

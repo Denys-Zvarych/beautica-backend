@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -46,4 +47,24 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
              WHERE u.id = :clientId
             """, nativeQuery = true)
     void recalculateClientRating(@Param("clientId") UUID clientId);
+
+    /**
+     * Rating-bucket counts for a client's received reviews, backing
+     * {@code UserRatingResponse}'s {@code ratingDistribution} (Phase 27.x, {@code GET
+     * /users/me/rating}). Only buckets with at least one review are returned — {@code
+     * UserService.getMyRating} zero-fills the missing 1-5 buckets so every star rating is
+     * present in the response, mirroring {@code ReviewRepository#countByMasterIdGroupByRating}
+     * exactly. No new index needed: {@code client_reviews.subject_client_id} is already indexed
+     * ({@code idx_client_reviews_subject_client}, created in {@code
+     * V128__create_client_reviews_and_user_rating.sql:33}, declared on the entity too), and this
+     * query reuses the very same column {@link #recalculateClientRating} filters on. That index
+     * covers the {@code WHERE subject_client_id = :clientId} predicate but not the {@code GROUP BY
+     * cr.rating}, so Postgres runs a small Hash Aggregate over the filtered rows — deliberate, and
+     * no composite index is warranted: the aggregated set is bounded by a single client's own
+     * lifetime review count, not by table-wide growth, and the master/salon twins ({@code
+     * ReviewRepository#countByMasterIdGroupByRating} / {@code #countBySalonIdGroupByRating}) take
+     * the same approach.
+     */
+    @Query("SELECT cr.rating AS rating, COUNT(cr) AS count FROM ClientReview cr WHERE cr.subjectClient.id = :clientId GROUP BY cr.rating")
+    List<RatingCountProjection> countBySubjectClientIdGroupByRating(@Param("clientId") UUID clientId);
 }

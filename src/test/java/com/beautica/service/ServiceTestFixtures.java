@@ -232,6 +232,19 @@ class ServiceTestFixtures {
         return count == null ? 0L : count;
     }
 
+    /**
+     * Reads the denormalised {@code masters.min_effective_price} (V58) straight from the DB —
+     * never through an API projection, so the assertion pins the persisted column that the
+     * search/browse ordering actually reads, not a value recomputed on the way out.
+     *
+     * @return {@code null} when the master has no active service (the column's "no bookable
+     *         price" encoding)
+     */
+    BigDecimal minEffectivePriceForMaster(UUID masterId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT min_effective_price FROM masters WHERE id = ?", BigDecimal.class, masterId);
+    }
+
     record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
     }
 

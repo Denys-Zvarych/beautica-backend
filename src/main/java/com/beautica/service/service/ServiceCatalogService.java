@@ -33,9 +33,11 @@ import com.beautica.service.repository.PlatformCategoryRepository;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
@@ -56,6 +58,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class ServiceCatalogService {
 
@@ -250,14 +253,17 @@ public class ServiceCatalogService {
     }
 
     /**
-     * First-time bulk service setup for an INDEPENDENT_MASTER acting on their own behalf.
+     * Additive bulk service creation for an INDEPENDENT_MASTER acting on their own behalf.
      *
      * <p>The acting master is resolved from the authenticated principal's {@code userId}
      * (never a client-supplied id), mirroring {@link #addIndependentMasterService}. The
      * batch is created all-or-nothing in this single transaction.
      *
-     * @throws ForbiddenException if the user is not an INDEPENDENT_MASTER
-     * @throws BusinessException  (409) if the master already has any active service
+     * <p>Usable whether or not the master already has services — it backs both the initial
+     * catalogue-setup screen and later "add more services" passes.
+     *
+     * @throws ForbiddenException        if the user is not an INDEPENDENT_MASTER
+     * @throws DuplicateServiceException (409) if a batch item's service type is already offered
      */
     @Transactional
     public List<MasterServiceResponse> bulkCreateIndependentMasterServices(
@@ -275,7 +281,7 @@ public class ServiceCatalogService {
     }
 
     /**
-     * First-time bulk service setup performed by a SALON_OWNER/SALON_ADMIN on behalf of a
+     * Additive bulk service creation performed by a SALON_OWNER/SALON_ADMIN on behalf of a
      * master in their salon (including the owner-operated master row).
      *
      * <p>Salon-membership of the target master is verified here as the second half of the
@@ -283,8 +289,11 @@ public class ServiceCatalogService {
      * {@link #assignServiceToMaster}. Services are owned by the master row, not the salon —
      * no salon-level catalog entity is created.
      *
-     * @throws ForbiddenException if the master does not belong to the given salon
-     * @throws BusinessException  (409) if the master already has any active service
+     * <p>Usable whether or not the master already has services — it backs both the initial
+     * catalogue-setup screen and later "add more services" passes.
+     *
+     * @throws ForbiddenException        if the master does not belong to the given salon
+     * @throws DuplicateServiceException (409) if a batch item's service type is already offered
      */
     @Transactional
     public List<MasterServiceResponse> bulkCreateSalonMasterServices(
@@ -303,17 +312,21 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Shared first-time bulk-create core for a resolved master.
+     * Shared additive bulk-create core for a resolved master.
      *
      * <p>Services in this platform are owned by the master row regardless of how the master
      * was created (independent or salon-bound), so both entry points persist
      * {@code ownerType = INDEPENDENT_MASTER, ownerId = master.id} and a per-definition
      * {@link MasterServiceAssignment} — identical to {@link #addIndependentMasterService}.
      *
-     * <p>Enforces the first-time precondition (409 when any active service already exists),
-     * rejects duplicate {@code serviceTypeId}s, derives each service name + category from the
-     * chosen {@link ServiceType}, reuses {@link #applyPriceMode} for the validated price mode,
-     * and persists the whole batch transactionally (all-or-nothing).
+     * <p>Additive by design: the batch is appended to whatever the master already offers, so the
+     * same endpoint serves both the empty-catalogue onboarding screen and a later "add more
+     * services" pass. The only conflict left is a per-service one — a batch item whose
+     * {@link ServiceType} the owner already offers is rejected 409 {@code DUPLICATE_SERVICE}.
+     *
+     * <p>Rejects duplicate {@code serviceTypeId}s within the batch, derives each service name +
+     * category from the chosen {@link ServiceType}, reuses {@link #applyPriceMode} for the
+     * validated price mode, and persists the whole batch transactionally (all-or-nothing).
      */
     private List<MasterServiceResponse> bulkCreateForMaster(
             Master master,
@@ -321,33 +334,42 @@ public class ServiceCatalogService {
             UUID ownerId,
             BulkCreateServicesRequest request) {
 
-        // TOCTOU guard: serialize concurrent first-time bulk setups for the same master.
-        // existsActiveServiceForMaster is a read-then-write check with no DB-level
-        // uniqueness backstop, so two concurrent bulk POSTs could both pass it and both
-        // commit, doubling the menu. Acquire a transaction-scoped advisory lock keyed by
-        // masterId BEFORE the precondition check (which is re-evaluated under the lock,
-        // inside this same @Transactional) — the second caller blocks until the first
-        // commits, then its re-check sees the now-existing services and rejects with 409.
-        // Mirrors the booking overlap-guard advisory lock (anti-bug pattern).
-        Integer lockResult = masterServiceRepository.acquireBulkSetupLock(master.getId());
-        if (lockResult == null) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
-                    "Bulk-setup lock acquisition failed");
-        }
-
-        if (masterServiceRepository.existsActiveServiceForMaster(master.getId())) {
-            throw new BusinessException(HttpStatus.CONFLICT,
-                    "Bulk setup is only available for a master with no active services");
-        }
-
         rejectDuplicateServiceTypeIds(request.items());
 
         // PERF: resolve all service types in ONE query (the ids are already distinct,
         // guaranteed by rejectDuplicateServiceTypeIds) instead of N serialized findById
         // calls, then validate every DISTINCT derived category in ONE query instead of a
         // SELECT EXISTS per item. Both walks share this resolved-types map.
+        //
+        // These three steps run OUTSIDE the advisory lock (backend-perf finding 2): they are
+        // pure in-memory validation plus reads of GLOBAL reference data (service_types,
+        // platform_categories) — no owner-scoped state, so serializing them buys nothing while
+        // extending the lock hold by ~2 DB round-trips on every call. Hoisting them also means a
+        // request that 400s/404s on a bad service type never takes the lock at all.
         Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
         validateBulkCategoriesActive(typesById.values());
+
+        // TOCTOU guard: serialize concurrent additive bulk adds for the same master.
+        // assertNoActiveDuplicatesInBatch below is a read-then-write check — it reads the
+        // owner's already-taken service types, then inserts. Two concurrent bulk POSTs for the
+        // same master could therefore both read "type X is free" and both proceed. The V121
+        // unique index is the correctness backstop (the loser 500s at flush and is translated to
+        // a 409), but taking a transaction-scoped advisory lock keyed by masterId makes the
+        // second caller wait for the first to commit, so its duplicate guard sees the committed
+        // rows and produces the clean, item-naming 409 instead of a raced constraint violation.
+        // Mirrors the booking overlap-guard advisory lock (anti-bug pattern).
+        //
+        // The serialized window is deliberately NARROW — it opens here and closes at commit,
+        // covering exactly the read-then-write span: the duplicate guard, the inserts, the flush,
+        // and the min_effective_price refresh that must not be observed out of order. Everything
+        // above needs no serialization.
+        //
+        // The cache eviction below is NOT inside this window and must not be: evictMasterServicesCache
+        // only REGISTERS an afterCommit synchronization, so the actual evict runs after the
+        // transaction commits and therefore after this lock is released (anti-bug §F rule 2 — an
+        // inline evict would let a concurrent reader repopulate the cache from a pre-commit snapshot).
+        acquireBulkSetupLockWithTimeout(master.getId());
+
         // PERF: and the V121 duplicate guard for the WHOLE batch in ONE query too, rather than
         // one findActiveDuplicateId per item. See assertNoActiveDuplicatesInBatch.
         assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
@@ -369,6 +391,47 @@ public class ServiceCatalogService {
         evictMasterServicesCache(List.of(master.getId()));
 
         return created;
+    }
+
+    /**
+     * Takes the transaction-scoped per-master advisory lock that serializes the additive
+     * bulk-create critical section, bounding the wait at the 3s {@code lock_timeout} the
+     * repository query fuses into the same round-trip. The lock lives in its own salt-{@code 2}
+     * key space, so it contends only with other bulk setups for the same master — never with the
+     * booking master/client locks (salts {@code 0}/{@code 1}); see
+     * {@link MasterServiceRepository#acquireBulkSetupLockWithTimeout(UUID)}.
+     *
+     * <p><b>Why a bounded wait rather than {@code pg_try_advisory_xact_lock}.</b> Under a
+     * try-lock the loser of ORDINARY contention fails instantly, before it can re-check
+     * duplicates against the winner's committed rows — so it would return a bare "already in
+     * progress" instead of the 409 {@code DUPLICATE_SERVICE} carrying a populated
+     * {@code existingServiceDefId} that the mobile screen deep-links on. A bounded wait keeps
+     * normal contention behaving exactly as before (wait → acquire → re-check → clean 409) and
+     * aborts only pathological contention, which is the pool-saturation case worth bounding.
+     *
+     * @throws BusinessException 503 when the wait exceeds {@code lock_timeout} (Postgres
+     *                           {@code 55P03 lock_not_available}, surfaced by Spring/Hibernate
+     *                           exception translation as
+     *                           {@link PessimisticLockingFailureException}) — a transient
+     *                           "master is busy, retry" condition, deliberately distinct from the
+     *                           semantically loaded 409 this endpoint reserves for
+     *                           {@code DUPLICATE_SERVICE}; 500 when the lock query returns no row
+     */
+    private void acquireBulkSetupLockWithTimeout(UUID masterId) {
+        Integer lockResult;
+        try {
+            lockResult = masterServiceRepository.acquireBulkSetupLockWithTimeout(masterId);
+        } catch (PessimisticLockingFailureException ex) {
+            // Never echo SQL state, the timeout value or the driver cause to the caller (§I/§N);
+            // only the exception's simple class name, at DEBUG, for server-side triage.
+            log.debug("Bulk-setup lock wait exceeded lock_timeout: {}", ex.getClass().getSimpleName());
+            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Service setup is busy for this master, please retry");
+        }
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Bulk-setup lock acquisition failed");
+        }
     }
 
     /**
@@ -480,7 +543,7 @@ public class ServiceCatalogService {
 
     /**
      * Rejects a batch that toggles the same service type on twice. Without this guard a
-     * caller could create two near-identical services in one call, which the first-time
+     * caller could create two near-identical services in one call, which the multi-select
      * setup screen never intends.
      *
      * <p><b>Deliberately a 400, NOT the {@code DUPLICATE_SERVICE} 409</b> (decision made
@@ -1247,7 +1310,7 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Batch form of {@link #assertNoActiveDuplicate} for the bulk first-time-setup path: ONE
+     * Batch form of {@link #assertNoActiveDuplicate} for the additive bulk-create path: ONE
      * query covering every item, instead of one per item.
      *
      * <p><b>Why batched.</b> The request accepts up to 100 items, and the per-item form issued
@@ -1258,11 +1321,14 @@ public class ServiceCatalogService {
      * defeated JDBC insert batching. Batching the guard and batching the flush only pay off
      * together.
      *
-     * <p><b>NOT redundant with the caller's {@code existsActiveServiceForMaster} precondition:</b>
-     * that gate is assignment-level (active {@link MasterServiceAssignment} + active definition),
-     * whereas the V121 index is definition-level. A definition owned by this master that is
-     * active but carries no active assignment passes the bulk precondition and still collides
-     * with the index — this check turns that into a clean 409 instead of a 500 at flush.
+     * <p><b>This is the only cross-request conflict guard the bulk path has.</b> Bulk create is
+     * additive — there is no "master must have zero services" precondition to lean on — so every
+     * collision with what the owner already offers is caught here. The guard is definition-level,
+     * exactly like the V121 unique index it front-runs, which means it also covers the awkward
+     * case of an active definition carrying no active assignment: invisible in the master's menu,
+     * still a collision at INSERT. Catching it here turns that into a clean 409 naming the
+     * offending item instead of a 500 at flush. {@link #flushBulkBatch} still translates a raced
+     * V121 violation as the last line of defence.
      *
      * <p>Reported collision is the FIRST in <em>request order</em>, not in result order: the
      * query's row order is unspecified, and blaming a later item for an earlier item's conflict

@@ -34,5 +34,13 @@ public enum OutboxEventType {
     BOOKING_RESCHEDULED,
 
     /** A booking was completed; prompt the client to leave a rating + comment (Phase 18.1). */
-    REVIEW_REQUESTED
+    REVIEW_REQUESTED,
+
+    /**
+     * Nudges the PROVIDER (never the client) that an elapsed {@code CONFIRMED} booking is still
+     * awaiting closure (Phase 29.5 — see {@code com.beautica.booking.domain.BookingClosureRule}).
+     * This is a work-queue reminder, not a status transition: nothing that enqueues or drains this
+     * event may ever write {@code bookings.status} — see {@code ClosureReminderArchitectureTest}.
+     */
+    CLOSURE_REMINDER
 }

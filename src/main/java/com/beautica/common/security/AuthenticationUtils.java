@@ -62,6 +62,25 @@ public final class AuthenticationUtils {
     }
 
     /**
+     * Nullable counterpart to {@link #userId(Authentication)} for the rare caller that must
+     * treat "no principal" as a legitimate, non-exceptional case rather than a 403 — e.g. a
+     * {@code permitAll} route that behaves differently for an authenticated CLIENT than for an
+     * anonymous guest, but must not fail the guest's request (Phase 32.1 D4).
+     *
+     * <p>Returns {@code null} for a missing {@link Authentication}, a non-
+     * {@link UsernamePasswordAuthenticationToken} principal (e.g. Spring Security's anonymous
+     * token), or non-{@link UUID} {@code details} — the same contract as {@link #userId} minus
+     * the throw. Callers that require an authenticated principal must keep using {@link #userId}.
+     */
+    public static UUID userIdOrNull(Authentication authentication) {
+        if (authentication instanceof UsernamePasswordAuthenticationToken token
+                && token.getDetails() instanceof UUID id) {
+            return id;
+        }
+        return null;
+    }
+
+    /**
      * Resolves the authenticated user's {@link Role} from its granted authorities
      * (e.g. {@code ROLE_SALON_OWNER} → {@link Role#SALON_OWNER}).
      *

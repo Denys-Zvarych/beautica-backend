@@ -1,0 +1,69 @@
+-- Phase 28.4 audit fix (Finding 1 — HIGH, backend-perf): index for GET /bookings/me?partition=PAST
+-- at PROVIDER scale (master scope). Chosen — and every rejected alternative below documented —
+-- from EXPLAIN (ANALYZE, BUFFERS) evidence against a seeded 50,000-row single-master dataset
+-- (scripts/seed-booking-perf-dataset.sh, the same tool + methodology V117/Phase 26.6 used), per
+-- this repo's locked "measure before indexing" discipline. Full plan output for every variant
+-- tested (with/without this index, with/without the BookingSpecifications.java companion
+-- statusIn(...) conjunct, forced ordered-scan vs default bitmap-scan) lives in
+-- docs/backend-phases/phase-216-28.1-booking-partition-enum-and-specifications.md — not
+-- duplicated here.
+--
+-- PROBLEM MEASURED: BookingSpecifications.partition(PAST) is
+--   status IN (COMPLETED, NOT_COMPLETED) OR (status = CONFIRMED AND ends_at < :now)
+-- Neither existing bookings index has a WHERE clause matching this OR, so it can only ever be
+-- applied as a post-fetch Filter. At a deep OFFSET (~20,000 rows into a 50,000-row master's
+-- history) the planner's cost model judged interpolating through
+-- idx_bookings_master_starts_at (V117) more expensive than a full Seq Scan of the ENTIRE
+-- bookings table (not just this master's rows) followed by an explicit Sort — 17.7ms, confirmed
+-- by EXPLAIN, and — critically — that Seq Scan cost SCALES WITH THE GLOBAL TABLE SIZE (it
+-- touched all ~100,000 rows across every master in the measurement DB, not this master's
+-- ~50,000), exactly the "punishes the busiest masters hardest, and scales platform-wide"
+-- pattern this repo's own Anti-Bug rules warn about (Anti-Bug §E, mirrors this migration's own
+-- V117 §"Shape 5" precedent, itself a Seq Scan finding).
+--
+-- FIX: a partial index scoped to the union of every status the PAST partition (and, as a
+-- byproduct, UPCOMING) can ever match — COMPLETED, NOT_COMPLETED, CONFIRMED — with the same
+-- (master_id, starts_at DESC, id ASC) column shape as idx_bookings_master_starts_at (V117), so a
+-- matching query gets the identical "no extra Sort node, id-tiebreaker-covering" benefit that
+-- index already provides for the unfiltered/date-range shapes.
+--
+-- REQUIRES a companion code change (already shipped in this diff): BookingSpecifications.java's
+-- partition(PAST) now ANDs the ORIGINAL cb.or(...) with a redundant
+-- statusIn({COMPLETED, NOT_COMPLETED, CONFIRMED}) conjunct — logically a no-op (every disjunct of
+-- the OR already implies one of those three statuses) but load-bearing for THIS index: Postgres's
+-- partial-index matcher only proves a query implies an index's WHERE clause via a fairly literal
+-- syntactic match, and did NOT prove implication through the nested OR/AND shape in manual
+-- testing. Without that companion conjunct, this index is silently unused dead weight — see that
+-- method's javadoc before touching either side of this pair.
+--
+-- MEASURED RESULT (master scope, deep OFFSET ~20,000, WITH this index + the companion conjunct):
+--   * Planner's own default choice: Bitmap Index Scan on this index (~30,000 rows touched — this
+--     master's own PAST-eligible rows only, NOT the global table) + Bitmap Heap Scan + Sort —
+--     16.0ms. Slower than the theoretical optimum below, but already decouples cost from global
+--     table size, which is the finding's core complaint.
+--   * Forcing `SET enable_bitmapscan = off` (isolating the plain ordered Index Scan this index
+--     also supports, matching ORDER BY starts_at DESC, id ASC with NO extra Sort node): 4.9ms —
+--     a ~3.6x improvement over the no-index baseline. The default planner under-uses this path at
+--     this dataset's current statistics; a `status` statistics-target bump could close that gap
+--     but is deliberately NOT bundled into this migration (out of THIS finding's scope — flagged
+--     as a follow-up in the phase doc, not blindly applied without its own measurement pass).
+--
+-- SALON SCOPE — deliberately NOT indexed here, despite the finding also asking about it. Measured
+-- and REJECTED: BookingSpecifications.salonIdIn joins Booking -> Master -> Salon and filters
+-- salon.id, never touching bookings.master_id as a bound constant, so Postgres's planner
+-- consistently prefers a Hash Join (Seq Scan on bookings, hashed against the salon's small
+-- master-id set) over any per-master index probe — confirmed by testing this exact candidate
+-- index against a seeded 50,000-row / 5-master salon dataset: its mere presence changed NOTHING
+-- (27.2ms before and after), and even forcibly disabling hash/merge joins could not coax a cheap
+-- per-master Nested Loop out of the planner. Further measurement established this Seq Scan is
+-- PRE-EXISTING and NOT specific to the partition=PAST OR this migration targets — an UNFILTERED
+-- salon-scope query (no partition, no status filter at all) is EQUALLY slow (26.2ms, also a full
+-- Seq Scan) — so indexing the PAST shape specifically would not address the actual bottleneck
+-- (the join-based salonIdIn predicate itself) and would just be a second unused index. Fixing
+-- salon scope requires resolving master ids application-side (bookings.master_id = ANY(:ids),
+-- bypassing the join) across ALL of BookingRepositoryCustomImpl's salon-scoped finders, not only
+-- the partition one — a structural change well beyond this finding's "add an index" scope. Flagged
+-- as a new backend-perf finding in the phase doc, not fixed in this migration.
+CREATE INDEX idx_bookings_master_past_partition_starts_at
+    ON bookings (master_id, starts_at DESC, id ASC)
+    WHERE status IN ('COMPLETED', 'NOT_COMPLETED', 'CONFIRMED');

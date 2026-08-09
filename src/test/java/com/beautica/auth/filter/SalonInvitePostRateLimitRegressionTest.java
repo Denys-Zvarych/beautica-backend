@@ -34,8 +34,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>This drives the <i>real</i> filter through {@code doFilterInternal} and asserts only
  * observable HTTP behaviour. The salon-invite bucket is built internally (like
  * {@code inviteBuckets} / {@code otpVerifyBuckets} / {@code searchBuckets}), so this test
- * references no new constructor arg; the 18 positional permissive caches mirror the public
- * 18-{@code @Qualifier} constructor.
+ * references no new constructor arg; the 19 positional permissive caches mirror the public
+ * 19-{@code @Qualifier} constructor.
  */
 @DisplayName("AuthRateLimitFilter — POST /salons/{salonId}/invite per-IP throttle (SEC-fix enumeration/timing regression net)")
 class SalonInvitePostRateLimitRegressionTest {
@@ -59,7 +59,7 @@ class SalonInvitePostRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
         // constructor (includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets, Phase
         // A5). The salon-invite-POST throttle is internal to the filter (built like
         // inviteBuckets), so this test references no new constructor arg beyond the count.
@@ -68,7 +68,7 @@ class SalonInvitePostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive());
+                permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postSalonInvite(UUID salonId) {
