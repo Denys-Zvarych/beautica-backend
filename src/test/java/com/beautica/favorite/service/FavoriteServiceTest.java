@@ -60,11 +60,14 @@ import static org.mockito.Mockito.when;
  * Unit tests for {@link FavoriteService} (Phase 19.1).
  *
  * <p>All collaborators (repository, master/salon repositories, the M2
- * locality-label seam) are mocked; the tests verify the favoriting/unfavoriting
- * business rules — idempotency, {@code SALON_MASTER} rejection, missing-target
- * {@code 404}, the concurrent-race fallback, {@code lastServiceName} resolution
- * and the no-N+1 label batching — without booting Hibernate. End-to-end query
- * correctness lives in {@code FavoriteMigrationIT}.
+ * locality-label seam, {@link FavoritePersistenceService}) are mocked; the tests verify the
+ * favoriting/unfavoriting business rules — idempotency, {@code SALON_MASTER} rejection,
+ * missing-target {@code 404}, the concurrent-race fallback, {@code lastServiceName} resolution
+ * and the no-N+1 label batching — without booting Hibernate. Because
+ * {@code favoritePersistenceService} is a mock here, it has no real transaction to poison, so
+ * these tests cannot see the aborted-transaction gap a genuine two-thread race exposes; that
+ * proof lives in {@code FavoriteSalonServiceIT}'s real-Postgres concurrency test. End-to-end
+ * query correctness lives in {@code FavoriteMigrationIT}.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("FavoriteService — unit")
@@ -87,6 +90,9 @@ class FavoriteServiceTest {
 
     @Mock
     private DiscoveryLocationResolver discoveryLocationResolver;
+
+    @Mock
+    private FavoritePersistenceService favoritePersistenceService;
 
     @InjectMocks
     private FavoriteService favoriteService;
@@ -196,7 +202,7 @@ class FavoriteServiceTest {
                             FavoriteResponse::targetId, FavoriteResponse::createdAt)
                     .containsExactly(existing.getId(), FavoriteTargetType.MASTER, targetId,
                             existing.getCreatedAt());
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -208,7 +214,7 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.MASTER, targetId))
                     .thenReturn(Optional.empty());
             Favorite saved = existingFavorite(clientId, FavoriteTargetType.MASTER, targetId);
-            when(favoriteRepository.saveAndFlush(any(Favorite.class))).thenReturn(saved);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId);
@@ -217,7 +223,7 @@ class FavoriteServiceTest {
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.MASTER);
 
             ArgumentCaptor<Favorite> captor = ArgumentCaptor.forClass(Favorite.class);
-            verify(favoriteRepository).saveAndFlush(captor.capture());
+            verify(favoritePersistenceService).persistNew(captor.capture());
             assertThat(captor.getValue())
                     .as("persisted favorite is scoped to the authenticated principal")
                     .extracting(Favorite::getClientId, Favorite::getTargetType, Favorite::getTargetId)
@@ -236,7 +242,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verify(favoriteRepository, never())
                     .findByClientIdAndTargetTypeAndTargetId(any(), any(), any());
         }
@@ -251,7 +257,7 @@ class FavoriteServiceTest {
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Master not found");
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -267,7 +273,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -281,7 +287,7 @@ class FavoriteServiceTest {
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, targetId))
                     .isInstanceOf(NotFoundException.class);
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -294,7 +300,7 @@ class FavoriteServiceTest {
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Salon not found");
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verifyNoInteractions(masterRepository);
         }
 
@@ -306,13 +312,13 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SALON, targetId))
                     .thenReturn(Optional.empty());
             Favorite saved = existingFavorite(clientId, FavoriteTargetType.SALON, targetId);
-            when(favoriteRepository.saveAndFlush(any(Favorite.class))).thenReturn(saved);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, targetId);
 
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SALON);
-            verify(favoriteRepository).saveAndFlush(any());
+            verify(favoritePersistenceService).persistNew(any());
         }
 
         @Test
@@ -325,7 +331,7 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SALON, targetId))
                     .thenReturn(Optional.empty())
                     .thenReturn(Optional.of(raced));
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenThrow(new DataIntegrityViolationException("uq_favorite"));
 
             FavoriteResponse response =
@@ -342,7 +348,7 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SALON, targetId))
                     .thenReturn(Optional.empty())
                     .thenReturn(Optional.empty());
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenThrow(new DataIntegrityViolationException("uq_favorite"));
 
             assertThatThrownBy(() ->
@@ -369,14 +375,14 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SERVICE, targetId))
                     .thenReturn(Optional.empty());
             Favorite saved = existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
-            when(favoriteRepository.saveAndFlush(any(Favorite.class))).thenReturn(saved);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
 
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
             assertThat(response.targetId()).isEqualTo(targetId);
-            verify(favoriteRepository).saveAndFlush(any());
+            verify(favoritePersistenceService).persistNew(any());
         }
 
         @Test
@@ -390,14 +396,14 @@ class FavoriteServiceTest {
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.SERVICE, targetId))
                     .thenReturn(Optional.empty());
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenReturn(existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId));
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
 
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
-            verify(favoriteRepository).saveAndFlush(any());
+            verify(favoritePersistenceService).persistNew(any());
         }
 
         @Test
@@ -411,7 +417,7 @@ class FavoriteServiceTest {
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Service not found");
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verifyNoInteractions(masterRepository, salonRepository);
         }
 
@@ -428,7 +434,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -446,7 +452,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -466,7 +472,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -495,7 +501,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -516,14 +522,14 @@ class FavoriteServiceTest {
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.SERVICE, targetId))
                     .thenReturn(Optional.empty());
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenReturn(existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId));
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
 
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
-            verify(favoriteRepository).saveAndFlush(any());
+            verify(favoritePersistenceService).persistNew(any());
         }
 
         @Test
@@ -541,7 +547,7 @@ class FavoriteServiceTest {
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
 
             assertThat(response.id()).isEqualTo(existing.getId());
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -555,7 +561,7 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SERVICE, targetId))
                     .thenReturn(Optional.empty())
                     .thenReturn(Optional.of(raced));
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenThrow(new DataIntegrityViolationException("uq_favorite"));
 
             FavoriteResponse response =
@@ -596,14 +602,14 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SALON_SERVICE, targetId))
                     .thenReturn(Optional.empty());
             Favorite saved = existingFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
-            when(favoriteRepository.saveAndFlush(any(Favorite.class))).thenReturn(saved);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
 
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SALON_SERVICE);
             assertThat(response.targetId()).isEqualTo(targetId);
-            verify(favoriteRepository).saveAndFlush(any());
+            verify(favoritePersistenceService).persistNew(any());
         }
 
         @Test
@@ -616,7 +622,7 @@ class FavoriteServiceTest {
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Service not found");
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verifyNoInteractions(masterServiceRepository);
         }
 
@@ -633,7 +639,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verifyNoInteractions(masterServiceRepository);
         }
 
@@ -658,7 +664,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verifyNoInteractions(masterServiceRepository);
         }
 
@@ -677,7 +683,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -697,7 +703,7 @@ class FavoriteServiceTest {
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
 
             assertThat(response.id()).isEqualTo(existing.getId());
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -713,7 +719,7 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.SALON_SERVICE, targetId))
                     .thenReturn(Optional.empty())
                     .thenReturn(Optional.of(raced));
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenThrow(new DataIntegrityViolationException("uq_favorite"));
 
             FavoriteResponse response =

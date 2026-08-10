@@ -48,7 +48,10 @@ import java.util.UUID;
  * {@code 409}). The {@code uq_favorite} UNIQUE index is the last-resort guard: a
  * concurrent double-submit that races past the pre-check is caught as a
  * {@link DataIntegrityViolationException} and resolved by re-reading the now-present
- * row. {@link #removeFavorite} is a delete-if-exists (→ controller {@code 204}).
+ * row. The insert attempt itself runs in {@link FavoritePersistenceService}'s own
+ * {@code REQUIRES_NEW} transaction, so a losing caller's re-read runs on an unaffected
+ * transaction instead of one Postgres has already marked aborted — see that class's
+ * javadoc. {@link #removeFavorite} is a delete-if-exists (→ controller {@code 204}).
  *
  * <h3>Target validation (application layer, not DB CHECK)</h3>
  * A {@code MASTER} target must be an {@code INDEPENDENT_MASTER}-owned master
@@ -76,6 +79,7 @@ public class FavoriteService {
     private final MasterServiceRepository masterServiceRepository;
     private final ServiceRepository serviceRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
+    private final FavoritePersistenceService favoritePersistenceService;
 
     /**
      * Favorites the target for {@code clientUserId} (the authenticated principal).
@@ -372,12 +376,19 @@ public class FavoriteService {
 
     private FavoriteResponse insertFavorite(UUID clientUserId, FavoriteTargetType targetType, UUID targetId) {
         try {
-            Favorite saved = favoriteRepository.saveAndFlush(
+            // Delegates to a separate bean's REQUIRES_NEW transaction (see
+            // FavoritePersistenceService's javadoc) — calling an annotated method on THIS bean
+            // instead would bypass the @Transactional proxy entirely and run the insert inside
+            // this method's own (already-open) transaction, reintroducing the aborted-transaction
+            // bug the re-read below exists to avoid.
+            Favorite saved = favoritePersistenceService.persistNew(
                     Favorite.of(clientUserId, targetType, targetId));
             return FavoriteResponse.from(saved);
         } catch (DataIntegrityViolationException e) {
-            // Concurrent double-submit raced past the pre-check and hit uq_favorite.
-            // Resolve idempotently by returning the row the other request inserted.
+            // Concurrent double-submit raced past the pre-check and hit uq_favorite in the OTHER
+            // transaction (FavoritePersistenceService's). That transaction rolled back on its own;
+            // THIS transaction never touched the failing statement, so it is still healthy and this
+            // re-read succeeds instead of hitting Postgres 25P02 (aborted transaction).
             return favoriteRepository
                     .findByClientIdAndTargetTypeAndTargetId(clientUserId, targetType, targetId)
                     .map(FavoriteResponse::from)

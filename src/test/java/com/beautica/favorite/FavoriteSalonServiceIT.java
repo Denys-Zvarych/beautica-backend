@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -180,68 +181,109 @@ class FavoriteSalonServiceIT extends AbstractIntegrationTest {
      * {@code DataIntegrityViolationException} unit test — it is a genuinely stronger check than
      * that mock and it caught something the mock could not.
      *
-     * <p><b>Finding surfaced by writing this as a REAL concurrency test (pre-existing, not
-     * introduced by this track — reproduces identically for MASTER/SALON/SERVICE targets, since
-     * {@code insertFavorite} is one shared method).</b> {@code FavoriteService#addFavorite} is
-     * {@code @Transactional} end-to-end. When the loser's {@code saveAndFlush} hits
-     * {@code uq_favorite}, Postgres marks that session's transaction ABORTED (protocol-level, not
-     * just the one statement) — so the catch block's fallback
+     * <p><b>Fixed defect (pre-existing, not introduced by this track — reproduced identically for
+     * MASTER/SALON/SERVICE targets, since {@code insertFavorite} is one shared method).</b>
+     * {@code FavoriteService#addFavorite} is {@code @Transactional} end-to-end. When the loser's
+     * insert attempt hit {@code uq_favorite}, Postgres marked that session's transaction ABORTED
+     * (protocol-level, not just the one statement) — so the catch block's fallback
      * {@code findByClientIdAndTargetTypeAndTargetId} re-read, running in the SAME now-aborted
-     * transaction, itself fails with {@code 25P02 current transaction is aborted}, surfacing as a
+     * transaction, itself failed with {@code 25P02 current transaction is aborted}, surfacing as a
      * {@code JpaSystemException} instead of the intended graceful idempotent return. The mocked
-     * unit-test sibling ({@code FavoriteServiceTest#should_returnRacedRow_when_...}) cannot see
+     * unit-test sibling ({@code FavoriteServiceTest#should_returnRacedRow_when_...}) could not see
      * this: Mockito's fake repository has no real transaction to abort, so the re-read mock always
-     * "succeeds". <b>uq_favorite itself is never at risk</b> — Postgres still allows exactly one
-     * row for the tuple — only the graceful-idempotent-return CONTRACT can currently fail for the
-     * loser under a true race. Flagged as a pre-existing gap for a dedicated follow-up (a
-     * {@code Propagation.REQUIRES_NEW} re-read after marking the outer transaction rollback-only);
-     * fixing the shared four-arm transaction boundary is out of scope for this migration task.
+     * "succeeded" there regardless of the production bug.
      *
-     * <p>This test therefore asserts the guarantee that DOES unconditionally hold — the DB-level
-     * dedupe — while tolerating (and logging) the pre-existing exception on the losing side,
-     * rather than asserting a "neither caller observes an exception" contract the code does not
-     * currently deliver.
+     * <p><b>Fix:</b> the insert attempt now runs in {@link com.beautica.favorite.service
+     * .FavoritePersistenceService}'s own {@code Propagation.REQUIRES_NEW} transaction. A
+     * {@code uq_favorite} violation rolls back only that inner transaction; the caller's own
+     * transaction never touched the failing statement, so its recovery re-read runs on a healthy
+     * connection and returns the winner's row instead of blowing up. Both racing callers now
+     * observe a successful, idempotent result — this test asserts exactly that, unconditionally
+     * (no tolerated exception), and the row-count assertion still pins the DB-level dedupe that
+     * always held.
      */
     @Test
-    @DisplayName("two concurrent addFavorite calls for the same target persist exactly one row "
-            + "(uq_favorite dedupe holds under genuine concurrency)")
-    void should_persistExactlyOneRow_when_twoThreadsRaceTheSameSalonServiceFavorite() throws Exception {
+    @DisplayName("two concurrent addFavorite calls for the same target BOTH succeed idempotently, "
+            + "and exactly one row persists (uq_favorite dedupe + graceful re-read under genuine "
+            + "concurrency)")
+    void should_bothSucceedIdempotently_when_twoThreadsRaceTheSameSalonServiceFavorite() throws Exception {
         UUID clientId = createClient("salon-svc-race-client@beautica.test");
         UUID salonId = createSalon("salon-svc-race-owner@beautica.test");
         UUID masterId = createSalonMaster(salonId, "salon-svc-race-master@beautica.test");
         UUID serviceDefId = createSalonServiceDefinition(salonId, true);
         assignMasterToService(masterId, serviceDefId, true);
 
+        // Both racing callers await this barrier immediately before the call under test, so neither
+        // can proceed until both threads are scheduled and ready — contention is forced, not left to
+        // chance OS scheduling. Bounded (5s) so a broken barrier fails fast instead of hanging the suite.
+        CyclicBarrier barrier = new CyclicBarrier(2);
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
-            Callable<FavoriteResponse> race = () ->
-                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, serviceDefId);
+            Callable<FavoriteResponse> race = () -> {
+                barrier.await(5, TimeUnit.SECONDS);
+                return favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, serviceDefId);
+            };
             Future<FavoriteResponse> f1 = pool.submit(race);
             Future<FavoriteResponse> f2 = pool.submit(race);
 
-            int successes = 0;
-            int failures = 0;
-            for (Future<FavoriteResponse> f : List.of(f1, f2)) {
-                try {
-                    f.get(10, TimeUnit.SECONDS);
-                    successes++;
-                } catch (Exception e) {
-                    // See the pre-existing-gap note above: the loser MAY currently surface a
-                    // transactional error instead of a graceful idempotent return. Tolerated here;
-                    // the row-count assertion below is the guarantee this test actually pins.
-                    failures++;
-                }
-            }
+            // Unconditional — no branching on which caller "wins": both futures MUST resolve to a
+            // successful, idempotent FavoriteResponse. A test that only tallies successes/failures
+            // without asserting on them can never go red for this defect (see project memory on
+            // mutation-test concurrency guards) — .get() below throws if either caller failed,
+            // which fails this test outright rather than being swallowed into a counter.
+            FavoriteResponse r1 = f1.get(10, TimeUnit.SECONDS);
+            FavoriteResponse r2 = f2.get(10, TimeUnit.SECONDS);
 
-            assertThat(successes)
-                    .as("at least one of the two racing callers must succeed")
-                    .isGreaterThanOrEqualTo(1);
-            assertThat(successes + failures).isEqualTo(2);
+            assertThat(r1.targetId()).isEqualTo(serviceDefId);
+            assertThat(r2.targetId()).isEqualTo(serviceDefId);
+            assertThat(r2.id())
+                    .as("both racing callers must resolve to the SAME persisted row (idempotent)")
+                    .isEqualTo(r1.id());
             assertThat(favoriteRepository.count())
                     .as("uq_favorite must allow exactly one row for this tuple, no matter how many "
-                            + "concurrent callers raced to create it — this is the guarantee that must "
-                            + "never break, independent of the graceful-return gap noted above")
+                            + "concurrent callers raced to create it")
                     .isEqualTo(1);
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    /**
+     * Same race, pinned to a {@code SERVICE} target — proves the fix covers the shared
+     * {@code insertFavorite}/{@code FavoritePersistenceService} path for a PRE-EXISTING arm, not
+     * only the new {@code SALON_SERVICE} one added by this track.
+     */
+    @Test
+    @DisplayName("two concurrent addFavorite calls for the same SERVICE target BOTH succeed "
+            + "idempotently (pre-existing arm, proves the fix is not SALON_SERVICE-specific)")
+    void should_bothSucceedIdempotently_when_twoThreadsRaceTheSameServiceFavorite() throws Exception {
+        UUID clientId = createClient("svc-race-client@beautica.test");
+        UUID masterId = createIndependentMaster("svc-race-master@beautica.test");
+        UUID serviceDefId = createIndependentMasterServiceDefinition(masterId);
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+
+        // See should_bothSucceedIdempotently_when_twoThreadsRaceTheSameSalonServiceFavorite for why
+        // this barrier exists: it forces both callers to enter addFavorite together instead of
+        // relying on incidental wall-clock overlap.
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Callable<FavoriteResponse> race = () -> {
+                barrier.await(5, TimeUnit.SECONDS);
+                return favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, masterServiceId);
+            };
+            Future<FavoriteResponse> f1 = pool.submit(race);
+            Future<FavoriteResponse> f2 = pool.submit(race);
+
+            FavoriteResponse r1 = f1.get(10, TimeUnit.SECONDS);
+            FavoriteResponse r2 = f2.get(10, TimeUnit.SECONDS);
+
+            assertThat(r2.id()).isEqualTo(r1.id());
+            assertThat(favoriteRepository.count()).isEqualTo(1);
         } finally {
             pool.shutdown();
         }
