@@ -2,6 +2,7 @@ package com.beautica.service.service;
 
 import com.beautica.auth.Role;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.service.dto.MasterServiceResponse;
 import lombok.RequiredArgsConstructor;
@@ -63,7 +64,8 @@ public class MasterServiceFavoriteDecorator {
         }
 
         List<UUID> targetIds = services.stream().map(MasterServiceResponse::id).toList();
-        Set<UUID> favoritedIds = favoriteRepository.findFavoritedServiceIds(clientId, targetIds);
+        Set<UUID> favoritedIds = favoriteRepository.findFavoritedServiceIds(
+                clientId, FavoriteTargetType.SERVICE, targetIds);
 
         return services.stream()
                 .map(response -> response.withIsFavorite(favoritedIds.contains(response.id())))

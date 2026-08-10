@@ -6,6 +6,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
+import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
@@ -111,6 +112,9 @@ class ServiceValidationMessageContractTest {
 
     @MockBean
     private MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
+
+    @MockBean
+    private SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
 
     private static RequestPostProcessor owner() {
         var authority = new SimpleGrantedAuthority("ROLE_" + Role.SALON_OWNER.name());

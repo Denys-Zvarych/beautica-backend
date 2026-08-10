@@ -17,6 +17,7 @@ import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
+import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletResponse;
@@ -126,15 +127,21 @@ class ServiceControllerTest {
     @MockBean
     private MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
 
+    @MockBean
+    private SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
+
     /**
      * Default passthrough stub for every test that does not care about {@code isFavorite}
-     * decoration — the vast majority of the {@code GET /masters/{id}/services} tests below
-     * predate Phase 32.1 and assert on fields the decorator never touches. Individual tests that
-     * DO care about decoration override this stub explicitly.
+     * decoration — the vast majority of the {@code GET /masters/{id}/services} and
+     * {@code GET /salons/{id}/services} tests below predate the favourite-decoration tracks and
+     * assert on fields the decorators never touch. Individual tests that DO care about
+     * decoration override these stubs explicitly.
      */
     @BeforeEach
     void stubFavoriteDecoratorAsPassthrough() {
         when(masterServiceFavoriteDecorator.decorate(any(), any()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        when(salonServiceFavoriteDecorator.decorate(any(), any()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
     }
 
@@ -149,7 +156,7 @@ class ServiceControllerTest {
 
     private ServiceDefinitionResponse stubServiceDefResponse(UUID id, String name) {
         return new ServiceDefinitionResponse(id, name, null, null, 60, 10, true, null, null, null, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
     }
 
     private MasterServiceResponse stubMasterServiceResponse(UUID id, UUID masterId, String name) {
@@ -166,7 +173,7 @@ class ServiceControllerTest {
         var sdResponse = new ServiceDefinitionResponse(
                 UUID.randomUUID(), name, null, null, 60, 10, true,
                 serviceTypeId, serviceTypeNameUk, null, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
@@ -182,7 +189,7 @@ class ServiceControllerTest {
         var sdResponse = new ServiceDefinitionResponse(
                 UUID.randomUUID(), name, null, null, 60, 10, true,
                 serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
         return new MasterServiceResponse(id, masterId, sdResponse,
                 null, null, new BigDecimal("350.00"), 60, true,
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
@@ -194,7 +201,7 @@ class ServiceControllerTest {
             UUID id, String name, UUID serviceTypeId, String serviceTypeNameUk, String serviceTypeSlug) {
         return new ServiceDefinitionResponse(id, name, null, "MANICURE", 60, 10, true,
                 serviceTypeId, serviceTypeNameUk, serviceTypeSlug, null,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
     }
 
     // ── POST /api/v1/salons/{salonId}/services ─────────────────────────────────
@@ -868,7 +875,7 @@ class ServiceControllerTest {
                 serviceId, "Range Manicure", null, "MANICURE", 60, 0, true,
                 null, null, null, null,
                 PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"),
-                "від 500 до 800 ₴");
+                "від 500 до 800 ₴", null);
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
@@ -1317,7 +1324,7 @@ class ServiceControllerTest {
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
         var stub = new ServiceDefinitionResponse(
                 serviceDefId, "Manicure", null, null, 60, 10, true, null, null, null, photoUrl,
-                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴");
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
         when(serviceCatalogService.updateServicePhoto(eq(serviceDefId), eq(photoUrl)))

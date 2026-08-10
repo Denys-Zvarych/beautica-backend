@@ -1,6 +1,7 @@
 package com.beautica.service.service;
 
 import com.beautica.auth.Role;
+import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.service.dto.MasterServiceResponse;
 import org.junit.jupiter.api.BeforeEach;
@@ -100,7 +101,7 @@ class MasterServiceFavoriteDecoratorTest {
         UUID notFavourited = UUID.randomUUID();
         List<MasterServiceResponse> services = List.of(stub(favourited), stub(notFavourited));
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(eq(clientId), any()))
+        when(favoriteRepository.findFavoritedServiceIds(eq(clientId), eq(FavoriteTargetType.SERVICE), any()))
                 .thenReturn(Set.of(favourited));
 
         List<MasterServiceResponse> result = decorator.decorate(services, client);
@@ -125,7 +126,7 @@ class MasterServiceFavoriteDecoratorTest {
         List<MasterServiceResponse> result = decorator.decorate(List.of(), client);
 
         assertThat(result).isEmpty();
-        verify(favoriteRepository, never()).findFavoritedServiceIds(any(), any());
+        verify(favoriteRepository, never()).findFavoritedServiceIds(any(), any(), any());
     }
 
     @Test
@@ -136,7 +137,8 @@ class MasterServiceFavoriteDecoratorTest {
         MasterServiceResponse original = stub(UUID.randomUUID());
         List<MasterServiceResponse> services = List.of(original);
         Authentication client = authenticatedAs(clientId, Role.CLIENT);
-        when(favoriteRepository.findFavoritedServiceIds(eq(clientId), any())).thenReturn(Set.of());
+        when(favoriteRepository.findFavoritedServiceIds(eq(clientId), eq(FavoriteTargetType.SERVICE), any()))
+                .thenReturn(Set.of());
 
         List<MasterServiceResponse> result = decorator.decorate(services, client);
 

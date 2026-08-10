@@ -308,10 +308,12 @@ class FavoriteControllerTest {
 
     private static FavoriteServiceResponse wishListRow() {
         return new FavoriteServiceResponse(
-                UUID.randomUUID(), UUID.randomUUID(), "Manicure",
+                FavoriteServiceResponse.SourceType.MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), "Manicure",
                 "Maria", "Levchenko", "https://cdn/avatar.png",
                 90, PriceType.RANGE,
-                new BigDecimal("600.00"), new BigDecimal("900.00"), "vid 600 do 900");
+                new BigDecimal("600.00"), new BigDecimal("900.00"), "vid 600 do 900",
+                null, null, null);
     }
 
     @Test

@@ -875,7 +875,8 @@ class ServiceCatalogServiceTest {
                 PriceType.FIXED,
                 new BigDecimal("500.00"),
                 new BigDecimal("600.00"),
-                "500.00 ₴"
+                "500.00 ₴",
+                null
         );
 
         MasterServiceResponse full = new MasterServiceResponse(
