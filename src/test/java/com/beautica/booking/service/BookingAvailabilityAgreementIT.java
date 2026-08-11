@@ -458,6 +458,122 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7g/7h/7i — EXPLICIT_TIMES: a booking that RUNS THROUGH a later declared time eats it
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // An EXPLICIT_TIMES day emits exactly the declared times, and its ONLY end bound is the same Kyiv
+    // civil day — there is deliberately no rule that a service must finish before the next declared time
+    // (locked 2026-08-11: an unreachable declared time is the master's own responsibility, and there is no
+    // warning at declaration time by product decision). So a master who declares 10:00 and 11:00 and then
+    // sells a 4-hour service at 10:00 has, without being told, closed the whole day.
+    //
+    // Case 7f already books ONE of two declared times, but with a 60-min service against declared
+    // 13:00/15:00 — the booking ends at 14:00 and touches nothing. These three cases are the first
+    // anywhere to seed a booking whose half-open [starts_at, ends_at) span strictly CONTAINS a later
+    // declared time, which is the interior branch of the declared walk's overlap test.
+
+    @Test
+    @DisplayName("case 7g — a 4-hour booking at the 10:00 declared time swallows the 11:00 one: /slots "
+            + "EMPTY and working=FALSE, for a 30-min request as well as a 4-hour one")
+    void should_agreeDayUnavailable_when_aLongBookingSwallowsTheOtherDeclaredTime() {
+        LocalDate day = TODAY.plusDays(16);
+
+        Master m = seedIndependentMaster();
+        UUID svc4h = addService(m, 240, 0);
+        UUID svc30 = addService(m, 30, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        // Seeded BEFORE any read — a raw JDBC insert evicts no `available-slots` entry (see case 7c).
+        insertBooking(m.masterId(), svc4h, seedClient(), day,
+                LocalTime.of(10, 0), LocalTime.of(14, 0), "CONFIRMED");
+
+        // A 30-min request is the strongest form of the assertion: the NEXT client's own duration cannot
+        // rescue a start that already lies inside an occupied range, because a candidate's end is always
+        // after its start, which is already after the booking's start. A day gate that tested only "does
+        // a booking START on this declared time?" would still offer 11:00 here.
+        assertThat(slotStarts(m.masterId(), day, svc30))
+                .as("11:00 is strictly inside the booked [10:00,14:00) — a 30-min request does not fit "
+                        + "'between' anything, because the declared walk offers declared times only")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc30))
+                .as("working-days MUST agree — both declared times are consumed")
+                .isFalse();
+
+        assertThat(slotStarts(m.masterId(), day, svc4h))
+                .as("the same verdict for the 4-hour service the booking itself used")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc4h))
+                .as("agreement invariant on the second service too")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("case 7h — THRESHOLD: a 60-min booking at 10:00 ends exactly on the 11:00 declared time "
+            + "(still offered, day TRUE); a 61-min one overruns it (empty, day FALSE)")
+    void should_gateTheLaterDeclaredTimeOnExactOverrun_atTheOneMinuteBoundary() {
+        LocalDate fits = TODAY.plusDays(17);
+        LocalDate overruns = TODAY.plusDays(18);
+
+        Master m = seedIndependentMaster();
+        UUID svc60 = addService(m, 60, 0);   // what the NEXT client asks for, on both days
+        UUID svc61 = addService(m, 61, 0);   // the one-minute-longer service booked on the second day
+        UUID client = seedClient();
+        for (LocalDate day : List.of(fits, overruns)) {
+            masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                    new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                            WeekdayMode.EXPLICIT_TIMES, null,
+                            List.of(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        }
+        insertBooking(m.masterId(), svc60, client, fits,
+                LocalTime.of(10, 0), LocalTime.of(11, 0), "CONFIRMED");
+        insertBooking(m.masterId(), svc61, client, overruns,
+                LocalTime.of(10, 0), LocalTime.of(11, 1), "CONFIRMED");
+
+        assertThat(slotStarts(m.masterId(), fits, svc60))
+                .as("the booking ends exactly where the 11:00 declared time starts; the overlap test is "
+                        + "strict on both sides, so 11:00 survives (10:00 itself is taken)")
+                .containsExactly(LocalTime.of(11, 0));
+        assertThat(bookableDay(m.masterId(), fits, svc60))
+                .as("working-days agrees — one declared time is still reachable")
+                .isTrue();
+
+        assertThat(slotStarts(m.masterId(), overruns, svc60))
+                .as("ONE minute of overrun puts 11:00 strictly inside [10:00,11:01) and kills the whole "
+                        + "day. This pair is what separates a strict overlap test from an inclusive one.")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), overruns, svc60))
+                .as("working-days agrees — nothing left to reach")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("case 7i — bufferMinutesAfter counts toward the overrun: a 60-min service with a 10-min "
+            + "buffer booked at 10:00 ends 11:10 and consumes the 11:00 declared time")
+    void should_countBufferTowardTheOverrun_when_aDeclaredTimeFollowsABufferedBooking() {
+        LocalDate day = TODAY.plusDays(19);
+
+        Master m = seedIndependentMaster();
+        UUID svcPlain = addService(m, 60, 0);        // what the next client asks for
+        UUID svcBuffered = addService(m, 60, 10);    // 60 min of work + a 10-min buffer after it
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        // Persisted exactly as BookingService does it: ends_at = starts_at + duration + buffer.
+        insertBufferedBooking(m.masterId(), svcBuffered, seedClient(), day, LocalTime.of(10, 0), 60, 10);
+
+        assertThat(slotStarts(m.masterId(), day, svcPlain))
+                .as("the SAME 60-min service that leaves 11:00 bookable with no buffer (case 7h) consumes "
+                        + "it once its 10-min buffer is folded into ends_at — 11:10 > 11:00")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svcPlain))
+                .as("working-days agrees — the buffer closed the day")
+                .isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
     // Case 7d/7e — EXPLICIT_TIMES END BOUND: a declared time must FINISH inside its own Kyiv day
     // ════════════════════════════════════════════════════════════════════════════════════════
     //
@@ -671,6 +787,25 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NOW(), NOW())",
                 UUID.randomUUID(), clientId, masterId, masterServiceId, status,
                 startsAt, endsAt, PRICE, minutes);
+    }
+
+    /**
+     * A booking persisted the way {@code BookingService} persists one when the service carries a buffer:
+     * {@code ends_at = starts_at + duration + bufferMinutesAfter} (BookingService:1842), with the buffer
+     * recorded in {@code buffer_minutes_at_booking}. The slot walk subtracts the persisted
+     * {@code [starts_at, ends_at)} span, so the buffer occupies the master exactly as the work does —
+     * which is why a buffer can consume a later declared time (case 7i).
+     */
+    private void insertBufferedBooking(UUID masterId, UUID masterServiceId, UUID clientId, LocalDate date,
+                                       LocalTime start, int durationMinutes, int bufferMinutes) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime endsAt = startsAt.plusMinutes((long) durationMinutes + bufferMinutes);
+        jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), clientId, masterId, masterServiceId,
+                startsAt, endsAt, PRICE, durationMinutes, bufferMinutes);
     }
 
     /**
