@@ -286,120 +286,208 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
 
     /**
      * Per-client favorited-services page for {@code GET /favorites/services} — the BEAUTY
-     * WISH LIST (Phase 31.4).
-     *
-     * <p>Returns the {@link com.beautica.service.entity.MasterServiceAssignment} graph rather
-     * than a native {@code Object[]} projection, deliberately (§ Phase 31.4 D2): money must be
-     * derived by {@code ServicePricing} — the one code path the master's own menu uses — and a
-     * hand-rolled COALESCE in SQL is exactly how the wish list and the profile start printing
-     * different prices. The page is capped at 20 rows, so the projection's performance argument
-     * does not apply at this size; correctness does.
-     *
-     * <p>The {@code Favorite → MasterServiceAssignment} join is <b>unmapped</b>
-     * ({@code target_id} is polymorphic — {@code masters.id} OR {@code salons.id} OR
-     * {@code master_services.id} — so there is no association to navigate); it is an explicit
-     * ad-hoc entity {@code JOIN … ON}. Being an INNER join, it also silently drops any stale
-     * favourite whose target row was hard-deleted, exactly as the masters/salons projections do.
-     *
-     * <p><b>All THREE {@code isActive} predicates are load-bearing</b> (Phase 31.3 D4). A
-     * favourite row survives its target's deactivation — there is no cleanup job for
-     * MASTER/SALON today and this track adds none — so the filtering happens on read: a
-     * deactivated service disappears from the wish list instead of offering a «Записатись»
-     * that would 404 at booking time. The three flags are independent:
+     * WISH LIST (Phase 31.4), now merging TWO favourite arms into one list (salon-service-
+     * favourites track):
      * <ul>
-     *   <li>{@code msa.isActive} — the master unassigned this service from their menu.</li>
-     *   <li>{@code sd.isActive} — {@code ServiceCatalogService.deactivateServiceDefinition}
-     *       soft-deletes the definition <em>without</em> touching the assignment rows, so
-     *       {@code sd.isActive = false} while {@code msa.isActive = true} is a real state.</li>
-     *   <li>{@code m.isActive} — <b>the master themself deactivated</b>. Added by the 2026-08
-     *       security audit: without it a deactivated master kept a live «Записатись» in every
-     *       client's wish list, which {@code BookingService.doCreateBooking} then rejects with
-     *       404 — precisely the dead CTA this javadoc claims to prevent. Costs no extra join:
-     *       {@code m} is already joined for the row's master identity.</li>
+     *   <li>{@code SERVICE} — a {@code master_services.id} (a chosen master's assignment;
+     *       Phase 31.3/31.4, unchanged in shape).</li>
+     *   <li>{@code SALON_SERVICE} — a salon-owned {@code service_definitions.id} favourited
+     *       BEFORE a master was chosen (the salon-catalogue step).</li>
      * </ul>
      *
-     * <p><b>A FOURTH predicate — the owning salon's {@code isActive}</b> (2026-08 security
-     * re-audit MEDIUM). {@code SalonService.deactivateSalon} sets {@code salons.is_active = false}
-     * but does NOT cascade to {@code masters.is_active}, so every master of a closed salon still
-     * reads as active. Unlike the MASTER arm, a {@code SALON_MASTER}'s service IS wish-listable
-     * (locked decision), so this list is the one surface that can show a closed salon's staff —
-     * {@code /favorites/salons} correctly hid the salon itself while this list kept offering its
-     * masters' services with a live «Записатись». The booking path now rejects those too
-     * ({@code BookingService.doCreateBooking}); this predicate stops the dead CTA being rendered
-     * at all.
+     * <p><b>Why native SQL with a {@code UNION ALL}, not two JPQL queries merged in Java.</b>
+     * The two arms have structurally different identities (one has a {@code master_services}
+     * row, the other doesn't) but the wish-list card renders the SAME shape for both, and the
+     * two arms must interleave by {@code created_at DESC} as ONE paginated list — a client who
+     * favourited a salon service, then a master's service, then another salon service must see
+     * all three in that order on one page, not two separately-paginated sub-lists stitched
+     * together. A single {@code UNION ALL} keeps this ONE statement (content) plus ONE count
+     * statement (only issued by Spring Data when a page is full), so
+     * {@code FavoriteListProjectionTest}'s pinned "1 statement for a short page, 2 for a full
+     * page" invariant is unaffected by adding the second arm — the query count does not grow
+     * with the number of arms, only with whether the page needs a count at all.
      *
-     * <p><b>The {@code m.salon IS NULL} branch is load-bearing, not defensive.</b> An
-     * {@code INDEPENDENT_MASTER} has {@code masters.salon_id = NULL} by construction
-     * ({@code MasterService.createMasterForIndependentUser} never sets one) and must stay
-     * bookable, so the predicate is a disjunction, never a bare {@code sal.isActive = true}.
-     * For the same reason the salon is reached through an explicit {@code LEFT JOIN}: the
-     * implicit path form ({@code m.salon.isActive}) compiles to an INNER join in Hibernate 6 and
-     * would silently drop every independent master's service from the list.
+     * <p><b>Zero entity hydration, deliberately (§I, unchanged property).</b> Every column is a
+     * scalar; nothing here is a JPA entity or association, for EITHER arm. This is a strictly
+     * stronger form of the previous "master identity as scalars, never {@code JOIN FETCH
+     * m.user}" guarantee: neither arm hydrates a {@code Master}, {@code User}, {@code Salon} or
+     * {@code ServiceDefinition} row into the persistence context, so
+     * {@code FavoriteListProjectionTest}'s "zero Salon / zero User entity loads" assertions hold
+     * for both arms without qualification.
      *
-     * <p><b>Why the projection is {@code Object[]} and not a bare entity page.</b> The row's
-     * master identity ({@code firstName}/{@code lastName}/{@code avatarUrl}) is read as SCALARS
-     * off a plain {@code JOIN m.user u}, never a {@code JOIN FETCH}. Fetching the user would
-     * hydrate the whole 32-column {@code users} row per wish-list item — including
-     * {@code password_hash}, {@code password_reset_code_hash}, {@code verification_code_hash}
-     * and {@code tokens_valid_after} — into the persistence context, for three strings the DTO
-     * actually prints. At {@code size=20} that is 20 credential-bearing managed entities per
-     * request (§I). {@code msa.serviceDefinition} and {@code msa.master} stay {@code JOIN FETCH}
-     * because {@code ServicePricing} and the master id genuinely need them as entities.
-     * {@code Master.user} is LAZY, so the fetched {@code Master} carries only an uninitialised
-     * proxy — no {@code users} row is loaded at all. Every fetch is ToOne, so
-     * {@code LIMIT}/{@code OFFSET} stays in SQL (no in-memory pagination).
+     * <p><b>Price band</b> — {@code price_type} / {@code price_min} / {@code price_max} are read
+     * straight off {@code service_definitions.price_type} / {@code base_price} / {@code
+     * price_max} for BOTH arms; that is exactly the definition's advertised band, i.e. exactly
+     * what {@code ServicePricing.ofDefinition(sd)} would derive from the same row (Phase 31.4
+     * D2) — the override on {@code master_services.price_override} affects only the booking
+     * floor, never this band (see {@code ServicePricing}'s class javadoc), so it is correctly
+     * absent from this SELECT. {@code duration_minutes} is the one field the two arms compute
+     * differently: the MASTER arm applies {@code COALESCE(msa.duration_override_minutes,
+     * sd.base_duration_minutes)} (the master's own override); the SALON arm has no assignment to
+     * override from, so it is bare {@code sd.base_duration_minutes} — matching
+     * {@code ServicePricing.ofDefinition}'s {@code effectiveDurationMinutes} for a bare
+     * definition (override arguments {@code null}). {@code FavoriteService} formats
+     * {@code priceDisplay} from these three scalars via the same {@code PriceDisplayFormatter}
+     * {@code ServicePricing} calls internally — see {@code FavoriteServiceResponse.fromRow}.
      *
-     * <p>Column layout (stable — index-matched in {@code FavoriteService.mapWishListRow}):
+     * <p><b>Master-performed invariant on the SALON arm (locked product decision).</b> The
+     * {@code EXISTS} clause mirrors {@code MasterServiceRepository
+     * #existsBookableAssignmentForSalonService} / {@code #findBookableAssignmentsBySalon}: a
+     * favourited salon service only appears here while at least one active master of the active
+     * salon still performs it. The favourite ROW is never deleted when that stops being true —
+     * exactly the existing MASTER/SALON/SERVICE self-healing behaviour — it just stops (and later
+     * resumes) appearing in this read. The MASTER arm keeps its pre-existing four flags
+     * ({@code msa.is_active}, {@code sd.is_active}, {@code m.is_active}, salon-active-or-null)
+     * for the same reason, unchanged from Phase 31.3/31.4.
+     *
+     * <p><b>Column layout</b> (stable — index-matched in {@code FavoriteService.mapWishListRow}
+     * and {@code FavoriteServiceResponse.fromRow}); columns 15/16 exist for the {@code ORDER BY}
+     * tiebreak only and are never read on the Java side:
      * <ol start="0">
-     *   <li>{@link MasterServiceAssignment} (fetch-joined: {@code serviceDefinition}, {@code master})</li>
-     *   <li>master's {@code users.first_name}</li>
-     *   <li>master's {@code users.last_name}</li>
-     *   <li>master's {@code users.avatar_url}</li>
+     *   <li>{@code source_type} — {@code "MASTER"} or {@code "SALON"}</li>
+     *   <li>{@code master_service_id} — {@code master_services.id}; {@code NULL} for a SALON row</li>
+     *   <li>{@code master_id} — {@code masters.id}; {@code NULL} for a SALON row</li>
+     *   <li>{@code service_def_id} — {@code service_definitions.id}, present on both arms</li>
+     *   <li>{@code service_name}</li>
+     *   <li>{@code master_first_name} — {@code NULL} for a SALON row</li>
+     *   <li>{@code master_last_name} — {@code NULL} for a SALON row</li>
+     *   <li>{@code master_avatar_url} — {@code NULL} for a SALON row</li>
+     *   <li>{@code duration_minutes} — effective duration (see above)</li>
+     *   <li>{@code price_type}</li>
+     *   <li>{@code price_min} — the definition's {@code base_price}</li>
+     *   <li>{@code price_max} — {@code NULL} for FIXED</li>
+     *   <li>{@code salon_id} — {@code NULL} for a MASTER row</li>
+     *   <li>{@code salon_name} — {@code NULL} for a MASTER row</li>
+     *   <li>{@code salon_avatar_url} — {@code NULL} for a MASTER row</li>
+     *   <li>{@code created_at} — ordering only</li>
+     *   <li>{@code favorite_id} — tiebreak only, makes the order total</li>
      * </ol>
      *
-     * <p><b>Ordering</b> matches {@code /favorites/masters} and {@code /favorites/salons}
-     * byte-for-byte: {@code f.createdAt DESC} (most recently hearted first) with the target id
-     * as a tiebreak, making it a total order so paging never drops or duplicates a row.
+     * <p><b>Ordering</b> matches {@code /favorites/masters} and {@code /favorites/salons}:
+     * {@code created_at DESC} (most recently hearted first) with the favourite row's own id as a
+     * tiebreak — a total order across BOTH arms, so paging never drops or duplicates a row even
+     * when a MASTER row and a SALON row share the same {@code created_at} millisecond.
      */
     @Query(value = """
-            SELECT msa, u.firstName, u.lastName, u.avatarUrl FROM Favorite f
-            JOIN MasterServiceAssignment msa ON msa.id = f.targetId
-            JOIN FETCH msa.serviceDefinition sd
-            JOIN FETCH msa.master m
-            JOIN m.user u
-            LEFT JOIN m.salon sal
-            WHERE f.clientId = :clientId
-              AND f.targetType = com.beautica.favorite.entity.FavoriteTargetType.SERVICE
-              AND msa.isActive = true
-              AND sd.isActive = true
-              AND m.isActive = true
-              AND (m.salon IS NULL OR sal.isActive = true)
-            ORDER BY f.createdAt DESC, msa.id ASC
+            SELECT * FROM (
+                SELECT
+                    'MASTER'                 AS source_type,
+                    msa.id                   AS master_service_id,
+                    m.id                     AS master_id,
+                    sd.id                    AS service_def_id,
+                    sd.name                  AS service_name,
+                    u.first_name             AS master_first_name,
+                    u.last_name              AS master_last_name,
+                    u.avatar_url             AS master_avatar_url,
+                    COALESCE(msa.duration_override_minutes, sd.base_duration_minutes) AS duration_minutes,
+                    sd.price_type            AS price_type,
+                    sd.base_price            AS price_min,
+                    sd.price_max             AS price_max,
+                    NULL::uuid               AS salon_id,
+                    NULL::varchar            AS salon_name,
+                    NULL::varchar            AS salon_avatar_url,
+                    f.created_at             AS created_at,
+                    f.id                     AS favorite_id
+                FROM favorites f
+                JOIN master_services msa ON msa.id = f.target_id
+                JOIN service_definitions sd ON sd.id = msa.service_def_id
+                JOIN masters m ON m.id = msa.master_id
+                JOIN users u ON u.id = m.user_id
+                LEFT JOIN salons sal ON sal.id = m.salon_id
+                WHERE f.client_id = :clientId
+                  AND f.target_type = 'SERVICE'
+                  AND msa.is_active = true
+                  AND sd.is_active = true
+                  AND m.is_active = true
+                  AND (m.salon_id IS NULL OR sal.is_active = true)
+
+                UNION ALL
+
+                SELECT
+                    'SALON'                  AS source_type,
+                    NULL::uuid               AS master_service_id,
+                    NULL::uuid               AS master_id,
+                    sd.id                    AS service_def_id,
+                    sd.name                  AS service_name,
+                    NULL::varchar            AS master_first_name,
+                    NULL::varchar            AS master_last_name,
+                    NULL::varchar            AS master_avatar_url,
+                    sd.base_duration_minutes AS duration_minutes,
+                    sd.price_type            AS price_type,
+                    sd.base_price            AS price_min,
+                    sd.price_max             AS price_max,
+                    sal.id                   AS salon_id,
+                    sal.name                 AS salon_name,
+                    sal.avatar_url           AS salon_avatar_url,
+                    f.created_at             AS created_at,
+                    f.id                     AS favorite_id
+                FROM favorites f
+                JOIN service_definitions sd ON sd.id = f.target_id AND sd.owner_type = 'SALON'
+                JOIN salons sal ON sal.id = sd.owner_id
+                WHERE f.client_id = :clientId
+                  AND f.target_type = 'SALON_SERVICE'
+                  AND sd.is_active = true
+                  AND sal.is_active = true
+                  AND EXISTS (
+                      SELECT 1 FROM master_services msa2
+                      JOIN masters m2 ON m2.id = msa2.master_id
+                      WHERE msa2.service_def_id = sd.id
+                        AND msa2.is_active = true
+                        AND m2.is_active = true
+                        AND m2.salon_id = sal.id
+                        AND m2.is_active = true
+                  )
+            ) combined
+            ORDER BY created_at DESC, favorite_id
             """,
             countQuery = """
-            SELECT count(msa) FROM Favorite f
-            JOIN MasterServiceAssignment msa ON msa.id = f.targetId
-            JOIN msa.master m
-            LEFT JOIN m.salon sal
-            WHERE f.clientId = :clientId
-              AND f.targetType = com.beautica.favorite.entity.FavoriteTargetType.SERVICE
-              AND msa.isActive = true
-              AND msa.serviceDefinition.isActive = true
-              AND m.isActive = true
-              AND (m.salon IS NULL OR sal.isActive = true)
-            """)
+            SELECT
+                (SELECT COUNT(*)
+                 FROM favorites f
+                 JOIN master_services msa ON msa.id = f.target_id
+                 JOIN service_definitions sd ON sd.id = msa.service_def_id
+                 JOIN masters m ON m.id = msa.master_id
+                 LEFT JOIN salons sal ON sal.id = m.salon_id
+                 WHERE f.client_id = :clientId
+                   AND f.target_type = 'SERVICE'
+                   AND msa.is_active = true
+                   AND sd.is_active = true
+                   AND m.is_active = true
+                   AND (m.salon_id IS NULL OR sal.is_active = true))
+                +
+                (SELECT COUNT(*)
+                 FROM favorites f
+                 JOIN service_definitions sd ON sd.id = f.target_id AND sd.owner_type = 'SALON'
+                 JOIN salons sal ON sal.id = sd.owner_id
+                 WHERE f.client_id = :clientId
+                   AND f.target_type = 'SALON_SERVICE'
+                   AND sd.is_active = true
+                   AND sal.is_active = true
+                   AND EXISTS (
+                       SELECT 1 FROM master_services msa2
+                       JOIN masters m2 ON m2.id = msa2.master_id
+                       WHERE msa2.service_def_id = sd.id
+                         AND msa2.is_active = true
+                         AND m2.is_active = true
+                         AND m2.salon_id = sal.id))
+            """,
+            nativeQuery = true)
     Page<Object[]> findFavoriteServiceRows(@Param("clientId") UUID clientId,
                                            Pageable pageable);
 
     /**
-     * Membership test for {@code masterServices.id} values a CLIENT has favourited — backs the
-     * per-request {@code isFavorite} decoration on {@code GET /masters/{masterId}/services}
-     * (Phase 32.1 D5), NOT the wish-list page above.
+     * Membership test for polymorphic target ids a CLIENT has favourited — backs the per-request
+     * {@code isFavorite} decoration on {@code GET /masters/{masterId}/services} ({@code targetType
+     * = SERVICE}, {@code targetIds} = {@code masterServices.id} values, Phase 32.1 D5) AND on
+     * {@code GET /salons/{salonId}/services} ({@code targetType = SALON_SERVICE}, {@code targetIds}
+     * = {@code service_definitions.id} values, salon-service-favourites track), NOT the wish-list
+     * page above. Renamed from a {@code SERVICE}-implicit method to an explicit {@code targetType}
+     * parameter for exactly this reuse — every caller now states which arm it means.
      *
      * <p><b>One statement, membership tested in memory</b> against the returned {@link Set} —
      * deliberately not {@code existsBy…} per row (N+1) and not {@link #findFavoriteServiceRows}
-     * (which fetch-joins the whole assignment graph for a 20-row wish-list page — far more work
-     * than a set of ids, and capped at 20 so it would also be the wrong shape for a 200-row menu).
+     * (which is shaped for a capped 20-row wish-list page, far more work than a set of ids, and
+     * the wrong shape for a 200-row menu or catalogue).
      *
      * <p><b>Index: {@code uq_favorite UNIQUE (client_id, target_type, target_id)}
      * ({@code V92__create_favorites.sql}) — no new migration.</b> Equality on {@code client_id}
@@ -408,13 +496,15 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * {@code idx_favorites_client_created} (V135) is the ORDERING index the three per-client list
      * queries ride and is not what this predicate uses.
      *
-     * <p><b>{@code targetType = SERVICE} is load-bearing, not decorative.</b> {@code target_id} is
+     * <p><b>{@code targetType} is load-bearing, not decorative.</b> {@code target_id} is
      * polymorphic with no FK — a {@code MASTER} or {@code SALON} favourite can carry a
-     * {@code target_id} that happens to collide with an unrelated {@code master_services.id}.
-     * Dropping this predicate would flag that master/salon favourite as a favourited SERVICE too.
+     * {@code target_id} that happens to collide with an unrelated {@code master_services.id} or
+     * {@code service_definitions.id}. Dropping this predicate would flag that unrelated favourite
+     * as a match too.
      *
      * <p>Callers MUST short-circuit on an empty {@code targetIds} collection — a master with no
-     * active services must never reach this method with an empty {@code IN} list.
+     * active services (or a salon with no catalogue rows) must never reach this method with an
+     * empty {@code IN} list.
      *
      * <p><b>{@code @Transactional(readOnly = true)}</b> (audit-fix, P9 checklist): without it,
      * Spring Data opens a plain read-write transaction for this custom {@code @Query} method. No
@@ -428,9 +518,10 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
     @Query("""
             SELECT f.targetId FROM Favorite f
             WHERE f.clientId = :clientId
-              AND f.targetType = com.beautica.favorite.entity.FavoriteTargetType.SERVICE
+              AND f.targetType = :targetType
               AND f.targetId IN :targetIds
             """)
     Set<UUID> findFavoritedServiceIds(@Param("clientId") UUID clientId,
+                                       @Param("targetType") FavoriteTargetType targetType,
                                        @Param("targetIds") Collection<UUID> targetIds);
 }

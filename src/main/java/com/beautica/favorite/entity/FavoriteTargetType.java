@@ -30,9 +30,31 @@ package com.beautica.favorite.entity;
  * {@code FavoriteService.validateServiceTarget} deliberately applies <b>no role check</b>:
  * an active {@code master_services} row belonging to a {@code SALON_MASTER} is a valid
  * {@code SERVICE} target. Locked user decision, 2026-08-07 (Phase 31.3).
+ *
+ * <p>{@code SALON_SERVICE} (salon-service-favourites track) means a
+ * {@code service_definitions} row where {@code owner_type = 'SALON'} — the favorite's
+ * {@code targetId} is the {@code service_definitions.id}, <b>never</b> a
+ * {@code master_services.id}. Today, only an independent master's service can be
+ * favourited via {@code SERVICE}; a salon's catalogue is browsed one step earlier — before
+ * a master is chosen — so there is no {@code master_services} row yet to point at.
+ * {@code service_definitions} is polymorphically owned ({@code owner_type}/{@code owner_id}),
+ * so a definition id functionally determines its salon; the salon is derived server-side
+ * (one join) rather than carried as a second id, which is why this is a single UUID and not
+ * a composite {@code (salonId, serviceDefId)} key — {@code uq_favorite UNIQUE (client_id,
+ * target_type, target_id)} (V92) does not dedupe NULLs, so a nullable second column would
+ * silently break uniqueness for every other arm.
+ *
+ * <p><b>Master-performed invariant applies here too.</b> Per the locked "salon offering =
+ * master-performed only" rule, {@code FavoriteService.validateSalonServiceTarget} additionally
+ * requires at least one active assignment by an active master of that (active) salon — a
+ * favourite is a pointer, not a guarantee; visibility of the pointer stays derived, exactly as
+ * the {@code SERVICE} arm's read-time filtering already works (see
+ * {@code FavoriteRepository.findFavoriteServiceRows}'s javadoc). The write-time check mirrors
+ * {@code MasterServiceRepository#findBookableAssignmentsBySalon}.
  */
 public enum FavoriteTargetType {
     MASTER,
     SALON,
-    SERVICE
+    SERVICE,
+    SALON_SERVICE
 }

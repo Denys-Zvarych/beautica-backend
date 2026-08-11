@@ -176,6 +176,48 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                 .isEqualTo(2);
     }
 
+    // ── V136: SALON_SERVICE target_type (salon-service-favourites track) ────────
+
+    @Test
+    @DisplayName("V136 chk_favorite_target_type admits SALON_SERVICE while still rejecting an unknown value")
+    void should_acceptSalonServiceTargetType_when_v136Applied() {
+        UUID clientId = createClient("v136-client@beautica.test");
+
+        jdbcTemplate.update(
+                "INSERT INTO favorites (client_id, target_type, target_id) VALUES (?, 'SALON_SERVICE', ?)",
+                clientId, UUID.randomUUID());
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM favorites WHERE client_id = ? AND target_type = 'SALON_SERVICE'",
+                Integer.class, clientId)).isEqualTo(1);
+
+        // The widening is additive — a bogus value is still rejected by the same constraint.
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "INSERT INTO favorites (client_id, target_type, target_id) VALUES (?, 'CATALOGUE_ITEM', ?)",
+                clientId, UUID.randomUUID()))
+                .isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    @DisplayName("MASTER, SALON and SERVICE favorites still insert after the V136 widening")
+    void should_stillAcceptPriorValues_when_v136Applied() {
+        UUID clientId = createClient("v136-prior-client@beautica.test");
+
+        jdbcTemplate.update(
+                "INSERT INTO favorites (client_id, target_type, target_id) VALUES (?, 'MASTER', ?)",
+                clientId, UUID.randomUUID());
+        jdbcTemplate.update(
+                "INSERT INTO favorites (client_id, target_type, target_id) VALUES (?, 'SALON', ?)",
+                clientId, UUID.randomUUID());
+        jdbcTemplate.update(
+                "INSERT INTO favorites (client_id, target_type, target_id) VALUES (?, 'SERVICE', ?)",
+                clientId, UUID.randomUUID());
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM favorites WHERE client_id = ?", Integer.class, clientId))
+                .isEqualTo(3);
+    }
+
     // ── SERVICE favorites: the salon-master asymmetry (locked user decision) ─────
 
     @Test

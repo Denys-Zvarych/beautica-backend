@@ -15,8 +15,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Integration coverage for {@link FavoriteRepository#findFavoritedServiceIds(UUID,
- * java.util.Collection)} — the membership query backing the {@code isFavorite} decoration on
- * {@code GET /masters/{masterId}/services} (Phase 32.1 D5), run against real Postgres.
+ * FavoriteTargetType, java.util.Collection)} — the membership query backing the
+ * {@code isFavorite} decoration on {@code GET /masters/{masterId}/services} (Phase 32.1 D5), run
+ * against real Postgres.
  *
  * <p>Deliberately narrow: the decorator's decision table (who gets queried at all) is pinned by
  * {@code MasterServiceFavoriteDecoratorTest} with a mocked repository. This class exists only to
@@ -42,7 +43,7 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         insertFavorite(clientId, FavoriteTargetType.SERVICE, favouritedNotInSet);
 
         Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
-                clientId, List.of(favouritedInSet, notFavouritedInSet));
+                clientId, FavoriteTargetType.SERVICE, List.of(favouritedInSet, notFavouritedInSet));
 
         assertThat(result)
                 .as("only the favourited id that was ALSO in the requested set may be returned — "
@@ -64,12 +65,81 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         // to stop.
         insertFavorite(clientId, FavoriteTargetType.MASTER, masterServiceId);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(clientId, List.of(masterServiceId));
+        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+                clientId, FavoriteTargetType.SERVICE, List.of(masterServiceId));
 
         assertThat(result)
                 .as("a MASTER-typed favourite must never be reported as a favourited SERVICE, even "
                         + "when its target_id value happens to equal a real master_services.id")
                 .isEmpty();
+    }
+
+    // ── SALON_SERVICE arm isolation (salon-service-favourites track gap, closed 2026-08-10) ────
+
+    /**
+     * The {@code targetType} parameter was widened from an implicit {@code SERVICE} literal to
+     * an explicit argument specifically so {@code SalonServiceFavoriteDecorator} could reuse this
+     * query for the {@code SALON_SERVICE} arm. The pre-existing MASTER-vs-SERVICE collision test
+     * above proves the predicate is load-bearing for the ORIGINAL two types; it says nothing about
+     * whether the NEW type is isolated the same way. {@code target_id} has no FK, so nothing stops
+     * a {@code SALON_SERVICE} favourite's id from colliding with an unrelated
+     * {@code master_services.id} passed in a {@code GET /masters/{id}/services} decoration call
+     * (or vice versa) — this pins that the widened predicate still isolates correctly in BOTH
+     * directions.
+     */
+    @Test
+    @DisplayName("a SALON_SERVICE favourite whose target_id collides with a queried master_services.id "
+            + "must NOT be returned when targetType = SERVICE — the widened predicate still isolates "
+            + "the new arm from the old one")
+    void should_ignoreSalonServiceFavorite_when_queryingServiceTargetTypeAndIdsCollide() {
+        UUID clientId = createClient("fav-repo-salonsvc-collision-client@beautica.test");
+        UUID master = createIndependentMaster("fav-repo-salonsvc-collision-master@beautica.test");
+        UUID masterServiceId = createMasterService(master);
+        // A SALON_SERVICE favourite carrying the SAME uuid value as an unrelated master_services
+        // row — nothing in the schema forbids this collision.
+        insertFavorite(clientId, FavoriteTargetType.SALON_SERVICE, masterServiceId);
+
+        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+                clientId, FavoriteTargetType.SERVICE, List.of(masterServiceId));
+
+        assertThat(result)
+                .as("a SALON_SERVICE-typed favourite must never be reported as a favourited SERVICE, "
+                        + "even when its target_id value happens to equal a real master_services.id")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("a SERVICE favourite whose target_id collides with a queried service_definitions.id "
+            + "must NOT be returned when targetType = SALON_SERVICE — isolation holds in the other "
+            + "direction too")
+    void should_ignoreServiceFavorite_when_queryingSalonServiceTargetTypeAndIdsCollide() {
+        UUID clientId = createClient("fav-repo-service-collision-client@beautica.test");
+        UUID master = createIndependentMaster("fav-repo-service-collision-master@beautica.test");
+        UUID masterServiceId = createMasterService(master);
+        insertFavorite(clientId, FavoriteTargetType.SERVICE, masterServiceId);
+
+        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+                clientId, FavoriteTargetType.SALON_SERVICE, List.of(masterServiceId));
+
+        assertThat(result)
+                .as("a SERVICE-typed favourite must never be reported as a favourited SALON_SERVICE, "
+                        + "even when its target_id value happens to equal a real master_services.id")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("returns a genuinely SALON_SERVICE-favourited service_definitions.id when queried "
+            + "with targetType = SALON_SERVICE — the new arm's happy path, not just its collisions")
+    void should_returnMatchingId_when_queryingSalonServiceTargetType() {
+        UUID clientId = createClient("fav-repo-salonsvc-happy-client@beautica.test");
+        UUID salonServiceDefId = UUID.randomUUID();
+        UUID notFavourited = UUID.randomUUID();
+        insertFavorite(clientId, FavoriteTargetType.SALON_SERVICE, salonServiceDefId);
+
+        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+                clientId, FavoriteTargetType.SALON_SERVICE, List.of(salonServiceDefId, notFavourited));
+
+        assertThat(result).containsExactly(salonServiceDefId);
     }
 
     @Test
@@ -79,7 +149,8 @@ class FavoriteRepositoryIT extends AbstractIntegrationTest {
         UUID master = createIndependentMaster("fav-repo-none-master@beautica.test");
         UUID masterServiceId = createMasterService(master);
 
-        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(clientId, List.of(masterServiceId));
+        Set<UUID> result = favoriteRepository.findFavoritedServiceIds(
+                clientId, FavoriteTargetType.SERVICE, List.of(masterServiceId));
 
         assertThat(result).isNotNull().isEmpty();
     }

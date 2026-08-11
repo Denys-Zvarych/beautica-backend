@@ -12,6 +12,7 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
+import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -106,6 +107,7 @@ public class ServiceController {
 
     private final ServiceCatalogService serviceCatalogService;
     private final MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
+    private final SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
 
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
             // Explicit success response so springdoc does NOT treat the lone 409 below as the
@@ -191,11 +193,21 @@ public class ServiceController {
      *
      * <p>Note this shares its path with {@link #addServiceToSalon} above — no route
      * collision, they are distinct HTTP methods (POST vs GET).
+     *
+     * <p><strong>{@code isFavorite} decoration (salon-service-favourites track).</strong>
+     * {@code serviceCatalogService.getSalonServiceCatalog} is cached per-{@code salonId} and
+     * shared across every caller, so it can never know who is asking. This method composes the
+     * cached, caller-agnostic catalog with {@link SalonServiceFavoriteDecorator#decorate}, a
+     * SEPARATE bean invoked here — lexically outside the {@code @Cacheable} method — so the
+     * per-client flag is applied fresh on every request and never enters the cache. An
+     * authenticated CLIENT sees {@code true}/{@code false} per service; every other caller
+     * (anonymous, or any other role) sees {@code null}.
      */
     @GetMapping("/salons/{salonId}/services")
     public ApiResponse<SalonServiceCatalogResponse> getSalonServiceCatalog(
-            @PathVariable UUID salonId) {
-        return ApiResponse.ok(serviceCatalogService.getSalonServiceCatalog(salonId));
+            @PathVariable UUID salonId, Authentication authentication) {
+        SalonServiceCatalogResponse catalog = serviceCatalogService.getSalonServiceCatalog(salonId);
+        return ApiResponse.ok(salonServiceFavoriteDecorator.decorate(catalog, authentication));
     }
 
     /**

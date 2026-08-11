@@ -351,4 +351,43 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
               AND sd.isActive = true
             """)
     List<MasterServiceAssignment> findBookableAssignmentsBySalon(@Param("salonId") UUID salonId);
+
+    /**
+     * Existence-only sibling of {@link #findBookableAssignmentsBySalon} for exactly ONE service
+     * definition — backs {@code FavoriteService.validateSalonServiceTarget} (salon-service-favourites
+     * track): a {@code SALON_SERVICE} favourite target must have at least one active assignment by
+     * an active master of that active salon, mirroring the "salon offering = master-performed only"
+     * invariant this codebase already applies at read time to the salon catalogue and to the
+     * {@code SERVICE} wish-list arm.
+     *
+     * <p>{@code sd.isActive = true} is redundant with the caller's own definition-active check (it
+     * already loaded and checked the same {@code ServiceDefinition}) but is kept here anyway, exactly
+     * as {@link #findBookableAssignmentsBySalon} checks it: defence-in-depth against a TOCTOU window
+     * between the caller's load and this query, at zero extra join cost (the definition is already
+     * reached via {@code msa.serviceDefinition}).
+     *
+     * <p>{@code m.salon.isActive = true} is the explicit salon-active gate the 2026-08 security
+     * re-audit added elsewhere ({@code FavoriteService.validateServiceTarget},
+     * {@code FavoriteRepository.findFavoriteServiceRows}): {@code SalonService.deactivateSalon} does
+     * NOT cascade to {@code masters.is_active}, so a closed salon's masters still read as active — this
+     * predicate is the one thing that stops a closed salon's service from being favouritable via this
+     * arm. There is no {@code m.salon IS NULL} branch here (unlike the {@code SERVICE} arm's mirrored
+     * predicate): a {@code SALON_SERVICE} target's definition is asserted {@code ownerType == SALON}
+     * by the caller before this method runs, so every candidate master matching {@code m.salon.id =
+     * :salonId} necessarily has a non-null salon.
+     */
+    @Query("""
+            SELECT COUNT(msa) > 0
+            FROM MasterServiceAssignment msa
+            JOIN msa.master m
+            WHERE msa.serviceDefinition.id = :serviceDefId
+              AND msa.isActive = true
+              AND msa.serviceDefinition.isActive = true
+              AND m.isActive = true
+              AND m.salon.id = :salonId
+              AND m.salon.isActive = true
+            """)
+    boolean existsBookableAssignmentForSalonService(
+            @Param("salonId") UUID salonId,
+            @Param("serviceDefId") UUID serviceDefId);
 }

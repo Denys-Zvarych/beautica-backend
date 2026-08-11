@@ -19,7 +19,10 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.ServiceRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -45,7 +48,10 @@ import java.util.UUID;
  * {@code 409}). The {@code uq_favorite} UNIQUE index is the last-resort guard: a
  * concurrent double-submit that races past the pre-check is caught as a
  * {@link DataIntegrityViolationException} and resolved by re-reading the now-present
- * row. {@link #removeFavorite} is a delete-if-exists (→ controller {@code 204}).
+ * row. The insert attempt itself runs in {@link FavoritePersistenceService}'s own
+ * {@code REQUIRES_NEW} transaction, so a losing caller's re-read runs on an unaffected
+ * transaction instead of one Postgres has already marked aborted — see that class's
+ * javadoc. {@link #removeFavorite} is a delete-if-exists (→ controller {@code 204}).
  *
  * <h3>Target validation (application layer, not DB CHECK)</h3>
  * A {@code MASTER} target must be an {@code INDEPENDENT_MASTER}-owned master
@@ -71,7 +77,9 @@ public class FavoriteService {
     private final MasterRepository masterRepository;
     private final SalonRepository salonRepository;
     private final MasterServiceRepository masterServiceRepository;
+    private final ServiceRepository serviceRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
+    private final FavoritePersistenceService favoritePersistenceService;
 
     /**
      * Favorites the target for {@code clientUserId} (the authenticated principal).
@@ -182,38 +190,27 @@ public class FavoriteService {
 
     /**
      * One bounded page of this client's BEAUTY WISH LIST — favorited services, newest
-     * favorite first (Phase 31.4).
+     * favorite first (Phase 31.4; extended by the salon-service-favourites track to merge a
+     * second source arm — see {@code FavoriteRepository.findFavoriteServiceRows}).
      *
-     * <p>Each row carries what the card renders (service name, master name + avatar,
-     * duration, price band) and the two ids {@code POST /bookings} needs, so «Записатись»
-     * costs no extra call. Money is derived by the shared {@code ServicePricing} path, so the
-     * wish list and the master's own menu can never print different prices.
+     * <p>Each row carries what the card renders (service name, master OR salon identity,
+     * duration, price band) and, for a MASTER row, the two ids {@code POST /bookings} needs, so
+     * «Записатись» costs no extra call. Money is derived from the same three
+     * {@code service_definitions} columns {@code ServicePricing.ofDefinition} reads, for both
+     * arms, so the wish list and the master's own menu (or the salon catalogue) can never print
+     * different prices.
      *
-     * <p>Rows whose assignment, service definition <b>or performing master</b> went inactive are
-     * filtered out by the query, not deleted: the favourite row survives (consistent with
-     * MASTER/SALON, Phase 31.3 D4), it simply stops appearing rather than offering a dead CTA.
-     * The repository's {@code JOIN FETCH} graph initialises everything the DTO traverses, so the
-     * mapping below runs inside this read-only transaction with no lazy loads (§E-2).
+     * <p>Rows whose assignment, service definition, performing master, <b>or (for a SALON row)
+     * owning salon</b> went inactive are filtered out by the query, not deleted: the favourite
+     * row survives (consistent with MASTER/SALON/SERVICE), it simply stops appearing rather than
+     * offering a dead CTA — and reappears if a master is re-assigned to the service, since
+     * nothing was ever deleted.
      */
     @Transactional(readOnly = true)
     public Page<FavoriteServiceResponse> listServiceFavorites(UUID clientUserId, Pageable pageable) {
         Page<Object[]> rows = favoriteRepository.findFavoriteServiceRows(
                 clientUserId, SortWhitelist.stripSort(pageable));
-        return rows.map(FavoriteService::mapWishListRow);
-    }
-
-    /**
-     * Maps one wish-list projection row — {@code [assignment, firstName, lastName, avatarUrl]},
-     * the layout pinned in {@code FavoriteRepository.findFavoriteServiceRows}. The master's
-     * identity arrives as scalars rather than through {@code msa.getMaster().getUser()} so no
-     * credential-bearing {@code users} row is hydrated for the page (§I).
-     */
-    private static FavoriteServiceResponse mapWishListRow(Object[] row) {
-        return FavoriteServiceResponse.from(
-                (MasterServiceAssignment) row[0],
-                (String) row[1],
-                (String) row[2],
-                (String) row[3]);
+        return rows.map(FavoriteServiceResponse::fromRow);
     }
 
     // ── target validation ─────────────────────────────────────────────────────
@@ -226,6 +223,7 @@ public class FavoriteService {
             case MASTER -> validateMasterTarget(targetId);
             case SALON -> validateSalonTarget(targetId);
             case SERVICE -> validateServiceTarget(targetId);
+            case SALON_SERVICE -> validateSalonServiceTarget(targetId);
         }
     }
 
@@ -325,16 +323,72 @@ public class FavoriteService {
         }
     }
 
+    /**
+     * Validates a {@code SALON_SERVICE} target — {@code targetId} is a
+     * {@code service_definitions.id} where {@code owner_type = 'SALON'}, <b>never</b> a
+     * {@code master_services.id}. This is the "browse the salon catalogue, favorite a service
+     * before choosing a master" arm; the {@code SERVICE} arm above stays the "already chose a
+     * master" one. See {@link FavoriteTargetType}'s javadoc for the full identity rationale.
+     *
+     * <p><b>Three checks, all load-bearing:</b>
+     * <ol>
+     *   <li>The definition must exist and be active — {@code 404} unknown, {@code 400} inactive
+     *       (mirrors every other arm's "missing vs. inactive" split).</li>
+     *   <li>{@code ownerType} must be {@code SALON} — an {@code INDEPENDENT_MASTER}-owned
+     *       definition has no {@code master_services} row to point a {@code SALON_SERVICE}
+     *       favourite at coherently; that definition is favouritable only via {@code SERVICE}
+     *       (a {@code master_services.id}), never via this arm.</li>
+     *   <li><b>Master-performed invariant</b> (locked product decision — "salon offering =
+     *       master-performed only"): at least one active {@link MasterServiceAssignment} by an
+     *       active master of that active salon must exist. Without this a client could favourite
+     *       a definition no one currently performs — indistinguishable from a live catalogue
+     *       entry until they try to book it. {@code existsBookableAssignmentForSalonService}
+     *       mirrors the exact predicate {@code MasterServiceRepository
+     *       #findBookableAssignmentsBySalon} uses to build the public catalogue, so write-time
+     *       and read-time can never disagree about what counts as "performed".</li>
+     * </ol>
+     *
+     * <p>The favourite is a pointer, not a guarantee: visibility stays derived at read time
+     * exactly as the {@code SERVICE} arm already works (a master or salon can go inactive after
+     * the favourite is written; the row survives and the list query filters it out, then back in
+     * if a master is re-assigned — no cleanup job, consistent with every other arm).
+     */
+    private void validateSalonServiceTarget(UUID serviceDefId) {
+        ServiceDefinition definition = serviceRepository.findById(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service not found"));
+
+        if (!definition.isActive()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Only an active service can be favorited");
+        }
+        if (definition.getOwnerType() != OwnerType.SALON) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "Only a salon-owned service can be favorited as SALON_SERVICE");
+        }
+        if (!masterServiceRepository.existsBookableAssignmentForSalonService(
+                definition.getOwnerId(), serviceDefId)) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "No active master currently performs this service");
+        }
+    }
+
     // ── insert with concurrent-duplicate fallback ─────────────────────────────
 
     private FavoriteResponse insertFavorite(UUID clientUserId, FavoriteTargetType targetType, UUID targetId) {
         try {
-            Favorite saved = favoriteRepository.saveAndFlush(
+            // Delegates to a separate bean's REQUIRES_NEW transaction (see
+            // FavoritePersistenceService's javadoc) — calling an annotated method on THIS bean
+            // instead would bypass the @Transactional proxy entirely and run the insert inside
+            // this method's own (already-open) transaction, reintroducing the aborted-transaction
+            // bug the re-read below exists to avoid.
+            Favorite saved = favoritePersistenceService.persistNew(
                     Favorite.of(clientUserId, targetType, targetId));
             return FavoriteResponse.from(saved);
         } catch (DataIntegrityViolationException e) {
-            // Concurrent double-submit raced past the pre-check and hit uq_favorite.
-            // Resolve idempotently by returning the row the other request inserted.
+            // Concurrent double-submit raced past the pre-check and hit uq_favorite in the OTHER
+            // transaction (FavoritePersistenceService's). That transaction rolled back on its own;
+            // THIS transaction never touched the failing statement, so it is still healthy and this
+            // re-read succeeds instead of hitting Postgres 25P02 (aborted transaction).
             return favoriteRepository
                     .findByClientIdAndTargetTypeAndTargetId(clientUserId, targetType, targetId)
                     .map(FavoriteResponse::from)
