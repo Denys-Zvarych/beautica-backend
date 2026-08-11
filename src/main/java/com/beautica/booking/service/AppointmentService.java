@@ -21,6 +21,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -246,6 +247,31 @@ public class AppointmentService {
         // precedence and rationale as the single-service create path.
         assertNoClientConflict(clientId, firstStart, lastEnd);
 
+        // SCHEDULE-FIT GATE (2026-08-11 HIGH) — the multi-service counterpart of the single-service
+        // create gate in BookingService#doCreateBooking. Neither BookingStartsAtValidator above nor the
+        // client-conflict / span-overlap checks ask whether the master WORKS this window, so a visit
+        // could be created on a day-off or inside a lunch-break gap. Uses the BE-2 N-service overload,
+        // never N single-service checks: each leg can fit alone while the CHAIN overruns the working
+        // window.
+        //
+        // PLACEMENT IS LOAD-BEARING, and mirrors BookingService#doCreateBooking's (see its comment):
+        //   * AFTER the idempotent-replay lookup above — a replay's OWN items occupy the slot, so the
+        //     slot list no longer contains it; gating earlier would turn a legitimate retry into a 409
+        //     instead of returning the already-created visit.
+        //   * AFTER the assertNoClientConflict call immediately above — the slot list already has the
+        //     master's CONFIRMED bookings subtracted, so a span that is BOTH the client's own conflict
+        //     and master-busy would fail HERE with the generic "Slot not available" and mask the
+        //     structured, actionable CLIENT_BOOKING_CONFLICT that the locked product decision requires
+        //     to win. Never reorder these two, and never replace one with the other: BOTH must run, in
+        //     this order. Pinned by AppointmentCreateIT
+        //     #should_returnClientBookingConflictNotSlotNotAvailable_when_bothClientConflictAndOffSlotApply.
+        //   * BEFORE the per-master advisory lock — an off-schedule request never contends for it.
+        //   * The planner's OWN assignments are handed through (Perf MEDIUM, 2026-08-11) so the gate does
+        //     not re-run findByMasterIdAndIdWithGraph once per chained service — planChainedItems already
+        //     resolved every one of them above, in this same persistence context.
+        assertVisitStartsOnAvailableSlot(
+                master.getId(), request.masterServiceIds(), VisitPlanner.assignmentsOf(items), firstStart);
+
         Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
@@ -345,6 +371,20 @@ public class AppointmentService {
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
+    }
+
+    /**
+     * Whole-visit schedule-fit guard for {@link #doCreateAppointment} — delegates to the shared
+     * {@link BookingSlotAvailabilityGuard}, the SAME implementation
+     * {@code AppointmentTransitionService#rescheduleAppointment} uses for the identical question, so the
+     * create and reschedule paths cannot drift on what "the master works this visit window" means.
+     * A non-matching start is a {@code 409 "Slot not available"}.
+     */
+    private void assertVisitStartsOnAvailableSlot(
+            UUID masterId, List<UUID> masterServiceIds, List<MasterServiceAssignment> preloaded,
+            OffsetDateTime startsAt) {
+        BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceIds, preloaded, startsAt);
     }
 
     private void assertNoClientConflict(UUID clientId, OffsetDateTime startsAt, OffsetDateTime endsAt) {

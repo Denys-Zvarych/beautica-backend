@@ -121,6 +121,11 @@ class GuestBookingPostRateLimitRegressionTest {
 
         // A read on the same /book/** prefix must NOT consume the booking bucket — guards
         // against the fix over-broadening its matcher to all /book/** traffic.
+        //
+        // Since 2026-08-11 this GET has a bucket of its OWN (guestAvailabilityBuckets, 60/60s — see
+        // GuestAvailabilityGetRateLimitTest); this assertion is unchanged and still means what it always
+        // did: ONE read must not be charged to the 5/15min BOOKING budget. One request is two orders of
+        // magnitude inside the availability cap, so it passes on that bucket too.
         var get = new MockHttpServletRequest("GET", "/api/v1/book/marija-l-cd34/availability");
         get.setRemoteAddr(REMOTE_ADDR);
         var response = new MockHttpServletResponse();

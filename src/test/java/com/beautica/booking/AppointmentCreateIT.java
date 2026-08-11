@@ -1,8 +1,14 @@
 package com.beautica.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.verify;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -13,10 +19,14 @@ import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.StreamSupport;
+import javax.sql.DataSource;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.stubbing.Answer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
@@ -28,6 +38,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 
 /**
  * Full-HTTP-stack smoke suite for BE-3's {@code POST /api/v1/appointments} — the multi-service
@@ -60,6 +71,23 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    /**
+     * Spied (not mocked) so {@code should_return409AndPersistNothing_when_chainOverlapsExistingBooking}
+     * can inject a deterministic interleaving into the {@code existsOverlap} → {@code flush()} window and,
+     * in the same breath, VERIFY the request reached {@code saveAll} — the assertion that keeps that
+     * test's rollback counts from going vacuous. Every call still runs the real repository.
+     */
+    @MockitoSpyBean
+    private BookingRepository bookingRepository;
+
+    /**
+     * Used only to open a connection OUTSIDE the request's transaction, so a row committed mid-request
+     * survives that transaction's rollback. {@code jdbcTemplate} cannot serve here: on the request thread
+     * it would join the very transaction under test via {@code DataSourceUtils}.
+     */
+    @Autowired
+    private DataSource dataSource;
 
     private BookingTestFixtures fixtures;
 
@@ -421,9 +449,30 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
     // 4. Overlap 409 — master busy → conflict, NOTHING persisted (hard atomicity)
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * <b>Why the blocker is committed mid-request instead of pre-seeded.</b> This test used to pre-seed a
+     * CONFIRMED booking at [12:00, 13:00) and expect {@code AppointmentService}'s span
+     * {@code existsOverlap} to reject the chain. Since the schedule-fit gate landed (2026-08-11) that
+     * arrangement is dead: the gate runs first and {@code getAvailableSlots} has already subtracted every
+     * CONFIRMED booking on the master, so 12:00 is simply absent from the slot list and the gate 409s
+     * before the advisory lock is taken. The request never reached the INSERT, making both count
+     * assertions vacuously true and leaving the atomic-rollback guarantee — the highest-value guarantee of
+     * the phase — unexercised.
+     *
+     * <p>Pre-seeding cannot be salvaged: for committed data the gate strictly DOMINATES
+     * {@code existsOverlap} and therefore the GIST backstop too. See {@link OverlapRaceSupport} for the
+     * full argument; the same reasoning re-armed the guest twin
+     * ({@code GuestVisitLinkParityIT#should_rollbackWholeVisit_when_chainOverlapsExistingBooking}), and
+     * this test uses the identical technique.
+     *
+     * <p>NOTHING is stubbed. {@code existsOverlap} really runs and truthfully answers "free", because at
+     * that instant the master IS free; the blocker is then committed from an independent connection —
+     * i.e. inside the check → flush window the GIST constraint exists to police — and the flush trips it.
+     */
     @Test
-    @DisplayName("a chain colliding with an EXISTING CONFIRMED booking on that master → 409, and the "
-            + "whole visit rolls back atomically: zero appointments AND zero chained bookings persist")
+    @DisplayName("a chain colliding with a booking committed between the overlap check and the flush → "
+            + "409, and the whole visit rolls back atomically: the INSERT was reached, yet zero "
+            + "appointments AND zero chained bookings persist")
     void should_return409AndPersistNothing_when_chainOverlapsExistingBooking() throws Exception {
         String masterEmail = "appt-overlap-master-" + System.nanoTime() + "@beautica.test";
         UUID masterId = fixtures.createIndependentMaster(masterEmail);
@@ -436,21 +485,39 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
 
         ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
                 .plusDays(5).withHour(12).withMinute(0).withSecond(0).withNano(0);
-        // A pre-existing guest (LINK) CONFIRMED booking occupies [12:00, 13:00] on this master — a
-        // DIFFERENT booking than the client's, so the master-busy overlap check (not the client
-        // conflict check) is what fires.
-        seedGuestConfirmedBooking(masterId, serviceA, startsAt, 60);
+
+        // The interleaving. After the REAL existsOverlap has run, commit a guest (LINK) CONFIRMED booking
+        // over [13:00, 14:00) — where the visit's SECOND item lands. A GUEST blocker (client_id NULL)
+        // keeps this unambiguously about the master-busy path, never the client-conflict guard.
+        Answer<?> forwardToRealRepository = OverlapRaceSupport.forwardingAnswerOf(bookingRepository);
+        AtomicBoolean blockerCommitted = new AtomicBoolean(false);
+        doAnswer(invocation -> {
+            boolean overlapped = (boolean) forwardToRealRepository.answer(invocation);
+            if (blockerCommitted.compareAndSet(false, true)) {
+                commitGuestBlockerOnItsOwnConnection(masterId, serviceB, startsAt.plusMinutes(60), 60);
+            }
+            return overlapped;
+        }).when(bookingRepository).existsOverlap(any(UUID.class), any(), any());
 
         ResponseEntity<String> resp = postVisit(clientToken, masterId, startsAt, serviceA, serviceB);
 
+        assertThat(blockerCommitted)
+                .as("guard: the interleaving must actually have fired, otherwise everything below is "
+                        + "vacuous. status=%s body=%s", resp.getStatusCode(), resp.getBody())
+                .isTrue();
         assertThat(resp.getStatusCode())
-                .as("the first item overlaps the occupied slot — body: %s", resp.getBody())
+                .as("the GIST no_overlapping_bookings backstop rejects the chain — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CONFLICT);
         assertThat(objectMapper.readTree(resp.getBody()).path("success").asBoolean())
                 .as("conflict envelope carries success=false")
                 .isFalse();
 
-        // Hard atomicity — the highest-value guarantee of the phase. The pre-seeded guest booking
+        // NON-VACUITY: the request got past BOTH pre-checks and attempted the INSERT. Without this the
+        // two count assertions below would pass just as happily for an early rejection that wrote nothing.
+        verify(bookingRepository).saveAll(argThat((Iterable<Booking> items) ->
+                items != null && StreamSupport.stream(items.spliterator(), false).count() == 2));
+
+        // Hard atomicity — the highest-value guarantee of the phase. The mid-request guest booking
         // (appointment_id NULL) is the ONLY booking that may remain; no appointment and no chained
         // booking may have been left behind.
         assertThat(jdbcTemplate.queryForObject(
@@ -460,6 +527,92 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM bookings WHERE appointment_id IS NOT NULL", Long.class))
                 .as("a rolled-back overlap must leave ZERO chained booking rows")
+                .isEqualTo(0L);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 4b. Guard PRECEDENCE — CLIENT_BOOKING_CONFLICT wins over the schedule-fit gate
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Regression pin for a CRITICAL 2026-08-11 defect: the schedule-fit gate
+     * ({@code assertVisitStartsOnAvailableSlot}) was added to {@code AppointmentService#doCreateAppointment}
+     * by REPLACING {@code assertNoClientConflict} instead of sitting after it, so
+     * {@code POST /appointments} stopped rejecting a client double-booking altogether.
+     *
+     * <p>The whole scoped suite stayed green because {@code CLIENT_BOOKING_CONFLICT} coverage existed
+     * only on the single-service create path ({@code BookingIntegrationTest}) and on reschedule —
+     * nothing pinned it on the APPOINTMENT path. This is that missing mirror.
+     *
+     * <p>It asserts PRECEDENCE, not status. Both failure modes are 409, so a status-only assertion
+     * would pass with the guard deleted and be worthless. The discriminator is the response
+     * {@code data.code}: the structured {@code CLIENT_BOOKING_CONFLICT} (with
+     * {@code conflictingBookingId}) versus the generic master-busy {@code "Slot not available"}, which
+     * carries {@code data:null}.
+     *
+     * <p>Arrangement makes BOTH guards fire on the same request: master A is already busy at the slot
+     * (so the slot oracle has subtracted it and the fit gate would 409), and the client separately
+     * holds an overlapping booking with an unrelated master C (so the client-conflict guard would
+     * 409). Only the documented ordering — client conflict first, fit gate second — yields the
+     * structured code.
+     */
+    @Test
+    @DisplayName("POST /appointments — CLIENT_BOOKING_CONFLICT (not the generic \"Slot not available\") "
+            + "wins when BOTH the client-conflict guard and the schedule-fit gate would fire")
+    void should_returnClientBookingConflictNotSlotNotAvailable_when_bothClientConflictAndOffSlotApply()
+            throws Exception {
+        String masterEmail = "appt-cbc-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        String clientEmail = "appt-cbc-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientUserId = fixtures.createUser(clientEmail, "CLIENT", null);
+        UUID serviceA = fixtures.createIndependentMasterService(masterId); // 60/0
+        UUID serviceB = fixtures.createIndependentMasterService(masterId); // 60/0
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        // An unrelated master C, where the CLIENT's own pre-existing booking lives.
+        String otherMasterEmail = "appt-cbc-other-" + System.nanoTime() + "@beautica.test";
+        UUID otherMasterId = fixtures.createIndependentMaster(otherMasterEmail);
+        UUID otherService = fixtures.createIndependentMasterService(otherMasterId);
+        addWorkingHoursForEveryDay(otherMasterId);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(4).withHour(14).withMinute(0).withSecond(0).withNano(0);
+
+        // (1) Master A is BUSY at [14:00, 15:00) — a guest booking, so this is master-busy, not the
+        //     client's own calendar. getAvailableSlots subtracts it, so 14:00 is absent from master
+        //     A's slot list and the schedule-fit gate WOULD reject this start with "Slot not available".
+        seedGuestConfirmedBooking(masterId, serviceA, startsAt, 60);
+        // (2) The CLIENT separately holds [14:00, 15:00) with master C — inside the requested visit's
+        //     [14:00, 16:00) span, so the client-conflict guard WOULD reject it with the structured code.
+        UUID clientBlockerId =
+                seedClientConfirmedBooking(otherMasterId, otherService, clientUserId, startsAt, 60);
+
+        ResponseEntity<String> resp = postVisit(clientToken, masterId, startsAt, serviceA, serviceB);
+
+        assertThat(resp.getStatusCode())
+                .as("both guards apply — either way this is a 409; the CODE is what discriminates. Body: %s",
+                        resp.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+        JsonNode body = objectMapper.readTree(resp.getBody());
+        assertThat(body.path("data").path("code").asText())
+                .as("PRECEDENCE: assertNoClientConflict must run BEFORE assertVisitStartsOnAvailableSlot, "
+                        + "so the structured, actionable CLIENT_BOOKING_CONFLICT wins over the generic "
+                        + "master-busy/off-schedule 409 (locked product decision). Deleting or reordering "
+                        + "the client-conflict call turns this into \"Slot not available\". Body: %s",
+                        resp.getBody())
+                .isEqualTo("CLIENT_BOOKING_CONFLICT");
+        assertThat(body.path("data").path("conflictingBookingId").asText())
+                .as("the structured payload must name the CLIENT's own blocking booking, not the "
+                        + "master-busy one — that is the whole point of the specific code")
+                .isEqualTo(clientBlockerId.toString());
+        assertThat(body.path("message").asText())
+                .as("the generic master-busy copy must NOT be what the caller sees")
+                .isNotEqualTo("Slot not available");
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM appointments WHERE client_id = ?", Long.class, clientUserId))
+                .as("a client-conflict rejection persists no appointment")
                 .isEqualTo(0L);
     }
 
@@ -734,5 +887,46 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
                         + "500.00, ?, 0, NOW(), NOW())",
                 UUID.randomUUID(), masterId, masterServiceId, UUID.randomUUID(),
                 start, end, durationMinutes);
+    }
+
+    /**
+     * Same row as {@link #seedGuestConfirmedBooking}, but committed in its OWN transaction so it survives
+     * the rollback of the request racing it — see {@link OverlapRaceSupport#commitOutsideTransaction}.
+     */
+    private void commitGuestBlockerOnItsOwnConnection(UUID masterId, UUID masterServiceId,
+                                                      ZonedDateTime startsAt, int durationMinutes)
+            throws Exception {
+        OffsetDateTime start = startsAt.toOffsetDateTime();
+        OverlapRaceSupport.commitOutsideTransaction(dataSource,
+                "INSERT INTO bookings (id, master_id, master_service_id, status, booking_source, "
+                        + "guest_name, guest_phone, cancel_token, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'CONFIRMED', 'LINK', 'Guest', '+380501112233', ?, ?, ?, "
+                        + "500.00, ?, 0, NOW(), NOW())",
+                UUID.randomUUID(), masterId, masterServiceId, UUID.randomUUID(),
+                start, start.plusMinutes(durationMinutes), durationMinutes);
+    }
+
+    /**
+     * Occupies {@code [startsAt, startsAt + durationMinutes)} with a CONFIRMED booking owned by
+     * {@code clientUserId} — the counterpart of {@link #seedGuestConfirmedBooking}, which seeds a
+     * client-less guest row. Seed this on a DIFFERENT master than the one under test so the row is
+     * invisible to that master's {@code existsOverlap}/slot oracle and can only be found by the
+     * client-calendar guard ({@code findFirstConflictingClientBookingId}), which is master-agnostic.
+     *
+     * @return the booking id, echoed back as {@code data.conflictingBookingId}
+     */
+    private UUID seedClientConfirmedBooking(UUID masterId, UUID masterServiceId, UUID clientUserId,
+                                            ZonedDateTime startsAt, int durationMinutes) {
+        UUID bookingId = UUID.randomUUID();
+        OffsetDateTime start = startsAt.toOffsetDateTime();
+        OffsetDateTime end = start.plusMinutes(durationMinutes);
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "booking_source, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', 'APP', ?, ?, 500.00, ?, 0, NOW(), NOW())",
+                bookingId, clientUserId, masterId, masterServiceId, start, end, durationMinutes);
+        return bookingId;
     }
 }

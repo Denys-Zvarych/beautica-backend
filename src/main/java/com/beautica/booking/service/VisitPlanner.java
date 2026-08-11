@@ -171,6 +171,22 @@ class VisitPlanner {
         return windows;
     }
 
+    /**
+     * The planned items' already-JOIN-FETCHed assignments, PARALLEL to the {@code serviceIds} list that
+     * produced them ({@link #planChainedItems} resolves in list order, so index {@code i} is service
+     * {@code i}'s assignment) — the shape
+     * {@code SlotCalculationService#getAvailableSlots(UUID, java.time.LocalDate, List, List)} accepts as
+     * {@code preloaded}.
+     *
+     * <p>Lives here, not on either caller, so the APP ({@code AppointmentService}) and LINK
+     * ({@code GuestBookingService}) visit-create paths hand the schedule-fit gate the identical list —
+     * the same "the two create paths cannot drift" rule this whole class exists for (Perf MEDIUM,
+     * 2026-08-11).
+     */
+    static List<MasterServiceAssignment> assignmentsOf(List<PlannedItem> items) {
+        return items.stream().map(PlannedItem::masterService).toList();
+    }
+
     /** One resolved, priced service line ready to become a chained {@code Booking} row. */
     record PlannedItem(
             MasterServiceAssignment masterService,

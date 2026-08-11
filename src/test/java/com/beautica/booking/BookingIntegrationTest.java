@@ -32,15 +32,29 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.service.SlotCalculationService;
+import com.beautica.common.TimeZones;
+import com.beautica.service.entity.MasterServiceAssignment;
 import com.fasterxml.jackson.databind.JsonNode;
+import org.mockito.stubbing.Answer;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 
+import javax.sql.DataSource;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 @Import(TestSecurityConfig.class)
 @DisplayName("Booking — full-flow integration")
@@ -59,8 +73,34 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    @Autowired
+    /**
+     * Spied (not mocked) so {@code should_return409FromTheOverlapCheck_when_aBookingCommitsAfterTheGate}
+     * can VERIFY that the create path reached — or did not reach — {@code existsOverlap} and
+     * {@code saveAndFlush}. Those two verifies are what distinguish a rejection by the pre-INSERT overlap
+     * check from one by the schedule-fit gate in front of it or the GIST backstop behind it; all three
+     * are the same 409 with the same body and the same surviving row count, so no black-box assertion can
+     * tell them apart. Every call still runs the real repository.
+     *
+     * <p>Was a plain {@code @Autowired} field that no test in this class ever read (dead scaffolding).
+     */
+    @MockitoSpyBean
     private BookingRepository bookingRepository;
+
+    /**
+     * Spied so the same test can inject a deterministic interleaving into the window between the
+     * schedule-fit gate's availability read and the overlap check — see that test's Javadoc. Nothing is
+     * stubbed out: the answer forwards to the real bean and only appends a side effect.
+     */
+    @MockitoSpyBean
+    private SlotCalculationService slotCalculationService;
+
+    /**
+     * Used only to open a connection OUTSIDE the request's transaction, so a row committed mid-request
+     * survives that transaction's rollback. {@code jdbcTemplate} cannot serve here: on the request thread
+     * it would join the very transaction under test via {@code DataSourceUtils}.
+     */
+    @Autowired
+    private DataSource dataSource;
 
     @Autowired
     private GuestTokenProvider guestTokenProvider;
@@ -394,6 +434,132 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         assertThat(count)
                 .as("exactly one booking row must exist in the database after a conflict")
                 .isEqualTo(1L);
+    }
+
+    /**
+     * <b>The integration-tier pin on {@code existsOverlap} for the single-service create path</b>
+     * (restored 2026-08-11).
+     *
+     * <h2>Why the sibling test above no longer covers this</h2>
+     * {@code should_return409_when_sameSlotBookedTwiceSequentially} still passes, but since the
+     * schedule-fit gate landed its 409 no longer originates in {@code existsOverlap}: for COMMITTED data
+     * the gate strictly DOMINATES it. {@code getAvailableSlots} subtracts exactly the CONFIRMED rows
+     * {@code existsOverlap} scans, so the first booking is simply absent from the slot list and the gate
+     * rejects before the advisory lock is even taken. Delete the {@code existsOverlap} call from
+     * {@code doCreateBooking} entirely and that test stays green — see {@link OverlapRaceSupport} for the
+     * full dominance argument, which re-armed the two visit-path rollback tests the same way.
+     *
+     * <h2>Why the remaining coverage is not enough on its own</h2>
+     * {@code existsOverlap} is still pinned at the unit tier ({@code BookingServiceTest}, with the gate
+     * stubbed open) and in the concurrency ITs (where the racers contend over an UNCOMMITTED slot the
+     * gate cannot see). Neither exercises the case this test does: the gate answering from the
+     * {@code available-slots} Caffeine cache — {@code @Cacheable(sync = true)} — while the DB has moved
+     * on. The gate is a CACHED read; {@code existsOverlap} is the uncached, authoritative one. Any
+     * eviction regression makes the gate stale-permissive and {@code existsOverlap} the ONLY committed-
+     * data defence left in front of the INSERT, which is precisely when a green suite must not have
+     * stopped watching it.
+     *
+     * <h2>The arrangement</h2>
+     * NOTHING is stubbed out. The real {@code getAvailableSlots} runs and truthfully offers 12:00 —
+     * at that instant the master IS free. A guest (LINK, {@code client_id NULL}, so this is the
+     * master-busy path and never the client-conflict guard) booking is then committed from an
+     * independent connection, i.e. inside the gate → overlap-check window. The gate has already
+     * accepted; the real {@code existsOverlap} then queries live DB state, sees the blocker and 409s
+     * BEFORE the INSERT — which is what {@code verify(never()).saveAndFlush} discriminates from a
+     * GIST-backstop rejection at flush time.
+     */
+    @Test
+    @DisplayName("POST /bookings — the pre-INSERT existsOverlap check still rejects a booking that "
+            + "commits after the schedule-fit gate passed: 409, no INSERT attempted, 1 row")
+    void should_return409FromTheOverlapCheck_when_aBookingCommitsAfterTheGate() throws Exception {
+        String clientToken = createClientAndGetToken("integ-race-client-" + System.nanoTime() + "@beautica.test");
+        UUID masterId = createSalonOwnerSalonAndMaster("integ-race-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(12).withMinute(0).withSecond(0).withNano(0);
+
+        Answer<?> forwardToRealService = OverlapRaceSupport.forwardingAnswerOf(slotCalculationService);
+        AtomicBoolean blockerCommitted = new AtomicBoolean(false);
+        doAnswer(invocation -> {
+            Object slots = forwardToRealService.answer(invocation);
+            if (blockerCommitted.compareAndSet(false, true)) {
+                commitGuestBlockerOnItsOwnConnection(masterId, masterServiceId, startsAt, 60);
+            }
+            return slots;
+        }).when(slotCalculationService)
+                .getAvailableSlots(any(UUID.class), any(LocalDate.class), any(UUID.class),
+                        nullable(MasterServiceAssignment.class));
+
+        log.debug("Act: POST a start the gate has just been told is free, racing a blocker committed "
+                + "between the gate's read and the overlap check");
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(request, bearerHeaders(clientToken)),
+                String.class);
+
+        assertThat(blockerCommitted)
+                .as("guard: the interleaving must actually have fired, otherwise everything below is "
+                        + "vacuous. status=%s body=%s", response.getStatusCode(), response.getBody())
+                .isTrue();
+        assertThat(response.getStatusCode())
+                .as("a booking that commits after the gate passed must still be caught — body: %s",
+                        response.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        // THE pin. Deleting the existsOverlap call from doCreateBooking leaves the GIST backstop to
+        // reject at flush time instead — same 409, same body, same surviving row count — and only this
+        // pair of verifies notices the difference.
+        //
+        // Read as a triple, these three verifies name WHICH of the three same-409 sites fired:
+        //   * the GATE ran and passed          → findActiveTimeRangesByMasterInRange was called (below);
+        //                                        had the gate rejected, existsOverlap would never be reached
+        //   * existsOverlap ran and rejected   → verify(existsOverlap), times(1) by default
+        //   * the GIST backstop did NOT fire   → never(saveAndFlush): no INSERT was even attempted
+        verify(bookingRepository).existsOverlap(any(UUID.class), any(), any());
+        verify(bookingRepository, never()).saveAndFlush(any());
+
+        // The gate's own booking read, pinned by NAME (2026-08-11): it must be the two-column
+        // BookingTimeRange projection, never the SELECT * findOverlappingByMaster this path used to call —
+        // that variant pulled 20+-column managed entities (guest PII, cancel tokens) into the CREATE
+        // transaction's persistence context to be dirty-checked at flush, purely to read two getters. The
+        // method itself is now deleted, so a regression could only arrive as a new entity-returning
+        // finder; this verify is what would notice. It also proves the gate genuinely reached the DB here
+        // (a cache HIT would have skipped it), which is what makes the existsOverlap verify above
+        // meaningful — the window this test injects into only exists if the gate actually read.
+        verify(bookingRepository, atLeastOnce())
+                .findActiveTimeRangesByMasterInRange(any(UUID.class), any(), any());
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE master_id = ?", Long.class, masterId))
+                .as("only the mid-request blocker survives — the rejected create wrote nothing")
+                .isEqualTo(1L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE master_id = ? AND client_id IS NULL", Long.class, masterId))
+                .as("and that surviving row is the GUEST blocker, so the rejection was master-busy, "
+                        + "never the client-conflict guard")
+                .isEqualTo(1L);
+    }
+
+    /**
+     * A CONFIRMED guest (LINK) booking occupying {@code [startsAt, startsAt + durationMinutes)},
+     * committed in its OWN transaction so it survives the rollback of the request racing it — see
+     * {@link OverlapRaceSupport#commitOutsideTransaction}.
+     */
+    private void commitGuestBlockerOnItsOwnConnection(UUID masterId, UUID masterServiceId,
+                                                      ZonedDateTime startsAt, int durationMinutes)
+            throws Exception {
+        OffsetDateTime start = startsAt.toOffsetDateTime();
+        OverlapRaceSupport.commitOutsideTransaction(dataSource,
+                "INSERT INTO bookings (id, master_id, master_service_id, status, booking_source, "
+                        + "guest_name, guest_phone, cancel_token, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'CONFIRMED', 'LINK', 'Guest', '+380501112233', ?, ?, ?, "
+                        + "500.00, ?, 0, NOW(), NOW())",
+                UUID.randomUUID(), masterId, masterServiceId, UUID.randomUUID(),
+                start, start.plusMinutes(durationMinutes), durationMinutes);
     }
 
     @Test

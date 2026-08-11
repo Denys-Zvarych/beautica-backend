@@ -74,6 +74,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -302,6 +303,26 @@ class BookingServiceTest {
         throw new RuntimeException("Field not found: " + name);
     }
 
+    /**
+     * Stubs the CREATE-path schedule-fit oracle (2026-08-11) so {@code startsAt} resolves to an
+     * on-schedule slot, mirroring {@link #stubRescheduleSlotAvailable} for the reschedule path.
+     *
+     * <p>Required by every create test that expects the booking to be PERSISTED: all three create
+     * paths now assert the requested start matches a slot the master actually works, and an unstubbed
+     * mock answers with an empty slot list — i.e. "the master does not work then" — which is a 409.
+     */
+    private void stubCreateSlotAvailable(ZonedDateTime startsAt) {
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId),
+                nullable(MasterServiceAssignment.class)))
+                .thenReturn(List.of(new AvailableSlotResponse(
+                        startsAt.withZoneSameInstant(KYIV),
+                        startsAt.plusMinutes(60).withZoneSameInstant(KYIV))));
+    }
+
+    /** {@link #stubCreateSlotAvailable(ZonedDateTime)} for the many tests that book {@link #validRequest()}. */
+    private void stubCreateSlotAvailable() {
+        stubCreateSlotAvailable(validRequest().startsAt());
+    }
     // ── createBooking ──────────────────────────────────────────────────────────
 
     @Test
@@ -315,6 +336,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
@@ -347,6 +369,7 @@ class BookingServiceTest {
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
         // Act
+        stubCreateSlotAvailable();
         BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
         // Assert — booking created; master_id is the owner-master's ID
@@ -381,6 +404,7 @@ class BookingServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(true);
+        stubCreateSlotAvailable();
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
                 .isInstanceOf(BusinessException.class)
@@ -438,6 +462,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -550,6 +575,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
@@ -574,6 +600,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         BookingDetailResponse result = bookingService.createBooking(clientId, null, validRequest());
 
@@ -653,6 +680,7 @@ class BookingServiceTest {
                 null,
                 null
         );
+        stubCreateSlotAvailable(request.startsAt());
 
         BookingDetailResponse result = bookingService.createBooking(clientId, null, request);
 
@@ -695,6 +723,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -715,6 +744,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -735,6 +765,7 @@ class BookingServiceTest {
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        stubCreateSlotAvailable();
 
         bookingService.createBooking(clientId, null, validRequest());
 
@@ -1533,7 +1564,8 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         // Guard short-circuits ahead of the whole reschedule critical section (Q6 verify-not-called).
-        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
+        verify(slotCalculationService, never()).getAvailableSlots(
+                any(), any(), any(UUID.class), nullable(MasterServiceAssignment.class));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
@@ -1684,7 +1716,8 @@ class BookingServiceTest {
         AvailableSlotResponse slot = new AvailableSlotResponse(
                 newStartsAt.atZoneSameInstant(KYIV),
                 newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
-        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId)))
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId),
+                nullable(MasterServiceAssignment.class)))
                 .thenReturn(List.of(slot));
         // lenient: since the Phase 19.4 client-then-master reorder, the client-conflict test
         // that also calls this helper throws before the master lock is ever acquired, making
@@ -1734,7 +1767,8 @@ class BookingServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         // Guard fires before any slot lookup / lock / persistence
-        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
+        verify(slotCalculationService, never()).getAvailableSlots(
+                any(), any(), any(UUID.class), nullable(MasterServiceAssignment.class));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
@@ -1829,7 +1863,8 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         // No slot matches newStartsAt → off-schedule
-        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId)))
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId),
+                nullable(MasterServiceAssignment.class)))
                 .thenReturn(List.of());
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))

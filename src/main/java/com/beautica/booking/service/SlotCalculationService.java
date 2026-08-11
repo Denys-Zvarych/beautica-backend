@@ -109,7 +109,61 @@ public class SlotCalculationService {
     @Transactional(readOnly = true)
     @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
-        return computeAvailableSlots(masterId, date, List.of(masterServiceId));
+        return computeAvailableSlots(masterId, date, List.of(masterServiceId), null);
+    }
+
+    /**
+     * <b>Preloaded-assignment single-service slot list (Perf MEDIUM, 2026-08-11)</b> — same contract, same
+     * cache and the SAME cache key as the three-arg overload above, plus the assignment the caller already
+     * holds.
+     *
+     * <p><b>Why.</b> The two single-service CREATE paths — {@code BookingService#doCreateBooking} and
+     * {@code GuestBookingService#createSingleServiceBooking} — resolve the assignment with
+     * {@code findByMasterIdAndIdWithGraph} before they reach the schedule-fit gate, and the gate's
+     * availability read then issued the IDENTICAL finder a second time through
+     * {@link #loadBookableAssignments}. Same persistence context, same instance — a pure SQL round trip for
+     * nothing, paid on every create that misses the {@code available-slots} cache.
+     *
+     * <p><b>Exactly the {@code hasBookableFutureSlot(…, preloaded, …)} pattern</b>
+     * ({@link #hasBookableFutureSlot(UUID, UUID, MasterServiceAssignment, LocalDate, LocalDate)}):
+     * {@code preloaded} is deliberately NOT part of the cache key, so this overload and the three-arg one
+     * share one cache entry per {@code (masterId, date, masterServiceId)} and a create can be served from
+     * (and can populate) the very entry {@code GET /masters/{id}/slots} produced.
+     *
+     * <p><b>Caller contract: a MANAGED instance loaded in THIS transaction.</b> {@link #matchesRequest}
+     * verifies IDENTITY only — assignment id, owning master, {@code isActive}. It does NOT compare
+     * {@code durationOverrideMinutes}, {@code serviceDefinition.baseDurationMinutes} or
+     * {@code serviceDefinition.bufferMinutesAfter} — precisely the three fields {@link #effectiveDuration}
+     * reads to size every slot. A verified {@code preloaded} is therefore trusted for its DURATION, not
+     * merely for its identity: passing "any assignment with the right id" is NOT safe.
+     *
+     * <p><b>Why it is nonetheless safe today.</b> All four producers load through
+     * {@code MasterServiceRepository#findByMasterIdAndIdWithGraph} inside the SAME {@code @Transactional} as
+     * the guard that calls this — {@code BookingService#doCreateBooking} ({@code BookingService}:1827 →
+     * :1896) and {@code GuestBookingService#createSingleServiceBooking} ({@code GuestBookingService}:214 →
+     * :228) for this overload; {@code AppointmentService#doCreateAppointment} and
+     * {@code GuestBookingService#createGuestVisit} through the shared {@code VisitPlanner#planChainedItems}
+     * ({@code VisitPlanner}:73) for the list overload below. No caller mutates duration or buffer, and the
+     * {@link #loadBookableAssignments} fallback re-queries the SAME persistence context, so Hibernate returns
+     * the identical managed instance — the fallback is not one bit fresher. In-transaction divergence is
+     * impossible, so nothing wrong can be computed and nothing wrong can be cached.
+     *
+     * <p><b>The sharp edge, for whoever adds the fifth caller.</b> {@code preloaded} is NOT part of the cache
+     * key (deliberately — see above). A caller handing in a DETACHED or SYNTHETIC assignment that merely
+     * carries the right id, master and active flag would satisfy {@link #matchesRequest}, size the slot list
+     * from ITS stale duration, and have that list CACHED and served to every other caller under a key that
+     * never mentions it. Pass a managed instance loaded in this transaction, or pass {@code null}. Two
+     * bounding notes so this reads precisely rather than alarmingly: the multi-service {@code preloaded}
+     * overload is NOT {@code @Cacheable}, so this cache exposure is single-service only; and the key's
+     * silence about duration is pre-existing on the three-arg overload above, which has always keyed on
+     * {@code masterServiceId} alone.
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
+    public List<AvailableSlotResponse> getAvailableSlots(
+            UUID masterId, LocalDate date, UUID masterServiceId, MasterServiceAssignment preloaded) {
+        return computeAvailableSlots(masterId, date, List.of(masterServiceId),
+                preloaded != null ? List.of(preloaded) : null);
     }
 
     /**
@@ -141,16 +195,48 @@ public class SlotCalculationService {
     public List<AvailableSlotResponse> getAvailableSlots(
             UUID masterId, LocalDate date, List<UUID> masterServiceIds) {
         assertServiceIds(masterServiceIds);
-        return computeAvailableSlots(masterId, date, masterServiceIds);
+        return computeAvailableSlots(masterId, date, masterServiceIds, null);
+    }
+
+    /**
+     * <b>Preloaded-assignment multi-service slot list (Perf MEDIUM, 2026-08-11)</b> — the N-service twin of
+     * {@link #getAvailableSlots(UUID, LocalDate, UUID, MasterServiceAssignment)}, for the two visit CREATE
+     * paths ({@code AppointmentService#doCreateAppointment} and {@code GuestBookingService#createGuestVisit})
+     * whose shared {@code VisitPlanner#planChainedItems} has already run {@code findByMasterIdAndIdWithGraph}
+     * once per chained service. Without this the gate re-ran that finder N more times, so a 4-service
+     * {@code POST /appointments} issued 8 assignment queries where 4 suffice (bounded by
+     * {@value #MAX_SERVICES_PER_VISIT}, so never an unbounded N+1 — just avoidable on every create).
+     *
+     * <p>{@code preloaded} must be PARALLEL to {@code masterServiceIds} (same size, same order) and — like
+     * its single-service twin — must be MANAGED instances loaded in THIS transaction. {@link #matchesRequest}
+     * verifies id / master / active element-wise and NOT the duration or buffer fields
+     * {@link #effectiveDuration} sums, so a verified list is trusted for its Σ duration; see the
+     * single-service overload's Javadoc for the full invariant and why it holds. The only producer is
+     * {@code VisitPlanner#planChainedItems} ({@code VisitPlanner}:73), on behalf of
+     * {@code AppointmentService#doCreateAppointment} and {@code GuestBookingService#createGuestVisit}, both
+     * inside the create transaction. This overload is UNCACHED (same reason the three-arg list overload is —
+     * see its Javadoc), so a bad {@code preloaded} here could only corrupt the one response, never a cache
+     * entry other callers are served from.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> getAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded) {
+        assertServiceIds(masterServiceIds);
+        return computeAvailableSlots(masterId, date, masterServiceIds, preloaded);
     }
 
     /**
      * Shared slot-list core for both the single-service and multi-service entry points. Identical to the
      * pre-BE-2 single-service body except that the block length is the SUM of the ordered assignments'
      * effective durations ({@link #validatedTotalDuration}) rather than one service's.
+     *
+     * <p>{@code preloaded} is the caller's already-resolved assignment list ({@code null} on every read
+     * path) — see {@link #resolveAssignments}.
      */
     private List<AvailableSlotResponse> computeAvailableSlots(
-            UUID masterId, LocalDate date, List<UUID> masterServiceIds) {
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded) {
         // Step 1: date range validation — cheapest guard, no DB.
         // ONE clock read for the whole request (Perf LOW-2): `today`, the horizon and the bookable cutoff
         // are all derived from the same Instant, so no two checks can straddle a clock tick.
@@ -166,7 +252,11 @@ public class SlotCalculationService {
         // Step 2: load each master service in order — validated first to close the working-hours oracle.
         // Shared with getBookableWorkingDays, so an unknown / foreign / inactive service answers identically
         // on the slot endpoint and on the availability-aware working-days endpoint.
-        List<MasterServiceAssignment> assignments = loadBookableAssignments(masterId, masterServiceIds);
+        //
+        // A CREATE path hands its already-JOIN-FETCHed assignments in via `preloaded` (Perf MEDIUM,
+        // 2026-08-11) and skips the reload entirely — see #resolveAssignments.
+        List<MasterServiceAssignment> assignments =
+                resolveAssignments(masterId, masterServiceIds, preloaded);
 
         // Guard: master must be BOOKABLE to expose any slots. All chained assignments share the same
         // master (they are loaded master-scoped), so the first one's master carries the liveness flag.
@@ -205,9 +295,14 @@ public class SlotCalculationService {
         // This replaces the legacy single-WorkingHours window + schedule-exception closure check with
         // the unified model: multi-interval days, validity windows, custom-hours overrides, and
         // day-offs. NO_SCHEDULE (gap) or OVERRIDE_DAY_OFF resolve to empty intervals — no slots.
+        //
+        // Phase 15.8/15.9 EXPLICIT_TIMES days are answered from their DECLARED times, never from the
+        // derived [min..max] window the resolver also projects — see #isExplicitTimes / the
+        // TimeSlotCalculator#calculateDeclaredSlots Javadoc for the bug that motivated this.
         EffectiveDayResponse effective = masterScheduleService.resolveEffectiveDay(masterId, date);
         List<WorkIntervalDto> intervals = effective.intervals();
-        if (intervals == null || intervals.isEmpty()) {
+        boolean explicitTimes = isExplicitTimes(effective);
+        if (!explicitTimes && (intervals == null || intervals.isEmpty())) {
             return List.of();
         }
 
@@ -223,18 +318,34 @@ public class SlotCalculationService {
         // load a post-midnight booking (the native finder filters starts_at < windowEnd) → double-book.
         // It stays defensive and cheap (one extra day only on a state that cannot occur); the normal path
         // keeps the tight single-day window (Anti-Bug §E narrow window).
+        //
+        // NOT evaluated for an EXPLICIT_TIMES day: its single projected "interval" is the DERIVED
+        // display window, which is legitimately degenerate (start == end) when the day declares exactly
+        // one time — that would trip the ordering probe below and widen the booking query by a whole
+        // extra day for nothing. Declared candidates are day-bounded (they must end by this date's Kyiv
+        // midnight — see TimeSlotCalculator#calculateDeclaredSlots), so the tight single-day window is
+        // always sufficient for them.
         OffsetDateTime dayStart = date.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
-        boolean crossesMidnight = intervals.stream()
+        boolean crossesMidnight = !explicitTimes && intervals.stream()
                 .anyMatch(iv -> !iv.endTime().isAfter(iv.startTime()));
         LocalDate windowEndDate = crossesMidnight ? date.plusDays(2) : date.plusDays(1);
         OffsetDateTime dayEnd = windowEndDate.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
 
         // Step 7: load existing bookings that overlap the day window (CONFIRMED only).
         // Loaded once for the whole day and subtracted from every interval below.
+        //
+        // Two-column projection, never managed entities (Perf MEDIUM, 2026-08-11) — the same
+        // findActiveTimeRangesByMasterInRange the whole-window loader (#loadOccupiedByDay) already uses,
+        // with a byte-identical predicate and the same idx_bookings_master_slot_overlap index. This body
+        // used to call findOverlappingByMaster (SELECT *), which was harmless while it ran only inside
+        // read-only slot reads — but since the schedule-fit gate put this read on all four CREATE paths,
+        // every one of those 20+-column managed Bookings (guest PII and cancel tokens included) joined the
+        // create transaction's persistence context and got dirty-checked at flush. A master with 15
+        // bookings that day added 15 managed entities to every create's flush for two getters.
         List<TimeRange> occupied = bookingRepository
-                .findOverlappingByMaster(masterId, dayStart, dayEnd)
+                .findActiveTimeRangesByMasterInRange(masterId, dayStart, dayEnd)
                 .stream()
-                .map(b -> new TimeRange(b.getStartsAt().toInstant(), b.getEndsAt().toInstant()))
+                .map(b -> new TimeRange(b.startsAt().toInstant(), b.endsAt().toInstant()))
                 .toList();
 
         // Step 8: generate candidate slots per resolved interval and union the results (shared with
@@ -242,7 +353,7 @@ public class SlotCalculationService {
         // per interval is the multi-interval generalization of the legacy single-window call — gaps
         // between intervals (lunch breaks) naturally yield no slots. The cutoff is derived from the SAME
         // `now` the range guard above used (Perf LOW-2), not re-read per interval.
-        return computeDayFreeRanges(date, intervals, totalDuration, occupied, BookingWindow.bookableCutoff(now))
+        return computeDayFreeRanges(date, effective, totalDuration, occupied, BookingWindow.bookableCutoff(now))
                 .stream()
                 .map(r -> new AvailableSlotResponse(
                         r.start().atZone(TimeZones.KYIV),
@@ -553,6 +664,58 @@ public class SlotCalculationService {
     }
 
     /**
+     * The assignments backing this request: the caller's {@code preloaded} list when it verifies against
+     * the request, otherwise a fresh {@link #loadBookableAssignments} load (Perf MEDIUM, 2026-08-11).
+     *
+     * <p><b>Fall back, never throw.</b> A mismatch is a caller bug, not a client input, and this is a pure
+     * perf shortcut — so an unverifiable {@code preloaded} degrades to the DB load rather than inventing a
+     * new failure mode. The unknown / foreign / inactive → 404 semantics stay exactly where they were, in
+     * {@link #loadBookableAssignment}, and are still what an inactive assignment hits (a non-active entity
+     * fails {@link #matchesRequest}, falls through to the load, and 404s there as before).
+     */
+    private List<MasterServiceAssignment> resolveAssignments(
+            UUID masterId, List<UUID> masterServiceIds, List<MasterServiceAssignment> preloaded) {
+        return matchesRequest(masterId, masterServiceIds, preloaded)
+                ? preloaded
+                : loadBookableAssignments(masterId, masterServiceIds);
+    }
+
+    /**
+     * True iff {@code preloaded} is IDENTITY-compatible with what {@link #loadBookableAssignments} would have
+     * returned for {@code (masterId, masterServiceIds)}: parallel to the id list, each element non-null,
+     * ACTIVE, carrying the requested assignment id and belonging to the requested master. Every check is
+     * in-memory — the master's id is served off the {@code @ManyToOne} proxy without a statement — so
+     * verifying costs nothing next to the query it replaces.
+     *
+     * <p><b>Identity ONLY — never the duration fields.</b> This deliberately does not compare
+     * {@code durationOverrideMinutes}, {@code serviceDefinition.baseDurationMinutes} or
+     * {@code serviceDefinition.bufferMinutesAfter}, the three values {@link #effectiveDuration} reads to size
+     * every slot — it has nothing fresh to compare them against without re-issuing the very query
+     * {@code preloaded} exists to avoid. So a "match" means "the right ROW", NOT "the same field values the
+     * DB holds right now": the duration is taken on trust from the caller. What makes that sound is the
+     * caller contract documented on the {@code preloaded} overloads — a managed instance loaded in the same
+     * transaction, where the fallback load would hand back that identical instance anyway. Read together
+     * with the cache-key note there before relaxing either side.
+     */
+    private boolean matchesRequest(
+            UUID masterId, List<UUID> masterServiceIds, List<MasterServiceAssignment> preloaded) {
+        if (preloaded == null || preloaded.size() != masterServiceIds.size()) {
+            return false;
+        }
+        for (int i = 0; i < masterServiceIds.size(); i++) {
+            MasterServiceAssignment msa = preloaded.get(i);
+            if (msa == null
+                    || !msa.isActive()
+                    || !masterServiceIds.get(i).equals(msa.getId())
+                    || msa.getMaster() == null
+                    || !masterId.equals(msa.getMaster().getId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Sum of the ordered assignments' effective durations ({@link #effectiveDuration}, which already folds
      * each service's own {@code bufferMinutesAfter} — the D4 policy: buffer applied between chained services
      * and at the tail), guarded by the {@value #MAX_TOTAL_DURATION_MINUTES}-min ceiling. For a 1-element
@@ -596,15 +759,49 @@ public class SlotCalculationService {
     }
 
     /**
-     * Union of free slots across a day's resolved work intervals (extracted from getAvailableSlots
-     * Step 8). {@code occupied} must already be narrowed to the target date's window; {@code cutoff} is the
-     * request's single lead-time floor (Perf LOW-2 — never re-derived per interval).
+     * <b>THE per-day slot-shape switch.</b> True iff {@code day}'s effective schedule is an
+     * {@code EXPLICIT_TIMES} one (a weekly-template weekday or a per-date {@code CUSTOM_HOURS} override
+     * carrying discrete start times — Phase 15.8 / 15.9), in which case its bookable starts are exactly
+     * those declared times and its {@code intervals} carry only the DERIVED display window
+     * {@code [min..max]} ({@code ScheduleMapper#toDerivedWindow}).
+     *
+     * <p>Read by BOTH the materialised slot list ({@link #computeDayFreeRanges}) and the day-gate
+     * predicate ({@link #isDayBookable}), so {@code working-days} and {@code /slots} branch on the same
+     * one-line rule and cannot diverge on the shape of a day (pinned by
+     * {@code BookingAvailabilityAgreementIT}).
+     *
+     * <p>{@code times} is {@code null} on every non-EXPLICIT_TIMES day (see
+     * {@link EffectiveDayResponse}), hence the explicit null check rather than an emptiness test alone.
+     */
+    private boolean isExplicitTimes(EffectiveDayResponse day) {
+        return day.times() != null && !day.times().isEmpty();
+    }
+
+    /**
+     * Free slots for one resolved day — the union across its work intervals for an INTERVAL day
+     * (extracted from getAvailableSlots Step 8), or the day's DECLARED times for an
+     * {@code EXPLICIT_TIMES} day. {@code occupied} must already be narrowed to the target date's window;
+     * {@code cutoff} is the request's single lead-time floor (Perf LOW-2 — never re-derived per interval).
+     *
+     * <p><b>Interval days are byte-for-byte unchanged</b>, including the fixed {@link #SLOT_STEP} grid
+     * anchored at each interval's start and the stranded tail it can leave (a 13:30–15:15 window offering
+     * no 14:15 start for a 60-min service) — reviewed and deliberately KEPT (2026-08-11 product decision).
+     *
+     * <p>An {@code EXPLICIT_TIMES} day emits exactly the times the master declared, subject to the same
+     * lead-time cutoff and the same strict-overlap test, plus a same-Kyiv-day end bound — see
+     * {@link TimeSlotCalculator#calculateDeclaredSlots}. It must NOT be strided on {@link #SLOT_STEP}
+     * across the derived {@code [min..max]} window: that fabricated undeclared starts AND made the last
+     * declared time unbookable.
      */
     private List<TimeRange> computeDayFreeRanges(
-            LocalDate date, List<WorkIntervalDto> intervals, Duration totalDuration,
+            LocalDate date, EffectiveDayResponse day, Duration totalDuration,
             List<TimeRange> occupied, Instant cutoff) {
+        if (isExplicitTimes(day)) {
+            return timeSlotCalculator.calculateDeclaredSlots(
+                    date, day.times(), totalDuration, occupied, cutoff);
+        }
         List<TimeRange> result = new ArrayList<>();
-        for (WorkIntervalDto interval : intervals) {
+        for (WorkIntervalDto interval : day.intervals()) {
             result.addAll(timeSlotCalculator.calculateAvailableSlots(
                     date, interval.startTime(), interval.endTime(), totalDuration, SLOT_STEP, occupied,
                     cutoff));
@@ -655,11 +852,20 @@ public class SlotCalculationService {
     private boolean isDayBookable(
             EffectiveDayResponse day, Duration totalDuration,
             Map<LocalDate, List<TimeRange>> occupiedByDay, Instant cutoff) {
+        List<TimeRange> occupied = occupiedByDay.getOrDefault(day.date(), List.of());
+        // EXPLICIT_TIMES: same shape switch (#isExplicitTimes) and same declared-times predicate the
+        // slot list uses, only short-circuiting — so a day whose declared times ALL fail the filters
+        // (past the cutoff, occupied, or unable to finish inside the Kyiv day) reports working = false,
+        // exactly matching the empty slot list. The derived [min..max] window is deliberately NOT
+        // consulted here either.
+        if (isExplicitTimes(day)) {
+            return timeSlotCalculator.hasDeclaredSlot(
+                    day.date(), day.times(), totalDuration, occupied, cutoff);
+        }
         List<WorkIntervalDto> intervals = day.intervals();
         if (intervals == null || intervals.isEmpty()) {
             return false;
         }
-        List<TimeRange> occupied = occupiedByDay.getOrDefault(day.date(), List.of());
         for (WorkIntervalDto interval : intervals) {
             if (timeSlotCalculator.hasAvailableSlot(
                     day.date(), interval.startTime(), interval.endTime(), totalDuration, SLOT_STEP,

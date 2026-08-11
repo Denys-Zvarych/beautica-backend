@@ -645,36 +645,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("clientId") UUID clientId,
             @Param("idempotencyKey") String idempotencyKey);
 
-    @Query(value = """
-            SELECT * FROM bookings
-            WHERE master_id = :masterId
-              AND status = 'CONFIRMED'
-              AND starts_at < :windowEnd
-              AND ends_at   > :windowStart
-            """, nativeQuery = true)
-    // Callers must pass a narrow [windowStart, windowEnd) spanning only the target day.
-    // A wide window causes full table scans and inflates the returned list unnecessarily.
-    List<Booking> findOverlappingByMaster(
-            @Param("masterId") UUID masterId,
-            @Param("windowStart") OffsetDateTime windowStart,
-            @Param("windowEnd") OffsetDateTime windowEnd
-    );
-
     /**
      * The occupied {@code [startsAt, endsAt)} intervals of a master's CONFIRMED bookings
-     * overlapping {@code [windowStart, windowEnd)}, ordered by start. Backs the whole availability
-     * computation — the calendar day projection ({@code SlotCalculationService#getBookableWorkingDays}),
-     * the free-slot bookability gate ({@code hasBookableFutureSlot}) and the batched catalogue filter
-     * ({@code filterBookableAssignments}): the whole window is loaded ONCE per master and sliced per-day
-     * in memory, instead of one {@link #findOverlappingByMaster} query per day.
+     * overlapping {@code [windowStart, windowEnd)}, ordered by start. <b>THE single booking read behind the
+     * whole availability computation</b> — the per-day slot list ({@code SlotCalculationService
+     * #getAvailableSlots}, one target day), the calendar day projection ({@code
+     * SlotCalculationService#getBookableWorkingDays}), the free-slot bookability gate ({@code
+     * hasBookableFutureSlot}) and the batched catalogue filter ({@code filterBookableAssignments}); the
+     * three range consumers load their whole window ONCE per master and slice it per-day in memory
+     * ({@code SlotCalculationService#loadOccupiedByDay}) rather than issuing one query per day.
      *
-     * <p><b>Projection, not entities (Perf MEDIUM-1).</b> Returns {@link BookingTimeRange} — the only two
-     * columns any consumer reads. The previous {@code SELECT *} native variant hydrated full managed
-     * {@code Booking} entities (20+ columns incl. guest PII and the cancel token) purely to call two
-     * getters. The overlap predicate ({@code starts_at < windowEnd AND ends_at > windowStart}) is
-     * unchanged from {@link #findOverlappingByMaster} — so a booking whose tail spills past a day
-     * boundary is still returned, and the query still rides {@code idx_bookings_master_slot_overlap}.
-     * Bounded by the service layer's ≤180-day booking horizon (Anti-Bug §E-3 — not an unbounded scan).
+     * <p><b>Projection, not entities (Perf MEDIUM-1; extended to the day path 2026-08-11).</b> Returns
+     * {@link BookingTimeRange} — the only two columns any consumer reads. This replaced a {@code SELECT *}
+     * native sibling ({@code findOverlappingByMaster}) that hydrated full managed {@code Booking} entities
+     * (20+ columns incl. guest PII and the cancel token) purely to call two getters; that sibling was
+     * deleted once the day path moved here, so no non-projection variant survives for a caller to reach
+     * for by accident (Anti-Bug §E-1). The overlap predicate ({@code starts_at < windowEnd AND ends_at >
+     * windowStart}) is byte-identical to the one it replaced — a booking whose tail spills past a day
+     * boundary is still returned — and the query still rides {@code idx_bookings_master_slot_overlap}
+     * ({@code (master_id, starts_at, ends_at) WHERE status = 'CONFIRMED'}, V113:61-64).
+     *
+     * <p>Callers must pass a narrow window: a single target day for the slot list, or the ≤180-day booking
+     * horizon for the range consumers (Anti-Bug §E-3 — not an unbounded scan).
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingTimeRange(b.startsAt, b.endsAt)

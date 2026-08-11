@@ -8,6 +8,7 @@ import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.service.MasterScheduleService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -333,6 +334,194 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                 .as("/slots agrees — no morning start (2h interval too short); only 14:00/14:30/15:00 in "
                         + "the afternoon (last 3h slot ends 18:00)")
                 .containsExactly(LocalTime.of(14, 0), LocalTime.of(14, 30), LocalTime.of(15, 0));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7b — EXPLICIT_TIMES day: the DECLARED times ARE the slot set (2026-08-11 HIGH-1 fix)
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 7b — an EXPLICIT_TIMES override declaring 13:00 and 15:00 offers EXACTLY those two "
+            + "starts for a 60-min service — no fabricated 13:30/14:00, and 15:00 is NOT swallowed")
+    void should_offerExactlyTheDeclaredTimes_when_dayIsExplicitTimes() {
+        LocalDate day = TODAY.plusDays(11);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        // The resolver projects this day as the DERIVED window [13:00..15:00] (a display artifact) plus
+        // the declared times. Striding that window on the 30-min grid used to offer 13:00/13:30/14:00 —
+        // two starts the master never declared — while 15:00, which they DID declare, could never be
+        // offered at all: it is the window END, so nothing can start there and still fit.
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(13, 0), LocalTime.of(15, 0))));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("the declared times ARE the slot set — never a grid across the derived window")
+                .containsExactly(LocalTime.of(13, 0), LocalTime.of(15, 0));
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days agrees: the day has declared times that survive every filter")
+                .isTrue();
+
+        // A day declaring exactly ONE time projects a DEGENERATE derived window (min == max), which the
+        // interval walk rejected outright (workEnd == workStart → no slots), so such a day could not be
+        // booked at all. Its own master/date, so the assertion is not served from a warm cache entry.
+        Master solo = seedIndependentMaster();
+        UUID soloSvc = addService(solo, 60, 0);
+        masterScheduleService.upsertOverride(solo.userId(), solo.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(LocalTime.of(13, 0))));
+
+        assertThat(slotStarts(solo.masterId(), day, soloSvc))
+                .as("a single declared time is bookable — its derived window is a zero-length point")
+                .containsExactly(LocalTime.of(13, 0));
+    }
+
+    /**
+     * <b>Scope note (mutation-tested 2026-08-11).</b> This is an AGREEMENT pin, not a fix-regression pin:
+     * with the {@code isExplicitTimes} switch reverted it stays GREEN, because a lone declared time
+     * projects a degenerate {@code [13:00..13:00]} derived window from which the interval walk also
+     * yields nothing. That is fine for what it asserts — day gate ⇔ slot list on a negative day — but do
+     * not read it as protecting the declared-times routing. Cases 7b/7d/7f do that, and all three go red
+     * against that revert.
+     */
+    @Test
+    @DisplayName("case 7c — day-gate agreement on an EXPLICIT_TIMES day whose ONLY declared time is "
+            + "already booked: working=FALSE and /slots EMPTY (both agree)")
+    void should_agreeDayUnavailable_when_theOnlyDeclaredTimeIsTaken() {
+        LocalDate day = TODAY.plusDays(12);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        // A single declared time — the case whose derived window is DEGENERATE (min == max), which the
+        // interval walk rejected outright, so such a day could never be booked at all.
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(LocalTime.of(13, 0))));
+
+        // NB: no read before the booking is inserted — the first slotStarts call would populate the
+        // `available-slots` cache, and a raw JDBC insert evicts nothing. The "a lone declared time is
+        // bookable" half of this contract is asserted in case 7b on its own master.
+        insertBooking(m.masterId(), svc, seedClient(), day, LocalTime.of(13, 0), LocalTime.of(14, 0), "CONFIRMED");
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("/slots — the only declared time is taken, so nothing is offered")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days MUST agree: a day whose declared times all fail the filters is "
+                        + "non-working — the day gate and the slot list share one predicate")
+                .isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7f — PARTIALLY booked EXPLICIT_TIMES day: the survivors are still DECLARED times
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The positive half of the day-gate/slot-list agreement on an EXPLICIT_TIMES day, and the case
+     * case 7c cannot pin. 7c seeds a day with ONE declared time and books it, then asserts empty +
+     * {@code working = false} — a verdict the PRE-FIX interval walk also returns, because a lone
+     * declared time projects a degenerate {@code [13:00..13:00]} window that yields nothing either way.
+     * 7c is a sound agreement pin, but it is green against the bug and cannot detect a regression of it.
+     *
+     * <p>Here two times are declared and only the first is booked. The fix offers the remaining DECLARED
+     * time (15:00); the interval walk offers 14:00 — a start the master never declared, produced by
+     * striding the derived window across the freed grid. Same day, same booking, opposite answers, so
+     * the assertion discriminates.
+     */
+    @Test
+    @DisplayName("case 7f — booking ONE of two declared times leaves the OTHER declared time (15:00) on "
+            + "offer, never a grid start (14:00) the master never declared")
+    void should_offerTheRemainingDeclaredTime_when_oneOfTwoDeclaredTimesIsBooked() {
+        LocalDate day = TODAY.plusDays(15);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(13, 0), LocalTime.of(15, 0))));
+        // NB: seeded BEFORE any read — a raw JDBC insert evicts no `available-slots` cache entry, so a
+        // read here would poison the assertions below (same trap case 7c documents).
+        insertBooking(m.masterId(), svc, seedClient(), day,
+                LocalTime.of(13, 0), LocalTime.of(14, 0), "CONFIRMED");
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("13:00 is taken; 15:00 is the only other DECLARED time and it survives. 14:00 is "
+                        + "what the derived-window grid would fabricate once 13:00–14:00 frees up — it "
+                        + "must not appear, because the master never offered it.")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days agrees — a declared time still survives every filter")
+                .isTrue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7d/7e — EXPLICIT_TIMES END BOUND: a declared time must FINISH inside its own Kyiv day
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // The end bound is the one filter with no counterpart on an interval day: an interval carries a real
+    // endTime, an EXPLICIT_TIMES day does not, so the walk falls back to "ends by this date's Kyiv
+    // midnight". It is asserted at the unit tier (TimeSlotCalculatorTest, incl. both DST days), but the
+    // unit tier cannot see whether SlotCalculationService actually ROUTES an explicit-times day here —
+    // the same day also carries a DERIVED [min..max] window that the interval walk would happily consume
+    // and answer differently.
+    //
+    // What each case actually pins, end to end on real Postgres (mutation-tested 2026-08-11):
+    //   * 7d pins the ROUTING **and** the bound. Its two declared times project a real [23:00..23:30]
+    //     window that the reverted interval walk consumes differently, so 7d goes RED against the
+    //     `isExplicitTimes` revert; the withheld 23:30 is the end bound itself.
+    //   * 7e pins the END BOUND ONLY — on BOTH endpoints, which is its job. Its lone declared time
+    //     projects a DEGENERATE [23:30..23:30] window from which the interval walk also yields nothing,
+    //     so 7e stays GREEN against that revert and does NOT discriminate the routing switch. Same
+    //     limitation, same cause, as case 7c's scope note above records for itself. It keeps its place
+    //     as the negative-day agreement pin for the bound: working=FALSE and /slots EMPTY must agree
+    //     when the only declared time cannot finish inside its own civil day.
+    // Routing regressions are covered by cases 7b/7d/7f — all three go red against that revert.
+
+    @Test
+    @DisplayName("case 7d — an EXPLICIT_TIMES day declaring 23:00 and 23:30 offers only 23:00 for a "
+            + "60-min service: 23:30 cannot finish inside its own Kyiv day")
+    void should_withholdDeclaredTimeThatCannotFinishInsideTheKyivDay() {
+        LocalDate day = TODAY.plusDays(13);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(23, 0), LocalTime.of(23, 30))));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("23:00 + 60 min ends exactly at midnight and is kept; 23:30 would run into the next "
+                        + "civil day and is withheld. The schedule model forbids cross-midnight ranges, "
+                        + "so this is the strictest bound the domain asserts.")
+                .containsExactly(LocalTime.of(23, 0));
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days agrees — one declared time survives every filter")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("case 7e — an EXPLICIT_TIMES day whose ONLY declared time cannot finish inside the Kyiv "
+            + "day: working=FALSE and /slots EMPTY (both agree)")
+    void should_agreeDayUnavailable_when_theOnlyDeclaredTimeOverrunsTheKyivDay() {
+        LocalDate day = TODAY.plusDays(14);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(LocalTime.of(23, 30))));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("/slots — the single declared time cannot fit a 60-min service before midnight")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days MUST agree: hasDeclaredSlot applies the SAME day-end bound the slot "
+                        + "list does, so the day gate cannot advertise a day that yields nothing")
+                .isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════
