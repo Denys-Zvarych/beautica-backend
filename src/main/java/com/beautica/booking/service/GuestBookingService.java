@@ -215,6 +215,19 @@ public class GuestBookingService {
                 .filter(MasterServiceAssignment::isActive)
                 .orElseThrow(() -> new NotFoundException("Service not available for this master"));
 
+        // SCHEDULE-FIT GATE (2026-08-11 HIGH) — the guest/LINK counterpart of the gate in
+        // BookingService#doCreateBooking, and deliberately NOT weaker: this endpoint is permitAll, so it
+        // is the EASIEST of the three create paths to hand a hand-crafted off-schedule start. Until this
+        // line the LINK path enforced only BookingStartsAtValidator (lead time + horizon) and the
+        // overlap check in persistBooking, so a guest could book a day-off or a lunch-break minute and
+        // land CONFIRMED on the master's calendar with a confirmation SMS. Same oracle the public
+        // availability endpoint (#availableSlots, just above) already serves to this very caller — so the
+        // page now accepts exactly what it offers. Run BEFORE the advisory lock in persistBooking.
+        // `msa` is handed through so the gate does not re-issue the findByMasterIdAndIdWithGraph resolved
+        // immediately above (Perf MEDIUM, 2026-08-11) — same persistence context, same instance.
+        BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, master.getId(), msa.getId(), msa, req.startsAt());
+
         Booking saved = persistBooking(master, msa, req, guestPhone);
 
         outboxService.enqueueNewBooking(saved.getId());
@@ -245,6 +258,17 @@ public class GuestBookingService {
         OffsetDateTime firstStart = req.startsAt();
         List<VisitPlanner.PlannedItem> items = visitPlanner.planChainedItems(master, serviceIds, firstStart);
         OffsetDateTime lastEnd = items.get(items.size() - 1).endsAt();
+
+        // SCHEDULE-FIT GATE (2026-08-11 HIGH) — identical to the APP visit-create gate
+        // (AppointmentService#doCreateAppointment): the BE-2 N-service overload over the ordered
+        // serviceIds, never N per-item checks (each leg can fit alone while the CHAIN overruns the
+        // working window). Runs AFTER planChainedItems (unknown/foreign/inactive service still 404s
+        // first) and BEFORE the advisory lock, so an off-schedule guest request never contends for it.
+        // planChainedItems' OWN assignments are handed through (Perf MEDIUM, 2026-08-11) so the gate does
+        // not re-run findByMasterIdAndIdWithGraph once per chained service — identical to the APP path.
+        BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
+                slotCalculationService, master.getId(), serviceIds,
+                VisitPlanner.assignmentsOf(items), firstStart);
 
         // Per-master advisory lock BEFORE the overlap check — same fused-timeout mechanism the single
         // guest path uses (this endpoint is permitAll, so the 3s lock_timeout bounds the wait against the

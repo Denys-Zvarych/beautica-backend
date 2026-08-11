@@ -102,6 +102,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // availability read, so only the booking POST consumes this bucket.
     private static final String GUEST_BOOKING_PATH_PREFIX = "/api/v1/book/";
     private static final String GUEST_BOOKING_PATH_SUFFIX = "/booking";
+    // Guest availability READ: GET /api/v1/book/{slug}/availability — the public booking page's slot
+    // list, matched by the same prefix + a distinct suffix. It is deliberately NOT part of
+    // guestBookingBuckets (that bucket's own comment says "only the booking POST consumes this bucket"),
+    // because a legitimate guest issues MANY availability GETs per single booking POST — sharing one
+    // 5/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
+    private static final String GUEST_AVAILABILITY_PATH_SUFFIX = "/availability";
     // Guest cancel-by-link POST carries the {token} variable as a single path segment, so it
     // is matched by prefix only: /api/v1/book/cancel/{token}. The prefix /api/v1/book/cancel/
     // does not collide with the guest-booking POST (which ends in /booking) nor with the OTP
@@ -196,6 +202,29 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
+    // Per-IP cap for GET /api/v1/book/{slug}/availability (60 / 60 s) — the LOW-fix flood guard for the
+    // last unthrottled permitAll() surface under /book. Deliberately the SAME budget as slotsBuckets
+    // (the authenticated twin, GET /masters/{id}/slots + /working-days, default 60/60s): the two answer
+    // the very same question from the same SlotCalculationService oracle, so the guest page must not be
+    // throttled harder than the in-app calendar that costs the server exactly as much.
+    //
+    // Why it needed one at all: the endpoint drives resolveEffectiveDay + the booking-overlap query + the
+    // full slot walk per distinct `date`, at zero auth cost, and the create gate now calls that same
+    // oracle. An attacker rotating `date` could sustain that work unbounded. The cap bounds the RATE (the
+    // ≤180-day horizon in SlotCalculationService already bounds how many distinct dates exist to rotate,
+    // and the available-slots Caffeine cache absorbs repeats of one date).
+    //
+    // Why 60/min does not throttle legitimate browsing: a real client hits this once per DATE TAP on the
+    // public booking page — a human picking a day makes single-digit requests per minute, and even an
+    // impatient user tapping through a whole visible week is ~7. 60/min leaves an order of magnitude of
+    // headroom, which matters because this bucket is IP-keyed and Ukrainian mobile users share
+    // carrier-grade NAT (the availability regression documented at length on SEARCH_CAPACITY). A shared
+    // booking link opened by several people behind one CGNAT egress still fits comfortably.
+    //
+    // Built internally (not an injected @Qualifier bean) so the public 19-arg constructor — depended on
+    // by several slice/regression tests — stays unchanged, mirroring guestBookingBuckets/cancelPostBuckets.
+    private static final long GUEST_AVAILABILITY_CAPACITY = 60;
+    private static final Duration GUEST_AVAILABILITY_WINDOW = Duration.ofMinutes(1);
     // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
     // expose authed-only street addresses for independent masters, so the throttle bounds the
     // RATE at which a single source can page through every district/city and the DB work each
@@ -366,6 +395,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rather than injected so the public 16-arg constructor stays stable for the slice/regression
     // tests that construct this filter directly.
     private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET /api/v1/book/{slug}/availability — the LOW-fix flood guard for the public
+    // booking page's slot read, the one permitAll() surface under /book that had no bucket at all. Built
+    // internally rather than injected so the public 19-arg constructor stays stable for the
+    // slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> guestAvailabilityBuckets;
     // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
     // discovery reads (which now surface authed-only independent-master street addresses).
     // Built internally rather than injected so the public 16-arg constructor stays stable for
@@ -461,6 +495,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(cancelPostBandwidth())
                         .build());
+        this.guestAvailabilityBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(GUEST_AVAILABILITY_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(guestAvailabilityBandwidth())
+                        .build());
         this.searchBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
@@ -517,6 +557,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(CANCEL_POST_CAPACITY)
                 .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth guestAvailabilityBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(GUEST_AVAILABILITY_CAPACITY)
+                .refillIntervally(GUEST_AVAILABILITY_CAPACITY, GUEST_AVAILABILITY_WINDOW)
                 .build();
     }
 
@@ -597,6 +644,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
                 && (path.endsWith(SLOTS_PATH_SUFFIX) || path.endsWith(WORKING_DAYS_PATH_SUFFIX))) {
             applyRateLimit(request, response, filterChain, slotsBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Guest-availability read rate-limit: GET /api/v1/book/{slug}/availability — matched by
+        // prefix + suffix (the {slug} is one path segment), checked before the POST-only guard so this
+        // GET is covered. The /availability suffix cannot collide with the sibling public reads under
+        // /book: /{slug}/info, /cancel/{token} (GET cancel-info) and the OTP/booking/cancel POSTs all
+        // end in something else, so ONLY the availability GET consumes this bucket.
+        //
+        // Until this branch the endpoint fell through to the unmatched-GET path with no throttle at all —
+        // the LINK counterpart of the slots branch immediately above, driving the same
+        // SlotCalculationService oracle at zero auth cost. Cap: 60 / 60 s per IP, deliberately the same
+        // budget as slotsBuckets (see GUEST_AVAILABILITY_CAPACITY for the sizing and for why it does not
+        // throttle a guest tapping through dates).
+        if (HttpMethod.GET.matches(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && path.endsWith(GUEST_AVAILABILITY_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 

@@ -1331,15 +1331,21 @@ public class AppointmentTransitionService {
      * the BE-2 multi-service overload) exactly as {@code BookingService#assertStartsOnAvailableSlot}
      * does for one service. Compared by {@code isEqual} on the slot start instant, same as the
      * single-booking guard. A non-matching start throws the same {@code 409 "Slot not available"}.
+     *
+     * <p><b>2026-08-11.</b> Delegates to {@link BookingSlotAvailabilityGuard} — this body used to be a
+     * byte-for-byte duplicate of the shared guard's, the exact drift risk that class exists to remove
+     * (it already absorbed the two single-service duplicates). Now that the multi-service question is
+     * also asked by {@code AppointmentService}'s and {@code GuestBookingService}'s create paths, all
+     * three share ONE implementation — and with it the Kyiv-civil-date normalisation the inlined
+     * {@code startsAt.toLocalDate()} above got wrong for a just-after-midnight start sent in a non-Kyiv
+     * offset.
      */
     private void assertVisitStartsOnAvailableSlot(UUID masterId, List<UUID> masterServiceIds, OffsetDateTime startsAt) {
-        boolean onSchedule = slotCalculationService
-                .getAvailableSlots(masterId, startsAt.toLocalDate(), masterServiceIds)
-                .stream()
-                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
-        if (!onSchedule) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        // preloaded = null (Perf MEDIUM, 2026-08-11): this is a RESCHEDULE, so nothing has resolved the
+        // assignments here — replanFromNewStart works purely off each item's frozen duration/buffer
+        // snapshot and never touches master_services. The gate loads them itself, exactly as before.
+        BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceIds, null, startsAt);
     }
 
     /**
@@ -1357,8 +1363,10 @@ public class AppointmentTransitionService {
      * depends on THIS class for the per-item client-cancel header-lock seam).
      */
     private void assertItemStartsOnAvailableSlot(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+        // preloaded = null — same reasoning as #assertVisitStartsOnAvailableSlot above: a per-item
+        // reschedule resolves no assignment, so there is none to hand through.
         BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
-                slotCalculationService, masterId, masterServiceId, startsAt);
+                slotCalculationService, masterId, masterServiceId, null, startsAt);
     }
 
     /**

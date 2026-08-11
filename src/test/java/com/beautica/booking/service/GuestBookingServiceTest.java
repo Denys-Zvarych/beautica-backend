@@ -35,8 +35,10 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -122,6 +124,10 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(true);
+        // On schedule on purpose: the 409 this test asserts must come from the OVERLAP check, not
+        // from the create-path schedule-fit gate (which would return the same status for the wrong
+        // reason and defang the assertion).
+        stubSlotAvailable(startsAt);
 
         assertThatThrownBy(() -> service.createGuestBooking(
                 "Bearer t", SLUG, new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль")))
@@ -156,16 +162,24 @@ class GuestBookingServiceTest {
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
     }
 
-    // ── MEDIUM-FIX REGRESSION (Phase 13.3): startsAt lead-time + max-window parity ──
-    // The authenticated BookingService.validateStartsAt enforces MIN_MINUTES_AHEAD (15 min)
-    // and MAX_DAYS_AHEAD (180 d). The guest path currently relies ONLY on the DTO's @Future,
-    // so a guest can book 1 minute from now or 5 years out. The fix mirrors validateStartsAt
-    // into the guest path (and ideally asserts the slot is real). These two tests pin the
-    // intended 400s and are EXPECTED-RED until the fix lands — today the booking is persisted
-    // (CONFIRMED) because no lead-time / window check runs in createGuestBooking.
+    // ── REGRESSION PINS (Phase 13.3): startsAt lead-time + max-window parity ──
+    // The authenticated BookingService.validateStartsAt enforces MIN_MINUTES_AHEAD (15 min) and
+    // MAX_DAYS_AHEAD (180 d). The guest path once relied ONLY on the DTO's @Future, so a guest could
+    // book 1 minute from now or 5 years out; these two tests were written RED against that gap.
+    //
+    // The fix landed in 3afa360 (2026-07-01) — GuestBookingService#createGuestBooking now calls
+    // BookingStartsAtValidator.validate(req.startsAt(), kyivClock), the very same guard the
+    // authenticated path uses — so both have been GREEN since. They are ordinary regression pins now:
+    // deleting that validate() call turns them red again, which is exactly their job. (The stale
+    // "EXPECTED-RED until the fix lands" markers they carried until 2026-08-11 claimed the opposite and
+    // invited a reader to dismiss a real failure as expected.)
+    //
+    // NOT made redundant by the create-path schedule-fit gate added the same day: that gate answers
+    // "does the master work then", returns 409, and is only reached for a start these 400s let through.
 
     @Test
-    @DisplayName("EXPECTED-RED: should reject (400) when guest startsAt is below the 15-min lead time")
+    @DisplayName("guest create — 400 when startsAt is below the 15-min lead time (parity with the "
+            + "authenticated path's BookingStartsAtValidator)")
     void should_reject_when_guestStartsAtBelowLeadTime() {
         // clock is fixed at 2026-06-01T10:00:00Z; +5 min is in the future (passes @Future)
         // but below the 15-min lead time the authenticated path enforces.
@@ -189,7 +203,8 @@ class GuestBookingServiceTest {
     }
 
     @Test
-    @DisplayName("EXPECTED-RED: should reject (400) when guest startsAt is beyond the availability window")
+    @DisplayName("guest create — 400 when startsAt is beyond the 180-day availability window (parity "
+            + "with the authenticated path's BookingStartsAtValidator)")
     void should_reject_when_guestStartsAtBeyondAvailabilityWindow() {
         // clock is fixed at 2026-06-01; +400 days is well beyond both the authenticated
         // 180-day cap and the 60-day availabilityMaxDays the public endpoint serves.
@@ -256,6 +271,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId, thirdServiceId));
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
@@ -287,6 +303,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+        stubVisitSlotAvailable(startsAt, List.of(serviceId));
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
@@ -314,6 +331,30 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        stubSlotAvailable(startsAt);
+    }
+
+    /**
+     * Stubs the create-path schedule-fit oracle (2026-08-11) for the LEGACY single-service guest path,
+     * so {@code startsAt} resolves to a slot the master actually works.
+     *
+     * <p>Required by every guest test that expects the booking to be PERSISTED: the guest/LINK create
+     * path now asserts schedule fit exactly as the authenticated path does, and an unstubbed mock
+     * answers with an empty slot list — i.e. "the master does not work then" — which is a 409.
+     */
+    private void stubSlotAvailable(OffsetDateTime startsAt) {
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(java.time.LocalDate.class), eq(serviceId),
+                nullable(MasterServiceAssignment.class)))
+                .thenReturn(List.of(new com.beautica.booking.dto.AvailableSlotResponse(
+                        startsAt.toZonedDateTime(), startsAt.plusMinutes(60).toZonedDateTime())));
+    }
+
+    /** {@link #stubSlotAvailable} for the multi-service VISIT path — the BE-2 ordered-list overload. */
+    private void stubVisitSlotAvailable(OffsetDateTime startsAt, List<UUID> serviceIds) {
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(java.time.LocalDate.class), eq(serviceIds),
+                anyList()))
+                .thenReturn(List.of(new com.beautica.booking.dto.AvailableSlotResponse(
+                        startsAt.toZonedDateTime(), startsAt.plusMinutes(60).toZonedDateTime())));
     }
 
     private Master master() {
@@ -339,6 +380,7 @@ class GuestBookingServiceTest {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(inv -> inv.getArgument(0));
+        stubSlotAvailable(startsAt);
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,

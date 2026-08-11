@@ -195,8 +195,8 @@ class AppointmentItemRescheduleIT extends AbstractIntegrationTest {
     // independently 409 on this exact scenario. Investigated and confirmed GENUINELY IMPOSSIBLE to
     // separate at the HTTP level in this domain, not merely inconvenient to construct:
     // SlotCalculationService.getAvailableSlots subtracts EVERY one of the master's CONFIRMED
-    // bookings (bookingRepository.findOverlappingByMaster is scoped by masterId ALONE, never by
-    // masterServiceId — see that query's own Javadoc) from the day's free ranges before generating
+    // bookings (bookingRepository.findActiveTimeRangesByMasterInRange is scoped by masterId ALONE, never
+    // by masterServiceId — see that query's own Javadoc) from the day's free ranges before generating
     // candidate slots. A CONFIRMED sibling of THIS SAME visit is, by definition, one of the
     // master's own CONFIRMED bookings, so its window is ALREADY excluded from "available" before
     // assertNoSiblingOverlap (which only ever inspects CONFIRMED siblings, phase 30.3) gets a

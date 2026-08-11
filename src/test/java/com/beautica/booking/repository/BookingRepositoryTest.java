@@ -140,77 +140,18 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
                 .build();
     }
 
-    @Test
-    @DisplayName("should_findOverlappingBookings_when_bookingSpansQueryWindow")
-    void should_findOverlappingBookings_when_bookingSpansQueryWindow() {
-        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
-
-        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
-        em.persist(booking);
-        em.flush();
-
-        OffsetDateTime windowStart = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime windowEnd = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
-
-        List<Booking> result = bookingRepository.findOverlappingByMaster(
-                master.getId(),
-                windowStart,
-                windowEnd
-        );
-
-        assertThat(result)
-                .hasSize(1)
-                .extracting(Booking::getId)
-                .containsExactly(booking.getId());
-    }
-
-    @Test
-    @DisplayName("should_findOverlap_when_confirmedBookingOverlaps")
-    void should_findOverlap_when_confirmedBookingOverlaps() {
-        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
-
-        Booking booking = buildBooking(BookingStatus.CONFIRMED, startsAt, endsAt);
-        em.persist(booking);
-        em.flush();
-
-        OffsetDateTime windowStart = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime windowEnd = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
-
-        List<Booking> result = bookingRepository.findOverlappingByMaster(
-                master.getId(),
-                windowStart,
-                windowEnd
-        );
-
-        assertThat(result)
-                .hasSize(1)
-                .extracting(Booking::getId)
-                .containsExactly(booking.getId());
-    }
-
-    @Test
-    @DisplayName("should_notReturnBooking_when_statusIsDeclined")
-    void should_notReturnBooking_when_statusIsDeclined() {
-        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
-
-        Booking booking = buildBooking(BookingStatus.DECLINED, startsAt, endsAt);
-        em.persist(booking);
-        em.flush();
-
-        OffsetDateTime windowStart = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime windowEnd = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
-
-        List<Booking> result = bookingRepository.findOverlappingByMaster(
-                master.getId(),
-                windowStart,
-                windowEnd
-        );
-
-        assertThat(result).isEmpty();
-    }
+    // The three tests that used to sit here — should_findOverlappingBookings_when_bookingSpansQueryWindow,
+    // should_findOverlap_when_confirmedBookingOverlaps and should_notReturnBooking_when_statusIsDeclined —
+    // pinned findOverlappingByMaster, the SELECT * native sibling deleted on 2026-08-11 when the per-day
+    // slot path moved to findActiveTimeRangesByMasterInRange (nothing calls it any more, so keeping it
+    // would leave an entity-hydrating variant beside the projection for a future caller to reach for —
+    // Anti-Bug §E-1). Their contract is not lost: the identical predicate is pinned against the surviving
+    // projection further down (see the findActiveTimeRangesByMasterInRange block) —
+    // should_projectStartAndEnd_forConfirmedBookingsInRange covers the in-window/ordering case,
+    // should_excludeTerminalStatuses_when_projectingActiveTimeRanges covers DECLINED (and CANCELLED,
+    // COMPLETED, NOT_COMPLETED), and should_excludeBoundaryAbuttingBookings_when_projectingActiveTimeRanges
+    // covers the half-open window edges. Retargeting them here would have produced literal duplicates of
+    // those three.
 
     @Test
     @DisplayName("should_existsOverlapReturnTrue_when_confirmedBookingConflicts")
@@ -294,27 +235,8 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         assertThat(result).isFalse();
     }
 
-    @Test
-    @DisplayName("should_notReturnBooking_when_statusIsCancelled")
-    void should_notReturnBooking_when_statusIsCancelled() {
-        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
-
-        Booking booking = buildBooking(BookingStatus.CANCELLED, startsAt, endsAt);
-        em.persist(booking);
-        em.flush();
-
-        OffsetDateTime windowStart = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
-        OffsetDateTime windowEnd = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
-
-        List<Booking> result = bookingRepository.findOverlappingByMaster(
-                master.getId(),
-                windowStart,
-                windowEnd
-        );
-
-        assertThat(result).isEmpty();
-    }
+    // should_notReturnBooking_when_statusIsCancelled sat here — same deletion, same reason as the block
+    // above; CANCELLED is covered by should_excludeTerminalStatuses_when_projectingActiveTimeRanges.
 
     @Test
     @DisplayName("should_returnEmpty_when_idempotencyKeyNotFound")

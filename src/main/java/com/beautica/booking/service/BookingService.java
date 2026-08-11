@@ -1611,7 +1611,10 @@ public class BookingService {
         // off-schedule time yields no matching slot → 409 "Slot not available", the same status
         // the create/overlap path returns for an unbookable time. The authoritative overlap check
         // (excluding this booking's own row) still runs under the lock below.
-        assertStartsOnAvailableSlot(masterId, masterServiceId, newStartsAt);
+        // No preloaded assignment here (Perf MEDIUM, 2026-08-11): the reschedule path holds only
+        // booking.getMasterService(), an uninitialised LAZY proxy whose graph the availability read needs —
+        // dereferencing it would cost the very query passing it is meant to save. null ⇒ plain reload.
+        assertStartsOnAvailableSlot(masterId, masterServiceId, null, newStartsAt);
 
         // Duration + buffer are frozen at the original booking; mirror the create-path
         // end-time formula (duration + buffer) rather than recomputing from master_services.
@@ -1866,6 +1869,32 @@ public class BookingService {
         // about this client's own calendar (backend-perf).
         assertNoClientConflict(clientId, startsAt, endsAt);
 
+        // SCHEDULE-FIT GATE (2026-08-11 HIGH). validateStartsAt above enforces only the lead-time floor
+        // and the 180-day horizon; assertNoClientConflict enforces only the CLIENT's own calendar; the
+        // existsOverlap check below (and the GIST EXCLUDE behind it) enforces only collision with an
+        // existing booking. None of them asks whether the master actually WORKS this time, so until this
+        // line a client could POST a start on a day-off override, inside a lunch-break gap, or on an
+        // off-grid minute and have it persisted CONFIRMED onto the master's calendar. Reuses the exact
+        // oracle the reschedule path has always used (#assertStartsOnAvailableSlot).
+        //
+        // PLACEMENT IS LOAD-BEARING, and is why this sits here rather than beside validateStartsAt:
+        //   * AFTER assertNoClientConflict — the slot list already has the master's CONFIRMED bookings
+        //     subtracted, so a time that is BOTH the client's own conflict and master-busy would fail
+        //     here with the generic "Slot not available" and mask the structured, actionable
+        //     CLIENT_BOOKING_CONFLICT that the locked product decision (see the comment on that call)
+        //     requires to win. Pinned by BookingIntegrationTest
+        //     #should_returnClientBookingConflictNotGenericConflict_when_bothClientConflictAndMasterBusyApply.
+        //   * BEFORE the per-master advisory lock — an off-schedule request must never contend for the
+        //     lock every other client of a popular master is queued on. Only this client's OWN
+        //     (uncontended) client lock is held across it.
+        //
+        // Rejection is the same 409 "Slot not available" the overlap check returns — off-schedule and
+        // already-taken stay indistinguishable to the caller, leaking no schedule detail.
+        //
+        // `msa` is handed through so the gate does not re-issue the findByMasterIdAndIdWithGraph this
+        // method already ran at :1823 (Perf MEDIUM, 2026-08-11) — same persistence context, same instance.
+        assertStartsOnAvailableSlot(master.getId(), msa.getId(), msa, startsAt);
+
         Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
@@ -1965,9 +1994,10 @@ public class BookingService {
      * duplicate method bodies. See that class's Javadoc for why it is a static utility rather than a
      * shared bean (avoids a circular dependency with {@code AppointmentTransitionService}).
      */
-    private void assertStartsOnAvailableSlot(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+    private void assertStartsOnAvailableSlot(
+            UUID masterId, UUID masterServiceId, MasterServiceAssignment preloaded, OffsetDateTime startsAt) {
         BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
-                slotCalculationService, masterId, masterServiceId, startsAt);
+                slotCalculationService, masterId, masterServiceId, preloaded, startsAt);
     }
 
     private void validateStartsAt(OffsetDateTime startsAt) {

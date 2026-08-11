@@ -248,7 +248,7 @@ class SlotCalculationServiceTest {
         // TEMPLATE day 09:00–17:00, no override → equivalent to the legacy working-hours window
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(
                 eq(date),
@@ -306,7 +306,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(
                 eq(date),
@@ -434,18 +434,16 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        Booking mockBooking = mock(Booking.class);
-        when(mockBooking.getStartsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T09:00:00+03:00"));
-        when(mockBooking.getEndsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
+        BookingTimeRange occupied = new BookingTimeRange(
+                OffsetDateTime.parse("2026-05-09T09:00:00+03:00"),
+                OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
-                .thenReturn(List.of(mockBooking));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
+                .thenReturn(List.of(occupied));
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
@@ -484,7 +482,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(any(), any()))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
@@ -521,17 +519,15 @@ class SlotCalculationServiceTest {
                 .build();
 
         // Existing booking occupies 09:00–10:00 Kyiv (06:00–07:00 UTC)
-        Booking existingBooking = mock(Booking.class);
-        when(existingBooking.getStartsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T09:00:00+03:00"));
-        when(existingBooking.getEndsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
+        BookingTimeRange existingBooking = new BookingTimeRange(
+                OffsetDateTime.parse("2026-05-09T09:00:00+03:00"),
+                OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of(existingBooking));
         // Calculator returns empty — simulates the 10:00 slot being blocked because the
         // 90-min candidate window [10:00, 11:30] overlaps the occupied range [09:00, 10:00]
@@ -642,7 +638,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(new TimeRange(slotStart, slotEnd)));
@@ -667,7 +663,7 @@ class SlotCalculationServiceTest {
     }
 
     @Test
-    @DisplayName("should pass Kyiv day-boundary window to findOverlappingByMaster")
+    @DisplayName("should pass Kyiv day-boundary window to findActiveTimeRangesByMasterInRange")
     void should_passDayBoundaryWindow_when_queryingOverlappingBookings() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -691,7 +687,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
@@ -700,7 +696,7 @@ class SlotCalculationServiceTest {
 
         ArgumentCaptor<OffsetDateTime> startCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
         ArgumentCaptor<OffsetDateTime> endCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
-        verify(bookingRepository).findOverlappingByMaster(eq(masterId), startCaptor.capture(), endCaptor.capture());
+        verify(bookingRepository).findActiveTimeRangesByMasterInRange(eq(masterId), startCaptor.capture(), endCaptor.capture());
 
         // Service must query the full day in Kyiv time: midnight-to-midnight on the target date.
         OffsetDateTime expectedStart = date.atStartOfDay(kyiv).toOffsetDateTime();
@@ -741,7 +737,7 @@ class SlotCalculationServiceTest {
         // TEMPLATE day 09:00–17:00, no override
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(new TimeRange(slotStart.toInstant(), slotEnd.toInstant())));
@@ -1407,7 +1403,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(b));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
@@ -1536,7 +1532,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(assignment(masterId, serviceA, 60, 30)));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());

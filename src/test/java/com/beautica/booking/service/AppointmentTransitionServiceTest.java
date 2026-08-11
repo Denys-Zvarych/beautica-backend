@@ -48,6 +48,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
@@ -726,7 +728,8 @@ class AppointmentTransitionServiceTest {
         when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(item));
         AvailableSlotResponse slot = new AvailableSlotResponse(
                 newFirstStart.atZoneSameInstant(KYIV), newFirstStart.plusHours(1).atZoneSameInstant(KYIV));
-        when(slotCalculationService.getAvailableSlots(eq(masterId), eq(newFirstStart.toLocalDate()), eq(List.of(masterServiceId))))
+        when(slotCalculationService.getAvailableSlots(eq(masterId), eq(newFirstStart.toLocalDate()),
+                eq(List.of(masterServiceId)), isNull()))
                 .thenReturn(List.of(slot));
         when(visitPlanner.replanFromNewStart(eq(List.of(item)), eq(newFirstStart)))
                 .thenReturn(List.of(new VisitPlanner.PlannedWindow(newFirstStart, newFirstStart.plusHours(1))));
@@ -919,7 +922,7 @@ class AppointmentTransitionServiceTest {
     private void stubItemSlotAvailable(OffsetDateTime newStartsAt) {
         AvailableSlotResponse slot = new AvailableSlotResponse(
                 newStartsAt.atZoneSameInstant(KYIV), newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
-        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(masterServiceId)))
+        when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(masterServiceId), isNull()))
                 .thenReturn(List.of(slot));
     }
 
@@ -1339,6 +1342,7 @@ class AppointmentTransitionServiceTest {
                 .isInstanceOf(BookingElapsedException.class);
 
         verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
-        verify(slotCalculationService, never()).getAvailableSlots(any(), any(), any(UUID.class));
+        verify(slotCalculationService, never()).getAvailableSlots(
+                any(), any(), any(UUID.class), nullable(MasterServiceAssignment.class));
     }
 }

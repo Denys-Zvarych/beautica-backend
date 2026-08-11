@@ -10,6 +10,9 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.dashboard.dto.RevenueResponse;
 import com.beautica.master.dto.MasterDetailResponse;
+import com.beautica.master.dto.WeeklyScheduleDayRequest;
+import com.beautica.master.dto.WeeklyScheduleRequest;
+import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -181,6 +184,32 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
                 .as("upsert working hours must return 200")
                 .isEqualTo(HttpStatus.OK);
         log.debug("Step 4 complete — working hours set for masterId={}", masterId);
+
+        // ── Step 4b: publish the WEEKLY SCHEDULE the availability resolver actually reads ──────
+        // PATCH .../working-hours above writes the LEGACY `working_hours` table. Since Phase 15.4
+        // the effective-day oracle behind slot generation (SlotCalculationService →
+        // MasterScheduleService#resolveEffectiveDay) reads `weekly_schedules` + `working_intervals`
+        // ONLY — it never looks at `working_hours`. That divergence was invisible while create
+        // validated nothing but lead-time/horizon/overlap; now that all create paths gate on
+        // schedule fit (BookingSlotAvailabilityGuard, 2026-08-11), a master whose hours exist only
+        // in the legacy table has an EMPTY slot list and every booking is a 409 "Slot not
+        // available". Seed the modern template through its own public endpoint — same 08:00–20:00
+        // every ISO weekday — so Step 7's start lands on a real slot.
+        var weeklyReq = new WeeklyScheduleRequest(
+                LocalDate.now(KYIV), null,
+                java.util.stream.IntStream.rangeClosed(1, 7)
+                        .mapToObj(isoDow -> new WeeklyScheduleDayRequest(isoDow, List.of(
+                                new WorkIntervalDto(java.time.LocalTime.of(8, 0),
+                                        java.time.LocalTime.of(20, 0)))))
+                        .toList());
+        ResponseEntity<String> weeklyResp = restTemplate.exchange(
+                "/api/v1/masters/" + masterId + "/weekly-schedules", HttpMethod.POST,
+                new HttpEntity<>(weeklyReq, bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(weeklyResp.getStatusCode())
+                .as("create weekly schedule must return 201, body=%s", weeklyResp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        log.debug("Step 4b complete — weekly schedule published for masterId={}", masterId);
 
         // ── Step 5: create a service definition ───────────────────────────────
         // Since Phase 16.x / V111, service_type_id is mandatory (@NotNull) and must belong to
