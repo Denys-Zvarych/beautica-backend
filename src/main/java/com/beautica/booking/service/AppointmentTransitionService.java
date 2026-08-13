@@ -39,7 +39,6 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -652,10 +651,6 @@ public class AppointmentTransitionService {
         List<VisitPlanner.PlannedWindow> windows = visitPlanner.replanFromNewStart(confirmedItems, newFirstStart);
         OffsetDateTime newLastEnd = windows.get(windows.size() - 1).endsAt();
 
-        // Old (date, masterServiceId) keys, captured BEFORE any item is mutated, for after-commit
-        // cache eviction (mirrors AppointmentService#registerSlotEviction).
-        Set<SlotKey> oldSlotKeys = collectSlotKeys(confirmedItems);
-
         // Cycle-5 audit finding 1 (2026-08-03) — canonical appointments-before-bookings lock order
         // (cycle-2 audit finding 1), applied here for the FIRST time on this method: everything
         // above (the unlocked resolve/authz/status/elapsed checks, the availability query, and the
@@ -725,7 +720,7 @@ public class AppointmentTransitionService {
         // (never one per service) — the drain worker addresses the OTHER party from that one booking.
         outboxService.enqueueBookingRescheduled(saved.get(0).getId(), initiatedByProvider);
 
-        registerRescheduleEviction(masterId, salonIdOfMaster(master), oldSlotKeys, collectSlotKeys(saved));
+        registerRescheduleEviction(masterId, salonIdOfMaster(master));
 
         // Render the FULL visit (moved CONFIRMED items are mutated in place within `items`; any
         // declined item keeps its old row) so the response still shows every service line.
@@ -870,9 +865,6 @@ public class AppointmentTransitionService {
         // Phase 30.3 layer 1 — in-memory sibling pre-check, before any lock, zero extra queries.
         assertNoSiblingOverlap(items, bookingId, newStartsAt, newEndsAt);
 
-        // Captured BEFORE any mutation, for after-commit cache eviction.
-        Set<SlotKey> oldSlotKeys = collectSlotKeys(List.of(target));
-
         // Lock order: header → client → master (canonical, cycle-2 audit finding 1). Unlike
         // BookingService#rescheduleBooking's use of this SAME method (phase 30.2), a false result
         // here IS a 409 — the header is a named part of THIS route's request (phase 30.1 D4).
@@ -928,7 +920,7 @@ public class AppointmentTransitionService {
         // Reference the MOVED CHILD (never item 0) so the notification names the right service.
         outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
 
-        registerRescheduleEviction(masterId, salonIdOfMaster(master), oldSlotKeys, collectSlotKeys(List.of(saved)));
+        registerRescheduleEviction(masterId, salonIdOfMaster(master));
 
         // The in-memory list was loaded ordered by the OLD startsAt; the mutation above may have
         // moved `target` out of that order, so it must be re-sorted before rendering — the stale
@@ -1473,38 +1465,24 @@ public class AppointmentTransitionService {
         return new ClientBookingConflictException(conflict);
     }
 
-    /** Distinct (Kyiv-civil date, masterServiceId) keys touched by every item in {@code items}. */
-    private Set<SlotKey> collectSlotKeys(List<Booking> items) {
-        Set<SlotKey> keys = new LinkedHashSet<>();
-        for (Booking item : items) {
-            UUID serviceId = item.getMasterService().getId();
-            keys.add(new SlotKey(item.getStartsAt().toLocalDate(), serviceId));
-            keys.add(new SlotKey(item.getEndsAt().toLocalDate(), serviceId));
-        }
-        return keys;
-    }
-
     private static UUID salonIdOfMaster(Master master) {
         Salon salon = master.getSalon();
         return salon != null ? salon.getId() : null;
     }
 
     /**
-     * After-commit availability-cache eviction for a reschedule — the union of the OLD (freed) and
-     * NEW (now-occupied) {@code (date, masterServiceId)} keys, plus the per-master free-slot
-     * verdict, the salon catalogue, and the master-calendar page cache, each evicted once. No
-     * revenue-dashboard eviction: a rescheduled visit stays {@code CONFIRMED} (never terminal), so
-     * it cannot affect revenue. Mirrors {@link #registerEviction}'s after-commit shape.
+     * After-commit availability-cache eviction for a reschedule, plus the salon catalogue and the
+     * master-calendar page cache, each evicted once. No revenue-dashboard eviction: a rescheduled
+     * visit stays {@code CONFIRMED} (never terminal), so it cannot affect revenue. Mirrors
+     * {@link #registerEviction}'s after-commit shape.
+     *
+     * <p>The by-master sweep covers BOTH the freed old dates and the newly-occupied new ones in a
+     * single pass, so this no longer needs the old/new {@code (date, masterServiceId)} key union it
+     * previously had to collect before mutating the items.
      */
-    private void registerRescheduleEviction(UUID masterId, UUID salonId, Set<SlotKey> oldKeys, Set<SlotKey> newKeys) {
-        Set<SlotKey> slotKeys = new LinkedHashSet<>(oldKeys);
-        slotKeys.addAll(newKeys);
-
+    private void registerRescheduleEviction(UUID masterId, UUID salonId) {
         Runnable task = () -> {
-            for (SlotKey key : slotKeys) {
-                slotCalculationService.evictAvailableSlots(masterId, key.date(), key.masterServiceId());
-            }
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
@@ -1564,11 +1542,13 @@ public class AppointmentTransitionService {
 
     /**
      * After-commit availability-cache eviction for the whole visit — reuses the exact single-service
-     * booking-write hooks so a parallel reader cannot repopulate stale data mid-write. Distinct
-     * (Kyiv-civil date, masterServiceId) keys are collected across every item (both the start and end
-     * day, in case a service spans midnight); the per-master free-slot verdict, the salon catalogue,
-     * and the master-calendar page cache are each evicted once. A non-null {@code revenueActorId}
-     * additionally evicts that actor's revenue dashboard, keyed on the actor id exactly as
+     * booking-write hook so a parallel reader cannot repopulate stale data mid-write. The visit's
+     * items occupy the master's time, which bounds the slots offered for every service the master
+     * performs on those dates, so all three availability caches are swept by master prefix
+     * ({@link SlotCalculationService#evictMasterAvailabilityCaches}) rather than per
+     * {@code (date, masterServiceId)}; the salon catalogue and the master-calendar page cache are
+     * each evicted once. A non-null {@code revenueActorId} additionally evicts that actor's revenue
+     * dashboard, keyed on the actor id exactly as
      * {@code BookingService#evictRevenueDashboardAfterCommit} does.
      */
     private void registerEviction(List<Booking> items, UUID revenueActorId) {
@@ -1577,18 +1557,8 @@ public class AppointmentTransitionService {
         Salon salon = master.getSalon();
         UUID salonId = salon != null ? salon.getId() : null;
 
-        Set<SlotKey> slotKeys = new LinkedHashSet<>();
-        for (Booking item : items) {
-            UUID serviceId = item.getMasterService().getId();
-            slotKeys.add(new SlotKey(item.getStartsAt().toLocalDate(), serviceId));
-            slotKeys.add(new SlotKey(item.getEndsAt().toLocalDate(), serviceId));
-        }
-
         Runnable task = () -> {
-            for (SlotKey key : slotKeys) {
-                slotCalculationService.evictAvailableSlots(masterId, key.date(), key.masterServiceId());
-            }
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
@@ -1617,6 +1587,4 @@ public class AppointmentTransitionService {
         }
     }
 
-    /** Distinct availability-cache eviction key: one Kyiv-civil date × one master-service. */
-    private record SlotKey(LocalDate date, UUID masterServiceId) {}
 }

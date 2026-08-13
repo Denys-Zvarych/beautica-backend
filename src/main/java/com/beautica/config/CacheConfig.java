@@ -264,7 +264,7 @@ public class CacheConfig {
         // 500 entries, sync=true. Key is {masterId, masterServiceId, from, to}; the window portion
         // cannot be evicted per-date, so it is evicted by MASTER PREFIX on every schedule write
         // (MasterScheduleService#evictSlotsAfterCommit) AND every booking write
-        // (SlotCalculationService#evictBookableFutureSlotsByMaster, called from the booking-write
+        // (SlotCalculationService#evictMasterAvailabilityCaches, called from the booking-write
         // afterCommit hooks) — a new/cancelled booking anywhere in the horizon can flip the verdict.
         // Metered + raised cap (Perf #5). Key is {masterId, masterServiceId, from, to}: the booking
         // horizon window is fixed per call, so live cardinality is ~ (active masters × services they
@@ -284,7 +284,7 @@ public class CacheConfig {
         // yield different bookable-day sets. Mirrors master-service-bookable: 60-sec TTL, sync=true
         // (hot client-calendar key), metered. Evicted by MASTER PREFIX (the key's first element) on every
         // schedule write (MasterScheduleService#evictSlotsAfterCommit) AND every booking write
-        // (SlotCalculationService#evictBookableFutureSlotsByMaster) — a new/cancelled booking anywhere in
+        // (SlotCalculationService#evictMasterAvailabilityCaches) — a new/cancelled booking anywhere in
         // the window can flip a day from bookable to full. Cardinality is master × service × calendar
         // window (the mobile calendar pages by month), so it is sized like master-service-bookable.
         //

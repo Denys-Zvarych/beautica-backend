@@ -34,13 +34,10 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
-import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -361,7 +358,7 @@ public class AppointmentService {
         outboxService.enqueueNewBooking(savedBookings.get(0).getId());
         outboxService.enqueueStatusChanged(savedBookings.get(0).getId());
 
-        registerSlotEviction(master.getId(), salonIdOf(master), items);
+        registerSlotEviction(master.getId(), salonIdOf(master));
 
         return appointment.getId();
     }
@@ -407,24 +404,18 @@ public class AppointmentService {
     }
 
     /**
-     * Evicts the master's availability caches for every (date, service) the visit touches, after
-     * commit — reusing the exact single-service booking-write eviction hooks so a parallel reader
-     * cannot repopulate stale data mid-write. Distinct (local date, masterServiceId) keys are
-     * collected across every item (and both the start and end day, in the rare event a service spans
-     * midnight), then the per-master free-slot verdict and the salon catalogue are evicted once.
+     * Evicts the master's availability caches after commit, so a parallel reader cannot repopulate
+     * stale data mid-write — reusing the exact single-service booking-write eviction hook.
+     *
+     * <p>Takes no per-item key set: the visit occupies a contiguous block of the master's time, which
+     * moves the offered slots for every service the master performs on those dates, not merely the
+     * booked ones. {@link SlotCalculationService#evictMasterAvailabilityCaches} sweeps all three
+     * availability caches by master prefix in one pass, which subsumes the per-{@code (date, service)}
+     * enumeration this method used to build (including the start/end-day pair).
      */
-    private void registerSlotEviction(UUID masterId, UUID salonId, List<VisitPlanner.PlannedItem> items) {
-        Set<SlotKey> slotKeys = new LinkedHashSet<>();
-        for (VisitPlanner.PlannedItem item : items) {
-            UUID serviceId = item.masterService().getId();
-            slotKeys.add(new SlotKey(item.startsAt().toLocalDate(), serviceId));
-            slotKeys.add(new SlotKey(item.endsAt().toLocalDate(), serviceId));
-        }
+    private void registerSlotEviction(UUID masterId, UUID salonId) {
         Runnable task = () -> {
-            for (SlotKey key : slotKeys) {
-                slotCalculationService.evictAvailableSlots(masterId, key.date(), key.masterServiceId());
-            }
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
@@ -440,7 +431,4 @@ public class AppointmentService {
             task.run();
         }
     }
-
-    /** Distinct availability-cache eviction key: one Kyiv-civil date × one master-service. */
-    private record SlotKey(LocalDate date, UUID masterServiceId) {}
 }

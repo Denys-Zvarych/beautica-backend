@@ -652,14 +652,26 @@ class SlotCalculationServiceTest {
         assertThat(result.get(0).endsAt()).isEqualTo(slotEnd.atZone(kyiv));
     }
 
+    /**
+     * Pins the exact cache-name SET a booking write sweeps. {@code available-slots} is the one that
+     * closes the staleness hole (a booking of service A had been leaving service B's cached slot list
+     * offering the time A consumed); the other two were already swept. Naming all three here means
+     * dropping any of them from {@code BOOKING_WRITE_CACHES} fails a test rather than silently
+     * re-opening a stale-availability window for the 60-second TTL.
+     *
+     * <p>That the sweep matches on the key's first element (the masterId) and so removes EVERY
+     * service's entry is asserted end-to-end against a real Caffeine cache in
+     * {@code SlotCalculationServiceCacheTest}; this unit test only owns the cache-name set.
+     */
     @Test
-    @DisplayName("evictAvailableSlots — method compiles and does not throw (signature guard)")
-    void should_notThrow_when_evictAvailableSlotsCalledDirectly() {
-        // Compile/signature guard only — no AOP proxy active in this unit test context.
-        // Cache eviction behaviour (@CacheEvict) is verified in SlotCalculationServiceCacheTest.
-        assertThatCode(() -> slotCalculationService.evictAvailableSlots(
-                UUID.randomUUID(), LocalDate.now(clock), UUID.randomUUID()))
-                .doesNotThrowAnyException();
+    @DisplayName("evictMasterAvailabilityCaches — sweeps all three availability caches by master prefix")
+    void should_sweepAllAvailabilityCaches_when_evictMasterAvailabilityCachesCalled() {
+        UUID masterId = UUID.randomUUID();
+
+        slotCalculationService.evictMasterAvailabilityCaches(masterId);
+
+        verify(cacheEvictor).evictByMasterPrefix(
+                masterId, "available-slots", "master-service-bookable", "master-bookable-days");
     }
 
     @Test
