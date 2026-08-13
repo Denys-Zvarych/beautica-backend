@@ -173,19 +173,122 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     // ── Phase 26.5 — GET /bookings/me/booked-days (day-rail dot set) ──────────
     //
-    // The rail's dot set must be the caller's FULL booking history for the range — no
-    // status filter (see the design's `_bookingDays` getter, computed from the unfiltered
-    // `widget.bookings`, not the filtered `_visible` view) — so, unlike
-    // findActiveIdsByMasterIdAndStartsAtBetween above, these three queries deliberately
-    // carry no `status IN (...)` predicate.
+    // THE RAIL MUST AGREE WITH THE LIST IT NAVIGATES TO. A dot exists to say "tap here and
+    // you will find bookings"; a dot on a day the destination list renders empty is a
+    // user-visible lie. So a query below carries a status predicate only where a locked decision
+    // pinned its own screen's DEFAULT visibility rule — today that is the master rail alone; the
+    // other two are deliberately unfiltered (see below). Where a status is unknown to one side,
+    // the rail and the list must still make the SAME choice about it — see the allow-list
+    // paragraph below, which is how that agreement is preserved.
+    //
+    // findBookedDatesByMasterId (master's own «Мої записи» rail) — EXCLUDES CANCELLED and
+    // DECLINED (locked product decision, user, 2026-08-13). That screen hides both by
+    // default: they are one unit to the user, because the who-cancelled distinction was
+    // collapsed on 2026-07-15 and both now render the identical «Скасовано» badge. A day
+    // whose ONLY bookings are cancelled/declined must therefore NOT be dotted — tapping it
+    // would open an empty day. NOT_COMPLETED (no-show) is deliberately NOT excluded: it
+    // stays visible in that list as the master's own record of a client who did not turn
+    // up, and it feeds the two-sided client rating. COMPLETED and CONFIRMED obviously stay.
+    //
+    // The predicate is written as an ALLOW-list (`IN ('CONFIRMED','COMPLETED','NOT_COMPLETED')`),
+    // NOT as the deny-list `NOT IN ('CANCELLED','DECLINED')` that expresses the same product rule
+    // more directly. The two are LOGICALLY IDENTICAL and cannot diverge: chk_booking_status pins
+    // the domain to exactly five values — V113__remove_pending_booking_status.sql:14 backfilled
+    // every PENDING row to CONFIRMED, :33-37 rebuilt the constraint as ('CONFIRMED','DECLINED',
+    // 'COMPLETED','NOT_COMPLETED','CANCELLED'), and V115:25 ran VALIDATE CONSTRAINT on it, so the
+    // allow-list is the exact set complement of the deny-list at the DB level. ('PENDING' is
+    // retired for good; no PENDING row can exist or be inserted — do not re-derive this.)
+    //
+    // WHY THE ALLOW-LIST FORM IS LOAD-BEARING (backend-perf HIGH, 2026-08-13). The IN form is
+    // byte-for-byte the WHERE clause of the partial index
+    // idx_bookings_master_past_partition_starts_at (V130__bookings_partition_past_master_index.sql
+    // :67-69). Postgres's predicate_implied_by is a SYNTACTIC matcher: it proves the IN form
+    // implies that index predicate trivially, and cannot prove it of the NOT IN form at all.
+    // Measured on local Postgres, 100,053 bookings, post-VACUUM ANALYZE, over the real client
+    // window (mobile sends today ± 180 days, booked_days_notifier.dart:86 — a 361-day span):
+    //   NOT IN => Bitmap Heap Scan on idx_bookings_master_starts_at, 3,038 rows dropped by a
+    //             post-fetch Filter, 269 shared buffers;
+    //   IN     => Index Only Scan using idx_bookings_master_past_partition_starts_at,
+    //             Heap Fetches: 0, 40 shared buffers.
+    // 6.7x the buffer traffic. And the Seq Scan that V130 was written to eliminate is REACHABLE on
+    // the NOT IN form — an earlier revision of this comment claimed it "was not reproduced here",
+    // which was a single-window artifact and is RETRACTED. Plan sweep (backend-perf, 2026-08-13,
+    // 50,000-booking master inside the same 100,053-booking dataset, post-VACUUM ANALYZE):
+    //   366d cap, recent      NOT IN: SEQ SCAN, 90,525 rows dropped by Filter, 2,179 buffers,
+    //                                 11.7 ms  |  IN: Index Only Scan, 79 buffers, 4.5 ms
+    //   366d cap, 2026-fwd    NOT IN: SEQ SCAN, 2,179 buffers, 13.5 ms
+    //                                 |  IN: Index Only Scan, 52 buffers, 2.4 ms
+    //   366d cap, 2024        NOT IN: Bitmap Heap Scan, 6,588 rows dropped by Filter, 577 buffers,
+    //                                 4.9 ms   |  IN: Index Only Scan, 81 buffers
+    //   real client window    NOT IN: Bitmap Heap Scan, 271 buffers, 2.5 ms
+    //   (361d, today ± 180)           |  IN: Index Only Scan, 43 buffers, 1.9 ms
+    // Every window returns the IDENTICAL 354-row result (symmetric-difference check = 0): this is
+    // purely a plan difference, never a semantic one. Not every window degrades — the 2024 row is a
+    // span sitting wholly inside that master's dense history, so the range predicate estimates low
+    // and a bitmap path still wins for both forms. The Seq Scan appears when a 366-day window
+    // reaches the master's SPARSE FORWARD TAIL (start >= ~2026-01-01): the planner over-estimates
+    // there (17,243 rows estimated vs 5,745 actual) and seq cost 4263.27 undercuts the bitmap
+    // alternative. That is a shape production traffic grows into, not a synthetic one.
+    //
+    // AND THE REAL CLIENT WINDOW SITS 2.2% FROM THAT CLIFF. On today ± 180 days the planner chooses
+    // Bitmap Heap at cost=1456.19..4155.68 over a forced Seq Scan at cost=0.00..4245.59 — a 2.2%
+    // margin that a single ANALYZE re-sample can flip. So the allow-list is LOAD-BEARING, not
+    // cosmetic or stylistic: it takes the choice away from the planner by giving the status
+    // predicate an index it can syntactically match. Do NOT rewrite this back to the more readable
+    // NOT IN form believing the regression is hypothetical — it has been measured at 30x buffers
+    // and 3.5x latency, and the window production actually sends is marginal. The NOT IN plan is
+    // the one free to degrade that way precisely because it has no matchable index for the status
+    // predicate at all and is left to the planner's row estimates (Anti-Bug §E).
+    //
+    // V130's own header (:30-37)
+    // already establishes this precedent on the sibling query: BookingSpecifications#partition
+    // carries a logically redundant statusIn(...) conjunct existing purely to make this same index
+    // matchable. This is the second instance of the same rule, not a new one.
+    //
+    // A SIXTH STATUS IS NOT A SILENT EVENT. Adding one requires a migration that rewrites
+    // chk_booking_status (that is the only way a new value can ever be stored), and that migration
+    // is the review checkpoint — grep for the constraint and this query is found. So the allow-list
+    // does not hide a future status behind an invisible default; it makes the reviewer name it.
+    //
+    // AND THE ALLOW-LIST IS THE SHAPE THAT KEEPS RAIL AND LIST AGREEING. Mobile's day list calls
+    // GET /bookings/me with an explicit status ALLOW-list on the wire
+    // (BookingStatus.visibleInDayListByDefault — `filterable` minus {CANCELLED, DECLINED}), because
+    // that endpoint has no "exclude" parameter. Matching that shape here means an unknown sixth
+    // status is treated the SAME way by both sides — neither dots it nor lists it — instead of the
+    // deny-list's split verdict (rail dots the day, list returns nothing, so the master taps into
+    // an empty day). Agreement is the invariant this whole block exists to protect; the allow-list
+    // preserves it, the deny-list breaks it in the cosmetic direction. (Mobile still renders any
+    // row it does decode: an unrecognised wire status becomes BookingStatus.unknown, never a
+    // dropped row — so a genuinely reachable booking is never invisible in the list itself.)
+    //
+    // findBookedDatesBySalonIds / findBookedDatesByClientId deliberately carry NO status
+    // predicate — unchanged. The 2026-08-13 decision was scoped to the MASTER's rail only;
+    // the owner and client screens have not had their list filters changed, so adding one
+    // here would break the very agreement this block exists to preserve. Revisit only
+    // together with those screens' own default filters.
+    //
+    // (Contrast findActiveIdsByMasterIdAndStartsAtBetween above, whose CONFIRMED/COMPLETED
+    // allow-list serves a different question — "which bookings are live" — not "which days
+    // does the list have rows for".)
     //
     // Native + SELECT DISTINCT on a timezone-converted date expression: JPQL has no
-    // AT TIME ZONE function, and grouping must happen in Postgres (≤ ~361 rows back), not
-    // by loading every booking row into heap and reducing in Java. The half-open
+    // AT TIME ZONE function, and grouping must happen in Postgres, not by loading every booking row
+    // into heap and reducing in Java. Note the two cardinalities are very different and only the
+    // first is bounded by the date span: at most 367 rows are RETURNED (the range is inclusive of
+    // both bounds and ScheduleDateMath#assertSpanWithinMax caps the span at 366), but the number of
+    // rows SCANNED to produce them is the master's whole booking volume inside that window and is
+    // unbounded by anything here — measured at 4,558 index entries for a 10,000-booking master on
+    // the real 361-day client window. That is exactly why the index match below is load-bearing:
+    // the DISTINCT is cheap, the scan feeding it is not. The half-open
     // [:from, :toExclusive) bound on starts_at mirrors BookingService's LocalDate ->
     // OffsetDateTime conversion (from.atStartOfDay(TimeZones.KYIV), to.plusDays(1)
     // .atStartOfDay(TimeZones.KYIV)) exactly, so a dot here and a day-filtered result on
-    // GET /bookings/me always agree.
+    // GET /bookings/me agree on the RANGE. (They agree on the ROW SET too, provided the
+    // caller asks GET /bookings/me for the same statuses its screen shows — for the master
+    // rail that means passing status=CONFIRMED,COMPLETED,NOT_COMPLETED, now literally the same
+    // allow-list this query names, so the two sides are textually comparable rather than
+    // complementary — see the allow-list paragraph above. GET /bookings/me's
+    // "no status param => no filter" contract is unchanged.)
     //
     // The 'Europe/Kyiv' literal below cannot be replaced with a bound parameter reliably
     // (AT TIME ZONE's right-hand operand is polymorphic; Postgres can fail to infer a bound
@@ -211,6 +314,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.master_id = :masterId
               AND b.starts_at >= :from
               AND b.starts_at < :toExclusive
+              AND b.status IN ('CONFIRMED', 'COMPLETED', 'NOT_COMPLETED')
             ORDER BY d
             """, nativeQuery = true)
     List<Date> findBookedDatesByMasterId(

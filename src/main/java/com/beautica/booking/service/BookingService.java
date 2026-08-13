@@ -597,18 +597,38 @@ public class BookingService {
      * distinct. Backs the day-rail dot on the booking-management design
      * ({@code SalonManagementDesign/lib/widgets/bookings_toolbar.dart}'s {@code _bookingDays}).
      *
-     * <p><b>Filter-independent by design.</b> The design computes {@code _bookingDays} from the
-     * screen's full, unfiltered booking list, not the filtered/sorted view — so the dots keep
-     * showing where bookings are even while a status/date/service filter narrows the list below.
-     * This method therefore takes no {@code status} / {@code serviceId} parameter and applies no
-     * status predicate — do not add one "for symmetry" with {@link #getMyBookings}.
+     * <p><b>Independent of the caller's ad-hoc filters, but NOT of the screen's default.</b> The
+     * design computes {@code _bookingDays} from the screen's own booking list rather than the
+     * filtered/sorted view, so the dots keep showing where bookings are even while a user-applied
+     * status/date/service filter narrows the list below. This method therefore takes no {@code
+     * status} / {@code serviceId} parameter — do not add one "for symmetry" with {@link
+     * #getMyBookings}.
+     *
+     * <p>That independence stops at the screen's <em>default</em> visibility rule, because a dot
+     * must never point at a day the destination list renders empty. On the master's «Мої записи»
+     * screen {@code CANCELLED} and {@code DECLINED} are hidden by default (locked product
+     * decision, user, 2026-08-13 — both render the identical «Скасовано» badge since the
+     * who-cancelled distinction was collapsed on 2026-07-15), so the master-scoped query excludes
+     * them and a day whose only bookings are cancelled/declined is not dotted. {@code
+     * NOT_COMPLETED} stays dotted — it stays visible in that list as the master's own no-show
+     * record and feeds the two-sided client rating. The SALON_OWNER and CLIENT branches below are
+     * unchanged and still carry no status predicate; see {@code BookingRepository}'s block comment
+     * above the three queries for the full rationale.
      *
      * <p><b>{@code from}/{@code to} are required</b> (unlike {@code getMyBookings}'s optional
      * range) and capped at 366 days via {@link ScheduleDateMath#assertSpanWithinMax} — an
      * unbounded default would scan the caller's entire booking history. Converted to the same
      * half-open {@code [from, toExclusive)} Kyiv-zoned instant range {@code getMyBookings} uses,
-     * so a dot returned here and a non-empty {@code GET /bookings/me?from=D&to=D} for the same
-     * date D always agree.
+     * so a dot returned here and {@code GET /bookings/me?from=D&to=D} for the same date D can
+     * never diverge on timezone or boundary handling. For the master scope they agree on the row
+     * set too once the caller passes the statuses its screen actually shows
+     * ({@code &status=CONFIRMED,COMPLETED,NOT_COMPLETED}) — literally the same allow-list the query
+     * itself names, so client and query agree by textual identity rather than by set complement,
+     * and a hypothetical sixth status is hidden by BOTH rather than dotted by one and dropped by
+     * the other. {@code BookingRepository}'s block comment explains why the allow-list form is also
+     * what makes the query match its partial index. {@code getMyBookings}'s own "no
+     * {@code status} param ⇒ no filter" contract is deliberately left untouched for every other
+     * caller.
      *
      * <p>Role scope mirrors {@link #getMyBookings}: {@code SALON_MASTER}/{@code
      * INDEPENDENT_MASTER} see their own bookings (scoped by {@code masterId}, resolved from the
@@ -618,8 +638,12 @@ public class BookingService {
      * (they manage staff/services, not bookings).
      *
      * <p>Aggregation happens in Postgres ({@code SELECT DISTINCT} on a timezone-converted date
-     * expression, at most ~366 rows back) — never by loading the caller's booking history into
-     * heap and reducing with {@code .map(...).distinct()} in Java.
+     * expression) — never by loading the caller's booking history into heap and reducing with
+     * {@code .map(...).distinct()} in Java. The 366-day span cap bounds the rows RETURNED (at most
+     * 367, both bounds inclusive); it does <em>not</em> bound the rows SCANNED, which is the
+     * caller's entire booking volume inside that window — thousands of rows for a busy master, and
+     * the reason the master-scoped query's status predicate is written to match a partial index.
+     * See {@code BookingRepository}'s block comment for that measurement.
      */
     @Transactional(readOnly = true)
     public List<LocalDate> getMyBookedDays(UUID actorUserId, Authentication auth, LocalDate from, LocalDate to) {

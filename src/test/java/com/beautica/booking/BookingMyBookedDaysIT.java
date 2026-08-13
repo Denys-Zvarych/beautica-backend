@@ -392,6 +392,115 @@ class BookingMyBookedDaysIT extends AbstractIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // 5b — status visibility: the rail must agree with the list it navigates to
+    // (locked product decision, user, 2026-08-13)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("master rail — a day whose ONLY bookings are CANCELLED or DECLINED is NOT dotted, "
+            + "while NOT_COMPLETED/COMPLETED/CONFIRMED days stay dotted and a mixed day survives "
+            + "its cancelled sibling (locked decision 2026-08-13)")
+    void should_omitCancelledAndDeclinedOnlyDays_when_masterQueriesBookedDays() throws Exception {
+        String masterEmail = "mbbd-status-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser(
+                "mbbd-status-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+
+        LocalDate base = LocalDate.of(2032, 3, 1);
+        LocalDate cancelledOnly = base;                 // must NOT be dotted
+        LocalDate declinedOnly = base.plusDays(1);      // must NOT be dotted
+        LocalDate noShowOnly = base.plusDays(2);        // MUST stay dotted (no-show record)
+        LocalDate completedOnly = base.plusDays(3);     // MUST stay dotted
+        LocalDate confirmedOnly = base.plusDays(4);     // MUST stay dotted
+        LocalDate mixed = base.plusDays(5);             // MUST stay dotted — one live sibling
+
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(cancelledOnly, 10, 0), "CANCELLED");
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(declinedOnly, 10, 0), "DECLINED");
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(noShowOnly, 10, 0), "NOT_COMPLETED");
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(completedOnly, 10, 0), "COMPLETED");
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(confirmedOnly, 10, 0), "CONFIRMED");
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(mixed, 10, 0), "CANCELLED");
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(mixed, 14, 0), "CONFIRMED");
+
+        List<LocalDate> bookedDays = callBookedDays(fixtures.tokenFor(masterEmail), base, base.plusDays(6));
+
+        assertThat(bookedDays)
+                .as("a day whose only bookings are CANCELLED/DECLINED must not be dotted (tapping it "
+                        + "would open an empty day), but NOT_COMPLETED must stay dotted — it is the "
+                        + "master's own no-show record and feeds the two-sided client rating — and a "
+                        + "day holding both a cancelled and a live booking must remain dotted")
+                .containsExactly(noShowOnly, completedOnly, confirmedOnly, mixed);
+    }
+
+    @Test
+    @DisplayName("the 2026-08-13 exclusion is scoped to the MASTER query only — the CLIENT scope "
+            + "(findBookedDatesByClientId) still dots a cancelled-only day, proving the sibling "
+            + "native queries were deliberately left unfiltered")
+    void should_stillDotCancelledOnlyDay_when_clientQueriesBookedDays() throws Exception {
+        String masterEmail = "mbbd-status-scope-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+
+        String clientEmail = "mbbd-status-scope-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+
+        LocalDate day = LocalDate.of(2032, 4, 12);
+        insertBookingWithStatus(clientId, masterId, serviceId, null, kyiv(day, 10, 0), "CANCELLED");
+
+        List<LocalDate> clientDays = callBookedDays(fixtures.tokenFor(clientEmail), day, day);
+        List<LocalDate> masterDays = callBookedDays(fixtures.tokenFor(masterEmail), day, day);
+
+        assertThat(clientDays)
+                .as("the CLIENT branch carries no status predicate and must be untouched by the "
+                        + "master-scoped 2026-08-13 change")
+                .containsExactly(day);
+        assertThat(masterDays)
+                .as("the same cancelled booking must be absent from the MASTER's rail — this is the "
+                        + "asymmetry the repository block comment documents")
+                .isEmpty();
+    }
+
+    /**
+     * The symmetric counterpart to
+     * {@link #should_stillDotCancelledOnlyDay_when_clientQueriesBookedDays()}, closing the other half
+     * of the same scoping contract (backend-qa, 2026-08-13).
+     *
+     * <p>{@code BookingRepository}'s block comment states that BOTH sibling native queries —
+     * {@code findBookedDatesByClientId} AND {@code findBookedDatesBySalonIds} — deliberately keep no
+     * status predicate, because the 2026-08-13 decision was scoped to the master's rail alone and
+     * the owner/client screens' own default list filters were never changed; adding one would break
+     * the rail-vs-list agreement rather than preserve it. Only the client half of that statement was
+     * pinned. A later "make the three queries consistent" refactor could therefore add the predicate
+     * to the salon query with every test still green, and the owner's rail would silently stop
+     * dotting days whose bookings a salon screen still lists.
+     */
+    @Test
+    @DisplayName("the 2026-08-13 exclusion is scoped to the MASTER query only — the SALON_OWNER "
+            + "scope (findBookedDatesBySalonIds) still dots a cancelled-only day, the untested half "
+            + "of the same deliberate-asymmetry contract the CLIENT test above pins")
+    void should_stillDotCancelledOnlyDay_when_salonOwnerQueriesBookedDays() throws Exception {
+        BookingTestFixtures.SalonFixture salon =
+                fixtures.createSalon("mbbd-status-scope-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = fixtures.createUser(
+                "mbbd-status-scope-owner-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createSalonService(salon.salonId(), salon.masterId());
+
+        LocalDate day = LocalDate.of(2032, 5, 18);
+        insertBookingWithStatus(clientId, salon.masterId(), serviceId, salon.salonId(),
+                kyiv(day, 11, 0), "CANCELLED");
+
+        List<LocalDate> ownerDays = callBookedDays(fixtures.tokenFor(salon.ownerEmail()), day, day);
+
+        assertThat(ownerDays)
+                .as("the SALON_OWNER branch carries no status predicate and must be untouched by the "
+                        + "master-scoped 2026-08-13 change — the owner's screen has its own list "
+                        + "filter, so narrowing the rail here would break rail/list agreement rather "
+                        + "than preserve it")
+                .containsExactly(day);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // 6 — no-N+1 query-count guard (phase doc's "one query per call" acceptance
     // criterion, untestable while the endpoint 500'd — real Postgres via Hibernate
     // Statistics, mirroring FavoriteListProjectionTest / LocalityDiscoveryPerfHardeningTest)
@@ -531,22 +640,34 @@ class BookingMyBookedDaysIT extends AbstractIntegrationTest {
      */
     private UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId,
                                 OffsetDateTime startsAt) {
+        return insertBookingWithStatus(clientId, masterId, masterServiceId, salonId, startsAt, "CONFIRMED");
+    }
+
+    /**
+     * Status-parameterised sibling of {@link #insertBooking}, added for the 2026-08-13 rail-visibility
+     * decision. Inserts raw SQL rather than driving the transition endpoints on purpose: this suite
+     * proves what the native queries return for a given row, so the row's {@code status} must be a
+     * direct input, not the by-product of a transition whose own guards (elapsed-time, actor role)
+     * would otherwise dictate which statuses are even reachable in a fixture.
+     */
+    private UUID insertBookingWithStatus(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId,
+                                          OffsetDateTime startsAt, String status) {
         UUID bookingId = UUID.randomUUID();
         if (salonId != null) {
             jdbcTemplate.update(
                     "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
                             + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
                             + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
-                            + "VALUES (?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, 500.00, 60, 0, 'APP', NOW(), NOW())",
-                    bookingId, clientId, masterId, masterServiceId, salonId,
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 500.00, 60, 0, 'APP', NOW(), NOW())",
+                    bookingId, clientId, masterId, masterServiceId, salonId, status,
                     startsAt, startsAt.plusMinutes(60));
         } else {
             jdbcTemplate.update(
                     "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
                             + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
                             + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
-                            + "VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, 500.00, 60, 0, 'APP', NOW(), NOW())",
-                    bookingId, clientId, masterId, masterServiceId,
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, 500.00, 60, 0, 'APP', NOW(), NOW())",
+                    bookingId, clientId, masterId, masterServiceId, status,
                     startsAt, startsAt.plusMinutes(60));
         }
         return bookingId;
