@@ -176,6 +176,47 @@ public class AppointmentController {
     }
 
     /**
+     * Provider-initiated PER-SERVICE completion (additive counterpart of {@code /complete}) —
+     * completes exactly ONE service line of a multi-service visit, leaving its siblings CONFIRMED:
+     * {@code PATCH /api/v1/appointments/{appointmentId}/services/{bookingId}/complete}. Fixes the
+     * reported bug where tapping «Завершити» on one card of a multi-service visit completed every
+     * service in the visit, because the only complete route was the whole-visit one above.
+     *
+     * <p>Same provider authority as the whole-visit completion (role-only gate here +
+     * {@code enforceCanManageAppointment} ownership guard in the service, §D). No request body — mirrors
+     * {@code PATCH /bookings/{id}/complete} and the whole-visit route above, neither of which takes a
+     * note (unlike decline/not-complete, {@code providerComment} is never collected for a completion).
+     * The header collapses to {@code COMPLETED} only once the completed child was the last CONFIRMED
+     * service, and the visit's single review-requested notification (never one per item) fires exactly
+     * then. A {@code bookingId} not belonging to the appointment is a 404; a non-CONFIRMED (already
+     * terminal) child is a 409.
+     */
+    @Operation(summary = "Complete one service line of a visit",
+            description = "Provider-initiated completion of ONE service line of a multi-service visit. "
+                    + "Siblings stay CONFIRMED. The header collapses to COMPLETED, and the visit's single "
+                    + "review-requested notification fires, only once the last CONFIRMED sibling completes.")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204", description = "Completed"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "403", description = "Missing, foreign, or non-authorized visit (uniform — no existence oracle)"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "bookingId is not a child of appointmentId"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "Service already terminal, or changed concurrently (retryable)")
+    })
+    @PatchMapping("/{appointmentId}/services/{bookingId}/complete")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
+    public ResponseEntity<Void> completeAppointmentItem(
+            @PathVariable UUID appointmentId,
+            @PathVariable UUID bookingId,
+            Authentication auth
+    ) {
+        appointmentTransitionService.completeAppointmentItem(
+                AuthenticationUtils.userId(auth), appointmentId, bookingId);
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
      * Provider-initiated visit no-show (BE-4) — moves the whole visit to {@code NOT_COMPLETED} in
      * lockstep. Mirrors {@code PATCH /bookings/{id}/not-complete}: role-only provider gate here + the
      * {@code enforceCanCancelBooking} ownership guard in the service (§D). The optional
