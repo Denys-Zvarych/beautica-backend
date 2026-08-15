@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code afterCommit} eviction hook is covered by the booking-service cache tests. What is NOT covered
  * anywhere is that THIS cache actually (a) serves a stale verdict when the underlying bookings change
  * WITHOUT an eviction, and (b) recomputes the fresh verdict once
- * {@link SlotCalculationService#evictBookableFutureSlotsByMaster} fires — i.e. that the whole cache +
+ * {@link SlotCalculationService#evictMasterAvailabilityCaches} fires — i.e. that the whole cache +
  * evictor + executor + config wiring closes the loop. That is what this test pins, deterministically.
  *
  * <p>"Now" is frozen so the seeded future day is unambiguously inside the booking horizon and the
@@ -86,7 +86,7 @@ class MasterBookableDaysCacheIT extends AbstractIntegrationTest {
                 .isTrue();
 
         // 4) Evict by master prefix — the same call every booking/schedule write routes through.
-        slotCalculationService.evictBookableFutureSlotsByMaster(m.masterId());
+        slotCalculationService.evictMasterAvailabilityCaches(m.masterId());
 
         // 5) Third read — the cache miss recomputes against the now-booked day → false. The loop closes.
         assertThat(bookableDay(m.masterId(), svc))

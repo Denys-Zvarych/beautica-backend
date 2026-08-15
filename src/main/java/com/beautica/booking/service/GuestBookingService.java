@@ -40,10 +40,8 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -383,11 +381,10 @@ public class GuestBookingService {
         UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
         Runnable task = () -> {
             sendConfirmationSms(guestPhone, smsText);
-            slotCalculationService.evictAvailableSlots(
-                    master.getId(), saved.getStartsAt().toLocalDate(), msa.getId());
-            // A new guest booking changed occupancy → evict the master's free-slot bookability
-            // verdict (master-prefix; window keys can't be evicted per-date).
-            slotCalculationService.evictBookableFutureSlotsByMaster(master.getId());
+            // A new guest booking changed occupancy → evict the master's availability caches by
+            // master prefix. Not per (date, service): the booked time bounds the slots offered for
+            // EVERY service this master performs that day, not only the booked one.
+            slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             // A flipped verdict can add/remove a service from the salon catalogue (perf/security #2).
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
@@ -407,28 +404,19 @@ public class GuestBookingService {
 
     /**
      * After-commit side-effects for a guest VISIT create (BE-7): ONE confirmation SMS (built from the
-     * first item, reusing the single-service template) plus availability-cache eviction fanned out over
-     * every item — reusing the exact single-service eviction hooks so a parallel reader cannot repopulate
-     * stale data mid-write. Distinct (Kyiv-civil date, masterServiceId) keys are collected across all
-     * items (both start and end day, in case a service spans midnight); the per-master free-slot verdict
-     * and the salon catalogue are each evicted once.
+     * first item, reusing the single-service template) plus availability-cache eviction — reusing the
+     * exact single-service eviction hook so a parallel reader cannot repopulate stale data mid-write.
+     * The visit occupies a contiguous block of the master's time, so the by-master sweep in
+     * {@link SlotCalculationService#evictMasterAvailabilityCaches} subsumes the per-{@code (date,
+     * service)} key set this method used to enumerate; the salon catalogue is evicted once.
      */
     private void registerVisitAfterCommit(Master master, List<VisitPlanner.PlannedItem> items,
                                           Booking firstSaved, String guestPhone, String cancelUrl) {
         String smsText = buildConfirmationSms(master, visitSmsServiceName(items), firstSaved, cancelUrl);
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
-        Set<SlotKey> slotKeys = new LinkedHashSet<>();
-        for (VisitPlanner.PlannedItem item : items) {
-            UUID serviceId = item.masterService().getId();
-            slotKeys.add(new SlotKey(item.startsAt().toLocalDate(), serviceId));
-            slotKeys.add(new SlotKey(item.endsAt().toLocalDate(), serviceId));
-        }
         Runnable task = () -> {
             sendConfirmationSms(guestPhone, smsText);
-            for (SlotKey key : slotKeys) {
-                slotCalculationService.evictAvailableSlots(master.getId(), key.date(), key.masterServiceId());
-            }
-            slotCalculationService.evictBookableFutureSlotsByMaster(master.getId());
+            slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
@@ -544,7 +532,4 @@ public class GuestBookingService {
         String last = u.getLastName() == null ? "" : u.getLastName().trim();
         return (first + " " + last).trim();
     }
-
-    /** Distinct availability-cache eviction key: one Kyiv-civil date × one master-service. */
-    private record SlotKey(LocalDate date, UUID masterServiceId) {}
 }

@@ -18,7 +18,6 @@ import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
-import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -40,8 +39,24 @@ import java.util.UUID;
 public class SlotCalculationService {
 
     private static final Duration SLOT_STEP = Duration.ofMinutes(30);
+    private static final String SLOTS_CACHE = "available-slots";
     private static final String BOOKABLE_CACHE = "master-service-bookable";
     private static final String BOOKABLE_DAYS_CACHE = "master-bookable-days";
+
+    /**
+     * The three per-master availability caches a BOOKING write invalidates, all evicted together by
+     * master prefix — see {@link #evictMasterAvailabilityCaches}.
+     *
+     * <p>Deliberately the same set, and the same technique, that a SCHEDULE write already sweeps via
+     * {@code MasterScheduleService#SCHEDULE_WRITE_CACHES}; that array additionally carries
+     * {@code master-working-days} / {@code master-usable-schedule}, which are pure functions of the
+     * schedule shape and so cannot be moved by a booking.
+     */
+    private static final String[] BOOKING_WRITE_CACHES = {
+            SLOTS_CACHE,
+            BOOKABLE_CACHE,
+            BOOKABLE_DAYS_CACHE,
+    };
 
     /**
      * durationOverride max (480 min) + bufferMinutesAfter max (120 min) — see the DTO validation matrix.
@@ -100,14 +115,14 @@ public class SlotCalculationService {
      * one-service request, and called directly by {@code GuestBookingService#availableSlots} and
      * {@code BookingService}'s on-schedule create check. Left byte-for-byte UNCHANGED: the same cache
      * ({@code available-slots}, key {@code {masterId, date, masterServiceId}}, {@code sync=true}) and the
-     * same eviction (per-key {@link #evictAvailableSlots} + the master-prefix sweeps) it always had.
+     * same eviction (the by-master {@link #evictMasterAvailabilityCaches} sweep) it always had.
      *
      * <p>Delegates to the N-service core {@link #computeAvailableSlots} with a 1-element list; the summed
      * duration of a 1-element list is exactly that service's effective duration, so the output is identical
      * to the pre-BE-2 implementation.
      */
     @Transactional(readOnly = true)
-    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
+    @Cacheable(value = SLOTS_CACHE, key = "{#masterId, #date, #masterServiceId}", sync = true)
     public List<AvailableSlotResponse> getAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {
         return computeAvailableSlots(masterId, date, List.of(masterServiceId), null);
     }
@@ -159,7 +174,7 @@ public class SlotCalculationService {
      * {@code masterServiceId} alone.
      */
     @Transactional(readOnly = true)
-    @Cacheable(value = "available-slots", key = "{#masterId, #date, #masterServiceId}", sync = true)
+    @Cacheable(value = SLOTS_CACHE, key = "{#masterId, #date, #masterServiceId}", sync = true)
     public List<AvailableSlotResponse> getAvailableSlots(
             UUID masterId, LocalDate date, UUID masterServiceId, MasterServiceAssignment preloaded) {
         return computeAvailableSlots(masterId, date, List.of(masterServiceId),
@@ -414,7 +429,7 @@ public class SlotCalculationService {
      * durations legitimately yield different day sets. 60 sec TTL, {@code sync = true} (hot client-calendar
      * key). Evicted by master prefix on every schedule write
      * ({@code MasterScheduleService#evictSlotsAfterCommit}) AND every booking write
-     * ({@link #evictBookableFutureSlotsByMaster}) — a booking anywhere in the window can flip a day.
+     * ({@link #evictMasterAvailabilityCaches}) — a booking anywhere in the window can flip a day.
      */
     @Transactional(readOnly = true)
     @Cacheable(value = BOOKABLE_DAYS_CACHE,
@@ -555,7 +570,7 @@ public class SlotCalculationService {
      * {@code master-usable-schedule}; evicted by master prefix from every schedule write
      * ({@code MasterScheduleService#evictSlotsAfterCommit}) and every booking write
      * ({@code BookingService}/{@code GuestBookingService}/{@code BookingCancellationService}) via
-     * {@link #evictBookableFutureSlotsByMaster}.
+     * {@link #evictMasterAvailabilityCaches}.
      */
     @Transactional(readOnly = true)
     @Cacheable(value = BOOKABLE_CACHE, key = "{#masterId, #masterServiceId, #from, #to}", sync = true)
@@ -914,35 +929,54 @@ public class SlotCalculationService {
 
     // ── cache eviction ──────────────────────────────────────────────────────────────────────
 
-    // NOT_SUPPORTED: eviction must not run inside the caller's transaction — it fires after the
-    // surrounding transaction suspends so the cache is only invalidated independently of commit/rollback.
-    // BookingService must call this from a TransactionSynchronization.afterCommit() callback.
-    @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @CacheEvict(value = "available-slots", key = "{#masterId, #date, #masterServiceId}")
-    public void evictAvailableSlots(UUID masterId, LocalDate date, UUID masterServiceId) {}
-
     /**
-     * Evicts one master's booking-availability caches by master prefix, after commit — both the
-     * {@code master-service-bookable} verdict ({@link #hasBookableFutureSlot}) and the
-     * {@code master-bookable-days} calendar projection ({@link #getBookableWorkingDays}). Both are keyed by
-     * a SpEL inline-list whose FIRST element is the masterId ({@code {#masterId, #masterServiceId, #from,
-     * #to}} and {@code {#masterId, #from, #to, #masterServiceId}} — a {@link List} at runtime), so the
-     * window portion cannot be evicted per-date: a booking write anywhere in the master's horizon can flip
-     * any window's verdict and any day's availability. We therefore evict every key whose first element is
-     * this master (bounded to one master, not blanket). Mirrors
-     * {@code MasterScheduleService#evictByMasterPrefix}.
+     * Evicts one master's booking-availability caches by master prefix, after commit — the per-date slot
+     * lists ({@code available-slots}, {@link #getAvailableSlots}), the {@code master-service-bookable}
+     * verdict ({@link #hasBookableFutureSlot}) and the {@code master-bookable-days} calendar projection
+     * ({@link #getBookableWorkingDays}). All three are keyed by a SpEL inline-list whose FIRST element is
+     * the masterId ({@code {#masterId, #date, #masterServiceId}}, {@code {#masterId, #masterServiceId,
+     * #from, #to}}, {@code {#masterId, #from, #to, #masterServiceId}} — a {@link List} at runtime), so
+     * every key for this master is dropped, bounded to one master and never a blanket {@code clear()}
+     * (Anti-Bug §F-6). Mirrors {@code MasterScheduleService#evictSlotsAfterCommit}.
      *
-     * <p>Called from the booking-write {@code afterCommit} hooks ({@code BookingService},
-     * {@code GuestBookingService}, {@code BookingCancellationService}), from {@code MasterService} on
-     * master (de)activation, and from {@code ServiceCatalogService} on service-definition mutations.
-     * Schedule writes evict the same two caches from {@code MasterScheduleService#evictSlotsAfterCommit}.
+     * <p><b>Why {@code available-slots} is swept by MASTER and not by {@code (master, date, service)}.</b>
+     * A master performs one service at a time, so a booking of service A consumes wall-clock time that
+     * bounds the slots offered for EVERY other service B the same master performs — the A-shaped booking
+     * shortens or deletes B's candidate slots on that date. Evicting only the booked service's key left
+     * every OTHER service's cached list advertising a time that was already taken, for the full 60-second
+     * TTL. Creation was still refused (the {@code existsOverlap} check plus the {@code bookings} GIST
+     * exclusion on {@code (master_id, tstzrange(starts_at, ends_at))} — {@code V18__create_bookings.sql} —
+     * return 409), so the defect was display-only and self-healing; it nonetheless offered a slot that
+     * could not be booked, which is what this sweep removes.
      *
-     * <p>The keyset scan itself now runs on the {@code cacheEvictionExecutor}, off the committing request
-     * thread (Perf MEDIUM-3) — see {@link MasterCachePrefixEvictor}. Callers are unchanged: they still
-     * invoke this from {@code afterCommit}, so eviction can only ever happen AFTER the write is visible.
+     * <p><b>Why the whole master and not just the written date.</b> Caffeine behind Spring's cache
+     * abstraction supports no prefix/wildcard eviction, so the only mechanism available is the keyset scan
+     * in {@link MasterCachePrefixEvictor} — and its predicate matches on a key PREFIX. Matching two
+     * elements ({@code masterId} + {@code date}) would preserve the master's other dates, but it would also
+     * make correctness depend on the caller deriving the same Kyiv-civil date the READ path keys on; the
+     * booking-write call sites derived it with a bare {@code startsAt.toLocalDate()} (the date in whatever
+     * offset the row came back in, not Kyiv), so a near-midnight booking evicted a key that never existed.
+     * Dropping the date from the eviction predicate removes that failure mode by construction. The cost is
+     * the master's other cached dates, which is bounded: {@code available-slots} holds 500 entries across
+     * ALL masters × dates × services, so one master's share is small, the booking write rate per master is
+     * far below one per 60-second TTL, and the same write already sweeps the larger
+     * {@code master-bookable-days} (2 000 entries) by master prefix for exactly this reason.
+     *
+     * <p>Called from every booking-write {@code afterCommit} hook — {@code BookingService} (create,
+     * decline, complete, not-complete, cancel, reschedule; {@code declineBookingForBatch} deliberately
+     * does NOT, because its caller {@code ScheduleOverrideConflictService} issues ONE combined sweep for
+     * the whole batch), {@code AppointmentService} and {@code AppointmentTransitionService}
+     * (multi-service visits), {@code GuestBookingService} and {@code GuestVisitCancellationService} (LINK),
+     * {@code BookingCancellationService} — from {@code MasterService} on master (de)activation, and from
+     * {@code ServiceCatalogService} on service-definition mutations.
+     *
+     * <p>The keyset scan runs on the {@code cacheEvictionExecutor}, off the committing request thread
+     * (Perf MEDIUM-3) — see {@link MasterCachePrefixEvictor}. Callers still invoke this from
+     * {@code afterCommit}, so eviction can only ever happen AFTER the write is visible; the async hop can
+     * delay it past commit, never move it before (Anti-Bug §F-2).
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    public void evictBookableFutureSlotsByMaster(UUID masterId) {
-        cacheEvictor.evictByMasterPrefix(masterId, BOOKABLE_CACHE, BOOKABLE_DAYS_CACHE);
+    public void evictMasterAvailabilityCaches(UUID masterId) {
+        cacheEvictor.evictByMasterPrefix(masterId, BOOKING_WRITE_CACHES);
     }
 }

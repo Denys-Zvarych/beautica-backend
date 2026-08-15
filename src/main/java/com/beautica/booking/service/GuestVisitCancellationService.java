@@ -24,14 +24,11 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
-import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -186,21 +183,11 @@ public class GuestVisitCancellationService {
         String phone = first.getGuestPhone();
         String smsText = buildCancellationSms(first);
 
-        Set<SlotKey> slotKeys = new LinkedHashSet<>();
-        for (Booking item : items) {
-            UUID serviceId = item.getMasterService().getId();
-            slotKeys.add(new SlotKey(
-                    item.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toLocalDate(), serviceId));
-            slotKeys.add(new SlotKey(
-                    item.getEndsAt().atZoneSameInstant(TimeZones.KYIV).toLocalDate(), serviceId));
-        }
-
         Runnable task = () -> {
             sendCancellationSms(phone, smsText);
-            for (SlotKey key : slotKeys) {
-                slotCalculationService.evictAvailableSlots(masterId, key.date(), key.masterServiceId());
-            }
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            // Cancelling FREES the master's time, which widens the slots offered for every service
+            // this master performs on those dates — swept by master prefix, not per (date, service).
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
@@ -255,7 +242,4 @@ public class GuestVisitCancellationService {
         String last = u.getLastName() == null ? "" : u.getLastName().trim();
         return (first + " " + last).trim();
     }
-
-    /** Distinct availability-cache eviction key: one Kyiv-civil date × one master-service. */
-    private record SlotKey(LocalDate date, UUID masterServiceId) {}
 }

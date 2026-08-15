@@ -694,7 +694,7 @@ public class MasterService {
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+                slotCalculationService.evictMasterAvailabilityCaches(masterId);
                 if (salonId != null) {
                     salonCatalogCacheEvictor.evict(salonId);
                 }

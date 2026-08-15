@@ -339,6 +339,136 @@ class AsyncConfigTest {
         }
     }
 
+    /**
+     * The master-availability cache-eviction pool (Perf MEDIUM-3), previously untested in any shape.
+     *
+     * <p>The bean is annotated {@code @Profile("!test")}, so no integration test ever instantiates it
+     * — {@code TestAsyncConfig} substitutes a synchronous stand-in. That makes this class the ONLY
+     * place its production shape can be pinned, and it can do so because it calls the {@code @Bean}
+     * factory method directly: {@code @Profile} is a container-time concern and has no effect on a
+     * plain {@code new AsyncConfig()}.
+     *
+     * <p><b>Why the sizing is behaviour, not cosmetics</b> (backend-perf LOW, 2026-08-13). The bean
+     * shipped as {@code core = 1 / max = 2 / queue = 1000}. That is not "up to two evictions at a
+     * time": a {@link ThreadPoolExecutor} with a bounded queue grows past its core size only once
+     * the queue is FULL, so this pool was effectively single-threaded in every state short of a
+     * 1000-task backlog — a platform-wide serialization point for evictions that can each park
+     * 50–200 ms on a {@code sync = true} reader's Neon round-trip. One master's slow eviction
+     * therefore delayed every other master's. Raising the core to 2 is the fix; asserting
+     * {@code core == max} is what stops it silently regressing to the same trap the
+     * {@code smsReminderExecutor} above already fell into once.
+     */
+    @Nested
+    @DisplayName("cacheEvictionExecutor bean")
+    class CacheEvictionExecutor {
+
+        private final ThreadPoolTaskExecutor bean = (ThreadPoolTaskExecutor) asyncConfig.cacheEvictionExecutor();
+        private final ThreadPoolExecutor pool = bean.getThreadPoolExecutor();
+
+        /**
+         * The load-bearing sizing assertion, and the one that would have caught the shipped bug by
+         * inspection: with a bounded queue, {@code core < max} means the advertised max is
+         * unreachable in practice, so effective concurrency is the CORE, not the max.
+         */
+        @Test
+        @DisplayName("cacheEvictionExecutor — core equals max, so the advertised concurrency is the real one")
+        void should_makeCoreEqualMax_when_cacheEvictionExecutorBuilt() {
+            assertThat(pool.getCorePoolSize())
+                    .as("core=%s below max=%s means this bounded-queue pool never grows until its "
+                                    + "1000-slot queue is full — effective eviction concurrency would be the "
+                                    + "core size, making one slow master's sweep block every other master's",
+                            pool.getCorePoolSize(), pool.getMaximumPoolSize())
+                    .isEqualTo(pool.getMaximumPoolSize());
+        }
+
+        @Test
+        @DisplayName("cacheEvictionExecutor — pool size is 2")
+        void should_configurePoolSizeOfTwo_when_cacheEvictionExecutorBuilt() {
+            assertThat(pool.getMaximumPoolSize())
+                    .as("cacheEvictionExecutor max pool size")
+                    .isEqualTo(2);
+        }
+
+        /**
+         * The behavioural counterpart to {@code core == max}, and the assertion a configuration edit
+         * that merely looks right cannot satisfy. Two tasks are submitted back-to-back into an EMPTY
+         * queue and each parks on a {@link CyclicBarrier} of 2 — the barrier can only trip if both
+         * are running at the same instant. Under the shipped {@code core = 1} shape the second task
+         * sits in the (far from full) queue behind the first blocked worker and the barrier times
+         * out: that is head-of-line blocking, reproduced directly.
+         */
+        @Test
+        @DisplayName("cacheEvictionExecutor — a second eviction starts while the first is still "
+                + "parked, so one master's slow sweep cannot head-of-line-block another's")
+        void should_runTwoEvictionsConcurrently_when_theQueueIsEmpty() throws Exception {
+            int width = pool.getMaximumPoolSize();
+            CyclicBarrier allRunning = new CyclicBarrier(width);
+            CountDownLatch tripped = new CountDownLatch(width);
+
+            try {
+                for (int i = 0; i < width; i++) {
+                    bean.execute(() -> {
+                        try {
+                            allRunning.await(10, TimeUnit.SECONDS);
+                            tripped.countDown();
+                        } catch (Exception e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+                }
+
+                assertThat(tripped.await(15, TimeUnit.SECONDS))
+                        .as("only %s of %s evictions were running at once — a bounded-queue pool with "
+                                        + "core < max stays at core until the queue fills, so the second "
+                                        + "master's sweep waits behind the first master's Neon stall",
+                                width - tripped.getCount(), width)
+                        .isTrue();
+            } finally {
+                // ThreadPoolTaskExecutor workers are NON-daemon: leaking them on a failed assertion
+                // hangs the Gradle test JVM at exit instead of just failing the test.
+                bean.shutdown();
+            }
+        }
+
+        @Test
+        @DisplayName("cacheEvictionExecutor — queue capacity is 1000, so caller-runs stays pathological")
+        void should_configureQueueCapacityOf1000_when_cacheEvictionExecutorBuilt() {
+            assertThat(pool.getQueue().remainingCapacity())
+                    .as("cacheEvictionExecutor queue capacity — the fallback policy below degrades "
+                            + "eviction onto the committing thread, so the queue must make that rare")
+                    .isEqualTo(1000);
+        }
+
+        /**
+         * CallerRunsPolicy is a documented, deliberate deviation from the Anti-Bug §H-2 ban on
+         * caller-runs (which targets pools whose tasks do NETWORK I/O). Here the task is a pure
+         * in-memory Caffeine keyset scan, and a DISCARDING policy would serve stale availability for
+         * the cache's full 60-second TTL — offering a client a day that is actually full, the exact
+         * bug the eviction exists to prevent.
+         */
+        @Test
+        @DisplayName("cacheEvictionExecutor — saturation runs the sweep on the caller, it never "
+                + "discards an eviction (a dropped sweep serves stale availability for the full TTL)")
+        void should_useCallerRunsPolicy_when_cacheEvictionQueueSaturated() {
+            assertThat(pool.getRejectedExecutionHandler())
+                    .as("a discarding policy would leave a full day advertised as bookable until the "
+                            + "60s cache TTL expires")
+                    .isInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.AbortPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.DiscardPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.DiscardOldestPolicy.class);
+        }
+
+        @Test
+        @DisplayName("cacheEvictionExecutor — worker threads use the 'cache-evict-' name prefix")
+        void should_nameWorkerThreadsWithCacheEvictPrefix_when_taskSubmitted() throws InterruptedException {
+            assertThat(captureWorkerThreadName(bean))
+                    .as("cacheEvictionExecutor worker thread name — the prefix is what makes an "
+                            + "eviction stall identifiable in a thread dump")
+                    .startsWith("cache-evict-");
+        }
+    }
+
     @Nested
     @DisplayName("CallerBlocksPolicy")
     class CallerBlocksPolicyBehaviour {

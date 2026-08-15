@@ -434,6 +434,23 @@ public class AsyncConfig implements AsyncConfigurer {
      * actually full — the exact bug the eviction exists to prevent). Caller-runs degrades, at worst, to the
      * pre-fix behaviour. The queue is sized generously so that fallback stays a pathological case.
      *
+     * <p><b>corePoolSize = 2, not 1</b> (backend-perf LOW, 2026-08-13). {@code maxPoolSize = 2} alone
+     * did NOT deliver two workers: {@link ThreadPoolExecutor} only grows past the core size once the
+     * queue is FULL, so with a 1000-slot queue this pool was single-threaded in every state short of
+     * a 1000-task backlog. That made it a single point of serialization for the exact stall the
+     * paragraph above documents — one eviction blocked on a {@code sync = true} reader's Neon
+     * round-trip held up EVERY other master's eviction platform-wide, for ~50-200 ms. Raising the
+     * core to 2 is safe rather than merely faster: {@code MasterCachePrefixEvictor} is stateless
+     * (its only field is the {@code CacheManager}) and each task is an idempotent "remove every key
+     * with this master's prefix", so concurrent tasks either touch disjoint key sets (different
+     * masters) or perform the identical removal (same master) — there is no ordering guarantee to
+     * lose. Nothing sequences read-side repopulation against this queue today either: a reader can
+     * always {@code computeIfAbsent} between two queued evictions, single-threaded or not. The
+     * rejection path is unchanged-or-better (max was already 2, so caller-runs fires no sooner), and
+     * the cost is one lazily-created thread. Throughput was never the problem — measured load is
+     * ~0.24 sweeps/sec against roughly 10 000/sec of capacity — head-of-line blocking was, and
+     * headroom does not fix that.
+     *
      * <p>No {@link DelegatingSecurityContextTaskExecutor} wrapper: eviction reads no
      * {@code SecurityContext} — it takes a masterId and cache names, nothing principal-derived.
      */
@@ -441,7 +458,7 @@ public class AsyncConfig implements AsyncConfigurer {
     @Profile("!test")
     public TaskExecutor cacheEvictionExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(1);
+        executor.setCorePoolSize(2);
         executor.setMaxPoolSize(2);
         executor.setQueueCapacity(1000);
         executor.setThreadNamePrefix("cache-evict-");

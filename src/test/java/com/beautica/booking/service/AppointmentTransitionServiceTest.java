@@ -452,7 +452,7 @@ class AppointmentTransitionServiceTest {
         verify(bookingRepository, never()).save(any());
         verify(appointmentRepository, never()).collapseHeaderIfNoConfirmedSiblingsRemain(any(), any(), any(), any());
         verify(outboxService, never()).enqueueStatusChanged(any());
-        verify(slotCalculationService, never()).evictAvailableSlots(any(), any(), any());
+        verify(slotCalculationService, never()).evictMasterAvailabilityCaches(any());
         verify(cachePrefixEvictor, never()).evictByKeyPrefixNow(any(), any());
     }
 
@@ -619,7 +619,7 @@ class AppointmentTransitionServiceTest {
                 .as("the sole target must never be mutated once filtered out")
                 .isEqualTo(com.beautica.booking.enums.BookingStatus.CONFIRMED);
         verify(bookingRepository).saveAll(java.util.List.of());
-        verify(slotCalculationService, never()).evictAvailableSlots(any(), any(), any());
+        verify(slotCalculationService, never()).evictMasterAvailabilityCaches(any());
         verify(cachePrefixEvictor, never()).evictByKeyPrefixNow(any(), any());
     }
 
@@ -682,8 +682,7 @@ class AppointmentTransitionServiceTest {
 
         // No active Spring transaction in this unit test — registerEviction's own "no synchronization
         // active" branch runs the eviction task immediately rather than skipping it.
-        verify(slotCalculationService).evictAvailableSlots(any(), any(), any());
-        verify(slotCalculationService).evictBookableFutureSlotsByMaster(any());
+        verify(slotCalculationService).evictMasterAvailabilityCaches(any());
         verify(cachePrefixEvictor).evictByKeyPrefixNow(any(), eq("master-calendar"));
     }
 

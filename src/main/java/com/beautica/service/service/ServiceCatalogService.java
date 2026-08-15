@@ -1237,14 +1237,14 @@ public class ServiceCatalogService {
      * Evicts the {@code master-service-bookable} verdict for each affected master after commit
      * (perf #6). Deactivating a definition removes it from every performing master's bookable set, so
      * the shared free-slot verdict that gates the booking master-list must be invalidated (by master
-     * prefix — {@link com.beautica.booking.service.SlotCalculationService#evictBookableFutureSlotsByMaster}),
+     * prefix — {@link com.beautica.booking.service.SlotCalculationService#evictMasterAvailabilityCaches}),
      * alongside {@code masterServices} and {@code available-slots}.
      */
     private void evictBookableFutureSlotsCache(List<UUID> masterIds) {
         if (masterIds.isEmpty()) {
             return;
         }
-        Runnable task = () -> masterIds.forEach(slotCalculationService::evictBookableFutureSlotsByMaster);
+        Runnable task = () -> masterIds.forEach(slotCalculationService::evictMasterAvailabilityCaches);
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(
                     new TransactionSynchronization() {

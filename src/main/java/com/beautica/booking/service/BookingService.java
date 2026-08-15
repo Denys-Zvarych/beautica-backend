@@ -597,18 +597,38 @@ public class BookingService {
      * distinct. Backs the day-rail dot on the booking-management design
      * ({@code SalonManagementDesign/lib/widgets/bookings_toolbar.dart}'s {@code _bookingDays}).
      *
-     * <p><b>Filter-independent by design.</b> The design computes {@code _bookingDays} from the
-     * screen's full, unfiltered booking list, not the filtered/sorted view — so the dots keep
-     * showing where bookings are even while a status/date/service filter narrows the list below.
-     * This method therefore takes no {@code status} / {@code serviceId} parameter and applies no
-     * status predicate — do not add one "for symmetry" with {@link #getMyBookings}.
+     * <p><b>Independent of the caller's ad-hoc filters, but NOT of the screen's default.</b> The
+     * design computes {@code _bookingDays} from the screen's own booking list rather than the
+     * filtered/sorted view, so the dots keep showing where bookings are even while a user-applied
+     * status/date/service filter narrows the list below. This method therefore takes no {@code
+     * status} / {@code serviceId} parameter — do not add one "for symmetry" with {@link
+     * #getMyBookings}.
+     *
+     * <p>That independence stops at the screen's <em>default</em> visibility rule, because a dot
+     * must never point at a day the destination list renders empty. On the master's «Мої записи»
+     * screen {@code CANCELLED} and {@code DECLINED} are hidden by default (locked product
+     * decision, user, 2026-08-13 — both render the identical «Скасовано» badge since the
+     * who-cancelled distinction was collapsed on 2026-07-15), so the master-scoped query excludes
+     * them and a day whose only bookings are cancelled/declined is not dotted. {@code
+     * NOT_COMPLETED} stays dotted — it stays visible in that list as the master's own no-show
+     * record and feeds the two-sided client rating. The SALON_OWNER and CLIENT branches below are
+     * unchanged and still carry no status predicate; see {@code BookingRepository}'s block comment
+     * above the three queries for the full rationale.
      *
      * <p><b>{@code from}/{@code to} are required</b> (unlike {@code getMyBookings}'s optional
      * range) and capped at 366 days via {@link ScheduleDateMath#assertSpanWithinMax} — an
      * unbounded default would scan the caller's entire booking history. Converted to the same
      * half-open {@code [from, toExclusive)} Kyiv-zoned instant range {@code getMyBookings} uses,
-     * so a dot returned here and a non-empty {@code GET /bookings/me?from=D&to=D} for the same
-     * date D always agree.
+     * so a dot returned here and {@code GET /bookings/me?from=D&to=D} for the same date D can
+     * never diverge on timezone or boundary handling. For the master scope they agree on the row
+     * set too once the caller passes the statuses its screen actually shows
+     * ({@code &status=CONFIRMED,COMPLETED,NOT_COMPLETED}) — literally the same allow-list the query
+     * itself names, so client and query agree by textual identity rather than by set complement,
+     * and a hypothetical sixth status is hidden by BOTH rather than dotted by one and dropped by
+     * the other. {@code BookingRepository}'s block comment explains why the allow-list form is also
+     * what makes the query match its partial index. {@code getMyBookings}'s own "no
+     * {@code status} param ⇒ no filter" contract is deliberately left untouched for every other
+     * caller.
      *
      * <p>Role scope mirrors {@link #getMyBookings}: {@code SALON_MASTER}/{@code
      * INDEPENDENT_MASTER} see their own bookings (scoped by {@code masterId}, resolved from the
@@ -618,8 +638,12 @@ public class BookingService {
      * (they manage staff/services, not bookings).
      *
      * <p>Aggregation happens in Postgres ({@code SELECT DISTINCT} on a timezone-converted date
-     * expression, at most ~366 rows back) — never by loading the caller's booking history into
-     * heap and reducing with {@code .map(...).distinct()} in Java.
+     * expression) — never by loading the caller's booking history into heap and reducing with
+     * {@code .map(...).distinct()} in Java. The 366-day span cap bounds the rows RETURNED (at most
+     * 367, both bounds inclusive); it does <em>not</em> bound the rows SCANNED, which is the
+     * caller's entire booking volume inside that window — thousands of rows for a busy master, and
+     * the reason the master-scoped query's status predicate is written to match a partial index.
+     * See {@code BookingRepository}'s block comment for that measurement.
      */
     @Transactional(readOnly = true)
     public List<LocalDate> getMyBookedDays(UUID actorUserId, Authentication auth, LocalDate from, LocalDate to) {
@@ -1012,7 +1036,7 @@ public class BookingService {
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking saved = declineBookingCore(actorUserId, bookingId, req);
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved, resolveNow());
     }
@@ -1155,6 +1179,11 @@ public class BookingService {
         if (saved.getClient() != null) {
             outboxService.enqueueReviewRequested(saved.getId());
         }
+        // COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so it FREES the
+        // booking's window. assertElapsedForComplete only requires `now >= startsAt`, never
+        // `now >= endsAt`, so a provider may close an in-progress booking early — the unused tail
+        // becomes bookable at once and must not stay hidden for the availability TTL.
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit(actorUserId);
         // Announce the completion as a domain fact so other feature packages can react without
@@ -1215,6 +1244,11 @@ public class BookingService {
         booking.setProviderComment(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        // NOT_COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so it FREES the
+        // booking's window. No-show carries NO temporal guard, so the booking may still be in the
+        // future — its slot is then genuinely re-bookable and must return to the picker at once
+        // rather than staying hidden for the availability TTL.
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         evictRevenueDashboardAfterCommit(actorUserId);
         return BookingResponse.from(saved, resolveNow());
@@ -1388,7 +1422,7 @@ public class BookingService {
                     appointmentId, headerWasLocked, saved.getClientCancellationNote());
         }
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved, resolveNow());
     }
@@ -1621,8 +1655,6 @@ public class BookingService {
         OffsetDateTime newEndsAt = newStartsAt.plusMinutes(
                 (long) booking.getDurationMinutesAtBooking() + booking.getBufferMinutesAtBooking());
 
-        LocalDate oldDate = booking.getStartsAt().toLocalDate();
-
         // Phase 30.2 (cycle-2 audit finding 1 — lock-order fix): lock the visit HEADER, if this
         // booking is one item of a multi-service visit, BEFORE the client/master advisory locks
         // below — restoring the canonical appointments-before-bookings order that cancelBooking
@@ -1695,12 +1727,11 @@ public class BookingService {
         // address the notification to the OTHER party (client-initiated -> notify the provider,
         // unchanged; provider-initiated -> notify the client).
         outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
-        // Evict the freed old-day slots and the now-occupied new-day slots, plus the
-        // provider calendar — after commit, so a parallel reader cannot repopulate stale data.
-        registerSlotEviction(masterId, salonIdOf(saved), oldDate, saved.getMasterService().getId());
-        if (!oldDate.equals(newStartsAt.toLocalDate())) {
-            registerSlotEviction(masterId, salonIdOf(saved), newStartsAt.toLocalDate(), saved.getMasterService().getId());
-        }
+        // Evict the freed old-day slots and the now-occupied new-day slots, plus the provider
+        // calendar — after commit, so a parallel reader cannot repopulate stale data. One call
+        // covers both days: the sweep is by master, so it drops every cached date for this master
+        // (it no longer needs the old/new date pair the per-key eviction had to enumerate).
+        registerSlotEviction(masterId, salonIdOf(saved));
         evictMasterCalendarAfterCommit(masterId);
         // A rescheduled booking is always CONFIRMED with a FRESH, FUTURE endsAt — validateStartsAt
         // enforces the same lead-time floor reschedule uses for the NEW slot, so
@@ -1938,7 +1969,7 @@ public class BookingService {
         // is simply the client-facing half of the same create event, not a genuine transition.
         outboxService.enqueueNewBooking(saved.getId());
         outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved), saved.getStartsAt().toLocalDate(), saved.getMasterService().getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         return BookingResponse.from(saved, resolveNow());
     }
 
@@ -2082,12 +2113,17 @@ public class BookingService {
         return salon != null ? salon.getId() : null;
     }
 
-    private void registerSlotEviction(UUID masterId, UUID salonId, LocalDate date, UUID masterServiceId) {
+    /**
+     * After-commit availability-cache eviction for a booking write, plus the salon catalogue.
+     *
+     * <p>Deliberately NOT per {@code (date, masterServiceId)}: the written time bounds the slots
+     * offered for EVERY service this master performs that day, so the write sweeps all three per-master
+     * caches — see {@link SlotCalculationService#evictMasterAvailabilityCaches}, which documents why the
+     * sweep is by master prefix and which caches it covers.
+     */
+    private void registerSlotEviction(UUID masterId, UUID salonId) {
         Runnable task = () -> {
-            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
-            // The booking changed occupancy → the master's free-slot bookability verdict may
-            // flip; evict by master prefix (window keys can't be evicted per-date).
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             // A flipped bookability verdict can add/remove a service from the salon catalogue
             // (perf/security #2). Null salon (independent master) owns no catalogue entry.
             if (salonId != null) {

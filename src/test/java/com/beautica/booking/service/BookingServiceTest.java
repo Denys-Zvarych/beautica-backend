@@ -344,11 +344,7 @@ class BookingServiceTest {
         verify(bookingRepository).saveAndFlush(captor.capture());
         assertThat(captor.getValue().getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(result).isNotNull();
-        verify(slotCalculationService).evictAvailableSlots(
-                eq(masterId),
-                any(LocalDate.class),
-                eq(masterServiceId)
-        );
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
     }
 
     @Test
@@ -378,7 +374,7 @@ class BookingServiceTest {
         assertThat(captor.getValue().getMaster().getMasterType()).isEqualTo(MasterType.SALON_OWNER);
         assertThat(captor.getValue().getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(result).isNotNull();
-        verify(slotCalculationService).evictAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId));
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
     }
 
     @Test
@@ -792,11 +788,7 @@ class BookingServiceTest {
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.DECLINED);
         assertThat(booking.getCancellationReason()).isEqualTo(CancellationReason.PROVIDER_UNAVAILABLE);
         verify(outboxService).enqueueStatusChanged(bookingId);
-        verify(slotCalculationService).evictAvailableSlots(
-                eq(masterId),
-                any(LocalDate.class),
-                eq(masterServiceId)
-        );
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
     }
 
     @Test
@@ -967,6 +959,24 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("availability caches are evicted by master when a booking is completed — COMPLETED leaves "
+            + "the `status = 'CONFIRMED'` occupancy predicate, and assertElapsedForComplete only requires "
+            + "now >= startsAt, so an in-progress booking completed early frees the unused tail of its window")
+    void should_evictMasterAvailabilityCaches_when_bookingCompleted() {
+        // Arrange
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildElapsedBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        // Act
+        bookingService.completeBooking(actorId, bookingId);
+
+        // Assert
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
+    }
+
+    @Test
     @DisplayName("guest (LINK / null-client) completion enqueues STATUS_CHANGED but never REVIEW_REQUESTED")
     void should_notEnqueueReviewRequested_when_completingGuestBooking() {
         UUID actorId = UUID.randomUUID();
@@ -1106,6 +1116,26 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("availability caches are evicted by master when a FUTURE booking is marked not-completed — "
+            + "NOT_COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so the slot is freed "
+            + "and must reappear in the picker at once instead of staying hidden for the availability TTL")
+    void should_evictMasterAvailabilityCaches_when_futureBookingMarkedNotCompleted() {
+        // Arrange — a future booking: no-show has NO temporal guard, so this is the case where the
+        // freed window is genuinely still bookable and the missing eviction was observable.
+        UUID actorId = UUID.randomUUID();
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "No show");
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        when(bookingRepository.save(any())).thenReturn(booking);
+
+        // Act
+        bookingService.notCompleteBooking(actorId, bookingId, req);
+
+        // Assert
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
+    }
+
+    @Test
     @DisplayName("ForbiddenException is thrown when an unauthorized actor attempts to mark a booking not-completed")
     void should_throwForbidden_when_unauthorizedActorMarksNotCompleted() {
         UUID actorId = UUID.randomUUID();
@@ -1222,11 +1252,7 @@ class BookingServiceTest {
 
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
         verify(outboxService).enqueueStatusChanged(bookingId);
-        verify(slotCalculationService).evictAvailableSlots(
-                eq(masterId),
-                any(LocalDate.class),
-                eq(masterServiceId)
-        );
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
     }
 
     @Test

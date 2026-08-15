@@ -460,7 +460,7 @@ class MasterServiceTest {
 
     // ── bookability-cache eviction guard (deactivate/reactivate flips is_active) ──
     // Regression net for the fix: each is_active flip must, after commit, evict
-    //   • master-service-bookable (via slotCalculationService.evictBookableFutureSlotsByMaster(masterId)), and
+    //   • master-service-bookable (via slotCalculationService.evictMasterAvailabilityCaches(masterId)), and
     //   • salon-service-catalog   (via salonCatalogCacheEvictor.evict(salonId), non-null salon only).
     // Without these, a deactivated sole-performer's SALON service lingered in
     // GET /salons/{id}/services + the booking master-list for up to the 60s TTL.
@@ -490,7 +490,7 @@ class MasterServiceTest {
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
-        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor).evict(salonId);
     }
 
@@ -515,7 +515,7 @@ class MasterServiceTest {
 
         runAndReplayAfterCommit(() -> masterService.deactivateOwnerMaster(actorUserId, salonId));
 
-        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor).evict(salonId);
     }
 
@@ -551,7 +551,7 @@ class MasterServiceTest {
         assertThat(inactive.isActive())
                 .as("reactivation branch must flip the row active")
                 .isTrue();
-        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor).evict(salonId);
     }
 
@@ -577,7 +577,7 @@ class MasterServiceTest {
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
-        verify(slotCalculationService).evictBookableFutureSlotsByMaster(masterId);
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor, never()).evict(any());
     }
 

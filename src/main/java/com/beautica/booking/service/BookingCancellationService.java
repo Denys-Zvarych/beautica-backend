@@ -22,7 +22,6 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
-import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
@@ -173,15 +172,13 @@ public class BookingCancellationService {
         String phone = booking.getGuestPhone();
         String smsText = buildCancellationSms(booking);
         UUID masterId = booking.getMaster().getId();
-        UUID masterServiceId = booking.getMasterService().getId();
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
-        LocalDate date = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toLocalDate();
         Runnable task = () -> {
             sendCancellationSms(phone, smsText);
-            // Cancelling frees a slot → the freed slot must reappear in the picker and the master's
-            // free-slot bookability verdict may flip (un-hiding a service). Evict both.
-            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            // Cancelling frees the master's time → the freed slot must reappear in the picker for
+            // EVERY service this master performs that day (not just the cancelled one), and the
+            // free-slot bookability verdict may flip (un-hiding a service). One by-master sweep.
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             // Un-hiding a service also changes the salon catalogue (perf/security #2).
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
