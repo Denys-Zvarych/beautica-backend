@@ -22,23 +22,25 @@ class BookingPartitionTest {
         assertThat(BookingPartition.COVER)
                 .containsExactlyInAnyOrder(
                         BookingPartition.UPCOMING, BookingPartition.PAST, BookingPartition.CANCELLED)
-                .doesNotContain(BookingPartition.AWAITING_CLOSURE)
+                .doesNotContain(BookingPartition.AWAITING_CLOSURE, BookingPartition.HISTORY)
                 .hasSize(3);
     }
 
     @Test
-    @DisplayName("isCoverMember() is TRUE for UPCOMING/PAST/CANCELLED, FALSE only for AWAITING_CLOSURE")
+    @DisplayName("isCoverMember() is TRUE for UPCOMING/PAST/CANCELLED, FALSE for AWAITING_CLOSURE "
+            + "and HISTORY")
     void should_returnCoverMembershipPerConstant_when_isCoverMemberCalled() {
         assertThat(BookingPartition.UPCOMING.isCoverMember()).isTrue();
         assertThat(BookingPartition.PAST.isCoverMember()).isTrue();
         assertThat(BookingPartition.CANCELLED.isCoverMember()).isTrue();
         assertThat(BookingPartition.AWAITING_CLOSURE.isCoverMember()).isFalse();
+        assertThat(BookingPartition.HISTORY.isCoverMember()).isFalse();
     }
 
     @Test
-    @DisplayName("BookingPartition has exactly four constants — AWAITING_CLOSURE is additive, "
-            + "not a replacement of any pre-29.3 member")
-    void should_haveFourConstants_when_valuesInspected() {
-        assertThat(BookingPartition.values()).hasSize(4);
+    @DisplayName("BookingPartition has exactly five constants — AWAITING_CLOSURE and HISTORY are "
+            + "both additive named views, never a replacement of any cover member")
+    void should_haveFiveConstants_when_valuesInspected() {
+        assertThat(BookingPartition.values()).hasSize(5);
     }
 }

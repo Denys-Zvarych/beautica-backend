@@ -46,6 +46,28 @@ import java.util.Set;
  * Including AWAITING_CLOSURE in a cover sum DOUBLE-COUNTS every row in it.
  * </pre>
  *
+ * <p><b>Phase 30.x — {@code HISTORY} is a UNION VIEW spanning two cover members, not a fourth
+ * member either.</b> Same category of thing as {@code AWAITING_CLOSURE}, approached from the
+ * opposite direction — {@code AWAITING_CLOSURE} names a piece carved OUT of one cover member;
+ * {@code HISTORY} names the union of TWO whole cover members:
+ *
+ * <pre>
+ * HISTORY = PAST &#8746; CANCELLED
+ *         = COMPLETED &#8746; NOT_COMPLETED &#8746; (CONFIRMED AND ends_at &lt; now) &#8746; CANCELLED &#8746; DECLINED
+ *         &#8801; everything EXCEPT UPCOMING
+ *
+ *     HISTORY  &#8745;  UPCOMING  =  &#8709;
+ *     HISTORY  &#8746;  UPCOMING  =  all bookings
+ *     count(HISTORY) + count(UPCOMING) == count(unfiltered)
+ *
+ * Including HISTORY in a {UPCOMING, PAST, CANCELLED} cover sum DOUBLE-COUNTS every PAST and
+ * every CANCELLED row (HISTORY already contains all of them).
+ * </pre>
+ *
+ * <p>{@code HISTORY} exists for {@code GET /bookings/me} callers (the mobile master «Архів» page)
+ * that want one correctly-paginated request over "everything not upcoming" instead of stitching
+ * together two separate {@code PAST}/{@code CANCELLED} pages client-side.
+ *
  * <p>Concretely: {@code PAST} = {@code (COMPLETED} &#8746; {@code NOT_COMPLETED)} &#8846; {@code
  * AWAITING_CLOSURE} — the second OR-leg of {@code partition(PAST)} <b>is</b> {@code
  * AWAITING_CLOSURE} (see {@link com.beautica.booking.domain.BookingClosureRule}, the single
@@ -55,15 +77,17 @@ import java.util.Set;
  * <p>{@link #COVER} is the total, disjoint cover — {@code {UPCOMING, PAST, CANCELLED}}. Every
  * cover-sum assertion, existing or future, MUST iterate {@link #COVER}, never {@link #values()}:
  * a cover assertion written as {@code Arrays.stream(BookingPartition.values())} would silently
- * double-count {@code AWAITING_CLOSURE} rows the moment this constant landed, so the enum itself
- * carries the guard rather than relying on reviewers to notice. {@link #isCoverMember()} is the
- * per-value form of the same guard.
+ * double-count {@code AWAITING_CLOSURE} rows the moment this constant landed, and would now ALSO
+ * double-count every {@code PAST}/{@code CANCELLED} row a second time via {@code HISTORY} — so the
+ * enum itself carries the guard rather than relying on reviewers to notice. {@link #isCoverMember()}
+ * is the per-value form of the same guard.
  */
 public enum BookingPartition {
     UPCOMING,
     PAST,
     CANCELLED,
-    AWAITING_CLOSURE;
+    AWAITING_CLOSURE,
+    HISTORY;
 
     /**
      * The total, disjoint cover — {@code {UPCOMING, PAST, CANCELLED}}. See this enum's class
@@ -74,8 +98,10 @@ public enum BookingPartition {
 
     /**
      * {@code true} for {@link #UPCOMING}/{@link #PAST}/{@link #CANCELLED} — the three members of
-     * the total, disjoint cover ({@link #COVER}). {@code false} only for {@link
-     * #AWAITING_CLOSURE}, which is a named subset of {@link #PAST}, not a fourth cover member.
+     * the total, disjoint cover ({@link #COVER}). {@code false} for {@link #AWAITING_CLOSURE}
+     * (a named subset of {@code PAST}) and for {@link #HISTORY} (a named union of {@code PAST} and
+     * {@code CANCELLED}) — neither is a fourth cover member; both would double-count if folded
+     * into a cover sum.
      */
     public boolean isCoverMember() {
         return COVER.contains(this);

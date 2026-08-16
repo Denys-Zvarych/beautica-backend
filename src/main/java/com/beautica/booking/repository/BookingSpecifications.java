@@ -275,6 +275,16 @@ public final class BookingSpecifications {
      * handles {@code status = 'CONFIRMED'} &#8658; {@code status IN ('COMPLETED','NOT_COMPLETED',
      * 'CONFIRMED')} without help — the gap that forced the conjunct is specific to the nested
      * OR/AND shape of {@code PAST}.
+     *
+     * <p><b>Phase 30.x — the {@code HISTORY} arm is {@code Specification.not(UPCOMING)}, not a
+     * re-derived {@code PAST}-or-{@code CANCELLED} expression.</b> {@link
+     * BookingPartition#HISTORY} is the union view {@code PAST} &#8746; {@code CANCELLED} &#8801;
+     * everything except {@code UPCOMING} (see {@link BookingPartition}'s javadoc). Rather than
+     * duplicating the clock/timezone-sensitive {@code endsAtOnOrAfter} comparison a second time,
+     * this arm recurses into this same {@code switch} for the {@code UPCOMING} case and negates
+     * the result with {@link Specification#not}, so the {@code HISTORY} predicate can never drift
+     * from whatever {@code UPCOMING} is defined as. {@code endsAt} is a non-nullable column, so the
+     * negation carries no SQL three-valued-logic ({@code NULL}) hazard.
      */
     public static Specification<Booking> partition(BookingPartition partition, OffsetDateTime now) {
         return switch (partition) {
@@ -288,6 +298,7 @@ public final class BookingSpecifications {
                             BookingClosureRule.awaitingClosure(now).toPredicate(root, query, cb)));
             case CANCELLED -> statusIn(EnumSet.of(BookingStatus.CANCELLED, BookingStatus.DECLINED));
             case AWAITING_CLOSURE -> BookingClosureRule.awaitingClosure(now);
+            case HISTORY -> Specification.not(partition(BookingPartition.UPCOMING, now));
         };
     }
 }
