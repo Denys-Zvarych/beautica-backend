@@ -78,6 +78,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       fixture straddles the {@code now} boundary itself.</li>
  *   <li><b>Invalid enum</b> — {@code ?partition=BOGUS} is a 400 that does not echo the valid
  *       {@code UPCOMING}/{@code PAST}/{@code CANCELLED} constants.</li>
+ *   <li><b>{@code HISTORY} (Phase 30.x)</b> — the union view {@code PAST} &#8746; {@code CANCELLED}
+ *       &#8801; everything except {@code UPCOMING}, backing the mobile master archive page:
+ *       {@code HISTORY} equals the exact set union of the {@code PAST} and {@code CANCELLED} pages,
+ *       is the exact complement of {@code UPCOMING} ({@code count(HISTORY) + count(UPCOMING) ==
+ *       count(unfiltered)}), and correctly includes an elapsed-unclosed {@code CONFIRMED}
+ *       (AWAITING_CLOSURE) row while excluding a not-yet-elapsed one — the boundary a naive
+ *       "everything except {@code CONFIRMED}" implementation would get wrong.</li>
  * </ol>
  *
  * <p><b>Backwards-compatibility proof (out of THIS file, by design).</b> The five pre-28.1 sibling
@@ -168,6 +175,54 @@ class BookingMyBookingsPartitionIT extends AbstractIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // HISTORY — union view (PAST ∪ CANCELLED ≡ everything except UPCOMING), Phase 30.x
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER — partition HISTORY returns exactly PAST ∪ CANCELLED, is the "
+            + "exact complement of UPCOMING, and correctly includes the elapsed-unclosed CONFIRMED "
+            + "(AWAITING_CLOSURE) row while excluding the not-yet-elapsed CONFIRMED row")
+    void should_returnUnionOfPastAndCancelled_when_partitionIsHistory() throws Exception {
+        String masterEmail = "mbpi-history-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbpi-history-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+
+        Fixture fx = seedEightRowFixture(clientId, masterId, serviceId, null);
+        String token = fixtures.tokenFor(masterEmail);
+
+        Set<UUID> history = idSet(call(token, "HISTORY", null, null, null, null));
+        Set<UUID> upcoming = idSet(call(token, "UPCOMING", null, null, null, null));
+        Set<UUID> past = idSet(call(token, "PAST", null, null, null, null));
+        Set<UUID> cancelled = idSet(call(token, "CANCELLED", null, null, null, null));
+
+        assertThat(history)
+                .as("HISTORY must be exactly PAST ∪ CANCELLED for this fixture")
+                .containsExactlyInAnyOrderElementsOf(union(past, cancelled));
+
+        // Boundary this test exists to pin: a naive "everything except CONFIRMED" implementation
+        // would wrongly exclude the elapsed-unclosed CONFIRMED row (confirmedElapsed) from HISTORY,
+        // and/or wrongly include the not-yet-elapsed CONFIRMED row (confirmedUpcoming).
+        assertThat(history)
+                .as("an elapsed CONFIRMED (awaiting-closure) booking IS in HISTORY")
+                .contains(fx.confirmedElapsed);
+        assertThat(history)
+                .as("a future CONFIRMED (upcoming) booking is NOT in HISTORY")
+                .doesNotContain(fx.confirmedUpcoming, fx.confirmedBoundary);
+
+        assertThat(history).as("HISTORY ∩ UPCOMING = ∅").doesNotContainAnyElementsOf(upcoming);
+        assertThat(history.size() + upcoming.size())
+                .as("complement property: count(HISTORY) + count(UPCOMING) == count(unfiltered)")
+                .isEqualTo(8);
+    }
+
+    private static Set<UUID> union(Set<UUID> a, Set<UUID> b) {
+        Set<UUID> result = new HashSet<>(a);
+        result.addAll(b);
+        return result;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Total-disjoint-cover — CLIENT path (structurally different query: single-query projection)
     // ══════════════════════════════════════════════════════════════════════════
 
@@ -203,11 +258,71 @@ class BookingMyBookingsPartitionIT extends AbstractIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // HISTORY — CLIENT path (mirrors the INDEPENDENT_MASTER HISTORY test above; the shared
+    // partition() dispatch is exercised identically on both code paths, but a role-parameterised
+    // suite exists precisely so a future change that diverges per role cannot pass silently — see
+    // backend-security's Phase 30.x INFO finding)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("CLIENT — partition HISTORY returns exactly PAST ∪ CANCELLED, is the exact "
+            + "complement of UPCOMING, and never leaks another client's rows")
+    void should_returnUnionOfPastAndCancelled_when_partitionIsHistory_forClient() throws Exception {
+        String masterEmail = "mbpi-history-cli-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+        String clientEmail = "mbpi-history-cli-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+
+        Fixture fx = seedEightRowFixture(clientId, masterId, serviceId, null);
+
+        // Unrelated second client's own CANCELLED booking must never leak into the first
+        // client's HISTORY page.
+        UUID otherClientId = fixtures.createUser(
+                "mbpi-history-cli-other-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID otherClientCancelled = insertBooking(
+                otherClientId, masterId, serviceId, null, "CANCELLED", NOW.plusHours(20), NOW.plusHours(21));
+
+        String token = fixtures.tokenFor(clientEmail);
+
+        Set<UUID> history = idSet(call(token, "HISTORY", null, null, null, null));
+        Set<UUID> upcoming = idSet(call(token, "UPCOMING", null, null, null, null));
+        Set<UUID> past = idSet(call(token, "PAST", null, null, null, null));
+        Set<UUID> cancelled = idSet(call(token, "CANCELLED", null, null, null, null));
+
+        assertThat(history)
+                .as("HISTORY must be exactly this client's own PAST ∪ CANCELLED")
+                .containsExactlyInAnyOrderElementsOf(union(past, cancelled));
+        assertThat(history)
+                .as("an elapsed CONFIRMED (awaiting-closure) booking IS in HISTORY")
+                .contains(fx.confirmedElapsed);
+        assertThat(history)
+                .as("a not-yet-elapsed CONFIRMED booking, including the endsAt==now boundary row, "
+                        + "is NOT in HISTORY")
+                .doesNotContain(fx.confirmedUpcoming, fx.confirmedBoundary);
+        assertThat(history)
+                .as("must never contain the OTHER client's CANCELLED booking, though it must still "
+                        + "contain this client's own DECLINED row")
+                .doesNotContain(otherClientCancelled)
+                .contains(fx.declined);
+        assertThat(history.size())
+                .as("exactly this client's own 6 HISTORY rows (4 PAST + 2 CANCELLED) — the other "
+                        + "client's CANCELLED row must not inflate the count")
+                .isEqualTo(6);
+        assertThat(history).doesNotContainAnyElementsOf(upcoming);
+        assertThat(history.size() + upcoming.size())
+                .as("complement property: count(HISTORY) + count(UPCOMING) == count(unfiltered) for "
+                        + "the CLIENT code path too")
+                .isEqualTo(8);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // Total-disjoint-cover — SALON_OWNER path (lighter fixture: proves salon scope composes too)
     // ══════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("SALON_OWNER — one booking per partition, scoped to the owner's own salon only")
+    @DisplayName("SALON_OWNER — one booking per partition, scoped to the owner's own salon only; "
+            + "HISTORY equals exactly the PAST + CANCELLED rows")
     void should_partitionBeTotalAndDisjoint_when_salonOwnerHasOneBookingPerPartition() throws Exception {
         BookingTestFixtures.SalonFixture salon = fixtures.createSalon("mbpi-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = fixtures.createUser("mbpi-owner-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
@@ -225,12 +340,109 @@ class BookingMyBookingsPartitionIT extends AbstractIntegrationTest {
         UUID otherServiceId = fixtures.createSalonService(otherSalon.salonId(), otherSalon.masterId());
         insertBooking(clientId, otherSalon.masterId(), otherServiceId, otherSalon.salonId(),
                 "CONFIRMED", NOW.plusHours(1), NOW.plusHours(2));
+        // Unrelated second owner's own CANCELLED booking — must never leak into the first
+        // owner's HISTORY page either.
+        insertBooking(clientId, otherSalon.masterId(), otherServiceId, otherSalon.salonId(),
+                "CANCELLED", NOW.plusHours(8), NOW.plusHours(9));
 
         String token = fixtures.tokenFor(salon.ownerEmail());
 
         assertThat(idSet(call(token, "UPCOMING", null, null, null, null))).containsExactly(upcomingId);
         assertThat(idSet(call(token, "PAST", null, null, null, null))).containsExactly(pastId);
         assertThat(idSet(call(token, "CANCELLED", null, null, null, null))).containsExactly(cancelledId);
+        assertThat(idSet(call(token, "HISTORY", null, null, null, null)))
+                .as("HISTORY = PAST ∪ CANCELLED, scoped to this owner's own salon only — never the "
+                        + "other owner's CONFIRMED or CANCELLED rows")
+                .containsExactlyInAnyOrder(pastId, cancelledId);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SALON_ADMIN — hard-rejected on every partition, HISTORY included (pinned explicitly per
+    // backend-security's Phase 30.x INFO finding: a future salon-archive phase will deliberately
+    // revisit this, so the CURRENT behaviour needs an explicit regression test, not an implicit one)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("SALON_ADMIN — GET /bookings/me?partition=HISTORY is 403 Forbidden, same as every "
+            + "other partition value (BookingService's role switch rejects SALON_ADMIN before "
+            + "partition is ever inspected)")
+    void should_rejectSalonAdmin_when_partitionIsHistory() throws Exception {
+        BookingTestFixtures.SalonFixture salon = fixtures.createSalon("mbpi-admin-" + System.nanoTime() + "@beautica.test");
+        String adminEmail = "mbpi-admin-user-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(adminEmail, "SALON_ADMIN", salon.salonId());
+        String token = fixtures.tokenFor(adminEmail);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/me?partition=HISTORY", HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("SALON_ADMIN must be rejected on partition=HISTORY exactly like every other "
+                        + "partition — they manage staff/services, not bookings")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Pagination — HISTORY spanning 2 pages, mixing PAST-shaped and CANCELLED-shaped rows (the
+    // union's two cover members) — closes the gap the existing PAST-only pagination test leaves:
+    // HISTORY is the largest, unbounded-growth partition backing the mobile master «Архів» page.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("partition=HISTORY spanning 2 pages — totalElements and each page match the ground "
+            + "truth (NOT (CONFIRMED AND not-yet-elapsed)), across rows alternating between the PAST "
+            + "and CANCELLED cover members that make up the HISTORY union")
+    void should_keepTotalsAndCursorCorrect_when_historyResultSpansMultiplePages() throws Exception {
+        String masterEmail = "mbpi-history-page-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser("mbpi-history-page-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+
+        int historyCount = 13;
+        OffsetDateTime t = NOW.minusDays(30);
+        for (int i = 0; i < historyCount; i++) {
+            // Alternate COMPLETED (PAST cover member) and CANCELLED (CANCELLED cover member) — both
+            // land in HISTORY, but via the two different underlying cover members the union spans.
+            if (i % 2 == 0) {
+                insertBooking(clientId, masterId, serviceId, null, "COMPLETED", t, t.plusHours(1));
+            } else {
+                insertBooking(clientId, masterId, serviceId, null, "CANCELLED", t, t.plusHours(1));
+            }
+            t = t.plusDays(1);
+        }
+        // Noise the ground truth must exclude: a not-yet-elapsed CONFIRMED (UPCOMING), including
+        // the endsAt==now boundary row itself.
+        insertBooking(clientId, masterId, serviceId, null, "CONFIRMED", NOW.plusHours(1), NOW.plusHours(2));
+        insertBooking(clientId, masterId, serviceId, null, "CONFIRMED", NOW.minusHours(1), NOW);
+
+        List<UUID> groundTruth = jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE master_id = ? AND NOT (status = 'CONFIRMED' AND ends_at >= ?) "
+                        + "ORDER BY starts_at DESC, id ASC",
+                UUID.class, masterId, NOW);
+        assertThat(groundTruth).as("fixture sanity check").hasSize(historyCount);
+
+        String token = fixtures.tokenFor(masterEmail);
+        int pageSize = 8;
+        List<UUID> collected = new ArrayList<>();
+        for (int page = 0; page < 2; page++) {
+            JsonNode resp = callPaged(token, "HISTORY", page, pageSize);
+            assertThat(resp.path("data").path("totalElements").asLong())
+                    .as("page %d totalElements must reflect the HISTORY-filtered count only", page)
+                    .isEqualTo(historyCount);
+
+            List<UUID> pageIds = idList(resp);
+            int from = page * pageSize;
+            int to = Math.min(historyCount, from + pageSize);
+            assertThat(pageIds)
+                    .as("page %d must equal the ground-truth slice [%d,%d)", page, from, to)
+                    .containsExactlyElementsOf(groundTruth.subList(from, to));
+            collected.addAll(pageIds);
+        }
+        assertThat(collected)
+                .as("both pages together reproduce the full ground truth, no row dropped or duplicated")
+                .containsExactlyInAnyOrderElementsOf(groundTruth)
+                .hasSize(historyCount);
+        assertThat(new HashSet<>(collected)).hasSize(historyCount);
     }
 
     // ══════════════════════════════════════════════════════════════════════════

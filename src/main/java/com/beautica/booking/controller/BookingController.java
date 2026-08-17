@@ -143,10 +143,15 @@ public class BookingController {
             @Parameter(description = "Time-based partition: UPCOMING (status=CONFIRMED and not yet "
                     + "elapsed), PAST (COMPLETED/NOT_COMPLETED, or an elapsed unclosed CONFIRMED), "
                     + "or CANCELLED (CANCELLED/DECLINED) — a total, disjoint cover of every "
-                    + "booking status. When present, `status` is IGNORED — NOT a 400 — this is the "
-                    + "additive rollout safety valve: a client sending both params degrades cleanly "
-                    + "to the pre-partition `status`-only behaviour against a backend that does not "
-                    + "yet know `partition`. Omit for byte-identical pre-Phase-28 behaviour.")
+                    + "booking status. AWAITING_CLOSURE is a named subset of PAST (an elapsed "
+                    + "unclosed CONFIRMED booking only). HISTORY is a union view spanning PAST and "
+                    + "CANCELLED, i.e. every booking EXCEPT UPCOMING, in one correctly-paginated "
+                    + "request — use it for an \"archive\"/history list that must include cancelled "
+                    + "and declined bookings alongside finished ones. When present, `status` is "
+                    + "IGNORED — NOT a 400 — this is the additive rollout safety valve: a client "
+                    + "sending both params degrades cleanly to the pre-partition `status`-only "
+                    + "behaviour against a backend that does not yet know `partition`. Omit for "
+                    + "byte-identical pre-Phase-28 behaviour.")
             @RequestParam(required = false) BookingPartition partition,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
