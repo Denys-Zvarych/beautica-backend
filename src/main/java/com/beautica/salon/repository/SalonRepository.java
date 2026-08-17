@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -70,6 +71,27 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     List<UUID> findIdsByOwnerIdAndIsActiveTrue(@Param("ownerId") UUID ownerId);
 
     boolean existsByIdAndOwnerId(UUID id, UUID ownerId);
+
+    /**
+     * Batched twin of {@link #existsByIdAndOwnerId}: of the supplied salon ids, the subset owned
+     * by {@code ownerId}. Backs
+     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} — ONE statement for a
+     * whole page of bookings instead of one {@code existsByIdAndOwnerId} per row (anti-bug §E: no
+     * N+1). Cost is flat in page size: the caller de-duplicates the page's salon ids first, and a
+     * page with no salon-employed master skips the call entirely.
+     *
+     * <p><b>Deliberately carries no {@code isActive} predicate</b>, unlike
+     * {@link #findIdsByOwnerIdAndIsActiveTrue}. The per-row predicate this batches — the
+     * {@code master.getSalon().getOwner().getId().equals(actorId)} arm of
+     * {@code AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)} and its
+     * {@link #existsByIdAndOwnerId} fallback — has none either, and neither does the
+     * {@code POST /client-reviews} write gate. Adding one here would make the listing's
+     * {@code providerCanReviewClient} flag disagree with both {@code GET /bookings/&#123;id&#125;}
+     * and the write endpoint for an owner whose salon has been deactivated.
+     */
+    @Query("SELECT s.id FROM Salon s WHERE s.id IN :salonIds AND s.owner.id = :ownerId")
+    List<UUID> findIdsByIdInAndOwnerId(
+            @Param("salonIds") Collection<UUID> salonIds, @Param("ownerId") UUID ownerId);
 
     /**
      * Lightweight owner-id projection (Phase 21.3 rotation PERF fix). Used by

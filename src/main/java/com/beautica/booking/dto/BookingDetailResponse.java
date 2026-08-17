@@ -141,12 +141,13 @@ import java.util.UUID;
  *
  * <p><b>{@code providerCanReviewClient}</b> (extends track 27.x / Phase 27.5) — the PROVIDER-side
  * mirror of {@code canReview}, gating the "Залишити відгук про клієнта" CTA on
- * {@code GET /bookings/{id}} only (NOT on any {@code GET /bookings/me} row — see below). {@code
- * true} iff ALL of: (1) the CURRENT authenticated viewer has provider review-authority over THIS
- * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking} — the exact
- * predicate backing {@code @authz.canReviewClient}/{@code enforceCanReviewClient} on
- * {@code POST /client-reviews}, so this can never disagree with what the write endpoint will
- * actually accept; (2) {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} —
+ * {@code GET /bookings/{id}} AND on every provider row of {@code GET /bookings/me} (see below).
+ * {@code true} iff ALL of: (1) the CURRENT authenticated viewer has provider review-authority over THIS
+ * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)}
+ * — byte-for-byte the predicate {@code enforceCanReviewClient} throws on inside
+ * {@code ClientReviewService.create}, so this flag and the service-layer arm of
+ * {@code POST /client-reviews} can never disagree; (2)
+ * {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} —
  * {@code status == COMPLETED} OR an elapsed-but-unclosed {@code CONFIRMED} booking (mirrors the
  * client-side {@code canReview} widening and {@code ClientReviewService.create}'s write gate, so
  * a booking that aged into Past by elapsed time is offered here even before the provider closes
@@ -155,13 +156,51 @@ import java.util.UUID;
  * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
  * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
- * DTO at all. {@code BookingService#getBooking} is the ONLY caller that computes this for real;
- * every other construction site ({@code enrichCreated}, {@code rescheduleBooking}, the CLIENT
- * projection path, and the provider {@code GET /bookings/me} listing) hardcodes {@code false} —
- * a freshly-created or just-rescheduled booking is always {@code CONFIRMED} (never reviewable
- * yet), the CLIENT projection path's viewer is always CLIENT (structurally excluded), and the
- * provider listing was out of scope for the CTA this field backs. See each hardcoding site's own
- * comment before "optimising" this away.
+ * DTO at all. TWO callers compute this for real, through ONE shared conjunction
+ * ({@code BookingService#providerCanReviewClient}): {@code BookingService#getBooking} (per-row
+ * inputs) and {@code BookingService#listProviderBookings} (the provider {@code GET /bookings/me}
+ * rows, same conjunction fed from page-scoped batched lookups — see
+ * {@code BookingService#loadProviderReviewBatch}). The listing hardcoded {@code false} until the
+ * archive-CTA fix; that was worse than omitting the field, because a client mapping it faithfully
+ * saw a constant and had to gate its CTA on {@code status} alone, which then could not clear once
+ * the provider had left feedback. Do not reintroduce a constant on any surface a client renders.
+ * The REMAINING construction sites still pass {@code false} and are still sound: {@code
+ * enrichCreated} and {@code rescheduleBooking} (a freshly-created or just-rescheduled booking is
+ * always {@code CONFIRMED} and future-dated, so it satisfies neither disjunct of
+ * {@code isReviewEligible}) and the CLIENT projection path (its viewer is always CLIENT —
+ * structurally excluded from provider authority). See each of those sites' own comment before
+ * "optimising" this away.
+ *
+ * <p><b>Precisely how far the "agrees with the write endpoint" claim reaches (phase-27.x security
+ * audit, LOW 3).</b> An earlier revision of this javadoc asserted the flag "can never disagree" with
+ * {@code @authz.canReviewClient} as well. That is NOT true in general, and the weaker claim above is
+ * the accurate one. {@code POST /client-reviews} is gated TWICE — the SpEL {@code @PreAuthorize}
+ * {@code @authz.canReviewClient} and then {@code enforceCanReviewClient} in the service — and the
+ * two derive "is this an independent-master booking" from different sources. The SpEL arm reads the
+ * {@code BookingCompletionAccess} projection and takes {@code salonId == null}; the entity arm (and
+ * therefore this flag) takes {@code masterType == INDEPENDENT_MASTER}. Those coincide on every
+ * production-normal row but not on all of them, because {@code masters.salon_id} is
+ * {@code ON DELETE SET NULL} ({@code V4__Patch_salons_add_masters.sql:13}) and neither the schema nor
+ * {@code Master} constrains {@code master_type} against it: a salon-typed master whose salon row was
+ * deleted has {@code salonId == null} with {@code masterType != INDEPENDENT_MASTER}, so the SpEL arm
+ * grants that master authority over their own booking while this flag reads {@code false}. What
+ * still holds — and is what the CTA depends on — is that the endpoint accepts only the CONJUNCTION
+ * of both arms, so a viewer this flag shows {@code true} to is never rejected on authority grounds
+ * by the service arm, and the divergent row above is fail-closed for the UI (no CTA offered, and
+ * none would have succeeded). The mirror case (an {@code INDEPENDENT_MASTER}-typed master carrying a
+ * non-null {@code salon_id}) would invert that and over-offer the CTA into a 403; no writer produces
+ * that shape today, but nothing structurally forbids it either.
+ *
+ * <p><b>Why the two derivations were NOT unified.</b> Unifying means putting {@code masterType} into
+ * {@code BookingCompletionAccess} and switching the projection-based predicates to it. That
+ * projection is shared by six authorization paths ({@code canCompleteBooking},
+ * {@code canCancelBooking}, {@code canRescheduleBooking}, {@code canReviewClient},
+ * {@code canRescheduleAppointment}, {@code enforceCanManageAppointment}), several with no
+ * entity-based twin to backstop them, and on the divergent row above it would REVOKE write authority
+ * those gates grant today. That is an authorization behaviour change, out of scope for a
+ * documentation-accuracy finding; it needs its own phase, with the product question "may a master
+ * whose salon was deleted still close out their own bookings?" answered first. The javadoc was
+ * softened instead.
  *
  * <p><b>Phase B1 — {@code masterAvgRating}/{@code masterReviewCount}.</b> The master's public
  * rating aggregate, surfaced so the client's booking-detail and leave-feedback screens can render
