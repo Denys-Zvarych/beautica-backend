@@ -1,0 +1,67 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Reviewed-and-accepted gitleaks findings.
+#
+# Each line is a gitleaks FINGERPRINT: <commit>:<file>:<rule>:<line>.
+# A fingerprint pins one finding in one historical commit, so this file
+# can never mask a NEW secret -- not even a new secret added to the very
+# same file. Do not replace these with path- or rule-wide allowlists in a
+# .gitleaks.toml: that would blind the scanner going forward.
+#
+# Why these exist at all: the `dev` -> `main` release PR scans a range
+# reaching back to April 2026, so gitleaks re-reports findings from old
+# commits that were reviewed at the time. Every entry below was re-checked
+# on 2026-07-24 before being added.
+#
+# Before adding a line here: confirm the value is NOT a production
+# credential. If it is, ROTATE IT FIRST -- an ignore entry hides the
+# alert, it does not make a leaked key safe.
+# ──────────────────────────────────────────────────────────────────────────
+
+# --- False positives: test fixtures, not credentials ----------------------
+
+# A fake invite-accept URL used as round-trip plaintext for the outbox
+# cipher. The query value is a hand-typed 12-char literal on a reserved
+# .example domain. (Deliberately not quoted verbatim here -- reproducing
+# the literal in this file would itself trip the generic-api-key rule.)
+315065630f4a8afa379657580e66e19b114bcb61:src/test/java/com/beautica/notification/crypto/OutboxPayloadCipherTest.java:generic-api-key:35
+
+# Two @DisplayName / service-type slug literals ("Brow Shaping" and its
+# Ukrainian pair) flagged purely on entropy. No credential involved.
+c0ec265994cb1a93fb0ff0ee64ebdfb024e1cb75:src/test/java/com/beautica/service/repository/CatalogRepositoryTest.java:generic-api-key:217
+c0ec265994cb1a93fb0ff0ee64ebdfb024e1cb75:src/test/java/com/beautica/service/repository/CatalogRepositoryTest.java:generic-api-key:343
+
+# Another fixture URL with a dummy query value, asserting the rendered
+# href is not line-broken by the Thymeleaf email template. (Value not
+# reproduced here -- see the note above.)
+5e32674d5ff270e8afcc600bcd4a81e3ac938ac6:src/test/java/com/beautica/notification/EmailServiceTest.java:generic-api-key:177
+
+# HMAC key for the guest-token unit tests, literally spelled
+# "test-secret-that-is-at-least-32-bytes-long-xx" -- long enough to satisfy
+# the 32-byte minimum, and nothing more.
+3afa3608e94f4f7dd31d675dd77fdb82af2e46bb:src/test/java/com/beautica/auth/phoneotp/GuestTokenProviderTest.java:generic-api-key:29
+3afa3608e94f4f7dd31d675dd77fdb82af2e46bb:src/test/java/com/beautica/auth/phoneotp/GuestTokenConfusionTest.java:generic-api-key:29
+
+# OutboxKeyDevGuardTest.DEV_KEY_B64 -- a BLOCKLIST sentinel. The guard under
+# test exists to REJECT this exact key at startup, so the test must name it.
+# Removing it would delete the assertion that the dev key can never boot prod.
+feed4e95c6bf33b9d4262957278bd6331feccdd3:src/test/java/com/beautica/notification/crypto/OutboxKeyDevGuardTest.java:generic-api-key:22
+
+# --- Real values, but local-dev-profile only ------------------------------
+#
+# All three lived in `application-local.yml`, which is loaded ONLY under the
+# `local` Spring profile against localhost Docker Postgres. Production
+# (Railway) has always sourced these from the JWT_SECRET / OUTBOX_PAYLOAD_KEY
+# environment variables -- see ARCHITECTURE-backend.md § 0.5. Current `dev`
+# already env-wraps every one of them, so none of these values is reachable
+# from any deployed configuration.
+
+# app.jwt.secret -- base64 of the literal placeholder text
+# "test-local-dev-secret-needs-to-be-random-256bit!". Never random, never prod.
+f263068a29b1767c6497391917c4ed9c0d97dffb:src/main/resources/application-local.yml:generic-api-key:32
+
+# app.jwt.secret -- a random local dev value; superseded by ${JWT_SECRET}.
+8e796bc7cab53ee72d24534551189b18f0208f01:src/main/resources/application-local.yml:generic-api-key:37
+
+# app.outbox.payload-key -- local dev AES key, carried an explicit
+# "Local dev only -- never use in prod" comment in the same commit.
+315065630f4a8afa379657580e66e19b114bcb61:src/main/resources/application-local.yml:generic-api-key:58
