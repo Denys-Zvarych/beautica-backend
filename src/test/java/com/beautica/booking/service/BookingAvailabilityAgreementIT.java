@@ -1107,6 +1107,92 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
      * Read-only: it never mutates the cache, so it cannot influence the behavioural assertions it sits
      * beside.
      */
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 19 — the STAFF existence check answers exactly what the STAFF slot list would
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>Perf-refactor equivalence pin (perf LOW, 2026-08-18).</b> The staff create path's
+     * schedule-fit gate used to materialise a whole day of {@code AvailableSlotResponse} objects and
+     * scan them for {@code startsAt}; it now asks {@link SlotCalculationService#isStaffSlotAvailable},
+     * which applies the same comparison inside the per-interval walk and short-circuits. The staff
+     * slot list is uncached, so that list was rebuilt on every single create purely to answer a
+     * boolean.
+     *
+     * <p>The refactor is only safe if the two agree on EVERY probe, not just on the happy one, so
+     * this drives both against the genuine resolver + calculator + booking subtraction and asserts
+     * the boolean equals list membership for: an offered start, an off-grid start, a start below the
+     * staff floor, and a start outside the working interval. Both the INTERVAL day shape and the
+     * {@code EXPLICIT_TIMES} day shape are covered, because {@code dayFreeRangesContainStart} mirrors
+     * {@code computeDayFreeRanges}'s branch on exactly that switch.
+     *
+     * <p>It doubles as the staff-floor pin: at 17:20 the 17:30 start IS offered to staff (floor 0)
+     * while the client list is empty (floor 17:35), which is the whole reason a separate staff entry
+     * point exists.
+     */
+    @Test
+    @DisplayName("case 19 — isStaffSlotAvailable ⇔ getStaffAvailableSlots membership on both day "
+            + "shapes, and the 17:30 start staff may book is one the client list does not offer")
+    void should_agreeWithTheStaffSlotList_when_answeringTheStaffExistenceCheck() {
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 30, 0);
+        seedInterval(m.masterId(), TODAY, null, TODAY.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(18, 0));
+
+        // The staff floor is "now" (17:20), not "now + 15" — so the 17:30 grid start survives.
+        assertThat(staffSlotStarts(m.masterId(), TODAY, svc))
+                .as("staff floor 0 keeps the last grid start of the day")
+                .containsExactly(LocalTime.of(17, 30));
+        assertThat(slotStarts(m.masterId(), TODAY, svc))
+                .as("the CLIENT list at the same moment is empty — 17:30 is below the 17:35 cutoff")
+                .isEmpty();
+
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(17, 30));  // offered
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(17, 45));  // off the 30-min grid
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(17, 0));   // below the staff floor
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(18, 30));  // outside the interval
+
+        // EXPLICIT_TIMES day — the other arm of the isExplicitTimes switch both methods branch on.
+        LocalDate declaredDay = TODAY.plusDays(9);
+        seedExplicitTimesDay(m, declaredDay, LocalTime.of(13, 0), LocalTime.of(15, 0));
+
+        assertThat(staffSlotStarts(m.masterId(), declaredDay, svc))
+                .containsExactly(LocalTime.of(13, 0), LocalTime.of(15, 0));
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(13, 0));  // declared
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(15, 0));  // declared
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(14, 0));  // never declared
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(13, 30)); // grid, undeclared
+    }
+
+    /** The STAFF (zero-lead) slot-list start wall-clocks for a single date. */
+    private List<LocalTime> staffSlotStarts(UUID masterId, LocalDate date, UUID masterServiceId) {
+        return slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceId, null)
+                .stream()
+                .map(s -> s.startsAt().toLocalTime())
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * The invariant the perf refactor must preserve: the boolean the create-path gate now asks equals
+     * the membership test it used to run over the materialised list — for this exact start, on this
+     * exact date, through the same real pipeline.
+     */
+    private void assertStaffAgreement(UUID masterId, LocalDate date, UUID masterServiceId,
+                                      LocalTime start) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+
+        boolean inList = slotCalculationService
+                .getStaffAvailableSlots(masterId, date, masterServiceId, null).stream()
+                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
+        boolean existenceCheck = slotCalculationService
+                .isStaffSlotAvailable(masterId, date, masterServiceId, null, startsAt);
+
+        assertThat(existenceCheck)
+                .as("isStaffSlotAvailable must equal list membership at %s on %s", start, date)
+                .isEqualTo(inList);
+    }
+
     private long cachedSlotEntryCount(UUID masterId) {
         var caffeine = (com.github.benmanes.caffeine.cache.Cache<?, ?>) slotCache().getNativeCache();
         return caffeine.asMap().keySet().stream()

@@ -57,6 +57,28 @@ public final class BookingWindow {
     }
 
     /**
+     * {@link #MIN_MINUTES_AHEAD} as a shared, immutable {@link Duration} — the client/APP + guest/LINK
+     * lead-time floor, expressed so a caller that must vary it can name the default instead of
+     * re-deriving it.
+     *
+     * <p>Exactly ONE caller varies it: the STAFF create path (Phase 22.2). A walk-in is a client
+     * standing at the counter, so its locked product rule is "now is allowed, the past is not"
+     * (minimum lead 0). That floor has to be applied to the SLOT LIST as well as to
+     * {@code BookingStartsAtValidator}, because the create path proves schedule-fit by requiring
+     * {@code startsAt} to MATCH a generated slot — with the 15-minute floor baked into the generator
+     * a walk-in "now" could never match anything, and the phase's own acceptance criterion ("a
+     * {@code startsAt} equal to now, within a working slot, is accepted") would be unimplementable.
+     * {@code SlotCalculationService#getStaffAvailableSlots} therefore passes {@link Duration#ZERO}
+     * where every other caller passes this.
+     *
+     * <p>This does NOT weaken the three call sites in the list above: they all still derive their
+     * floor from here, and the staff variant is a separate, uncached entry point.
+     */
+    public static Duration minLead() {
+        return MIN_LEAD;
+    }
+
+    /**
      * {@link #bookableCutoff(Clock)} for a caller that has ALREADY read the clock (Perf LOW-2). A single
      * request must derive exactly ONE {@code now}: reading the clock again per day / per work interval
      * both wasted calls and — worse — produced two slightly different cutoffs for the same logical

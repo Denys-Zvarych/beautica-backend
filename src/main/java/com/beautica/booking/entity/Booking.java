@@ -4,6 +4,7 @@ import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.common.AuditableEntity;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -27,6 +28,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 import org.hibernate.annotations.DynamicUpdate;
+import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
@@ -463,19 +465,36 @@ public class Booking extends AuditableEntity {
                 .build();
     }
 
+    /**
+     * <b>{@code BusinessException(BAD_REQUEST)}, never {@code IllegalArgumentException}</b>
+     * (security LOW, 2026-08-18). {@code GlobalExceptionHandler} has no
+     * {@code IllegalArgumentException} handler, so one escaping this factory falls to the
+     * {@code Exception.class} catch-all: a <b>500 plus a full ERROR stack trace</b> for what is, by
+     * construction, a missing required input. These four values are the same ones the Phase 22.2
+     * command records reject as a 400 ({@code StaffBookingCommand}, {@code StaffClientRef.Guest},
+     * {@code StaffBookingScope}), so the status must agree rather than depend on which layer noticed.
+     *
+     * <p>No caller can reach these branches today — {@code StaffClientRef.Guest} rejects blank
+     * identity fields, {@code UkrainianPhoneNormalizer#toE164} rejects an unusable phone and
+     * {@code StaffBookingService} rejects a null actor before the load. That is exactly why the
+     * status matters: this is the backstop for the day a second caller appears, and a backstop that
+     * answers 500 is not one.
+     */
     private static void requireStaffWalkInIdentity(
             String guestName, String guestSurname, String guestPhone, UUID createdByUserId) {
-        if (guestName == null || guestName.isBlank()) {
-            throw new IllegalArgumentException("guestName must not be blank for a STAFF walk-in booking");
-        }
-        if (guestSurname == null || guestSurname.isBlank()) {
-            throw new IllegalArgumentException("guestSurname must not be blank for a STAFF walk-in booking");
-        }
-        if (guestPhone == null || guestPhone.isBlank()) {
-            throw new IllegalArgumentException("guestPhone must not be blank for a STAFF walk-in booking");
-        }
+        requireStaffText(guestName, "guestName");
+        requireStaffText(guestSurname, "guestSurname");
+        requireStaffText(guestPhone, "guestPhone");
         if (createdByUserId == null) {
-            throw new IllegalArgumentException("createdByUserId must not be null for a STAFF booking");
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "createdByUserId must not be null for a STAFF booking");
+        }
+    }
+
+    private static void requireStaffText(String value, String field) {
+        if (value == null || value.isBlank()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    field + " must not be blank for a STAFF walk-in booking");
         }
     }
 

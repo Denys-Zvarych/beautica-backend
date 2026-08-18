@@ -31,8 +31,6 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -271,16 +269,12 @@ public class GuestBookingService {
         // Per-master advisory lock BEFORE the overlap check — same fused-timeout mechanism the single
         // guest path uses (this endpoint is permitAll, so the 3s lock_timeout bounds the wait against the
         // advisory-lock DoS class). No client lock: a guest has no account to serialize on.
-        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
-        if (lock == null) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
-        }
+        //
         // ONE span overlap check over [firstStart, lastEnd): the chained items are contiguous by
         // construction, so their union equals the span (identical rationale to AppointmentService). The
         // per-row no_overlapping_bookings GIST EXCLUDE still backstops each insert (the catch below → 409).
-        if (bookingRepository.existsOverlap(master.getId(), firstStart, lastEnd)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        BookingSlotLockGuard.lockMasterAndAssertFree(
+                bookingRepository, master.getId(), firstStart, lastEnd);
 
         UUID cancelToken = UUID.randomUUID();
         Appointment appointment = Appointment.guestAppointment(
@@ -351,13 +345,12 @@ public class GuestBookingService {
         // BookingService.doCreateBooking, so check + insert are atomic (no TOCTOU race).
         // acquireAdvisoryLockWithTimeout() bounds this wait to 3s in the same round trip
         // (see class-level Javadoc above).
-        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
-        if (lock == null) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
-        }
-        if (bookingRepository.existsOverlap(master.getId(), startsAt, endsAt)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        //
+        // Extracted to BookingSlotLockGuard in Phase 22.2 so the STAFF create path could reuse this
+        // lock/overlap/save sequence instead of becoming a third copy of it. Byte-for-byte the same
+        // repository calls, the same 409 message and the same DataIntegrityViolationException
+        // translation this method has always made — see that class's Javadoc.
+        BookingSlotLockGuard.lockMasterAndAssertFree(bookingRepository, master.getId(), startsAt, endsAt);
 
         // Freeze the RANGE ceiling beside the floor (V119), by the same rule and at the same
         // moment as the registered-client path (BookingService#doCreateBooking). Null = single
@@ -366,11 +359,7 @@ public class GuestBookingService {
                 master, msa, master.getSalon(), startsAt, endsAt,
                 price, BookingPriceRange.resolveCeiling(msa),
                 duration, buffer, req.name(), req.surname(), guestPhone);
-        try {
-            return bookingRepository.saveAndFlush(booking);
-        } catch (DataIntegrityViolationException e) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        return BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
     }
 
     private void registerAfterCommit(Master master, MasterServiceAssignment msa,
@@ -390,16 +379,7 @@ public class GuestBookingService {
                 salonCatalogCacheEvictor.evict(salonId);
             }
         };
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    task.run();
-                }
-            });
-        } else {
-            task.run();
-        }
+        BookingAfterCommit.run(task);
     }
 
     /**
@@ -421,16 +401,7 @@ public class GuestBookingService {
                 salonCatalogCacheEvictor.evict(salonId);
             }
         };
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    task.run();
-                }
-            });
-        } else {
-            task.run();
-        }
+        BookingAfterCommit.run(task);
     }
 
     private void sendConfirmationSms(String guestPhone, String smsText) {

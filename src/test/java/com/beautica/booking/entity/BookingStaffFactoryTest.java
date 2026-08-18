@@ -1,9 +1,11 @@
 package com.beautica.booking.entity;
 
 import com.beautica.booking.enums.BookingSource;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.booking.enums.BookingStatus;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
@@ -103,8 +105,10 @@ class BookingStaffFactoryTest {
     @DisplayName("should reject a blank guestName")
     void should_reject_when_guestNameBlank() {
         assertThatThrownBy(() -> staffBooking("  ", "Коваль", "+380501234567", STAFF_ID))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("guestName");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestName")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     /**
@@ -117,24 +121,30 @@ class BookingStaffFactoryTest {
     @DisplayName("should reject a null guestName")
     void should_reject_when_guestNameNull() {
         assertThatThrownBy(() -> staffBooking(null, "Коваль", "+380501234567", STAFF_ID))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("guestName");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestName")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     @DisplayName("should reject a blank guestSurname")
     void should_reject_when_guestSurnameBlank() {
         assertThatThrownBy(() -> staffBooking("Олена", "   ", "+380501234567", STAFF_ID))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("guestSurname");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestSurname")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     @DisplayName("should reject a null guestPhone")
     void should_reject_when_guestPhoneNull() {
         assertThatThrownBy(() -> staffBooking("Олена", "Коваль", null, STAFF_ID))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("guestPhone");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestPhone")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     /**
@@ -146,24 +156,53 @@ class BookingStaffFactoryTest {
     @DisplayName("should reject a null guestSurname (unlike the LINK guest factory)")
     void should_reject_when_guestSurnameNull() {
         assertThatThrownBy(() -> staffBooking("Олена", null, "+380501234567", STAFF_ID))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("guestSurname");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestSurname")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     @DisplayName("should reject a blank guestPhone")
     void should_reject_when_guestPhoneBlank() {
         assertThatThrownBy(() -> staffBooking("Олена", "Коваль", "", STAFF_ID))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("guestPhone");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestPhone")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     @DisplayName("should reject a null createdByUserId")
     void should_reject_when_createdByUserIdNull() {
         assertThatThrownBy(() -> staffBooking("Олена", "Коваль", "+380501234567", null))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("createdByUserId");
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("createdByUserId")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    /**
+     * <b>The type is the assertion</b> (security LOW, 2026-08-18). This guard used to throw
+     * {@link IllegalArgumentException}, for which {@code GlobalExceptionHandler} has no handler — so
+     * every one of these rejections would have surfaced as a <b>500 with a full ERROR stack
+     * trace</b> via the {@code Exception.class} catch-all, for a missing required input the Phase
+     * 22.2 command records already reject as a 400. Asserting only "it throws" let that pass; the
+     * status is what a caller and an on-call engineer actually see.
+     *
+     * <p><b>Every guard branch now pins the status</b> (QA 2026-08-18), not just this one. This case
+     * used to be the sole 400 assertion in the class while the other seven asserted type + message
+     * only, so a status regression on the {@code createdByUserId} or name/surname branches — the
+     * shape a 22.4 controller mapping is most likely to hit — would have shipped green. It survives
+     * as the named blank-phone case; the {@code .extracting(getStatus())} chain on each sibling is
+     * what closes the rest.
+     */
+    @Test
+    @DisplayName("should carry a 400 status on the blank-phone branch, not the handler's 500 catch-all")
+    void should_reject400_when_walkInIdentityIncomplete() {
+        assertThatThrownBy(() -> staffBooking("Олена", "Коваль", "  ", STAFF_ID))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
     }
 
     private static Booking staffBooking(String name, String surname, String phone, UUID staffId) {
