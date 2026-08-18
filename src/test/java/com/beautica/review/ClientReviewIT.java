@@ -95,9 +95,9 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("400 when the booking is CONFIRMED and its endsAt has NOT yet elapsed — the "
-            + "important assertion the review-eligibility widening below must preserve: a still-open "
-            + "booking stays unreviewable")
+    @DisplayName("400 when the booking is CONFIRMED and its endsAt has NOT yet elapsed — a "
+            + "still-open booking stays unreviewable, same as an elapsed-but-unclosed one (see "
+            + "the sibling test below)")
     void should_return400_when_bookingConfirmedAndNotYetElapsed() throws Exception {
         Salon salon = createSalon("clirev-notcompleted-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-notcompleted-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
@@ -117,10 +117,11 @@ class ClientReviewIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("201 when the booking is CONFIRMED but its endsAt has already ELAPSED — the bug "
-            + "fix: a booking the provider never closed but that aged into Past by time must be "
-            + "reviewable, mirroring the client-side ReviewService widening")
-    void should_return201_when_bookingConfirmedButElapsed() throws Exception {
+    @DisplayName("400 when the booking is CONFIRMED but its endsAt has already ELAPSED — unlike the "
+            + "client-side ReviewService widening, the PROVIDER direction does NOT treat an "
+            + "elapsed-but-unclosed CONFIRMED booking as reviewable: the provider must actually "
+            + "close the booking (PATCH .../complete) before rating the client")
+    void should_return400_when_bookingConfirmedButElapsed() throws Exception {
         Salon salon = createSalon("clirev-elapsed-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("clirev-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId, salon.salonId, "CONFIRMED");
@@ -130,11 +131,20 @@ class ClientReviewIT extends AbstractIntegrationTest {
                 URL, HttpMethod.POST, new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail))), String.class);
 
         assertThat(resp.getStatusCode())
-                .as("an elapsed-but-unclosed CONFIRMED booking must be reviewable — body: %s", resp.getBody())
-                .isEqualTo(HttpStatus.CREATED);
+                .as("an elapsed-but-unclosed CONFIRMED booking must stay unreviewable on the "
+                        + "provider->client direction — body: %s", resp.getBody())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        // GlobalExceptionHandler#handleBusiness genericises every BAD_REQUEST BusinessException
+        // message to "Invalid request" (anti-enumeration — see its javadoc); ClientReviewService's
+        // specific "This booking must be marked completed before you can review the client" string
+        // never reaches the wire for this status, so the wire-level contract this IT can pin is the
+        // generic message, matching the same-shape assertion in BookingMyBookingsSortIT.
+        assertThat(objectMapper.readTree(resp.getBody()).path("message").asText(""))
+                .as("pins the wire-level 400 message contract for this branch — body: %s", resp.getBody())
+                .isEqualTo("Invalid request");
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
-                .isEqualTo(1);
+                .isZero();
     }
 
     @Test

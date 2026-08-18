@@ -1465,8 +1465,9 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         // candidates.isEmpty() (+0) or ran the salon lookup and found no authority (+1), so the flag
         // is blind to exactly the distinction this gate pins. What separates them is the candidate
         // filter's own two conjuncts, both observable on the row: a registered client, and
-        // review-eligibility — which BookingClosureRule#isReviewEligible grants on COMPLETED by
-        // status alone, without consulting endsAt. If a future fixture change flipped either, this
+        // review-eligibility — which BookingClosureRule#isProviderReviewEligible grants on
+        // COMPLETED by status alone, without consulting endsAt. If a future fixture change flipped
+        // either, this
         // test would silently fall back onto the +0 short-circuit and pin a number the three sibling
         // gates already cover.
         assertThat(fiveRowPage.data())

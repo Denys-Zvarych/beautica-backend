@@ -139,6 +139,11 @@ public final class BookingClosureRule {
      * is the single canonical definition shared between the read-side {@code canReview} DTO flag
      * and the write-side gate, and the two can never disagree.
      *
+     * <p><b>CLIENT&rarr;PROVIDER direction only.</b> The PROVIDER(master)&rarr;CLIENT direction
+     * ({@code POST /client-reviews}) uses the deliberately narrower {@link
+     * #isProviderReviewEligible} instead — see that method's javadoc for why the two directions
+     * are not the same rule.
+     *
      * @param status the booking's current status
      * @param endsAt the absolute-instant end of the booking
      * @param now    an already-resolved absolute instant, same contract as {@link
@@ -146,5 +151,35 @@ public final class BookingClosureRule {
      */
     public static boolean isReviewEligible(BookingStatus status, OffsetDateTime endsAt, OffsetDateTime now) {
         return status == BookingStatus.COMPLETED || isAwaitingClosure(status, endsAt, now);
+    }
+
+    /**
+     * The STATUS half of PROVIDER(master)&rarr;CLIENT review eligibility — deliberately NARROWER
+     * than {@link #isReviewEligible} and NOT a reuse of it. {@code true} iff {@code status ==
+     * COMPLETED}; every other status, including an elapsed-but-unclosed {@code CONFIRMED} booking,
+     * is {@code false}.
+     *
+     * <p><b>Why the two directions differ — this is the load-bearing asymmetry, not an
+     * inconsistency to "fix":</b> {@link #isReviewEligible} exists because the CLIENT has no lever
+     * over whether the provider ever closes a booking out — a visit that aged into the client's
+     * "Past" tab purely by elapsed time must stay reviewable, or an unclosed booking could strand
+     * the client's review forever. The PROVIDER is the opposite case: closing the booking ({@code
+     * PATCH /bookings/{id}/complete}) is the provider's OWN action, entirely within their control.
+     * Letting a provider rate the client before performing that closing action lets them submit a
+     * rating for a visit they have not yet attested actually happened — {@code CONFIRMED} (elapsed
+     * or not), {@code NOT_COMPLETED}, {@code CANCELLED}, and {@code DECLINED} must all reject. The
+     * fix this method encodes: the master "Відгук" (review) CTA was appearing on the archive page
+     * at the same time as the "mark complete" CTA, and the backend accepted the rating before the
+     * booking was ever completed.
+     *
+     * <p><b>Do not "consistency-clean" this into {@link #isReviewEligible}, and do not make this
+     * method delegate to it.</b> The two predicates look similar (both gate a review write) but
+     * encode different product rules for different actors, and a future reader collapsing them
+     * back into one shared method reintroduces the exact bug this method was added to fix.
+     *
+     * @param status the booking's current status
+     */
+    public static boolean isProviderReviewEligible(BookingStatus status) {
+        return status == BookingStatus.COMPLETED;
     }
 }

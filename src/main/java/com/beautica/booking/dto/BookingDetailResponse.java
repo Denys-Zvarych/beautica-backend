@@ -147,12 +147,15 @@ import java.util.UUID;
  * — byte-for-byte the predicate {@code enforceCanReviewClient} throws on inside
  * {@code ClientReviewService.create}, so this flag and the service-layer arm of
  * {@code POST /client-reviews} can never disagree; (2)
- * {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} —
- * {@code status == COMPLETED} OR an elapsed-but-unclosed {@code CONFIRMED} booking (mirrors the
- * client-side {@code canReview} widening and {@code ClientReviewService.create}'s write gate, so
- * a booking that aged into Past by elapsed time is offered here even before the provider closes
- * it — see that method's javadoc for the full rationale); (3) the booking has a real client (not a
- * guest/LINK booking); (4) no {@code ClientReview} already exists for this booking. A CLIENT or
+ * {@link com.beautica.booking.domain.BookingClosureRule#isProviderReviewEligible} —
+ * {@code status == COMPLETED}, STRICTLY. Unlike the client-side {@code canReview} flag (which uses
+ * {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} and also admits an
+ * elapsed-but-unclosed {@code CONFIRMED} booking), this direction does NOT extend to that shape:
+ * the provider controls their own closing action ({@code PATCH .../complete}), so offering the
+ * review CTA before that action lets them rate a visit they have not yet attested happened — see
+ * {@code BookingClosureRule#isProviderReviewEligible}'s javadoc for the full rationale; (3) the
+ * booking has a real client (not a guest/LINK booking); (4) no {@code ClientReview} already
+ * exists for this booking. A CLIENT or
  * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
  * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
@@ -166,8 +169,8 @@ import java.util.UUID;
  * the provider had left feedback. Do not reintroduce a constant on any surface a client renders.
  * The REMAINING construction sites still pass {@code false} and are still sound: {@code
  * enrichCreated} and {@code rescheduleBooking} (a freshly-created or just-rescheduled booking is
- * always {@code CONFIRMED} and future-dated, so it satisfies neither disjunct of
- * {@code isReviewEligible}) and the CLIENT projection path (its viewer is always CLIENT —
+ * always {@code CONFIRMED}, never {@code COMPLETED}, so it can never satisfy {@code
+ * isProviderReviewEligible}) and the CLIENT projection path (its viewer is always CLIENT —
  * structurally excluded from provider authority). See each of those sites' own comment before
  * "optimising" this away.
  *
@@ -322,12 +325,14 @@ public record BookingDetailResponse(
         boolean canReview,
         @Schema(description = "TRUE only for the CURRENT authenticated viewer, and only on "
                 + "GET /bookings/{id}: the viewer has provider review-authority over this "
-                + "booking, the booking is COMPLETED or an elapsed-but-unclosed CONFIRMED "
-                + "booking (BookingClosureRule#isReviewEligible), it has a real (non-guest) "
+                + "booking, the booking is COMPLETED (strictly — unlike the client-side canReview "
+                + "flag, an elapsed-but-unclosed CONFIRMED booking does NOT qualify here; see "
+                + "BookingClosureRule#isProviderReviewEligible), it has a real (non-guest) "
                 + "client, and no ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
-                + "unauthorized provider, or any row served by GET /bookings/me (both the "
-                + "CLIENT and provider listing paths hardcode false — see "
-                + "BookingDetailResponse's class javadoc). Gates the \"Залишити відгук про "
+                + "unauthorized provider, or any row of the CLIENT listing path of "
+                + "GET /bookings/me (which hardcodes false). The PROVIDER rows of "
+                + "GET /bookings/me carry the real per-row value — see "
+                + "BookingDetailResponse's class javadoc. Gates the \"Залишити відгук про "
                 + "клієнта\" CTA; the write endpoint (POST /client-reviews) re-checks the same "
                 + "conditions server-side regardless of this value.")
         boolean providerCanReviewClient,

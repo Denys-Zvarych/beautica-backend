@@ -18,9 +18,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Clock;
-import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.util.UUID;
 
 /**
@@ -30,10 +27,15 @@ import java.util.UUID;
  * swapping the authority direction: here the actor is the PROVIDER (with authority over the
  * booking) and the subject is the CLIENT.
  *
- * <p>The STATUS+TIME eligibility gate mirrors {@code ReviewService#createReview} exactly — the
- * client-review path had the identical "Past-tab-by-elapsed-time but never COMPLETED" bug (see
- * {@link BookingClosureRule#isReviewEligible}'s javadoc), fixed here by reusing the same
- * canonical predicate rather than re-deriving {@code status == COMPLETED}.
+ * <p><b>The STATUS eligibility gate does NOT mirror {@code ReviewService#createReview}</b> — this
+ * was the earlier (incorrect) design and has since been narrowed on purpose. Unlike the
+ * client&rarr;provider direction, this write path requires {@code status == COMPLETED} strictly,
+ * via {@link BookingClosureRule#isProviderReviewEligible}, never the wider {@link
+ * BookingClosureRule#isReviewEligible} an elapsed-but-unclosed {@code CONFIRMED} booking would
+ * satisfy. Rationale: closing the booking is the PROVIDER's own action; letting them rate the
+ * client before performing it lets them submit a rating for a visit they have not yet attested
+ * happened. See {@link BookingClosureRule#isProviderReviewEligible}'s javadoc for the full
+ * argument — do not re-widen this to reuse {@code isReviewEligible}.
  */
 @Service
 @RequiredArgsConstructor
@@ -43,19 +45,11 @@ public class ClientReviewService {
     private final BookingRepository bookingRepository;
     private final AuthorizationService authz;
     private final ApplicationEventPublisher eventPublisher;
-    private final Clock clock;
 
-    /**
-     * Absolute-instant "now" for {@link BookingClosureRule#isReviewEligible} — {@link
-     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, the SAME idiom {@code
-     * BookingService#resolveNow} / {@code ReviewService#resolveNow} / {@code
-     * AppointmentService#resolveNow} use for the identical purpose (Anti-Bug §G: never {@code
-     * Instant.now()} / {@code OffsetDateTime.now()} directly, and never a second, divergent clock
-     * idiom for the same rule).
-     */
-    private OffsetDateTime resolveNow() {
-        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
-    }
+    // No Clock field here — unlike ReviewService#createReview, this write path's eligibility gate
+    // (BookingClosureRule#isProviderReviewEligible) is a pure STATUS check with no TIME half, so
+    // there is no "now" to resolve. Do not re-add a Clock dependency here unless the gate is
+    // deliberately widened again — see the class javadoc for why it should not be.
 
     @Transactional
     public ClientReviewResponse create(UUID actorUserId, CreateClientReviewRequest request) {
@@ -71,14 +65,15 @@ public class ClientReviewService {
         // non-trivial shape decline/complete/reschedule already share via enforceCan*).
         authz.enforceCanReviewClient(actorUserId, booking);
 
-        // 3. 400 if the booking is neither COMPLETED nor an elapsed-but-unclosed CONFIRMED
-        // booking — locked product decision, same as ReviewService#createReview: a booking that
-        // aged into "Past" by elapsed time must be reviewable even when the provider never
-        // closed it out (see BookingClosureRule#isReviewEligible's javadoc). NOT_COMPLETED /
-        // CANCELLED / DECLINED stay unreviewable regardless of endsAt.
-        if (!BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), resolveNow())) {
+        // 3. 400 if the booking is not COMPLETED. Unlike ReviewService#createReview (client-side),
+        // this direction does NOT extend eligibility to an elapsed-but-unclosed CONFIRMED booking
+        // — locked product decision: the PROVIDER controls their own closing action (PATCH
+        // .../complete), so a rating must follow it, never precede or substitute for it. See
+        // BookingClosureRule#isProviderReviewEligible's javadoc for the full rationale.
+        // CONFIRMED (elapsed or not) / NOT_COMPLETED / CANCELLED / DECLINED all stay unreviewable.
+        if (!BookingClosureRule.isProviderReviewEligible(booking.getStatus())) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "This booking is not yet eligible for a review");
+                    "This booking must be marked completed before you can review the client");
         }
 
         // 4. 400 if the booking has no client (guest/LINK booking, V89 chk_bookings_guest_fields)

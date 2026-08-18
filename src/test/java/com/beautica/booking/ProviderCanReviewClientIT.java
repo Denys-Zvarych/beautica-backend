@@ -174,10 +174,10 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("true — the booking is CONFIRMED but its endsAt has already ELAPSED, even though the "
-            + "provider never marked it COMPLETED — the bug fix mirrored from the client-side "
-            + "canReview widening")
-    void should_returnTrue_when_bookingIsConfirmedButElapsed() throws Exception {
+    @DisplayName("false — the booking is CONFIRMED and its endsAt has already ELAPSED, but the "
+            + "provider never marked it COMPLETED — unlike the client-side canReview widening, the "
+            + "provider direction does NOT extend to an elapsed-but-unclosed CONFIRMED booking")
+    void should_returnFalse_when_bookingIsConfirmedButElapsed() throws Exception {
         Salon salon = createSalon("pcrc-elapsed-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("pcrc-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
@@ -186,8 +186,10 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
         JsonNode detail = getBookingDetail(bookingId, tokenFor(salon.ownerEmail()));
 
         assertThat(detail.path("providerCanReviewClient").asBoolean())
-                .as("an elapsed-but-unclosed CONFIRMED booking must offer the provider-review CTA")
-                .isTrue();
+                .as("an elapsed-but-unclosed CONFIRMED booking must NOT offer the provider-review "
+                        + "CTA — the provider controls their own closing action (PATCH "
+                        + ".../complete), so a rating must follow it, never substitute for it")
+                .isFalse();
     }
 
     @Test
@@ -415,6 +417,27 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                 .as("a still-open, non-elapsed CONFIRMED booking can never be reviewed yet — and "
                         + "loadProviderReviewBatch's candidate filter must not change that answer "
                         + "while skipping the lookups")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("LIST false — a CONFIRMED booking whose endsAt has already ELAPSED is still NOT "
+            + "review-eligible on the LIST surface either — loadProviderReviewBatch's candidate "
+            + "pre-filter and the shared providerCanReviewClient conjunction must both apply "
+            + "isProviderReviewEligible (COMPLETED strictly), not the wider client-side "
+            + "isReviewEligible the detail path's own elapsed-CONFIRMED case above also guards")
+    void should_returnFalseOnListRow_when_bookingIsConfirmedButElapsed() throws Exception {
+        Salon salon = createSalon("pcrc-list-elapsed-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("pcrc-list-elapsed-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "CONFIRMED");
+
+        JsonNode row = listRow(bookingId, tokenFor(salon.ownerEmail()));
+
+        assertThat(row.path("providerCanReviewClient").asBoolean())
+                .as("an elapsed-but-unclosed CONFIRMED booking must NOT offer the provider-review "
+                        + "CTA on the LISTING either — the provider must actually close the "
+                        + "booking (PATCH .../complete) before rating the client")
                 .isFalse();
     }
 
