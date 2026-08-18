@@ -28,15 +28,18 @@ import org.springframework.security.core.context.SecurityContextHolder;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -2293,5 +2296,225 @@ class AuthorizationServiceTest {
                 .as("the delegation must be behaviour-identical on the happy path — owner is granted")
                 .isTrue();
         verify(salonRepository).existsByIdAndOwnerId(salonId, actorId);
+    }
+
+    // ── filterBookingIdsWithProviderAuthority — the BATCHED provider-authority gate ─────────────
+    //
+    // The page-scoped twin of hasProviderAuthorityOverBooking, added so GET /bookings/me can put a
+    // real providerCanReviewClient on every provider row instead of the literal `false` it used to
+    // hardcode. Both forms funnel through the same private kernel (hasProviderAuthorityOverRow), so
+    // what is genuinely NEW here — and what these tests exist for — is the batched half:
+    //   • the salon arm is membership of a set resolved in ONE query, not a per-row
+    //     existsByIdAndOwnerId (the `ownedSalonIds::contains` predicate);
+    //   • the `salonId != null` guard still stands in front of that membership test;
+    //   • the live-salon ids handed to the query are DE-DUPLICATED and the query is skipped
+    //     entirely when the page holds no salon-employed master;
+    //   • SALON_ADMIN — the one role the batched form provably cannot answer — is REJECTED rather
+    //     than silently answered "no authority".
+    //
+    // Unit tier, not IT, on purpose: the SALON_ADMIN arm is unreachable over HTTP
+    // (BookingService#listProviderBookings 403s that role before a single row is hydrated), so
+    // contriving an endpoint for it would test a route that does not exist. The list-surface
+    // behaviour this backs is pinned end-to-end in ProviderCanReviewClientIT.
+
+    /** A salon-employed row: {@code masterType = SALON_MASTER}, live salon = {@code salonId}. */
+    private Booking salonBooking(UUID bookingId, UUID salonId) {
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        return salonBookingWithSalon(bookingId, salon);
+    }
+
+    /**
+     * Same shape as {@link #salonBooking}, but with the master's live {@code Salon} supplied
+     * directly — so a test can hand in {@code null} for the detached-master case the
+     * {@code salonId != null} guard exists to answer.
+     */
+    private Booking salonBookingWithSalon(UUID bookingId, Salon salon) {
+        // The master's own User is read for EVERY row (the independent-master arm's argument is
+        // evaluated eagerly, salon rows included), so it must be stubbed even here — it just can
+        // never match the actor, because the independentMasterBooking flag is false.
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(UUID.randomUUID());
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getUser()).thenReturn(masterUser);
+        when(master.getSalon()).thenReturn(salon);
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(bookingId);
+        when(booking.getMaster()).thenReturn(master);
+        return booking;
+    }
+
+    /** An independent-master row: no salon at all, authority is master-user identity. */
+    private Booking independentBooking(UUID bookingId, UUID masterUserId) {
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(masterUserId);
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getUser()).thenReturn(masterUser);
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(bookingId);
+        when(booking.getMaster()).thenReturn(master);
+        return booking;
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — a SALON_OWNER gets back ONLY the rows "
+            + "booked at a salon they own; a row at a salon owned by someone else is excluded even "
+            + "though it is on the same page")
+    void should_returnOnlyRowsAtOwnedSalons_when_filteringPageForSalonOwner() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownedSalonId = UUID.randomUUID();
+        UUID foreignSalonId = UUID.randomUUID();
+        UUID ownedBookingId = UUID.randomUUID();
+        UUID foreignBookingId = UUID.randomUUID();
+
+        // The membership set the batched form tests against — only the owned salon comes back.
+        when(salonRepository.findIdsByIdInAndOwnerId(
+                eq(Set.of(ownedSalonId, foreignSalonId)), eq(ownerId)))
+                .thenReturn(List.of(ownedSalonId));
+
+        Set<UUID> withAuthority = authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.SALON_OWNER, ownerId,
+                List.of(salonBooking(ownedBookingId, ownedSalonId),
+                        salonBooking(foreignBookingId, foreignSalonId)));
+
+        assertThat(withAuthority)
+                .as("the batched form must answer exactly what the per-row form answers: authority "
+                        + "over the owned salon's booking and NOTHING over the foreign salon's. A "
+                        + "predicate laxer than ownedSalonIds::contains would leak %s into this set.",
+                        foreignBookingId)
+                .containsExactly(ownedBookingId);
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — a row whose master has NO live salon "
+            + "(detached from the salon that still holds the booking snapshot) is excluded, and does "
+            + "not corrupt the verdict on the owned row beside it")
+    void should_excludeRowWhoseMasterHasNoLiveSalon_when_filteringPage() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownedSalonId = UUID.randomUUID();
+        UUID ownedBookingId = UUID.randomUUID();
+        UUID detachedBookingId = UUID.randomUUID();
+
+        // Only the one real salon id reaches the query — the detached row contributes nothing.
+        when(salonRepository.findIdsByIdInAndOwnerId(eq(Set.of(ownedSalonId)), eq(ownerId)))
+                .thenReturn(List.of(ownedSalonId));
+
+        Set<UUID> withAuthority = authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.SALON_OWNER, ownerId,
+                List.of(salonBooking(ownedBookingId, ownedSalonId),
+                        salonBookingWithSalon(detachedBookingId, null)));
+
+        assertThat(withAuthority)
+                .as("a salon-employed master with a null live salon has no salon whose ownership "
+                        + "could be tested — the `salonId != null` guard must exclude %s outright, "
+                        + "never fall through to the membership test with a null key",
+                        detachedBookingId)
+                .containsExactly(ownedBookingId);
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — an INDEPENDENT_MASTER's own row is "
+            + "included by master-user identity, and NO salon-ownership query is issued for a page "
+            + "with no salon-employed master")
+    void should_returnIndependentMasterRow_and_issueNoSalonQuery_when_actorIsThatMastersUser() {
+        UUID masterUserId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        Set<UUID> withAuthority = authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.INDEPENDENT_MASTER, masterUserId,
+                List.of(independentBooking(bookingId, masterUserId)));
+
+        assertThat(withAuthority)
+                .as("an independent master holds provider authority over their own booking")
+                .containsExactly(bookingId);
+        verify(salonRepository, never()).findIdsByIdInAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — an INDEPENDENT_MASTER's row is excluded "
+            + "when the actor is a DIFFERENT user, so the independent arm cannot be satisfied by "
+            + "merely being some master")
+    void should_excludeIndependentMasterRow_when_actorIsADifferentUser() {
+        UUID otherMasterUserId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        Set<UUID> withAuthority = authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.INDEPENDENT_MASTER, actorId,
+                List.of(independentBooking(bookingId, otherMasterUserId)));
+
+        assertThat(withAuthority)
+                .as("another independent master's booking must never fall inside this actor's "
+                        + "authority — that would be a cross-master IDOR on the review CTA")
+                .isEmpty();
+        verify(salonRepository, never()).findIdsByIdInAndOwnerId(any(), any());
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — three rows at ONE salon cost exactly ONE "
+            + "salon-ownership query over a DE-DUPLICATED id set, never one query per row")
+    void should_issueExactlyOneDeduplicatedSalonQuery_when_pageHasManyRowsAtOneSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        UUID third = UUID.randomUUID();
+
+        when(salonRepository.findIdsByIdInAndOwnerId(eq(Set.of(salonId)), eq(ownerId)))
+                .thenReturn(List.of(salonId));
+
+        Set<UUID> withAuthority = authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.SALON_OWNER, ownerId,
+                List.of(salonBooking(first, salonId), salonBooking(second, salonId),
+                        salonBooking(third, salonId)));
+
+        assertThat(withAuthority)
+                .as("all three rows sit at the owned salon")
+                .containsExactlyInAnyOrder(first, second, third);
+        // The single strongest signal that this is the BATCHED form and not the per-row one in
+        // disguise: the stubbed argument above is a ONE-element set for a THREE-row page, so a
+        // per-row implementation would neither match the stub nor land on times(1).
+        verify(salonRepository, times(1)).findIdsByIdInAndOwnerId(eq(Set.of(salonId)), eq(ownerId));
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — SALON_ADMIN is REJECTED with "
+            + "IllegalArgumentException before any query, never silently answered \"no authority\"")
+    void should_throwIllegalArgument_when_actorRoleIsSalonAdmin() {
+        UUID adminId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.SALON_ADMIN, adminId, List.of(mock(Booking.class))))
+                .as("the batched form has no assigned-admin arm; answering an admin at all would "
+                        + "under-report the authority they really hold, and an empty result is "
+                        + "indistinguishable from a legitimate denial")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("SALON_ADMIN");
+
+        // Deliberately NOT ForbiddenException: this is a programming error (a caller routed a role
+        // this method cannot answer), and a 403 would look exactly like the silent wrong answer the
+        // guard exists to prevent.
+        assertThatThrownBy(() -> authorizationService.filterBookingIdsWithProviderAuthority(
+                Role.SALON_ADMIN, adminId, List.of()))
+                .isNotInstanceOf(ForbiddenException.class);
+        // The throw fences the whole method — no page is walked and no statement is issued.
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("filterBookingIdsWithProviderAuthority — every role that IS routed here in "
+            + "production (owner / salon master / independent master) is answered, not rejected")
+    void should_notThrow_when_actorRoleIsAnyRoleReachableThroughTheProviderListing() {
+        UUID actorId = UUID.randomUUID();
+
+        for (Role role : List.of(Role.SALON_OWNER, Role.SALON_MASTER, Role.INDEPENDENT_MASTER)) {
+            assertThatCode(() -> authorizationService.filterBookingIdsWithProviderAuthority(
+                    role, actorId, List.of()))
+                    .as("%s reaches this method through BookingService#listProviderBookings and "
+                            + "must be answered", role)
+                    .doesNotThrowAnyException();
+        }
     }
 }

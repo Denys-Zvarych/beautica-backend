@@ -73,6 +73,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -194,19 +195,25 @@ public class BookingService {
 
     /**
      * Viewer-aware predicate backing {@code BookingDetailResponse#providerCanReviewClient}
-     * (extends track 27.x / Phase 27.5) — computed ONLY by {@link #getBooking} (see that DTO
-     * field's javadoc for why every other construction site hardcodes {@code false}).
+     * (extends track 27.x / Phase 27.5) on the single-booking DETAIL path ({@link #getBooking}).
+     * The {@code GET /bookings/me} provider listing computes the same flag through the same
+     * conjunction ({@link #providerCanReviewClient}) but feeds it batched, page-scoped inputs —
+     * see {@link #loadProviderReviewBatch}. {@link #enrichCreated} still passes a literal
+     * {@code false}, and that one remains sound for the reason its own javadoc gives (a
+     * just-created booking can never be {@code COMPLETED}, the only status
+     * {@link BookingClosureRule#isProviderReviewEligible} admits).
      *
      * <p>Mirrors the EXACT conditions {@code ClientReviewService.create} checks before persisting
      * a {@code ClientReview}, so this can never promise a CTA the write endpoint would then
      * reject: (1) the actor has provider review-authority over this booking, via
      * {@link AuthorizationService#hasProviderAuthorityOverBooking} — the same predicate
      * {@code enforceCanReviewClient} throws on, reused non-throwing here rather than
-     * re-derived; (2) {@link BookingClosureRule#isReviewEligible} — {@code status == COMPLETED}
-     * OR an elapsed-but-unclosed {@code CONFIRMED} booking (the SAME predicate the client-side
-     * {@code canReview} flag and {@code ClientReviewService.create}'s write gate both use, so a
-     * booking that aged into Past by elapsed time is never falsely withheld here even though the
-     * provider never closed it — mirrors the fix already applied to the client review path); (3)
+     * re-derived; (2) {@link BookingClosureRule#isProviderReviewEligible} — {@code status ==
+     * COMPLETED}, STRICTLY, unlike the client-side {@code canReview} flag's {@link
+     * BookingClosureRule#isReviewEligible}, which also admits an elapsed-but-unclosed {@code
+     * CONFIRMED} booking. The two directions are deliberately NOT the same predicate here — the
+     * provider controls their own closing action, so a rating must follow it rather than
+     * substitute for it; see {@link BookingClosureRule#isProviderReviewEligible}'s javadoc; (3)
      * the booking has a real client (a guest/LINK booking has none — V89 {@code
      * chk_bookings_guest_fields}); (4) no {@link com.beautica.review.entity.ClientReview} already
      * exists for this booking. A CLIENT or SALON_MASTER viewer always fails condition (1), so this
@@ -238,13 +245,62 @@ public class BookingService {
      *
      * @param now the SAME already-resolved instant {@link #getBooking} uses for {@code canReview}
      *            and {@code awaitingClosure} — never a second, independently-resolved instant.
+     *            Kept on THIS method's signature even though its own body no longer reads it: the
+     *            audit-fix that dropped {@code providerCanReviewClient}'s dead {@code endsAt}/
+     *            {@code now} params (they stopped being consulted when the predicate swapped to
+     *            {@link BookingClosureRule#isProviderReviewEligible}) is scoped to that private
+     *            static method's own two call sites. Widening it into this method's signature too
+     *            would ripple into its single call site in {@link #getBooking} for no behavioural
+     *            gain — {@code now} is resolved there once for canReview/awaitingClosure regardless
+     *            of what this method does with it, so leave it here rather than chase the ripple.
      */
     private boolean computeProviderCanReviewClient(UUID actorUserId, Booking booking, OffsetDateTime now) {
-        return !authz.isOwningClientViewer(actorUserId, booking)
-                && authz.hasProviderAuthorityOverBooking(actorUserId, booking)
-                && BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now)
-                && booking.getClient() != null
-                && !clientReviewRepository.existsByBookingId(booking.getId());
+        boolean hasProviderAuthority = !authz.isOwningClientViewer(actorUserId, booking)
+                && authz.hasProviderAuthorityOverBooking(actorUserId, booking);
+        return providerCanReviewClient(
+                hasProviderAuthority, booking.getStatus(),
+                booking.getClient() != null,
+                () -> clientReviewRepository.existsByBookingId(booking.getId()));
+    }
+
+    /**
+     * {@code providerCanReviewClient = provider authority over the booking && status == COMPLETED
+     * && a registered client exists to be reviewed && no {@code ClientReview} already exists}.
+     * The provider&rarr;client mirror of {@link #canReview} in SHAPE only — the STATUS half is
+     * <b>NOT</b> the same predicate. This delegates to {@link
+     * BookingClosureRule#isProviderReviewEligible} (strictly {@code status == COMPLETED}), never
+     * {@link BookingClosureRule#isReviewEligible} (which also admits an elapsed-but-unclosed
+     * {@code CONFIRMED} booking) — see {@link BookingClosureRule#isProviderReviewEligible}'s
+     * javadoc for why the provider direction does not get that widening: the provider controls
+     * their own closing action, so a rating must follow it rather than substitute for it.
+     *
+     * <p><b>This is the single definition shared by BOTH surfaces that expose the flag</b>:
+     * {@link #computeProviderCanReviewClient} (the {@code GET /bookings/&#123;id&#125;} detail
+     * path, which supplies authority from {@code AuthorizationService}'s per-row entity predicate
+     * and review-existence from a single {@code existsByBookingId}) and {@link
+     * #listProviderBookings} (the {@code GET /bookings/me} provider listing, which supplies the
+     * same two inputs from the page-scoped batched lookups in {@link #loadProviderReviewBatch}).
+     * Conjuncts and their ORDER are therefore identical on both, which is the point: before this
+     * method existed the listing hardcoded {@code false} and the two surfaces disagreed on every
+     * completed booking — the archive CTA stayed lit after the provider had already left feedback,
+     * because the mobile card could not trust a flag that was a constant. Do not re-derive this
+     * conjunction at either call site.
+     *
+     * <p>{@code clientReviewExists} is a {@link BooleanSupplier}, not a {@code boolean}, so the
+     * detail path keeps paying its {@code client_reviews} probe ONLY when the cheap in-memory
+     * conjuncts have not already decided the answer — the short-circuit that keeps
+     * {@code GET /bookings/&#123;id&#125;} at its pinned statement count
+     * ({@code BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ALIGNED}). An eagerly-evaluated
+     * argument would fire that query on every single detail read, including the future-dated
+     * CONFIRMED bookings that are the common case.
+     */
+    private static boolean providerCanReviewClient(
+            boolean hasProviderAuthority, BookingStatus status, boolean hasClient,
+            BooleanSupplier clientReviewExists) {
+        return hasProviderAuthority
+                && BookingClosureRule.isProviderReviewEligible(status)
+                && hasClient
+                && !clientReviewExists.getAsBoolean();
     }
 
     /**
@@ -438,9 +494,11 @@ public class BookingService {
      * (no N+1), same as before this phase.
      *
      * <p><b>Provider roles</b> (master / salon-owner) reuse the established two-query ID-page +
-     * graph-hydrate pattern (Fix H1), then add exactly two bounded follow-ups for the page:
-     * one batched {@code findReviewedBookingIds} and the two-query label resolution — never a
-     * per-row lookup.
+     * graph-hydrate pattern (Fix H1), then add only bounded, page-scoped follow-ups — never a
+     * per-row lookup: {@code ReviewRepository#findReviewedBookingIds} (the client&rarr;provider
+     * direction, backing {@code canReview}), the two-query label resolution, and at most two more
+     * for {@code providerCanReviewClient} (see {@link #loadProviderReviewBatch}, which skips both
+     * whenever no row on the page can qualify). The count is flat in page size on every branch.
      *
      * <p><b>Phase 26.1 — multi-select status.</b> {@code status} widened from a single optional
      * {@link BookingStatus} to a repeatable {@link List}, bound by Spring from both
@@ -941,8 +999,11 @@ public class BookingService {
     }
 
     /**
-     * Provider path — ID-page + graph hydrate (Fix H1), then one batched review-existence
-     * query and the two-query label resolution for the whole page.
+     * Provider path — ID-page + graph hydrate (Fix H1), then the batched review-existence
+     * queries (one per review DIRECTION — see {@link #loadProviderReviewBatch} for the
+     * provider&rarr;client one and its salon-ownership companion) and the two-query label
+     * resolution for the whole page. Every follow-up is bounded by the page and flat in its size;
+     * nothing here is per row.
      *
      * <p><b>Phase 28.2.</b> {@code partition != null} routes each branch to its {@code
      * ...ByPartition} repository counterpart instead of the {@code statuses}-filtered method —
@@ -996,6 +1057,9 @@ public class BookingService {
         // Batched review-existence for the whole page (one query), so canReview is correct
         // without a per-row existsByBookingId (§E: no N+1).
         Set<UUID> reviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(idPage.getContent()));
+        // Same batching discipline for the provider->client direction: at most two more bounded
+        // statements for the WHOLE page, never a per-row probe. See loadProviderReviewBatch.
+        ProviderReviewBatch providerReview = loadProviderReviewBatch(role, actorUserId, hydrated);
         DiscoveryLabels labels = resolveBookingLabels(hydrated);
 
         // Restore the original ordering dictated by the pageable sort — the IN clause
@@ -1010,16 +1074,93 @@ public class BookingService {
                     UUID districtId = discoveryDistrictId(b);
                     boolean canReview = canReview(
                             b.getStatus(), b.getEndsAt(), now, reviewed.contains(b.getId()), b.getClient() != null);
-                    // providerCanReviewClient hardcoded false: this row-by-row path backs
-                    // GET /bookings/me's provider listing, which is out of scope for the
-                    // "Залишити відгук про клієнта" CTA this field gates — see
-                    // BookingDetailResponse's class javadoc. Only GET /bookings/{id}
-                    // (BookingService#getBooking) computes it for real.
+                    // Real per-row value, through the SAME conjunction GET /bookings/{id} uses
+                    // (providerCanReviewClient below) — only its two DB-bound inputs come from the
+                    // page-scoped batches instead of per-row probes. It was hardcoded false here
+                    // until the archive-CTA fix; a constant on the wire is worse than an absent
+                    // field, because a client that maps it faithfully can never clear the CTA.
+                    boolean providerCanReviewClient = providerCanReviewClient(
+                            providerReview.withAuthority().contains(b.getId()),
+                            b.getStatus(), b.getClient() != null,
+                            () -> providerReview.alreadyReviewed().contains(b.getId()));
                     return BookingDetailResponse.from(
-                            b, canReview, false, labels.cityLabel(cityId), labels.districtLabel(districtId), now);
+                            b, canReview, providerCanReviewClient,
+                            labels.cityLabel(cityId), labels.districtLabel(districtId), now);
                 })
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
+    }
+
+    /**
+     * The two DB-bound inputs {@link #providerCanReviewClient} needs, resolved ONCE for a whole
+     * provider page.
+     *
+     * @param withAuthority   ids of the page's rows the actor holds provider authority over
+     * @param alreadyReviewed ids among those that already carry a {@code ClientReview}
+     */
+    private record ProviderReviewBatch(Set<UUID> withAuthority, Set<UUID> alreadyReviewed) {
+        static final ProviderReviewBatch EMPTY = new ProviderReviewBatch(Set.of(), Set.of());
+    }
+
+    /**
+     * Batched counterpart of the two per-row lookups {@link #computeProviderCanReviewClient} makes
+     * on the single-booking detail path, for the {@code GET /bookings/me} provider listing.
+     *
+     * <p><b>Adds at most TWO statements per page request, and neither scales with page size:</b>
+     * one {@code SalonRepository#findIdsByIdInAndOwnerId} over the page's DE-DUPLICATED live-salon
+     * ids (inside {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, skipped
+     * outright when every master on the page is independent) and one
+     * {@code ClientReviewRepository#findReviewedBookingIds} over a single bounded {@code IN} list.
+     * The alternative — calling {@link #computeProviderCanReviewClient} per row — is a double N+1:
+     * an authority query AND a {@code client_reviews} probe for every row, plus a live-salon proxy
+     * initialisation per distinct salon.
+     *
+     * <p><b>The two early returns are pure cost gates and cannot change any row's flag.</b> They
+     * mirror, in the same order, the conjuncts {@link #providerCanReviewClient} evaluates before it
+     * would consult either batch: a row that is not review-eligible or has no registered client is
+     * {@code false} by that method regardless of what these lookups would have said, and so is a
+     * row absent from {@code withAuthority}. Narrowing the ids handed to each query is therefore
+     * semantics-preserving by construction — it is the page-level form of the identical
+     * short-circuit {@link #getBooking} applies to its own {@code existsByBookingId} probe. The
+     * eligibility pre-filter uses {@link BookingClosureRule#isProviderReviewEligible} (STATUS only,
+     * strictly {@code status == COMPLETED}) — NOT {@link BookingClosureRule#isReviewEligible} — so
+     * this batch and {@link #providerCanReviewClient}'s own conjunct can never disagree about which
+     * candidates are worth an authority/review-existence lookup. No {@code now} parameter is needed
+     * here any more: unlike the client-side eligibility rule, the provider one has no TIME half.
+     *
+     * <p><b>{@code AuthorizationService#isOwningClientViewer} is deliberately not consulted here</b>,
+     * though {@link #computeProviderCanReviewClient} leads with it. That gate is a COST gate on the
+     * detail path (it keeps an owning-CLIENT viewer out of the provider-authority walk) and is
+     * documented there as unable to change the flag's value. On this path it cannot even apply: the
+     * role dispatch in {@link #getMyBookings} routes {@code Role.CLIENT} to
+     * {@code listClientBookings}, so no caller reaching here is a client, let alone the booking's
+     * own. Adding it would buy nothing and would introduce a {@code SecurityContext} read on a path
+     * that is called directly, without one, by {@code BookingPriceRangeContractIT}.
+     *
+     * <p><b>{@code role} is passed through purely as an assertion.</b>
+     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} has no {@code SALON_ADMIN}
+     * arm and now throws rather than silently answering "no authority" for one; the role dispatch in
+     * {@link #listProviderBookings} already rejects {@code SALON_ADMIN} with a
+     * {@code ForbiddenException} before any row is hydrated, so that throw is unreachable from here.
+     * It exists so that relaxing the dispatch fails loudly instead of quietly under-reporting an
+     * assigned admin's authority.
+     */
+    private ProviderReviewBatch loadProviderReviewBatch(
+            Role role, UUID actorUserId, List<Booking> page) {
+        List<Booking> candidates = page.stream()
+                .filter(b -> b.getClient() != null
+                        && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
+                .toList();
+        if (candidates.isEmpty()) {
+            return ProviderReviewBatch.EMPTY;
+        }
+        Set<UUID> withAuthority =
+                authz.filterBookingIdsWithProviderAuthority(role, actorUserId, candidates);
+        if (withAuthority.isEmpty()) {
+            return ProviderReviewBatch.EMPTY;
+        }
+        return new ProviderReviewBatch(withAuthority,
+                Set.copyOf(clientReviewRepository.findReviewedBookingIds(List.copyOf(withAuthority))));
     }
 
     /**

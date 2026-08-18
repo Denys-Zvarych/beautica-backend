@@ -19,6 +19,39 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
     boolean existsByBookingId(UUID bookingId);
 
     /**
+     * Batch existence check: the subset of the supplied booking ids that already carry a
+     * provider&rarr;client review. Mirrors {@code ReviewRepository#findReviewedBookingIds}
+     * (the client&rarr;provider direction) exactly — same shape, same purpose.
+     *
+     * <p>Used by {@code BookingService#listProviderBookings} to compute
+     * {@code providerCanReviewClient} for a page of provider-scoped bookings in ONE statement
+     * instead of a per-row {@link #existsByBookingId} (anti-bug §E: no N+1). The caller narrows
+     * the id list to the rows that are still candidates (review-eligible, with a registered
+     * client, and inside the actor's provider authority) before calling, so the {@code IN} list
+     * is bounded by the page and the statement is skipped entirely when no row qualifies —
+     * the same "only query when it can flip the result" short-circuit
+     * {@code BookingService#getBooking} applies on the single-row path.
+     *
+     * @implNote <b>UNSCOPED — the caller MUST pre-narrow {@code bookingIds} to bookings the actor
+     * holds provider authority over</b> (anti-bug §E-4: repository finders are unscoped by default).
+     * This query has no actor predicate whatsoever: it answers "which of these bookings carry a
+     * provider&rarr;client review" for ANY id list handed to it, including bookings belonging to a
+     * different salon or master. That is deliberate — the authority decision is not the repository's
+     * to make, and folding an {@code actorId} in here would duplicate, in JPQL, the ownership rule
+     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} owns, giving two
+     * implementations that can drift. It is safe ONLY because the sole caller,
+     * {@code BookingService#loadProviderReviewBatch}, passes exactly the {@code withAuthority} set
+     * that method returned, and returns early when it is empty. Review-existence is a weak signal
+     * (a boolean per id, no review content), but it is still information about a stranger's booking,
+     * and a caller that skipped the narrowing would additionally hand attacker-chosen ids straight
+     * into an unbounded {@code IN} list. Any NEW caller must narrow first, or this method must gain
+     * its own scoping before that caller lands. Contrast {@code SalonRepository#findIdsByIdInAndOwnerId},
+     * which IS actor-scoped ({@code s.owner.id = :ownerId}) and needs no such contract.
+     */
+    @Query("SELECT cr.booking.id FROM ClientReview cr WHERE cr.booking.id IN :bookingIds")
+    List<UUID> findReviewedBookingIds(@Param("bookingIds") List<UUID> bookingIds);
+
+    /**
      * Recalculates {@code users.avg_rating}/{@code users.review_count} for one client, mirroring
      * {@code ReviewRepository#recalculateMasterRating}'s single-pass native aggregate exactly
      * (same {@code COALESCE}-to-{@code NULL} no-reviews handling — unlike the master/salon

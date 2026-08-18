@@ -3422,15 +3422,15 @@ class BookingServiceTest {
     // ── getBooking — providerCanReviewClient truth table (track 27.x / Phase 27.5) ──
     //
     // providerCanReviewClient = authz.hasProviderAuthorityOverBooking(actor, booking)
-    //     && BookingClosureRule.isReviewEligible(status, endsAt, now)
+    //     && BookingClosureRule.isProviderReviewEligible(status)
     //     && booking.getClient() != null
     //     && !clientReviewRepository.existsByBookingId(booking.getId())
     //
-    // isReviewEligible = (status == COMPLETED) OR (status == CONFIRMED && endsAt.isBefore(now)) —
-    // widened by the same fix already applied to the client-side canReview/ReviewService path
-    // (mirrored bug: a booking that ages into Past by elapsed time but is never closed by the
-    // provider must still be reviewable). See the dedicated ELAPSED-true / FUTURE-false /
-    // NOT_COMPLETED-still-false cases below.
+    // isProviderReviewEligible = status == COMPLETED, STRICTLY — unlike the client-side
+    // canReview/ReviewService path's BookingClosureRule#isReviewEligible, this direction does NOT
+    // widen to an elapsed-but-unclosed CONFIRMED booking: the provider controls their own closing
+    // action (PATCH .../complete), so a rating must follow it, never substitute for it. See the
+    // dedicated ELAPSED-still-false / FUTURE-false / NOT_COMPLETED-still-false cases below.
     //
     // ProviderCanReviewClientIT already pins this end-to-end through real HTTP + role/authority
     // resolution. These cases isolate BookingService#computeProviderCanReviewClient itself via a
@@ -3492,10 +3492,11 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("providerCanReviewClient is true for a CONFIRMED booking whose endsAt has already "
-            + "ELAPSED, even though the provider never marked it COMPLETED — the bug fix mirrored "
-            + "from the client-side canReview/ReviewService widening")
-    void should_returnProviderCanReviewClientTrue_when_bookingConfirmedButElapsed() {
+    @DisplayName("providerCanReviewClient is false for a CONFIRMED booking whose endsAt has already "
+            + "ELAPSED, even though the client-side canReview/ReviewService path would treat this "
+            + "same shape as reviewable — the provider direction requires COMPLETED strictly, and "
+            + "the review-existence check is never reached")
+    void should_returnProviderCanReviewClientFalse_when_bookingConfirmedButElapsed() {
         // buildBookingStartingAt with a past startsAt yields endsAt = startsAt + 1h, still
         // strictly before "now" (clock is fixed at Instant.now() in setUp) for a 3h-ago start.
         Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.CONFIRMED,
@@ -3503,21 +3504,21 @@ class BookingServiceTest {
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
-        when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
 
         BookingDetailResponse result = bookingService.getBooking(clientId, bookingId);
 
         assertThat(result.providerCanReviewClient())
-                .as("an elapsed-but-unclosed CONFIRMED booking must offer the provider-review CTA, "
-                        + "same as the client-side canReview flag already does for this row shape")
-                .isTrue();
-        verify(clientReviewRepository).existsByBookingId(bookingId);
+                .as("an elapsed-but-unclosed CONFIRMED booking must NOT offer the provider-review "
+                        + "CTA — the provider must actually close the booking before rating the "
+                        + "client")
+                .isFalse();
+        verify(clientReviewRepository, never()).existsByBookingId(any());
     }
 
     @Test
     @DisplayName("providerCanReviewClient stays false for a NOT_COMPLETED (no-show) booking even "
             + "with an elapsed endsAt and provider authority — guards against over-widening "
-            + "isReviewEligible beyond CONFIRMED")
+            + "isProviderReviewEligible beyond COMPLETED")
     void should_returnProviderCanReviewClientFalse_when_bookingNotCompletedNoShow() {
         Booking booking = buildBookingStartingAt(bookingId, client, master, msa, BookingStatus.NOT_COMPLETED,
                 ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
@@ -3569,6 +3570,74 @@ class BookingServiceTest {
         assertThat(result.providerCanReviewClient())
                 .as("a booking that already has a client review must never re-offer the CTA")
                 .isFalse();
+    }
+
+    // ── listProviderBookings — loadProviderReviewBatch pre-filter (audit-fix cycle 1, item 1) ──
+    //
+    // The pre-filter in BookingService#loadProviderReviewBatch narrows the page to
+    // (client != null && BookingClosureRule.isProviderReviewEligible(status)) BEFORE issuing
+    // AuthorizationService#filterBookingIdsWithProviderAuthority and
+    // ClientReviewRepository#findReviewedBookingIds. Every existing providerCanReviewClient test
+    // exercises the FINAL conjunction (which re-checks isProviderReviewEligible on its own), so a
+    // pre-filter mutation is invisible there. These two tests instead assert on the pre-filter's
+    // only observable effect: which booking ids reach the two batched queries.
+
+    @Test
+    @DisplayName("loadProviderReviewBatch's pre-filter passes ONLY the COMPLETED booking id to the "
+            + "batched authority/review-existence queries, excluding a sibling elapsed-but-unclosed "
+            + "CONFIRMED booking in the same page")
+    void should_passOnlyCompletedBookingId_toProviderReviewBatchQueries_when_pageMixesCompletedAndElapsedConfirmed() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking completedBooking = buildBooking(UUID.randomUUID(), client, master, msa, BookingStatus.COMPLETED);
+        Booking elapsedConfirmedBooking = buildBookingStartingAt(UUID.randomUUID(), client, master, msa,
+                BookingStatus.CONFIRMED, ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
+        List<UUID> pageIds = List.of(completedBooking.getId(), elapsedConfirmedBooking.getId());
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(pageIds));
+        when(bookingRepository.findAllByIdsWithGraph(pageIds))
+                .thenReturn(List.of(completedBooking, elapsedConfirmedBooking));
+        when(reviewRepository.findReviewedBookingIds(pageIds)).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+        when(authz.filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking)))
+                .thenReturn(Set.of(completedBooking.getId()));
+        when(clientReviewRepository.findReviewedBookingIds(List.of(completedBooking.getId())))
+                .thenReturn(List.of());
+
+        bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
+
+        verify(authz).filterBookingIdsWithProviderAuthority(Role.SALON_OWNER, actorId, List.of(completedBooking));
+        verify(clientReviewRepository).findReviewedBookingIds(List.of(completedBooking.getId()));
+    }
+
+    @Test
+    @DisplayName("loadProviderReviewBatch short-circuits BEFORE either batched query when every row "
+            + "in the page is CONFIRMED (none COMPLETED) — the empty-candidate fast path must not "
+            + "issue the authority lookup or the review-existence lookup at all")
+    void should_skipBothBatchedQueries_when_noRowInPageIsProviderReviewEligible() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking futureConfirmedBooking = buildBooking(UUID.randomUUID(), client, master, msa, BookingStatus.CONFIRMED);
+        Booking elapsedConfirmedBooking = buildBookingStartingAt(UUID.randomUUID(), client, master, msa,
+                BookingStatus.CONFIRMED, ZonedDateTime.now(clock).minusHours(3).toOffsetDateTime());
+        List<UUID> pageIds = List.of(futureConfirmedBooking.getId(), elapsedConfirmedBooking.getId());
+
+        when(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of(salonId));
+        when(bookingRepository.findIdsBySalonIdsFiltered(List.of(salonId), null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(pageIds));
+        when(bookingRepository.findAllByIdsWithGraph(pageIds))
+                .thenReturn(List.of(futureConfirmedBooking, elapsedConfirmedBooking));
+        when(reviewRepository.findReviewedBookingIds(pageIds)).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        bookingService.getMyBookings(actorId, buildAuth(Role.SALON_OWNER), null, null, null, null, pageable);
+
+        verify(authz, never()).filterBookingIdsWithProviderAuthority(any(), any(), any());
+        verify(clientReviewRepository, never()).findReviewedBookingIds(any());
     }
 
     // ── getBooking — enriched fields (Phase 19.3) ────────────────────────────────

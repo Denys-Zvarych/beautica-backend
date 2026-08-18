@@ -10,6 +10,8 @@ import jakarta.persistence.criteria.Root;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.OffsetDateTime;
 import java.util.EnumSet;
@@ -95,6 +97,48 @@ class BookingClosureRuleTest {
     void should_returnFalse_when_completedWithElapsedEndsAt() {
         assertThat(BookingClosureRule.isAwaitingClosure(
                 BookingStatus.COMPLETED, NOW.minusYears(1), NOW)).isFalse();
+    }
+
+    // ── isProviderReviewEligible — full-enum truth table (fix: PROVIDER(master)→CLIENT review ────
+    // ── gate must require COMPLETED strictly; a CONFIRMED-but-elapsed booking must NOT qualify) ──
+
+    @ParameterizedTest
+    @EnumSource(BookingStatus.class)
+    @DisplayName("isProviderReviewEligible — true iff status == COMPLETED; every other current or "
+            + "future BookingStatus value must be false. Parameterised over the full enum on "
+            + "purpose: a new status added later is picked up automatically instead of silently "
+            + "defaulting to untested")
+    void should_returnTrueOnlyForCompleted_when_evaluatingProviderReviewEligibilityAcrossAllStatuses(
+            BookingStatus status) {
+        boolean expected = status == BookingStatus.COMPLETED;
+
+        assertThat(BookingClosureRule.isProviderReviewEligible(status))
+                .as("status=%s", status)
+                .isEqualTo(expected);
+    }
+
+    // ── the asymmetry itself — the load-bearing fact a future "consistency cleanup" would erase ──
+
+    @Test
+    @DisplayName("the CLIENT->PROVIDER and PROVIDER->CLIENT eligibility rules DISAGREE on the same "
+            + "elapsed-but-unclosed CONFIRMED booking, on purpose — isReviewEligible admits it "
+            + "(true), isProviderReviewEligible rejects it (false). Pinned so a future reader "
+            + "cannot 'consistency-clean' isProviderReviewEligible into delegating to "
+            + "isReviewEligible without this test going red — see BookingClosureRule"
+            + "#isProviderReviewEligible's javadoc, which explicitly warns against that collapse")
+    void should_disagreeOnElapsedUnclosedConfirmedBooking_when_comparingClientAndProviderEligibility() {
+        OffsetDateTime elapsedEndsAt = NOW.minusMinutes(1);
+
+        assertThat(BookingClosureRule.isReviewEligible(BookingStatus.CONFIRMED, elapsedEndsAt, NOW))
+                .as("CLIENT->PROVIDER direction: an elapsed-but-unclosed CONFIRMED booking must "
+                        + "stay reviewable by the client — the client has no lever over whether "
+                        + "the provider ever closes the booking out")
+                .isTrue();
+        assertThat(BookingClosureRule.isProviderReviewEligible(BookingStatus.CONFIRMED))
+                .as("PROVIDER->CLIENT direction: the SAME booking shape must NOT be reviewable by "
+                        + "the provider — closing the booking is the provider's own action, and "
+                        + "rating the client before performing it is exactly the bug this fix closes")
+                .isFalse();
     }
 
     // ── awaitingClosure — the Criteria Specification form ───────────────────────────────────────
