@@ -40,10 +40,35 @@ public sealed interface StaffBookingScope {
     /**
      * A salon-scoped staff booking: the target master must belong to {@code salonId}.
      *
-     * <p>Constructed by 22.4 for a {@code SALON_OWNER} or {@code SALON_ADMIN} caller, from the salon
-     * derived off the target master and re-verified against the caller's management rights — never
-     * from a client-supplied path variable or body field (phase-171 amendment A2 removed
-     * {@code {salonId}} from the route for exactly that reason).
+     * <p><b>{@code salonId} is the CALLER's salon — never the target master's.</b> The only
+     * sanctioned producer is {@code StaffBookingScopeResolver} (Phase 22.4), which reads it out of a
+     * query keyed on the authenticated actor and nothing else: {@code salons.owner_id = :actorId} for
+     * a {@code SALON_OWNER}, {@code users.salon_id} for a {@code SALON_ADMIN}. It is never taken from
+     * a client-supplied path variable or body field (phase-171 amendment A2 removed
+     * {@code &#123;salonId&#125;} from the route for exactly that reason), and it is never derived
+     * from the target master — the single-salon owner and admin branches do not read the master at
+     * all.
+     *
+     * <p><b>Why deriving it from the master would be a vulnerability, not a shortcut.</b>
+     * {@code StaffBookingService#assertMasterInScope}'s {@code InSalon} arm is
+     * {@code master.getSalon().getId().equals(inSalon.salonId())}. Populate {@code salonId} from
+     * {@code master.getSalon()} and that arm compares the master's salon <em>against itself</em> — a
+     * tautology that can never fail, collapsing 100% of the salon path's defence in depth onto the
+     * {@code @PreAuthorize} annotation alone. An earlier revision of this javadoc described the value
+     * as "derived off the target master and re-verified", which is precisely the shape that is
+     * forbidden; {@code StaffBookingScopeResolverTest} pins the correct provenance both by value and
+     * by {@code verifyNoInteractions(masterRepository)}.
+     *
+     * <p>The one branch that touches the master — a multi-salon owner, who has no
+     * {@code &#123;salonId&#125;} in the route to disambiguate with — uses it only as a
+     * <em>selector among salons already proven to be the caller's</em>
+     * ({@code MasterRepository#findSalonIdByIdAndSalonOwnerId} carries the ownership predicate inside
+     * the query, and the result is re-checked against the actor-keyed set).
+     *
+     * <p>Note the asymmetry with {@link Self}, and that it is deliberate: 22.2 cross-checks
+     * {@code Self} against the trusted {@code actorId} itself, so a body-sourced {@code Self} is
+     * inert; {@code InSalon}'s claim — "the caller manages this salon" — needs a membership lookup
+     * that can only live in the resolver.
      */
     record InSalon(UUID salonId) implements StaffBookingScope {
         public InSalon {

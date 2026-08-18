@@ -1,0 +1,130 @@
+package com.beautica.booking.controller;
+
+import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.dto.CreateStaffBookingRequest;
+import com.beautica.booking.dto.StaffBookingScope;
+import com.beautica.booking.service.StaffBookingScopeResolver;
+import com.beautica.booking.service.StaffBookingService;
+import com.beautica.common.ApiResponse;
+import com.beautica.common.security.AuthenticationUtils;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.UUID;
+
+/**
+ * HTTP surface for provider-created (walk-in / phone-in) bookings — Phase 22.4.
+ *
+ * <h2>Route: no {@code &#123;salonId&#125;}</h2>
+ * {@code POST /api/v1/masters/&#123;masterId&#125;/bookings} (amendment A2). An
+ * {@code INDEPENDENT_MASTER} has no salon to put in such a segment, and a {@code Master} belongs to
+ * at most one salon anyway — so carrying the salon in the path bought nothing except a
+ * salonId/masterId <b>mismatch</b> state that a guard then had to police. Deriving the salon removes
+ * the failure mode instead of guarding it.
+ *
+ * <h2>Where authorization happens, and why in two places</h2>
+ * <ol>
+ *   <li><b>Role gate + {@code @authz.canBookForMaster}</b> on the method. One predicate, keyed on
+ *       the TARGET's {@code masterType} (amendment A3). It answers 403 — never 404 — for an unknown,
+ *       inactive or closed-salon master, so {@code masterId} cannot be probed for existence. Because
+ *       method security runs before the handler, this also fixes the ordering against 22.2's own
+ *       indistinct 404 for the same condition: over HTTP an unauthorized caller can never reach it.</li>
+ *   <li><b>{@link StaffBookingScopeResolver}</b> then derives the {@link StaffBookingScope} FROM THE
+ *       CALLER. This is not the gate repeated (Anti-Bug §D): SpEL cannot return a value, and the
+ *       scope is the datum 22.2's {@code assertMasterInScope} needs. Deriving
+ *       {@code InSalon.salonId} from the target master instead would make that check compare the
+ *       master's salon against itself — see the resolver's Javadoc.</li>
+ * </ol>
+ *
+ * <h2>The actor never comes from the body</h2>
+ * {@code actorId} is read here from the security context and handed to
+ * {@code StaffBookingService#createStaffBooking} as its own parameter.
+ * {@code bookings.created_by_user_id} is the ONLY attribution a staff booking carries — there is
+ * deliberately no fourth {@code BookingSource} value for an independent master's self-booking
+ * (amendment A7), the discriminator being
+ * {@code created_by_user_id = (SELECT user_id FROM masters WHERE id = booking.master_id)} — so a
+ * spoofable actor would destroy the audit trail. See {@link CreateStaffBookingRequest} for the
+ * fields deliberately absent from the wire shape.
+ *
+ * <h2>Not here</h2>
+ * No notification and no SMS. The walk-in SMS is Phase 22.7 (built in full, gated OFF), and no
+ * outbox enqueue is specified for a staff booking — inventing one now would risk double-notifying
+ * when 22.7 lands. <b>Open product question, flagged not decided:</b> a master currently gets a
+ * calendar row and no message when someone books on their behalf.
+ */
+@RestController
+@RequestMapping("/api/v1/masters/{masterId}/bookings")
+@RequiredArgsConstructor
+@Tag(name = "Staff bookings", description = "Provider-created walk-in / phone-in bookings")
+public class StaffBookingController {
+
+    private final StaffBookingService staffBookingService;
+    private final StaffBookingScopeResolver staffBookingScopeResolver;
+
+    /**
+     * Creates one {@code CONFIRMED}, {@code STAFF}-sourced booking for an account-less walk-in.
+     *
+     * @param masterId the master whose calendar the booking lands on — authorised by
+     *                 {@code canBookForMaster} before this method runs
+     * @param request  the walk-in identity, service and start; validated at the boundary
+     * @param auth     the authenticated caller — the ONLY source of both the actor id and the scope
+     */
+    @PostMapping
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') "
+            + "and @authz.canBookForMaster(authentication, #masterId)")
+    @Operation(
+            summary = "Create a walk-in booking on a master's calendar",
+            description = """
+                    Salon owners and admins may book any master of the salon they manage; an
+                    independent master may book only themselves. The salon the booking is scoped to
+                    is derived from the caller, never from the request. The booking is created
+                    CONFIRMED with source STAFF, no cancel token, and created_by_user_id set to the
+                    caller. The guest phone is normalised to E.164 server-side; non-Ukrainian
+                    numbers are rejected. No SMS or notification is sent by this endpoint.""",
+            security = @SecurityRequirement(name = "bearerAuth"))
+    @ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "201", description = "Booking created"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "400", description = "Invalid payload, phone, or start time",
+                    content = @io.swagger.v3.oas.annotations.media.Content()),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "403",
+                    description = "Not authorised for this master — also returned for an unknown "
+                            + "or inactive master, so the id cannot be probed for existence",
+                    content = @io.swagger.v3.oas.annotations.media.Content()),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "Service not performed by this master",
+                    content = @io.swagger.v3.oas.annotations.media.Content()),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409",
+                    description = "Start is off-schedule or the window is already taken",
+                    content = @io.swagger.v3.oas.annotations.media.Content())
+    })
+    public ResponseEntity<ApiResponse<BookingResponse>> createStaffBooking(
+            @PathVariable UUID masterId,
+            @Valid @RequestBody CreateStaffBookingRequest request,
+            Authentication auth
+    ) {
+        UUID actorId = AuthenticationUtils.userId(auth);
+        StaffBookingScope scope = staffBookingScopeResolver.resolve(auth, masterId);
+
+        BookingResponse response =
+                staffBookingService.createStaffBooking(request.toCommand(masterId, scope), actorId);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.ok(response));
+    }
+}

@@ -179,9 +179,98 @@ class BookingRateLimitFilterTest {
                 "PUT", "/api/v1/masters/" + masterId + "/overrides/" + date);
     }
 
+    /** Phase 22.4 — the staff walk-in create, {@code POST /masters/{masterId}/bookings}. */
+    private static MockHttpServletRequest postStaffBooking(UUID masterId) {
+        return new MockHttpServletRequest("POST", "/api/v1/masters/" + masterId + "/bookings");
+    }
+
+    /** The provider-facing read of a master's calendar — a GET, and never throttled. */
+    private static MockHttpServletRequest getMasterBookings(UUID masterId) {
+        return new MockHttpServletRequest("GET", "/api/v1/masters/" + masterId + "/bookings");
+    }
+
     private static MockHttpServletRequest postOverrideConflictsPreview(UUID masterId) {
         return new MockHttpServletRequest(
                 "POST", "/api/v1/masters/" + masterId + "/overrides/conflicts");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Percent-encoded spellings of the SAME routes. Spring MVC routes on the DECODED path, so
+    // each of these reaches the identical controller handler as its plain sibling above — and
+    // must therefore consume the identical bucket. `%73` = 's', `%65` = 'e', `%6c` = 'l'; none
+    // is a trailing slash, matrix variable or encoded slash, so StrictHttpFirewall lets them
+    // through untouched.
+    // ---------------------------------------------------------------------------------------
+
+    /** {@code POST /api/v1/booking%73} — the client create, spelled to dodge an exact-equals match. */
+    private static MockHttpServletRequest postCreateEncoded() {
+        return new MockHttpServletRequest("POST", "/api/v1/booking%73");
+    }
+
+    /** {@code POST /api/v1/masters/{masterId}/booking%73} — the staff walk-in create. */
+    private static MockHttpServletRequest postStaffBookingEncoded(UUID masterId) {
+        return new MockHttpServletRequest("POST", "/api/v1/masters/" + masterId + "/booking%73");
+    }
+
+    /** {@code PATCH /api/v1/bookings/{bookingId}/declin%65} — the SMS-spend budget's route. */
+    private static MockHttpServletRequest patchDeclineEncoded(UUID bookingId) {
+        return new MockHttpServletRequest("PATCH", "/api/v1/bookings/" + bookingId + "/declin%65");
+    }
+
+    /** {@code PUT /api/v1/masters/{masterId}/override%73/{date}} — the bulk-decline budget's route. */
+    private static MockHttpServletRequest putScheduleOverrideEncoded(UUID masterId, LocalDate date) {
+        return new MockHttpServletRequest(
+                "PUT", "/api/v1/masters/" + masterId + "/override%73/" + date);
+    }
+
+    /** {@code PATCH /api/v1/appointments/{appointmentId}/cance%6c} — a whole-visit mutation. */
+    private static MockHttpServletRequest patchAppointmentCancelEncoded(UUID appointmentId) {
+        return new MockHttpServletRequest("PATCH", "/api/v1/appointments/" + appointmentId + "/cance%6c");
+    }
+
+    /**
+     * {@code POST /api/v1/master%73/{masterId}/bookings} — the staff create with its PREFIX
+     * re-spelled instead of its suffix. Every rule in {@link BookingRateLimitFilter#selectRoute} is
+     * a conjunction of a {@code startsWith} and a {@code endsWith}/{@code contains}; the fixtures
+     * above only ever attack the second half, so the first half was matched exclusively against
+     * plain spellings. An attacker picks whichever half is cheaper.
+     */
+    private static MockHttpServletRequest postStaffBookingPrefixEncoded(UUID masterId) {
+        return new MockHttpServletRequest("POST", "/api/v1/master%73/" + masterId + "/bookings");
+    }
+
+    /**
+     * {@code POST /api/v1/masters/{masterId}/bookings;v=1} — a matrix parameter on the LAST
+     * segment. {@code UrlPathHelper.setRemoveSemicolonContent(true)} strips it and Spring MVC does
+     * the same, so this reaches the identical handler — but the raw URI does not satisfy
+     * {@code endsWith("/bookings")}.
+     *
+     * <p>The segment placement is load-bearing, not cosmetic: hung off the {@code {masterId}}
+     * segment instead ({@code /masters/{id};v=1/bookings}) the raw URI still satisfies BOTH halves
+     * of the rule, so such a fixture would pass with the decode step reverted and pin nothing.
+     */
+    private static MockHttpServletRequest postStaffBookingWithMatrixParameter(UUID masterId) {
+        return new MockHttpServletRequest("POST", "/api/v1/masters/" + masterId + "/bookings;v=1");
+    }
+
+    /**
+     * {@code POST /api/v1//masters/{masterId}/bookings} — a duplicated slash, which
+     * {@code UrlPathHelper}'s sanitiser collapses. Neither this nor the matrix shape is percent
+     * encoding, and both are handled by a DIFFERENT step of {@link
+     * BookingRateLimitFilter#resolveMatchPath} than {@code %73} is — so the encoded-literal tests
+     * do not cover them.
+     */
+    private static MockHttpServletRequest postStaffBookingWithDuplicateSlash(UUID masterId) {
+        return new MockHttpServletRequest("POST", "/api/v1//masters/" + masterId + "/bookings");
+    }
+
+    /**
+     * {@code POST /api/v1/masters/{masterId}/bookings/bulk} — no such route exists; the fixture
+     * exists to pin the filter javadoc's explicit claim that a future sub-path would be
+     * <em>unbucketed</em> rather than silently inheriting the staff-create budget.
+     */
+    private static MockHttpServletRequest postBelowStaffBookingRoute(UUID masterId) {
+        return new MockHttpServletRequest("POST", "/api/v1/masters/" + masterId + "/bookings/bulk");
     }
 
     @Test
@@ -971,6 +1060,106 @@ class BookingRateLimitFilterTest {
                 .isNotNull();
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Phase 22.4 — POST /masters/{masterId}/bookings (staff walk-in create). SEC MEDIUM,
+    // 2026-08-18: this was the ONLY booking-create path in the app with no bucket at all, while
+    // POST /bookings and POST /appointments both consumed bookingWriteBuckets. It is not just row
+    // spam — StaffBookingService takes the PER-MASTER advisory lock the CLIENT create path also
+    // takes, so one compromised staff token could queue unbounded contention on a master real
+    // clients are booking; from 22.7 it is an SMS-spend pump too.
+    // -------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("should_return429_when_staffBookingCreateBudgetExhausted")
+    void should_return429_when_staffBookingCreateBudgetExhausted() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        MockHttpServletResponse firstResponse = new MockHttpServletResponse();
+        MockFilterChain firstChain = new MockFilterChain();
+        filter.doFilterInternal(postStaffBooking(masterId), firstResponse, firstChain);
+        assertThat(firstResponse.getStatus())
+                .as("the first staff create within capacity must be forwarded")
+                .isNotEqualTo(429);
+        assertThat(firstChain.getRequest()).isNotNull();
+
+        MockHttpServletResponse secondResponse = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(postStaffBooking(masterId), secondResponse, secondChain);
+
+        assertThat(secondResponse.getStatus())
+                .as("POST /masters/{masterId}/bookings must be throttled on the create budget — it "
+                        + "previously had no bucket at all")
+                .isEqualTo(429);
+        assertThat(secondResponse.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(secondChain.getRequest())
+                .as("a throttled staff create must NOT reach the per-master advisory lock")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_shareOneBucket_when_sameStaffAlternatesClientCreateAndStaffCreate")
+    void should_shareOneBucket_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
+        // The staff create must draw on the SAME per-user budget as POST /bookings, so a caller
+        // cannot double their create allowance by alternating the two routes.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse staffResponse = new MockHttpServletResponse();
+        filter.doFilterInternal(postStaffBooking(UUID.randomUUID()), staffResponse, new MockFilterChain());
+
+        assertThat(staffResponse.getStatus())
+                .as("the shared write bucket must already be exhausted by the earlier POST /bookings")
+                .isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("should_throttleAcrossMasters_when_sameStaffTargetsDifferentMasters")
+    void should_throttleAcrossMasters_when_sameStaffTargetsDifferentMasters() throws Exception {
+        // The bucket is keyed on the CALLER, not on {masterId} — otherwise one token could spray
+        // one create per master and evade the budget entirely.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(postStaffBooking(UUID.randomUUID()), new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse otherMasterResponse = new MockHttpServletResponse();
+        filter.doFilterInternal(
+                postStaffBooking(UUID.randomUUID()), otherMasterResponse, new MockFilterChain());
+
+        assertThat(otherMasterResponse.getStatus())
+                .as("switching target master must not refill the caller's create budget")
+                .isEqualTo(429);
+    }
+
+    @Test
+    @DisplayName("should_passThrough_when_masterBookingsPathIsAReadNotACreate")
+    void should_passThrough_when_masterBookingsPathIsAReadNotACreate() throws Exception {
+        // Guards the new startsWith/endsWith matcher against widening to the whole prefix: only the
+        // POST is a create. A GET on the identical path must stay unthrottled.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        filter.doFilterInternal(getMasterBookings(masterId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse secondResponse = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(getMasterBookings(masterId), secondResponse, secondChain);
+
+        assertThat(secondResponse.getStatus()).isNotEqualTo(429);
+        assertThat(secondChain.getRequest()).isNotNull();
+
+        // ...and the single-slot bucket must still be intact for a real staff create.
+        MockHttpServletResponse createResponse = new MockHttpServletResponse();
+        filter.doFilterInternal(postStaffBooking(masterId), createResponse, new MockFilterChain());
+        assertThat(createResponse.getStatus())
+                .as("the write bucket must be untouched by the GETs above")
+                .isNotEqualTo(429);
+    }
+
     @Test
     @DisplayName("should_passThrough_when_appointmentPathIsAReadNotACoveredMutation")
     void should_passThrough_when_appointmentPathIsAReadNotACoveredMutation() throws Exception {
@@ -984,5 +1173,294 @@ class BookingRateLimitFilterTest {
 
         assertThat(getResponse.getStatus()).isNotEqualTo(429);
         assertThat(getChain.getRequest()).isNotNull();
+    }
+
+    // ===========================================================================================
+    // Path matching — decoded + normalized, not raw getRequestURI() (SEC HIGH, 2026-08-18).
+    //
+    // selectRoute used to match on request.getRequestURI(), which the servlet container returns
+    // STILL PERCENT-ENCODED, while Spring MVC routes on the DECODED path. Every one of the five
+    // routes in this filter was therefore bypassable by re-spelling one literal character of the
+    // rule — POST /api/v1/masters/{id}/booking%73 reaches StaffBookingController normally but
+    // endsWith("/bookings") is false, so no token is consumed. Mirrors
+    // AuthRateLimitFilterTest.PercentEncodingAndNormalizationBypass, which pins the identical fix
+    // on the auth buckets (PR #95). Each test below spends the caller's single slot on the PLAIN
+    // spelling first, then asserts the ENCODED spelling hits the SAME exhausted bucket — proving
+    // both "it is bucketed" and "it is the same bucket", not merely that it 429s somewhere.
+    // ===========================================================================================
+
+    @Test
+    @DisplayName("should_throttle_when_staffBookingCreatePathIsPercentEncoded")
+    void should_throttle_when_staffBookingCreatePathIsPercentEncoded() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        filter.doFilterInternal(postStaffBooking(masterId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse encodedResponse = new MockHttpServletResponse();
+        MockFilterChain encodedChain = new MockFilterChain();
+        filter.doFilterInternal(postStaffBookingEncoded(masterId), encodedResponse, encodedChain);
+
+        assertThat(encodedResponse.getStatus())
+                .as("POST /masters/{id}/booking%73 routes to the staff create and must consume the "
+                        + "SAME already-exhausted write bucket as the plain spelling")
+                .isEqualTo(429);
+        assertThat(encodedResponse.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(encodedChain.getRequest())
+                .as("a throttled encoded staff create must NOT reach the per-master advisory lock")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_throttle_when_declinePathIsPercentEncoded")
+    void should_throttle_when_declinePathIsPercentEncoded() throws Exception {
+        BookingRateLimitFilter filter = filterWithDeclineBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID bookingId = UUID.randomUUID();
+
+        filter.doFilterInternal(patchDecline(bookingId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse encodedResponse = new MockHttpServletResponse();
+        MockFilterChain encodedChain = new MockFilterChain();
+        filter.doFilterInternal(patchDeclineEncoded(bookingId), encodedResponse, encodedChain);
+
+        assertThat(encodedResponse.getStatus())
+                .as("PATCH /bookings/{id}/declin%65 must consume the SAME decline bucket — this is "
+                        + "the SMS-spend path from Phase 22.7, the costliest route to leave unbucketed")
+                .isEqualTo(429);
+        assertThat(encodedResponse.getHeader("Retry-After")).isEqualTo("60");
+        assertThat(encodedChain.getRequest())
+                .as("a throttled encoded decline must NOT reach the SMS dispatch")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_throttle_when_clientCreatePathIsPercentEncoded")
+    void should_throttle_when_clientCreatePathIsPercentEncoded() throws Exception {
+        // POST /api/v1/bookings is matched by exact equals, the strictest of the five rules — and
+        // therefore the one an encoded spelling defeats most completely.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse encodedResponse = new MockHttpServletResponse();
+        MockFilterChain encodedChain = new MockFilterChain();
+        filter.doFilterInternal(postCreateEncoded(), encodedResponse, encodedChain);
+
+        assertThat(encodedResponse.getStatus())
+                .as("POST /api/v1/booking%73 must consume the SAME write bucket as POST /api/v1/bookings")
+                .isEqualTo(429);
+        assertThat(encodedChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_throttle_when_scheduleOverrideWritePathIsPercentEncoded")
+    void should_throttle_when_scheduleOverrideWritePathIsPercentEncoded() throws Exception {
+        // The bulk-decline budget: one PUT can mass-decline up to MAX_CONFLICTS_PER_WRITE bookings.
+        BookingRateLimitFilter filter = filterWithOverrideBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 9, 14);
+
+        filter.doFilterInternal(putScheduleOverride(masterId, date), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse encodedResponse = new MockHttpServletResponse();
+        MockFilterChain encodedChain = new MockFilterChain();
+        filter.doFilterInternal(putScheduleOverrideEncoded(masterId, date), encodedResponse, encodedChain);
+
+        assertThat(encodedResponse.getStatus())
+                .as("PUT /masters/{id}/override%73/{date} must consume the SAME schedule-override bucket")
+                .isEqualTo(429);
+        assertThat(encodedResponse.getHeader("Retry-After")).isEqualTo("60");
+        assertThat(encodedChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_throttle_when_appointmentMutationPathIsPercentEncoded")
+    void should_throttle_when_appointmentMutationPathIsPercentEncoded() throws Exception {
+        // The /appointments/{id}/* PATCH family — the fifth and last route shape in selectRoute.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID appointmentId = UUID.randomUUID();
+
+        filter.doFilterInternal(patchAppointmentCancel(appointmentId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse encodedResponse = new MockHttpServletResponse();
+        MockFilterChain encodedChain = new MockFilterChain();
+        filter.doFilterInternal(patchAppointmentCancelEncoded(appointmentId), encodedResponse, encodedChain);
+
+        assertThat(encodedResponse.getStatus())
+                .as("PATCH /appointments/{id}/cance%6c must consume the SAME write bucket — the "
+                        + "appointments header's SELECT ... FOR UPDATE is exactly what this budget protects")
+                .isEqualTo(429);
+        assertThat(encodedChain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("should_notOverMatch_when_decodedPathIsStillAnUncoveredRoute")
+    void should_notOverMatch_when_decodedPathIsStillAnUncoveredRoute() throws Exception {
+        // The decode must not WIDEN matching: a route that is legitimately uncovered stays
+        // uncovered after decoding. PATCH /bookings/{id}/complete is deliberately unbucketed
+        // (see the filter's class javadoc), and so is its encoded spelling.
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID bookingId = UUID.randomUUID();
+
+        var first = new MockFilterChain();
+        filter.doFilterInternal(
+                new MockHttpServletRequest("PATCH", "/api/v1/bookings/" + bookingId + "/complet%65"),
+                new MockHttpServletResponse(), first);
+        var secondResponse = new MockHttpServletResponse();
+        var secondChain = new MockFilterChain();
+        filter.doFilterInternal(
+                new MockHttpServletRequest("PATCH", "/api/v1/bookings/" + bookingId + "/complet%65"),
+                secondResponse, secondChain);
+
+        assertThat(first.getRequest()).isNotNull();
+        assertThat(secondResponse.getStatus())
+                .as("single-booking complete carries no lock-contention risk and must stay unthrottled, "
+                        + "encoded or not")
+                .isNotEqualTo(429);
+        assertThat(secondChain.getRequest()).isNotNull();
+    }
+
+    // ===========================================================================================
+    // The half of each rule the encoded-literal tests above never attack, and the new route's
+    // neighbours (Phase 22.4 QA).
+    //
+    // Every rule in selectRoute is `startsWith(PREFIX) && endsWith(SUFFIX)`. The five tests above
+    // re-spell the SUFFIX only, so a passing suite proved nothing about the PREFIX literal — and
+    // resolveMatchPath's javadoc separately advertises two NON-percent normalizations (";matrix"
+    // stripping and "//" collapse) that no test in this file exercised at all. Each test below
+    // spends the caller's single slot on the plain spelling first, so a 429 can only mean the
+    // evasive spelling landed in the SAME bucket.
+    // ===========================================================================================
+
+    @Test
+    @DisplayName("the staff create is throttled when its /masters/ PREFIX segment is percent-encoded")
+    void should_throttle_when_theStaffCreatePrefixSegmentIsPercentEncoded() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        filter.doFilterInternal(postStaffBooking(masterId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockFilterChain chain = new MockFilterChain();
+        filter.doFilterInternal(postStaffBookingPrefixEncoded(masterId), response, chain);
+
+        assertThat(response.getStatus())
+                .as("POST /api/v1/master%%73/{id}/bookings satisfies endsWith(\"/bookings\") but not a "
+                        + "raw startsWith(\"/api/v1/masters/\") — it must still consume the SAME "
+                        + "already-exhausted write bucket")
+                .isEqualTo(429);
+        assertThat(response.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(chain.getRequest())
+                .as("a throttled prefix-encoded staff create must NOT reach the per-master advisory lock")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("the staff create is throttled when a matrix parameter is hung off the master segment")
+    void should_throttle_when_theStaffCreatePathCarriesAMatrixParameter() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        filter.doFilterInternal(postStaffBooking(masterId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockFilterChain chain = new MockFilterChain();
+        filter.doFilterInternal(postStaffBookingWithMatrixParameter(masterId), response, chain);
+
+        assertThat(response.getStatus())
+                .as("setRemoveSemicolonContent(true) is load-bearing, not cosmetic: /masters/{id};v=1/"
+                        + "bookings reaches the same handler and must consume the SAME write bucket")
+                .isEqualTo(429);
+        assertThat(chain.getRequest()).isNull();
+    }
+
+    @Test
+    @DisplayName("the staff create is throttled when the path carries a duplicated slash")
+    void should_throttle_when_theStaffCreatePathHasADuplicatedSlash() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        filter.doFilterInternal(postStaffBooking(masterId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockFilterChain chain = new MockFilterChain();
+        filter.doFilterInternal(postStaffBookingWithDuplicateSlash(masterId), response, chain);
+
+        assertThat(response.getStatus())
+                .as("UrlPathHelper's slash collapse is the third normalization resolveMatchPath relies "
+                        + "on; /api/v1//masters/{id}/bookings must consume the SAME write bucket")
+                .isEqualTo(429);
+        assertThat(chain.getRequest()).isNull();
+    }
+
+    /**
+     * Phase 22.4 put a SECOND rule on the {@code /api/v1/masters/} prefix, immediately above the
+     * schedule-override rule, and the two deliberately hold DIFFERENT budgets (10s vs 60s
+     * {@code Retry-After}). The existing suite pins override≠decline but never override≠write, so
+     * an over-broad staff-create rule — {@code contains("/bookings")}, a dropped method check, a
+     * shared bucket argument — would have merged the two budgets with every test still green.
+     */
+    @Test
+    @DisplayName("exhausting the staff-create budget leaves the schedule-override budget untouched")
+    void should_notShareBucket_when_staffCreateAndScheduleOverrideAreCalledBySameActor() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        filter.doFilterInternal(postStaffBooking(masterId), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse exhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(postStaffBooking(masterId), exhausted, new MockFilterChain());
+
+        MockHttpServletResponse overrideResponse = new MockHttpServletResponse();
+        MockFilterChain overrideChain = new MockFilterChain();
+        filter.doFilterInternal(
+                putScheduleOverride(masterId, LocalDate.of(2026, 9, 14)), overrideResponse, overrideChain);
+
+        assertThat(exhausted.getStatus())
+                .as("the staff-create budget is spent")
+                .isEqualTo(429);
+        assertThat(overrideResponse.getStatus())
+                .as("the schedule-override write has its OWN bucket and a 60s Retry-After; a spent "
+                        + "create budget must not throttle it")
+                .isNotEqualTo(429);
+        assertThat(overrideChain.getRequest())
+                .as("the override write must reach the handler")
+                .isNotNull();
+    }
+
+    /**
+     * The filter's own javadoc on {@code BOOKINGS_SUFFIX} states that a hypothetical
+     * {@code POST .../bookings/bulk} "would be silently unbucketed rather than inheriting this one".
+     * That is a deliberate, documented limitation and the note tells the next author to add a route
+     * entry — so it needs to stay true by test, not by comment. The follow-up call proves the
+     * caller's single slot was still intact, i.e. the sub-path consumed nothing.
+     */
+    @Test
+    @DisplayName("a sub-path below the staff-create route consumes no token and is not bucketed")
+    void should_passThrough_when_aSubPathBelowTheStaffCreateRouteIsPosted() throws Exception {
+        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID masterId = UUID.randomUUID();
+
+        MockHttpServletResponse bulkResponse = new MockHttpServletResponse();
+        MockFilterChain bulkChain = new MockFilterChain();
+        filter.doFilterInternal(postBelowStaffBookingRoute(masterId), bulkResponse, bulkChain);
+
+        MockHttpServletResponse firstStaffCreate = new MockHttpServletResponse();
+        filter.doFilterInternal(postStaffBooking(masterId), firstStaffCreate, new MockFilterChain());
+        MockHttpServletResponse secondStaffCreate = new MockHttpServletResponse();
+        filter.doFilterInternal(postStaffBooking(masterId), secondStaffCreate, new MockFilterChain());
+
+        assertThat(bulkResponse.getStatus())
+                .as("endsWith(\"/bookings\") is false for .../bookings/bulk — no rule matches")
+                .isNotEqualTo(429);
+        assertThat(bulkChain.getRequest()).isNotNull();
+        assertThat(firstStaffCreate.getStatus())
+                .as("the caller's single slot must still be unspent after the sub-path call")
+                .isNotEqualTo(429);
+        assertThat(secondStaffCreate.getStatus())
+                .as("and exactly one slot existed, so the next real create is throttled")
+                .isEqualTo(429);
     }
 }

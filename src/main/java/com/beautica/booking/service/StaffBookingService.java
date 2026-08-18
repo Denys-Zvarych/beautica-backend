@@ -142,6 +142,23 @@ public class StaffBookingService {
         // findByIdWithUserAndSalon (not a salon-only variant): the Self scope arm below reads
         // master.getUser().getId(), so the `user` JOIN FETCH is load-bearing, not surplus — see the
         // class-level note under "Nothing is re-implemented".
+        //
+        // THIS IS THE SECOND READ OF THE SAME ROW, AND IT IS DELIBERATE (LOW, security + perf,
+        // accepted 2026-08-18). AuthorizationService#canBookForMaster already loaded this master by
+        // the same PK in the @PreAuthorize gate. Do not "optimise" the pair away:
+        //   * Passing the gate's instance in as a `preloaded` argument saves nothing.
+        //     open-in-view is false and StaffBookingController is not @Transactional, so that
+        //     instance is DETACHED by the time this method's persistence context opens; using it
+        //     would need a merge(), which reissues this exact SELECT. Net zero, plus a merge. This
+        //     is NOT the VisitPlanner `preloaded` pattern used a few lines below — that one hands
+        //     entities down WITHIN one transaction, where they stay managed.
+        //   * This read is a TOCTOU NARROWING, not waste: MasterBookability and master.getSalon()
+        //     are re-evaluated against committed state INSIDE the transaction that inserts. Reusing
+        //     the gate's snapshot would widen the race to span the whole authz step, so a master
+        //     deactivated (or a salon closed) between gate and insert would still get a booking.
+        //   * Nor may the gate move in here: that forfeits the before-handler ordering which makes
+        //     the 404 below unreachable over HTTP for an unauthorized caller — this phase's core
+        //     property. See AuthorizationService#canBookForMaster's "Accepted costs" javadoc.
         Master master = masterRepository.findByIdWithUserAndSalon(cmd.masterId())
                 .filter(MasterBookability::isBookable)
                 .orElseThrow(() -> new NotFoundException("Master not found or inactive"));
