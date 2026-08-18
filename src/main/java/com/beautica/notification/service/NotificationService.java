@@ -1,6 +1,7 @@
 package com.beautica.notification.service;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
 import com.beautica.common.util.Placeholders;
@@ -182,9 +183,33 @@ public class NotificationService {
         // NOT_COMPLETED) stays the pre-25.7 clean no-op — do not widen this branch to a new
         // status without a dedicated guest-booking test (track 24.x fixed seven separate
         // client==null null-derefs in exactly this area).
+        //
+        // Phase 22.1 (security): the SMS half is gated on the SOURCE, not on the null client.
+        // V137 makes client_id IS NULL reachable for a STAFF walk-in — a phone TYPED IN by a salon
+        // employee about a third party, verified by nothing. A LINK guest, by contrast, proved
+        // their number by answering an OTP before the booking existed. Keying the SMS on
+        // `client == null` would treat the two identically and turn every staff-entered digit
+        // string into a destination the platform sends Beautica-branded, provider-authored text
+        // to with no consent step anywhere: a typo texts a stranger, and a deliberate entry makes
+        // us an on-demand SMS relay (unsolicited-SMS amplification, sender-reputation damage,
+        // Turbosms cost). The gate is "SMS iff LINK" and both halves are pinned by
+        // NotificationServiceTest (#should_notSendDeclineSms_when_staffWalkInBookingDeclined /
+        // #should_stillSendDeclineSms_when_linkGuestBookingDeclined).
+        //
+        // The null-client early return itself stays, and must: it is what keeps getClient()
+        // .getEmail() below from NPEing. Narrowing this outer `if` to `client == null && LINK`
+        // would drop a STAFF walk-in straight into the registered-client email/push path.
+        //
+        // Conjunct ORDER is deliberate — status first, source second. Both orders are equally
+        // correct at runtime, but source-first short-circuits before reading the status on every
+        // non-LINK row, which leaves the status stub unexercised in the CONFIRMED/COMPLETED/
+        // NOT_COMPLETED no-op regression test and trips Mockito's UnnecessaryStubbingException.
+        // Status-first also reads better: DECLINED is still the primary discriminator (25.7), and
+        // the source gate narrows it.
         if (booking.getClient() == null) {
-            if (booking.getStatus() == BookingStatus.DECLINED) {
-                sendGuestDeclineSms(booking);
+            if (booking.getStatus() == BookingStatus.DECLINED
+                    && booking.getBookingSource() == BookingSource.LINK) {
+                sendLinkGuestDeclineSms(booking);
             } else {
                 log.debug("Skipping STATUS_CHANGED notification for account-less guest booking {}", booking.getId());
             }
@@ -427,12 +452,18 @@ public class NotificationService {
     }
 
     /**
-     * Dispatches the guest-decline SMS (Phase 25.7). Failures are swallowed after logging the
-     * exception class only — never the phone or message text (Anti-Bug §I) — mirroring
-     * {@code BookingCancellationService.sendCancellationSms}: the booking is already committed
-     * as DECLINED, so an SMS-provider failure must not fail outbox dispatch.
+     * Dispatches the decline SMS for a {@code LINK} guest booking (Phase 25.7). Failures are
+     * swallowed after logging the exception class only — never the phone or message text
+     * (Anti-Bug §I) — mirroring {@code BookingCancellationService.sendCancellationSms}: the booking
+     * is already committed as DECLINED, so an SMS-provider failure must not fail outbox dispatch.
+     *
+     * <p>Named for {@code LINK} rather than "guest" deliberately (Phase 22.1): a STAFF walk-in is
+     * also account-less, but its phone was typed by an employee about a third party rather than
+     * proven by the recipient's own OTP, so it is NOT an eligible destination. Only the LINK branch
+     * of {@link #notifyBookingStatusChanged(BookingVisit)} may call this — do not re-generalise
+     * this method to "any booking with a guestPhone".
      */
-    private void sendGuestDeclineSms(Booking booking) {
+    private void sendLinkGuestDeclineSms(Booking booking) {
         String phone = booking.getGuestPhone();
         if (phone == null || phone.isBlank()) {
             log.warn("Guest DECLINED booking {} has no guestPhone — skipping decline SMS", booking.getId());
