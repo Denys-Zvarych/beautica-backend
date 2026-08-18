@@ -10,6 +10,9 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.dashboard.dto.RevenueResponse;
 import com.beautica.master.dto.MasterDetailResponse;
+import com.beautica.master.dto.WeeklyScheduleDayRequest;
+import com.beautica.master.dto.WeeklyScheduleRequest;
+import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -41,6 +44,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -181,6 +185,32 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.OK);
         log.debug("Step 4 complete — working hours set for masterId={}", masterId);
 
+        // ── Step 4b: publish the WEEKLY SCHEDULE the availability resolver actually reads ──────
+        // PATCH .../working-hours above writes the LEGACY `working_hours` table. Since Phase 15.4
+        // the effective-day oracle behind slot generation (SlotCalculationService →
+        // MasterScheduleService#resolveEffectiveDay) reads `weekly_schedules` + `working_intervals`
+        // ONLY — it never looks at `working_hours`. That divergence was invisible while create
+        // validated nothing but lead-time/horizon/overlap; now that all create paths gate on
+        // schedule fit (BookingSlotAvailabilityGuard, 2026-08-11), a master whose hours exist only
+        // in the legacy table has an EMPTY slot list and every booking is a 409 "Slot not
+        // available". Seed the modern template through its own public endpoint — same 08:00–20:00
+        // every ISO weekday — so Step 7's start lands on a real slot.
+        var weeklyReq = new WeeklyScheduleRequest(
+                LocalDate.now(KYIV), null,
+                java.util.stream.IntStream.rangeClosed(1, 7)
+                        .mapToObj(isoDow -> new WeeklyScheduleDayRequest(isoDow, List.of(
+                                new WorkIntervalDto(java.time.LocalTime.of(8, 0),
+                                        java.time.LocalTime.of(20, 0)))))
+                        .toList());
+        ResponseEntity<String> weeklyResp = restTemplate.exchange(
+                "/api/v1/masters/" + masterId + "/weekly-schedules", HttpMethod.POST,
+                new HttpEntity<>(weeklyReq, bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(weeklyResp.getStatusCode())
+                .as("create weekly schedule must return 201, body=%s", weeklyResp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        log.debug("Step 4b complete — weekly schedule published for masterId={}", masterId);
+
         // ── Step 5: create a service definition ───────────────────────────────
         // Since Phase 16.x / V111, service_type_id is mandatory (@NotNull) and must belong to
         // the request's category — resolve a real seeded HAIRDRESSING service type via the same
@@ -256,6 +286,21 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
                 .as("booking must be CONFIRMED in DB immediately after creation")
                 .isEqualTo("CONFIRMED");
         log.debug("Step 7 complete — bookingId={} auto-confirmed", bookingId);
+
+        // ── Step 7.5: fast-forward the booking's startsAt into the past ────────
+        // BookingTemporalGuard.assertElapsedForComplete (Phase 27.1, already committed on this
+        // branch) requires startsAt <= now before a booking can be completed — this fixture books
+        // 2 days ahead (Step 7) so BookingStartsAtValidator's lead-time floor is satisfied at CREATE
+        // time, then immediately called /complete, which the guard now (correctly) rejects with 409.
+        // BookingStartsAtValidator forbids creating a booking in the past outright, so the only way
+        // to get an elapsed CONFIRMED booking is to create it in the future and fast-forward its
+        // startsAt afterwards — via a direct SQL update, never by weakening or bypassing the guard
+        // itself. Only starts_at moves; the booking has no other master booking to overlap with in
+        // this isolated test, so no exclusion constraint is at risk.
+        jdbcTemplate.update(
+                "UPDATE bookings SET starts_at = ? WHERE id = ?",
+                OffsetDateTime.now(KYIV).minusMinutes(5), bookingId);
+        log.debug("Step 7.5 complete — bookingId={} startsAt fast-forwarded into the past", bookingId);
 
         // ── Step 8: owner completes the booking ───────────────────────────────
         ResponseEntity<Void> completeResp = restTemplate.exchange(

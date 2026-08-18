@@ -46,7 +46,11 @@ class PlatformCategoryOrderLookup {
         this.platformCategoryRepository = platformCategoryRepository;
     }
 
-    @Cacheable(value = CACHE_NAME, key = CACHE_KEY)
+    // sync = true: since PlatformCategoryLabelResolver put this list on the public
+    // (permitAll) free-text search path, a TTL expiry on this ONE constant key would
+    // otherwise let every concurrent search request issue its own findApprovedActive()
+    // — a thundering herd on the single hottest key in the application.
+    @Cacheable(value = CACHE_NAME, key = CACHE_KEY, sync = true)
     @Transactional(readOnly = true)
     List<PlatformCategory> getApprovedActive() {
         return platformCategoryRepository.findApprovedActive();

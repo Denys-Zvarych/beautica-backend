@@ -632,6 +632,89 @@ class MediaServiceTest {
         verify(r2, times(3)).deleteFile(anyString());
     }
 
+    // ------------------------------------- avatar blob coverage in the deleteByUploader sweep
+
+    @Test
+    @DisplayName("purges the users.avatar_r2_key blob and nulls both avatar columns in the deleteByUploader sweep")
+    void should_purgeAvatarBlob_when_deleteByUploaderSweeps() {
+        UUID uploaderId = UUID.randomUUID();
+        User uploader = newUser(uploaderId);
+        uploader.setAvatarR2Key("avatars/" + uploaderId + "/photo.jpg");
+        uploader.setAvatarUrl("https://r2/avatars/" + uploaderId + "/photo.jpg");
+        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
+                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
+                .mediaType(MediaType.PORTFOLIO).r2Key("k-a").r2Url("u-a").build();
+        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(uploader));
+        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of(portfolio));
+
+        service.deleteByUploader(uploaderId);
+
+        // The avatar blob lives on the users row, not in media_files — a media-rows-only
+        // sweep would leave it publicly retrievable after the account is deleted.
+        verify(r2).deleteFile("avatars/" + uploaderId + "/photo.jpg");
+        verify(r2).deleteFile("k-a");
+        assertThat(uploader.getAvatarR2Key()).isNull();
+        assertThat(uploader.getAvatarUrl()).isNull();
+        verify(userRepo).save(uploader);
+    }
+
+    @Test
+    @DisplayName("still purges the avatar blob when the uploader owns no media_files rows")
+    void should_purgeAvatarBlob_when_uploaderHasNoMediaRows() {
+        // Regression guard: the sweep's `rows.isEmpty()` short-circuit must not skip the
+        // avatar. A CLIENT with a profile photo and no portfolio is exactly this case.
+        UUID uploaderId = UUID.randomUUID();
+        User uploader = newUser(uploaderId);
+        uploader.setAvatarR2Key("avatars/" + uploaderId + "/photo.jpg");
+        uploader.setAvatarUrl("https://r2/avatars/" + uploaderId + "/photo.jpg");
+        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(uploader));
+        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of());
+
+        service.deleteByUploader(uploaderId);
+
+        verify(r2).deleteFile("avatars/" + uploaderId + "/photo.jpg");
+        assertThat(uploader.getAvatarR2Key()).isNull();
+        assertThat(uploader.getAvatarUrl()).isNull();
+    }
+
+    @Test
+    @DisplayName("does not touch R2 in the deleteByUploader sweep when the uploader has no avatar")
+    void should_skipAvatarSweep_when_uploaderHasNoAvatar() {
+        UUID uploaderId = UUID.randomUUID();
+        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(newUser(uploaderId)));
+        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of());
+
+        service.deleteByUploader(uploaderId);
+
+        verifyNoInteractions(r2);
+    }
+
+    @Test
+    @DisplayName("continues the deleteByUploader sweep and redacts the key when the avatar R2 delete fails")
+    void should_continueSweep_when_avatarR2DeleteFails() {
+        UUID uploaderId = UUID.randomUUID();
+        User uploader = newUser(uploaderId);
+        String avatarKey = "avatars/" + uploaderId + "/photo.jpg";
+        uploader.setAvatarR2Key(avatarKey);
+        uploader.setAvatarUrl("https://r2/" + avatarKey);
+        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(uploader));
+        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of());
+        doThrow(new RuntimeException("transient R2 outage")).when(r2).deleteFile(avatarKey);
+        listAppender.list.clear();
+
+        // Best-effort, mirroring the per-row policy: no throw, DB pointer dropped anyway.
+        service.deleteByUploader(uploaderId);
+
+        assertThat(uploader.getAvatarR2Key()).isNull();
+        List<ILoggingEvent> warns = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warns).hasSize(1);
+        assertThat(warns.get(0).getFormattedMessage())
+                .contains("[key omitted]")
+                .doesNotContain(avatarKey);
+    }
+
     // ---------------------------------------------------- QA MEDIUM #3 — getPortfolio
 
     @Test

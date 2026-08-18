@@ -1,12 +1,14 @@
 package com.beautica.config;
 
 import com.beautica.booking.filter.BookingRateLimitFilter;
+import com.beautica.booking.service.ScheduleOverrideConflictService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.BandwidthBuilder;
 import io.github.bucket4j.Bucket;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -130,16 +132,51 @@ public class RateLimitConfig {
 
     private static final Duration SUGGEST_SERVICE_TYPE_WINDOW = Duration.ofMinutes(60);
 
-    // Per-IP cap for the two first-time bulk-service-setup endpoints (60-second window):
+    // Per-IP cap for the two bulk-service-create endpoints (60-second window):
     //   - POST /api/v1/independent-masters/me/services/bulk
     //   - POST /api/v1/salons/{salonId}/masters/{masterId}/services/bulk
-    // Even the 409 (first-time-only) path runs full 100-item validation, so this is an
-    // authenticated DoS-amplifier surface — kept low (10/min) to match the other write
+    // Every call runs full 100-item validation + persistence, and the path is additive (no
+    // cheap precondition rejects repeat calls), so this is an authenticated DoS-amplifier
+    // surface — kept low (10/min) to match the other write
     // buckets (media, profile-update, device-token). IP-keyed for consistency with every
     // other bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs).
     // Configurable so integration tests on 127.0.0.1 can raise the cap.
     @Value("${app.rate-limit.bulk-service-setup-capacity:10}")
     private long bulkServiceSetupCapacity;
+
+    // Per-IP cap for the SINGLE-item service write endpoints on ServiceController
+    // (60-second window):
+    //   - POST   /api/v1/independent-masters/me/services
+    //   - POST   /api/v1/salons/{salonId}/services
+    //   - POST   /api/v1/salons/{salonId}/masters/{masterId}/services
+    //   - PATCH  /api/v1/services/{serviceDefId}
+    //   - PATCH  /api/v1/services/{serviceDefId}/photo
+    //   - DELETE /api/v1/services/{serviceDefId}
+    //
+    // Every one of these fell through to the unmatched else/non-POST branch of
+    // AuthRateLimitFilter with NO bucket at all, which undercut bulkServiceSetupCapacity's own
+    // stated rationale: the bulk bucket is capped to bound service_definitions row growth, but an
+    // attacker wanting that growth simply looped the unthrottled single-create instead — the
+    // strictly better lever, since it also skipped the per-master advisory lock the bulk path
+    // takes. Closing it makes bulk the tighter path again, as intended.
+    //
+    // SEPARATE bucket from bulkServiceSetupCapacity, deliberately: a bulk request does up to 100
+    // items of work, a single write does one. Sharing the bulk bucket would either impose its
+    // tight 10/min on legitimate per-item usage, or force that cap up and re-loosen exactly the
+    // DoS amplifier the bulk bucket exists to bound. Each is sized for its own unit of work.
+    //
+    // Sizing (60/min). The bulk endpoint already accepts a 100-item catalogue in ONE request, so
+    // a provider who works through the per-item forms instead — building out a menu service by
+    // service, or sweeping prices across an existing one with PATCH, each service costing a
+    // create plus a photo PATCH — must not be throttled into a 60-second stall for preferring
+    // that UX. 60/min covers a 30-service build-out (create + photo per service) in one sitting
+    // with no 429, well past the realistic per-master catalogue size, while still capping
+    // sustained row growth at 60 rows/min — 16x BELOW what the already-accepted bulk ceiling
+    // permits (10 req/min x 100 items = 1000 rows/min). IP-keyed for consistency with every other
+    // bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs). Configurable so
+    // integration tests on 127.0.0.1 can raise the cap.
+    @Value("${app.rate-limit.service-write-capacity:60}")
+    private long serviceWriteCapacity;
 
     // Per-IP cap for POST /api/v1/support/contact (60-minute window).
     // Each successful call sends an email to the support inbox, so this is an
@@ -187,7 +224,7 @@ public class RateLimitConfig {
 
     private static final Duration BOOKING_WRITE_WINDOW = Duration.ofSeconds(10);
 
-    // Per-user cap for the two SMS/notification-triggering booking-write endpoints:
+    // Per-user cap for the SMS/notification-triggering booking-write endpoints:
     //   - PATCH /api/v1/bookings/{bookingId}/decline
     //   - PATCH /api/v1/bookings/{bookingId}/not-complete
     // Deliberately a SEPARATE bucket from bookingWriteCapacity above (different threat model —
@@ -198,13 +235,128 @@ public class RateLimitConfig {
     // (smishing / SMS-bomb concern), which the tight 5-per-10s create/reschedule budget was never
     // sized to bound. 10 requests / 60s mirrors the other authenticated-write buckets in this
     // class (media upload, profile update, bulk service setup) — generous enough for a provider
-    // clearing a backlog of no-shows/declines in one sitting, while capping a scripted flood to
-    // at most 10 outbound messages per minute per account. Configurable so integration tests can
-    // raise the cap.
+    // clearing a backlog of no-shows/declines in one sitting. Configurable so integration tests
+    // can raise the cap.
+    //
+    // NOT shared with PUT /api/v1/masters/{masterId}/overrides/{date} (2026-07-26 product decision
+    // reversal, D6) — that route used to share this bucket (plus a proportional per-conflict charge
+    // via the now-deleted BookingDeclineRateLimiter) because an override write could fan a
+    // provider-authored note out to guest phones as SMS. An override-driven decline now carries no
+    // note and dispatches no notification at all, so it has its own dedicated bucket instead —
+    // see {@link #scheduleOverrideWriteBuckets()}.
     @Value("${app.rate-limit.booking-decline-capacity:10}")
     private long bookingDeclineCapacity;
 
     private static final Duration BOOKING_DECLINE_WINDOW = Duration.ofSeconds(60);
+
+    // Per-user cap for PUT /api/v1/masters/{masterId}/overrides/{date} (the schedule-override
+    // write). Own bucket, deliberately NOT shared with bookingDeclineBuckets above (2026-07-26
+    // product decision reversal, D6 — see that field's javadoc for why the two used to be one
+    // bucket and no longer are).
+    //
+    // Sized for the mobile client's real fan-out, not for one logical action: a multi-day
+    // save (e.g. a vacation) is expanded CLIENT-SIDE into one PUT per date, so a month-long
+    // vacation is realistically ~31 consecutive requests from one actor in a single save flow.
+    // 50/60s gives that legitimate worst case comfortable headroom (19 requests, ~60% margin) —
+    // enough to also absorb the occasional 409-then-retry round trip (a PUT that 409s because a
+    // booking was created between preview and confirm re-submits with cancelOverlapping=true) —
+    // while still meaningfully bounding a scripted loop far beyond what any real save flow needs.
+    // This is still a destructive bulk write (each request can mass-decline up to
+    // ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE bookings), so it is throttled like
+    // every other authenticated write in this class — just sized for its own fan-out pattern
+    // rather than borrowed from a sibling bucket. Configurable so integration tests can raise
+    // the cap.
+    @Value("${app.rate-limit.schedule-override-write-capacity:50}")
+    private long scheduleOverrideWriteCapacity;
+
+    /**
+     * Per-actor AGGREGATE decline-count budget for {@code PUT /api/v1/masters/{masterId}/overrides/{date}}
+     * (2026-07-26 security audit finding 1 — MEDIUM). {@link #scheduleOverrideWriteCapacity} above and
+     * {@code ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE} (100) are INDEPENDENT caps — one
+     * bounds request frequency, the other bounds conflicts declined per request — so nothing bounds
+     * their PRODUCT: an already-authorized ({@code canManageMasterSchedule}) but compromised account
+     * could mass-decline on the order of 50 req/min &times; 100 conflicts/req = 5,000 {@code CONFIRMED}
+     * bookings per minute across every master it manages, with D6 removing the one signal (a client
+     * notification) that would otherwise surface the damage quickly. This bucket closes that gap by
+     * charging {@code conflicts.size()} tokens per write (not the flat 1-per-request charge every other
+     * bucket in this class uses) — see {@code ScheduleOverrideConflictService}'s consumption call,
+     * placed in the same spot as its {@code MAX_CONFLICTS_PER_WRITE} check: before any decline executes,
+     * all-or-nothing, nothing mutated on rejection.
+     *
+     * <p><b>Sizing arithmetic.</b> The legitimate worst case is a master saving a long vacation: the
+     * mobile client expands a multi-day span into ONE {@code PUT} per date (see
+     * {@link #scheduleOverrideWriteCapacity}'s javadoc), so a month-long holiday is realistically ~31
+     * consecutive requests from one actor. Per date, the physical ceiling on a master's own confirmed
+     * bookings is bounded by the calendar itself — a 10-hour working day at 20-minute slots is ~30
+     * bookings, and {@code MAX_CONFLICTS_PER_WRITE} independently caps any single date at 100 regardless.
+     * Taking the (deliberately unrealistic, upper-bound) case where EVERY one of the 31 dates is maximally
+     * booked: 31 &times; 30 = 930 conflicts declined across the whole save flow. This bucket's capacity
+     * (1500) clears that with the SAME ~61% headroom ratio {@link #scheduleOverrideWriteCapacity}
+     * itself uses (50 vs. a 31-request legitimate worst case is also a ~61% margin: 50 / 31 &asymp; 1.61;
+     * 1500 / 930 &asymp; 1.61) — comfortable room for the occasional 409-then-retry resubmit, while
+     * remaining two orders of magnitude below the ~300,000 conflicts/hour (5,000/min &times; 60) the
+     * uncapped product above would otherwise allow: an attacker sustaining the maximum per-request /
+     * per-minute rate exhausts this budget in about 18 seconds (1500 &divide; 83.3 conflicts/sec) and is
+     * then locked out of further schedule-override declines against this budget for the rest of the
+     * hour, regardless of how many more {@code PUT} requests {@link #scheduleOverrideWriteCapacity}
+     * would otherwise still allow.
+     *
+     * <p><b>Window (1 hour, not 1 minute).</b> A per-minute window would clip the legitimate vacation-save
+     * burst described above if the mobile client fires its ~31 requests faster than tokens refill; a
+     * longer, larger-capacity window absorbs that burst in full while still bounding sustained abuse — see
+     * {@link #SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW}.
+     *
+     * <p><b>CRITICAL invariant (must never regress).</b> Bucket4j's {@code tryConsume(N)} can never
+     * succeed when {@code N} exceeds the bucket's OWN capacity, even fully refilled — an earlier version
+     * of this feature charged proportionally against a capacity-10 bucket and thereby PERMANENTLY 429'd
+     * any override declining 11+ bookings. This capacity (1500) MUST exceed
+     * {@code ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE} (100) so a single maximal
+     * legitimate request (100 conflicts) can always be satisfied by a full bucket — pinned against the
+     * production default by {@code ScheduleOverrideConflictServiceTest
+     * #should_allowSingleRequestDecliningMaxConflictsPerWrite_when_budgetBucketIsFull} and enforced at
+     * boot for ANY configured value (not just the default) by
+     * {@link #validateScheduleOverrideDeclineBudgetCapacity()}, pinned by
+     * {@code RateLimitConfigTest#should_failStartup_when_declineBudgetCapacityDoesNotExceedMaxConflictsPerWrite}.
+     * Configurable so integration tests can raise the cap.
+     */
+    @Value("${app.rate-limit.schedule-override-decline-budget-capacity:1500}")
+    private long scheduleOverrideDeclineBudgetCapacity;
+
+    /** See {@link #scheduleOverrideDeclineBudgetCapacity}'s javadoc for why 1 hour, not 1 minute. */
+    private static final Duration SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW = Duration.ofHours(1);
+
+    /**
+     * Boot-time guard for the CRITICAL invariant documented on
+     * {@link #scheduleOverrideDeclineBudgetCapacity}: that field's capacity MUST exceed
+     * {@link ScheduleOverrideConflictService#MAX_CONFLICTS_PER_WRITE} (100), because Bucket4j's
+     * {@code tryConsume(N)} can never succeed for {@code N} greater than the bucket's OWN capacity,
+     * even fully refilled. Both existing pin tests (this class's and
+     * {@code ScheduleOverrideConflictServiceTest}'s) only ever exercise the hardcoded default (1500)
+     * reflected into the field — neither reads whatever value is ACTUALLY configured at runtime — so
+     * an operator setting {@code app.rate-limit.schedule-override-decline-budget-capacity} (e.g. via a
+     * Railway env var) to anything at or below 100 would silently and PERMANENTLY 429 every legitimate
+     * schedule-override write that declines 51-100 conflicts, with no test catching it. This method
+     * fails application startup instead, referencing
+     * {@link ScheduleOverrideConflictService#MAX_CONFLICTS_PER_WRITE} directly (never a duplicated
+     * literal) so the guard cannot itself drift from the value it protects.
+     */
+    @PostConstruct
+    void validateScheduleOverrideDeclineBudgetCapacity() {
+        int maxConflictsPerWrite = ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE;
+        if (scheduleOverrideDeclineBudgetCapacity <= maxConflictsPerWrite) {
+            throw new IllegalStateException(
+                    ("app.rate-limit.schedule-override-decline-budget-capacity is %d, but it must be "
+                            + "strictly greater than ScheduleOverrideConflictService.MAX_CONFLICTS_PER_WRITE "
+                            + "(%d). Bucket4j's tryConsume(N) can never succeed for N greater than a bucket's "
+                            + "own capacity, even fully refilled, so a decline-budget capacity at or below "
+                            + "the per-write conflict cap would permanently reject (HTTP 429) any legitimate "
+                            + "schedule-override write that declines more conflicts than the configured "
+                            + "capacity allows. Raise "
+                            + "app.rate-limit.schedule-override-decline-budget-capacity to a value strictly "
+                            + "greater than %d.")
+                            .formatted(scheduleOverrideDeclineBudgetCapacity, maxConflictsPerWrite, maxConflictsPerWrite));
+        }
+    }
 
     // 5-minute eviction grace past the rate-limit window so a bucket entry is not
     // evicted the instant its window rolls over (avoids a false-start on the very
@@ -401,16 +553,17 @@ public class RateLimitConfig {
     }
 
     /**
-     * Per-IP bucket for the two first-time bulk-service-setup endpoints
+     * Per-IP bucket for the two bulk-service-create endpoints
      * ({@code POST .../services/bulk}).
      *
      * <p>Cap: 10 requests per 60-second window per source IP — matching the other
      * authenticated write buckets ({@link #mediaUploadBuckets()},
      * {@link #profileUpdateBuckets()}, {@link #deviceTokenBuckets()}). Each request can
      * carry up to 100 items whose validation (type resolution, category checks,
-     * persistence) runs even on the 409 first-time-only path, so an unthrottled
-     * token-holder is a DoS amplifier; the low cap removes that lever while staying
-     * generous for a legitimate retry.
+     * persistence) runs in full on every call — the path is additive, so no cheap
+     * precondition short-circuits a repeat caller. An unthrottled token-holder is
+     * therefore a DoS amplifier; the low cap removes that lever while staying generous
+     * for a legitimate retry.
      *
      * <p>IP-keyed (not user-keyed) for consistency with every other bucket in this
      * filter: JWT parsing happens in
@@ -419,6 +572,25 @@ public class RateLimitConfig {
     @Bean
     public LoadingCache<String, Bucket> bulkServiceSetupBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, bulkServiceSetupCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-IP bucket for the SINGLE-item service write endpoints on
+     * {@code ServiceController} — the create/update/delete/photo routes that are not the
+     * {@code /bulk} pair (see {@link #serviceWriteCapacity}'s javadoc for the full route list,
+     * why this is not shared with {@link #bulkServiceSetupBuckets()}, and the 60/min arithmetic).
+     *
+     * <p>Cap: 60 requests per 60-second window per source IP. Before this bucket these routes had
+     * no throttle at all, which made single-create a strictly better row-growth lever than the
+     * bulk endpoint the {@link #bulkServiceSetupBuckets()} cap was sized to bound.
+     *
+     * <p>IP-keyed (not user-keyed) for consistency with every other bucket in this filter: JWT
+     * parsing happens in {@link com.beautica.auth.JwtAuthenticationFilter}, which runs after
+     * {@code AuthRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> serviceWriteBuckets() {
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, serviceWriteCapacity, ONE_MINUTE);
     }
 
     /**
@@ -478,11 +650,11 @@ public class RateLimitConfig {
 
     /**
      * Per-user bucket (see {@link #bookingDeclineCapacity} field javadoc) shared by
-     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and
-     * {@code PATCH /api/v1/bookings/{bookingId}/not-complete}, consumed by
-     * {@link com.beautica.booking.filter.BookingRateLimitFilter}. {@code expireAfterAccess} gives
-     * a 5-minute grace past the 60-second window so a bucket entry is not evicted the instant the
-     * window rolls over.
+     * {@code PATCH /api/v1/bookings/{bookingId}/decline} and {@code PATCH
+     * /api/v1/bookings/{bookingId}/not-complete}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
+     * charge. {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket
+     * entry is not evicted the instant the window rolls over.
      */
     @Bean
     public LoadingCache<String, Bucket> bookingDeclineBuckets() {
@@ -491,6 +663,40 @@ public class RateLimitConfig {
                 BOOKING_DECLINE_WINDOW.plus(EVICTION_GRACE),
                 bookingDeclineCapacity,
                 BOOKING_DECLINE_WINDOW);
+    }
+
+    /**
+     * Per-user bucket (see {@link #scheduleOverrideWriteCapacity} field javadoc) for
+     * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}, consumed by
+     * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
+     * charge — the SAME charging shape as every other bucket in this class; this route no longer
+     * carries any additional proportional charge (see {@link #bookingDeclineCapacity}'s javadoc for
+     * why that was removed). {@code expireAfterAccess} gives a 5-minute grace past the 60-second
+     * window so a bucket entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> scheduleOverrideWriteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                ONE_MINUTE.plus(EVICTION_GRACE),
+                scheduleOverrideWriteCapacity,
+                ONE_MINUTE);
+    }
+
+    /**
+     * Per-actor bucket for {@link #scheduleOverrideDeclineBudgetCapacity} (security audit finding 1) —
+     * consumed directly by {@code ScheduleOverrideConflictService}, NOT by {@link BookingRateLimitFilter}
+     * (see that field's javadoc for why this cannot be a flat per-request filter charge). {@code
+     * expireAfterAccess} gives a 5-minute grace past the 1-hour window so a bucket entry is not evicted
+     * the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> scheduleOverrideDeclineBudgetBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW.plus(EVICTION_GRACE),
+                scheduleOverrideDeclineBudgetCapacity,
+                SCHEDULE_OVERRIDE_DECLINE_BUDGET_WINDOW);
     }
 
     /**
@@ -507,18 +713,19 @@ public class RateLimitConfig {
      * {@code InternalCategoryControllerTest}). Binding filter + buckets into one non-scanned
      * {@code @Configuration} makes them all-or-nothing and therefore safe by construction: the
      * full application context loads all of them — so the production per-user rate limits that
-     * close the advisory-lock connection-pool-exhaustion DoS AND the guest-decline-SMS mass-burst
-     * DoS remain fully active and unchanged — while a slice loads none of them and refreshes
-     * cleanly, with no per-test mock or import needed.
+     * close the advisory-lock connection-pool-exhaustion DoS, the guest-decline-SMS mass-burst
+     * DoS, AND the schedule-override bulk-write DoS remain fully active and unchanged — while a
+     * slice loads none of them and refreshes cleanly, with no per-test mock or import needed.
      */
     @Bean
     public BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
         // Direct call (not a LoadingCache<String, Bucket> parameter): this class declares many
         // beans of that exact generic type, so injecting by type would be ambiguous and resolve
         // only by lucky parameter-name matching. @Configuration is CGLIB-proxied, so this returns
-        // the same bookingWriteBuckets/bookingDeclineBuckets singletons — unambiguous by
-        // construction.
-        return new BookingRateLimitFilter(bookingWriteBuckets(), bookingDeclineBuckets(), objectMapper);
+        // the same bookingWriteBuckets/bookingDeclineBuckets/scheduleOverrideWriteBuckets
+        // singletons — unambiguous by construction.
+        return new BookingRateLimitFilter(
+                bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(), objectMapper);
     }
 
     /**

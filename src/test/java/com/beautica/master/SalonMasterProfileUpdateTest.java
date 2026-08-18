@@ -105,6 +105,9 @@ class SalonMasterProfileUpdateTest {
     @MockBean
     private com.beautica.master.service.MasterScheduleService masterScheduleService;
 
+    @MockBean
+    private com.beautica.booking.service.ScheduleOverrideConflictService scheduleOverrideConflictService;
+
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
 

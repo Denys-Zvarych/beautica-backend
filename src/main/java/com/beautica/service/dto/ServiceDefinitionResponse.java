@@ -2,7 +2,6 @@ package com.beautica.service.dto;
 
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
-import com.beautica.service.util.PriceDisplayFormatter;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
@@ -42,13 +41,39 @@ public record ServiceDefinitionResponse(
         PriceType priceType,
         BigDecimal priceMin,
         BigDecimal priceMax,
-        String priceDisplay
+        String priceDisplay,
+        /**
+         * Whether the authenticated CLIENT caller has this SALON service in their wish list
+         * ({@code favorites}, {@code FavoriteTargetType.SALON_SERVICE}) — decorated on
+         * {@code GET /salons/{salonId}/services} only (salon-service-favourites track).
+         *
+         * <p><b>{@code null} means "not applicable", never "not favourited"</b> — the same
+         * contract {@code MasterServiceResponse.isFavorite} carries. It is {@code null} for an
+         * anonymous caller, a non-CLIENT caller, and every provider-side service-management
+         * response this DTO is ALSO used for ({@code POST}/{@code PATCH /services/...}), since
+         * favouriting is a CLIENT-only concept there. It is {@code null} inside the
+         * {@code salon-service-catalog} cache (keyed by {@code salonId} alone, shared across
+         * every caller including anonymous guests): this field is decorated per-request, AFTER
+         * the cache read, by {@code SalonServiceFavoriteDecorator} — a separate bean the
+         * controller composes in, lexically OUTSIDE the {@code @Cacheable}
+         * {@code ServiceCatalogService.getSalonServiceCatalog} call, never a method that cached
+         * service self-invokes. {@code false} is reserved for "this CLIENT genuinely has not
+         * favourited this row", so any {@code true}/{@code false} found inside the cache is
+         * unambiguously a leak (see {@code SalonCatalogueFavoriteDecorationIT}).
+         */
+        @Schema(types = {"boolean", "null"}, nullable = true,
+                description = "true/false only for an authenticated CLIENT caller on "
+                        + "GET /salons/{salonId}/services; null everywhere else (anonymous/"
+                        + "non-CLIENT callers, every provider-side service-management response, "
+                        + "and always null inside the salon-service-catalog cache) — decorated "
+                        + "per-request, after the cache read.")
+        Boolean isFavorite
 ) {
     public static ServiceDefinitionResponse from(ServiceDefinition sd) {
-        String priceDisplay = null;
-        if (sd.getPriceType() != null && sd.getBasePrice() != null) {
-            priceDisplay = PriceDisplayFormatter.format(sd.getPriceType(), sd.getBasePrice(), sd.getPriceMax());
-        }
+        // Money is derived in exactly one place (Phase 31.4 D2) so that this DTO, the
+        // master's service menu and the BEAUTY WISH LIST can never print different prices
+        // for the same service. Behaviour is identical to the previous inline derivation.
+        ServicePricing pricing = ServicePricing.ofDefinition(sd);
 
         return new ServiceDefinitionResponse(
                 sd.getId(),
@@ -62,10 +87,25 @@ public record ServiceDefinitionResponse(
                 sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
                 sd.getServiceType() != null ? sd.getServiceType().getSlug() : null,
                 sd.getPhotoUrl(),
-                sd.getPriceType(),
-                sd.getBasePrice(),
-                sd.getPriceMax(),
-                priceDisplay
+                pricing.priceType(),
+                pricing.priceMin(),
+                pricing.priceMax(),
+                pricing.priceDisplay(),
+                null    // isFavorite — decorated per-request, outside this factory (salon-service-favourites track)
         );
+    }
+
+    /**
+     * Returns a new instance with {@code isFavorite} set — the ONLY way to populate the field,
+     * since a record has no setter. Used exclusively by {@code SalonServiceFavoriteDecorator},
+     * never by {@code ServiceCatalogService} (mirrors {@code MasterServiceResponse
+     * #withIsFavorite}): the cached {@code getSalonServiceCatalog} method must never call this,
+     * or the cache would start holding client-specific data.
+     */
+    public ServiceDefinitionResponse withIsFavorite(boolean favorite) {
+        return new ServiceDefinitionResponse(
+                id, name, description, category, baseDurationMinutes, bufferMinutesAfter,
+                isActive, serviceTypeId, serviceTypeNameUk, serviceTypeSlug, photoUrl,
+                priceType, priceMin, priceMax, priceDisplay, favorite);
     }
 }

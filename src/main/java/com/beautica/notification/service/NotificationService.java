@@ -3,7 +3,9 @@ package com.beautica.notification.service;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
+import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.SchemeGuard;
+import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.sms.SmsService;
@@ -97,23 +99,77 @@ public class NotificationService {
 
     // NOT @Async — called synchronously by NotificationOutboxDrainWorker
 
-    public void notifyNewBooking(Booking booking) {
+    /**
+     * Notifies the PROVIDER of a new booking — or of a whole new multi-service visit.
+     *
+     * <p>Takes a {@link BookingVisit}, not a bare {@code Booking}, because exactly ONE
+     * {@code NEW_BOOKING} outbox row is enqueued per visit (keyed to the first chained booking):
+     * without the sibling rows this described only the lead service. A single-service booking
+     * arrives as {@link BookingVisit#single(Booking)} and every value below collapses to the
+     * scalar this method always read — the legacy copy is unchanged, character for character.
+     */
+    public void notifyNewBooking(BookingVisit visit) {
+        Booking booking = visit.lead();
         String masterEmail = booking.getMaster().getUser().getEmail();
         UUID masterUserId = booking.getMaster().getUser().getId();
         String clientName = resolveClientName(booking);
-        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
-        emailService.sendNewBookingEmail(masterEmail, booking);
+        emailService.sendNewBookingEmail(masterEmail, visit);
         pushService.sendToUser(
                 masterUserId,
                 "Нове бронювання",
-                truncate("Клієнт " + clientName + " забронював " + serviceName),
+                truncate("Клієнт " + clientName + " забронював " + bookedSubject(visit)),
                 Map.of("type", "NEW_BOOKING", "bookingId", bookingId)
         );
     }
 
-    public void notifyBookingStatusChanged(Booking booking) {
+    /**
+     * What the push body says was booked: the service NAME for a single-service booking (unchanged
+     * pre-visit wording), or a numeral phrase — «3 послуги», «5 послуг» — for a multi-service visit.
+     * A visit's full service list is not pushed: the push body is capped at
+     * {@link #PUSH_BODY_MAX_LENGTH} and up to ten names would be truncated mid-name.
+     */
+    private static String bookedSubject(BookingVisit visit) {
+        return visit.isMultiService()
+                ? UkrainianPlurals.servicesPhrase(visit.size())
+                : safe(visit.leadServiceName());
+    }
+
+    /**
+     * Whether this {@code DECLINED} outbox row describes the WHOLE visit or ONE service line of it.
+     * There are two decline routes and only the appointment HEADER tells them apart:
+     *
+     * <ul>
+     *   <li>{@code AppointmentTransitionService#declineAppointmentItem} — one service line is
+     *       declined, its siblings stay {@code CONFIRMED}, the header stays {@code CONFIRMED}, and
+     *       {@code STATUS_CHANGED} is enqueued against that ONE booking. Naming the whole visit here
+     *       would tell the client that services they still have are cancelled.</li>
+     *   <li>{@code AppointmentTransitionService#declineAppointment} — the header AND every item move
+     *       to {@code DECLINED}, and {@code persistAndNotify} enqueues ONE {@code STATUS_CHANGED}
+     *       against {@code items.get(0)}. This is the path that was silently telling a client only
+     *       their first service was cancelled while the rest of the visit was gone too.</li>
+     * </ul>
+     *
+     * <p>The {@code isMultiService()} half is what makes a null header safe: a legacy booking with
+     * no appointment, or a caller that could not resolve one, falls to the per-item wording — the
+     * conservative default, identical to the pre-visit copy.
+     *
+     * <p>It does NOT, however, insulate the per-item route from the whole-visit branch in every
+     * case, and an earlier version of this note wrongly claimed it did. Declining the LAST still-
+     * CONFIRMED line collapses the header to {@code DECLINED}; by then every sibling is
+     * {@code DECLINED} too, so the resolver's status filter retains them all and this predicate is
+     * true on what was a PER-ITEM action. The copy that results is nevertheless correct — the visit
+     * genuinely is fully cancelled at that point, and every service it names is one this client
+     * booked and has now lost — so the branch is left as is deliberately.
+     */
+    private static boolean isWholeVisitDecline(BookingVisit visit) {
+        return visit.appointmentStatus() == BookingStatus.DECLINED && visit.isMultiService();
+    }
+
+    /** @see #notifyNewBooking(BookingVisit) for why this takes a visit rather than a booking. */
+    public void notifyBookingStatusChanged(BookingVisit visit) {
+        Booking booking = visit.lead();
         // Guest (LINK) bookings have a null client (V89 chk_bookings_guest_fields) and no
         // account to notify by email/push. Repurposing PATCH /decline as provider-initiated
         // cancellation (Phase 24.2) makes "provider cancels a guest booking" a routine path —
@@ -142,22 +198,37 @@ public class NotificationService {
 
         switch (status) {
             case CONFIRMED -> {
-                emailService.sendBookingConfirmedEmail(clientEmail, booking);
+                emailService.sendBookingConfirmedEmail(clientEmail, visit);
                 pushService.sendToUser(
                         clientUserId,
                         "Бронювання підтверджено",
-                        truncate("Ваше бронювання на " + serviceName + " підтверджено"),
+                        truncate("Ваше бронювання на " + bookedSubject(visit) + " підтверджено"),
                         Map.of("type", "BOOKING_CONFIRMED", "bookingId", bookingId)
                 );
             }
+            // A decline arrives by TWO different routes and they need OPPOSITE copy — see
+            // isWholeVisitDecline. Getting this wrong in either direction misinforms the client:
+            // naming the whole visit for a per-item decline cancels services that are still on;
+            // naming only the lead for a whole-visit decline (the pre-fix behaviour) leaves the
+            // client believing the rest of the visit still stands, and they turn up for it.
             case DECLINED -> {
-                emailService.sendBookingDeclinedEmail(clientEmail, booking);
-                pushService.sendToUser(
-                        clientUserId,
-                        "Бронювання скасовано",
-                        truncate("Ваше бронювання на " + serviceName + " скасовано"),
-                        Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
-                );
+                if (isWholeVisitDecline(visit)) {
+                    emailService.sendVisitDeclinedEmail(clientEmail, visit);
+                    pushService.sendToUser(
+                            clientUserId,
+                            "Бронювання скасовано",
+                            truncate("Ваше бронювання на " + bookedSubject(visit) + " скасовано"),
+                            Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
+                    );
+                } else {
+                    emailService.sendBookingDeclinedEmail(clientEmail, booking);
+                    pushService.sendToUser(
+                            clientUserId,
+                            "Бронювання скасовано",
+                            truncate("Ваше бронювання на " + serviceName + " скасовано"),
+                            Map.of("type", "BOOKING_DECLINED", "bookingId", bookingId)
+                    );
+                }
             }
             default -> log.debug("No notification action for booking status [{}], bookingId={}", status, bookingId);
         }
@@ -167,7 +238,7 @@ public class NotificationService {
      * Notifies the provider (master / salon-admin) that the client moved the booking to a new
      * time (Phase 19.2; copy updated Phase 24.4 — the booking stays {@code CONFIRMED} at the new
      * time, there is no re-approval step). Targets the master's user — the same recipient as
-     * {@link #notifyNewBooking(Booking)} — with «Бронювання перенесено» copy.
+     * {@link #notifyNewBooking(BookingVisit)} — with «Бронювання перенесено» copy.
      */
     public void notifyBookingRescheduled(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
@@ -180,6 +251,37 @@ public class NotificationService {
                 masterUserId,
                 "Бронювання перенесено",
                 truncate("Клієнт переніс бронювання на " + serviceName),
+                Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
+        );
+    }
+
+    /**
+     * Notifies the CLIENT that the PROVIDER moved their booking to a new time (Phase 27.3 —
+     * REVERSES the previously-locked "reschedule is client-only" decision; this is the
+     * client-facing twin of {@link #notifyBookingRescheduled(Booking)}, which stays unchanged for
+     * the client-initiated case).
+     *
+     * <p>A guest (LINK) booking has no client account ({@code booking.getClient() == null}) — no
+     * email/push channel exists to reach. Skips cleanly, mirroring {@link
+     * #notifyReviewRequested(Booking)}'s guest guard; a provider CAN reach this path for a guest
+     * booking ({@code BookingService.rescheduleBooking}'s provider branch does not require a
+     * client to exist), so this guard is load-bearing, not defensive-only.
+     */
+    public void notifyBookingRescheduledClient(Booking booking) {
+        if (booking.getClient() == null) {
+            log.debug("Skipping client-facing BOOKING_RESCHEDULED for account-less guest booking {}", booking.getId());
+            return;
+        }
+        String clientEmail = booking.getClient().getEmail();
+        UUID clientUserId = booking.getClient().getId();
+        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
+        String bookingId = booking.getId().toString();
+
+        emailService.sendBookingRescheduledClientEmail(clientEmail, booking);
+        pushService.sendToUser(
+                clientUserId,
+                "Бронювання перенесено",
+                truncate("Ваш майстер переніс бронювання на " + serviceName),
                 Map.of("type", "BOOKING_RESCHEDULED", "bookingId", bookingId)
         );
     }
@@ -212,6 +314,37 @@ public class NotificationService {
                 "Оцініть візит",
                 truncate("Як пройшов ваш візит на " + serviceName + "? Залиште відгук"),
                 Map.of("type", "REVIEW_REQUESTED", "bookingId", bookingId)
+        );
+    }
+
+    /**
+     * Notifies the PROVIDER (master / salon-admin) — never the client — that an elapsed {@code
+     * CONFIRMED} booking is still awaiting closure (Phase 29.5/29.6). This is a work-queue nudge,
+     * not a status change: dispatched purely from the {@code CLOSURE_REMINDER} outbox row a
+     * separate, already-committed native claim wrote — this method (and everything it calls)
+     * must never read or write {@code booking.status}, never call {@link
+     * #notifyReviewRequested(Booking)}, and never call {@code
+     * BookingService#computeProviderCanReviewClient} — see {@code ClosureReminderArchitectureTest}.
+     *
+     * <p>A guest (LINK) booking still has a real master to nudge (guests only lack a client
+     * account — see {@link #notifyNewBooking(BookingVisit)}), so unlike the client-facing notify
+     * methods above, there is no {@code booking.getClient() == null} guard to skip: the recipient
+     * here never depends on the client existing. {@link #resolveClientName(Booking)} already
+     * handles the guest case for the copy that names the client in the reminder.
+     */
+    public void notifyClosureReminder(Booking booking) {
+        String masterEmail = booking.getMaster().getUser().getEmail();
+        UUID masterUserId = booking.getMaster().getUser().getId();
+        String clientName = resolveClientName(booking);
+        String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
+        String bookingId = booking.getId().toString();
+
+        emailService.sendClosureReminderEmail(masterEmail, booking, buildBookingUrl(bookingId));
+        pushService.sendToUser(
+                masterUserId,
+                "Позначте візит",
+                truncate("Візит з " + clientName + " на " + serviceName + " завершився — закрийте його"),
+                Map.of("type", "CLOSURE_REMINDER", "bookingId", bookingId)
         );
     }
 
@@ -257,6 +390,19 @@ public class NotificationService {
                     "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
         }
         return frontendBaseUrl + "/bookings/" + bookingId + "/review";
+    }
+
+    /**
+     * Builds the booking-detail deep link for the closure-reminder email's CTA (Phase 29.5) —
+     * {@code {FRONTEND_BASE_URL}/bookings/{id}}, mirroring {@link #buildReviewUrl(String)}'s
+     * scheme guard. Mobile phase 230 handles the app-side routing for this link.
+     */
+    private String buildBookingUrl(String bookingId) {
+        if (!SchemeGuard.isAllowedScheme(frontendBaseUrl)) {
+            throw new IllegalStateException(
+                    "app.frontend.base-url must use HTTPS scheme for non-localhost origins, got: " + frontendBaseUrl);
+        }
+        return frontendBaseUrl + "/bookings/" + bookingId;
     }
 
     /**
@@ -309,16 +455,20 @@ public class NotificationService {
      */
     private String buildGuestDeclineSms(Booking booking) {
         OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        String base = smsProperties.getSms().getDecline()
-                .replace("{serviceName}", safe(booking.getMasterService().getServiceDefinition().getName()))
-                .replace("{masterName}", masterName(booking.getMaster()))
-                .replace("{date}", SMS_DATE_FMT.format(kyiv))
-                .replace("{time}", SMS_TIME_FMT.format(kyiv));
+        // Placeholders.format, not chained String.replace: a provider-controlled service name
+        // containing a literal "{date}" would otherwise be expanded by the NEXT replace in the
+        // chain, letting the name steer the layout of a message the guest reads as platform copy.
+        String base = Placeholders.format(smsProperties.getSms().getDecline(), Map.of(
+                "serviceName", safe(booking.getMasterService().getServiceDefinition().getName()),
+                "masterName", masterName(booking.getMaster()),
+                "date", SMS_DATE_FMT.format(kyiv),
+                "time", SMS_TIME_FMT.format(kyiv)));
         String comment = truncateForSms(stripUrlsForSms(booking.getProviderComment()));
         if (comment.isBlank()) {
             return base;
         }
-        return base + smsProperties.getSms().getDeclineReason().replace("{comment}", comment);
+        return base + Placeholders.format(
+                smsProperties.getSms().getDeclineReason(), Map.of("comment", comment));
     }
 
     /**

@@ -178,6 +178,114 @@ public class TimeSlotCalculator {
         return result;
     }
 
+    /**
+     * <b>Declared-times slot list</b> — the EXPLICIT_TIMES counterpart of
+     * {@link #calculateAvailableSlots}. For a day whose effective schedule is a set of DISCRETE start
+     * times (a weekly-template weekday or a per-date override with {@code EXPLICIT_TIMES} rows), the
+     * bookable slots are EXACTLY those declared times: there is no window to stride and no grid to
+     * synthesize.
+     *
+     * <p><b>Why this exists (bug fix, 2026-08-11).</b> The resolver projects an EXPLICIT_TIMES day as a
+     * DERIVED window {@code [min(times) .. max(times)]} so that window-only consumers keep working
+     * ({@code ScheduleMapper#toDerivedWindow}). Feeding that synthetic window to
+     * {@link #calculateAvailableSlots} fabricated a 30-minute grid across it: a master declaring exactly
+     * {13:00, 15:00} was offered 13:00/13:30/14:00 for a 60-min service — two times they never declared —
+     * while 15:00, which they DID declare, was unreachable (it is the window END, so nothing can start
+     * there and still fit). The derived window is a display artifact and must never act as a fit
+     * constraint.
+     *
+     * <p><b>End bound.</b> An explicit-times day has no real interval end, so the only non-artifact
+     * bound is the calendar day itself: a candidate is dropped if it would run past {@code date}'s
+     * midnight in {@link TimeZones#KYIV}. The schedule model forbids cross-midnight ranges (a night
+     * shift is two single-day rows on adjacent ISO weekdays), so "ends within the same Kyiv civil day"
+     * is the strictest bound the domain actually asserts — and, unlike the derived window end, it never
+     * swallows a declared time.
+     *
+     * <p>Every other per-candidate filter is IDENTICAL to the interval walk, by construction: the
+     * lead-time {@code cutoff} floor and the same strict-overlap test ({@link #overlapsAny}; end-to-start
+     * touching stays allowed, and each occupied range's end already folds in the booking's buffer).
+     *
+     * @param declaredTimes the day's declared start times, sorted ascending and de-duplicated by the
+     *                      resolver; iterated in order, so the result is ascending too
+     * @param occupied      pre-filtered to {@code date}'s window, exactly as {@link #calculateAvailableSlots}
+     *                      requires
+     */
+    public List<TimeRange> calculateDeclaredSlots(
+            LocalDate date,
+            List<LocalTime> declaredTimes,
+            Duration serviceDuration,
+            List<TimeRange> occupied,
+            Instant cutoff
+    ) {
+        return walkDeclared(date, declaredTimes, serviceDuration, occupied, cutoff, false);
+    }
+
+    /**
+     * <b>Existence-only</b> counterpart of {@link #calculateDeclaredSlots}, mirroring
+     * {@link #hasAvailableSlot}'s relationship to {@link #calculateAvailableSlots}: {@code true} as soon
+     * as ONE declared time is bookable. Same predicate, same cutoff, same overlap test, same day-end
+     * bound — only the termination differs, so the day-gate ({@code SlotCalculationService#isDayBookable},
+     * behind {@code GET /masters/{id}/working-days} and the catalogue gate) and the materialised slot
+     * list can never disagree about an EXPLICIT_TIMES day.
+     */
+    public boolean hasDeclaredSlot(
+            LocalDate date,
+            List<LocalTime> declaredTimes,
+            Duration serviceDuration,
+            List<TimeRange> occupied,
+            Instant cutoff
+    ) {
+        return !walkDeclared(date, declaredTimes, serviceDuration, occupied, cutoff, true).isEmpty();
+    }
+
+    /**
+     * The single declared-times walk shared by {@link #calculateDeclaredSlots} and
+     * {@link #hasDeclaredSlot} — the exact shape {@link #walk} has for interval days, so the list and the
+     * existence answer are the same code path with a different termination.
+     */
+    private List<TimeRange> walkDeclared(
+            LocalDate date,
+            List<LocalTime> declaredTimes,
+            Duration serviceDuration,
+            List<TimeRange> occupied,
+            Instant cutoff,
+            boolean stopAtFirst
+    ) {
+        Objects.requireNonNull(date, "date must not be null");
+        Objects.requireNonNull(declaredTimes, "declaredTimes must not be null");
+        Objects.requireNonNull(cutoff, "cutoff must not be null");
+
+        if (serviceDuration.isNegative() || serviceDuration.isZero())
+            throw new IllegalArgumentException("serviceDuration must be positive");
+        if (serviceDuration.compareTo(Duration.ofDays(1)) > 0)
+            throw new IllegalArgumentException("serviceDuration must not exceed 24 hours");
+
+        List<TimeRange> safeOccupied = occupied != null ? occupied : List.of();
+        // Exclusive end-of-day bound, resolved as a civil instant so a DST transition shortens/lengthens
+        // the day correctly (never a flat +24h — see the cross-midnight branch in #walk).
+        Instant dayEndInst = date.plusDays(1).atStartOfDay(TimeZones.KYIV).toInstant();
+
+        List<TimeRange> result = new ArrayList<>();
+        for (LocalTime declared : declaredTimes) {
+            if (declared == null) {
+                continue;
+            }
+            Instant start = date.atTime(declared).atZone(TimeZones.KYIV).toInstant();
+            TimeRange candidate = new TimeRange(start, start.plus(serviceDuration));
+
+            if (candidate.start().isBefore(cutoff)
+                    || candidate.end().isAfter(dayEndInst)
+                    || overlapsAny(candidate, safeOccupied)) {
+                continue;
+            }
+            result.add(candidate);
+            if (stopAtFirst) {
+                return result;
+            }
+        }
+        return result;
+    }
+
     private boolean overlapsAny(TimeRange candidate, List<TimeRange> occupied) {
         for (TimeRange o : occupied) {
             if (candidate.start().isBefore(o.end()) && candidate.end().isAfter(o.start())) {

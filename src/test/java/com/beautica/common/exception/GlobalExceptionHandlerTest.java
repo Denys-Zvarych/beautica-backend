@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.MethodParameter;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DeadlockLoserDataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -1104,18 +1105,23 @@ class GlobalExceptionHandlerTest {
                 .contains("/swagger-ui/index.html");
     }
 
-    // ── handleCannotAcquireLock (Phase 19.4 — 55P03 lock_timeout → 409) ──────────
+    // ── handlePessimisticLockingFailure (Phase 19.4 — 55P03 lock_timeout → 409; widened cycle-2
+    //    audit finding 2 — 40P01 deadlock_detected → the SAME 409, not a 500) ──────────
     //
     // CannotAcquireLockException is Spring's SQLState translation of Postgres 55P03
-    // (lock_not_available), raised when a booking advisory-lock wait exceeds the 3s
-    // lock_timeout fused into BookingRepository.acquireClientAdvisoryLockWithTimeout /
-    // acquireAdvisoryLockWithTimeout. Before this handler existed, the generic
-    // handleGeneric(Exception) fallback would have turned a lock-wait timeout into a
-    // bare 500 with no "try again" semantics — these tests pin the 409 mapping.
+    // (lock_not_available), raised when a lock wait exceeds the 3s lock_timeout fused into
+    // BookingRepository.acquireClientAdvisoryLockWithTimeout / acquireAdvisoryLockWithTimeout /
+    // AppointmentRepository.lockHeaderIfConfirmed / lockHeaderRegardlessOfStatus.
+    // DeadlockLoserDataAccessException is Spring's translation of Postgres 40P01
+    // (deadlock_detected) — a SIBLING of CannotAcquireLockException under the shared
+    // PessimisticLockingFailureException superclass, NOT a subtype of it, so a handler scoped to
+    // ONLY CannotAcquireLockException never matched a real deadlock — it fell through to the
+    // generic handleGeneric(Exception) fallback and surfaced as a bare 500. These tests pin the
+    // 409 mapping for BOTH exception shapes via the shared superclass handler.
 
     @Test
-    @DisplayName("handleCannotAcquireLock — returns 409 with the standard conflict message when a "
-            + "booking advisory-lock wait exceeds lock_timeout")
+    @DisplayName("handlePessimisticLockingFailure — returns 409 with the standard conflict message when a "
+            + "lock wait exceeds lock_timeout")
     void should_return409_when_cannotAcquireLockExceptionThrown() {
         // Arrange — mirrors the real translation path: Hibernate/Spring wraps the Postgres
         // 55P03 SQLState into CannotAcquireLockException with a driver-shaped cause message
@@ -1125,7 +1131,7 @@ class GlobalExceptionHandlerTest {
                 new RuntimeException("ERROR: canceling statement due to lock timeout"));
 
         // Act
-        ResponseEntity<ApiResponse<Void>> response = handler.handleCannotAcquireLock(ex);
+        ResponseEntity<ApiResponse<Void>> response = handler.handlePessimisticLockingFailure(ex);
 
         // Assert — same "try again" semantics as the existing master/client-busy 409s
         assertThat(response.getStatusCode())
@@ -1143,7 +1149,35 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("handleCannotAcquireLock — never echoes the SQL state, driver cause, or lock detail "
+    @DisplayName("handlePessimisticLockingFailure — returns the SAME 409 for DeadlockLoserDataAccessException "
+            + "— cycle-2 audit finding 2, defensive coverage: this exception is a SIBLING of "
+            + "CannotAcquireLockException, not a subtype, so a handler scoped to only that subtype would miss "
+            + "it. A real reproduced 40P01 deadlock in THIS codebase actually surfaces as "
+            + "CannotAcquireLockException (Hibernate's LockAcquisitionException classification covers the "
+            + "whole lock/deadlock SQLSTATE class, and HibernateJpaDialect maps it there uniformly — verified "
+            + "empirically) — DeadlockLoserDataAccessException is a latent-gap guard against a plain-JDBC "
+            + "translation path this JPA-only codebase does not currently exercise, not today's live path")
+    void should_return409_when_deadlockLoserExceptionThrown() {
+        // Arrange — a DeadlockLoserDataAccessException shaped as Spring's plain-JDBC translator would
+        // produce for Postgres 40P01 (not this codebase's live JPA path today — see DisplayName).
+        var ex = new DeadlockLoserDataAccessException(
+                "could not execute statement",
+                new RuntimeException("ERROR: deadlock detected"));
+
+        // Act
+        ResponseEntity<ApiResponse<Void>> response = handler.handlePessimisticLockingFailure(ex);
+
+        // Assert — identical "try again" semantics to the lock-timeout case, not a 500
+        assertThat(response.getStatusCode())
+                .as("a genuine deadlock must map to 409, not the 500 the generic handler would produce")
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().message())
+                .isEqualTo("Request could not be completed due to a conflict");
+    }
+
+    @Test
+    @DisplayName("handlePessimisticLockingFailure — never echoes the SQL state, driver cause, or lock detail "
             + "in the response body")
     void should_notLeakLockDetail_when_cannotAcquireLockExceptionThrown() {
         // Arrange — a cause message shaped like the real Postgres 55P03 error text, which
@@ -1153,7 +1187,7 @@ class GlobalExceptionHandlerTest {
         var ex = new CannotAcquireLockException("could not execute statement", new RuntimeException(leakyCause));
 
         // Act
-        ResponseEntity<ApiResponse<Void>> response = handler.handleCannotAcquireLock(ex);
+        ResponseEntity<ApiResponse<Void>> response = handler.handlePessimisticLockingFailure(ex);
 
         // Assert — no internal detail leaks into the HTTP body
         assertThat(response.getBody().message())
@@ -1164,7 +1198,7 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("handleCannotAcquireLock — emits the real cause only at DEBUG, never at a louder level")
+    @DisplayName("handlePessimisticLockingFailure — emits the real cause only at DEBUG, never at a louder level")
     void should_logCauseAtDebugOnly_when_cannotAcquireLockExceptionThrown() {
         // Arrange
         var ex = new CannotAcquireLockException("could not execute statement",
@@ -1172,7 +1206,7 @@ class GlobalExceptionHandlerTest {
         listAppender.list.clear();
 
         // Act
-        handler.handleCannotAcquireLock(ex);
+        handler.handlePessimisticLockingFailure(ex);
 
         // Assert — exactly one DEBUG event, no louder-level event at all (this handler never
         // needs ERROR/WARN — a bounded lock-wait timeout is an expected, self-healing condition)
@@ -1180,7 +1214,7 @@ class GlobalExceptionHandlerTest {
                 .filter(e -> e.getLevel() == Level.DEBUG)
                 .toList();
         assertThat(debugEvents)
-                .as("handleCannotAcquireLock must emit exactly one DEBUG log for server-side triage")
+                .as("handlePessimisticLockingFailure must emit exactly one DEBUG log for server-side triage")
                 .hasSize(1);
 
         boolean anyLouderLevel = listAppender.list.stream()

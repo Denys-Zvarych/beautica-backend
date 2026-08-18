@@ -136,7 +136,7 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
             + "existing suites only asserted status + cancellation_reason, never this column")
     void should_persistProviderComment_when_providerMarksNotComplete() {
         Fixture fx = seedSalonBooking();
-        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
+        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"Клієнт не з'явився, чекали 20 хвилин\"}";
         ResponseEntity<Void> resp = restTemplate.exchange(
@@ -261,7 +261,7 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
             + "and provider_comment persists NULL")
     void should_return204WithNullProviderComment_when_notCompleteCommentFieldAbsent() {
         Fixture fx = seedSalonBooking();
-        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
+        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\"}";
         ResponseEntity<Void> resp = restTemplate.exchange(
@@ -281,7 +281,7 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
             + "and provider_comment persists NULL")
     void should_return204WithNullProviderComment_when_notCompleteCommentIsBlank() {
         Fixture fx = seedSalonBooking();
-        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
+        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"   \"}";
         ResponseEntity<Void> resp = restTemplate.exchange(
@@ -300,7 +300,7 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
             + "old, now-removed 10-char floor), persisted verbatim")
     void should_return204_when_notCompleteCommentIsNineChars() {
         Fixture fx = seedSalonBooking();
-        UUID bookingId = insertBookingWithStatus(fx, "CONFIRMED", null);
+        UUID bookingId = insertElapsedBookingWithStatus(fx, "CONFIRMED", null);
 
         String body = "{\"cancellationReason\":\"CLIENT_NO_SHOW\",\"comment\":\"123456789\"}";
         ResponseEntity<Void> resp = restTemplate.exchange(
@@ -412,6 +412,24 @@ class BookingCommentPersistenceIT extends AbstractIntegrationTest {
                         "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
                         "booking_source, provider_comment, created_at, updated_at) " +
                         "VALUES (?, ?, ?, ?, ?, ?, NOW() + interval '1 day', NOW() + interval '1 day 1 hour', " +
+                        "500.00, 60, 0, 'APP', ?, NOW(), NOW())",
+                bookingId, fx.clientId, fx.masterId, fx.masterServiceId, fx.salonId, status, providerComment);
+        return bookingId;
+    }
+
+    /**
+     * ELAPSED variant of {@link #insertBookingWithStatus} — used by this class's
+     * {@code /not-complete} tests as the conventional no-show fixture (neither {@code /decline}
+     * nor {@code /not-complete} carries a temporal guard, so this is not a correctness
+     * requirement).
+     */
+    private UUID insertElapsedBookingWithStatus(Fixture fx, String status, String providerComment) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, " +
+                        "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, " +
+                        "booking_source, provider_comment, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, NOW() - interval '2 hours', NOW() - interval '1 hour', " +
                         "500.00, 60, 0, 'APP', ?, NOW(), NOW())",
                 bookingId, fx.clientId, fx.masterId, fx.masterServiceId, fx.salonId, status, providerComment);
         return bookingId;

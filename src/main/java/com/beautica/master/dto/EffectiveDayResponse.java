@@ -19,22 +19,62 @@ import java.util.List;
  * backward-compatible. For an EXPLICIT_TIMES day {@code intervals} still carries the derived window
  * {@code [min(times)..max(times)]} as a single interval, so window-only consumers keep working unchanged.
  *
+ * <p><b>Phase 15.12 (additive, nullable) — {@code windowStart}/{@code windowEnd}.</b> The display-only
+ * working-window bounds of whichever source produced {@code intervals}, so the mobile day-override editor
+ * (which hydrates from THIS projection, not from {@code GET /overrides}) can derive breaks as
+ * {@code window MINUS intervals} and recover a break sitting flush against an edge of the working day. Such
+ * a break leaves no gap between intervals — window 09:00–18:00 minus a 09:00–10:00 break stores as the
+ * single interval {@code [10:00–18:00]} — so gap reconstruction alone silently loses it.
+ *
+ * <p>The window always describes the same source as the {@code intervals} beside it:
+ * <ul>
+ *   <li>{@link EffectiveDaySource#TEMPLATE} — the template weekday's stored window
+ *       ({@code weekly_schedule_day_windows}).</li>
+ *   <li>{@link EffectiveDaySource#OVERRIDE_CUSTOM} — the override row's
+ *       {@code window_start}/{@code window_end}.</li>
+ *   <li>{@link EffectiveDaySource#OVERRIDE_DAY_OFF}, {@link EffectiveDaySource#NO_SCHEDULE}, any day with
+ *       no intervals, and every {@code EXPLICIT_TIMES} day — {@code null}.</li>
+ *   <li>Any resolved source that stored no window (every legacy row) — {@code null}; the client falls back
+ *       to today's gap reconstruction, i.e. exactly the pre-15.12 behaviour. A window is NEVER synthesized
+ *       from {@code min(start)..max(end)}, which would falsely assert "this day has no edge-flush break".</li>
+ * </ul>
+ *
+ * <p><b>Read-only metadata.</b> These bounds carry no availability meaning and reach no write path — this
+ * is a response record with no request counterpart. {@code intervals} remains the single canonical source
+ * of bookable time and {@code SlotCalculationService} reads {@link #intervals()} alone, so a projected
+ * window can neither widen nor narrow a computed slot (pinned by
+ * {@code SlotCalculationScheduleIT#should_produceIdenticalSlots_when_effectiveDayCarriesWorkingWindow}).
+ *
  * <p><b>Wire format:</b> {@code date} is a {@link LocalDate}, serialized ISO-8601 as {@code yyyy-MM-dd};
- * each {@code times} entry is a {@link LocalTime}, serialized ISO-8601 as {@code HH:mm:ss}.
+ * each {@code times} entry, and both window bounds, are {@link LocalTime}, serialized ISO-8601 as
+ * {@code HH:mm:ss}.
  */
 public record EffectiveDayResponse(
         LocalDate date,
         EffectiveDaySource source,
         List<WorkIntervalDto> intervals,
-        List<LocalTime> times
+        List<LocalTime> times,
+        LocalTime windowStart,
+        LocalTime windowEnd
 ) {
 
     /**
-     * Pre-15.8 convenience constructor: a day with no discrete times ({@code times == null}). Keeps the
-     * backward-compatible call shape for INTERVAL/override/no-schedule days.
+     * Pre-15.8 convenience constructor: a day with no discrete times ({@code times == null}) and no
+     * recorded working window. Keeps the backward-compatible call shape for INTERVAL/override/no-schedule
+     * days.
      */
     public EffectiveDayResponse(LocalDate date, EffectiveDaySource source, List<WorkIntervalDto> intervals) {
-        this(date, source, intervals, null);
+        this(date, source, intervals, null, null, null);
+    }
+
+    /**
+     * Pre-15.12 convenience constructor: the {@code intervals}/{@code times} shape that predates the
+     * display-only working-window bounds. Keeps every existing caller compiling unchanged with a
+     * {@code null} window (i.e. verbatim pre-15.12 behaviour).
+     */
+    public EffectiveDayResponse(
+            LocalDate date, EffectiveDaySource source, List<WorkIntervalDto> intervals, List<LocalTime> times) {
+        this(date, source, intervals, times, null, null);
     }
 
     /**

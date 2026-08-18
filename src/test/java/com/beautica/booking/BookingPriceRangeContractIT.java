@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
+import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
@@ -38,6 +39,7 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
@@ -75,6 +77,16 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     private static final String BOOKINGS_URL = "/api/v1/bookings";
     private static final OffsetDateTime ANCHOR =
             OffsetDateTime.of(2032, 3, 10, 8, 0, 0, 0, ZoneOffset.UTC);
+
+    /**
+     * Past-side twin of {@link #ANCHOR}, for fixtures that must be REVIEW-ELIGIBLE. {@link #ANCHOR}
+     * sits in 2032 so its {@code CONFIRMED} rows are still open; anything gating on
+     * {@code BookingClosureRule#isReviewEligible} needs the opposite. Explicit UTC, never a
+     * {@code NOW()}-relative interval — see
+     * {@link #seedCompletedSalonBookingsOnDistinctServices}.
+     */
+    private static final OffsetDateTime COMPLETED_ANCHOR =
+            OffsetDateTime.of(2024, 3, 10, 8, 0, 0, 0, ZoneOffset.UTC);
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -796,14 +808,18 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         UUID clientId = fixtures.createUser(
                 "bprc-owner-multi-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
 
+        // Each booking is stamped with the salon it was made at, exactly as every production write
+        // site does (BookingService:1794, AppointmentService:253/267). Phase 242: salonName is
+        // resolved from bookings.salon_id, so a fixture that leaves the column NULL renders both
+        // rows' salonName as null and the "different salons" premise below degrades to null == null.
         UUID serviceInFirst = createRangeService("SALON", firstSalon.salonId(), firstSalon.masterId(),
                 new BigDecimal("300.00"), new BigDecimal("500.00"), null);
         insertBooking(clientId, firstSalon.masterId(), serviceInFirst, ANCHOR,
-                new BigDecimal("300.00"), new BigDecimal("500.00"));
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", firstSalon.salonId());
         UUID serviceInSecond = createRangeService("SALON", secondSalonId, secondMasterId,
                 new BigDecimal("700.00"), new BigDecimal("900.00"), null);
         insertBooking(clientId, secondMasterId, serviceInSecond, ANCHOR.plusDays(1),
-                new BigDecimal("700.00"), new BigDecimal("900.00"));
+                new BigDecimal("700.00"), new BigDecimal("900.00"), "CONFIRMED", secondSalonId);
 
         var page = bookingService.getMyBookings(
                 ownerId, authFor(Role.SALON_OWNER), null, null, null, null, PageRequest.of(0, 20));
@@ -987,8 +1003,13 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * <p>Expected to equal {@link #PROVIDER_PAGE_STATEMENTS}: the role branch is shared
      * ({@code case SALON_MASTER, INDEPENDENT_MASTER} in {@code listProviderBookings}), so the six
      * statements are the identical six, and the extra {@code salons} row rides along on
-     * {@code findAllByIdsWithGraph}'s existing {@code LEFT JOIN FETCH m.salon} rather than costing
-     * a statement of its own. The two constants are kept SEPARATE rather than collapsed into one,
+     * {@code findAllByIdsWithGraph}'s {@code LEFT JOIN FETCH b.salon} (phase 242 — re-pointed from
+     * {@code m.salon}; see that query's javadoc) rather than costing a statement of its own. Note
+     * that the list path does NOT pay the rotated-case penalty the detail path does
+     * ({@link #OWNER_DETAIL_STATEMENTS_ROTATED}): nothing on it walks
+     * {@code master.getSalon()} — the per-row authorization is done upstream, on the ID page — so
+     * the master's live {@code Salon} proxy is never opened even when it diverges. The two
+     * constants are kept SEPARATE rather than collapsed into one,
      * because a future change that makes the salon path cost more must show up as a diff on THIS
      * line, not silently re-point a shared constant.
      *
@@ -1042,8 +1063,180 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * {@code findAllByIdsWithGraph} moves this count 19 -&gt; 20 (the salon owner's {@code User},
      * {@code password_hash} included) while {@link #SALON_MASTER_PAGE_STATEMENTS} stays at 6 —
      * exactly the split of responsibilities described above.
+     *
+     * <p><b>Phase B2 (QA, 2026-08-06) — the divergent-salon seed, and why 19 is UNCHANGED.</b>
+     * {@code BookingDetailResponse.from} now dereferences {@code booking.getSalon().getId()}. That
+     * costs nothing today because Hibernate serves an identifier off an UNINITIALISED
+     * {@code Salon} proxy — the same property mutation 2 above records for {@code Salon.owner}. But
+     * this gate could not have proved it: {@link #insertBooking}'s original form never wrote
+     * {@code bookings.salon_id}, so every row on this page had {@code booking.salon == null} and
+     * there was no proxy to dereference at all. The gate was structurally blind, not passing.
+     *
+     * <p>The fixture books at a salon DISTINCT from {@code masters.salon_id}. Divergence is the
+     * load-bearing part: with the two ids ALIGNED, both {@code b.salon} and {@code m.salon} resolve
+     * to the same row and the gate cannot tell which of them the page actually materialised.
+     *
+     * <p><b>Phase 242 — 19 is UNCHANGED, but the ONE {@code Salon} among them swapped identity.</b>
+     * The fetch join moved from {@code m.salon} to {@code b.salon}, so the hydrated salon is now
+     * the BOOKED one and it is the master's LIVE salon that is left as an untouched proxy. The
+     * count is the same because the page needs exactly one salon either way: nothing on the
+     * provider list path walks {@code master.getSalon()} (per-row authorization happens upstream,
+     * on the ID page), so the live-salon proxy is never opened. A rise to 20 means something
+     * started walking it — or that {@code s.owner} was fetch-joined back on.
+     *
+     * <p><b>Mutation-verified (Phase B2 QA):</b> forcing a proxy open with
+     * {@code Hibernate.initialize(...)} on the provider read path moves this count
+     * 19 -&gt; 20 while {@link #SALON_MASTER_PAGE_STATEMENTS} moves 6 -&gt; 7. This gate is also the
+     * one that would go red if {@code hibernate.jpa.compliance.proxy=true} were ever set: under JPA
+     * proxy compliance Hibernate must initialise a proxy to answer {@code getId()}, so the
+     * optimisation the remaining identifier-only reads rely on would silently stop applying and
+     * land here as 20.
      */
     private static final long SALON_MASTER_PAGE_ENTITIES = 19L;
+
+    /**
+     * Statement count for a SALON_OWNER page of REVIEW-ELIGIBLE bookings — the only fixture shape
+     * on which {@code BookingService#loadProviderReviewBatch} actually issues its two queries.
+     *
+     * <p><b>Why the three gates above cannot pin this.</b> Every one of them seeds through
+     * {@link #ANCHOR} (year 2032) with status {@code CONFIRMED}, i.e. rows that are neither
+     * {@code COMPLETED} nor elapsed. {@code loadProviderReviewBatch}'s candidate filter
+     * ({@code BookingClosureRule#isReviewEligible}) empties on such a page and returns
+     * {@code ProviderReviewBatch.EMPTY} before either lookup fires — so those three counts stayed
+     * at 6 through this change not because the new work is free but because their fixtures never
+     * reach it. "At most +2, flat in page size" was, until this gate, verified by nothing.
+     *
+     * <p><b>Why the OWNER and not a master.</b> A {@code SALON_MASTER} actor reaches only the first
+     * of the two lookups: {@code findIdsByIdInAndOwnerId} comes back empty (a master owns no
+     * salon), {@code withAuthority} is empty, and the second early return skips the
+     * {@code client_reviews} probe — a +1 branch, not the +2 one. The owner is the sole role that
+     * pays both. That +1 branch has its own gate now:
+     * {@link #SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS}. Until it existed this paragraph was the only
+     * thing standing behind the claim, and prose does not go red.
+     *
+     * <p>8 = the six {@link #SALON_MASTER_PAGE_STATEMENTS} already accounts for, with
+     * {@code salonRepository.findIdsByOwnerIdAndIsActiveTrue} standing in for
+     * {@code masterRepository.findByUserId} as the branch's own scope-resolution statement, PLUS
+     * the two this gate exists for: {@code SalonRepository#findIdsByIdInAndOwnerId} (page-scoped,
+     * over the DE-DUPLICATED live-salon ids) and
+     * {@code ClientReviewRepository#findReviewedBookingIds} (one bounded {@code IN} list).
+     * DERIVED FROM A RUN, never predicted — same rule as the constants above.
+     *
+     * <p><b>Measured at TWO row counts (2 and 5), and that is the whole design.</b> A single
+     * pinned number cannot tell "+2 flat" from "+2 per row" — both are consistent with any one
+     * observation, so an N+1 in {@code loadProviderReviewBatch} would sit inside a green gate. Two
+     * counts separate them: flat stays at 8 and 8, per-row would read 10 and 16. Neither count is
+     * 1, deliberately — at a single row "flat" and "per row" are numerically identical and the
+     * comparison would be inert.
+     */
+    private static final long OWNER_REVIEWABLE_PAGE_STATEMENTS = 8L;
+
+    /**
+     * Statement count for a SALON_MASTER page of REVIEW-ELIGIBLE bookings — the MIDDLE branch of
+     * {@code BookingService#loadProviderReviewBatch}, and the one neither sibling gate reaches.
+     *
+     * <p><b>Why this constant exists.</b> {@code loadProviderReviewBatch} has FOUR distinct cost
+     * shapes and, when this gate landed, only two were pinned by a running test — the fourth
+     * followed immediately after, as {@link #INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS}:
+     * <ul>
+     *   <li><b>+0</b> — no review-eligible row on the page, {@code candidates.isEmpty()} short-circuits
+     *       to {@code ProviderReviewBatch.EMPTY}. Pinned three times over, by
+     *       {@link #PROVIDER_PAGE_STATEMENTS}, {@link #CLIENT_PAGE_STATEMENTS} and
+     *       {@link #SALON_MASTER_PAGE_STATEMENTS} (all seeded {@code CONFIRMED} at {@link #ANCHOR}).</li>
+     *   <li><b>+2</b> — a {@code SALON_OWNER} over review-eligible rows: BOTH lookups fire. Pinned by
+     *       {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}.</li>
+     *   <li><b>+1</b> — THIS one. A {@code SALON_MASTER} over review-eligible rows reaches
+     *       {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, whose
+     *       {@code liveSalonIds} set is NON-empty (the actor's rows are all salon-employed), so
+     *       {@code SalonRepository#findIdsByIdInAndOwnerId} DOES fire — and comes back empty, because
+     *       a master owns no salon. {@code withAuthority} is then empty and the SECOND early return
+     *       skips the {@code client_reviews} probe entirely.</li>
+     *   <li><b>+1, the OPPOSITE query</b> — an {@code INDEPENDENT_MASTER} over review-eligible rows.
+     *       {@code liveSalonIds} is EMPTY so the salon lookup never fires, while
+     *       {@code withAuthority} is non-empty so the {@code client_reviews} probe DOES. Same
+     *       number, disjoint statement — pinned separately by
+     *       {@link #INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS}, which is why the two 7s are not
+     *       collapsed into one constant.</li>
+     * </ul>
+     * The +1 shape was previously asserted only in prose (on {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}'s
+     * "Why the OWNER and not a master" paragraph). Prose is not a gate: an N+1 introduced on this
+     * branch — a per-row {@code findIdsByIdInAndOwnerId}, say — would have left every green test green.
+     *
+     * <p>7 = the six {@link #SALON_MASTER_PAGE_STATEMENTS} already accounts for (identical role
+     * branch, identical fixture shape apart from status), PLUS the single
+     * {@code findIdsByIdInAndOwnerId}. DERIVED FROM A RUN, never predicted — the arithmetic above is
+     * a post-hoc reconciliation of a measured number, not a prediction that was then asserted.
+     *
+     * <p><b>Measured at TWO row counts (2 and 5), for the same reason
+     * {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS} is.</b> One pinned number cannot separate "+1 flat"
+     * from "+1 per row"; two can — flat reads 7 and 7, per-row would read 8 and 11. Neither count is
+     * 1, deliberately: at a single row the two models are numerically identical and the comparison
+     * would be inert.
+     *
+     * <p><b>Mutation-verified (QA, 2026-08-17), and the numbers in the paragraph above are that
+     * mutation's OBSERVED output, not an estimate.</b> Rewriting {@code loadProviderReviewBatch} to
+     * run its authority filter and its {@code client_reviews} probe PER ROW (a one-element
+     * {@code List.of(b)} per iteration) moves this gate 7 &rarr; <b>11</b> on the 5-row page and
+     * 7 &rarr; <b>8</b> on the 2-row page — exactly one extra {@code findIdsByIdInAndOwnerId} per
+     * row, the {@code client_reviews} probe still never firing because the per-row authority filter
+     * comes back empty for a master just as the batched one did. The gate therefore goes red on its
+     * OWN absolute assertion, and would go red on its growth-model assertion too (8 &ne; 11); it does
+     * not merely ride along behind {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}, which under the same
+     * mutation moves 8 &rarr; 16.
+     */
+    private static final long SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS = 7L;
+
+    /**
+     * Statement count for an {@code INDEPENDENT_MASTER} page of REVIEW-ELIGIBLE bookings — the
+     * FOURTH and last cost shape of {@code BookingService#loadProviderReviewBatch}, and the only one
+     * that was still unpinned once {@link #SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS} landed.
+     *
+     * <p><b>It is a {@code +1} like the salon-master branch, but the OPPOSITE {@code +1}.</b> The
+     * two shapes are numerically indistinguishable and structurally disjoint, which is precisely why
+     * one gate cannot stand in for the other:
+     * <ul>
+     *   <li><b>{@code SALON_MASTER}</b> — {@code liveSalonIds} is NON-empty (every row's master is
+     *       salon-employed), so {@code SalonRepository#findIdsByIdInAndOwnerId} FIRES and comes back
+     *       empty; {@code withAuthority} is then empty and the SECOND early return skips the
+     *       {@code client_reviews} probe. The one extra statement is the SALON lookup.</li>
+     *   <li><b>{@code INDEPENDENT_MASTER}</b> — THIS one. Every row's master is independent, so
+     *       {@code AuthorizationService#filterBookingIdsWithProviderAuthority} collects an EMPTY
+     *       {@code liveSalonIds} and short-circuits {@code ownedSalonIds} to {@code Set.of()}
+     *       WITHOUT a query. The independent arm ({@code masterUserId.equals(actorId)}) then admits
+     *       every row, {@code withAuthority} is non-empty, and
+     *       {@code ClientReviewRepository#findReviewedBookingIds} DOES fire. The one extra statement
+     *       is the {@code client_reviews} PROBE.</li>
+     * </ul>
+     * A regression that made the salon lookup per-row would be caught by the salon-master gate and
+     * be invisible here (that query never fires here at all); a regression that made the
+     * {@code client_reviews} probe per-row would be caught HERE and be invisible on the salon-master
+     * gate (that probe never fires there). Neither gate is redundant with the other, and the owner's
+     * {@code +2} gate — which pays both — cannot localise a rise to one of them.
+     *
+     * <p>7 = the six {@link #PROVIDER_PAGE_STATEMENTS} already accounts for (identical role branch
+     * and identical fixture shape apart from status, per
+     * {@link #seedCompletedIndependentBookingsOnDistinctServices}), PLUS the single
+     * {@code client_reviews} probe. DERIVED FROM A RUN, never predicted — the equality with
+     * {@link #SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS} is a coincidence of two different baselines
+     * each taking a different single extra query, and was confirmed by measurement rather than
+     * assumed from it. The two constants are kept SEPARATE for exactly that reason: collapsing them
+     * would assert an arithmetic identity that carries no shared meaning.
+     *
+     * <p><b>Measured at TWO row counts (2 and 5)</b>, for the same reason both sibling reviewable
+     * gates are: one pinned number cannot separate "+1 flat" from "+1 per row"; two can — flat reads
+     * 7 and 7, per-row would read 8 and 11. Neither count is 1, deliberately: at a single row the
+     * two models are numerically identical and the comparison would be inert.
+     *
+     * <p><b>Mutation-verified (QA, 2026-08-17), and the numbers below are that mutation's OBSERVED
+     * output.</b> Rewriting {@code loadProviderReviewBatch} to run its authority filter and its
+     * {@code client_reviews} probe PER ROW (a one-element {@code List.of(b)} per iteration) moves
+     * this gate 7 &rarr; <b>11</b> on the 5-row page and 7 &rarr; <b>8</b> on the 2-row page — one
+     * extra {@code findReviewedBookingIds} per row beyond the first, the salon lookup still never
+     * firing because every master on the page is independent. The gate goes red on its OWN absolute
+     * assertion and on its growth-model assertion (8 &ne; 11); it does not merely ride along behind
+     * the owner or salon-master gates.
+     */
+    private static final long INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS = 7L;
 
     private static Authentication authFor(Role role) {
         return new UsernamePasswordAuthenticationToken(
@@ -1096,8 +1289,9 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_MASTER scope — a 5-row page of SALON-owned bookings costs the same fixed "
-            + "statement count, with a real Salon.owner proxy on the page that must stay uninitialised")
+    @DisplayName("SALON_MASTER scope — a 5-row page of SALON-owned bookings, each booked at a "
+            + "DIFFERENT salon from the master's live one, costs the same fixed statement count and "
+            + "hydrates neither the Salon.owner proxy nor the booking's own Salon proxy")
     void should_notScaleStatementCount_when_salonMasterPageHasManyBookings() {
         var salon = fixtures.createSalon("bprc-qcount-salon-owner-" + System.nanoTime() + "@beautica.test");
         // As on the independent gate, the SERVICE takes the master's USER id, never masters.id.
@@ -1105,16 +1299,29 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 "SELECT user_id FROM masters WHERE id = ?", UUID.class, salon.masterId());
         UUID clientId = fixtures.createUser(
                 "bprc-qcount-salon-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        // Phase B2: the salon each booking was made AT — deliberately NOT the master's live salon.
+        // An aligned id would be served from the L1 cache entry `LEFT JOIN FETCH m.salon` already
+        // materialised, so BookingDetailResponse.from's booking.getSalon().getId() would never
+        // touch a proxy and the entity gate below would pass without testing anything.
+        UUID salonOwnerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID bookedSalonId = insertBareSalonUnderOwner(
+                salonOwnerId, "bprc-booked-salon-" + System.nanoTime());
+        assertThat(bookedSalonId)
+                .as("premise — the booking's salon and the master's live salon must be DIFFERENT "
+                        + "rows, or booking.getSalon() resolves off the L1 cache and no proxy is "
+                        + "dereferenced at all")
+                .isNotEqualTo(salon.salonId());
 
         Pageable pageable = PageRequest.of(0, 20);
         Statistics statistics = statistics();
 
-        seedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 1);
+        seedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 1, bookedSalonId);
         statistics.clear();
         bookingService.getMyBookings(masterUserId, authFor(Role.SALON_MASTER), null, null, null, null, pageable);
         long statementsForOneRow = statistics.getPrepareStatementCount();
 
-        seedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 4);
+        seedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 4, bookedSalonId);
         statistics.clear();
         var result = bookingService.getMyBookings(
                 masterUserId, authFor(Role.SALON_MASTER), null, null, null, null, pageable);
@@ -1128,6 +1335,19 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         assertThat(result.data())
                 .as("every row must carry a salon, or there is no Salon.owner proxy to guard")
                 .allSatisfy(b -> assertThat(b.salonName()).isNotNull());
+        // Phase B2 premise, and the second half of the one above: the entity count is only a gate
+        // on booking.getSalon() if every row actually has a DIVERGENT booking.salon to dereference.
+        // If a future fixture change stopped stamping bookings.salon_id (or realigned it with the
+        // master's salon), this gate would silently revert to the blind state it was in before B2
+        // while still passing at 19.
+        assertThat(result.data())
+                .as("every row's salonId must be the booking's OWN divergent salon snapshot, or "
+                        + "there is no uninitialised Salon proxy for the entity count to guard")
+                .allSatisfy(b -> assertThat(b.salonId()).isEqualTo(bookedSalonId));
+        assertThat(result.data())
+                .as("sanity — the divergence must survive the read path: salonId (booking snapshot) "
+                        + "and the master's live salon must not have collapsed to one value")
+                .allSatisfy(b -> assertThat(b.salonId()).isNotEqualTo(salon.salonId()));
         assertThat(statementsForFiveRows)
                 .as("absolute JDBC statement count for a 5-row SALON-master page. A rise means an "
                         + "association is being lazily initialised per page — most pointedly "
@@ -1137,12 +1357,334 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .as("absolute HYDRATED-ENTITY count for the same page. Complements the statement "
                         + "count in the OPPOSITE direction: a re-added fetch join costs no extra "
                         + "statement (it widens a join) and so is invisible above, but it does "
-                        + "materialise an extra entity — see this gate's javadoc.")
+                        + "materialise an extra entity — see this gate's javadoc. A rise to %s here "
+                        + "also means Phase B2's booking.getSalon().getId() stopped being served "
+                        + "off the uninitialised proxy (a fetch join on b.salon, an accidental "
+                        + "non-identifier dereference, or hibernate.jpa.compliance.proxy=true).",
+                        SALON_MASTER_PAGE_ENTITIES + 1)
                 .isEqualTo(SALON_MASTER_PAGE_ENTITIES);
         assertThat(statementsForFiveRows)
                 .as("secondary signal — statement count must not scale with row count; got %s for "
                         + "1 row, %s for 5 rows", statementsForOneRow, statementsForFiveRows)
                 .isEqualTo(statementsForOneRow);
+    }
+
+    @Test
+    @DisplayName("SALON_OWNER scope, REVIEW-ELIGIBLE page — the two providerCanReviewClient lookups "
+            + "cost a fixed +2 for the WHOLE page, pinned at TWO row counts so a per-row regression "
+            + "cannot hide behind a single number")
+    void should_notScaleStatementCount_when_ownerPageIsFullOfReviewEligibleBookings() {
+        var salon = fixtures.createSalon(
+                "bprc-qcount-owner-reviewable-" + System.nanoTime() + "@beautica.test");
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID clientId = fixtures.createUser(
+                "bprc-qcount-owner-reviewable-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        Pageable pageable = PageRequest.of(0, 20);
+        Statistics statistics = statistics();
+
+        seedCompletedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 2);
+        statistics.clear();
+        var twoRowPage = bookingService.getMyBookings(
+                ownerId, authFor(Role.SALON_OWNER), null, null, null, null, pageable);
+        long statementsForTwoRows = statistics.getPrepareStatementCount();
+
+        seedCompletedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 3);
+        statistics.clear();
+        var fiveRowPage = bookingService.getMyBookings(
+                ownerId, authFor(Role.SALON_OWNER), null, null, null, null, pageable);
+        long statementsForFiveRows = statistics.getPrepareStatementCount();
+
+        assertThat(twoRowPage.data()).hasSize(2);
+        assertThat(fiveRowPage.data()).hasSize(5);
+        // THE PREMISE, and the reason the three sibling gates were blind: unless every row on the
+        // page is genuinely review-eligible with a registered client AND inside the owner's
+        // authority, loadProviderReviewBatch returns EMPTY on one of its two early returns and the
+        // pinned number below measures a path that never ran.
+        assertThat(fiveRowPage.data())
+                .as("premise — every row must actually reach both lookups, or this gate pins a "
+                        + "short-circuit rather than the batched work it exists to bound")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
+        assertThat(twoRowPage.data())
+                .as("premise — same, on the smaller page: both measurements must exercise the same "
+                        + "branch or comparing them proves nothing")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
+
+        assertThat(statementsForFiveRows)
+                .as("absolute JDBC statement count for a 5-row review-eligible owner page. This is "
+                        + "the ONLY gate in this class whose fixture reaches "
+                        + "loadProviderReviewBatch's two queries at all.")
+                .isEqualTo(OWNER_REVIEWABLE_PAGE_STATEMENTS);
+        assertThat(statementsForTwoRows)
+                .as("the SAME absolute count on a 2-row page. Pinning one row count cannot "
+                        + "distinguish +2 flat from +2 per row; pinning two can.")
+                .isEqualTo(OWNER_REVIEWABLE_PAGE_STATEMENTS);
+        assertThat(statementsForFiveRows)
+                .as("the growth model, stated directly: flat in page size. Got %s for 2 rows and %s "
+                        + "for 5. A per-row implementation of loadProviderReviewBatch would read %s "
+                        + "and %s instead — equal absolute pins alone would not separate the two.",
+                        statementsForTwoRows, statementsForFiveRows,
+                        OWNER_REVIEWABLE_PAGE_STATEMENTS + 2 * 2 - 2,
+                        OWNER_REVIEWABLE_PAGE_STATEMENTS + 2 * 5 - 2)
+                .isEqualTo(statementsForTwoRows);
+    }
+
+    @Test
+    @DisplayName("SALON_MASTER scope, REVIEW-ELIGIBLE page — the salon-ownership lookup fires ONCE "
+            + "for the whole page and the client_reviews probe is skipped entirely, pinned at TWO "
+            + "row counts so a per-row regression on this branch cannot hide")
+    void should_notScaleStatementCount_when_salonMasterPageIsFullOfReviewEligibleBookings() {
+        var salon = fixtures.createSalon(
+                "bprc-qcount-master-reviewable-" + System.nanoTime() + "@beautica.test");
+        // As on every other provider gate here, the SERVICE takes the master's USER id, never masters.id.
+        UUID masterUserId = jdbcTemplate.queryForObject(
+                "SELECT user_id FROM masters WHERE id = ?", UUID.class, salon.masterId());
+        UUID clientId = fixtures.createUser(
+                "bprc-qcount-master-reviewable-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        Pageable pageable = PageRequest.of(0, 20);
+        Statistics statistics = statistics();
+
+        seedCompletedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 2);
+        statistics.clear();
+        var twoRowPage = bookingService.getMyBookings(
+                masterUserId, authFor(Role.SALON_MASTER), null, null, null, null, pageable);
+        long statementsForTwoRows = statistics.getPrepareStatementCount();
+
+        seedCompletedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 3);
+        statistics.clear();
+        var fiveRowPage = bookingService.getMyBookings(
+                masterUserId, authFor(Role.SALON_MASTER), null, null, null, null, pageable);
+        long statementsForFiveRows = statistics.getPrepareStatementCount();
+
+        assertThat(twoRowPage.data()).hasSize(2);
+        assertThat(fiveRowPage.data()).hasSize(5);
+        // THE PREMISE, and it cannot be read off providerCanReviewClient here the way the owner gate
+        // reads it: on this branch the flag is false whether the page short-circuited at
+        // candidates.isEmpty() (+0) or ran the salon lookup and found no authority (+1), so the flag
+        // is blind to exactly the distinction this gate pins. What separates them is the candidate
+        // filter's own two conjuncts, both observable on the row: a registered client, and
+        // review-eligibility — which BookingClosureRule#isProviderReviewEligible grants on
+        // COMPLETED by status alone, without consulting endsAt. If a future fixture change flipped
+        // either, this
+        // test would silently fall back onto the +0 short-circuit and pin a number the three sibling
+        // gates already cover.
+        assertThat(fiveRowPage.data())
+                .as("premise — every row must clear loadProviderReviewBatch's candidate filter "
+                        + "(registered client AND review-eligible), or the page short-circuits at "
+                        + "the FIRST early return and this gate measures the +0 branch instead")
+                .allSatisfy(b -> {
+                    assertThat(b.clientId()).isNotNull();
+                    assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED);
+                });
+        assertThat(twoRowPage.data())
+                .as("premise — same, on the smaller page: both measurements must exercise the same "
+                        + "branch or comparing them proves nothing")
+                .allSatisfy(b -> {
+                    assertThat(b.clientId()).isNotNull();
+                    assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED);
+                });
+        // The other half of the premise: the SECOND early return must be the one taken. A master owns
+        // no salon, so findIdsByIdInAndOwnerId comes back empty, withAuthority is empty, and the
+        // client_reviews probe never fires. If this ever read true the branch under measurement would
+        // have become the owner's +2 one and the pinned 7 below would be measuring something else.
+        assertThat(fiveRowPage.data())
+                .as("premise — a SALON_MASTER holds no provider review-authority, which is what makes "
+                        + "withAuthority empty and skips the client_reviews probe. A true here means "
+                        + "this gate silently migrated onto the +2 owner branch.")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
+
+        assertThat(statementsForFiveRows)
+                .as("absolute JDBC statement count for a 5-row review-eligible SALON_MASTER page — "
+                        + "the +1 branch: the salon-ownership lookup fires, the client_reviews probe "
+                        + "does not. A rise means one of them went per-row.")
+                .isEqualTo(SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS);
+        assertThat(statementsForTwoRows)
+                .as("the SAME absolute count on a 2-row page. Pinning one row count cannot "
+                        + "distinguish +1 flat from +1 per row; pinning two can.")
+                .isEqualTo(SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS);
+        assertThat(statementsForFiveRows)
+                .as("the growth model, stated directly: flat in page size. Got %s for 2 rows and %s "
+                        + "for 5. A per-row implementation of loadProviderReviewBatch would read %s "
+                        + "and %s instead — equal absolute pins alone would not separate the two.",
+                        statementsForTwoRows, statementsForFiveRows,
+                        SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS + 2 - 1,
+                        SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS + 5 - 1)
+                .isEqualTo(statementsForTwoRows);
+    }
+
+    @Test
+    @DisplayName("INDEPENDENT_MASTER scope, REVIEW-ELIGIBLE page — the salon-ownership lookup is "
+            + "skipped entirely and the client_reviews probe fires ONCE for the whole page (the "
+            + "MIRROR of the salon-master +1), pinned at TWO row counts")
+    void should_notScaleStatementCount_when_independentMasterPageIsFullOfReviewEligibleBookings() {
+        String masterEmail = "bprc-qcount-indep-reviewable-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        // As on every other provider gate here, the SERVICE takes the master's USER id, never masters.id.
+        UUID masterUserId = jdbcTemplate.queryForObject(
+                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        UUID clientId = fixtures.createUser(
+                "bprc-qcount-indep-reviewable-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+
+        Pageable pageable = PageRequest.of(0, 20);
+        Statistics statistics = statistics();
+
+        seedCompletedIndependentBookingsOnDistinctServices(clientId, masterId, 2);
+        statistics.clear();
+        var twoRowPage = bookingService.getMyBookings(
+                masterUserId, authFor(Role.INDEPENDENT_MASTER), null, null, null, null, pageable);
+        long statementsForTwoRows = statistics.getPrepareStatementCount();
+
+        seedCompletedIndependentBookingsOnDistinctServices(clientId, masterId, 3);
+        statistics.clear();
+        var fiveRowPage = bookingService.getMyBookings(
+                masterUserId, authFor(Role.INDEPENDENT_MASTER), null, null, null, null, pageable);
+        long statementsForFiveRows = statistics.getPrepareStatementCount();
+
+        assertThat(twoRowPage.data()).hasSize(2);
+        assertThat(fiveRowPage.data()).hasSize(5);
+        // PREMISE 1 — the candidate filter must clear, or the page short-circuits at the FIRST early
+        // return (+0) and this gate pins a number the three CONFIRMED-fixture gates already cover.
+        assertThat(fiveRowPage.data())
+                .as("premise — every row must clear loadProviderReviewBatch's candidate filter "
+                        + "(registered client AND review-eligible), or the page short-circuits at "
+                        + "the FIRST early return and this gate measures the +0 branch instead")
+                .allSatisfy(b -> {
+                    assertThat(b.clientId()).isNotNull();
+                    assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED);
+                });
+        assertThat(twoRowPage.data())
+                .as("premise — same, on the smaller page: both measurements must exercise the same "
+                        + "branch or comparing them proves nothing")
+                .allSatisfy(b -> {
+                    assertThat(b.clientId()).isNotNull();
+                    assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED);
+                });
+        // PREMISE 2 — what separates this shape from the SALON_MASTER +1. There the flag is FALSE
+        // (withAuthority empty, second early return taken, probe skipped); here an independent master
+        // holds authority over their own bookings by masterUserId.equals(actorId), withAuthority is
+        // non-empty, and the client_reviews probe is exactly the +1 being pinned. A false here would
+        // mean the page took the second early return and this gate had silently migrated onto the
+        // salon-master shape — the same 7, measuring a different query.
+        assertThat(fiveRowPage.data())
+                .as("premise — an INDEPENDENT_MASTER DOES hold provider review-authority over their "
+                        + "own completed bookings, which is what makes withAuthority non-empty and "
+                        + "fires the client_reviews probe. A false here means this gate slid onto "
+                        + "the salon-master +1 branch, where the probe never runs.")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
+        assertThat(twoRowPage.data())
+                .as("premise — same on the smaller page")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
+        // PREMISE 3 — what separates this shape from the OWNER's +2, which also reads true. The
+        // owner pays BOTH queries because their page's masters are salon-employed, so liveSalonIds
+        // is non-empty; here it must be EMPTY, which is what skips findIdsByIdInAndOwnerId. That is
+        // a property of masters.master_type / masters.salon_id, so it is asserted at its source as
+        // well as through the response's own salon snapshot.
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT master_type FROM masters WHERE id = ?", String.class, masterId))
+                .as("premise — filterBookingIdsWithProviderAuthority only skips the salon lookup "
+                        + "when EVERY row's master is INDEPENDENT_MASTER; a salon-employed master "
+                        + "here would make liveSalonIds non-empty and turn this into the owner shape")
+                .isEqualTo("INDEPENDENT_MASTER");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT salon_id FROM masters WHERE id = ?", UUID.class, masterId))
+                .as("premise — liveSalonId(master) must be null, or the id would land in "
+                        + "liveSalonIds even for an INDEPENDENT_MASTER-typed row")
+                .isNull();
+        assertThat(fiveRowPage.data())
+                .as("premise, response-observable half — a salon-less page: no row carries a salon, "
+                        + "so there is no live-salon id for findIdsByIdInAndOwnerId to look up")
+                .allSatisfy(b -> assertThat(b.salonId()).isNull());
+
+        assertThat(statementsForFiveRows)
+                .as("absolute JDBC statement count for a 5-row review-eligible INDEPENDENT_MASTER "
+                        + "page — the MIRROR +1: the client_reviews probe fires, the salon-ownership "
+                        + "lookup does not. A rise means the probe went per-row.")
+                .isEqualTo(INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS);
+        assertThat(statementsForTwoRows)
+                .as("the SAME absolute count on a 2-row page. Pinning one row count cannot "
+                        + "distinguish +1 flat from +1 per row; pinning two can.")
+                .isEqualTo(INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS);
+        assertThat(statementsForFiveRows)
+                .as("the growth model, stated directly: flat in page size. Got %s for 2 rows and %s "
+                        + "for 5. A per-row implementation of loadProviderReviewBatch would read %s "
+                        + "and %s instead — equal absolute pins alone would not separate the two.",
+                        statementsForTwoRows, statementsForFiveRows,
+                        INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS + 2 - 1,
+                        INDEPENDENT_MASTER_REVIEWABLE_PAGE_STATEMENTS + 5 - 1)
+                .isEqualTo(statementsForTwoRows);
+    }
+
+    /**
+     * INDEPENDENT-master twin of {@link #seedCompletedSalonBookingsOnDistinctServices}, and the
+     * REVIEW-ELIGIBLE twin of {@link #seedBookingsOnDistinctServices}: same
+     * distinct-service-per-row discipline and the same {@link #stampMasterLocality} stamp (so both
+     * label {@code IN} queries are actually counted), but the rows are {@code COMPLETED} with a
+     * registered client.
+     *
+     * <p><b>Modelled on the salon seed rather than reusing it.</b> The whole point of this shape is
+     * that there is NO salon graph — {@code masters.salon_id} is NULL and
+     * {@code service_definitions.owner_type} is {@code INDEPENDENT_MASTER} — which is what empties
+     * {@code liveSalonIds} in {@code AuthorizationService#filterBookingIdsWithProviderAuthority} and
+     * skips {@code findIdsByIdInAndOwnerId}. Contorting the salon seed into producing that would
+     * mean parameterising away every salon-specific line it has, leaving neither helper honest about
+     * what it seeds. {@code bookings.salon_id} is left NULL for the same reason it is on
+     * {@link #seedBookingsOnDistinctServices}: an independent master's booking has no salon
+     * snapshot, and the divergent-salon trick the entity gate needs is meaningless without one.
+     *
+     * <p><b>Anchored on an explicit UTC instant</b> ({@link #COMPLETED_ANCHOR}), never a
+     * {@code NOW()}-relative interval — review eligibility is elapsed-time dependent and the dev VM
+     * runs {@code TZ=Europe/Kyiv}. Same rationale, verbatim, as
+     * {@link #seedCompletedSalonBookingsOnDistinctServices}.
+     */
+    private void seedCompletedIndependentBookingsOnDistinctServices(
+            UUID clientId, UUID masterId, int count) {
+        stampMasterLocality(masterId);
+        long existing = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE master_id = ?", Long.class, masterId);
+        for (int i = 0; i < count; i++) {
+            UUID serviceId = createRangeService(
+                    masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+            insertBooking(clientId, masterId, serviceId,
+                    COMPLETED_ANCHOR.plusMinutes(90L * (existing + i)),
+                    new BigDecimal("300.00"), new BigDecimal("500.00"), "COMPLETED");
+        }
+    }
+
+    /**
+     * REVIEW-ELIGIBLE twin of {@link #seedSalonBookingsOnDistinctServices}: same
+     * distinct-service-per-row discipline, but the rows are {@code COMPLETED} with a registered
+     * client, which is what makes {@code BookingService#loadProviderReviewBatch} run instead of
+     * short-circuiting on its candidate filter.
+     *
+     * <p><b>{@code bookings.salon_id} is ALIGNED with the master's live salon here</b>, unlike the
+     * divergent-salon fixture the entity gate needs. Alignment is the production-normal shape and
+     * is what a review-eligible owner page looks like in real traffic; divergence would additionally
+     * rotate the row out of {@code BookingSpecifications#salonIdIn}'s scope, since the owner ID page
+     * joins through the master's LIVE salon.
+     *
+     * <p><b>Anchored on an explicit UTC instant</b> ({@link #COMPLETED_ANCHOR}), never a
+     * {@code NOW()}-relative interval: review eligibility is elapsed-time dependent and the dev VM
+     * runs {@code TZ=Europe/Kyiv}, so a local-time anchor would make the fixture's meaning
+     * machine-dependent. {@code COMPLETED} is in fact eligible by STATUS alone
+     * ({@code BookingClosureRule#isReviewEligible} short-circuits before it looks at
+     * {@code endsAt}), so a past instant is chosen for honesty about what the row represents rather
+     * than out of necessity — but the sibling {@code CONFIRMED}-and-elapsed shape does depend on
+     * it, and this constant is what a future variant would reuse.
+     */
+    private void seedCompletedSalonBookingsOnDistinctServices(
+            UUID clientId, UUID salonId, UUID masterId, int count) {
+        stampSalonLocality(salonId);
+        long existing = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE master_id = ?", Long.class, masterId);
+        for (int i = 0; i < count; i++) {
+            UUID serviceId = createRangeService(
+                    "SALON", salonId, masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+            insertBooking(clientId, masterId, serviceId,
+                    COMPLETED_ANCHOR.plusMinutes(90L * (existing + i)),
+                    new BigDecimal("300.00"), new BigDecimal("500.00"), "COMPLETED", salonId);
+        }
     }
 
     /**
@@ -1175,12 +1717,313 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * gate in this class stays exactly where it is — the observed split this gate was added for.
      * Do not adjust the constant to make a failing run pass without first establishing which
      * association the extra entity belongs to.
+     *
+     * <p><b>Phase 242 — this gate SPLIT into two, and the constants below are why.</b> B2 read only
+     * {@code booking.getSalon().getId()}, an identifier served off an uninitialised proxy for free.
+     * Phase 242 re-pointed the whole display block onto that same snapshot and reads real
+     * properties off it ({@code getName()}, {@code getStreet()}, {@code getLocationNote()}), which
+     * INITIALISE the proxy — so {@code findByIdWithFullGraph} now fetch-joins {@code b.salon}
+     * instead of {@code m.salon}. The two cases genuinely diverge from here:
+     * <ul>
+     *   <li><b>Aligned</b> ({@link #OWNER_DETAIL_ENTITIES_ALIGNED} = 7) — the production-normal
+     *       shape: {@code bookings.salon_id == masters.salon_id}, so the ONE fetched {@code Salon}
+     *       answers both the display block and {@code AuthorizationService}'s
+     *       {@code master.getSalon().getOwner().getId()} walk (the persistence context resolves
+     *       {@code m.salon} to the already-materialised row rather than minting a proxy). 7 is
+     *       therefore unchanged from before the re-point, and this is the count that matters for
+     *       real traffic.</li>
+     *   <li><b>Rotated</b> ({@link #OWNER_DETAIL_ENTITIES_ROTATED} = 8) — the deliberately
+     *       divergent fixture: the request now genuinely needs TWO salon rows, the booking's (to
+     *       display) and the master's live one (for the owner authorization check), and no fetch
+     *       strategy can serve both from one row. The extra entity is a {@code Salon}, NOT the
+     *       owner's {@code User} — the {@code s.owner} drop this gate was created for still holds,
+     *       which is exactly why the two constants sit one apart and not two.</li>
+     * </ul>
+     * Keeping both is the point: a single constant would have had to pick one shape and go blind
+     * to the other, and collapsing the pair is how a real {@code s.owner} re-fetch would later hide
+     * inside a number that had already been bumped once.
+     *
+     * <p>7 = 1 {@code Booking} + 1 {@code Master} + 1 master {@code User} + 1 {@code Salon}
+     * + 1 client {@code User} + 1 {@code MasterServiceAssignment} + 1 {@code ServiceDefinition}.
+     * The salon owner's {@code User} is conspicuously NOT among them, in either case.
      */
-    private static final long OWNER_DETAIL_ENTITIES = 7L;
+    private static final long OWNER_DETAIL_ENTITIES_ALIGNED = 7L;
+
+    /**
+     * Statement counts for the same two shapes — {@code findByIdWithFullGraph} plus the two
+     * {@code DiscoveryLocationResolver} label {@code IN} queries, and in the rotated case one
+     * further {@code salons} SELECT. Both DERIVED FROM A RUN, never predicted.
+     *
+     * <p>Phase 242 before/after: the ALIGNED count is unchanged at 3 — the production-normal shape
+     * pays nothing for the re-point. The ROTATED count moved 3 -&gt; 4, because a booking whose
+     * salon differs from its master's live salon genuinely needs both rows (one to display, one to
+     * authorize) and no fetch strategy can serve both from one. Restoring
+     * {@code LEFT JOIN FETCH m.salon} ALONGSIDE {@code b.salon} would trade that SELECT for a
+     * second {@code salons} join on every read, aligned or not, and still hydrate two entities in
+     * the rotated case — strictly worse. Do not "fix" it that way.
+     */
+    private static final long OWNER_DETAIL_STATEMENTS_ALIGNED = 3L;
+
+    /** See {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}. */
+    private static final long OWNER_DETAIL_STATEMENTS_ROTATED = 4L;
+
+    /** See {@link #OWNER_DETAIL_ENTITIES_ALIGNED} — the post-rotation shape. Derived from a run. */
+    private static final long OWNER_DETAIL_ENTITIES_ROTATED = 8L;
+
+    @Test
+    @DisplayName("GET /bookings/{id} for a booking whose master has since gone INDEPENDENT still "
+            + "serves the booked salon's name, and fetches it in the main query rather than "
+            + "lazy-loading it — the one shape that pins WHICH salon findByIdWithFullGraph fetches")
+    void should_notLazyLoadTheBookedSalon_when_theMasterHasSinceGoneIndependent() {
+        var salon = fixtures.createSalon("bprc-detail-gone-indep-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = fixtures.createUser(
+                "bprc-detail-gone-indep-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+
+        // Phase-242 QA audit, finding 3 — the salon and the master's PERSONAL users row carry
+        // DISTINCT, non-null values. Once masters.salon_id is NULL, a mapper that resolved the
+        // block off master.getSalon() does not merely lose the salon name: it falls straight
+        // through the salon-vs-independent ternary to THESE values and serves a past salon
+        // client the now-solo master's home address and door code. That is the sharpest form of
+        // this leak, and an isNotNull() on salonName alone cannot see it.
+        String salonName = "Booked Salon (gone-indep) " + System.nanoTime();
+        String salonStreet = "вул. Заброньована-" + System.nanoTime();
+        String salonNote = "A: 3-й поверх, код 1234";
+        jdbcTemplate.update(
+                "UPDATE salons SET name = ?, street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = ?",
+                salonName, salonStreet, "11-A", salonNote, salon.salonId());
+        String masterPersonalStreet = "вул-Домашня-СЕКРЕТ-" + System.nanoTime();
+        String masterPersonalNote = "домашній код 8765 — не показувати";
+        jdbcTemplate.update(
+                "UPDATE users SET street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                masterPersonalStreet, "88-ДІМ", masterPersonalNote, salon.masterId());
+
+        UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+
+        // The master leaves the salon and goes solo AFTER the booking. masters.salon_id becomes
+        // NULL; bookings.salon_id is a snapshot and keeps pointing at the salon the client booked.
+        jdbcTemplate.update(
+                "UPDATE masters SET salon_id = NULL, master_type = 'INDEPENDENT_MASTER' WHERE id = ?",
+                salon.masterId());
+        jdbcTemplate.update(
+                "UPDATE users SET salon_id = NULL WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                salon.masterId());
+
+        // Read as the master's OWN user: isAuthorizedToManageBooking's INDEPENDENT_MASTER branch
+        // settles it in memory, so this measures the read itself and not a SecurityContext walk.
+        UUID masterUserId = jdbcTemplate.queryForObject(
+                "SELECT user_id FROM masters WHERE id = ?", UUID.class, salon.masterId());
+
+        Statistics statistics = statistics();
+        statistics.clear();
+        var detail = bookingService.getBooking(masterUserId, bookingId);
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(detail.salonName())
+                .as("correctness — the visit WAS at a salon, so its name must still be served; a "
+                        + "master going solo does not retroactively turn a past salon visit into a "
+                        + "home-studio one. NULL here means the block was resolved off "
+                        + "master.getSalon(), the pre-242 source.")
+                .isEqualTo(salonName);
+        assertThat(detail.street())
+                .as("the booked salon's street, never the now-solo master's personal one")
+                .isEqualTo(salonStreet)
+                .isNotEqualTo(masterPersonalStreet);
+        assertThat(detail.locationNote())
+                .as("THE security assertion on this shape — a master going independent must not "
+                        + "hand every past client of theirs the door code to their HOME. The "
+                        + "negative is explicit so it cannot pass on two fixtures that happen to "
+                        + "agree.")
+                .isEqualTo(salonNote)
+                .isNotEqualTo(masterPersonalNote);
+        assertThat(statements)
+                .as("this is the ONLY shape that can tell findByIdWithFullGraph's LEFT JOIN FETCH "
+                        + "b.salon apart from the m.salon it replaced. In both the aligned and the "
+                        + "rotated fixture the two graphs happen to cost the same (aligned: one "
+                        + "row serves both; rotated: one is fetched and the other lazy-loaded, "
+                        + "either way 1 + 1). Here m.salon is NULL, so a graph still fetching it "
+                        + "materialises nothing and the mapper's booking.getSalon() property reads "
+                        + "lazy-load the booked salon — %s instead of %s.",
+                        OWNER_DETAIL_STATEMENTS_ALIGNED + 1, OWNER_DETAIL_STATEMENTS_ALIGNED)
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED);
+    }
+
+    /**
+     * Phase-242 QA audit, finding 2 — <b>INVERTED</b> once the walk was actually removed. This gate
+     * was authored asserting {@code rotated == aligned + 1}, i.e. that the owning CLIENT still paid
+     * the live-salon load on this surface; it now asserts the opposite, on the same fixture.
+     *
+     * <p>History, because the direction is the whole point. The phase-242 audit-fix batch hoisted
+     * the owning-client probe above {@code isAuthorizedToManageBooking} in
+     * {@code AuthorizationService#enforceCanViewBooking}, so the client no longer paid its
+     * {@code master.getSalon().getOwner()} proxy-initialising walk. That fixed
+     * {@code GET /appointments/&#123;id&#125;} ({@code AppointmentReadIT.VISIT_DETAIL_STATEMENTS}
+     * dropped 5 &rarr; 4) and <b>nothing else</b>: {@code BookingService#getBooking} re-entered the
+     * identical walk a few statements later through {@code computeProviderCanReviewClient} &rarr;
+     * {@code AuthorizationService#hasProviderAuthorityOverBooking}, unconditionally, for every
+     * viewer class including a CLIENT. That method now gates on
+     * {@code AuthorizationService#isOwningClientViewer} — the SAME classification
+     * {@code enforceCanViewBooking} already computed, so no extra {@code SecurityContext} read and
+     * no extra query — and the client pays nothing.
+     *
+     * <p>Still asserted as a DIFFERENCE against the aligned shape rather than as an absolute
+     * constant, so it needs no separately derived number and cannot drift out of step with
+     * {@link #OWNER_DETAIL_STATEMENTS_ALIGNED}. Any excess is a regression: the only statement that
+     * could reappear here is the master's LIVE {@code salons} row, a row this response never
+     * renders. {@link #OWNER_DETAIL_STATEMENTS_ROTATED} is NOT affected and must not be
+     * re-derived from this — the salon OWNER genuinely still needs that row to authorize, and pays
+     * for it in {@code enforceCanViewBooking} before {@code computeProviderCanReviewClient} is ever
+     * reached.
+     *
+     * <p><b>The fixture is COMPLETED on purpose.</b> On a future {@code CONFIRMED} booking
+     * {@code BookingClosureRule#isReviewEligible} is false, so a later reordering of
+     * {@code computeProviderCanReviewClient}'s conjuncts could suppress the walk for a reason that
+     * has nothing to do with the viewer, and this gate would pass vacuously. {@code COMPLETED}
+     * makes every other conjunct true, so the viewer gate is the only thing that can keep the count
+     * flat.
+     *
+     * <p>The {@code providerCanReviewClient} assertions are the behaviour half: the flag the gate
+     * protects must read {@code false} for this viewer on BOTH shapes, exactly as it did before the
+     * gate existed. A cost fix that flipped a CTA would be a product bug, not an optimisation.
+     *
+     * <p>The two reads are warmed first: {@code DiscoveryLocationResolver}'s label lookups are
+     * cached, so whichever read ran first would otherwise absorb them and the difference under
+     * test would be a caching artefact rather than the salon walk.
+     */
+    @Test
+    @DisplayName("GET /bookings/{id} read by the OWNING CLIENT costs the SAME whether or not the "
+            + "booking's salon diverges from the master's live one — computeProviderCanReviewClient "
+            + "no longer re-enters the getSalon().getOwner() walk that enforceCanViewBooking "
+            + "already short-circuits for this viewer")
+    void should_notPayTheLiveSalonWalk_when_theOwningClientReadsADivergentSalonBooking() {
+        var salon = fixtures.createSalon("bprc-client-rot-" + System.nanoTime() + "@beautica.test");
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID clientId = fixtures.createUser(
+                "bprc-client-rot-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+
+        UUID bookedElsewhereSalonId = insertBareSalonUnderOwner(
+                ownerId, "bprc-client-rot-booked-" + System.nanoTime());
+        assertThat(bookedElsewhereSalonId)
+                .as("premise — the second salon must be a DIFFERENT row from the master's live "
+                        + "one, or both reads measure the aligned shape and the comparison below "
+                        + "is between a value and itself")
+                .isNotEqualTo(salon.salonId());
+
+        // Same client, same master, same service, same locality, same COMPLETED status — the ONLY
+        // difference between the two rows is which salon bookings.salon_id points at.
+        UUID alignedBookingId = insertBooking(clientId, salon.masterId(), serviceId,
+                ANCHOR.minusYears(4), new BigDecimal("300.00"), new BigDecimal("500.00"),
+                "COMPLETED", salon.salonId());
+        UUID rotatedBookingId = insertBooking(clientId, salon.masterId(), serviceId,
+                ANCHOR.minusYears(4).plusDays(1), new BigDecimal("300.00"), new BigDecimal("500.00"),
+                "COMPLETED", bookedElsewhereSalonId);
+
+        SecurityContextHolder.getContext().setAuthentication(authFor(Role.CLIENT));
+        try {
+            // Warm the discovery-label cache for both rows before measuring anything.
+            bookingService.getBooking(clientId, alignedBookingId);
+            bookingService.getBooking(clientId, rotatedBookingId);
+
+            Statistics statistics = statistics();
+            statistics.clear();
+            var aligned = bookingService.getBooking(clientId, alignedBookingId);
+            long alignedStatements = statistics.getPrepareStatementCount();
+
+            statistics.clear();
+            var rotated = bookingService.getBooking(clientId, rotatedBookingId);
+            long rotatedStatements = statistics.getPrepareStatementCount();
+
+            assertThat(aligned.salonId())
+                    .as("premise — the aligned row's snapshot IS the master's live salon, so "
+                            + "master.getSalon() resolves off the already-materialised entity")
+                    .isEqualTo(salon.salonId());
+            assertThat(rotated.salonId())
+                    .as("premise — the rotated row's snapshot is the OTHER salon, so "
+                            + "master.getSalon() is a genuine uninitialised proxy on that read")
+                    .isEqualTo(bookedElsewhereSalonId)
+                    .isNotEqualTo(salon.salonId());
+            assertThat(rotated.status())
+                    .as("premise — COMPLETED, so isReviewEligible is true and the viewer gate is "
+                            + "the ONLY conjunct that can keep computeProviderCanReviewClient off "
+                            + "the salon walk (see this test's javadoc)")
+                    .isEqualTo(BookingStatus.COMPLETED);
+            assertThat(rotated.providerCanReviewClient())
+                    .as("behaviour half — the CLIENT viewer never gets the provider-review CTA, "
+                            + "before or after the cost gate")
+                    .isFalse();
+            assertThat(aligned.providerCanReviewClient())
+                    .as("behaviour half — same on the aligned shape, which never paid the walk")
+                    .isFalse();
+            assertThat(rotatedStatements)
+                    .as("aligned=%s, rotated=%s. Equal: the master's LIVE salons row is no longer "
+                            + "opened for this viewer. One more would mean "
+                            + "hasProviderAuthorityOverBooking's getSalon().getOwner() property "
+                            + "read is back on the client path inside "
+                            + "computeProviderCanReviewClient.",
+                            alignedStatements, rotatedStatements)
+                    .isEqualTo(alignedStatements);
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+
+    @Test
+    @DisplayName("GET /bookings/{id} as the salon OWNER — production-normal shape (the booking's "
+            + "salon IS the master's live salon): ONE Salon row serves both the address block and "
+            + "the ownership walk, and the owner's User is still never hydrated")
+    void should_hydrateExactlyOneSalon_when_bookingSalonMatchesTheMastersLiveSalon() {
+        var salon = fixtures.createSalon("bprc-detail-aligned-" + System.nanoTime() + "@beautica.test");
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salon.salonId());
+        UUID clientId = fixtures.createUser(
+                "bprc-detail-aligned-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
+                new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        stampSalonLocality(salon.salonId());
+        UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", salon.salonId());
+
+        Statistics statistics = statistics();
+        statistics.clear();
+        var detail = bookingService.getBooking(ownerId, bookingId);
+        long entities = statistics.getEntityLoadCount();
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(statements)
+                .as("absolute JDBC statement count for the production-normal detail read: the "
+                        + "single findByIdWithFullGraph + the two DiscoveryLocationResolver label "
+                        + "IN queries. A rise means an association the mapper reads stopped being "
+                        + "fetch-joined and is being lazily initialised.")
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ALIGNED);
+        assertThat(detail.salonId())
+                .as("premise — this gate is the ALIGNED case; the booking's snapshot and the "
+                        + "master's live salon must be the SAME row or it measures the other case")
+                .isEqualTo(salon.salonId());
+        assertThat(detail.salonName())
+                .as("premise — a real salon must be on the row, or there is no Salon.owner proxy")
+                .isNotNull();
+        assertThat(entities)
+                .as("absolute HYDRATED-ENTITY count for the production-normal detail read. This is "
+                        + "the number that must not move when the salon fetch is re-pointed: one "
+                        + "Salon row answers the address block AND the ownership walk. A rise to %s "
+                        + "means s.owner (or another association) was fetch-joined back on.",
+                        OWNER_DETAIL_ENTITIES_ALIGNED + 1)
+                .isEqualTo(OWNER_DETAIL_ENTITIES_ALIGNED);
+    }
 
     @Test
     @DisplayName("GET /bookings/{id} as the salon OWNER authorizes off the uninitialised Salon.owner "
-            + "proxy and hydrates no User row for it — pins the s.owner drop a statement count cannot see")
+            + "proxy and hydrates no User row for it — with a DIVERGENT booking salon the request "
+            + "needs both salon rows and no more")
     void should_notHydrateTheSalonOwner_when_loadingABookingDetail() {
         var salon = fixtures.createSalon("bprc-detail-owner-" + System.nanoTime() + "@beautica.test");
         UUID ownerId = jdbcTemplate.queryForObject(
@@ -1189,13 +2032,31 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 "bprc-detail-owner-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID serviceId = createRangeService("SALON", salon.salonId(), salon.masterId(),
                 new BigDecimal("300.00"), new BigDecimal("500.00"), null);
+        // Phase B2/242: booked at a DIFFERENT salon from the master's live one — the post-rotation
+        // shape. booking.getSalon() is the fetched row; master.getSalon() is a real uninitialised
+        // proxy that AuthorizationService's getOwner() walk must open.
+        UUID bookedSalonId = insertBareSalonUnderOwner(
+                ownerId, "bprc-detail-booked-salon-" + System.nanoTime());
+        assertThat(bookedSalonId)
+                .as("premise — divergent from the master's live salon, or this is the aligned case")
+                .isNotEqualTo(salon.salonId());
         UUID bookingId = insertBooking(clientId, salon.masterId(), serviceId, ANCHOR,
-                new BigDecimal("300.00"), new BigDecimal("500.00"));
+                new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", bookedSalonId);
 
         Statistics statistics = statistics();
         statistics.clear();
         var detail = bookingService.getBooking(ownerId, bookingId);
         long entities = statistics.getEntityLoadCount();
+        long statements = statistics.getPrepareStatementCount();
+
+        assertThat(statements)
+                .as("absolute JDBC statement count for a POST-ROTATION detail read — exactly one "
+                        + "more than the aligned case (%s), and that one is the master's live Salon "
+                        + "row, opened by AuthorizationService's getSalon().getOwner() walk. It is "
+                        + "irreducible: the request needs the booking's salon to display and the "
+                        + "master's live salon to authorize, and they are different rows. A rise "
+                        + "beyond this is a real regression.", OWNER_DETAIL_STATEMENTS_ALIGNED)
+                .isEqualTo(OWNER_DETAIL_STATEMENTS_ROTATED);
 
         // The authorization walk itself is the premise: reaching a response at all means
         // getOwner().getId() resolved off the proxy rather than throwing.
@@ -1206,12 +2067,20 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .as("premise — the row must carry a real salon, or there is no Salon.owner proxy "
                         + "for this gate to be about")
                 .isNotNull();
+        assertThat(detail.salonId())
+                .as("premise — the booking's own salon snapshot must be the DIVERGENT row, or "
+                        + "there is no second Salon for this gate to account for either")
+                .isEqualTo(bookedSalonId)
+                .isNotEqualTo(salon.salonId());
         assertThat(entities)
-                .as("absolute HYDRATED-ENTITY count for one owner-served booking detail. A rise to "
-                        + "%s means s.owner (or another association) was fetch-joined back onto "
-                        + "findByIdWithFullGraph — invisible to any statement count, which is "
-                        + "precisely why this gate counts entities.", OWNER_DETAIL_ENTITIES + 1)
-                .isEqualTo(OWNER_DETAIL_ENTITIES);
+                .as("absolute HYDRATED-ENTITY count for one owner-served booking detail whose "
+                        + "salon DIVERGES from the master's live one: the booking's Salon (fetched) "
+                        + "plus the master's live Salon (opened by the ownership walk), and nothing "
+                        + "else. A rise to %s means s.owner — or another association — was "
+                        + "fetch-joined back onto findByIdWithFullGraph, invisible to any statement "
+                        + "count, which is precisely why this gate counts entities.",
+                        OWNER_DETAIL_ENTITIES_ROTATED + 1)
+                .isEqualTo(OWNER_DETAIL_ENTITIES_ROTATED);
     }
 
     @Test
@@ -1338,8 +2207,15 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * cites exactly that path. This seed is the one that puts a real, initialisable
      * {@code Salon.owner} proxy on the page, so the pinned count below actually has the power to
      * catch a regression that starts walking {@code salon.getOwner()}.
+     *
+     * <p><b>{@code bookedSalonId} (Phase B2 QA)</b> is what each booking's own
+     * {@code bookings.salon_id} snapshot is set to — deliberately a DIFFERENT salon from
+     * {@code salonId} (the master's live affiliation, which drives {@code m.salon} and the
+     * locality stamp). See {@link #SALON_MASTER_PAGE_ENTITIES} for why the divergence is
+     * load-bearing rather than decorative.
      */
-    private void seedSalonBookingsOnDistinctServices(UUID clientId, UUID salonId, UUID masterId, int count) {
+    private void seedSalonBookingsOnDistinctServices(UUID clientId, UUID salonId, UUID masterId,
+                                                     int count, UUID bookedSalonId) {
         stampSalonLocality(salonId);
         long existing = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM bookings WHERE master_id = ?", Long.class, masterId);
@@ -1348,7 +2224,7 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                     "SALON", salonId, masterId, new BigDecimal("300.00"), new BigDecimal("500.00"), null);
             insertBooking(clientId, masterId, serviceId,
                     ANCHOR.plusMinutes(90L * (existing + i)),
-                    new BigDecimal("300.00"), new BigDecimal("500.00"));
+                    new BigDecimal("300.00"), new BigDecimal("500.00"), "CONFIRMED", bookedSalonId);
         }
     }
 
@@ -1533,16 +2409,64 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     private UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId,
                                OffsetDateTime startsAt, BigDecimal priceAtBooking,
                                BigDecimal priceMaxAtBooking, String status) {
+        return insertBooking(clientId, masterId, masterServiceId, startsAt,
+                priceAtBooking, priceMaxAtBooking, status, null);
+    }
+
+    /**
+     * {@code salon_id}-carrying form (Phase B2 QA). Every other overload leaves
+     * {@code bookings.salon_id} NULL, which made all four statement/entity gates in this class
+     * structurally blind to {@code BookingDetailResponse.from}'s
+     * {@code booking.getSalon() != null ? booking.getSalon().getId() : null} dereference: with a
+     * NULL FK there is no proxy to dereference at all, so the gates could not have caught it
+     * becoming a statement.
+     *
+     * <p>The value must be a salon row DISTINCT from the master's own {@code masters.salon_id} for
+     * the gate to bite. When the two agree, Hibernate resolves {@code booking.salon} off the
+     * first-level cache entry already materialised by {@code LEFT JOIN FETCH m.salon} and hands
+     * back the real entity — no proxy is ever created and the id read is trivially free. Only a
+     * divergent id (the post-rotation shape B2's whole design is about) produces a genuine
+     * uninitialised {@code Salon} proxy on the page.
+     */
+    private UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                               OffsetDateTime startsAt, BigDecimal priceAtBooking,
+                               BigDecimal priceMaxAtBooking, String status, UUID salonId) {
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
                         + "starts_at, ends_at, price_at_booking, price_max_at_booking, "
                         + "duration_minutes_at_booking, buffer_minutes_at_booking, booking_source, "
                         + "created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, masterId, masterServiceId, status, startsAt,
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, salonId, status, startsAt,
                 startsAt.plusMinutes(60), priceAtBooking, priceMaxAtBooking);
         return bookingId;
+    }
+
+    /**
+     * A second {@code salons} row under an EXISTING owner — the "salon the booking was made at"
+     * for the divergent-salon gates. Deliberately leaner than {@link #addSalonUnderOwner}: no
+     * master is attached, because nothing must ever put this salon on the page under test via the
+     * master graph. It exists as the target of {@code bookings.salon_id} alone.
+     *
+     * <p><b>Phase 242 — it is stamped with a locality, and that is load-bearing.</b> Since the
+     * display block (including {@code cityLabel}/{@code districtLabel}) is resolved from
+     * {@code booking.getSalon()}, a locality-less booked salon makes
+     * {@code DiscoveryLocationResolver.resolveLabels} short-circuit on two empty id sets and the
+     * page silently drops from six statements to four. The gates would then be pinning a number
+     * produced by what the fixture OMITS rather than by the production path — and would go blind
+     * to a regression in the label queries. Both salons carry the SAME locality on purpose: the
+     * divergence that matters to these gates is the salon ROW identity (which decides whether a
+     * proxy exists at all), not the locality values.
+     */
+    private UUID insertBareSalonUnderOwner(UUID ownerId, String name) {
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                salonId, ownerId, name);
+        stampSalonLocality(salonId);
+        return salonId;
     }
 
     /**

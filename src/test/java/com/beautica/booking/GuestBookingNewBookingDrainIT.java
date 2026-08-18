@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.notification.service.BookingVisit;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.booking.entity.Booking;
@@ -130,7 +131,7 @@ class GuestBookingNewBookingDrainIT extends AbstractIntegrationTest {
 
         // Proves the master-facing email dispatch was actually reached — i.e. clientName
         // resolution (booking.getClient() -> guest fallback) did not throw before this call.
-        verify(emailNotificationService).sendNewBookingEmail(anyString(), any(Booking.class));
+        verify(emailNotificationService).sendNewBookingEmail(anyString(), any(BookingVisit.class));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -179,12 +180,26 @@ class GuestBookingNewBookingDrainIT extends AbstractIntegrationTest {
                 UUID.class);
     }
 
+    /**
+     * Open-ended weekly schedule, all seven ISO weekdays 08:00–20:00 — the Phase 15.4 effective-day
+     * model the availability resolver actually reads (mirrors {@code BookingTestFixtures
+     * #addWorkingHoursForEveryDay}).
+     *
+     * <p>Was the legacy {@code working_hours} table, which no resolver has consulted since 15.4: it
+     * seeded nothing the slot calculator could see, so every start looked off-schedule the moment the
+     * create paths gained their schedule-fit gate (2026-08-11).
+     */
     private void addWorkingHoursForEveryDay(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to) "
+                        + "VALUES (?, ?, DATE '2020-01-01', NULL)",
+                scheduleId, masterId);
         for (int day = 1; day <= 7; day++) {
             jdbcTemplate.update(
-                    "INSERT INTO working_hours (id, master_id, day_of_week, start_time, end_time, is_active) "
-                            + "VALUES (?, ?, ?, '08:00', '20:00', true)",
-                    UUID.randomUUID(), masterId, day);
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                            + "VALUES (?, ?, ?, '08:00', '20:00')",
+                    UUID.randomUUID(), scheduleId, day);
         }
     }
 

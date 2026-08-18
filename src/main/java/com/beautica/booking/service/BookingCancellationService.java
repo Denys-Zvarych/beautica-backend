@@ -7,6 +7,7 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.service.NotificationOutboxService;
@@ -21,9 +22,9 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
-import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -54,6 +55,7 @@ public class BookingCancellationService {
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
+    private final GuestVisitCancellationService guestVisitCancellationService;
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
     private final SmsService smsService;
@@ -63,6 +65,7 @@ public class BookingCancellationService {
     private final Clock kyivClock;
 
     public BookingCancellationService(
+            GuestVisitCancellationService guestVisitCancellationService,
             BookingRepository bookingRepository,
             NotificationOutboxService outboxService,
             SmsService smsService,
@@ -70,6 +73,7 @@ public class BookingCancellationService {
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             Clock clock) {
+        this.guestVisitCancellationService = guestVisitCancellationService;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
         this.smsService = smsService;
@@ -88,8 +92,10 @@ public class BookingCancellationService {
      */
     @Transactional(readOnly = true)
     public CancelTokenInfoResponse getInfo(UUID token) {
-        Booking booking = loadCancellableOrThrow(token);
-        return buildInfo(booking);
+        // BE-7: a token on an Appointment is a multi-service visit — served by the visit service. Only a
+        // token that resolves to no visit falls through to the legacy single-booking path below.
+        return guestVisitCancellationService.getInfo(token)
+                .orElseGet(() -> buildInfo(loadCancellableOrThrow(token)));
     }
 
     /**
@@ -101,6 +107,12 @@ public class BookingCancellationService {
      */
     @Transactional
     public void cancel(UUID token) {
+        // BE-7: a token on an Appointment cancels the WHOLE visit (header + all items) via the visit
+        // service; it returns true when it handled the token. Only a non-visit token falls through to
+        // the legacy single-booking cancel below (byte-for-byte unchanged).
+        if (guestVisitCancellationService.cancel(token)) {
+            return;
+        }
         Booking booking = loadCancellableOrThrow(token);
 
         if (!isCancellable(booking)) {
@@ -160,15 +172,13 @@ public class BookingCancellationService {
         String phone = booking.getGuestPhone();
         String smsText = buildCancellationSms(booking);
         UUID masterId = booking.getMaster().getId();
-        UUID masterServiceId = booking.getMasterService().getId();
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
-        LocalDate date = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toLocalDate();
         Runnable task = () -> {
             sendCancellationSms(phone, smsText);
-            // Cancelling frees a slot → the freed slot must reappear in the picker and the master's
-            // free-slot bookability verdict may flip (un-hiding a service). Evict both.
-            slotCalculationService.evictAvailableSlots(masterId, date, masterServiceId);
-            slotCalculationService.evictBookableFutureSlotsByMaster(masterId);
+            // Cancelling frees the master's time → the freed slot must reappear in the picker for
+            // EVERY service this master performs that day (not just the cancelled one), and the
+            // free-slot bookability verdict may flip (un-hiding a service). One by-master sweep.
+            slotCalculationService.evictMasterAvailabilityCaches(masterId);
             // Un-hiding a service also changes the salon catalogue (perf/security #2).
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
@@ -196,13 +206,26 @@ public class BookingCancellationService {
         }
     }
 
+    /**
+     * Renders the guest cancellation SMS in ONE pass over the template — see
+     * {@link Placeholders#format}.
+     *
+     * <p>Chained {@link String#replace} was a template-injection vector here: {@code {serviceName}}
+     * was substituted BEFORE {@code {date}} and {@code {time}}, so each later {@code replace}
+     * re-scanned the service name it had just written in. A provider who named a service
+     * {@code "Манікюр {date}"} therefore got a second, fabricated date/time line expanded inside a
+     * message the guest reads as platform copy — SMS is a guest's only channel. This template
+     * carries no {@code {cancelUrl}}, so there is no link to duplicate, but the layout-steering
+     * vector is the same. A single pass copies substituted values out verbatim, so data can never
+     * become markup.
+     */
     private String buildCancellationSms(Booking booking) {
         OffsetDateTime kyiv = booking.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return smsProperties.getSms().getCancellation()
-                .replace("{serviceName}", booking.getMasterService().getServiceDefinition().getName())
-                .replace("{masterName}", masterName(booking.getMaster()))
-                .replace("{date}", DATE_FMT.format(kyiv))
-                .replace("{time}", TIME_FMT.format(kyiv));
+        return Placeholders.format(smsProperties.getSms().getCancellation(), Map.of(
+                "serviceName", booking.getMasterService().getServiceDefinition().getName(),
+                "masterName", masterName(booking.getMaster()),
+                "date", DATE_FMT.format(kyiv),
+                "time", TIME_FMT.format(kyiv)));
     }
 
     private static String masterName(Master master) {

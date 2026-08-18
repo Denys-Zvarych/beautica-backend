@@ -152,7 +152,8 @@ class GuestBookingRequestControlCharValidationTest {
 
         assertThat(componentNames)
                 .as("phone must NOT be a request-body field; it comes from the guest JWT sub claim")
-                .containsExactlyInAnyOrder("serviceId", "startsAt", "name", "surname")
+                // masterServiceIds added in BE-7 (multi-service guest visit); phone still absent.
+                .containsExactlyInAnyOrder("serviceId", "masterServiceIds", "startsAt", "name", "surname")
                 .noneMatch(n -> n.toLowerCase().contains("phone")
                         || n.toLowerCase().contains("msisdn")
                         || n.toLowerCase().equals("tel"));

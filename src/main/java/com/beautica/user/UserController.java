@@ -36,6 +36,19 @@ public class UserController {
         return ResponseEntity.ok(ApiResponse.ok(profile));
     }
 
+    /**
+     * The caller's own aggregate client rating (Phase 27.6). Primarily called by CLIENT
+     * principals — the "Мій рейтинг" read surface from the two-sided ratings pivot — but is not
+     * role-restricted: any authenticated user has been the client of at least a hypothetical
+     * booking, and there is nothing sensitive in a {@code null}/zero rating for a non-CLIENT role.
+     */
+    @GetMapping("/me/rating")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<ApiResponse<UserRatingResponse>> getMyRating(Authentication authentication) {
+        UUID userId = AuthenticationUtils.userId(authentication);
+        return ResponseEntity.ok(ApiResponse.ok(userService.getMyRating(userId)));
+    }
+
     @PatchMapping("/me")
     @PreAuthorize("isAuthenticated()")
     public ResponseEntity<ApiResponse<UserProfileResponse>> updateMe(

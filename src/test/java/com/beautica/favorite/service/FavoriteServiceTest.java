@@ -1,11 +1,13 @@
 package com.beautica.favorite.service;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
+import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.Favorite;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
@@ -13,7 +15,13 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -24,6 +32,10 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -38,6 +50,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -47,11 +60,14 @@ import static org.mockito.Mockito.when;
  * Unit tests for {@link FavoriteService} (Phase 19.1).
  *
  * <p>All collaborators (repository, master/salon repositories, the M2
- * locality-label seam) are mocked; the tests verify the favoriting/unfavoriting
- * business rules — idempotency, {@code SALON_MASTER} rejection, missing-target
- * {@code 404}, the concurrent-race fallback, {@code lastServiceName} resolution
- * and the no-N+1 label batching — without booting Hibernate. End-to-end query
- * correctness lives in {@code FavoriteMigrationIT}.
+ * locality-label seam, {@link FavoritePersistenceService}) are mocked; the tests verify the
+ * favoriting/unfavoriting business rules — idempotency, {@code SALON_MASTER} rejection,
+ * missing-target {@code 404}, the concurrent-race fallback, {@code lastServiceName} resolution
+ * and the no-N+1 label batching — without booting Hibernate. Because
+ * {@code favoritePersistenceService} is a mock here, it has no real transaction to poison, so
+ * these tests cannot see the aborted-transaction gap a genuine two-thread race exposes; that
+ * proof lives in {@code FavoriteSalonServiceIT}'s real-Postgres concurrency test. End-to-end
+ * query correctness lives in {@code FavoriteMigrationIT}.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("FavoriteService — unit")
@@ -67,7 +83,16 @@ class FavoriteServiceTest {
     private SalonRepository salonRepository;
 
     @Mock
+    private MasterServiceRepository masterServiceRepository;
+
+    @Mock
+    private com.beautica.service.repository.ServiceRepository serviceRepository;
+
+    @Mock
     private DiscoveryLocationResolver discoveryLocationResolver;
+
+    @Mock
+    private FavoritePersistenceService favoritePersistenceService;
 
     @InjectMocks
     private FavoriteService favoriteService;
@@ -78,10 +103,72 @@ class FavoriteServiceTest {
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private static Master masterOwnedBy(Role ownerRole) {
+        return masterOwnedBy(ownerRole, true);
+    }
+
+    /**
+     * {@code masterActive = false} models a provider who deactivated: the 2026-08 security audit
+     * made that a rejection on BOTH favorite arms, because a booking against such a master 404s.
+     */
+    private static Master masterOwnedBy(Role ownerRole, boolean masterActive) {
         User owner = new User(
                 "master-" + UUID.randomUUID() + "@beautica.test", "hash", ownerRole,
                 "Марія", "Левченко", "+380501234567");
-        return Master.builder().id(UUID.randomUUID()).user(owner).build();
+        return Master.builder()
+                .id(UUID.randomUUID())
+                .user(owner)
+                .isActive(masterActive)
+                .build();
+    }
+
+    /**
+     * An assignment whose owning master's user carries {@code ownerRole} — used to prove the
+     * SERVICE arm applies NO role check (a SALON_MASTER's service IS wish-listable), unlike the
+     * MASTER arm.
+     */
+    private static MasterServiceAssignment assignmentOwnedBy(Role ownerRole,
+                                                             boolean assignmentActive,
+                                                             boolean definitionActive) {
+        return assignmentOwnedBy(ownerRole, assignmentActive, definitionActive, true);
+    }
+
+    private static MasterServiceAssignment assignmentOwnedBy(Role ownerRole,
+                                                             boolean assignmentActive,
+                                                             boolean definitionActive,
+                                                             boolean masterActive) {
+        return assignmentOwnedBy(ownerRole, assignmentActive, definitionActive, masterActive, null);
+    }
+
+    /**
+     * {@code salon} models a SALON-employed master's owning salon (2026-08 security re-audit
+     * MEDIUM). {@code null} is the {@code INDEPENDENT_MASTER} shape — no salon at all — and MUST
+     * remain wish-listable, so it is the default every other overload passes.
+     */
+    private static MasterServiceAssignment assignmentOwnedBy(Role ownerRole,
+                                                             boolean assignmentActive,
+                                                             boolean definitionActive,
+                                                             boolean masterActive,
+                                                             Salon salon) {
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("600.00"))
+                .isActive(definitionActive)
+                .build();
+
+        Master master = masterOwnedBy(ownerRole, masterActive);
+        master.setSalon(salon);
+
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(sd)
+                .isActive(assignmentActive)
+                .build();
     }
 
     private static Favorite existingFavorite(UUID clientId, FavoriteTargetType type, UUID targetId) {
@@ -115,7 +202,7 @@ class FavoriteServiceTest {
                             FavoriteResponse::targetId, FavoriteResponse::createdAt)
                     .containsExactly(existing.getId(), FavoriteTargetType.MASTER, targetId,
                             existing.getCreatedAt());
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
@@ -127,7 +214,7 @@ class FavoriteServiceTest {
                     clientId, FavoriteTargetType.MASTER, targetId))
                     .thenReturn(Optional.empty());
             Favorite saved = existingFavorite(clientId, FavoriteTargetType.MASTER, targetId);
-            when(favoriteRepository.saveAndFlush(any(Favorite.class))).thenReturn(saved);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId);
@@ -136,7 +223,7 @@ class FavoriteServiceTest {
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.MASTER);
 
             ArgumentCaptor<Favorite> captor = ArgumentCaptor.forClass(Favorite.class);
-            verify(favoriteRepository).saveAndFlush(captor.capture());
+            verify(favoritePersistenceService).persistNew(captor.capture());
             assertThat(captor.getValue())
                     .as("persisted favorite is scoped to the authenticated principal")
                     .extracting(Favorite::getClientId, Favorite::getTargetType, Favorite::getTargetId)
@@ -155,7 +242,7 @@ class FavoriteServiceTest {
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verify(favoriteRepository, never())
                     .findByClientIdAndTargetTypeAndTargetId(any(), any(), any());
         }
@@ -170,51 +257,81 @@ class FavoriteServiceTest {
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Master not found");
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("rejects a deactivated MASTER target with 400 and writes no row")
+        void should_throwBadRequest_when_masterIsInactive() {
+            // Independent (so the role gate passes) but deactivated — the only failing flag.
+            when(masterRepository.findByIdWithUserAndSalon(targetId))
+                    .thenReturn(Optional.of(masterOwnedBy(Role.INDEPENDENT_MASTER, false)));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("throws 404 when the SALON target is deactivated — indistinguishable from missing")
+        void should_throwNotFound_when_salonIsInactive() {
+            // existsByIdAndIsActiveTrue answers false for a soft-deleted salon exactly as it does
+            // for an absent one; the client must not be able to tell the two apart.
+            when(salonRepository.existsByIdAndIsActiveTrue(targetId)).thenReturn(false);
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, targetId))
+                    .isInstanceOf(NotFoundException.class);
+
+            verifyNoInteractions(favoritePersistenceService);
         }
 
         @Test
         @DisplayName("throws 404 when the SALON target does not exist")
         void should_throwNotFound_when_salonMissing() {
-            when(salonRepository.existsById(targetId)).thenReturn(false);
+            when(salonRepository.existsByIdAndIsActiveTrue(targetId)).thenReturn(false);
 
             assertThatThrownBy(() ->
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, targetId))
                     .isInstanceOf(NotFoundException.class)
                     .hasMessageContaining("Salon not found");
 
-            verify(favoriteRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(favoritePersistenceService);
             verifyNoInteractions(masterRepository);
         }
 
         @Test
         @DisplayName("inserts a SALON favorite when the salon exists")
         void should_insertSalonFavorite_when_salonExists() {
-            when(salonRepository.existsById(targetId)).thenReturn(true);
+            when(salonRepository.existsByIdAndIsActiveTrue(targetId)).thenReturn(true);
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.SALON, targetId))
                     .thenReturn(Optional.empty());
             Favorite saved = existingFavorite(clientId, FavoriteTargetType.SALON, targetId);
-            when(favoriteRepository.saveAndFlush(any(Favorite.class))).thenReturn(saved);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
 
             FavoriteResponse response =
                     favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, targetId);
 
             assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SALON);
-            verify(favoriteRepository).saveAndFlush(any());
+            verify(favoritePersistenceService).persistNew(any());
         }
 
         @Test
         @DisplayName("resolves a concurrent unique-violation by re-reading the now-present row")
         void should_returnRacedRow_when_concurrentInsertHitsUniqueIndex() {
-            when(salonRepository.existsById(targetId)).thenReturn(true);
+            when(salonRepository.existsByIdAndIsActiveTrue(targetId)).thenReturn(true);
             Favorite raced = existingFavorite(clientId, FavoriteTargetType.SALON, targetId);
             // First read (pre-check) sees nothing; second read (post-violation) sees the raced row.
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.SALON, targetId))
                     .thenReturn(Optional.empty())
                     .thenReturn(Optional.of(raced));
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenThrow(new DataIntegrityViolationException("uq_favorite"));
 
             FavoriteResponse response =
@@ -226,12 +343,12 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("surfaces 409 when the unique-violation cannot be resolved by a re-read")
         void should_throwConflict_when_racedRowVanishesBeforeReRead() {
-            when(salonRepository.existsById(targetId)).thenReturn(true);
+            when(salonRepository.existsByIdAndIsActiveTrue(targetId)).thenReturn(true);
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.SALON, targetId))
                     .thenReturn(Optional.empty())
                     .thenReturn(Optional.empty());
-            when(favoriteRepository.saveAndFlush(any(Favorite.class)))
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
                     .thenThrow(new DataIntegrityViolationException("uq_favorite"));
 
             assertThatThrownBy(() ->
@@ -239,6 +356,493 @@ class FavoriteServiceTest {
                     .isInstanceOf(BusinessException.class)
                     .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                             .isEqualTo(HttpStatus.CONFLICT));
+        }
+    }
+
+    // ── addFavorite — SERVICE target (Phase 31.3) ───────────────────────────────
+
+    @Nested
+    @DisplayName("addFavorite — SERVICE target")
+    class AddServiceFavorite {
+
+        @Test
+        @DisplayName("inserts when the target is an active master_services row")
+        void should_persist_when_targetIsActiveService() {
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(
+                            assignmentOwnedBy(Role.INDEPENDENT_MASTER, true, true)));
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SERVICE, targetId))
+                    .thenReturn(Optional.empty());
+            Favorite saved = existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+
+            assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
+            assertThat(response.targetId()).isEqualTo(targetId);
+            verify(favoritePersistenceService).persistNew(any());
+        }
+
+        @Test
+        @DisplayName("ALLOWS a salon-employed master's service — deliberate asymmetry with the MASTER rule")
+        void should_persist_when_targetIsSalonMasterService() {
+            // Locked user decision (2026-08-07): a wish-listed service is a rebook shortcut,
+            // not an endorsement of a person. Copying validateMasterTarget's SALON_MASTER
+            // rejection here would make most of the catalogue un-wish-listable.
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(assignmentOwnedBy(Role.SALON_MASTER, true, true)));
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SERVICE, targetId))
+                    .thenReturn(Optional.empty());
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenReturn(existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+
+            assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
+            verify(favoritePersistenceService).persistNew(any());
+        }
+
+        @Test
+        @DisplayName("throws 404 when the master_services id is unknown")
+        void should_throwNotFound_when_masterServiceIdUnknown() {
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.empty());
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId))
+                    .isInstanceOf(NotFoundException.class)
+                    .hasMessageContaining("Service not found");
+
+            verifyNoInteractions(favoritePersistenceService);
+            verifyNoInteractions(masterRepository, salonRepository);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when the assignment itself is deactivated")
+        void should_throwBadRequest_when_assignmentInactive() {
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(
+                            assignmentOwnedBy(Role.INDEPENDENT_MASTER, false, true)));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when the service definition was soft-deleted but the assignment is still active")
+        void should_throwBadRequest_when_serviceDefinitionInactive() {
+            // deactivateServiceDefinition soft-deletes the definition without touching the
+            // assignment row, so this combination is a real state, not a synthetic one.
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(
+                            assignmentOwnedBy(Role.INDEPENDENT_MASTER, true, false)));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when the performing master deactivated, even though both "
+                + "service flags are still active")
+        void should_reject_when_masterIsInactive() {
+            // 2026-08 security audit. The assignment AND the definition are both active — the
+            // ONLY inactive flag is the master's. Without the master predicate this favorite is
+            // written and the wish list then offers a «Записатись» that doCreateBooking 404s.
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(
+                            assignmentOwnedBy(Role.INDEPENDENT_MASTER, true, true, false)));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when the master's SALON was deactivated, even though the "
+                + "assignment, the definition and the master row are all still active")
+        void should_reject_when_masterSalonIsInactive() {
+            // 2026-08 security re-audit MEDIUM. SalonService.deactivateSalon does NOT cascade to
+            // masters.is_active, so all three pre-existing flags stay true and only the salon's is
+            // false — the exact state that let a closed salon's services keep a live «Записатись».
+            MasterServiceAssignment assignment = assignmentOwnedBy(
+                    Role.SALON_MASTER, true, true, true,
+                    Salon.builder().id(UUID.randomUUID()).isActive(false).build());
+            // The rejection must be the CANONICAL rule's verdict, not a look-alike hand-rolled
+            // predicate: validateServiceTarget delegates to MasterBookability, so pin the two
+            // together here. If someone re-inlines the check and the two drift, this fails.
+            assertThat(MasterBookability.isBookable(assignment.getMaster()))
+                    .as("precondition: MasterBookability — the single canonical rule — must itself "
+                            + "call this master unbookable, so the 400 below is that rule's verdict")
+                    .isFalse();
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(assignment));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("ALLOWS a salon master's service while the salon is still ACTIVE — the salon "
+                + "guard must not reject every salon-employed master")
+        void should_persist_when_masterSalonIsActive() {
+            MasterServiceAssignment assignment = assignmentOwnedBy(
+                    Role.SALON_MASTER, true, true, true,
+                    Salon.builder().id(UUID.randomUUID()).isActive(true).build());
+            // The other half of the MasterBookability pin (see should_reject_when_masterSalonIsInactive):
+            // without this, a helper that always answered false would leave that test green while
+            // silently locking every salon-employed master out of the wish list.
+            assertThat(MasterBookability.isBookable(assignment.getMaster()))
+                    .as("precondition: an active master of an OPEN salon IS bookable")
+                    .isTrue();
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(assignment));
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SERVICE, targetId))
+                    .thenReturn(Optional.empty());
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenReturn(existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+
+            assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
+            verify(favoritePersistenceService).persistNew(any());
+        }
+
+        @Test
+        @DisplayName("returns the existing row on a duplicate — never inserts again (idempotent)")
+        void should_beIdempotent_when_sameServiceFavoritedTwice() {
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(
+                            assignmentOwnedBy(Role.INDEPENDENT_MASTER, true, true)));
+            Favorite existing = existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SERVICE, targetId))
+                    .thenReturn(Optional.of(existing));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+
+            assertThat(response.id()).isEqualTo(existing.getId());
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("resolves a concurrent unique-violation on the SERVICE path by re-reading")
+        void should_returnRacedRow_when_concurrentServiceInsertHitsUniqueIndex() {
+            when(masterServiceRepository.findByIdWithServiceDefinitionAndMaster(targetId))
+                    .thenReturn(Optional.of(
+                            assignmentOwnedBy(Role.INDEPENDENT_MASTER, true, true)));
+            Favorite raced = existingFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SERVICE, targetId))
+                    .thenReturn(Optional.empty())
+                    .thenReturn(Optional.of(raced));
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenThrow(new DataIntegrityViolationException("uq_favorite"));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, targetId);
+
+            assertThat(response.id()).isEqualTo(raced.getId());
+        }
+    }
+
+    // ── addFavorite — SALON_SERVICE target (salon-service-favourites track) ─────
+
+    @Nested
+    @DisplayName("addFavorite — SALON_SERVICE target")
+    class AddSalonServiceFavorite {
+
+        private ServiceDefinition salonServiceDefinition(UUID salonId, boolean active) {
+            return ServiceDefinition.builder()
+                    .id(targetId)
+                    .ownerType(OwnerType.SALON)
+                    .ownerId(salonId)
+                    .name("Pedicure")
+                    .baseDurationMinutes(45)
+                    .priceType(PriceType.FIXED)
+                    .basePrice(new BigDecimal("400.00"))
+                    .isActive(active)
+                    .build();
+        }
+
+        @Test
+        @DisplayName("inserts when the definition is a salon-owned, active service an active master performs")
+        void should_persist_when_targetIsBookableSalonService() {
+            UUID salonId = UUID.randomUUID();
+            when(serviceRepository.findById(targetId))
+                    .thenReturn(Optional.of(salonServiceDefinition(salonId, true)));
+            when(masterServiceRepository.existsBookableAssignmentForSalonService(salonId, targetId))
+                    .thenReturn(true);
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .thenReturn(Optional.empty());
+            Favorite saved = existingFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
+            when(favoritePersistenceService.persistNew(any(Favorite.class))).thenReturn(saved);
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
+
+            assertThat(response.targetType()).isEqualTo(FavoriteTargetType.SALON_SERVICE);
+            assertThat(response.targetId()).isEqualTo(targetId);
+            verify(favoritePersistenceService).persistNew(any());
+        }
+
+        @Test
+        @DisplayName("throws 404 when the service_definitions id is unknown")
+        void should_throwNotFound_when_serviceDefinitionUnknown() {
+            when(serviceRepository.findById(targetId)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .isInstanceOf(NotFoundException.class)
+                    .hasMessageContaining("Service not found");
+
+            verifyNoInteractions(favoritePersistenceService);
+            verifyNoInteractions(masterServiceRepository);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when the definition is soft-deleted")
+        void should_throwBadRequest_when_definitionInactive() {
+            UUID salonId = UUID.randomUUID();
+            when(serviceRepository.findById(targetId))
+                    .thenReturn(Optional.of(salonServiceDefinition(salonId, false)));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+            verifyNoInteractions(masterServiceRepository);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when the definition is owned by an INDEPENDENT_MASTER, not a SALON")
+        void should_throwBadRequest_when_definitionOwnedByIndependentMaster() {
+            ServiceDefinition definition = ServiceDefinition.builder()
+                    .id(targetId)
+                    .ownerType(OwnerType.INDEPENDENT_MASTER)
+                    .ownerId(UUID.randomUUID())
+                    .name("Manicure")
+                    .baseDurationMinutes(60)
+                    .priceType(PriceType.FIXED)
+                    .basePrice(new BigDecimal("600.00"))
+                    .isActive(true)
+                    .build();
+            when(serviceRepository.findById(targetId)).thenReturn(Optional.of(definition));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+            verifyNoInteractions(masterServiceRepository);
+        }
+
+        @Test
+        @DisplayName("rejects with 400 when no active master of the salon currently performs the service")
+        void should_throwBadRequest_when_noActiveMasterPerformsService() {
+            UUID salonId = UUID.randomUUID();
+            when(serviceRepository.findById(targetId))
+                    .thenReturn(Optional.of(salonServiceDefinition(salonId, true)));
+            when(masterServiceRepository.existsBookableAssignmentForSalonService(salonId, targetId))
+                    .thenReturn(false);
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("returns the existing row on a duplicate — never inserts again (idempotent)")
+        void should_beIdempotent_when_sameSalonServiceFavoritedTwice() {
+            UUID salonId = UUID.randomUUID();
+            when(serviceRepository.findById(targetId))
+                    .thenReturn(Optional.of(salonServiceDefinition(salonId, true)));
+            when(masterServiceRepository.existsBookableAssignmentForSalonService(salonId, targetId))
+                    .thenReturn(true);
+            Favorite existing = existingFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .thenReturn(Optional.of(existing));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
+
+            assertThat(response.id()).isEqualTo(existing.getId());
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("resolves a concurrent unique-violation on the SALON_SERVICE path by re-reading")
+        void should_returnRacedRow_when_concurrentSalonServiceInsertHitsUniqueIndex() {
+            UUID salonId = UUID.randomUUID();
+            when(serviceRepository.findById(targetId))
+                    .thenReturn(Optional.of(salonServiceDefinition(salonId, true)));
+            when(masterServiceRepository.existsBookableAssignmentForSalonService(salonId, targetId))
+                    .thenReturn(true);
+            Favorite raced = existingFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.SALON_SERVICE, targetId))
+                    .thenReturn(Optional.empty())
+                    .thenReturn(Optional.of(raced));
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenThrow(new DataIntegrityViolationException("uq_favorite"));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, targetId);
+
+            assertThat(response.id()).isEqualTo(raced.getId());
+        }
+    }
+
+    // ── listServiceFavorites ────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("listServiceFavorites")
+    class ListServiceFavorites {
+
+        /**
+         * Builds a raw {@code Object[]} row matching the merged native projection's column
+         * layout (indices 0-14 — see {@code FavoriteRepository.findFavoriteServiceRows}'s
+         * javadoc); columns 15/16 (ordering-only) are omitted since
+         * {@code FavoriteServiceResponse.fromRow} never reads them.
+         */
+        private static Object[] masterArmRow(MasterServiceAssignment msa, String firstName,
+                                             String lastName, String avatarUrl) {
+            return new Object[] {
+                    "MASTER", msa.getId(), msa.getMaster().getId(),
+                    msa.getServiceDefinition().getId(), msa.getServiceDefinition().getName(),
+                    firstName, lastName, avatarUrl,
+                    msa.getServiceDefinition().getBaseDurationMinutes(),
+                    msa.getServiceDefinition().getPriceType().name(),
+                    msa.getServiceDefinition().getBasePrice(),
+                    msa.getServiceDefinition().getPriceMax(),
+                    null, null, null
+            };
+        }
+
+        @Test
+        @DisplayName("maps every MASTER-arm projection row to a wish-list row, sort stripped")
+        void should_mapAssignmentsToWishListRows_when_clientHasServiceFavorites() {
+            MasterServiceAssignment msa = assignmentOwnedBy(Role.SALON_MASTER, true, true);
+            Object[] row = masterArmRow(msa, "Марія", "Левченко", "https://cdn/avatar.png");
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(row)));
+
+            Page<FavoriteServiceResponse> page =
+                    favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+
+            assertThat(page.getContent()).hasSize(1);
+            assertThat(page.getContent().get(0))
+                    .extracting(FavoriteServiceResponse::sourceType,
+                            FavoriteServiceResponse::masterServiceId,
+                            FavoriteServiceResponse::masterId,
+                            FavoriteServiceResponse::serviceDefId,
+                            FavoriteServiceResponse::serviceName,
+                            FavoriteServiceResponse::masterFirstName,
+                            FavoriteServiceResponse::masterLastName,
+                            FavoriteServiceResponse::masterAvatarUrl,
+                            FavoriteServiceResponse::durationMinutes,
+                            FavoriteServiceResponse::priceDisplay,
+                            FavoriteServiceResponse::salonId)
+                    .containsExactly(FavoriteServiceResponse.SourceType.MASTER,
+                            msa.getId(), msa.getMaster().getId(), msa.getServiceDefinition().getId(),
+                            "Manicure", "Марія", "Левченко", "https://cdn/avatar.png", 60, "600 ₴",
+                            null);
+        }
+
+        @Test
+        @DisplayName("carries a null avatar straight through from the scalar column")
+        void should_returnNullAvatar_when_projectionAvatarIsNull() {
+            MasterServiceAssignment msa = assignmentOwnedBy(Role.INDEPENDENT_MASTER, true, true);
+            Object[] row = masterArmRow(msa, "Олена", "Коваль", null);
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(row)));
+
+            Page<FavoriteServiceResponse> page =
+                    favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+
+            assertThat(page.getContent().get(0).masterAvatarUrl()).isNull();
+        }
+
+        @Test
+        @DisplayName("maps a SALON-arm projection row with null master identity fields and a populated salon")
+        void should_mapSalonArmRow_when_clientHasSalonServiceFavorite() {
+            UUID serviceDefId = UUID.randomUUID();
+            UUID salonId = UUID.randomUUID();
+            Object[] row = {
+                    "SALON", null, null, serviceDefId, "Pedicure",
+                    null, null, null,
+                    45, "FIXED", new BigDecimal("400.00"), null,
+                    salonId, "Salon Bella", "https://cdn/salon.png"
+            };
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(row)));
+
+            Page<FavoriteServiceResponse> page =
+                    favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+
+            assertThat(page.getContent()).hasSize(1);
+            FavoriteServiceResponse response = page.getContent().get(0);
+            assertThat(response.sourceType()).isEqualTo(FavoriteServiceResponse.SourceType.SALON);
+            assertThat(response.masterServiceId()).isNull();
+            assertThat(response.masterId()).isNull();
+            assertThat(response.masterFirstName()).isNull();
+            assertThat(response.masterLastName()).isNull();
+            assertThat(response.masterAvatarUrl()).isNull();
+            assertThat(response.serviceDefId()).isEqualTo(serviceDefId);
+            assertThat(response.salonId()).isEqualTo(salonId);
+            assertThat(response.salonName()).isEqualTo("Salon Bella");
+            assertThat(response.salonAvatarUrl()).isEqualTo("https://cdn/salon.png");
+            assertThat(response.durationMinutes()).isEqualTo(45);
+            assertThat(response.priceDisplay()).isEqualTo("400 ₴");
+        }
+
+        @Test
+        @DisplayName("returns an empty page when the client has wish-listed nothing")
+        void should_returnEmptyPage_when_noServiceFavorites() {
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(Page.empty());
+
+            Page<FavoriteServiceResponse> page =
+                    favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+
+            assertThat(page).isEmpty();
+            verifyNoInteractions(discoveryLocationResolver);
         }
     }
 

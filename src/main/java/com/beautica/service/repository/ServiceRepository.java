@@ -98,7 +98,7 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * {@code (serviceTypeId → existing active ServiceDefinition id)} pair that would collide
      * with a multi-item write for {@code (ownerType, ownerId)}.
      *
-     * <p><b>Why this exists.</b> The bulk first-time-setup path accepts up to 100 items
+     * <p><b>Why this exists.</b> The bulk service-create path accepts up to 100 items
      * ({@code @Size(max = 100)} on {@code BulkCreateServicesRequest}); calling
      * {@link #findActiveDuplicateId} per item issued 100 serialized SELECTs, regressing the
      * one-query batching its sibling steps ({@code resolveBulkServiceTypes},

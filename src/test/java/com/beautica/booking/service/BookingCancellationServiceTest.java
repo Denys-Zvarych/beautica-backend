@@ -53,6 +53,7 @@ class BookingCancellationServiceTest {
     private static final String GUEST_PHONE = "+380501234567";
     private static final OffsetDateTime NOW = OffsetDateTime.parse("2026-06-01T10:00:00Z");
 
+    @Mock private GuestVisitCancellationService guestVisitCancellationService;
     @Mock private BookingRepository bookingRepository;
     @Mock private NotificationOutboxService outboxService;
     @Mock private SmsService smsService;
@@ -64,8 +65,8 @@ class BookingCancellationServiceTest {
     @BeforeEach
     void setUp() {
         service = new BookingCancellationService(
-                bookingRepository, outboxService, smsService, slotCalculationService,
-                new BookingSmsProperties(), salonCatalogCacheEvictor,
+                guestVisitCancellationService, bookingRepository, outboxService, smsService,
+                slotCalculationService, new BookingSmsProperties(), salonCatalogCacheEvictor,
                 Clock.fixed(NOW.toInstant(), ZoneOffset.UTC));
     }
 
@@ -182,14 +183,45 @@ class BookingCancellationServiceTest {
         verifyNoInteractions(outboxService, smsService);
     }
 
+    @Test
+    @DisplayName("cancel must not expand a {date}/{time} placeholder that arrived inside the service name")
+    void should_notExpandAPlaceholderThatArrivedAsAValue_when_aServiceNameContainsOne() {
+        // buildCancellationSms substituted {serviceName} BEFORE {date}/{time} with chained
+        // String.replace, so each later replace re-scanned the name it had just written in. The
+        // service name is provider-controlled free text, so a provider naming a service
+        // "Манікюр {date} о {time}" rendered a SECOND, provider-positioned date/time line inside
+        // copy the guest reads as platform text — and SMS is the only channel a guest has.
+        OffsetDateTime startsAt = NOW.plusHours(5); // 2026-06-01T15:00Z → 18:00 Kyiv on 01.06.2026
+        when(bookingRepository.findByCancelTokenWithGraph(TOKEN))
+                .thenReturn(Optional.of(booking(startsAt, BookingStatus.CONFIRMED, "Манікюр {date} о {time}")));
+        when(bookingRepository.consumeCancelToken(TOKEN)).thenReturn(1);
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.cancel(TOKEN);
+
+        verify(smsService).send(eq(GUEST_PHONE), textCaptor.capture());
+        assertThat(textCaptor.getValue())
+                .as("the literal braces from the DATA must survive as text, never be expanded")
+                .contains("Манікюр {date} о {time}")
+                .as("the real date appears exactly once, where the TEMPLATE puts it")
+                .containsOnlyOnce("01.06.2026")
+                .as("the real time appears exactly once — a provider must not be able to fabricate a "
+                        + "second appointment time")
+                .containsOnlyOnce("18:00");
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private Booking booking(OffsetDateTime startsAt, BookingStatus status) {
+        return booking(startsAt, status, "Манікюр");
+    }
+
+    private Booking booking(OffsetDateTime startsAt, BookingStatus status, String serviceName) {
         User user = new User("m@beautica.test", "x", com.beautica.auth.Role.SALON_MASTER,
                 "Марія", "Левченко", null);
         Master master = Master.builder().id(UUID.randomUUID()).user(user).isActive(true).build();
         ServiceDefinition def = ServiceDefinition.builder()
-                .name("Манікюр")
+                .name(serviceName)
                 .baseDurationMinutes(60)
                 .bufferMinutesAfter(0)
                 .basePrice(new BigDecimal("350.00"))

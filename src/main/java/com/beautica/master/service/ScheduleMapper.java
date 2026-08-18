@@ -13,6 +13,7 @@ import com.beautica.master.entity.ScheduleExceptionInterval;
 import com.beautica.master.entity.ScheduleExceptionKind;
 import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.entity.WeeklySchedule;
+import com.beautica.master.entity.WeeklyScheduleDayWindow;
 import com.beautica.master.entity.WorkingInterval;
 import org.springframework.stereotype.Component;
 
@@ -22,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
@@ -62,8 +64,15 @@ public class ScheduleMapper {
                     .add(dt.getSlotTime());
         }
 
+        // Phase 15.12: display-only working-window bounds, at most one row per weekday.
+        Map<Integer, WeeklyScheduleDayWindow> windowsByDay = new TreeMap<>();
+        for (WeeklyScheduleDayWindow dw : schedule.getDayWindows()) {
+            windowsByDay.putIfAbsent(dw.getDayOfWeek(), dw);
+        }
+
         Map<Integer, WeeklyScheduleDayResponse> byDay = new TreeMap<>();
         for (var e : timesByDay.entrySet()) {
+            // An EXPLICIT_TIMES day has no window-with-breaks affordance, so it never carries window bounds.
             byDay.put(e.getKey(), new WeeklyScheduleDayResponse(
                     e.getKey(),
                     WeekdayMode.EXPLICIT_TIMES,
@@ -73,11 +82,14 @@ public class ScheduleMapper {
         for (var e : intervalsByDay.entrySet()) {
             // A day is INTERVAL only when it has no discrete-time rows (mode exclusivity is a service
             // invariant; this guards against a malformed historical row mixing both).
+            WeeklyScheduleDayWindow window = windowsByDay.get(e.getKey());
             byDay.putIfAbsent(e.getKey(), new WeeklyScheduleDayResponse(
                     e.getKey(),
                     WeekdayMode.INTERVAL,
                     e.getValue().stream().sorted(BY_START).toList(),
-                    List.of()));
+                    List.of(),
+                    window != null ? window.getWindowStart() : null,
+                    window != null ? window.getWindowEnd() : null));
         }
 
         List<WeeklyScheduleDayResponse> days = new ArrayList<>(byDay.values());
@@ -94,13 +106,17 @@ public class ScheduleMapper {
     public ScheduleOverrideResponse toOverrideResponse(ScheduleException exception) {
         List<LocalTime> times = toOverrideDiscreteTimes(exception);
         if (!times.isEmpty()) {
+            // An EXPLICIT_TIMES override has no window-with-breaks affordance — no window bounds.
             return new ScheduleOverrideResponse(
                     exception.getDate(), exception.getKind(),
                     WeekdayMode.EXPLICIT_TIMES, List.of(), times);
         }
+        // Phase 15.12: display-only window bounds, non-null only on an INTERVAL CUSTOM_HOURS row that
+        // recorded them (the service persists null for DAY_OFF / EXPLICIT_TIMES / legacy rows).
         return new ScheduleOverrideResponse(
                 exception.getDate(), exception.getKind(),
-                WeekdayMode.INTERVAL, toIntervalDtos(exception.getIntervals()), List.of());
+                WeekdayMode.INTERVAL, toIntervalDtos(exception.getIntervals()), List.of(),
+                exception.getWindowStart(), exception.getWindowEnd());
     }
 
     /**
@@ -137,6 +153,43 @@ public class ScheduleMapper {
             List<WorkIntervalDto> intervals,
             List<LocalTime> times) {
         return new EffectiveDayResponse(date, source, intervals, times);
+    }
+
+    /**
+     * Phase 15.12: effective-day projection carrying the resolved source's display-only working window, so
+     * the mobile day editor (which hydrates from this projection) can derive breaks as
+     * {@code window MINUS intervals} and recover a break flush against an edge of the working day.
+     *
+     * <p>Both bounds are {@code null} whenever the source stored none (every legacy row) — never
+     * synthesized. {@code times} is {@code null} here: an EXPLICIT_TIMES day has no window-with-breaks
+     * affordance and therefore never carries window bounds (use
+     * {@link #toEffectiveDay(LocalDate, EffectiveDaySource, List, List)} for those).
+     *
+     * <p>Metadata only — {@code intervals} stays the single canonical source of availability and no slot
+     * computation reads these bounds.
+     */
+    public EffectiveDayResponse toEffectiveDayWithWindow(
+            LocalDate date,
+            EffectiveDaySource source,
+            List<WorkIntervalDto> intervals,
+            LocalTime windowStart,
+            LocalTime windowEnd) {
+        return new EffectiveDayResponse(date, source, intervals, null, windowStart, windowEnd);
+    }
+
+    /**
+     * Phase 15.12: the stored display-only working window of one ISO weekday of a weekly template, if the
+     * client ever recorded one. Empty for every legacy day, every day off, and every EXPLICIT_TIMES day
+     * (the service never writes a row for those) — the caller then projects {@code null} bounds and the
+     * client falls back to gap reconstruction.
+     *
+     * <p>Traverses the batch-fetched {@code dayWindows} collection; callers must pass an entity loaded
+     * inside an open transaction, exactly as {@link #toDiscreteTimesForDay} already requires.
+     */
+    public Optional<WeeklyScheduleDayWindow> findDayWindow(WeeklySchedule schedule, int isoDow) {
+        return schedule.getDayWindows().stream()
+                .filter(dw -> dw.getDayOfWeek() == isoDow)
+                .findFirst();
     }
 
     /** Maps an override's intervals (already graph-fetched), ordered by start time. */

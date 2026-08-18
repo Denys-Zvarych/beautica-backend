@@ -51,7 +51,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code 409 BOOKING_ALREADY_ELAPSED}). Locked product rule: once a booking's appointment window
  * has fully passed ({@code endsAt < now}) it becomes read-only for the CLIENT and awaits provider
  * resolution — a client may no longer cancel or reschedule it, while the provider
- * (decline / complete / mark-no-show) still can.
+ * (complete / mark-no-show) still can.
+ *
+ * <p><b>Product decision reversal (REVERSES a claim this class used to pin twice).</b>
+ * {@code decline}'s brief future-only temporal guard, and {@code not-complete}'s brief
+ * elapsed-only temporal guard, have both been removed: a provider may decline OR mark a CONFIRMED
+ * booking a no-show at ANY time, future or already-elapsed. See Matrix #5 below, which was
+ * updated in place rather than left to silently document stale behaviour.
  *
  * <p><b>Threat model this pins — server-clock authority.</b> The elapsed verdict is computed
  * SOLELY from the injected server {@link java.time.Clock} and the persisted {@code endsAt}; no
@@ -209,10 +215,14 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
                 .isEqualTo(BookingStatus.CONFIRMED.name());
     }
 
-    // ── Matrix #5 — provider resolution paths REMAIN allowed on an elapsed CONFIRMED booking ─────
+    // ── Matrix #5 — provider resolution paths on an elapsed CONFIRMED booking ────────────────────
+    // Product decision reversal: decline no longer carries a temporal guard at all — a provider
+    // may decline a CONFIRMED booking at any time, elapsed or not, exactly like complete/not-complete.
 
     @Test
-    @DisplayName("provider decline on an elapsed CONFIRMED booking still succeeds → DECLINED (resolution path is NOT guarded)")
+    @DisplayName("provider decline on an ELAPSED CONFIRMED booking succeeds → DECLINED "
+            + "(decline has no temporal guard — a provider may resolve an elapsed booking by "
+            + "declining it, not only via complete/not-complete)")
     void should_allowProviderDecline_when_bookingElapsed() {
         Master master = createIndependentMaster("elapsed-decline-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
@@ -220,11 +230,11 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
         UUID bookingId = insertElapsedConfirmedBooking(clientId, master.masterId, serviceId);
 
         authenticateAs(master.userId);
-        bookingService.declineBooking(master.userId, bookingId,
-                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        bookingService.declineBooking(master.userId, bookingId, req);
 
         assertThat(bookingStatus(bookingId))
-                .as("the provider may decline (cancel) an elapsed booking — that is the resolution path")
+                .as("the provider may decline an already-started booking")
                 .isEqualTo(BookingStatus.DECLINED.name());
     }
 
@@ -245,7 +255,7 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("provider mark-no-show on an elapsed CONFIRMED booking still succeeds → NOT_COMPLETED (resolution path is NOT guarded)")
+    @DisplayName("provider mark-no-show on an elapsed CONFIRMED booking still succeeds → NOT_COMPLETED")
     void should_allowProviderMarkNoShow_when_bookingElapsed() {
         Master master = createIndependentMaster("elapsed-noshow-master-" + System.nanoTime() + "@beautica.test");
         UUID serviceId = createMasterService(master.masterId);
@@ -257,7 +267,26 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
                 new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
 
         assertThat(bookingStatus(bookingId))
-                .as("the provider may mark an elapsed booking as a no-show — the elapsed guard is client-only")
+                .as("the provider may mark an elapsed booking as a no-show")
+                .isEqualTo(BookingStatus.NOT_COMPLETED.name());
+    }
+
+    @Test
+    @DisplayName("provider mark-no-show on a FUTURE (not-yet-started) CONFIRMED booking succeeds too "
+            + "→ NOT_COMPLETED (not-complete has no temporal guard — reverted along with the rest of "
+            + "the elapsed-only restriction; the optional providerComment is accepted)")
+    void should_allowProviderMarkNoShow_when_bookingIsFuture() {
+        Master master = createIndependentMaster("future-noshow-master-" + System.nanoTime() + "@beautica.test");
+        UUID serviceId = createMasterService(master.masterId);
+        UUID clientId = createClient("future-noshow-client-" + System.nanoTime() + "@beautica.test");
+        UUID bookingId = insertFutureConfirmedBooking(clientId, master.masterId, serviceId);
+
+        authenticateAs(master.userId);
+        StatusUpdateRequest req = new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, "Клієнт не з'явився");
+        bookingService.notCompleteBooking(master.userId, bookingId, req);
+
+        assertThat(bookingStatus(bookingId))
+                .as("the provider may mark a future (not-yet-started) booking as a no-show")
                 .isEqualTo(BookingStatus.NOT_COMPLETED.name());
     }
 
@@ -352,6 +381,23 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
                         + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
                         + "booking_source, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, NULL, 'CONFIRMED', NOW() - interval '90 minutes', NOW() - interval '45 minutes', "
+                        + "500.00, 45, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId);
+        return bookingId;
+    }
+
+    /**
+     * Inserts an APP booking whose slot has NOT started yet (starts in 90 minutes) — the future
+     * counterpart to {@link #insertElapsedConfirmedBooking} above, used to prove not-complete
+     * (and decline) succeed regardless of elapsed state.
+     */
+    private UUID insertFutureConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, 'CONFIRMED', NOW() + interval '90 minutes', NOW() + interval '135 minutes', "
                         + "500.00, 45, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId);
         return bookingId;

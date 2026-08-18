@@ -7,7 +7,7 @@ import jakarta.validation.constraints.Size;
 import java.util.List;
 
 /**
- * Request body for the first-time bulk service setup flow.
+ * Request body for the bulk service-create flow.
  *
  * <p>Carries a non-empty list of {@link BulkServiceItemRequest} items, one per
  * service-type the master toggled on in the picker. The whole batch is created in a
@@ -19,8 +19,10 @@ import java.util.List;
  * (including the per-item {@code @ServicePriceValid} price-mode check) so each item's
  * field errors surface at the controller boundary as a 400, never as a 500 from the DB.
  *
- * <p>The endpoint is only valid for a master with <em>zero</em> active services; the
- * service layer enforces this and returns 409 otherwise (first-time-only product rule).
+ * <p>The flow is <em>additive</em>: the batch is appended to whatever the master already
+ * offers, so the same request backs both initial catalogue setup and later "add more
+ * services" passes. The only state-conflict is per-service — an item whose service type the
+ * master already offers is rejected with 409 {@code DUPLICATE_SERVICE}.
  *
  * @param items the services to create — non-empty, capped to a sane upper bound.
  */

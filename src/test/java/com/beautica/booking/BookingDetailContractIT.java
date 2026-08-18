@@ -23,7 +23,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.lang.reflect.RecordComponent;
+import java.math.BigDecimal;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -128,6 +131,57 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .isEqualTo("Майстер стрижки");
         assertThat(single.get("salonName").asText())
                 .isEqualTo("Contract Bare Salon");
+
+        // clientAvatarUrl non-vacuity. The reflective loop above ALREADY compares this field —
+        // it enumerates getRecordComponents(), so the component was picked up the moment it was
+        // added to the DTO, with no new hand-written assertion needed. But "both sides agree"
+        // is worthless while both sides are null, which is exactly what the unseeded fixture
+        // produced. This pins that the compared value is real on BOTH mapper paths: the entity
+        // path (client.getAvatarUrl()) and the CLIENT projection path (b.client.avatarUrl).
+        assertThat(single.get("clientAvatarUrl").asText())
+                .as("entity path (GET /bookings/{id}) must serve the client's seeded avatar, so "
+                        + "the parity loop compares a real value rather than null == null")
+                .isEqualTo(CLIENT_AVATAR_URL);
+        assertThat(listItem.get("clientAvatarUrl").asText())
+                .as("CLIENT projection path (GET /bookings/me) must serve the same real value — "
+                        + "this is the JPQL `b.client.avatarUrl` select, a physically different "
+                        + "read from the entity path's getter walk")
+                .isEqualTo(CLIENT_AVATAR_URL);
+        assertThat(single.get("clientAvatarUrl").asText())
+                .as("the client's avatar must never be the MASTER's — the two fields read two "
+                        + "different User graphs and a swap would be invisible if both were null")
+                .isNotEqualTo(MASTER_AVATAR_URL);
+        assertThat(single.get("masterAvatarUrl").asText())
+                .as("sibling field sanity — proves the master's avatar is genuinely a different "
+                        + "seeded value, not absent, so the inequality above is meaningful")
+                .isEqualTo(MASTER_AVATAR_URL);
+
+        // masterAvgRating/masterReviewCount non-vacuity (Phase B1), same reasoning as the
+        // clientAvatarUrl block above: the reflective loop already compares both fields, but the
+        // column defaults (0.00 / 0) normalise to null on BOTH paths, so without a seeded rating
+        // the comparison would be null == null. The entity path reads master.getAvgRating(); the
+        // CLIENT projection path reads the JPQL `m.avgRating` select — physically different reads.
+        assertThat(new BigDecimal(single.get("masterAvgRating").asText()))
+                .as("entity path (GET /bookings/{id}) must serve the seeded master rating")
+                .isEqualByComparingTo(MASTER_AVG_RATING);
+        assertThat(new BigDecimal(listItem.get("masterAvgRating").asText()))
+                .as("CLIENT projection path (GET /bookings/me) must serve the same real value")
+                .isEqualByComparingTo(MASTER_AVG_RATING);
+        assertThat(single.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
+        assertThat(listItem.get("masterReviewCount").asInt()).isEqualTo(MASTER_REVIEW_COUNT);
+
+        // salonId non-vacuity (Phase B2). The reflective loop above already compares the field,
+        // but it would compare null == null for an independent master's booking; this fixture
+        // seeds bookings.salon_id explicitly (see insertConfirmedBooking). The two paths read it
+        // physically differently — the entity path walks booking.getSalon().getId(), the CLIENT
+        // projection path selects the `b.salon.id` FK in JPQL — so this also pins that the JPQL
+        // identifier path resolves at all.
+        assertThat(single.get("salonId").asText())
+                .as("entity path (GET /bookings/{id}) must serve the booking's own salon_id")
+                .isEqualTo(fx.salonId().toString());
+        assertThat(listItem.get("salonId").asText())
+                .as("CLIENT projection path (GET /bookings/me) must serve the same salon_id")
+                .isEqualTo(fx.salonId().toString());
     }
 
     /**
@@ -164,6 +218,11 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                 .as("fixture sanity — the booking must actually carry client PII for the absence "
                         + "assertions below to mean anything")
                 .isEqualTo(CLIENT_FIRST_NAME);
+        assertThat(legitimate.get("clientAvatarUrl").asText())
+                .as("same non-vacuity gate for the client's LIKENESS: the denial assertions below "
+                        + "only prove something if an authorized read demonstrably DOES serve this "
+                        + "URL for this booking")
+                .isEqualTo(CLIENT_AVATAR_URL);
 
         String foreignMasterEmail = seedForeignMasterAtSameSalon(fx.salonId());
 
@@ -193,9 +252,205 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                         + "smuggled through a renamed or nested field the key scan would miss")
                 .doesNotContain(CLIENT_FIRST_NAME)
                 .doesNotContain(CLIENT_LAST_NAME)
+                // The client's LIKENESS. An avatar URL is a directly dereferenceable, publicly
+                // readable R2 object — leaking it into a 403 envelope hands a denied actor the
+                // client's photo outright, which is strictly worse than leaking an opaque id.
+                .doesNotContain(CLIENT_AVATAR_URL)
                 .doesNotContain("Contract Bare Salon")
                 .doesNotContain("MasterOwnStreet")
                 .doesNotContain("Майстер стрижки");
+    }
+
+    /**
+     * The POSITIVE half of the {@code clientAvatarUrl} widening — the feature itself.
+     *
+     * <p>Everything else about this field is asserted from the CLIENT's own two read paths, where
+     * the value is simply the caller's own photo and no widening has occurred. The widening is
+     * this: a PROVIDER receives a photo of somebody else. That path is
+     * {@code listProviderBookings} → {@code findIdsByMasterIdFiltered} + {@code
+     * findAllByIdsWithGraph} → {@code BookingDetailResponse.from} — a physically different query
+     * and a different scoping branch from either client path, and it had no assertion on this
+     * field anywhere in {@code src/test/}.
+     *
+     * <p>Asserted against DISTINCT seeded avatars so this cannot pass on a mapper that serves the
+     * master their own picture: the provider must receive the CLIENT's URL, and the row's
+     * {@code masterAvatarUrl} must still independently carry the master's.
+     */
+    @Test
+    @DisplayName("GET /bookings/me (provider path) — a master's own booking row carries the "
+            + "BOOKING CLIENT's avatar URL, not the master's own; this is the widening the field "
+            + "exists for and the provider-scoped query had no assertion on it")
+    void should_serveClientAvatarToProvider_when_masterListsOwnBookings() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        String masterEmail = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId());
+        JsonNode providerRow = findInMyBookings(bookingId, tokenFor(masterEmail));
+
+        assertThat(providerRow)
+                .as("the booking's own master must see it on their provider timeline")
+                .isNotNull();
+        assertThat(providerRow.get("clientAvatarUrl").asText())
+                .as("the provider must receive the CLIENT's photo — this is the whole point of "
+                        + "the field, and the entity-graph provider query had zero coverage of it")
+                .isEqualTo(CLIENT_AVATAR_URL);
+        assertThat(providerRow.get("clientAvatarUrl").asText())
+                .as("a mapper that read masterUser.getAvatarUrl() into this slot would render the "
+                        + "master's own face on every client card — distinct seeded URLs are what "
+                        + "make that swap fail here instead of shipping")
+                .isNotEqualTo(MASTER_AVATAR_URL);
+        assertThat(providerRow.get("masterAvatarUrl").asText())
+                .as("sibling field must still independently carry the master's own avatar")
+                .isEqualTo(MASTER_AVATAR_URL);
+    }
+
+    /**
+     * Phase 242 — the address block follows the BOOKING's salon, end-to-end, on BOTH mapper paths.
+     *
+     * <p>The leak this closes: {@code salonName}/{@code street}/{@code buildingNo}/
+     * {@code locationNote}/{@code cityLabel}/{@code districtLabel} used to resolve off
+     * {@code master.getSalon()} — the master's LIVE affiliation — so once a master rotated salons,
+     * a client opening an OLD booking was served the NEW salon's {@code locationNote}. That field
+     * is by its own {@code @Schema} contract the provider's arrival hint and holds door codes
+     * («3-й поверх, код 1234»), i.e. premises-access information for a salon the client has never
+     * booked at.
+     *
+     * <p>Both salons carry DISTINCT, NON-NULL street / buildingNo / locationNote / city / district.
+     * A null on either side would make every {@code isNotEqualTo} below pass vacuously — the trap
+     * this suite's own history is full of. The premise assertions guard exactly that.
+     *
+     * <p>Runs against the client's TWO read paths, which are physically different queries and
+     * independently maintained mappers: {@code GET /bookings/{id}} (entity path,
+     * {@code findByIdWithFullGraph} → {@code BookingDetailResponse#from}) and
+     * {@code GET /bookings/me} (projection path, {@code hydrateClientBookingDetails}). A fix
+     * applied to only one of them is the exact divergence class the reflective parity loop above
+     * exists for.
+     */
+    @Test
+    @DisplayName("after the master rotates salons, BOTH client read paths still serve the BOOKED "
+            + "salon's address and door code — the new salon's note never reaches the client")
+    void should_serveTheBookedSalonsAddress_when_theMasterHasSinceRotatedToAnotherSalon() throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses();
+        UUID bookingId = insertConfirmedBooking(fx);
+
+        Locality localityA = resolveLocality(0);
+        // Phase-242 QA audit, finding 4: selected so BOTH labels differ, not just the city one.
+        // District names repeat across Ukrainian cities, so an offset-based pick could hand back
+        // two localities whose districtLabel happens to coincide and quietly defang the
+        // districtLabel assertions below.
+        Locality localityB = resolveLocalityWithBothLabelsDifferentFrom(localityA);
+        assertThat(localityB.cityLabel())
+                .as("premise — the two seeded localities must differ, or the label assertions "
+                        + "below compare a value against itself and prove nothing")
+                .isNotEqualTo(localityA.cityLabel());
+        assertThat(localityB.districtLabel())
+                .as("premise — same, for the district half. discoveryDistrictId is a SEPARATE "
+                        + "line from discoveryCityId on every one of the three paths, so it needs "
+                        + "its own non-degenerate pair")
+                .isNotEqualTo(localityA.districtLabel());
+
+        // Salon A — where the visit was booked. bookings.salon_id already points here.
+        String salonAStreet = "вул. Заброньована-A";
+        String salonABuildingNo = "11-A";
+        String salonANote = "A: 3-й поверх, код 1234";
+        jdbcTemplate.update(
+                "UPDATE salons SET name = ?, city_id = ?, district_id = ?, street = ?, "
+                        + "building_no = ?, location_note = ? WHERE id = ?",
+                "Booked Salon A", localityA.cityId(), localityA.districtId(),
+                salonAStreet, salonABuildingNo, salonANote, fx.salonId());
+
+        // Salon B — a second salon of the SAME owner (rotateMasterSalon only permits same-owner
+        // moves), with a wholly different address and door code.
+        UUID ownerId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, fx.salonId());
+        String salonBStreet = "вул. Поточна-B";
+        String salonBBuildingNo = "22-B";
+        String salonBNote = "B: 5-й поверх, код 9999";
+        UUID salonBId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, city_id, district_id, street, building_no, "
+                        + "location_note, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
+                salonBId, ownerId, "Current Salon B", localityB.cityId(), localityB.districtId(),
+                salonBStreet, salonBBuildingNo, salonBNote);
+
+        // The rotation itself — AFTER the booking exists. masters.salon_id moves;
+        // bookings.salon_id is a snapshot and does not.
+        jdbcTemplate.update("UPDATE masters SET salon_id = ? WHERE id = ?", salonBId, fx.masterId());
+        jdbcTemplate.update("UPDATE users SET salon_id = ? WHERE id = ?", salonBId, fx.masterUserId());
+
+        String clientToken = tokenFor(fx.clientEmail());
+        String masterEmail = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, fx.masterUserId());
+        JsonNode detail = getBookingDetail(bookingId, clientToken);
+        JsonNode listRow = findInMyBookings(bookingId, clientToken);
+        // The provider list is a THIRD physical path: listProviderBookings + findAllByIdsWithGraph
+        // + BookingService#discoveryCityId/discoveryDistrictId (its own locality resolution, NOT
+        // enrichSingle's and NOT the projection's). Without it, re-pointing only two of the three
+        // would still pass.
+        JsonNode providerRow = findInMyBookings(bookingId, tokenFor(masterEmail));
+
+        assertThat(listRow).as("the client's own booking must appear on GET /bookings/me").isNotNull();
+        assertThat(providerRow)
+                .as("the booking's own master must see it on their provider timeline").isNotNull();
+
+        for (var path : List.of(
+                Map.entry("GET /bookings/{id} (entity path)", detail),
+                Map.entry("GET /bookings/me (projection path)", listRow),
+                Map.entry("GET /bookings/me (provider entity path)", providerRow))) {
+            String where = path.getKey();
+            JsonNode row = path.getValue();
+
+            assertThat(row.get("salonId").asText())
+                    .as("%s — salonId is the booking's own snapshot", where)
+                    .isEqualTo(fx.salonId().toString())
+                    .isNotEqualTo(salonBId.toString());
+            assertThat(row.get("salonName").asText())
+                    .as("%s — salonName now shares salonId's source; before phase 242 it tracked "
+                            + "the master's LIVE salon and the two disagreed here", where)
+                    .isEqualTo("Booked Salon A")
+                    .isNotEqualTo("Current Salon B");
+            assertThat(row.get("street").asText())
+                    .as("%s — street", where).isEqualTo(salonAStreet).isNotEqualTo(salonBStreet);
+            assertThat(row.get("buildingNo").asText())
+                    .as("%s — buildingNo", where)
+                    .isEqualTo(salonABuildingNo).isNotEqualTo(salonBBuildingNo);
+            assertThat(row.get("cityLabel").asText())
+                    .as("%s — cityLabel must describe the same premises as street, or the client "
+                            + "is sent to salon A's street in salon B's city. Each of the three "
+                            + "paths resolves this through a DIFFERENT piece of code "
+                            + "(enrichSingle / the projection's CASE WHEN / discoveryCityId), so "
+                            + "all three have to be re-pointed together.", where)
+                    .isEqualTo(localityA.cityLabel()).isNotEqualTo(localityB.cityLabel());
+            assertThat(row.get("districtLabel").asText())
+                    .as("%s — districtLabel rides discoveryDistrictId, which is a SEPARATE "
+                            + "re-pointed line from discoveryCityId in every one of the three "
+                            + "resolvers. Reverting only that line leaves cityLabel correct and "
+                            + "routes the client to salon A's street in salon B's district — the "
+                            + "cityLabel assertion above is blind to it.", where)
+                    .isEqualTo(localityA.districtLabel())
+                    .isNotEqualTo(localityB.districtLabel());
+            // THE security assertion, with the negative stated explicitly: a positive-only check
+            // would still pass if both salons happened to carry the same note.
+            assertThat(row.get("locationNote").asText())
+                    .as("%s — the client booked at salon A, so they must receive A's door code and "
+                            + "NEVER B's premises-access information", where)
+                    .isEqualTo(salonANote)
+                    .isNotEqualTo(salonBNote);
+        }
+
+        // Nothing about salon B may be smuggled into any other field of either body.
+        for (JsonNode row : List.of(detail, listRow)) {
+            assertThat(row.toString())
+                    .as("no field anywhere in the response may carry the rotated-to salon's "
+                            + "address or door code")
+                    .doesNotContain(salonBNote)
+                    .doesNotContain(salonBStreet)
+                    .doesNotContain(salonBBuildingNo)
+                    .doesNotContain("Current Salon B")
+                    .doesNotContain("Master's home door code");
+        }
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -204,13 +459,37 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
     private static final String CLIENT_LAST_NAME = "Кравченко";
 
     /**
+     * Distinct, non-null avatar URLs for the booking's client and its master.
+     *
+     * <p>They MUST differ. {@code clientAvatarUrl} and {@code masterAvatarUrl} are adjacent String
+     * reads off two different {@code User} graphs, and every fixture in this suite previously left
+     * both columns NULL — so a mapper that read the master's avatar into the client's field would
+     * have been invisible (null == null) to the reflective parity loop AND to the raw-body PII
+     * scan. Two different non-null values is what gives both gates something to fail on.
+     */
+    private static final String CLIENT_AVATAR_URL =
+            "https://cdn.beautica.test/avatars/contract-client-likeness.jpg";
+    private static final String MASTER_AVATAR_URL =
+            "https://cdn.beautica.test/avatars/contract-master-likeness.jpg";
+
+    /**
+     * Phase B1 — the seeded master's rating aggregate. Non-default on purpose (the columns default
+     * to {@code 0.00}/{@code 0}, which both mapper paths normalise to {@code null}/{@code 0}), so
+     * the reflective parity loop compares a REAL value on both sides instead of {@code null ==
+     * null}. The average is deliberately not a round number so a mapper that fabricated one would
+     * not coincidentally match.
+     */
+    private static final BigDecimal MASTER_AVG_RATING = new BigDecimal("4.75");
+    private static final int MASTER_REVIEW_COUNT = 12;
+
+    /**
      * Keys that must never appear in a denied booking read. {@code guestName}/{@code guestSurname}
      * are not {@link BookingDetailResponse} components today — they fold into
      * {@code clientFirstName}/{@code clientLastName} for guest (LINK) bookings — and are listed
      * anyway so a future DTO that starts surfacing them cannot slip through this gate unnoticed.
      */
     private static final Set<String> PII_FIELD_NAMES = Set.of(
-            "clientFirstName", "clientLastName", "clientId",
+            "clientFirstName", "clientLastName", "clientId", "clientAvatarUrl",
             "guestName", "guestSurname", "guestPhone",
             "street", "buildingNo", "locationNote", "salonName",
             "cityLabel", "districtLabel",
@@ -274,16 +553,22 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         // none of this must ever surface on a booking under this salon.
         jdbcTemplate.update(
                 "UPDATE users SET city_id = ?, district_id = ?, street = ?, building_no = ?, "
-                        + "location_note = ?, professional_title = ? WHERE id = ?",
+                        + "location_note = ?, professional_title = ?, avatar_url = ? WHERE id = ?",
                 masterCityDistrict[1], masterCityDistrict[0], "MasterOwnStreet", "13",
                 "Master's home door code - must NOT surface on a salon booking",
-                "Майстер стрижки", masterUserId);
+                "Майстер стрижки", MASTER_AVATAR_URL, masterUserId);
 
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
+                // Phase B1: avg_rating/review_count are seeded to a REVIEWED master on purpose.
+                // The reflective parity loop picks up masterAvgRating/masterReviewCount
+                // automatically, but "both sides agree" is worthless while both sides are the
+                // column defaults (0.00 / 0, which the mapper normalises to null / 0 on BOTH
+                // paths) — that would compare null == null and pass vacuously.
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, "
+                        + "avg_rating, review_count, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, ?, ?, NOW(), NOW())",
+                masterId, masterUserId, salonId, MASTER_AVG_RATING, MASTER_REVIEW_COUNT);
 
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -299,6 +584,11 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
 
         String clientEmail = "contract-client-" + System.nanoTime() + "@beautica.test";
         UUID clientId = createUser(clientEmail, "CLIENT", null);
+        // The client's LIKENESS — the payload of the clientAvatarUrl widening. Seeded here (not
+        // per-test) so EVERY test in this class, including the reflective parity loop, exercises
+        // a non-null value rather than agreeing vacuously on null.
+        jdbcTemplate.update("UPDATE users SET avatar_url = ? WHERE id = ?",
+                CLIENT_AVATAR_URL, clientId);
 
         return new Fixture(salonId, masterId, masterUserId, masterServiceId, clientEmail, clientId);
     }
@@ -313,6 +603,45 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
                         + "NOW() + interval '1 day 1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, fx.clientId(), fx.masterId(), fx.masterServiceId(), fx.salonId());
         return bookingId;
+    }
+
+    /**
+     * A real seeded district + its city, together with the Ukrainian labels the
+     * {@code DiscoveryLocationResolver} will resolve them to.
+     *
+     * @param index 0-based; distinct indices yield localities in DIFFERENT cities, so
+     *              {@code cityLabel} genuinely differs between them (the premise the phase-242
+     *              rotation test asserts before relying on it).
+     */
+    private Locality resolveLocality(int index) {
+        return jdbcTemplate.queryForObject(
+                "SELECT DISTINCT ON (c.id) d.id, c.id, c.name_uk, d.name_uk "
+                        + "FROM city_districts d JOIN cities c ON c.id = d.city_id "
+                        + "ORDER BY c.id, d.id OFFSET ? LIMIT 1",
+                (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
+                        rs.getString(3), rs.getString(4)),
+                index);
+    }
+
+    /**
+     * A locality whose city label AND district label both differ from {@code other}. Deterministic
+     * by construction rather than by hoping two offsets land on distinct names — Ukrainian district
+     * names («Центральний», «Соборний», …) recur across cities, so an offset-based second pick can
+     * silently produce a pair with an identical {@code districtLabel} and make every
+     * {@code isNotEqualTo(localityB.districtLabel())} below pass vacuously.
+     */
+    private Locality resolveLocalityWithBothLabelsDifferentFrom(Locality other) {
+        return jdbcTemplate.queryForObject(
+                "SELECT d.id, c.id, c.name_uk, d.name_uk "
+                        + "FROM city_districts d JOIN cities c ON c.id = d.city_id "
+                        + "WHERE c.name_uk <> ? AND d.name_uk <> ? "
+                        + "ORDER BY c.id, d.id LIMIT 1",
+                (rs, n) -> new Locality((UUID) rs.getObject(1), (UUID) rs.getObject(2),
+                        rs.getString(3), rs.getString(4)),
+                other.cityLabel(), other.districtLabel());
+    }
+
+    private record Locality(UUID districtId, UUID cityId, String cityLabel, String districtLabel) {
     }
 
     /** A real, occupied-territory-excluded (V53 seed) city/district pair — {@code [districtId, cityId]}. */

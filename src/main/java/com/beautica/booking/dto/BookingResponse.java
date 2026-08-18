@@ -1,5 +1,6 @@
 package com.beautica.booking.dto;
 
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.TimeZones;
@@ -45,9 +46,26 @@ public record BookingResponse(
         // priceAtBooking, priceMaxAtBooking and durationMinutesAtBooking are all snapshot columns
         // on the bookings row — they reflect the price band/duration the client agreed to, and are
         // never re-derived from current master_services/service_definitions values.
-        OffsetDateTime createdAt
+        OffsetDateTime createdAt,
+        @Schema(types = {"string", "null"}, format = "uuid", nullable = true,
+                description = "The multi-service visit (BE-5) this booking belongs to, or null for a "
+                        + "legacy single-service booking (appointment_id IS NULL). When non-null, "
+                        + "N booking rows sharing this id are ONE client-facing visit — the mobile My "
+                        + "Bookings list collapses them into a single card and fetches the full visit "
+                        + "via GET /appointments/{appointmentId}. A client that ignores this field is "
+                        + "unaffected (strictly additive).")
+        UUID appointmentId,
+        @Schema(description = "Derived, read-time-only (Phase 29.1/29.2) — TRUE when this "
+                + "booking's status is still CONFIRMED but its endsAt has already elapsed: no "
+                + "scheduled job ever transitions such a booking to a terminal state, so this "
+                + "flags the ones the provider still needs to close via /complete, "
+                + "/not-complete or /decline. NEVER persisted, NEVER cached — recomputed on "
+                + "every read from (status, endsAt, the current instant). Orthogonal to any "
+                + "review-eligibility field on the enriched detail DTO: an elapsed CONFIRMED "
+                + "booking is never itself review-eligible.")
+        boolean awaitingClosure
 ) {
-    public static BookingResponse from(Booking booking) {
+    public static BookingResponse from(Booking booking, OffsetDateTime now) {
         return new BookingResponse(
                 booking.getId(),
                 // Guest (LINK) bookings have no registered client (V89 chk_bookings_guest_fields) —
@@ -62,7 +80,12 @@ public record BookingResponse(
                 booking.getPriceAtBooking(),
                 booking.getPriceMaxAtBooking(),
                 booking.getDurationMinutesAtBooking(),
-                booking.getCreatedAt().atOffset(ZoneOffset.UTC)
+                booking.getCreatedAt().atOffset(ZoneOffset.UTC),
+                // appointment is a LAZY @ManyToOne on a nullable FK — Hibernate serves the
+                // identifier off the proxy (or resolves it as null) from the booking row itself,
+                // with no extra SELECT and no widening of any caller's fetch graph.
+                booking.getAppointment() != null ? booking.getAppointment().getId() : null,
+                BookingClosureRule.isAwaitingClosure(booking.getStatus(), booking.getEndsAt(), now)
         );
     }
 }

@@ -12,6 +12,7 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.notification.service.NotificationOutboxService;
+import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
@@ -127,6 +128,7 @@ class BookingServiceCacheTest {
     @MockBean NotificationOutboxService outboxService;
     @MockBean SlotCalculationService slotCalculationService;
     @MockBean ReviewRepository reviewRepository;
+    @MockBean ClientReviewRepository clientReviewRepository;
     @MockBean DiscoveryLocationResolver discoveryLocationResolver;
     // Phase 23.x (perf/security #2): BookingService evicts the salon-service-catalog cache via this
     // collaborator after commit. Not on the @SpringBootTest classes list, so mock it for wiring.
@@ -134,6 +136,16 @@ class BookingServiceCacheTest {
     // Phase 26.2: BookingService now validates the optional date-range filter via this
     // collaborator's span-only guard. Not on the @SpringBootTest classes list, so mock it here.
     @MockBean ScheduleDateMath dateMath;
+    // Track 27.x: BookingService locks/collapses the appointment header when a client cancels one
+    // leg of a multi-service visit. The eviction tests below all use single, appointment-less
+    // bookings, so that branch short-circuits — this mock exists purely to satisfy the wiring.
+    @MockBean AppointmentTransitionService appointmentTransitionService;
+    // Phase 30.6: AppointmentRepository entered the BookingService constructor (per-item
+    // reschedule). This sliced @SpringBootTest lists only BookingService + the prefix evictor as
+    // real beans, so every other constructor parameter must be supplied here — omitting it failed
+    // all four tests below at context load with NoSuchBeanDefinitionException, not on an assertion.
+    // The eviction paths exercised here use appointment-less bookings, so the mock is never called.
+    @MockBean com.beautica.booking.repository.AppointmentRepository appointmentRepository;
 
     /** Fixed so a test can seed a master-calendar key that really belongs to the booking's master. */
     private static final UUID MASTER_ID = UUID.randomUUID();
@@ -141,6 +153,7 @@ class BookingServiceCacheTest {
     @Autowired BookingService bookingService;
     @Autowired CacheManager cacheManager;
     @Autowired TransactionTemplate transactionTemplate;
+    @Autowired Clock clock;
 
     @BeforeEach
     void clearCache() {
@@ -211,6 +224,10 @@ class BookingServiceCacheTest {
         cache.put(bystanderKey, "value");
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+        // Phase 27.1: completeBooking now requires now >= startsAt (assertElapsedForComplete) —
+        // mockBookingInStatus's default startsAt is FUTURE (needed by the decline/not-complete
+        // tests sharing this helper), so override it to an ELAPSED time for this test only.
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(clock).minusHours(1));
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
@@ -248,6 +265,9 @@ class BookingServiceCacheTest {
         cache.put(bystanderKey, "value");
 
         Booking booking = mockBookingInStatus(bookingId, BookingStatus.CONFIRMED);
+        // not-complete has no temporal guard — an elapsed startsAt is just the conventional
+        // no-show fixture here, not a requirement.
+        when(booking.getStartsAt()).thenReturn(OffsetDateTime.now(clock).minusHours(1));
 
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         when(bookingRepository.save(any())).thenReturn(booking);
@@ -342,6 +362,15 @@ class BookingServiceCacheTest {
         when(booking.getPriceAtBooking()).thenReturn(new BigDecimal("200.00"));
         when(booking.getDurationMinutesAtBooking()).thenReturn(60);
         when(booking.getCreatedAt()).thenReturn(Instant.now());
+        // Freshness re-check seam (G4/G5): cancel/complete/decline/notComplete all re-probe the
+        // CURRENT row via existsConfirmedById immediately before mutating, because assertTransition
+        // only proves the status of the stale pre-load snapshot. An unstubbed mock returns false,
+        // which short-circuits to a 409 "Service changed concurrently" BEFORE any eviction runs —
+        // so without this stub these tests fail on the transition, never reaching the cache
+        // assertion they exist for. The row is declared still-CONFIRMED: no concurrent writer is
+        // being simulated here (that scenario belongs to BookingService's own concurrency tests).
+        when(bookingRepository.existsConfirmedById(bookingId))
+                .thenReturn(status == BookingStatus.CONFIRMED);
         return booking;
     }
 }

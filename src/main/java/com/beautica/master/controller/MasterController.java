@@ -2,6 +2,7 @@ package com.beautica.master.controller;
 
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.service.ScheduleOverrideConflictService;
 import com.beautica.master.dto.AvailableSlotsResponse;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.ApiResponse;
@@ -14,6 +15,8 @@ import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
+import com.beautica.master.dto.OverrideConflictPreviewResponse;
+import com.beautica.master.dto.OverrideConflictQueryRequest;
 import com.beautica.master.dto.RotateMasterRequest;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.ScheduleOverrideResponse;
@@ -26,6 +29,7 @@ import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
 import com.beautica.user.UserService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -61,6 +65,7 @@ public class MasterController {
     private final MasterService masterService;
     private final MasterScheduleService masterScheduleService;
     private final SlotCalculationService slotCalculationService;
+    private final ScheduleOverrideConflictService scheduleOverrideConflictService;
     private final UserService userService;
 
     @GetMapping("/me")
@@ -183,6 +188,14 @@ public class MasterController {
     /**
      * Idempotent upsert of a per-date override keyed by {@code {date}}. The path date is authoritative;
      * a body whose {@code date} disagrees with the path is rejected as a 400 to avoid an ambiguous write.
+     *
+     * <p><b>2026-07-26 design — booking-conflict cancellation.</b> Delegates to
+     * {@link ScheduleOverrideConflictService#applyOverrideWithConflictHandling}, not directly to
+     * {@link MasterScheduleService#upsertOverride}: the former OQ-1 "always allowed" rule is
+     * reversed here — if the intended override would leave a {@code CONFIRMED} booking without
+     * availability, the write is rejected with a 409 unless {@code request.cancelOverlapping()} is
+     * {@code true}, in which case the override is written and every conflicting booking is declined,
+     * atomically. See that service's javadoc for why the orchestration lives in the booking package.
      */
     @PutMapping("/{masterId}/overrides/{date}")
     @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
@@ -196,7 +209,31 @@ public class MasterController {
             throw new BusinessException("Path date must match the override body date");
         }
         UUID actorId = AuthenticationUtils.userId(authentication);
-        return ApiResponse.ok(masterScheduleService.upsertOverride(actorId, masterId, request));
+        return ApiResponse.ok(
+                scheduleOverrideConflictService.applyOverrideWithConflictHandling(actorId, masterId, request));
+    }
+
+    /**
+     * Read-only preview of which {@code CONFIRMED} bookings an intended override would orphan —
+     * 2026-07-26 design, "schedule override over existing bookings". Guarded by the MANAGE gate
+     * (not the read gate): this is a pre-write check, and it exposes client/guest identities, which
+     * {@code canReadMasterSchedule} (granted to a read-only {@code SALON_MASTER}) is not scoped to
+     * see. No writes, no side effects, no cache eviction — see
+     * {@link ScheduleOverrideConflictService#previewConflicts}, which ALSO re-verifies management
+     * authority inside the transaction (security audit finding 7) as defense in depth against a
+     * future internal caller losing this controller's {@code @PreAuthorize} gate.
+     */
+    @PostMapping("/{masterId}/overrides/conflicts")
+    @PreAuthorize("@authz.canManageMasterSchedule(authentication, #masterId)")
+    public ApiResponse<OverrideConflictPreviewResponse> previewOverrideConflicts(
+            @PathVariable UUID masterId,
+            @Valid @RequestBody OverrideConflictQueryRequest request,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        return ApiResponse.ok(scheduleOverrideConflictService.previewConflicts(
+                actorId, masterId, request.from(), request.to(), request.kind(), request.mode(),
+                request.intervals(), request.times()));
     }
 
     @DeleteMapping("/{masterId}/overrides/{date}")
@@ -225,7 +262,10 @@ public class MasterController {
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
     ) {
-        return ApiResponse.ok(masterScheduleService.resolveEffectiveRange(masterId, from, to));
+        // ForDisplay: this is the surface the mobile day editor hydrates from, so it needs the Phase 15.12
+        // display-only working window to rebuild a break flush against the edge of the working day. Every
+        // other consumer of the resolver reduces to availability and calls the window-free variant.
+        return ApiResponse.ok(masterScheduleService.resolveEffectiveRangeForDisplay(masterId, from, to));
     }
 
     /**
@@ -271,14 +311,26 @@ public class MasterController {
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
-            @RequestParam(required = false) UUID serviceId
+            @RequestParam(name = "serviceId", required = false)
+            @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+                    message = "at most {max} services can be booked in a single visit")
+            List<UUID> serviceIds
     ) {
         // Mode selection only — each branch delegates the whole decision to its owning service. The
         // cached methods live on two different beans, so dispatching here (rather than inside one of
-        // them) also keeps both @Cacheable proxies effective (self-invocation would bypass AOP — §F-3).
-        return ApiResponse.ok(serviceId == null
-                ? masterScheduleService.getClientWorkingDays(masterId, from, to)
-                : slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceId));
+        // them) also keeps every @Cacheable proxy effective (self-invocation would bypass AOP — §F-3).
+        //  • serviceId ABSENT      → schedule-shape mode (unchanged).
+        //  • one serviceId (N=1)   → cached single-service bookability day-gate (byte-for-byte legacy).
+        //  • several serviceIds    → multi-service single-visit day-gate (BE-2), summed duration.
+        List<MasterWorkingDayResponse> result;
+        if (serviceIds == null || serviceIds.isEmpty()) {
+            result = masterScheduleService.getClientWorkingDays(masterId, from, to);
+        } else if (serviceIds.size() == 1) {
+            result = slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds.get(0));
+        } else {
+            result = slotCalculationService.getBookableWorkingDays(masterId, from, to, serviceIds);
+        }
+        return ApiResponse.ok(result);
     }
 
     @DeleteMapping("/{masterId}")
@@ -347,14 +399,31 @@ public class MasterController {
         ));
     }
 
+    /**
+     * Bookable slots for a single-visit request of ONE or MORE services performed back-to-back by this
+     * master (BE-2). {@code serviceId} is a repeatable query param: {@code ?serviceId=a&serviceId=b}
+     * binds to an ordered {@code List}, and each candidate slot is sized to the SUM of the selected
+     * services' durations (D4 buffer policy — see {@link SlotCalculationService}). A single
+     * {@code ?serviceId=x} binds to a 1-element list and returns the exact legacy single-service result.
+     *
+     * <p>Mode dispatch is done HERE, not inside a {@code @Cacheable} method, so the single-service
+     * ({@code N=1}) call still hits its cache proxy — a self-invocation would bypass AOP (§F-3), the same
+     * reason {@link #getWorkingDays} dispatches its two modes in the controller.
+     */
     @GetMapping("/{masterId}/slots")
     @PreAuthorize("isAuthenticated()")
     public ApiResponse<AvailableSlotsResponse> getAvailableSlots(
             @PathVariable UUID masterId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
-            @RequestParam UUID serviceId
+            @RequestParam("serviceId")
+            @NotEmpty(message = "at least one serviceId is required")
+            @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+                    message = "at most {max} services can be booked in a single visit")
+            List<UUID> serviceIds
     ) {
-        List<AvailableSlotResponse> slots = slotCalculationService.getAvailableSlots(masterId, date, serviceId);
+        List<AvailableSlotResponse> slots = serviceIds.size() == 1
+                ? slotCalculationService.getAvailableSlots(masterId, date, serviceIds.get(0))
+                : slotCalculationService.getAvailableSlots(masterId, date, serviceIds);
         return ApiResponse.ok(new AvailableSlotsResponse(date, slots));
     }
 

@@ -4,6 +4,8 @@ import com.beautica.common.util.TimeSlotCalculator.TimeRange;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.*;
 import java.util.List;
@@ -510,5 +512,308 @@ class TimeSlotCalculatorTest {
         assertThat(slots.stream().map(TimeSlotCalculatorTest::localStart))
                 .as("the caller-supplied cutoff — not the clock — is the floor")
                 .containsExactly(LocalTime.of(11, 0), LocalTime.of(11, 30), LocalTime.of(12, 0));
+    }
+
+    // ── declared (EXPLICIT_TIMES) slots ────────────────────────────────────────
+
+    @Test
+    @DisplayName("declared slots — emits EXACTLY the declared times, never a grid across [min..max]")
+    void should_emitExactlyTheDeclaredTimes_when_dayIsExplicitTimes() {
+        // THE bug this method exists for: a master declaring only 13:00 and 15:00 used to be projected
+        // as the derived window 13:00–15:00 and strided on the 30-min grid, so a 60-min service was
+        // offered 13:00/13:30/14:00 — two undeclared starts — while 15:00, which WAS declared, could
+        // never be offered (nothing can start at a window's end and still fit).
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, List.of(LocalTime.of(13, 0), LocalTime.of(15, 0)),
+                Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .containsExactly(LocalTime.of(13, 0), LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("declared slots — a single declared time is bookable (its derived window is degenerate)")
+    void should_offerTheOnlyDeclaredTime_when_dayDeclaresExactlyOne() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, List.of(LocalTime.of(13, 0)), Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("min == max, so the derived window is zero-length and used to yield nothing")
+                .containsExactly(LocalTime.of(13, 0));
+    }
+
+    @Test
+    @DisplayName("declared slots — drops a declared time below the lead-time cutoff or overlapping a booking")
+    void should_dropDeclaredTime_when_belowCutoffOrOccupied() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(12, 0)).atZone(KYIV).toInstant();
+        // 15:00 is taken; 15:00-16:00 collides. 11:00 is below the cutoff. Only 13:00 survives.
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(15, 0), LocalTime.of(16, 0)));
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, List.of(LocalTime.of(11, 0), LocalTime.of(13, 0), LocalTime.of(15, 0)),
+                Duration.ofHours(1), occupied, cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .containsExactly(LocalTime.of(13, 0));
+    }
+
+    @Test
+    @DisplayName("declared slots — a booking ending exactly where a declared time starts does not block it")
+    void should_keepDeclaredTime_when_priorBookingEndsExactlyAtIt() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(12, 0), LocalTime.of(13, 0)));
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, List.of(LocalTime.of(13, 0)), Duration.ofHours(1), occupied, cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("end-to-start touching is allowed, exactly as on the interval walk")
+                .containsExactly(LocalTime.of(13, 0));
+    }
+
+    @Test
+    @DisplayName("declared slots — END BOUND: a declared time whose service runs past Kyiv midnight is dropped")
+    void should_dropDeclaredTime_when_serviceWouldRunPastMidnight() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, List.of(LocalTime.of(23, 0), LocalTime.of(23, 30)),
+                Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("23:00 ends exactly at midnight (kept); 23:30 would cross it (dropped)")
+                .containsExactly(LocalTime.of(23, 0));
+    }
+
+    @Test
+    @DisplayName("hasDeclaredSlot — agrees with calculateDeclaredSlots for the same inputs")
+    void should_agreeWithDeclaredSlotList_when_sameCutoffSupplied() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(16, 0)).atZone(KYIV).toInstant();
+        List<LocalTime> declared = List.of(LocalTime.of(13, 0), LocalTime.of(15, 0));
+
+        List<TimeRange> slots = calculator.calculateDeclaredSlots(
+                TEST_DATE, declared, Duration.ofHours(1), List.of(), cutoff);
+        boolean hasSlot = calculator.hasDeclaredSlot(
+                TEST_DATE, declared, Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(slots).as("every declared time is below the cutoff").isEmpty();
+        assertThat(hasSlot).isEqualTo(!slots.isEmpty());
+    }
+
+    // ── declared (EXPLICIT_TIMES) slots × a booking that CONTAINS a later declared time ─────────
+    //
+    // The INTERIOR-overlap branch of #overlapsAny on the declared walk: the candidate's start falls
+    // STRICTLY INSIDE an occupied [start, end). Every other declared-times fixture in this file collides
+    // at the start instant (#should_dropDeclaredTime_when_belowCutoffOrOccupied books 15:00–16:00 against
+    // the declared 15:00) or merely touches end-to-start (#should_keepDeclaredTime_when_priorBookingEnds…),
+    // so a naive "a declared time is consumed iff a booking STARTS on it" rule satisfies all of them while
+    // silently re-offering a time buried inside a long booking.
+    //
+    // The scenario is reachable by design: an EXPLICIT_TIMES day emits exactly the declared times and its
+    // only end bound is the same Kyiv civil day — there is deliberately NO rule that a service must finish
+    // before the next declared time (locked 2026-08-11; an unreachable declared time is the master's own
+    // responsibility). So a master may declare 10:00 and 11:00 and sell a 4-hour service at 10:00, after
+    // which the 11:00 they declared simply cannot be reached.
+
+    @ParameterizedTest(name = "requested service = {0} min")
+    @ValueSource(ints = {30, 240})
+    @DisplayName("declared slots — a booking spanning [10:00,14:00) withholds the 11:00 declared time it "
+            + "strictly contains, whatever duration the NEXT client requests")
+    void should_withholdDeclaredTimeStrictlyInsideABooking_regardlessOfRequestedDuration(int requestedMinutes) {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+        List<LocalTime> declared = List.of(LocalTime.of(10, 0), LocalTime.of(11, 0));
+        // A 4-hour service sold at the FIRST declared time occupies [10:00, 14:00) — 11:00 is interior.
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(10, 0), LocalTime.of(14, 0)));
+        Duration requested = Duration.ofMinutes(requestedMinutes);
+
+        List<TimeRange> result =
+                calculator.calculateDeclaredSlots(TEST_DATE, declared, requested, occupied, cutoff);
+
+        assertThat(result)
+                .as("10:00 collides at the start instant; 11:00 lies strictly inside [10:00,14:00). The "
+                        + "requested duration cannot rescue it — a candidate END is always after its own "
+                        + "start, which is already after the booking's start, so BOTH halves of the strict "
+                        + "overlap test hold for every duration. Requested = %d min.", requestedMinutes)
+                .isEmpty();
+        assertThat(calculator.hasDeclaredSlot(TEST_DATE, declared, requested, occupied, cutoff))
+                .as("the day gate must agree — both declared times are consumed, so the day is dead")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("declared slots — THRESHOLD (survives): a 60-min booking at the 10:00 declared time ends "
+            + "exactly on the 11:00 declared time, which stays on offer")
+    void should_keepTheLaterDeclaredTime_when_thePriorBookingEndsExactlyOnIt() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+        List<LocalTime> declared = List.of(LocalTime.of(10, 0), LocalTime.of(11, 0));
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(10, 0), LocalTime.of(11, 0)));
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, declared, Duration.ofHours(1), occupied, cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("the overlap test is STRICT on both sides, so end-to-start touching leaves 11:00 "
+                        + "bookable. The sibling case one minute longer is the other half of this pin.")
+                .containsExactly(LocalTime.of(11, 0));
+    }
+
+    @Test
+    @DisplayName("declared slots — THRESHOLD (dies): a 61-min booking at the 10:00 declared time overruns "
+            + "the 11:00 declared time by one minute and consumes it")
+    void should_withholdTheLaterDeclaredTime_when_thePriorBookingOverrunsItByOneMinute() {
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+        List<LocalTime> declared = List.of(LocalTime.of(10, 0), LocalTime.of(11, 0));
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(10, 0), LocalTime.of(11, 1)));
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, declared, Duration.ofHours(1), occupied, cutoff);
+
+        assertThat(result)
+                .as("11:00 is now strictly inside [10:00,11:01) — one minute of overrun kills the whole "
+                        + "declared time. Exactly ONE minute separates this from the case above, which is "
+                        + "what makes the pair distinguish a strict overlap test from an inclusive one.")
+                .isEmpty();
+        assertThat(calculator.hasDeclaredSlot(TEST_DATE, declared, Duration.ofHours(1), occupied, cutoff))
+                .as("the day gate agrees — no declared time survives")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("declared slots — the MIRROR case: a declared time whose service SWALLOWS a later "
+            + "booking is withheld too (the candidate starts outside the occupied range)")
+    void should_withholdDeclaredTime_when_itsServiceSwallowsALaterBooking() {
+        // The other half of the strict overlap test, and the reason a "is the candidate's START inside an
+        // occupied range?" containment check is not enough: here the candidate starts BEFORE the booking
+        // and runs straight through it, so only `candidate.end().isAfter(o.start())` catches it.
+        calculator = new TimeSlotCalculator(fixedClock("2026-05-07T00:00:00Z"));
+        Instant cutoff = TEST_DATE.atTime(LocalTime.of(0, 0)).atZone(KYIV).toInstant();
+        List<TimeRange> occupied = List.of(kyivRange(TEST_DATE, LocalTime.of(12, 0), LocalTime.of(13, 0)));
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                TEST_DATE, List.of(LocalTime.of(10, 0)), Duration.ofHours(4), occupied, cutoff);
+
+        assertThat(result)
+                .as("10:00 + 4h = [10:00,14:00) fully contains the 12:00–13:00 booking — the declared "
+                        + "time is not bookable for this service even though its start is free")
+                .isEmpty();
+    }
+
+    // ── declared (EXPLICIT_TIMES) slots × Europe/Kyiv DST ──────────────────────
+    //
+    // The declared-times walk bounds a candidate by "ends within the SAME Kyiv civil day", resolved as
+    // date.plusDays(1).atStartOfDay(KYIV).toInstant() — a CIVIL instant, never `dayStart + 24h`. On the
+    // two days a year where those differ the flat-24h shortcut is wrong in BOTH directions, and it is
+    // wrong silently: it either offers a slot that runs into the next day or withholds one that fits.
+    // The interval walk has carried this pin since 2024 (#should_useCivilEnd_when_*); the declared walk
+    // is new code with the same hazard, and this suite has already produced two time-of-day flakes, so
+    // it gets its own pins rather than the benefit of the doubt.
+    //
+    //   spring-forward 2026-03-29 → 23 h: [2026-03-28T22:00Z, 2026-03-29T21:00Z)
+    //                                     flat +24h would end at 22:00Z — an hour too LATE
+    //   fall-back      2026-10-25 → 25 h: [2026-10-24T21:00Z, 2026-10-25T22:00Z)
+    //                                     flat +24h would end at 21:00Z — an hour too EARLY
+
+    @Test
+    @DisplayName("declared slots — DST spring-forward (23 h day): the civil day end is 21:00Z, so 23:00 "
+            + "fits exactly and 23:30 is withheld")
+    void should_dropDeclaredTimeEndingAfterTheCivilDayEnd_when_springForwardDay() {
+        LocalDate springForward = LocalDate.of(2026, 3, 29);
+        calculator = new TimeSlotCalculator(fixedClock("2026-03-28T22:00:00Z"));
+        Instant cutoff = springForward.atStartOfDay(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                springForward, List.of(LocalTime.of(23, 0), LocalTime.of(23, 30)),
+                Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("23:00+1h ends at 2026-03-29T21:00Z = the civil day end (kept); 23:30 ends 21:30Z, "
+                        + "past it (dropped). A flat dayStart+24h bound (22:00Z) would keep BOTH and "
+                        + "offer a slot running into 2026-03-30.")
+                .containsExactly(LocalTime.of(23, 0));
+        assertThat(result.get(0).end())
+                .as("the surviving candidate ends exactly ON the civil day boundary, not one hour past it")
+                .isEqualTo(Instant.parse("2026-03-29T21:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("declared slots — DST fall-back (25 h day): the civil day end is 22:00Z, so a 23:00 "
+            + "declared time is still bookable")
+    void should_keepDeclaredTimeEndingAtTheCivilDayEnd_when_fallBackDay() {
+        LocalDate fallBack = LocalDate.of(2026, 10, 25);
+        calculator = new TimeSlotCalculator(fixedClock("2026-10-24T21:00:00Z"));
+        Instant cutoff = fallBack.atStartOfDay(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                fallBack, List.of(LocalTime.of(23, 0), LocalTime.of(23, 30)),
+                Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result.stream().map(TimeSlotCalculatorTest::localStart))
+                .as("23:00 (at +02:00 after the transition) + 1h ends at 2026-10-25T22:00Z = the civil "
+                        + "day end, so it is kept. A flat dayStart+24h bound (21:00Z) would WITHHOLD a "
+                        + "time the master genuinely declared. 23:30 still overruns and is dropped.")
+                .containsExactly(LocalTime.of(23, 0));
+        assertThat(result.get(0).end())
+                .isEqualTo(Instant.parse("2026-10-25T22:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("declared slots — a declared time inside the spring-forward GAP is shifted forward to a "
+            + "real instant (04:30), never emitted as a non-existent 03:30")
+    void should_shiftDeclaredTimeOutOfTheGap_when_springForwardDay() {
+        // 2026-03-29 Kyiv jumps 03:00 (+02) → 04:00 (+03): the wall clocks 03:00–03:59 do not exist.
+        // A master CAN declare 03:30 (the schedule model stores a bare LocalTime and knows no calendar),
+        // so the walk must resolve it to a real instant rather than throw or emit a phantom start.
+        LocalDate springForward = LocalDate.of(2026, 3, 29);
+        calculator = new TimeSlotCalculator(fixedClock("2026-03-28T22:00:00Z"));
+        Instant cutoff = springForward.atStartOfDay(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                springForward, List.of(LocalTime.of(3, 30)), Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).start())
+                .as("java.time resolves a gap local-time by shifting it forward by the gap length — "
+                        + "03:30 becomes 04:30+03:00 = 01:30Z, a real bookable instant")
+                .isEqualTo(Instant.parse("2026-03-29T01:30:00Z"));
+        assertThat(localStart(result.get(0)))
+                .as("what the client is offered is the shifted 04:30 wall clock, not the phantom 03:30")
+                .isEqualTo(LocalTime.of(4, 30));
+    }
+
+    @Test
+    @DisplayName("declared slots — a declared time inside the fall-back OVERLAP resolves to the EARLIER "
+            + "offset (+03:00), so the first of the two 03:30s is the one offered")
+    void should_resolveAmbiguousDeclaredTimeToTheEarlierOffset_when_fallBackDay() {
+        // 2026-10-25 Kyiv rewinds 04:00 (+03) → 03:00 (+02): the wall clocks 03:00–03:59 occur TWICE.
+        // Which one the master meant is genuinely ambiguous; pinning the choice is what stops a silent
+        // one-hour drift if the resolution strategy is ever changed.
+        LocalDate fallBack = LocalDate.of(2026, 10, 25);
+        calculator = new TimeSlotCalculator(fixedClock("2026-10-24T21:00:00Z"));
+        Instant cutoff = fallBack.atStartOfDay(KYIV).toInstant();
+
+        List<TimeRange> result = calculator.calculateDeclaredSlots(
+                fallBack, List.of(LocalTime.of(3, 30)), Duration.ofHours(1), List.of(), cutoff);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).start())
+                .as("the EARLIER (+03:00, pre-transition) occurrence — 00:30Z. The later one is 01:30Z.")
+                .isEqualTo(Instant.parse("2026-10-25T00:30:00Z"));
+        assertThat(result.get(0).end())
+                .as("the candidate's end is start + duration in REAL time, so it lands on 01:30Z — which "
+                        + "is the SECOND 03:30 wall clock, not 04:30")
+                .isEqualTo(Instant.parse("2026-10-25T01:30:00Z"));
     }
 }

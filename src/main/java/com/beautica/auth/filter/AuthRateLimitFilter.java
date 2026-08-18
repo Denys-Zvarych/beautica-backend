@@ -61,12 +61,29 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String MASTERS_ME_PROFILE_PATH = "/api/v1/masters/me/profile";
     private static final String CATEGORY_REQUEST_PATH = "/api/v1/service-categories/requests";
     private static final String SUGGEST_SERVICE_TYPE_PATH = "/api/v1/service-types/suggest";
-    // First-time bulk-service-setup endpoints. The independent path is an exact match;
+    // Bulk-service-create endpoints. The independent path is an exact match;
     // the salon path carries {salonId}/{masterId} variables, so it is matched by prefix +
     // suffix (same technique as the parameterized SLOTS_PATH below).
     private static final String BULK_IM_SERVICES_PATH = "/api/v1/independent-masters/me/services/bulk";
     private static final String BULK_SALON_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String BULK_SALON_SERVICES_SUFFIX = "/services/bulk";
+    // SINGLE-item service write routes (ServiceController), all sharing serviceWriteBuckets.
+    // Three shapes:
+    //   1. exact  POST   /api/v1/independent-masters/me/services            (IM single-create)
+    //   2. prefix+suffix POST /api/v1/salons/{salonId}/services  AND
+    //                    POST /api/v1/salons/{salonId}/masters/{masterId}/services
+    //      — both carry path variables and both end in the literal "/services", so one
+    //        prefix+suffix rule covers the salon-side single-creates (same technique as
+    //        BULK_SALON_SERVICES above). It cannot collide with the bulk route, which ends in
+    //        "/services/bulk", nor with the salon-invite route, which ends in "/invite".
+    //   3. prefix PATCH/DELETE /api/v1/services/{serviceDefId} and .../{serviceDefId}/photo
+    //      — one prefix covers the update, photo-update and deactivate routes. It cannot collide
+    //        with /api/v1/service-categories/** or /api/v1/service-types/**, which do not start
+    //        with the literal "services/" segment.
+    private static final String IM_SINGLE_SERVICE_PATH = "/api/v1/independent-masters/me/services";
+    private static final String SALON_SINGLE_SERVICE_PREFIX = "/api/v1/salons/";
+    private static final String SALON_SINGLE_SERVICE_SUFFIX = "/services";
+    private static final String SERVICE_DEF_WRITE_PATH_PREFIX = "/api/v1/services/";
     // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
     // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
     // This is the actual HTTP path SalonController.inviteMaster exposes to SALON_OWNER and
@@ -85,6 +102,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // availability read, so only the booking POST consumes this bucket.
     private static final String GUEST_BOOKING_PATH_PREFIX = "/api/v1/book/";
     private static final String GUEST_BOOKING_PATH_SUFFIX = "/booking";
+    // Guest availability READ: GET /api/v1/book/{slug}/availability — the public booking page's slot
+    // list, matched by the same prefix + a distinct suffix. It is deliberately NOT part of
+    // guestBookingBuckets (that bucket's own comment says "only the booking POST consumes this bucket"),
+    // because a legitimate guest issues MANY availability GETs per single booking POST — sharing one
+    // 5/15min bucket would make browsing dates impossible. See GUEST_AVAILABILITY_CAPACITY.
+    private static final String GUEST_AVAILABILITY_PATH_SUFFIX = "/availability";
     // Guest cancel-by-link POST carries the {token} variable as a single path segment, so it
     // is matched by prefix only: /api/v1/book/cancel/{token}. The prefix /api/v1/book/cancel/
     // does not collide with the guest-booking POST (which ends in /booking) nor with the OTP
@@ -179,18 +202,66 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // this filter directly.
     private static final long CANCEL_POST_CAPACITY = 10;
     private static final Duration CANCEL_POST_WINDOW = Duration.ofMinutes(15);
-    // Per-IP cap for GET /api/v1/search/** (40 / 60 s). These permitAll() discovery reads
-    // now expose authed-only street addresses for independent masters, so without a throttle
-    // a single IP could page through every district/city and bulk-harvest home addresses.
-    // 40/min is a paging-friendly ceiling — a human filtering + paginating discovery results
-    // (each page is one request) stays well under it, while a scripted crawler sweeping the
-    // catalogue is capped. IP-keyed for consistency with every other bucket in this filter
-    // (JWT is parsed in JwtAuthenticationFilter, which runs AFTER this filter; and the search
-    // endpoints are permitAll anyway, so anonymous callers carry no principal). Built
-    // internally (not an injected @Qualifier bean) so the public 16-arg constructor — depended
-    // on by several slice/regression tests — stays unchanged.
-    private static final long SEARCH_CAPACITY = 40;
+    // Per-IP cap for GET /api/v1/book/{slug}/availability (60 / 60 s) — the LOW-fix flood guard for the
+    // last unthrottled permitAll() surface under /book. Deliberately the SAME budget as slotsBuckets
+    // (the authenticated twin, GET /masters/{id}/slots + /working-days, default 60/60s): the two answer
+    // the very same question from the same SlotCalculationService oracle, so the guest page must not be
+    // throttled harder than the in-app calendar that costs the server exactly as much.
+    //
+    // Why it needed one at all: the endpoint drives resolveEffectiveDay + the booking-overlap query + the
+    // full slot walk per distinct `date`, at zero auth cost, and the create gate now calls that same
+    // oracle. An attacker rotating `date` could sustain that work unbounded. The cap bounds the RATE (the
+    // ≤180-day horizon in SlotCalculationService already bounds how many distinct dates exist to rotate,
+    // and the available-slots Caffeine cache absorbs repeats of one date).
+    //
+    // Why 60/min does not throttle legitimate browsing: a real client hits this once per DATE TAP on the
+    // public booking page — a human picking a day makes single-digit requests per minute, and even an
+    // impatient user tapping through a whole visible week is ~7. 60/min leaves an order of magnitude of
+    // headroom, which matters because this bucket is IP-keyed and Ukrainian mobile users share
+    // carrier-grade NAT (the availability regression documented at length on SEARCH_CAPACITY). A shared
+    // booking link opened by several people behind one CGNAT egress still fits comfortably.
+    //
+    // Built internally (not an injected @Qualifier bean) so the public 19-arg constructor — depended on
+    // by several slice/regression tests — stays unchanged, mirroring guestBookingBuckets/cancelPostBuckets.
+    private static final long GUEST_AVAILABILITY_CAPACITY = 60;
+    private static final Duration GUEST_AVAILABILITY_WINDOW = Duration.ofMinutes(1);
+    // Per-IP cap for GET /api/v1/search/** (240 / 60 s). These permitAll() discovery reads
+    // expose authed-only street addresses for independent masters, so the throttle bounds the
+    // RATE at which a single source can page through every district/city and the DB work each
+    // request costs.
+    //
+    // RAISED from 40 (perf/security audit 2026-07-29) — 40/min was an availability regression
+    // for legitimate users, not a meaningful anti-enumeration control:
+    //
+    //  * The bucket bounds rate, never total. `size` is capped at 100 and there are low
+    //    thousands of active providers, so a crawler drains the whole catalogue in a couple of
+    //    dozen requests either way — 40/min made that take ~35 s instead of ~6 s. What the cap
+    //    actually buys is a ceiling on sustained DB amplification per source, and 4 req/s is a
+    //    firm one for a query whose heaviest measured shape is tens of milliseconds.
+    //  * 40/min was below real usage. The client search box is incremental: it issues a request
+    //    per settled keystroke, and the discovery screen queries masters AND salons, so ~2
+    //    requests per settled keystroke. One user typing two queries («ламінування вій» ≈ 13
+    //    settle points) consumes the entire minute's budget on their own.
+    //  * The key makes that worse in exactly the market this serves. The rightmost
+    //    X-Forwarded-For entry is the correct spoof-resistant choice (see resolveClientIp), but
+    //    Ukrainian mobile users sit behind carrier-grade NAT, so thousands of unrelated
+    //    subscribers resolve to ONE bucket and the whole pool 429s permanently.
+    //
+    // NOT switched to principal keying. Doing so would mean parsing the JWT here, in a filter
+    // that runs BEFORE JwtAuthenticationFilter and deliberately knows nothing about the auth
+    // subsystem (see the comment on deviceTokenBuckets) — and it would not fix the case that
+    // motivates the change, since /search/** is permitAll and the CGNAT-shared callers being
+    // locked out are precisely the anonymous ones with no principal to key on. IP-keyed for
+    // consistency with every other bucket in this filter. Built internally (not an injected
+    // @Qualifier bean) so the public 16-arg constructor — depended on by several
+    // slice/regression tests — stays unchanged.
+    private static final long SEARCH_CAPACITY = 240;
     private static final Duration SEARCH_WINDOW = Duration.ofMinutes(1);
+    // Token cost per search request — see searchTokenCost() for why a deep page costs 2.
+    // The capacity above is deliberately UNCHANGED: this corrects the accounting, not the cap.
+    private static final long SEARCH_TOKENS_FIRST_PAGE = 1;
+    private static final long SEARCH_TOKENS_DEEP_PAGE = 2;
+    private static final String SEARCH_PAGE_PARAM = "page";
     // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
     // unthrottled surface. This is both the residual enumeration/timing surface left after the
     // InviteService 409->idempotent fix (the already-registered and active-invite branches do
@@ -289,10 +360,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Per-IP bucket for POST /api/v1/service-types/suggest — every successful
     // suggestion emails the admin, so this is an inbox-flood surface (5/hr).
     private final LoadingCache<String, Bucket> suggestServiceTypeBuckets;
-    // Per-IP bucket for the two first-time bulk-service-setup endpoints. Even the 409
-    // first-time-only path runs full 100-item validation, so an authenticated token-holder
-    // is a DoS amplifier without this guard (10/min).
+    // Per-IP bucket for the two bulk-service-create endpoints. Every call runs full
+    // 100-item validation + persistence (the path is additive — no cheap precondition
+    // rejects a repeat caller), so an authenticated token-holder is a DoS amplifier
+    // without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
+    // Per-IP bucket for the SINGLE-item service write routes (create / update / photo / delete).
+    // Every one of them was previously unthrottled, which made single-create a strictly BETTER
+    // service_definitions row-growth lever than the bulk endpoint bulkServiceSetupBuckets caps —
+    // and one that skips the per-master advisory lock too. 60/min; see
+    // RateLimitConfig#serviceWriteCapacity for the sizing arithmetic and for why this is a
+    // separate bucket rather than a share of bulkServiceSetupBuckets.
+    private final LoadingCache<String, Bucket> serviceWriteBuckets;
     // Per-IP bucket for POST /api/v1/support/contact — every successful request emails
     // the support inbox, so this is an email-bomb / outbound-quota surface (5/hr).
     private final LoadingCache<String, Bucket> supportContactBuckets;
@@ -316,6 +395,11 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rather than injected so the public 16-arg constructor stays stable for the slice/regression
     // tests that construct this filter directly.
     private final LoadingCache<String, Bucket> cancelPostBuckets;
+    // Per-IP bucket for GET /api/v1/book/{slug}/availability — the LOW-fix flood guard for the public
+    // booking page's slot read, the one permitAll() surface under /book that had no bucket at all. Built
+    // internally rather than injected so the public 19-arg constructor stays stable for the
+    // slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> guestAvailabilityBuckets;
     // Per-IP bucket for GET /api/v1/search/** — the SEC-fix scraping guard for the permitAll()
     // discovery reads (which now surface authed-only independent-master street addresses).
     // Built internally rather than injected so the public 16-arg constructor stays stable for
@@ -372,7 +456,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("supportContactBuckets") LoadingCache<String, Bucket> supportContactBuckets,
             @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
             @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
-            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets) {
+            @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -391,6 +476,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.otpSendBuckets = otpSendBuckets;
         this.verifyPasswordResetOtpBuckets = verifyPasswordResetOtpBuckets;
         this.changePasswordOtpBuckets = changePasswordOtpBuckets;
+        this.serviceWriteBuckets = serviceWriteBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -408,6 +494,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(CANCEL_POST_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(cancelPostBandwidth())
+                        .build());
+        this.guestAvailabilityBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(GUEST_AVAILABILITY_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(guestAvailabilityBandwidth())
                         .build());
         this.searchBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -465,6 +557,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return BandwidthBuilder.builder()
                 .capacity(CANCEL_POST_CAPACITY)
                 .refillIntervally(CANCEL_POST_CAPACITY, CANCEL_POST_WINDOW)
+                .build();
+    }
+
+    private static Bandwidth guestAvailabilityBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(GUEST_AVAILABILITY_CAPACITY)
+                .refillIntervally(GUEST_AVAILABILITY_CAPACITY, GUEST_AVAILABILITY_WINDOW)
                 .build();
     }
 
@@ -548,13 +647,34 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Guest-availability read rate-limit: GET /api/v1/book/{slug}/availability — matched by
+        // prefix + suffix (the {slug} is one path segment), checked before the POST-only guard so this
+        // GET is covered. The /availability suffix cannot collide with the sibling public reads under
+        // /book: /{slug}/info, /cancel/{token} (GET cancel-info) and the OTP/booking/cancel POSTs all
+        // end in something else, so ONLY the availability GET consumes this bucket.
+        //
+        // Until this branch the endpoint fell through to the unmatched-GET path with no throttle at all —
+        // the LINK counterpart of the slots branch immediately above, driving the same
+        // SlotCalculationService oracle at zero auth cost. Cap: 60 / 60 s per IP, deliberately the same
+        // budget as slotsBuckets (see GUEST_AVAILABILITY_CAPACITY for the sizing and for why it does not
+        // throttle a guest tapping through dates).
+        if (HttpMethod.GET.matches(method)
+                && path.startsWith(GUEST_BOOKING_PATH_PREFIX)
+                && path.endsWith(GUEST_AVAILABILITY_PATH_SUFFIX)) {
+            applyRateLimit(request, response, filterChain, guestAvailabilityBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
         // before the POST-only guard so these GET reads are covered. These permitAll() paths
         // expose authed-only independent-master street addresses, so the throttle is the
-        // IP-layer defence against bulk home-address harvesting. Cap: 40 / 60 s per IP.
+        // IP-layer ceiling on sustained scraping and DB amplification. Cap: 240 / 60 s per IP
+        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY search bucket — do
+        // not add a second one; both /search/masters and /search/salons share it by design.
         if (HttpMethod.GET.matches(method)
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
-            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS);
+            applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,
+                    searchTokenCost(request));
             return;
         }
 
@@ -584,6 +704,37 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                         || (path.startsWith(BULK_SALON_SERVICES_PREFIX)
                                 && path.endsWith(BULK_SALON_SERVICES_SUFFIX)))) {
             applyRateLimit(request, response, filterChain, bulkServiceSetupBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Single-service-CREATE rate-limit: POST on any of the three non-bulk create routes —
+        // /api/v1/independent-masters/me/services (exact) and the two salon-side routes matched by
+        // prefix + the literal "/services" suffix. Placed AFTER the bulk branch above so ordering
+        // is self-evidently safe, though the two rules are disjoint anyway (bulk ends in
+        // "/services/bulk", never "/services"). Cap: 60 / 60 s per IP (serviceWriteBuckets).
+        //
+        // Why this branch exists: without it these creates fell through to the unmatched else
+        // branch with NO throttle, so an attacker chasing service_definitions row growth just
+        // looped single-create instead of the rate-limited bulk endpoint — the strictly better
+        // lever, and one that skips the per-master advisory lock as well.
+        if (HttpMethod.POST.matches(method)
+                && (IM_SINGLE_SERVICE_PATH.equals(path)
+                        || (path.startsWith(SALON_SINGLE_SERVICE_PREFIX)
+                                && path.endsWith(SALON_SINGLE_SERVICE_SUFFIX)))) {
+            applyRateLimit(request, response, filterChain, serviceWriteBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Service-definition MUTATE rate-limit: PATCH /api/v1/services/{serviceDefId},
+        // PATCH /api/v1/services/{serviceDefId}/photo and DELETE /api/v1/services/{serviceDefId} —
+        // matched by prefix, which covers all three and cannot reach the sibling
+        // /api/v1/service-categories/** or /api/v1/service-types/** namespaces. Checked before the
+        // POST-only guard below so these PATCH/DELETE routes are covered; without this branch they
+        // fell through to it entirely unthrottled, the same gap as the creates above. They share
+        // ONE bucket with the creates by design — same class of single-item catalogue write.
+        if ((HttpMethod.PATCH.matches(method) || HttpMethod.DELETE.matches(method))
+                && path.startsWith(SERVICE_DEF_WRITE_PATH_PREFIX)) {
+            applyRateLimit(request, response, filterChain, serviceWriteBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -743,11 +894,58 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         return StringUtils.cleanPath(MATCH_PATH_HELPER.getPathWithinApplication(request));
     }
 
+    /**
+     * Tokens a {@code GET /api/v1/search/**} request costs: {@link #SEARCH_TOKENS_FIRST_PAGE}
+     * for {@code page=0}, {@link #SEARCH_TOKENS_DEEP_PAGE} for any deeper page.
+     *
+     * <h4>Why the flat 1-token charge understated the work by 2×</h4>
+     * {@link #SEARCH_CAPACITY} was sized as "4 req/s of a query whose heaviest measured shape
+     * is tens of milliseconds". But a request with {@code offset > 0} can execute <b>two</b>
+     * statements, not one: {@code COUNT(*) OVER()} rides on the returned rows, so an
+     * out-of-range page has no row to carry the total and {@code SearchService} recovers it
+     * with a first-page probe. And {@code @Cacheable(condition = "#pageable.pageNumber < 5")}
+     * means every page ≥ 5 is an unconditional miss, so the deep pages are exactly the ones
+     * that always reach the DB. A caller sweeping page indices therefore bought up to 8
+     * statements/s against a cap sized for 4. Charging 2 for those makes the number mean what
+     * it was sized to mean, without changing the capacity — which both audits agreed is the
+     * right value for availability behind carrier-grade NAT (see {@link #SEARCH_CAPACITY}).
+     *
+     * <p>Reads the {@code page} query parameter directly. Safe here: the branch is GET-only, so
+     * {@code getParameter} cannot consume a request body, and an absent / unparsable / negative
+     * value falls back to the cheap first-page charge — the DTO's own {@code @PositiveOrZero} /
+     * {@code @Max} / result-window constraints are what reject malformed paging, not this
+     * filter. The reachable window is bounded by {@code SearchResultWindow} (10 000 rows), so
+     * the deep-page population this surcharges is itself finite.</p>
+     */
+    private static long searchTokenCost(HttpServletRequest request) {
+        String page = request.getParameter(SEARCH_PAGE_PARAM);
+        if (page == null || page.isBlank()) {
+            return SEARCH_TOKENS_FIRST_PAGE;
+        }
+        try {
+            return Long.parseLong(page.trim()) > 0
+                    ? SEARCH_TOKENS_DEEP_PAGE
+                    : SEARCH_TOKENS_FIRST_PAGE;
+        } catch (NumberFormatException ex) {
+            // Unparsable page — the request will 400 in validation; charge the base cost.
+            return SEARCH_TOKENS_FIRST_PAGE;
+        }
+    }
+
     private void applyRateLimit(HttpServletRequest request,
                                 HttpServletResponse response,
                                 FilterChain filterChain,
                                 LoadingCache<String, Bucket> cache,
                                 int retryAfterSeconds) throws ServletException, IOException {
+        applyRateLimit(request, response, filterChain, cache, retryAfterSeconds, 1L);
+    }
+
+    private void applyRateLimit(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain,
+                                LoadingCache<String, Bucket> cache,
+                                int retryAfterSeconds,
+                                long tokens) throws ServletException, IOException {
         String ip = resolveClientIp(request);
         // Clamp to max IPv6 length (45 chars) to prevent oversized Caffeine cache keys
         // crafted via a long X-Forwarded-For header value.
@@ -756,7 +954,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         }
         Bucket bucket = cache.get(ip);
 
-        if (bucket.tryConsume(1)) {
+        if (bucket.tryConsume(tokens)) {
             filterChain.doFilter(request, response);
         } else {
             response.setStatus(429);

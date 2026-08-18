@@ -89,6 +89,78 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     // Safe-margin future dates: well clear of "today" so no-past-edit never trips by accident.
     private static final LocalDate FUTURE_FROM = LocalDate.now().plusDays(30);
 
+    /**
+     * Upper bound on statements issued by one AVAILABILITY-path fold — {@code resolveEffectiveRange} and
+     * {@code getClientWorkingDays} — SHARED by the 28-day and the 90-day guard so the two can never drift
+     * apart. Span-independence (the same bound holding for a 3× longer span) is the actual no-N+1 property
+     * being guarded; the absolute number is incidental.
+     *
+     * <p><b>Composition</b> (derived by measurement, not assumed — the previous version of this comment
+     * claimed a spare "tolerance for read-only transaction bookkeeping" that does not exist, and omitted
+     * statement 3 entirely):
+     * <ol>
+     *   <li>{@code findByMasterIdAndDateBetweenWithIntervals} — the override bulk load. Always.</li>
+     *   <li>{@code findOverlappingRangeWithIntervals} — the template bulk load. Always.</li>
+     *   <li>batched init of {@code ScheduleException.discreteTimes} — whenever ≥1 <em>non-DAY_OFF</em>
+     *       override falls in range. Neither {@code ScheduleExceptionRepository} finder fetch-joins that
+     *       collection (both take {@code LEFT JOIN FETCH se.intervals} only), so
+     *       {@code MasterScheduleService#resolveFromOverride}'s {@code toOverrideDiscreteTimes} call
+     *       lazy-initializes it.</li>
+     *   <li>batched init of {@code WeeklySchedule.discreteTimes} (15.8) — whenever a template covers.</li>
+     * </ol>
+     *
+     * <p><b>This ceiling therefore pins SPAN-INDEPENDENCE, not the window leak.</b> A fixture with no
+     * override in range spends only 3 of the 4, and that one statement of slack is exactly the cost of a
+     * {@code dayWindows} load — so a leak-back onto the availability path can hide underneath this bound.
+     * Detecting that is {@code P1d}'s job (the differential guard); see it before assuming this number
+     * protects anything it does not.
+     *
+     * <p><b>Back to 4 in Phase 15.12 (resolver split).</b> It was briefly 5 while the window projection ran
+     * inside the shared resolver. The split moved that projection to a decoration step on
+     * {@code resolveEffectiveRangeForDisplay} alone, so no availability caller loads {@code dayWindows} —
+     * see {@link #MAX_DISPLAY_RESOLVER_QUERIES}. Keeping this tight is the point: it is what would catch a
+     * future change quietly re-attaching the window to the availability path.
+     */
+    private static final long MAX_RESOLVER_QUERIES = 4L;
+
+    /**
+     * Upper bound for the DISPLAY fold ({@code resolveEffectiveRangeForDisplay}), which additionally
+     * projects the Phase 15.12 display-only working window: the batched {@code dayWindows} hydration, once
+     * for the whole fold regardless of span — never one per date.
+     *
+     * <p>Carries the same one-statement slack as {@link #MAX_RESOLVER_QUERIES} for the same reason (a
+     * fixture with no override in range), so on its own it would tolerate the window costing <em>two</em>
+     * extra statements while still reading as "exactly one". The "exactly one" half of the contract is
+     * asserted relationally by {@code P1d}; this constant, like its sibling, pins span-independence only.
+     */
+    private static final long MAX_DISPLAY_RESOLVER_QUERIES = MAX_RESOLVER_QUERIES + 1L;
+
+    /**
+     * One fold's JDBC statement count, measured with Hibernate {@link Statistics}. Extracted because the
+     * enable/clear/read/restore dance appeared verbatim in four guards (§Q4), and because {@code P1d} must
+     * measure two folds under provably identical mechanics — an inlined copy that drifted would silently
+     * invalidate the differential it asserts.
+     *
+     * <p>Restores the previous statistics-enabled state in a {@code finally} so a failing fold cannot leave
+     * statistics switched on for the rest of the class.
+     */
+    private <T> Measured<T> measure(java.util.function.Supplier<T> fold) {
+        Statistics stats = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
+        boolean wasEnabled = stats.isStatisticsEnabled();
+        stats.setStatisticsEnabled(true);
+        stats.clear();
+        try {
+            T result = fold.get();
+            return new Measured<>(result, stats.getPrepareStatementCount());
+        } finally {
+            stats.setStatisticsEnabled(wasEnabled);
+        }
+    }
+
+    /** A fold's result paired with the number of JDBC statements it cost. */
+    private record Measured<T>(T result, long queries) {
+    }
+
     // ── fixtures: seed an INDEPENDENT_MASTER (owns itself) + a SALON_OWNER salon/master ──
 
     /** A solo master + its user; {@code actorId == userId} is the rightful owner. */
@@ -495,25 +567,19 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
                     new ScheduleOverrideRequest(monday.plusDays(20), ScheduleExceptionKind.CUSTOM_HOURS,
                             List.of(iv(8, 9))));
 
-            Statistics stats = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
-            boolean wasEnabled = stats.isStatisticsEnabled();
-            stats.setStatisticsEnabled(true);
-            stats.clear();
-
             // A 28-day span across four weeks.
-            List<EffectiveDayResponse> days = scheduleService.resolveEffectiveRange(
-                    m.masterId(), monday, monday.plusDays(27));
-
-            long queries = stats.getPrepareStatementCount();
-            stats.setStatisticsEnabled(wasEnabled);
+            Measured<List<EffectiveDayResponse>> measured = measure(() ->
+                    scheduleService.resolveEffectiveRange(m.masterId(), monday, monday.plusDays(27)));
+            List<EffectiveDayResponse> days = measured.result();
 
             assertThat(days).as("one entry per inclusive date").hasSize(28);
             assertThat(byDate(days, monday).source()).isEqualTo(EffectiveDaySource.TEMPLATE);
             assertThat(byDate(days, monday.plusDays(10)).source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
             assertThat(byDate(days, monday.plusDays(20)).source()).isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
-            assertThat(queries)
-                    .as("resolver must bulk-load (overrides + templates) — no per-date N+1 across a 28-day span")
-                    .isLessThanOrEqualTo(4);
+            assertThat(measured.queries())
+                    .as("resolver must bulk-load (overrides + templates) — no per-date N+1 across a 28-day "
+                            + "span, actual=%s", measured.queries())
+                    .isLessThanOrEqualTo(MAX_RESOLVER_QUERIES);
         }
     }
 
@@ -1121,8 +1187,8 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
     class DataExposure {
 
         @Test
-        @DisplayName("EffectiveDayResponse exposes exactly date/source/intervals/times — no private free-text leaks (V83 + 15.8)")
-        void should_exposeOnlyDateSourceIntervalsTimes_inEffectiveDay() {
+        @DisplayName("EffectiveDayResponse exposes exactly date/source/intervals/times/window — no private free-text leaks (V83 + 15.8 + 15.12)")
+        void should_exposeOnlyDateSourceIntervalsTimesWindow_inEffectiveDay() {
             SeededMaster m = seedIndependentMaster();
             scheduleService.upsertOverride(
                     m.actorId(), m.masterId(),
@@ -1131,14 +1197,23 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
             EffectiveDayResponse pub = scheduleService.resolveEffectiveDay(m.masterId(), FUTURE_FROM);
             assertThat(pub.source()).isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
 
-            // Structural guard: the projection has exactly date/source/intervals/times — no reason/note ever.
+            // Structural guard: no reason/note — no free-text a master wrote may ever reach this projection.
             // Phase 15.8 widened the contract with `times` (discrete EXPLICIT_TIMES slots); `mode` was
             // intentionally NOT added to EffectiveDayResponse (only the weekly-template DTOs carry mode).
+            // Phase 15.12 widened it again with windowStart/windowEnd — a deliberate, reviewed addition:
+            // two nullable wall-clock TIMEs (display-only working-window bounds the master's own editor
+            // needs to rebuild an edge-flush break). They carry no free text, no identifier and no PII, so
+            // the leak class this guard exists for is unaffected. A DAY_OFF like the one asserted above
+            // projects them as null.
             assertThat(EffectiveDayResponse.class.getRecordComponents())
-                    .as("EffectiveDayResponse exposes exactly date/source/intervals/times "
-                            + "(V83 removed reason/note; 15.8 added times, NOT mode)")
+                    .as("EffectiveDayResponse exposes exactly date/source/intervals/times/window bounds "
+                            + "(V83 removed reason/note; 15.8 added times; 15.12 added the window; NOT mode)")
                     .extracting(java.lang.reflect.RecordComponent::getName)
-                    .containsExactlyInAnyOrder("date", "source", "intervals", "times");
+                    .containsExactlyInAnyOrder(
+                            "date", "source", "intervals", "times", "windowStart", "windowEnd");
+            assertThat(pub.windowStart())
+                    .as("a DAY_OFF has no working window to describe").isNull();
+            assertThat(pub.windowEnd()).isNull();
         }
     }
 
@@ -1169,28 +1244,205 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
                     new ScheduleOverrideRequest(monday.plusDays(60), ScheduleExceptionKind.CUSTOM_HOURS,
                             List.of(iv(8, 9))));
 
-            Statistics stats = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
-            boolean wasEnabled = stats.isStatisticsEnabled();
-            stats.setStatisticsEnabled(true);
-            stats.clear();
-
             // 90 inclusive days (monday .. monday+89).
-            List<EffectiveDayResponse> days = scheduleService.resolveEffectiveRange(
-                    m.masterId(), monday, monday.plusDays(89));
-
-            long queries = stats.getPrepareStatementCount();
-            stats.setStatisticsEnabled(wasEnabled);
+            Measured<List<EffectiveDayResponse>> measured = measure(() ->
+                    scheduleService.resolveEffectiveRange(m.masterId(), monday, monday.plusDays(89)));
+            List<EffectiveDayResponse> days = measured.result();
+            long queries = measured.queries();
 
             assertThat(days).as("one entry per inclusive date across the quarter").hasSize(90);
             assertThat(byDate(days, monday.plusDays(15)).source())
                     .isEqualTo(EffectiveDaySource.OVERRIDE_DAY_OFF);
             assertThat(byDate(days, monday.plusDays(60)).source())
                     .isEqualTo(EffectiveDaySource.OVERRIDE_CUSTOM);
-            // Identical bound to the 28-day case: the statement count is span-independent (2 bulk loads,
-            // tolerance for read-only tx bookkeeping), proving the fold is in-memory.
+            // Identical bound to the 28-day case (the SAME constant, so they cannot drift): the statement
+            // count is span-independent — bulk loads + batched collection hydration, proving the fold is
+            // in-memory. A 3× longer span costing the same number of statements is the real assertion.
             assertThat(queries)
                     .as("90-day fold must issue the same bounded query count as the 28-day fold — actual=%s", queries)
-                    .isLessThanOrEqualTo(4);
+                    .isLessThanOrEqualTo(MAX_RESOLVER_QUERIES);
+        }
+
+        /**
+         * P1b (Phase 15.12 resolver split) — the boolean-only CLIENT path folds through the shared
+         * {@code foldRange} core WITHOUT the decoration step, so its cost stays span-independent on the
+         * tight {@link #MAX_RESOLVER_QUERIES} availability bound even across a 90-day quarter.
+         *
+         * <p><b>What this does NOT prove</b> (corrected 2026-07-27 — the previous javadoc claimed the
+         * opposite): this fixture seeds no override, so it spends 3 of the 4 permitted statements. A
+         * leak-back — repointing {@code getClientWorkingDays} at the display variant, or refolding
+         * {@code withWindow} into {@code resolveFromTemplate} — costs exactly one batched
+         * {@code dayWindows} statement, landing on 4, which is still {@code <=} the bound. This guard
+         * would stay GREEN. {@code P1d} is the one that catches it; do not read this test as protecting
+         * against the window leaking onto the availability path.
+         */
+        @Test
+        @DisplayName("P1b — getClientWorkingDays stays span-independent on the tight availability bound")
+        void should_keepBoundedQueryCount_when_booleanPathFoldsQuarterSpan() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            // Every Monday and Wednesday in the span is a working day carrying a stored window, so a
+            // hypothetical per-day dayWindows load would fire on ~26 of the 90 dates — the shape this
+            // absolute ceiling genuinely does catch.
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null,
+                            new WeeklyScheduleDayRequest(1, WeekdayMode.INTERVAL,
+                                    List.of(iv(10, 17)), null, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                            new WeeklyScheduleDayRequest(3, WeekdayMode.INTERVAL,
+                                    List.of(iv(10, 14)), null, LocalTime.of(9, 0), LocalTime.of(14, 0))));
+
+            Measured<List<MasterWorkingDayResponse>> measured = measure(() ->
+                    scheduleService.getClientWorkingDays(m.masterId(), monday, monday.plusDays(89)));
+
+            assertThat(measured.result()).hasSize(90);
+            assertThat(measured.result().stream().filter(MasterWorkingDayResponse::working).count())
+                    .as("Mondays + Wednesdays across the quarter are working days").isGreaterThan(20L);
+            assertThat(measured.queries())
+                    .as("a 90-day boolean fold must stay bounded, not scale with the span — actual=%s",
+                            measured.queries())
+                    .isLessThanOrEqualTo(MAX_RESOLVER_QUERIES);
+        }
+
+        /**
+         * P1c (Phase 15.12 resolver split) — the display path DOES project the window, and its cost stays
+         * span-independent: one batched {@code dayWindows} load for the whole fold, never one per date.
+         *
+         * <p><b>Scope</b> (corrected 2026-07-27): this pins span-independence and that the projection
+         * actually happens. It does NOT pin "exactly one extra statement" — this fixture seeds no override,
+         * so it spends 4 of the 5 permitted, and the window could cost two statements without tripping the
+         * bound. {@code P1d} asserts the "exactly one" half relationally.
+         */
+        @Test
+        @DisplayName("P1c — resolveEffectiveRangeForDisplay projects the window and stays span-independent")
+        void should_stayBounded_when_displayPathProjectsWindowAcrossQuarter() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null,
+                            new WeeklyScheduleDayRequest(1, WeekdayMode.INTERVAL,
+                                    List.of(iv(10, 17)), null, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                            new WeeklyScheduleDayRequest(3, WeekdayMode.INTERVAL,
+                                    List.of(iv(10, 14)), null, LocalTime.of(9, 0), LocalTime.of(14, 0))));
+
+            Measured<List<EffectiveDayResponse>> measured = measure(() ->
+                    scheduleService.resolveEffectiveRangeForDisplay(
+                            m.masterId(), monday, monday.plusDays(89)));
+
+            assertThat(measured.result()).hasSize(90);
+            assertThat(byDate(measured.result(), monday).windowStart())
+                    .as("the display path really does project the window").isEqualTo(LocalTime.of(9, 0));
+            assertThat(measured.queries())
+                    .as("one batched dayWindows load for the whole 90-day fold — actual=%s",
+                            measured.queries())
+                    .isLessThanOrEqualTo(MAX_DISPLAY_RESOLVER_QUERIES);
+        }
+
+        /**
+         * P1d (2026-07-27 perf re-audit) — the DIFFERENTIAL guard, and the only one of the four that can
+         * actually detect a window leak onto the availability path.
+         *
+         * <p>P1/P1b/P1c are three independent ceilings. Each carries up to one statement of slack depending
+         * on whether an override happens to fall in the fixture's range, and a leak costs exactly one
+         * statement — so a leak can hide inside the slack of any of them. This test removes the slack by
+         * measuring BOTH folds over the SAME seeded fixture, in the same test, through the same
+         * {@link #measure} mechanics, and asserting the RELATIONSHIP:
+         *
+         * <pre>display == availability + 1   (P1d)
+         *  boolean == availability       (P1e)</pre>
+         *
+         * <p>That single equality pins both halves of the contract at once — the display path pays exactly
+         * one extra statement, and the availability path pays none — and it does so without hardcoding an
+         * absolute number that shifts with the fixture's override content or with a future
+         * {@code LEFT JOIN FETCH} added to either finder. Both sides move together, so the differential
+         * survives changes that would silently re-slacken the ceilings.
+         *
+         * <p>Verified to go RED against the exact regression it guards (repointing
+         * {@code getClientWorkingDays}/{@code resolveEffectiveRange} at the display variant).
+         */
+        @Test
+        @DisplayName("P1d — the display fold costs the availability fold + exactly one statement (same fixture)")
+        void should_costExactlyOneExtraStatement_when_displayFoldComparedToAvailabilityFold() {
+            SeededMaster m = seedQuarterFixtureWithWindows();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+
+            Measured<List<EffectiveDayResponse>> availability = measure(() ->
+                    scheduleService.resolveEffectiveRange(m.masterId(), monday, monday.plusDays(89)));
+            Measured<List<EffectiveDayResponse>> display = measure(() ->
+                    scheduleService.resolveEffectiveRangeForDisplay(
+                            m.masterId(), monday, monday.plusDays(89)));
+
+            assertThat(byDate(availability.result(), monday).windowStart())
+                    .as("control: the availability fold must project NO window").isNull();
+            assertThat(byDate(display.result(), monday).windowStart())
+                    .as("control: the display fold must project the window").isEqualTo(LocalTime.of(9, 0));
+            assertThat(display.queries())
+                    .as("the window must cost EXACTLY one batched statement — availability=%s, display=%s. "
+                            + "An EQUAL count means either the window was refolded into the shared core "
+                            + "(availability now pays for it) or the display path stopped projecting it",
+                            availability.queries(), display.queries())
+                    .isEqualTo(availability.queries() + 1);
+        }
+
+        /**
+         * P1e (2026-07-27 perf re-audit) — the second half of the differential, and the guard that covers
+         * the regression form {@code P1d} structurally cannot see.
+         *
+         * <p>{@code P1d} compares {@code resolveEffectiveRange} against {@code resolveEffectiveRangeForDisplay}.
+         * Repointing {@code getClientWorkingDays} at the display variant — the exact leak {@code P1b} was
+         * written for — leaves BOTH of those folds untouched, so {@code P1d} would stay green, and
+         * {@code P1b}'s ceiling has a statement of slack to absorb it. Neither catches it.
+         *
+         * <p>This test pins the CLIENT boolean path's wiring directly: over an identical fixture it must
+         * cost exactly what the window-free fold costs — not one more. Verified to go RED against the
+         * mutation.
+         */
+        @Test
+        @DisplayName("P1e — getClientWorkingDays costs exactly what the window-free fold costs, not one more")
+        void should_costSameAsAvailabilityFold_when_booleanPathResolvesQuarter() {
+            SeededMaster m = seedQuarterFixtureWithWindows();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+
+            Measured<List<MasterWorkingDayResponse>> booleanPath = measure(() ->
+                    scheduleService.getClientWorkingDays(m.masterId(), monday, monday.plusDays(89)));
+            Measured<List<EffectiveDayResponse>> availability = measure(() ->
+                    scheduleService.resolveEffectiveRange(m.masterId(), monday, monday.plusDays(89)));
+
+            assertThat(booleanPath.result()).hasSize(90);
+            assertThat(booleanPath.result().stream().filter(MasterWorkingDayResponse::working).count())
+                    .as("control: the fixture really does produce working days to fold")
+                    .isGreaterThan(20L);
+            assertThat(booleanPath.queries())
+                    .as("the CLIENT boolean path must fold through the WINDOW-FREE variant — boolean=%s, "
+                            + "availability=%s. One MORE than availability means getClientWorkingDays was "
+                            + "repointed at resolveEffectiveRangeForDisplay and is now paying for a window "
+                            + "it immediately discards",
+                            booleanPath.queries(), availability.queries())
+                    .isEqualTo(availability.queries());
+        }
+
+        /**
+         * The shared fixture for the two differential guards: an open-ended template whose Monday and
+         * Wednesday both carry a stored display-only window, plus a non-DAY_OFF override inside the span.
+         *
+         * <p>The override is deliberate — it makes the {@code ScheduleException.discreteTimes} batched init
+         * fire on every fold, so the measured counts sit at their maximum rather than in the 1-statement
+         * trough that let the absolute ceilings hide a leak. It cancels out of both differentials by
+         * construction, which is the point: the relationships hold regardless of which optional statements
+         * a fixture happens to trigger.
+         */
+        private SeededMaster seedQuarterFixtureWithWindows() {
+            SeededMaster m = seedIndependentMaster();
+            LocalDate monday = nextDateForDow(FUTURE_FROM, DayOfWeek.MONDAY);
+            scheduleService.upsertWeeklySchedule(m.actorId(), m.masterId(), null,
+                    weekly(monday, null,
+                            new WeeklyScheduleDayRequest(1, WeekdayMode.INTERVAL,
+                                    List.of(iv(10, 17)), null, LocalTime.of(9, 0), LocalTime.of(17, 0)),
+                            new WeeklyScheduleDayRequest(3, WeekdayMode.INTERVAL,
+                                    List.of(iv(10, 14)), null, LocalTime.of(9, 0), LocalTime.of(14, 0))));
+            scheduleService.upsertOverride(m.actorId(), m.masterId(),
+                    new ScheduleOverrideRequest(monday.plusDays(30), ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(8, 9))));
+            return m;
         }
 
         /**

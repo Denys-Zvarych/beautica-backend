@@ -875,7 +875,8 @@ class ServiceCatalogServiceTest {
                 PriceType.FIXED,
                 new BigDecimal("500.00"),
                 new BigDecimal("600.00"),
-                "500.00 ₴"
+                "500.00 ₴",
+                null
         );
 
         MasterServiceResponse full = new MasterServiceResponse(
@@ -893,7 +894,8 @@ class ServiceCatalogServiceTest {
                 "від 333.33 до 444.44 ₴",
                 UUID.randomUUID(),
                 "Манікюр",
-                "manicure"
+                "manicure",
+                null
         );
 
         MasterServiceResponse masked = MasterServiceResponse.fromPublic(full);

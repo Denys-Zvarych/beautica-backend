@@ -79,6 +79,67 @@ server:
   # Setting it to 'native' would cause Spring's ForwardedHeaderFilter to strip
   # X-Forwarded-For before AuthRateLimitFilter runs, making IP-based rate limiting
   # ineffective. The raw XFF header is read directly by AuthRateLimitFilter.
+  compression:
+    # Gzip responses at the Tomcat layer. Deliberately set HERE (shared config), not per
+    # profile: it is transport-level and profile-independent, and a prod-only value is how
+    # a setting ships untested. The `test` profile exercises it for real — the integration
+    # suite drives the app over TestRestTemplate on
+    # HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()), and Apache
+    # HttpClient 5's default exec chain includes ContentCompressionExec, so it negotiates
+    # `Accept-Encoding: gzip` and transparently decodes. MockMvc slice tests bypass Tomcat
+    # and are unaffected. Nothing upstream compresses: there is no reverse proxy in the
+    # image (the Dockerfile runs the jar directly) and Railway's edge proxies the origin
+    # response rather than encoding it — so this is the only place compression can happen.
+    # Double-compression is not a risk regardless: a proxy that receives an already
+    # Content-Encoding'd response does not re-encode it.
+    enabled: true
+    # Biggest win is the paginated list endpoints, which are maximally gzip-friendly:
+    # every avatarUrl on GET /bookings/me repeats the same long R2 host + `avatars/` prefix
+    # per row, and JSON key names repeat verbatim on every element.
+    #
+    # SCOPE = application/json ONLY. Narrowed from the former
+    # `application/json,application/problem+json,text/html,text/plain`:
+    #   - application/json is the only content type this app emits at volume — every REST
+    #     handler plus GlobalExceptionHandler (a @RestControllerAdvice returning ApiResponse,
+    #     i.e. application/json — NOT problem+json). No ProblemDetail exists anywhere, so the
+    #     problem+json alias was dead forward-cover and is dropped (YAGNI).
+    #   - text/html is produced by exactly two endpoints, the Thymeleaf review pages
+    #     (CategoryRequestReviewController, ServiceTypeSuggestionReviewController). Their FORM
+    #     pages embed a 32-byte review token TWICE next to attacker-chosen displayName /
+    #     suggestedName — the ONE place in the app where a secret and attacker-influenced text
+    #     share one compressible body (a textbook BREACH oracle). Dropping text/html costs
+    #     nothing (result pages are ~807 B, and the threshold below is inert anyway) and closes
+    #     that co-location. text/plain had no producer at all.
+    #
+    # BREACH on the remaining application/json auth responses is ACCEPTED, not mitigated.
+    # POST /auth/{login,refresh,register} return an AuthResponse carrying two raw JWTs plus a
+    # reflected `email`, and they ARE gzipped today (884 B -> 624 B on the wire — the "too
+    # small to ever compress" belief is false; see ResponseCompressionIT). This is safe here
+    # because BREACH is structurally inapplicable:
+    #   - Bearer-only + STATELESS, no cookies, CSRF disabled => an attacker has NO
+    #     ambient-authority primitive to force the victim's browser to replay the request
+    #     under attacker-chosen conditions (BREACH's precondition);
+    #   - every call mints a FRESH token => no stable secret to recover byte-by-byte across
+    #     repeated observations.
+    # >>> FUTURE MAINTAINER WARNING: if you add a cookie-based session, a CSRF token reflected
+    # >>> in a response body, or any other ambient-authority credential co-located with
+    # >>> attacker-influenced input, BREACH becomes LIVE and you MUST exclude those paths from
+    # >>> compression. server.compression has no path-exclusion knob, so that needs a servlet
+    # >>> Filter / response wrapper — do not just trust this note to stay true.
+    mime-types: application/json
+    # INERT in this application — kept only as a documented floor for any future handler that
+    # sets Content-Length explicitly (none does today). Measured, not assumed
+    # (ResponseCompressionIT#should_gzipSubThresholdBody_when_responseIsChunked): Spring MVC's
+    # Jackson converter streams JSON with NO Content-Length, so every JSON response goes out
+    # Transfer-Encoding: chunked with contentLength == -1. Tomcat's gate is
+    # `contentLength == -1 || contentLength > min`; the first arm short-circuits, so this
+    # threshold gates NOTHING for chunked bodies — all JSON here is compressed regardless of
+    # size, from 70-byte 404s upward. (The earlier comment claiming a single-entity body
+    # "would miss the default entirely" and that <1KB "risks growing a small body" was wrong on
+    # both counts: the growth already happens at every size and the threshold is not what
+    # prevents it.) Left at 1KB rather than deleted so it is pinned by that test and takes
+    # effect immediately should a handler ever back-fill Content-Length.
+    min-response-size: 1KB
   tomcat:
     # Swallow up to 5 MB of an oversized request body so Tomcat returns a clean 413
     # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.

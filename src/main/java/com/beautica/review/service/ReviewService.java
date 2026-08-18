@@ -3,9 +3,10 @@ package com.beautica.review.service;
 import org.springframework.data.domain.Sort;
 import java.util.Set;
 import com.beautica.common.web.SortWhitelist;
+import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.entity.Booking;
-import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.RatingBucket;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.PageResponse;
@@ -19,7 +20,6 @@ import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
 import com.beautica.review.dto.SalonReviewSummaryResponse;
-import com.beautica.review.dto.SalonReviewSummaryResponse.RatingBucket;
 import com.beautica.review.entity.Review;
 import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.repository.RatingCountProjection;
@@ -39,6 +39,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -54,6 +57,18 @@ public class ReviewService {
     private final SalonRepository salonRepository;
     private final MasterRepository masterRepository;
     private final ApplicationEventPublisher eventPublisher;
+    private final Clock clock;
+
+    /**
+     * Absolute-instant "now" for {@link BookingClosureRule#isReviewEligible} — {@link
+     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, the SAME idiom {@code
+     * BookingService#resolveNow} uses for the identical purpose (Anti-Bug §G: never {@code
+     * Instant.now()} / {@code OffsetDateTime.now()} directly, and never a second, divergent clock
+     * idiom for the same rule).
+     */
+    private OffsetDateTime resolveNow() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+    }
 
     @Transactional
     public ReviewResponse createReview(UUID clientId, CreateReviewRequest request) {
@@ -72,9 +87,14 @@ public class ReviewService {
             throw new ForbiddenException("Not authorized to review this booking");
         }
 
-        if (booking.getStatus() != BookingStatus.COMPLETED) {
+        // Locked product decision: a booking that entered the client's "Past" tab BY ELAPSED TIME
+        // is reviewable even when the provider never marked it COMPLETED — mirrors
+        // BookingService#canReview exactly (same BookingClosureRule#isReviewEligible call), so a
+        // client offered the canReview CTA can never land here and get rejected. NOT_COMPLETED /
+        // CANCELLED / DECLINED stay unreviewable regardless of endsAt — see that method's javadoc.
+        if (!BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), resolveNow())) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Review can only be submitted for completed bookings");
+                    "This booking is not yet eligible for a review");
         }
 
         if (reviewRepository.existsByBookingId(booking.getId())) {
@@ -103,7 +123,20 @@ public class ReviewService {
         // from master.getSalon() — booking.salon is the source of truth for "which salon
         // owned this booking at completion time"). null for an INDEPENDENT_MASTER booking.
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
-        eventPublisher.publishEvent(new ReviewCreatedEvent(booking.getMaster().getId(), salonId));
+        // masterUserId (Phase 240 re-audit, Finding 1) addresses the userId-keyed
+        // "master-detail-by-user" cache behind GET /masters/me, which masterId cannot reach.
+        // Costs nothing: findByIdWithFullGraph above JOIN FETCHes `m.user`, so getMaster() and
+        // getUser() are both fully hydrated entities in this persistence context — not proxies —
+        // and getId() reads an in-memory field. No lazy initialisation, no extra statement on the
+        // review-create path.
+        // clientId is the AUTHOR (this method's authenticated principal argument), carried so
+        // ClientPassportCacheEvictor can drop that client's cached BEAUTY PASSPORT — its
+        // reviewsWritten line just changed. Costs nothing: it is already a parameter.
+        eventPublisher.publishEvent(new ReviewCreatedEvent(
+                booking.getMaster().getId(),
+                booking.getMaster().getUser().getId(),
+                salonId,
+                clientId));
         return ReviewResponse.from(saved);
     }
 

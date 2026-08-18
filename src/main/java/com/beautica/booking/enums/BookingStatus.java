@@ -17,6 +17,14 @@ package com.beautica.booking.enums;
  * <p>{@code CANCELLED} = client backed out; {@code DECLINED} = provider backed out. The
  * distinction is load-bearing: the client's "Мої записи" must distinguish "ви скасували" from
  * "салон скасував".
+ *
+ * <p><b>Reviewability is not status-only.</b> A {@code CONFIRMED} booking whose {@code endsAt}
+ * has already elapsed is ALSO reviewable — no {@code @Scheduled} job ever auto-transitions an
+ * unclosed booking out of {@code CONFIRMED} (see {@code BookingClosureRule}'s header javadoc), so
+ * gating review eligibility on {@code COMPLETED} alone left every unclosed-but-elapsed booking
+ * permanently unreviewable once it aged into the client's "Past" tab. See {@code
+ * BookingClosureRule#isReviewEligible} for the full rule; {@code NOT_COMPLETED}/{@code
+ * CANCELLED}/{@code DECLINED} stay unreviewable regardless of time.
  */
 public enum BookingStatus {
     CONFIRMED,

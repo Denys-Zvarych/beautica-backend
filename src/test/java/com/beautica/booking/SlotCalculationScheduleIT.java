@@ -6,12 +6,14 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.TimeZones;
 import com.beautica.common.util.TimeSlotCalculator;
+import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WeeklyScheduleDayRequest;
 import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.master.entity.WeekdayMode;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.ScheduleDateMath;
@@ -577,6 +579,141 @@ class SlotCalculationScheduleIT extends AbstractIntegrationTest {
         return (int) Duration.between(
                 date.atStartOfDay(TimeZones.KYIV),
                 date.plusDays(1).atStartOfDay(TimeZones.KYIV)).toHours();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Phase 15.12 — the display-only working window must be INVISIBLE to the slot engine
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The safety property that makes the 15.12 working-window feature low-risk: {@code windowStart}/
+     * {@code windowEnd} are DISPLAY-ONLY metadata for the mobile editor (so a break flush against an edge of
+     * the working day survives a reload), and the interval list stays the single canonical source of
+     * availability.
+     *
+     * <p>Each test computes the slot list twice against the SAME intervals — once with no window stored,
+     * once with a window stored — and asserts the two lists are identical. A window strictly WIDER than the
+     * intervals must not add slots (it would if the engine ever read it), which is the realistic failure
+     * mode: the editor's window is by definition ⊇ the intervals whenever any break exists.
+     */
+    @Nested
+    @DisplayName("15.12 working window is display-only — slots never change")
+    class WorkingWindowIsDisplayOnly {
+
+        /** An INTERVAL weekday carrying display-only window bounds (either may be null). */
+        private WeeklyScheduleDayRequest dayWithWindow(
+                int dow, LocalTime windowStart, LocalTime windowEnd, WorkIntervalDto... intervals) {
+            return new WeeklyScheduleDayRequest(dow, WeekdayMode.INTERVAL, List.of(intervals), null,
+                    windowStart, windowEnd);
+        }
+
+        @Test
+        @DisplayName("a weekly-template window wider than the intervals produces byte-identical slots")
+        void should_produceIdenticalSlots_when_workingWindowIsStored() {
+            Seed s = seedMasterWithService(60);
+            LocalDate monday = LocalDate.of(2024, 6, 3); // ISO 1
+            // The editor's day is 09:00–18:00 with a 09:00–10:00 break flush against the start, which
+            // stores as the single interval [10:00–18:00].
+            UUID scheduleId = masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(monday, null,
+                            dayWithWindow(1, null, null, iv(LocalTime.of(10, 0), LocalTime.of(18, 0)))))
+                    .id();
+
+            List<LocalTime> withoutWindow = startWallClocks(slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId()));
+
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), scheduleId,
+                    weekly(monday, null,
+                            dayWithWindow(1, LocalTime.of(9, 0), LocalTime.of(18, 0),
+                                    iv(LocalTime.of(10, 0), LocalTime.of(18, 0)))));
+            List<LocalTime> withWindow = startWallClocks(slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId()));
+
+            assertThat(withWindow)
+                    .as("a stored 09:00–18:00 window must not widen the 10:00–18:00 interval's slots")
+                    .isEqualTo(withoutWindow);
+            assertThat(withWindow)
+                    .as("the 09:00 hour is inside the window but OUTSIDE every interval — never bookable")
+                    .doesNotContain(LocalTime.of(9, 0), LocalTime.of(9, 30))
+                    .startsWith(LocalTime.of(10, 0));
+        }
+
+        @Test
+        @DisplayName("a per-date override window wider than the intervals produces byte-identical slots")
+        void should_produceIdenticalSlots_when_overrideWorkingWindowIsStored() {
+            Seed s = seedMasterWithService(60);
+            LocalDate monday = LocalDate.of(2024, 6, 3);
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(monday, null, day(1, iv(LocalTime.of(9, 0), LocalTime.of(17, 0)))));
+            // Override the date to 10:00–12:00 of work; the editor's window was 10:00–14:00 with a
+            // 12:00–14:00 break flush against the END.
+            masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
+                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
+                            List.of(iv(LocalTime.of(10, 0), LocalTime.of(12, 0)))));
+
+            List<LocalTime> withoutWindow = startWallClocks(slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId()));
+
+            masterScheduleService.upsertOverride(s.actorId(), s.masterId(),
+                    new ScheduleOverrideRequest(monday, ScheduleExceptionKind.CUSTOM_HOURS,
+                            WeekdayMode.INTERVAL, List.of(iv(LocalTime.of(10, 0), LocalTime.of(12, 0))),
+                            null, false, LocalTime.of(10, 0), LocalTime.of(14, 0)));
+            List<LocalTime> withWindow = startWallClocks(slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId()));
+
+            assertThat(withWindow)
+                    .as("a stored 10:00–14:00 override window must not widen the 10:00–12:00 interval")
+                    .isEqualTo(withoutWindow);
+            assertThat(withWindow)
+                    .as("12:00–14:00 lies inside the window but outside every interval — never bookable")
+                    .containsExactly(LocalTime.of(10, 0), LocalTime.of(10, 30), LocalTime.of(11, 0));
+        }
+
+        @Test
+        @DisplayName("the window now VISIBLE on the effective-day projection still cannot change slots")
+        void should_produceIdenticalSlots_when_effectiveDayCarriesWorkingWindow() {
+            Seed s = seedMasterWithService(60);
+            LocalDate monday = LocalDate.of(2024, 6, 3); // ISO 1
+            UUID scheduleId = masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), null,
+                    weekly(monday, null,
+                            dayWithWindow(1, null, null, iv(LocalTime.of(10, 0), LocalTime.of(18, 0)))))
+                    .id();
+
+            // Control: no window stored anywhere.
+            EffectiveDayResponse before = masterScheduleService.resolveEffectiveDay(s.masterId(), monday);
+            List<LocalTime> withoutWindow = startWallClocks(slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId()));
+
+            masterScheduleService.upsertWeeklySchedule(s.actorId(), s.masterId(), scheduleId,
+                    weekly(monday, null,
+                            dayWithWindow(1, LocalTime.of(9, 0), LocalTime.of(18, 0),
+                                    iv(LocalTime.of(10, 0), LocalTime.of(18, 0)))));
+            EffectiveDayResponse after = masterScheduleService.resolveEffectiveDay(s.masterId(), monday);
+            List<LocalTime> withWindow = startWallClocks(slotServiceWithTodayBefore(monday)
+                    .getAvailableSlots(s.masterId(), monday, s.masterServiceId()));
+
+            assertThat(before.windowStart()).as("control: no window recorded yet").isNull();
+            // Phase 15.12 resolver split: the availability variants never project the window at all, so
+            // the slot engine cannot read one even by accident. Stronger than "it reads intervals() only".
+            assertThat(after.windowStart())
+                    .as("the object SlotCalculationService consumes carries NO window, though one IS stored")
+                    .isNull();
+            assertThat(after.windowEnd()).isNull();
+            assertThat(after.intervals())
+                    .as("availability side of the projection is untouched by the stored window")
+                    .isEqualTo(before.intervals());
+            // ...and the window really is stored — the display variant proves it, so the nulls above are
+            // the split working, not a save that silently failed.
+            assertThat(masterScheduleService.resolveEffectiveRangeForDisplay(s.masterId(), monday, monday)
+                    .get(0).windowStart())
+                    .as("the display variant DOES project it — the two variants differ only in the window")
+                    .isEqualTo(LocalTime.of(9, 0));
+            assertThat(withWindow)
+                    .as("slots are byte-identical with and without a stored window")
+                    .isEqualTo(withoutWindow)
+                    .doesNotContain(LocalTime.of(9, 0), LocalTime.of(9, 30))
+                    .startsWith(LocalTime.of(10, 0));
+        }
     }
 
     // ── booking seed helper ──────────────────────────────────────────────────────

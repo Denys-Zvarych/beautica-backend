@@ -68,15 +68,26 @@ import java.util.UUID;
  * populated by an authenticated caller can never leak addresses to an anonymous
  * one (and vice-versa). See {@code SearchController} for the strip.</p>
  *
- * <p><b>{@code matchedServiceNames} — per-service-filter match preview
- * (Phase 20.3):</b> when the request carries {@code serviceTypeSlugs}, this is
- * the capped ({@code SERVICE_NAME_CAP}), distinct list of the master's active
- * service names that actually matched the selected services, so the result card
- * can show <em>what</em> matched rather than the generic top-3
- * {@code serviceNames}. It is <b>empty</b> (never {@code null}) whenever no
- * service filter is active — the card then falls back to {@code serviceNames}.
- * Carries display strings only — safe on this {@code permitAll} endpoint
- * (§I).</p>
+ * <p><b>{@code matchedServiceNames} — match preview (Phase 20.3, extended to
+ * free text):</b> the capped ({@code SERVICE_NAME_CAP}), distinct list of the
+ * master's active service names that actually <em>explain</em> this row, so the
+ * result card can show <em>what</em> matched rather than the generic
+ * alphabetical top-3 {@code serviceNames}. Populated when the request carries:
+ * <ul>
+ *   <li><b>{@code serviceTypeSlugs}</b> — the services matching any selected
+ *       slug;</li>
+ *   <li><b>{@code q}</b> — the services whose own name satisfied at least one
+ *       query token while every token was satisfied through that same service
+ *       (group-scoped semantics — see {@code SearchService.appendQPredicate});</li>
+ *   <li><b>both</b> — their <b>intersection</b>: the services satisfying every
+ *       active filter, since anything else would put a service on the card that
+ *       does not match what the user asked for.</li>
+ * </ul>
+ * It is <b>empty</b> (never {@code null}) when neither filter is active, when a
+ * {@code q} match was carried entirely by the master's own name, or when the
+ * {@code q} and slug filters were satisfied by different services — the card
+ * then falls back to {@code serviceNames}. Carries display strings only — safe
+ * on this {@code permitAll} endpoint (§I).</p>
  */
 public record MasterSearchResult(
         UUID masterId,

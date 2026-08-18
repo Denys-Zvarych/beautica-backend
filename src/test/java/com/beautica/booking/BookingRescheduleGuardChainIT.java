@@ -163,6 +163,60 @@ class BookingRescheduleGuardChainIT extends AbstractIntegrationTest {
                 .isEqualTo("11:00");
     }
 
+    @Test
+    @DisplayName("PATCH /reschedule — 409 when the booking's master belongs to a salon that was "
+            + "DEACTIVATED after the booking was made (the slot oracle is the only guard here)")
+    void should_return409_when_rescheduleTargetsMasterWhoseSalonWasDeactivated() throws Exception {
+        // Phase 249 gap 2. MasterBookability's javadoc names the three reschedule routes as
+        // "derivative enforcers": they never call MasterBookability, they authorize a new start time
+        // solely by requiring it to match a slot SlotCalculationService#getAvailableSlots returns,
+        // and that method returns List.of() for a master whose salon is closed. Until this test that
+        // coupling was asserted only in prose — deleting the guard in getAvailableSlots left every
+        // reschedule test green while re-opening the exact hole the guard was added to close.
+        //
+        // SalonService.deactivateSalon does NOT cascade to masters.is_active, so the master still
+        // reads active: the salon term is the only thing that can reject this reschedule.
+        UUID masterId = createSalonOwnerSalonAndMaster(
+                "resched-guard-salon-owner-" + System.nanoTime() + "@beautica.test");
+        UUID masterServiceId = createMasterService(masterId);
+        addWorkingHoursForEveryDay(masterId);
+
+        String clientToken = createClientAndGetToken(
+                "resched-guard-salon-client-" + System.nanoTime() + "@beautica.test");
+        ZonedDateTime startsAt = ZonedDateTime.now(ZoneId.of("Europe/Kyiv")).plusDays(2)
+                .withHour(12).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = createBooking(clientToken, masterId, masterServiceId, startsAt);
+
+        // The target time is INSIDE the master's 08:00–20:00 working hours and free, so nothing but
+        // the salon-closure rule can reject it — without the guard this reschedule succeeds with 200.
+        ZonedDateTime newStartsAt = startsAt.plusHours(2);
+        jdbcTemplate.update(
+                "UPDATE salons SET is_active = false WHERE id = "
+                        + "(SELECT salon_id FROM masters WHERE id = ?)", masterId);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT is_active FROM masters WHERE id = ?", Boolean.class, masterId))
+                .as("precondition: deactivateSalon does not cascade — if masters.is_active ever "
+                        + "becomes false here, this test stops proving the SALON term specifically")
+                .isTrue();
+
+        String body = "{\"newStartsAt\":\"" + newStartsAt.toOffsetDateTime() + "\"}";
+        ResponseEntity<String> response = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("a closed salon's master exposes no slots, so no start time can match — 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT to_char(starts_at AT TIME ZONE 'Europe/Kyiv', 'HH24:MI') FROM bookings WHERE id = ?",
+                String.class, bookingId))
+                .as("booking must remain at its original 12:00 slot after the rejected reschedule")
+                .isEqualTo("12:00");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT status FROM bookings WHERE id = ?", String.class, bookingId))
+                .isEqualTo("CONFIRMED");
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     private String createClientAndGetToken(String email) throws Exception {

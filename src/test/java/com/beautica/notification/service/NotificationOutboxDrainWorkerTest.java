@@ -26,9 +26,11 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -62,6 +64,15 @@ class NotificationOutboxDrainWorkerTest {
     @Mock
     private BookingRepository bookingRepository;
 
+    /**
+     * Stubbed to the identity visit ({@code BookingVisit.single(booking)}) in {@link #wireself()},
+     * which is exactly what the real resolver returns for a booking with no appointment — the
+     * single-service shape every test here uses. Multi-service hydration is the resolver's own
+     * responsibility and is covered by {@code BookingVisitResolverTest}.
+     */
+    @Mock
+    private BookingVisitResolver visitResolver;
+
     @Mock
     private ObjectMapper objectMapper;
 
@@ -80,6 +91,8 @@ class NotificationOutboxDrainWorkerTest {
         // the phase methods through the Spring AOP proxy. In unit tests there is no proxy,
         // so we point `self` directly at the worker instance so drain() operates correctly.
         ReflectionTestUtils.setField(worker, "self", worker);
+        lenient().when(visitResolver.resolve(any(Booking.class), anyMap()))
+                .thenAnswer(inv -> BookingVisit.single(inv.getArgument(0)));
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────
@@ -109,7 +122,7 @@ class NotificationOutboxDrainWorkerTest {
 
         worker.drain();
 
-        verify(notificationService, times(1)).notifyNewBooking(booking);
+        verify(notificationService, times(1)).notifyNewBooking(BookingVisit.single(booking));
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -128,7 +141,7 @@ class NotificationOutboxDrainWorkerTest {
 
         worker.drain();
 
-        verify(notificationService, times(1)).notifyBookingStatusChanged(booking);
+        verify(notificationService, times(1)).notifyBookingStatusChanged(BookingVisit.single(booking));
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -139,7 +152,7 @@ class NotificationOutboxDrainWorkerTest {
     void should_decryptInviteUrlSealedAndDispatch_when_inviteEntryProcessed() throws Exception {
         // Arrange — use a real ObjectMapper so JSON deserialisation is actually exercised.
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -174,7 +187,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("entry transitions to DEAD without dispatch when cipher.open throws on corrupt ciphertext")
     void should_dead_letter_when_cipherOpenThrows() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -210,7 +223,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("entry transitions to DEAD without invoking cipher when inviteUrlSealed is missing from payload")
     void should_dead_letter_when_inviteUrlSealedMissing() throws Exception {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();
@@ -246,7 +259,7 @@ class NotificationOutboxDrainWorkerTest {
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
-        doThrow(new RuntimeException("dispatch error")).when(notificationService).notifyNewBooking(booking);
+        doThrow(new RuntimeException("dispatch error")).when(notificationService).notifyNewBooking(BookingVisit.single(booking));
 
         worker.drain();
 
@@ -268,7 +281,7 @@ class NotificationOutboxDrainWorkerTest {
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
-        doThrow(new RuntimeException("persistent failure")).when(notificationService).notifyNewBooking(booking);
+        doThrow(new RuntimeException("persistent failure")).when(notificationService).notifyNewBooking(BookingVisit.single(booking));
 
         worker.drain();
 
@@ -288,7 +301,7 @@ class NotificationOutboxDrainWorkerTest {
         when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
-        doThrow(new RuntimeException("x".repeat(600))).when(notificationService).notifyNewBooking(booking);
+        doThrow(new RuntimeException("x".repeat(600))).when(notificationService).notifyNewBooking(BookingVisit.single(booking));
 
         worker.drain();
 
@@ -319,7 +332,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking3.getId()).thenReturn(bookingId3);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking1, booking2, booking3));
         doThrow(new RuntimeException("status change failed"))
-                .when(notificationService).notifyBookingStatusChanged(booking3);
+                .when(notificationService).notifyBookingStatusChanged(BookingVisit.single(booking3));
 
         worker.drain();
 
@@ -342,7 +355,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Request failed: https://api.example.com/send?token=abc123secret"))
-                .when(notificationService).notifyNewBooking(booking);
+                .when(notificationService).notifyNewBooking(BookingVisit.single(booking));
 
         worker.drain();
 
@@ -368,7 +381,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Auth header invalid: " + jwtLike))
-                .when(notificationService).notifyNewBooking(booking);
+                .when(notificationService).notifyNewBooking(BookingVisit.single(booking));
 
         worker.drain();
 
@@ -393,6 +406,28 @@ class NotificationOutboxDrainWorkerTest {
         worker.drain();
 
         verify(notificationService, times(1)).notifyClientCancelled(booking);
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
+    // ── Test 10b: CLOSURE_REMINDER dispatches to notifyClosureReminder (Phase 29.5) ──
+
+    @Test
+    @DisplayName("notifyClosureReminder is called and status set to SENT when CLOSURE_REMINDER entry processed")
+    void should_callNotifyClosureReminder_when_closureReminderEntryProcessed() {
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.CLOSURE_REMINDER, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        worker.drain();
+
+        verify(notificationService, times(1)).notifyClosureReminder(booking);
+        // CLOSURE_REMINDER must never route through notifyReviewRequested — the mass-mail vector
+        // this whole track was designed to avoid coupling to.
+        verify(notificationService, never()).notifyReviewRequested(any());
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
@@ -441,7 +476,7 @@ class NotificationOutboxDrainWorkerTest {
         when(booking.getId()).thenReturn(bookingId);
         when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
         doThrow(new RuntimeException("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig"))
-                .when(notificationService).notifyNewBooking(booking);
+                .when(notificationService).notifyNewBooking(BookingVisit.single(booking));
 
         worker.drain();
 
@@ -505,7 +540,7 @@ class NotificationOutboxDrainWorkerTest {
     @DisplayName("INVITE entry with malformed JSON payload is dead-lettered without throwing")
     void should_setStatusToPending_when_invitePayloadIsInvalidJson() {
         NotificationOutboxDrainWorker workerWithRealMapper = new NotificationOutboxDrainWorker(
-                outboxRepository, notificationService, bookingRepository, REAL_MAPPER, cipher);
+                outboxRepository, notificationService, bookingRepository, visitResolver, REAL_MAPPER, cipher);
         ReflectionTestUtils.setField(workerWithRealMapper, "self", workerWithRealMapper);
 
         UUID aggregateId = UUID.randomUUID();

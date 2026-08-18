@@ -3,6 +3,7 @@ package com.beautica.master;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
+import com.beautica.booking.service.ScheduleOverrideConflictService;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
@@ -108,6 +109,9 @@ class MasterScheduleControllerTest {
 
     @MockBean
     private MasterScheduleService masterScheduleService;
+
+    @MockBean
+    private ScheduleOverrideConflictService scheduleOverrideConflictService;
 
     @MockBean(name = "authz")
     private AuthorizationService authz;
@@ -415,7 +419,7 @@ class MasterScheduleControllerTest {
         var masterId = UUID.randomUUID();
         var date = LocalDate.now().plusDays(1);
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
-        when(masterScheduleService.upsertOverride(any(), any(), any()))
+        when(scheduleOverrideConflictService.applyOverrideWithConflictHandling(any(), any(), any()))
                 .thenReturn(new ScheduleOverrideResponse(
                         date, ScheduleExceptionKind.CUSTOM_HOURS, List.of()));
         mockMvc.perform(put(BASE + "/" + masterId + "/overrides/" + date)
@@ -449,7 +453,7 @@ class MasterScheduleControllerTest {
         when(authz.canManageMasterSchedule(any(), any())).thenReturn(true);
         // V83 wire shape: a DAY_OFF override is just {date, kind}. The bare body passes @AssertTrue
         // isKindConsistent() (DAY_OFF -> no intervals) and reaches the service, which returns the override.
-        when(masterScheduleService.upsertOverride(any(), any(), any()))
+        when(scheduleOverrideConflictService.applyOverrideWithConflictHandling(any(), any(), any()))
                 .thenReturn(new ScheduleOverrideResponse(
                         date, ScheduleExceptionKind.DAY_OFF, List.of()));
         String body = "{\"date\":\"" + date + "\",\"kind\":\"DAY_OFF\"}";

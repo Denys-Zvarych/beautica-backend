@@ -66,7 +66,7 @@ class OtpVerifyRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 18 permissive caches — one positional arg per @Qualifier bucket on the production
+        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
         // constructor (now includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets,
         // Phase A5). The verify throttle the fix adds is internal to the filter, so this
         // test does not (and must not) reference any new constructor arg beyond the count: it
@@ -77,7 +77,7 @@ class OtpVerifyRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive());
+                permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postVerify() {

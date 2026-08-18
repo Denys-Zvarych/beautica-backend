@@ -35,7 +35,13 @@ import java.util.UUID;
                 name = "uq_favorite",
                 columnNames = {"client_id", "target_type", "target_id"}
         ),
-        indexes = @Index(name = "idx_favorites_client", columnList = "client_id, target_type")
+        // V135: order-covering index for the three per-client lists — the predicate
+        // (client_id, target_type) PLUS the ORDER BY created_at DESC. It replaced V92's
+        // idx_favorites_client, whose columns are a left prefix of this one (dropped in the
+        // same migration). JPA @Index cannot express DESC — column list only; the DB owns the
+        // sort direction, so ddl-auto=validate sees the names match and no drift is reported.
+        indexes = @Index(name = "idx_favorites_client_created",
+                columnList = "client_id, target_type, created_at")
 )
 @Getter
 @NoArgsConstructor

@@ -101,4 +101,43 @@ public interface SalonSearchProjection {
      * the salon recorded no note.
      */
     String getLocationNote();
+
+    /**
+     * Un-capped array of the distinct
+     * bookable service names that <em>explain</em> the free-text ({@code q})
+     * match — the services whose own name satisfied at least one query token
+     * while the salon as a whole satisfied every token through that same service
+     * (group-scoped semantics, see {@link SalonSearchSql}).
+     *
+     * <p>The deterministic sort and the {@code SERVICE_NAME_CAP} slice are applied
+     * when mapping ({@code SearchService.toMatchedServiceNames}), not in SQL —
+     * see {@link SalonSearchSql#STATIC_MATCHED_NAMES_LATERAL} for why a second
+     * {@code ORDER BY} cannot live in a Spring Data native query.</p>
+     *
+     * <p>{@code null} (→ an empty list on the DTO) when no {@code q} was supplied,
+     * or when the match was carried entirely by the salon's own name — in both
+     * cases no service explains the row and the card falls back to
+     * {@link #getServiceNames()}. Computed by the post-{@code LIMIT}
+     * {@code mnq} lateral spliced in from
+     * {@code SalonSearchSql.STATIC_MATCHED_NAMES_LATERAL}, so it costs only the
+     * paged rows. Display strings only — safe on the {@code permitAll}
+     * endpoint (§I).</p>
+     */
+    String[] getMatchedServiceNames();
+
+    /**
+     * Total number of salons matching the filters, before {@code LIMIT} —
+     * {@code COUNT(*) OVER()} evaluated inside the Top-N derived table, so Postgres
+     * computes it over the full filtered set and repeats it on every paged row.
+     *
+     * <p>This replaces the separate Spring Data {@code countQuery}, which re-ran the
+     * whole correlated group {@code EXISTS} a second time on every free-text salon
+     * search (perf audit 2026-07-29). {@code SearchService} reads it from the first
+     * row and assembles the {@code Page} itself, exactly as the master path and the
+     * per-service-filtered salon path already do.</p>
+     *
+     * <p>Never {@code null} on a returned row; an empty result yields no row at all,
+     * which the caller maps to a zero-total empty page.</p>
+     */
+    Long getTotalCount();
 }

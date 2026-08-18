@@ -15,6 +15,7 @@ import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
@@ -172,19 +173,122 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     // ── Phase 26.5 — GET /bookings/me/booked-days (day-rail dot set) ──────────
     //
-    // The rail's dot set must be the caller's FULL booking history for the range — no
-    // status filter (see the design's `_bookingDays` getter, computed from the unfiltered
-    // `widget.bookings`, not the filtered `_visible` view) — so, unlike
-    // findActiveIdsByMasterIdAndStartsAtBetween above, these three queries deliberately
-    // carry no `status IN (...)` predicate.
+    // THE RAIL MUST AGREE WITH THE LIST IT NAVIGATES TO. A dot exists to say "tap here and
+    // you will find bookings"; a dot on a day the destination list renders empty is a
+    // user-visible lie. So a query below carries a status predicate only where a locked decision
+    // pinned its own screen's DEFAULT visibility rule — today that is the master rail alone; the
+    // other two are deliberately unfiltered (see below). Where a status is unknown to one side,
+    // the rail and the list must still make the SAME choice about it — see the allow-list
+    // paragraph below, which is how that agreement is preserved.
+    //
+    // findBookedDatesByMasterId (master's own «Мої записи» rail) — EXCLUDES CANCELLED and
+    // DECLINED (locked product decision, user, 2026-08-13). That screen hides both by
+    // default: they are one unit to the user, because the who-cancelled distinction was
+    // collapsed on 2026-07-15 and both now render the identical «Скасовано» badge. A day
+    // whose ONLY bookings are cancelled/declined must therefore NOT be dotted — tapping it
+    // would open an empty day. NOT_COMPLETED (no-show) is deliberately NOT excluded: it
+    // stays visible in that list as the master's own record of a client who did not turn
+    // up, and it feeds the two-sided client rating. COMPLETED and CONFIRMED obviously stay.
+    //
+    // The predicate is written as an ALLOW-list (`IN ('CONFIRMED','COMPLETED','NOT_COMPLETED')`),
+    // NOT as the deny-list `NOT IN ('CANCELLED','DECLINED')` that expresses the same product rule
+    // more directly. The two are LOGICALLY IDENTICAL and cannot diverge: chk_booking_status pins
+    // the domain to exactly five values — V113__remove_pending_booking_status.sql:14 backfilled
+    // every PENDING row to CONFIRMED, :33-37 rebuilt the constraint as ('CONFIRMED','DECLINED',
+    // 'COMPLETED','NOT_COMPLETED','CANCELLED'), and V115:25 ran VALIDATE CONSTRAINT on it, so the
+    // allow-list is the exact set complement of the deny-list at the DB level. ('PENDING' is
+    // retired for good; no PENDING row can exist or be inserted — do not re-derive this.)
+    //
+    // WHY THE ALLOW-LIST FORM IS LOAD-BEARING (backend-perf HIGH, 2026-08-13). The IN form is
+    // byte-for-byte the WHERE clause of the partial index
+    // idx_bookings_master_past_partition_starts_at (V130__bookings_partition_past_master_index.sql
+    // :67-69). Postgres's predicate_implied_by is a SYNTACTIC matcher: it proves the IN form
+    // implies that index predicate trivially, and cannot prove it of the NOT IN form at all.
+    // Measured on local Postgres, 100,053 bookings, post-VACUUM ANALYZE, over the real client
+    // window (mobile sends today ± 180 days, booked_days_notifier.dart:86 — a 361-day span):
+    //   NOT IN => Bitmap Heap Scan on idx_bookings_master_starts_at, 3,038 rows dropped by a
+    //             post-fetch Filter, 269 shared buffers;
+    //   IN     => Index Only Scan using idx_bookings_master_past_partition_starts_at,
+    //             Heap Fetches: 0, 40 shared buffers.
+    // 6.7x the buffer traffic. And the Seq Scan that V130 was written to eliminate is REACHABLE on
+    // the NOT IN form — an earlier revision of this comment claimed it "was not reproduced here",
+    // which was a single-window artifact and is RETRACTED. Plan sweep (backend-perf, 2026-08-13,
+    // 50,000-booking master inside the same 100,053-booking dataset, post-VACUUM ANALYZE):
+    //   366d cap, recent      NOT IN: SEQ SCAN, 90,525 rows dropped by Filter, 2,179 buffers,
+    //                                 11.7 ms  |  IN: Index Only Scan, 79 buffers, 4.5 ms
+    //   366d cap, 2026-fwd    NOT IN: SEQ SCAN, 2,179 buffers, 13.5 ms
+    //                                 |  IN: Index Only Scan, 52 buffers, 2.4 ms
+    //   366d cap, 2024        NOT IN: Bitmap Heap Scan, 6,588 rows dropped by Filter, 577 buffers,
+    //                                 4.9 ms   |  IN: Index Only Scan, 81 buffers
+    //   real client window    NOT IN: Bitmap Heap Scan, 271 buffers, 2.5 ms
+    //   (361d, today ± 180)           |  IN: Index Only Scan, 43 buffers, 1.9 ms
+    // Every window returns the IDENTICAL 354-row result (symmetric-difference check = 0): this is
+    // purely a plan difference, never a semantic one. Not every window degrades — the 2024 row is a
+    // span sitting wholly inside that master's dense history, so the range predicate estimates low
+    // and a bitmap path still wins for both forms. The Seq Scan appears when a 366-day window
+    // reaches the master's SPARSE FORWARD TAIL (start >= ~2026-01-01): the planner over-estimates
+    // there (17,243 rows estimated vs 5,745 actual) and seq cost 4263.27 undercuts the bitmap
+    // alternative. That is a shape production traffic grows into, not a synthetic one.
+    //
+    // AND THE REAL CLIENT WINDOW SITS 2.2% FROM THAT CLIFF. On today ± 180 days the planner chooses
+    // Bitmap Heap at cost=1456.19..4155.68 over a forced Seq Scan at cost=0.00..4245.59 — a 2.2%
+    // margin that a single ANALYZE re-sample can flip. So the allow-list is LOAD-BEARING, not
+    // cosmetic or stylistic: it takes the choice away from the planner by giving the status
+    // predicate an index it can syntactically match. Do NOT rewrite this back to the more readable
+    // NOT IN form believing the regression is hypothetical — it has been measured at 30x buffers
+    // and 3.5x latency, and the window production actually sends is marginal. The NOT IN plan is
+    // the one free to degrade that way precisely because it has no matchable index for the status
+    // predicate at all and is left to the planner's row estimates (Anti-Bug §E).
+    //
+    // V130's own header (:30-37)
+    // already establishes this precedent on the sibling query: BookingSpecifications#partition
+    // carries a logically redundant statusIn(...) conjunct existing purely to make this same index
+    // matchable. This is the second instance of the same rule, not a new one.
+    //
+    // A SIXTH STATUS IS NOT A SILENT EVENT. Adding one requires a migration that rewrites
+    // chk_booking_status (that is the only way a new value can ever be stored), and that migration
+    // is the review checkpoint — grep for the constraint and this query is found. So the allow-list
+    // does not hide a future status behind an invisible default; it makes the reviewer name it.
+    //
+    // AND THE ALLOW-LIST IS THE SHAPE THAT KEEPS RAIL AND LIST AGREEING. Mobile's day list calls
+    // GET /bookings/me with an explicit status ALLOW-list on the wire
+    // (BookingStatus.visibleInDayListByDefault — `filterable` minus {CANCELLED, DECLINED}), because
+    // that endpoint has no "exclude" parameter. Matching that shape here means an unknown sixth
+    // status is treated the SAME way by both sides — neither dots it nor lists it — instead of the
+    // deny-list's split verdict (rail dots the day, list returns nothing, so the master taps into
+    // an empty day). Agreement is the invariant this whole block exists to protect; the allow-list
+    // preserves it, the deny-list breaks it in the cosmetic direction. (Mobile still renders any
+    // row it does decode: an unrecognised wire status becomes BookingStatus.unknown, never a
+    // dropped row — so a genuinely reachable booking is never invisible in the list itself.)
+    //
+    // findBookedDatesBySalonIds / findBookedDatesByClientId deliberately carry NO status
+    // predicate — unchanged. The 2026-08-13 decision was scoped to the MASTER's rail only;
+    // the owner and client screens have not had their list filters changed, so adding one
+    // here would break the very agreement this block exists to preserve. Revisit only
+    // together with those screens' own default filters.
+    //
+    // (Contrast findActiveIdsByMasterIdAndStartsAtBetween above, whose CONFIRMED/COMPLETED
+    // allow-list serves a different question — "which bookings are live" — not "which days
+    // does the list have rows for".)
     //
     // Native + SELECT DISTINCT on a timezone-converted date expression: JPQL has no
-    // AT TIME ZONE function, and grouping must happen in Postgres (≤ ~361 rows back), not
-    // by loading every booking row into heap and reducing in Java. The half-open
+    // AT TIME ZONE function, and grouping must happen in Postgres, not by loading every booking row
+    // into heap and reducing in Java. Note the two cardinalities are very different and only the
+    // first is bounded by the date span: at most 367 rows are RETURNED (the range is inclusive of
+    // both bounds and ScheduleDateMath#assertSpanWithinMax caps the span at 366), but the number of
+    // rows SCANNED to produce them is the master's whole booking volume inside that window and is
+    // unbounded by anything here — measured at 4,558 index entries for a 10,000-booking master on
+    // the real 361-day client window. That is exactly why the index match below is load-bearing:
+    // the DISTINCT is cheap, the scan feeding it is not. The half-open
     // [:from, :toExclusive) bound on starts_at mirrors BookingService's LocalDate ->
     // OffsetDateTime conversion (from.atStartOfDay(TimeZones.KYIV), to.plusDays(1)
     // .atStartOfDay(TimeZones.KYIV)) exactly, so a dot here and a day-filtered result on
-    // GET /bookings/me always agree.
+    // GET /bookings/me agree on the RANGE. (They agree on the ROW SET too, provided the
+    // caller asks GET /bookings/me for the same statuses its screen shows — for the master
+    // rail that means passing status=CONFIRMED,COMPLETED,NOT_COMPLETED, now literally the same
+    // allow-list this query names, so the two sides are textually comparable rather than
+    // complementary — see the allow-list paragraph above. GET /bookings/me's
+    // "no status param => no filter" contract is unchanged.)
     //
     // The 'Europe/Kyiv' literal below cannot be replaced with a bound parameter reliably
     // (AT TIME ZONE's right-hand operand is polymorphic; Postgres can fail to infer a bound
@@ -210,6 +314,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.master_id = :masterId
               AND b.starts_at >= :from
               AND b.starts_at < :toExclusive
+              AND b.status IN ('CONFIRMED', 'COMPLETED', 'NOT_COMPLETED')
             ORDER BY d
             """, nativeQuery = true)
     List<Date> findBookedDatesByMasterId(
@@ -248,7 +353,38 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Always called with the result of an ID-only page query, so the IN list size
      * equals the configured page size (default 20) — never unbounded.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — as with {@link #findByIdWithFullGraph}.
+     * <p><b>Phase 242 — the fetched salon is {@code b.salon}, NOT {@code m.salon}.</b> The address
+     * block {@code BookingDetailResponse#from} renders is the BOOKING's snapshot (see that class's
+     * javadoc), and it reads real properties ({@code getName()}, {@code getStreet()},
+     * {@code getLocationNote()}) which INITIALISE the proxy — unlike {@code salonId}'s
+     * identifier-only read, which was free. Leaving the fetch on {@code m.salon} would therefore
+     * cost one extra SELECT per distinct booked salon per page, exactly the N+1 this query exists
+     * to prevent. Consequence to keep in mind: {@code master.getSalon()} is no longer fetch-joined
+     * here.
+     *
+     * <p><b>Why that consequence is free on this path — and what would make it not free.</b> Be
+     * precise about which dereferences are actually cheap, because the two look alike:
+     * {@code getSalon().getId()} is an identifier read Hibernate serves off an UNINITIALISED
+     * proxy without a statement, but {@code getSalon().getOwner()} — {@code AuthorizationService}'s
+     * ownership walk — is a PROPERTY read that INITIALISES the {@code Salon} proxy (only the
+     * trailing {@code .getId()} on the resulting {@code User} proxy is free). The reason it still
+     * costs nothing here is NOT proxy-avoidance, it is FK coincidence: in the ordinary (un-rotated)
+     * shape {@code bookings.salon_id == masters.salon_id}, so {@code master.getSalon()} resolves to
+     * the {@code Salon} this query already materialised from {@code b.salon} in the persistence
+     * context and there is no proxy left to initialise. When the two FKs DIVERGE — the master has
+     * rotated salons since the booking, or gone independent — that walk issues a real
+     * {@code SELECT ... FROM salons}, measured at 3 &rarr; 4 statements on the detail read
+     * ({@code BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ROTATED}). The conclusion (free
+     * on the aligned shape, which is what this list path serves) is unchanged; the stated reason
+     * is. Since the phase-242 audit's finding 1, {@code AuthorizationService#enforceCanViewBooking}
+     * no longer runs that walk at all for the owning CLIENT; since its finding 2, neither does
+     * {@code BookingService#computeProviderCanReviewClient}, which used to re-enter the identical
+     * walk on {@code GET /bookings/&#123;id&#125;} a few statements later and cancelled out the
+     * first fix on that surface. The walk survives for the salon OWNER, who genuinely needs the
+     * row to authorize.
+     *
+     * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — as with
+     * {@link #findByIdWithFullGraph}.
      * {@code Salon.owner} is {@code LAZY}, so the fetch join was never an EAGER mitigation, and
      * none of this method's three callers dereferences it: {@code BookingDetailResponse#from}
      * (via {@code BookingService#listProviderBookings}) reads only the salon's name / street /
@@ -259,25 +395,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * included — hydrated per distinct salon on every provider booking-list and master-calendar
      * page. {@link #findByIdWithFullGraph} does not fetch {@code s.owner} either, for the same
      * reason: the {@code AuthorizationService} ownership checks its callers feed read
-     * {@code master.getSalon().getOwner().getId()}, and an identifier is served off the
-     * uninitialised proxy without a statement — so the fetch bought nothing there and was removed
-     * alongside this one.
+     * {@code master.getSalon().getOwner().getId()}, whose FINAL hop — the {@code User} identifier —
+     * is served off the uninitialised {@code User} proxy without a statement, so the fetch bought
+     * nothing there and was removed alongside this one. (The EARLIER hop, {@code getOwner()}
+     * itself, does initialise the {@code Salon}; fetching {@code s.owner} would not have avoided
+     * that, it would only have added the {@code users} row on top.)
      *
      * <p>The "no caller dereferences it" half of that claim is now enforced, not merely asserted:
      * {@code BookingPriceRangeContractIT#should_notScaleStatementCount_when_salonMasterPageHasManyBookings}
      * pins the statement count of a provider page whose rows carry a REAL salon — the only fixture
      * shape in which a {@code Salon.owner} proxy exists at all — so a regression that starts walking
      * it shows up as 6 -&gt; 7 there. Note the gate detects a dereference of a non-identifier
-     * property; {@code getOwner().getId()} is served off the uninitialised proxy and costs nothing,
-     * which is why {@code AuthorizationService}'s id-only checks would not have needed this fetch
-     * even if they did run here.
+     * property on the {@code Salon}; the {@code User} identifier at the end of
+     * {@code getOwner().getId()} is served off the uninitialised {@code User} proxy and costs
+     * nothing, which is why {@code AuthorizationService}'s checks would not have needed
+     * {@code s.owner} fetched even if they did run here.
      */
     @Query("""
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id IN :ids
@@ -293,15 +432,33 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * the same {@code JOIN m.user mu} already used for {@code mu.firstName}/{@code mu.lastName}
      * — no additional join, and the column is nullable (a master may never have set a title).
      *
+     * <p>Phase B1's {@code m.avgRating}/{@code m.reviewCount} likewise ride the {@code JOIN
+     * b.master m} alias this query has always carried (it already selects {@code m.id}) — two more
+     * scalars on the same {@code masters} row, so no additional join and no aggregate subquery.
+     * They are selected RAW; the zero-review-to-null rule is applied once, in Java, by {@code
+     * BookingDetailResponse#masterAvgRatingOrNull}, shared with the entity mapper path so the two
+     * cannot drift.
+     *
+     * <p><b>Phase 242 — {@code s} is {@code LEFT JOIN b.salon}, the BOOKING's own snapshot, not
+     * {@code LEFT JOIN m.salon}.</b> That is a one-line RE-POINT of an alias this query has always
+     * carried, not an added join: {@code s} is referenced ONLY by {@code s.name} and the five
+     * {@code CASE WHEN} columns below, all of which are display fields describing the premises the
+     * client is travelling to. Keying them off the master's LIVE affiliation served a rotated
+     * master's NEW salon's {@code locationNote} — a door code for premises the client never booked
+     * at — on every OLD booking. {@code b.salon.id} (Phase B2) now resolves through the very same
+     * alias, so {@code salonId} and {@code salonName} can no longer disagree.
+     *
      * <p>{@code locationNote}, {@code street}, {@code buildingNo}, {@code cityId} and
      * {@code districtId} are resolved by {@code CASE WHEN s.id IS NOT NULL THEN s.X ELSE mu.X END}
      * — salon-presence wins outright, even when the salon's own column is {@code NULL}. This
      * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from} exactly: {@code salon
-     * != null ? salon.getX() : masterUser.getX()}. <b>Do not use {@code COALESCE(s.X, mu.X)}
+     * != null ? salon.getX() : masterUser.getX()}, with {@code salon = booking.getSalon()} on both
+     * sides. <b>Do not use {@code COALESCE(s.X, mu.X)}
      * here</b> — {@code COALESCE} falls through to the master's own value whenever the salon's
-     * column is {@code NULL}, which for a salon-employed master leaks the master's personal
-     * data (e.g. their home door code) onto a salon booking. Riding the same
-     * {@code LEFT JOIN m.salon s} / {@code JOIN m.user mu} aliases — no additional join.
+     * column is {@code NULL}, which for a salon booking leaks the master's personal
+     * data (e.g. their home door code). Phase 242 changed WHICH salon the predicate keys off and
+     * nothing about the predicate itself. Riding the {@code LEFT JOIN b.salon s} /
+     * {@code JOIN m.user mu} aliases — no additional join (still 7).
      *
      * <p><b>Phase 26.7.1 — the sentinel is gone; this is now a pure {@code IN :ids} hydrate.</b>
      * Prior to this phase the {@code WHERE} clause carried {@code b.client.id = :clientId} plus
@@ -384,13 +541,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 CASE WHEN s.id IS NOT NULL THEN s.locationNote ELSE mu.locationNote END,
                 sd.category,
                 CASE WHEN r.id IS NOT NULL THEN true ELSE false END,
-                b.priceMaxAtBooking
+                b.priceMaxAtBooking,
+                b.appointment.id,
+                b.client.avatarUrl,
+                m.avgRating,
+                m.reviewCount,
+                b.salon.id
             )
             FROM Booking b
             JOIN b.client
             JOIN b.master m
             JOIN m.user mu
-            LEFT JOIN m.salon s
+            LEFT JOIN b.salon s
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
             LEFT JOIN Review r ON r.booking = b
@@ -403,14 +565,22 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     /**
      * <b>Guest (LINK) bookings ({@code client_id IS NULL}, V89) must resolve here too</b> —
      * {@code client} is a {@code LEFT JOIN FETCH}, not an inner join. An inner join here
-     * silently excludes every null-client row, which made {@code loadBookingOrThrow} (backing
+     * silently excludes every null-client row, which made the provider transition paths (backing
      * {@code /complete}, {@code /decline}, {@code /not-complete}) and {@code getBooking}
      * ({@code GET /bookings/{id}}) 404 for ANY guest booking — the entire provider-side guest
      * lifecycle was unreachable (CRITICAL finding, track 24.7 audit). See
      * {@link #findAllByIdsWithGraph} for the sibling batch-hydrate query with the same fix.
      *
-     * <p><b>Deliberately does NOT fetch {@code s.owner}</b> — the third and last removal of this
-     * dead fetch, after {@link #findAllByIdsWithGraph} and
+     * <p><b>Phase 242 — {@code LEFT JOIN FETCH b.salon}, not {@code m.salon}</b>, for the reason
+     * spelled out on {@link #findAllByIdsWithGraph}: {@code BookingDetailResponse#from} now reads
+     * real properties off the BOOKING's salon snapshot, so that is the association this graph must
+     * materialise. {@code AuthorizationService#isAuthorizedToManageBooking} /
+     * {@code #hasProviderAuthorityOverBooking} still walk {@code master.getSalon()}, but only to
+     * an identifier ({@code getOwner().getId()}), and for an un-rotated master the FK matches the
+     * fetched {@code b.salon} row so the persistence context answers without a statement.
+     *
+     * <p><b>Deliberately does NOT fetch the salon's {@code owner}</b> — the third and last removal
+     * of this dead fetch, after {@link #findAllByIdsWithGraph} and
      * {@code findActiveByClientIdAndIdempotencyKey}. It was dead for two independent reasons:
      * <ol>
      *   <li>Every {@code getOwner()} in {@code src/main/java} is either a null check or
@@ -422,8 +592,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *       {@code getOwner() != null} guards never initialise it and never evaluate false.</li>
      * </ol>
      * The fetch therefore cost an extra join into {@code users} plus a full {@code User} row
-     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking,
-     * loadBookingOrThrow and the cancel/reschedule paths) and {@code ReviewService#createReview} —
+     * ({@code password_hash} included) on all six callers — {@code BookingService} (getBooking and
+     * the decline/complete/cancel/reschedule paths) and {@code ReviewService#createReview} —
      * and bought nothing. Pinned by
      * {@code BookingPriceRangeContractIT#should_notHydrateTheSalonOwner_when_loadingABookingDetail}:
      * a statement count cannot detect a re-added fetch join (a fetch join widens an existing join
@@ -436,12 +606,101 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
             JOIN FETCH m.user
-            LEFT JOIN FETCH m.salon s
+            LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.id = :id
             """)
     Optional<Booking> findByIdWithFullGraph(@Param("id") UUID id);
+
+    /**
+     * All chained booking rows of ONE multi-service visit (BE-3), ordered by {@code startsAt}
+     * ascending. That ordering is retained unconditionally, but "back-to-back" is NOT: once any
+     * item has been rescheduled individually (phase 30.1's relaxed contiguity —
+     * {@code AppointmentTransitionService#rescheduleAppointmentItem}), consecutive rows may be
+     * separated by a legal gap. Callers must not assume adjacency from this ordering alone.
+     *
+     * <p>Naturally bounded — a visit holds at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT}
+     * (10) rows — so no {@code Pageable} is needed (§E-3). Rides the partial index
+     * {@code idx_bookings_appointment} (V125, {@code WHERE appointment_id IS NOT NULL}). Hydrates the
+     * SAME graph as {@link #findByIdWithFullGraph} ({@code master.user}, <b>{@code booking.salon}</b>,
+     * {@code masterService.serviceDefinition}) so {@code AppointmentDetailResponse.from} reads the
+     * master summary + per-item service name with no lazy load or N+1. Phase 242 re-pointed the
+     * salon fetch from {@code m.salon} to {@code b.salon}: the visit's address block is resolved
+     * from the ITEM's own salon snapshot ({@code AppointmentDetailResponse#from} reads
+     * {@code first.getSalon()}), which is real-property access and would otherwise lazy-load.
+     * {@code b.client} is deliberately
+     * NOT fetched — the appointment header carries the client, and the item projection does not read
+     * it.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id = :appointmentId
+            ORDER BY b.startsAt ASC
+            """)
+    List<Booking> findByAppointmentIdWithGraph(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * The chained booking rows of SEVERAL visits at once — the notification-drain counterpart of
+     * {@link #findByAppointmentIdWithGraph}, which resolves ONE visit.
+     *
+     * <p><b>Why a batch variant rather than a loop over the single-id query.</b>
+     * {@code NotificationOutboxDrainWorker} claims up to {@code BATCH_SIZE} (50) outbox rows per
+     * drain, and a single created visit contributes TWO visit-aware rows ({@code NEW_BOOKING} +
+     * {@code STATUS_CHANGED}, both keyed to the same lead booking), so resolving per entry issued
+     * the same visit query twice per visit and up to 50 times per batch. Worse, those queries ran
+     * DURING phase 2, which is contractually connection-free (see the drain worker's class javadoc)
+     * — each one checked a Hikari connection back out in between ~25 s SMTP calls. This method
+     * hydrates every visit in the batch in ONE statement, inside the phase-2 pre-load block that
+     * already bulk-loads the lead bookings, so phase 2 takes no connection after dispatch begins.
+     *
+     * <p><b>{@code JOIN FETCH b.appointment} is load-bearing, not decoration.</b> The header's
+     * status is what distinguishes a WHOLE-visit transition from a PER-ITEM one (
+     * {@code AppointmentTransitionService#declineAppointment} vs {@code #declineAppointmentItem}),
+     * which the item rows alone cannot express. The drain runs with {@code open-in-view: false} and
+     * no transaction, so an unfetched {@code Appointment} would be an uninitialised proxy on a
+     * detached row and reading {@code getStatus()} would throw {@code LazyInitializationException}
+     * — this fetch is the only reason it is safe.
+     *
+     * <p><b>The graph is scoped to exactly what a SIBLING row is read for, and no wider.</b> These
+     * rows feed {@code BookingVisitResolver} → {@code BookingVisit} only, whose consumers touch
+     * {@code masterService.serviceDefinition.name}, booking scalars, {@code appointment.getStatus()}
+     * and the {@code master}/{@code client} IDENTIFIERS used by the resolver's tenancy filter.
+     * Identifiers resolve off the uninitialised LAZY proxy without a statement (pinned by
+     * {@code MultiServiceNotificationIT#should_takeNoFurtherStatement_when_theResolverReadsSiblingPartyIdsOffDetachedProxies}),
+     * so {@code b.master}, {@code m.user} and {@code b.salon} are deliberately NOT fetched: they
+     * bought nothing and cost three extra joins plus a full {@code users} row — {@code password_hash}
+     * and client PII included — per sibling, resident in the phase-2 working set for the whole
+     * dispatch loop. Same defect class as the one {@link #findAllByIdsWithGraph} documents. Do NOT
+     * re-add a fetch here without a consumer that dereferences a NON-identifier property.
+     *
+     * <p>Bounded by construction: at most {@code BATCH_SIZE} distinct appointment ids, each holding
+     * at most {@code SlotCalculationService.MAX_SERVICES_PER_VISIT} (10) rows, so no
+     * {@code Pageable} is needed (§E-3). Rides the partial index {@code idx_bookings_appointment}
+     * (V125, {@code WHERE appointment_id IS NOT NULL}).
+     *
+     * <p>The {@code ORDER BY} carries the {@code appointment.id} leg ONLY, to keep the
+     * {@code groupingBy} bucket contents deterministic across runs. The former trailing
+     * {@code b.startsAt} leg was dead weight: {@code BookingVisit#of} re-sorts every bucket into
+     * {@code startsAt, id} order regardless (item order must survive a later per-item reschedule, so
+     * that sort cannot be delegated to SQL), and nothing between the two reads positionally except
+     * {@code items.get(0).getAppointment()}, whose header status is identical for every row of a
+     * bucket.
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            JOIN FETCH b.appointment a
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.appointment.id IN :appointmentIds
+            ORDER BY b.appointment.id ASC
+            """)
+    List<Booking> findByAppointmentIdsWithGraph(@Param("appointmentIds") List<UUID> appointmentIds);
 
     // ── Calendar / overlap queries (kept as native SQL) ────────────────────────
 
@@ -490,36 +749,28 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("clientId") UUID clientId,
             @Param("idempotencyKey") String idempotencyKey);
 
-    @Query(value = """
-            SELECT * FROM bookings
-            WHERE master_id = :masterId
-              AND status = 'CONFIRMED'
-              AND starts_at < :windowEnd
-              AND ends_at   > :windowStart
-            """, nativeQuery = true)
-    // Callers must pass a narrow [windowStart, windowEnd) spanning only the target day.
-    // A wide window causes full table scans and inflates the returned list unnecessarily.
-    List<Booking> findOverlappingByMaster(
-            @Param("masterId") UUID masterId,
-            @Param("windowStart") OffsetDateTime windowStart,
-            @Param("windowEnd") OffsetDateTime windowEnd
-    );
-
     /**
      * The occupied {@code [startsAt, endsAt)} intervals of a master's CONFIRMED bookings
-     * overlapping {@code [windowStart, windowEnd)}, ordered by start. Backs the whole availability
-     * computation — the calendar day projection ({@code SlotCalculationService#getBookableWorkingDays}),
-     * the free-slot bookability gate ({@code hasBookableFutureSlot}) and the batched catalogue filter
-     * ({@code filterBookableAssignments}): the whole window is loaded ONCE per master and sliced per-day
-     * in memory, instead of one {@link #findOverlappingByMaster} query per day.
+     * overlapping {@code [windowStart, windowEnd)}, ordered by start. <b>THE single booking read behind the
+     * whole availability computation</b> — the per-day slot list ({@code SlotCalculationService
+     * #getAvailableSlots}, one target day), the calendar day projection ({@code
+     * SlotCalculationService#getBookableWorkingDays}), the free-slot bookability gate ({@code
+     * hasBookableFutureSlot}) and the batched catalogue filter ({@code filterBookableAssignments}); the
+     * three range consumers load their whole window ONCE per master and slice it per-day in memory
+     * ({@code SlotCalculationService#loadOccupiedByDay}) rather than issuing one query per day.
      *
-     * <p><b>Projection, not entities (Perf MEDIUM-1).</b> Returns {@link BookingTimeRange} — the only two
-     * columns any consumer reads. The previous {@code SELECT *} native variant hydrated full managed
-     * {@code Booking} entities (20+ columns incl. guest PII and the cancel token) purely to call two
-     * getters. The overlap predicate ({@code starts_at < windowEnd AND ends_at > windowStart}) is
-     * unchanged from {@link #findOverlappingByMaster} — so a booking whose tail spills past a day
-     * boundary is still returned, and the query still rides {@code idx_bookings_master_slot_overlap}.
-     * Bounded by the service layer's ≤180-day booking horizon (Anti-Bug §E-3 — not an unbounded scan).
+     * <p><b>Projection, not entities (Perf MEDIUM-1; extended to the day path 2026-08-11).</b> Returns
+     * {@link BookingTimeRange} — the only two columns any consumer reads. This replaced a {@code SELECT *}
+     * native sibling ({@code findOverlappingByMaster}) that hydrated full managed {@code Booking} entities
+     * (20+ columns incl. guest PII and the cancel token) purely to call two getters; that sibling was
+     * deleted once the day path moved here, so no non-projection variant survives for a caller to reach
+     * for by accident (Anti-Bug §E-1). The overlap predicate ({@code starts_at < windowEnd AND ends_at >
+     * windowStart}) is byte-identical to the one it replaced — a booking whose tail spills past a day
+     * boundary is still returned — and the query still rides {@code idx_bookings_master_slot_overlap}
+     * ({@code (master_id, starts_at, ends_at) WHERE status = 'CONFIRMED'}, V113:61-64).
+     *
+     * <p>Callers must pass a narrow window: a single target day for the slot list, or the ≤180-day booking
+     * horizon for the range consumers (Anti-Bug §E-3 — not an unbounded scan).
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingTimeRange(b.startsAt, b.endsAt)
@@ -577,6 +828,35 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("excludeBookingId") UUID excludeBookingId
     );
 
+    /**
+     * Overlap check that excludes an ENTIRE visit's own chained rows — the appointment-level
+     * (BE-4 reschedule) analogue of {@link #existsOverlapExcluding}. A multi-service visit
+     * occupies N {@code bookings} rows (all sharing {@code appointment_id}), so a single
+     * {@code id <> :excludeBookingId} exclusion is not enough when re-planning the WHOLE block:
+     * the new span can legitimately overlap several of the visit's OWN current rows.
+     * {@code appointment_id IS DISTINCT FROM :appointmentId} is null-safe (legacy single-service
+     * bookings carry a {@code NULL appointment_id} and are never excluded by this predicate).
+     * Same predicate otherwise as {@link #existsOverlap} (CONFIRMED rows only, half-open interval
+     * overlap). Callers must hold the per-master advisory lock (see {@link #acquireAdvisoryLock(UUID)})
+     * before invoking, identical to the single-booking reschedule flow.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+              SELECT 1 FROM bookings
+               WHERE master_id = :masterId
+                 AND appointment_id IS DISTINCT FROM :appointmentId
+                 AND status = 'CONFIRMED'
+                 AND starts_at < :requestedEndsAt
+                 AND ends_at   > :requestedStartsAt
+            )
+            """, nativeQuery = true)
+    boolean existsOverlapExcludingAppointment(
+            @Param("masterId") UUID masterId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("appointmentId") UUID appointmentId
+    );
+
     // ── Client-scoped conflict check (cross-master/salon double-booking) ─────────
     /**
      * Id of the client's earliest {@code CONFIRMED} booking — with ANY
@@ -630,6 +910,29 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     );
 
     /**
+     * Same as {@link #findFirstConflictingClientBookingIdExcluding} but excludes an ENTIRE visit's
+     * own chained rows via {@code appointment_id} — the appointment-level (BE-4 reschedule)
+     * analogue, used when re-planning a whole multi-service visit rather than one booking. Null-safe
+     * the same way {@link #existsOverlapExcludingAppointment} is.
+     */
+    @Query(value = """
+            SELECT id FROM bookings
+             WHERE client_id = :clientId
+               AND appointment_id IS DISTINCT FROM :appointmentId
+               AND status = 'CONFIRMED'
+               AND starts_at < :requestedEndsAt
+               AND ends_at   > :requestedStartsAt
+             ORDER BY starts_at ASC
+             LIMIT 1
+            """, nativeQuery = true)
+    Optional<UUID> findFirstConflictingClientBookingIdExcludingAppointment(
+            @Param("clientId") UUID clientId,
+            @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
+            @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
+            @Param("appointmentId") UUID appointmentId
+    );
+
+    /**
      * Fused, single-round-trip form of the per-client advisory lock: sets this transaction's
      * {@code lock_timeout} to 3s via {@code set_config('lock_timeout', '3s', true)} — the
      * {@code is_local=true} third argument makes this functionally identical to
@@ -639,9 +942,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * round trip removes a network hop from every booking write (perf finding; measurable on
      * Neon's serverless proxy, which is a real network hop per statement, not a local call).
      *
-     * <p>Postgres evaluates a SELECT target list left-to-right per row, so
-     * {@code set_config(...)} is guaranteed to run before {@code pg_advisory_xact_lock(...)} on
-     * the same row — the 3s ceiling is already in force for THIS lock acquisition. Because the
+     * <p>Postgres does NOT formally guarantee subexpression evaluation order (docs §4.2.14 leaves
+     * it undefined), but the executor's {@code ExecProject} evaluates target-list entries in
+     * order, so in every current implementation {@code set_config(...)} runs before
+     * {@code pg_advisory_xact_lock(...)} on the same row — the 3s ceiling is already in force for
+     * THIS lock acquisition. Were that ever to change, only this one acquisition would wait
+     * unbounded (the pre-fix behaviour); the GUC would still bound the rest. Because the
      * GUC is transaction-scoped (not just statement-scoped), it also remains in force for the
      * rest of the transaction, so it still bounds the subsequent per-master
      * {@link #acquireAdvisoryLock(UUID)} wait in {@code BookingService.doCreateBooking} /
@@ -671,7 +977,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * <p>A session that waits longer than {@code lock_timeout} aborts the lock wait with
      * Postgres {@code 55P03 lock_not_available}. Hibernate/Spring exception translation
      * surfaces this as {@link org.springframework.dao.CannotAcquireLockException} — mapped to
-     * a clean 409 by {@code GlobalExceptionHandler#handleCannotAcquireLock} — instead of
+     * a clean 409 by {@code GlobalExceptionHandler#handlePessimisticLockingFailure} — instead of
      * parking the connection for the full Hikari connection-timeout (20 s) or surfacing a
      * bare 500.
      */
@@ -739,6 +1045,175 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     Optional<BookingCompletionAccess> findCompletionAccessById(@Param("bookingId") UUID bookingId);
 
+    /**
+     * All-rows visit-level (BE-4 reschedule) analogue of {@link #findCompletionAccessById}, backing
+     * BOTH {@code AuthorizationService.canRescheduleAppointment} AND {@code
+     * AuthorizationService.enforceCanManageAppointment} — the pre-lock authorization check for the
+     * whole-visit decline/complete/not-complete transitions AND the per-ITEM {@code
+     * declineAppointmentItem}. A visit is single-master (BE-1 locked design) BY CONSTRUCTION of the
+     * only writers that create chained bookings ({@code VisitPlanner.planChainedItems} resolves
+     * every item off one {@code Master}) — but that invariant has no DB constraint behind it:
+     * nothing in the schema (see {@code V124__create_appointments.sql} / {@code
+     * V125__add_bookings_appointment_id.sql}) enforces that a future writer cannot append a
+     * different-master item. This query therefore fetches EVERY row, deterministically ordered by
+     * {@code b.id}, and every caller must require provider authority over ALL of them, not just the
+     * first — trusting a single arbitrary row (the previous {@code Limit.of(1)} overload, removed)
+     * would silently authorize the whole visit off one item's master, an authorization bypass the
+     * moment a mixed-master visit exists. Cheap regardless: a visit is capped at {@code
+     * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3), so this is at most a 10-row
+     * projection read — no {@code JOIN FETCH}, same shape as the previous capped query. Returns
+     * empty when the appointment does not exist or has no items (fail-closed at the caller).
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingCompletionAccess(
+                bm.user.id,
+                bs.id
+            )
+            FROM Booking b
+            JOIN b.master bm
+            JOIN bm.user
+            LEFT JOIN bm.salon bs
+            WHERE b.appointment.id = :appointmentId
+            ORDER BY b.id
+            """)
+    List<BookingCompletionAccess> findAllCompletionAccessByAppointmentId(
+            @Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Scalar, entity-manager-bypassing projection of the CONFIRMED subset of an appointment's
+     * chained items — the post-lock freshness re-check
+     * {@code AppointmentTransitionService#rescheduleAppointment} runs immediately after acquiring
+     * the header lock (cycle-5 audit finding 1, 2026-08-03) and BEFORE mutating its own target
+     * items, whose entities were necessarily loaded (by {@code resolveVisitForClientReschedule}/
+     * {@code resolveVisitForProviderReschedule}) BEFORE that lock existed to protect the read.
+     *
+     * <p><b>Why a bare {@code b.id} projection, never {@code SELECT b}.</b> The caller's target
+     * items are already managed in the SAME persistence context. An entity-returning query for the
+     * same ids would hand back those SAME cached Java instances from the identity map rather than
+     * fresh column values — Hibernate never overwrites an already-managed entity's fields from a
+     * later query's resultset — mirroring {@link #findAllCompletionAccessByAppointmentId}'s and
+     * {@code AppointmentRepository#findClientIdById}'s identical non-poisoning rationale. A scalar
+     * projection never touches the entity manager, so it cannot be poisoned by (or poison) an
+     * earlier or later load of the same rows.
+     *
+     * <p>{@code Booking} now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so a
+     * plain {@code save()} of a stale, still-{@code CONFIRMED}-in-memory item no longer risks
+     * writing back a concurrently-committed terminal status — Hibernate only includes the columns
+     * this call's own transaction actually dirtied. This check therefore no longer exists to
+     * prevent a silent resurrection; it exists so a stale item is rejected with a clean, retryable
+     * 409 INSTEAD OF proceeding to move an item whose CONFIRMED precondition already lapsed — the
+     * caller compares this result against its own target ids and aborts on any mismatch rather
+     * than silently completing a transition the caller no longer has authority to make (the
+     * concurrent write already resolved this item to a different terminal state).
+     *
+     * @return the ids of {@code appointmentId}'s chained items that are, AS OF THIS CALL,
+     *         genuinely still {@code CONFIRMED} — empty if the appointment has no such items
+     */
+    @Query("""
+            SELECT b.id FROM Booking b
+             WHERE b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    Set<UUID> findConfirmedIdsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Scalar, entity-manager-bypassing CONFIRMED-status probe for exactly ONE booking id — the
+     * per-ITEM counterpart of {@link #findConfirmedIdsByAppointmentId}, used by the three per-item
+     * write paths that mutate a single already-loaded child row after taking the appointment
+     * header lock: {@code AppointmentTransitionService#rescheduleAppointmentItem},
+     * {@code AppointmentTransitionService#declineAppointmentItem}, and
+     * {@code BookingService#cancelBooking(UUID, Booking, CancelBookingRequest)} (F1, HIGH, cycle-6
+     * audit 2026-08-03 — closes the entity-staleness/terminal-state-resurrection defect class
+     * {@code rescheduleAppointment}'s own post-lock recheck already closed for the whole-visit
+     * path).
+     *
+     * <p><b>Why a bare boolean, never {@code SELECT b}.</b> Same non-poisoning rationale as
+     * {@link #findConfirmedIdsByAppointmentId}: each of the three callers' target {@code Booking}
+     * is already managed in the SAME persistence context, loaded (necessarily) BEFORE the header
+     * lock existed to protect that read. An entity-returning query for the same id would hand back
+     * that SAME cached instance from the identity map rather than fresh column values — Hibernate
+     * never overwrites an already-managed entity's fields from a later query's resultset. A scalar
+     * projection never touches the entity manager, so it cannot be poisoned by, or poison, an
+     * earlier or later load of the same row.
+     *
+     * <p>{@code Booking} now carries {@code @DynamicUpdate} (G1, cycle-7 audit 2026-08-03), so a
+     * plain {@code save()}/{@code saveAndFlush()} of a stale, still-{@code CONFIRMED}-in-memory
+     * target only writes the columns THIS transaction actually dirtied — e.g. a per-item cancel
+     * and a per-item reschedule of the SAME leg racing each other (both observing the header stay
+     * CONFIRMED because a sibling remains) can no longer clobber each other's disjoint columns
+     * (status vs. starts_at/ends_at). This check's job is therefore narrower than it used to be:
+     * it no longer prevents column-level corruption, it prevents a caller from completing a
+     * transition whose CONFIRMED precondition already lapsed — e.g. a reschedule silently
+     * "succeeding" (new time persisted) on a leg the other racer already declined, which would be
+     * a confusing state even though no column was corrupted. Each caller compares this result and
+     * aborts with a clean 409 on {@code false} rather than let that stale transition through.
+     *
+     * @return {@code true} iff {@code bookingId} exists and is, AS OF THIS CALL, still CONFIRMED
+     */
+    @Query("""
+            SELECT CASE WHEN COUNT(b) > 0 THEN true ELSE false END
+            FROM Booking b
+            WHERE b.id = :bookingId AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    boolean existsConfirmedById(@Param("bookingId") UUID bookingId);
+
+    // ── Schedule-override conflict check (2026-07-26 design) ──────────────────
+
+    /**
+     * Candidates for the "schedule override over existing bookings" conflict check: every
+     * {@code CONFIRMED} booking of {@code masterId} whose {@code startsAt} falls in
+     * {@code [notBefore, windowEnd)} — ONE query for the caller's WHOLE requested date range
+     * (Anti-Bug §E — never one query per expanded date), joined exactly enough to render an
+     * {@code OverrideConflictResponse} (client/guest name, service name) and to route the eventual
+     * cancellation ({@code appointmentId}, nullable — standalone vs. appointment-child decline).
+     *
+     * <p>{@code notBefore} folds BOTH lower bounds the design's conflict rule needs — "the date
+     * range starts here" and "never a booking that already started/is past on today's date" — into
+     * ONE comparison: the caller passes {@code max(rangeStart, now)}, computed once against the
+     * injected {@code Clock} (never {@code Instant.now()} — Anti-Bug §G).
+     *
+     * <p>{@code b.client} is a {@code LEFT JOIN}, not the implicit inner-join path — a guest
+     * (LINK) booking's {@code client_id} is {@code NULL} (V89), and an inner join here would
+     * silently exclude every guest conflict, the same defect class {@link #findByIdWithFullGraph}'s
+     * javadoc documents at length.
+     *
+     * <p><b>{@code pageable} (backend-perf audit finding 3, 2026-07-26 re-audit).</b> The caller
+     * passes an UNSORTED {@link Pageable} purely to cap the number of rows returned (Spring Data
+     * translates it to a plain SQL {@code LIMIT}/{@code OFFSET} — the query's own
+     * {@code ORDER BY b.startsAt ASC} above is untouched, since the {@code Pageable} carries no
+     * {@code Sort} of its own). Without this, a caller scanning a range up to 366 days wide could
+     * pull every {@code CONFIRMED} booking the master has in that whole span into memory before any
+     * filtering ever ran. See {@code ScheduleOverrideConflictService#MAX_CANDIDATES_SCANNED}'s
+     * javadoc for the caller-side cap value and rationale.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.OverrideConflictCandidate(
+                b.id,
+                b.appointment.id,
+                b.startsAt,
+                b.endsAt,
+                b.client.firstName,
+                b.client.lastName,
+                b.guestName,
+                b.guestSurname,
+                sd.name
+            )
+            FROM Booking b
+            LEFT JOIN b.client
+            JOIN b.masterService ms
+            JOIN ms.serviceDefinition sd
+            WHERE b.master.id = :masterId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt >= :notBefore
+              AND b.startsAt < :windowEnd
+            ORDER BY b.startsAt ASC
+            """)
+    List<OverrideConflictCandidate> findConfirmedCandidatesForOverrideConflictCheck(
+            @Param("masterId") UUID masterId,
+            @Param("notBefore") OffsetDateTime notBefore,
+            @Param("windowEnd") OffsetDateTime windowEnd,
+            Pageable pageable);
+
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.
@@ -758,8 +1233,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * Fused, single-round-trip form of the per-master advisory lock for callers that take
-     * ONLY the master lock (no client lock beforehand) — currently just
-     * {@code GuestBookingService#persistBooking}. Sets this transaction's {@code lock_timeout}
+     * ONLY the master lock (no client lock beforehand). Originally just
+     * {@code GuestBookingService#persistBooking}; now also used by the no-client-lock (guest
+     * visit) branch of {@code BookingService#rescheduleBooking} and
+     * {@code AppointmentTransitionService#rescheduleAppointment} (a guest booking/visit has no
+     * client account to lock or conflict-check against), and by
+     * {@code ScheduleOverrideConflictService#applyOverrideWithConflictHandling} (the
+     * schedule-override write is master-scoped only — it never takes a client lock at all,
+     * regardless of whether the conflicting bookings it may decline are guest or registered-client).
+     * Sets this transaction's {@code lock_timeout}
      * to 3s via {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent
      * to {@code SET LOCAL}) AND acquires the salt-{@code 0} advisory lock in the SAME
      * statement/round-trip — see {@link #acquireClientAdvisoryLockWithTimeout(UUID)} for the
@@ -771,9 +1253,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * unbounded lock wait there is an equally viable advisory-lock DoS vector as the
      * authenticated path — hence the timeout is fused here too, not just on the client lock.
      *
-     * <p>{@code BookingService} does NOT use this method for its own master lock: it always
-     * takes the client lock first via {@link #acquireClientAdvisoryLockWithTimeout(UUID)},
-     * which already sets the transaction-scoped timeout, so its later master lock uses the
+     * <p>Every OTHER caller that takes a client lock first (e.g. {@code BookingService}'s own
+     * registered-client create/reschedule path) does NOT use this method for its master lock: the
+     * client lock already sets the transaction-scoped timeout via
+     * {@link #acquireClientAdvisoryLockWithTimeout(UUID)}, so the later master lock uses the
      * plain {@link #acquireAdvisoryLock(UUID)} — re-applying the timeout there would be a
      * redundant round trip.
      */
@@ -792,16 +1275,23 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * (Anti-Bug §E-3: not unbounded), and aligned with the partial index
      * {@code idx_bookings_reminder} (LINK + reminder_sent = FALSE).
      *
-     * <p>The fetched rows are mutated ({@code reminderSent = true}) and saved by the
-     * job inside its transaction, so the {@code masterService}/{@code serviceDefinition}
-     * graph is joined to render the reminder text without a lazy load.
+     * <p>The fetched rows are mutated ({@code reminderSent = true}) by the job inside its
+     * transaction and flushed by dirty checking (no explicit save — they are managed), so the
+     * {@code masterService}/{@code serviceDefinition} graph is joined to render the reminder text
+     * without a lazy load.
      */
+    // {@code LEFT JOIN FETCH b.appointment} (BE-7): a multi-service guest visit's N item rows share one
+    // appointment_id, so the reminder sweep groups by it to send ONE reminder per visit (not one per
+    // item). The fetch hydrates the header eagerly so BookingReminderJob can read appointment id with no
+    // lazy load / N+1; legacy single guest bookings LEFT-join to a null header and each get their own
+    // reminder, unchanged.
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
             JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
+            LEFT JOIN FETCH b.appointment
             WHERE b.bookingSource = com.beautica.booking.enums.BookingSource.LINK
               AND b.reminderSent = false
               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
@@ -810,6 +1300,47 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findGuestBookingsForReminder(
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to);
+
+    // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
+    /**
+     * Cancels every still-{@code CONFIRMED} child booking of a guest visit in ONE conditional UPDATE:
+     * flips each to {@code CANCELLED}, stamps {@code CLIENT_CANCELLED}, and nulls its per-item cancel
+     * token (V91 permits a NULL token on a terminal LINK row). Called by
+     * {@code GuestVisitCancellationService} right after {@code AppointmentRepository#consumeCancelToken}
+     * wins the header race, so the header and all N items reach {@code CANCELLED} atomically in the same
+     * transaction — freeing every item's slot (the {@code no_overlapping_bookings} EXCLUDE predicate is
+     * {@code status = 'CONFIRMED'} only). Rides the partial index {@code idx_bookings_appointment}.
+     *
+     * @return the number of item rows cancelled
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.status = com.beautica.booking.enums.BookingStatus.CANCELLED,
+                   b.cancellationReason = com.beautica.booking.enums.CancellationReason.CLIENT_CANCELLED,
+                   b.cancelToken = null
+             WHERE b.appointment.id = :appointmentId
+               AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+            """)
+    int cancelItemsByAppointmentId(@Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Marks every item of the given guest visits as reminded (BE-7). Called by
+     * {@code BookingReminderJob} after it sends ONE reminder per visit: this flips ALL of a visit's
+     * item rows — including any tail item whose own {@code starts_at} falls outside the sweep's 2h
+     * reminder window (a visit can span up to 10h) — so no later sweep can re-remind the visit's tail.
+     * Bounded to the visits actually reminded in one sweep.
+     *
+     * @return the number of item rows updated
+     */
+    @Modifying
+    @Query("""
+            UPDATE Booking b
+               SET b.reminderSent = true
+             WHERE b.appointment.id IN :appointmentIds
+               AND b.reminderSent = false
+            """)
+    int markVisitRemindersSentByAppointmentIds(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     // ── Guest-cancel by link (Phase 13.4) ─────────────────────────────────────
     /**
@@ -822,6 +1353,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      *
      * <p>A consumed token is {@code NULL} (set by {@link #consumeCancelToken}), so a
      * replayed link returns empty → 404 (no info leak about token state).
+     *
+     * <p><b>BE-7 (guest visits).</b> The {@code b.appointment IS NULL} guard confines this legacy
+     * single-booking path to true standalone guest bookings. A multi-service visit's child item
+     * carries its own per-item {@code cancel_token} (mandated by the V91 {@code chk_bookings_guest_fields}
+     * CHECK) but MUST only be cancellable as a whole visit via the header token
+     * ({@code GuestVisitCancellationService}). Were a per-item token accepted here it would cancel one
+     * item and desync the {@code Appointment} header + siblings. Excluding {@code appointment_id IS NOT
+     * NULL} makes such a token resolve to empty → the existing 404 path, identical to an unknown token
+     * (no state oracle).
      */
     @Query("""
             SELECT b FROM Booking b
@@ -830,6 +1370,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.cancelToken = :cancelToken
+              AND b.appointment IS NULL
             """)
     Optional<Booking> findByCancelTokenWithGraph(@Param("cancelToken") UUID cancelToken);
 

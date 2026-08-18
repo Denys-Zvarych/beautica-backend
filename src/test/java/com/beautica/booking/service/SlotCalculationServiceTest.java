@@ -248,7 +248,7 @@ class SlotCalculationServiceTest {
         // TEMPLATE day 09:00–17:00, no override → equivalent to the legacy working-hours window
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(
                 eq(date),
@@ -306,7 +306,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(
                 eq(date),
@@ -434,18 +434,16 @@ class SlotCalculationServiceTest {
                 .isActive(true)
                 .build();
 
-        Booking mockBooking = mock(Booking.class);
-        when(mockBooking.getStartsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T09:00:00+03:00"));
-        when(mockBooking.getEndsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
+        BookingTimeRange occupied = new BookingTimeRange(
+                OffsetDateTime.parse("2026-05-09T09:00:00+03:00"),
+                OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
-                .thenReturn(List.of(mockBooking));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
+                .thenReturn(List.of(occupied));
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
 
@@ -484,7 +482,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(any(), any()))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
@@ -521,17 +519,15 @@ class SlotCalculationServiceTest {
                 .build();
 
         // Existing booking occupies 09:00–10:00 Kyiv (06:00–07:00 UTC)
-        Booking existingBooking = mock(Booking.class);
-        when(existingBooking.getStartsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T09:00:00+03:00"));
-        when(existingBooking.getEndsAt())
-                .thenReturn(OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
+        BookingTimeRange existingBooking = new BookingTimeRange(
+                OffsetDateTime.parse("2026-05-09T09:00:00+03:00"),
+                OffsetDateTime.parse("2026-05-09T10:00:00+03:00"));
 
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(OffsetDateTime.class), any(OffsetDateTime.class)))
                 .thenReturn(List.of(existingBooking));
         // Calculator returns empty — simulates the 10:00 slot being blocked because the
         // 90-min candidate window [10:00, 11:30] overlaps the occupied range [09:00, 10:00]
@@ -642,7 +638,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(new TimeRange(slotStart, slotEnd)));
@@ -656,18 +652,30 @@ class SlotCalculationServiceTest {
         assertThat(result.get(0).endsAt()).isEqualTo(slotEnd.atZone(kyiv));
     }
 
+    /**
+     * Pins the exact cache-name SET a booking write sweeps. {@code available-slots} is the one that
+     * closes the staleness hole (a booking of service A had been leaving service B's cached slot list
+     * offering the time A consumed); the other two were already swept. Naming all three here means
+     * dropping any of them from {@code BOOKING_WRITE_CACHES} fails a test rather than silently
+     * re-opening a stale-availability window for the 60-second TTL.
+     *
+     * <p>That the sweep matches on the key's first element (the masterId) and so removes EVERY
+     * service's entry is asserted end-to-end against a real Caffeine cache in
+     * {@code SlotCalculationServiceCacheTest}; this unit test only owns the cache-name set.
+     */
     @Test
-    @DisplayName("evictAvailableSlots — method compiles and does not throw (signature guard)")
-    void should_notThrow_when_evictAvailableSlotsCalledDirectly() {
-        // Compile/signature guard only — no AOP proxy active in this unit test context.
-        // Cache eviction behaviour (@CacheEvict) is verified in SlotCalculationServiceCacheTest.
-        assertThatCode(() -> slotCalculationService.evictAvailableSlots(
-                UUID.randomUUID(), LocalDate.now(clock), UUID.randomUUID()))
-                .doesNotThrowAnyException();
+    @DisplayName("evictMasterAvailabilityCaches — sweeps all three availability caches by master prefix")
+    void should_sweepAllAvailabilityCaches_when_evictMasterAvailabilityCachesCalled() {
+        UUID masterId = UUID.randomUUID();
+
+        slotCalculationService.evictMasterAvailabilityCaches(masterId);
+
+        verify(cacheEvictor).evictByMasterPrefix(
+                masterId, "available-slots", "master-service-bookable", "master-bookable-days");
     }
 
     @Test
-    @DisplayName("should pass Kyiv day-boundary window to findOverlappingByMaster")
+    @DisplayName("should pass Kyiv day-boundary window to findActiveTimeRangesByMasterInRange")
     void should_passDayBoundaryWindow_when_queryingOverlappingBookings() {
         UUID masterId = UUID.randomUUID();
         UUID masterServiceId = UUID.randomUUID();
@@ -691,7 +699,7 @@ class SlotCalculationServiceTest {
                 .thenReturn(Optional.of(msa));
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(any(), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of());
@@ -700,7 +708,7 @@ class SlotCalculationServiceTest {
 
         ArgumentCaptor<OffsetDateTime> startCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
         ArgumentCaptor<OffsetDateTime> endCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
-        verify(bookingRepository).findOverlappingByMaster(eq(masterId), startCaptor.capture(), endCaptor.capture());
+        verify(bookingRepository).findActiveTimeRangesByMasterInRange(eq(masterId), startCaptor.capture(), endCaptor.capture());
 
         // Service must query the full day in Kyiv time: midnight-to-midnight on the target date.
         OffsetDateTime expectedStart = date.atStartOfDay(kyiv).toOffsetDateTime();
@@ -741,7 +749,7 @@ class SlotCalculationServiceTest {
         // TEMPLATE day 09:00–17:00, no override
         when(masterScheduleService.resolveEffectiveDay(masterId, date))
                 .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0)));
-        when(bookingRepository.findOverlappingByMaster(eq(masterId), any(), any()))
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
                 .thenReturn(List.of());
         when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(List.of(new TimeRange(slotStart.toInstant(), slotEnd.toInstant())));
@@ -1230,6 +1238,111 @@ class SlotCalculationServiceTest {
         verify(timeSlotCalculator, never()).hasAvailableSlot(any(), any(), any(), any(), any(), any(), any());
     }
 
+    // ── salon-active gate on the three slot surfaces (2026-08 re-audit LOW) ──────────────
+    //
+    // SalonService.deactivateSalon does not cascade to masters.is_active, so a closed salon's
+    // master still passes Master::isActive and used to keep advertising slots that the (now
+    // hardened) create paths reject. These pin MasterBookability's salon term on each surface —
+    // a dead-CTA fix; the security boundary is the create paths, tested in BookingServiceTest /
+    // AppointmentServiceTest / MasterRepositoryBookingSlugTest.
+
+    @Test
+    @DisplayName("should return no slots when the master's salon was deactivated, even though the "
+            + "master row itself is still active")
+    void should_returnNoSlots_when_masterSalonIsDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, masterServiceId, false);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+
+        List<AvailableSlotResponse> slots =
+                slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        assertThat(slots)
+                .as("a closed salon's master must not advertise bookable slots")
+                .isEmpty();
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should mark every day not-working when the master's salon was deactivated")
+    void should_markAllDaysNotWorking_when_masterSalonIsDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 20);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, masterServiceId, false);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(msa));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+
+        List<MasterWorkingDayResponse> days = slotCalculationService.getBookableWorkingDays(
+                masterId, date, date, masterServiceId);
+
+        assertThat(days).containsExactly(new MasterWorkingDayResponse(date, false));
+        verify(timeSlotCalculator, never()).hasAvailableSlot(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("hasBookableFutureSlot is false when the master's salon was deactivated (catalogue gate)")
+    void should_returnNotBookable_when_masterSalonIsDeactivated() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 20);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, UUID.randomUUID(), false);
+
+        boolean bookable = slotCalculationService.hasBookableFutureSlot(msa, from, from.plusDays(30));
+
+        assertThat(bookable)
+                .as("the catalogue/master-list gate must not surface a closed salon's master")
+                .isFalse();
+        // The verdict short-circuits before any schedule or booking load.
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("hasBookableFutureSlot still evaluates a master whose salon is ACTIVE — the salon "
+            + "term must not reject every salon-employed master")
+    void should_stillEvaluate_when_masterSalonIsActive() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 5, 20);
+        LocalDate to = from.plusDays(30);
+        MasterServiceAssignment msa = assignmentOfSalonMaster(masterId, UUID.randomUUID(), true);
+
+        when(masterScheduleService.resolveEffectiveRange(masterId, from, to)).thenReturn(List.of());
+
+        slotCalculationService.hasBookableFutureSlot(msa, from, to);
+
+        // Reaching the schedule resolver at all proves the guard let an OPEN salon's master through
+        // — the assertion that matters, since an over-broad guard would silently empty the catalogue.
+        verify(masterScheduleService).resolveEffectiveRange(masterId, from, to);
+    }
+
+    /** An ACTIVE salon-employed master's active assignment, with the salon's flag parameterised. */
+    private static MasterServiceAssignment assignmentOfSalonMaster(
+            UUID masterId, UUID masterServiceId, boolean salonActive) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        master.setSalon(com.beautica.salon.entity.Salon.builder()
+                .id(UUID.randomUUID())
+                .isActive(salonActive)
+                .build());
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .serviceDefinition(sd)
+                .master(master)
+                .isActive(true)
+                .build();
+    }
+
     @Test
     @DisplayName("should throw NotFound when the serviceId does not belong to the master")
     void should_throwNotFound_when_serviceDoesNotBelongToMaster() {
@@ -1281,5 +1394,184 @@ class SlotCalculationServiceTest {
                 .isInstanceOf(NotFoundException.class);
 
         verifyNoInteractions(masterScheduleService);
+    }
+
+    // ── BE-2: multi-service single-visit (List<UUID>) slot list + calendar day-gate ─────────────
+
+    @Test
+    @DisplayName("should size the slot to the SUM of the chained services' effective durations (D4 buffers)")
+    void should_sumEffectiveDurations_when_multipleServicesRequested() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        // Service A: 60 + 10 buffer = 70. Service B: 45 + 15 buffer = 60. D4 total = 130.
+        MasterServiceAssignment a = assignment(masterId, serviceA, 60, 10);
+        MasterServiceAssignment b = assignment(masterId, serviceB, 45, 15);
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(a));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.of(b));
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).calculateAvailableSlots(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(130));
+    }
+
+    @Test
+    @DisplayName("should size the day-gate block to the SUM of the chained services' effective durations")
+    void should_sumEffectiveDurations_when_multipleServicesRequested_forWorkingDays() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        MasterServiceAssignment a = assignment(masterId, serviceA, 60, 0);
+        MasterServiceAssignment b = assignment(masterId, serviceB, 90, 0);
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(a));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.of(b));
+        when(masterScheduleService.resolveEffectiveRange(masterId, date, date))
+                .thenReturn(List.of(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(true);
+
+        slotCalculationService.getBookableWorkingDays(masterId, date, date, List.of(serviceA, serviceB));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).hasAvailableSlot(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(150));
+    }
+
+    @Test
+    @DisplayName("should throw 400 when the SUMMED chained duration exceeds the 600-minute cap")
+    void should_throw400_when_summedDurationExceedsMaximum() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        // 400 + 0 = 400 each; summed = 800 > 600. Neither alone would exceed the cap.
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(assignment(masterId, serviceA, 400, 0)));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.of(assignment(masterId, serviceB, 400, 0)));
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB)))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("exceeds maximum");
+
+        verifyNoInteractions(masterScheduleService);
+        verify(timeSlotCalculator, never()).calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("should throw NotFound when any chained service is unknown/foreign/inactive")
+    void should_throwNotFound_when_anyChainedServiceIsInvalid() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(assignment(masterId, serviceA, 60, 0)));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceB))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA, serviceB)))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("should throw 400 when the serviceId list is empty")
+    void should_throw400_when_serviceIdListEmpty() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, List.<UUID>of()))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(masterServiceRepository);
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("should throw 400 when the chained service list exceeds the per-visit cap")
+    void should_throw400_when_serviceIdListExceedsCap() {
+        UUID masterId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+        List<UUID> tooMany = java.util.stream.Stream
+                .generate(UUID::randomUUID)
+                .limit(SlotCalculationService.MAX_SERVICES_PER_VISIT + 1)
+                .toList();
+
+        assertThatThrownBy(() ->
+                slotCalculationService.getAvailableSlots(masterId, date, tooMany))
+                .isInstanceOf(BusinessException.class);
+
+        verifyNoInteractions(masterServiceRepository);
+        verifyNoInteractions(masterScheduleService);
+    }
+
+    @Test
+    @DisplayName("1-element list routes to the identical single-service duration (byte-for-byte)")
+    void should_matchSingleService_when_listHasOneElement() {
+        UUID masterId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 5, 8);
+
+        // 60 + 30 buffer = 90 — the same value the single-arg overload would compute.
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceA))
+                .thenReturn(Optional.of(assignment(masterId, serviceA, 60, 30)));
+        when(masterScheduleService.resolveEffectiveDay(masterId, date))
+                .thenReturn(templateDay(date, LocalTime.of(9, 0), LocalTime.of(18, 0)));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(any(), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.calculateAvailableSlots(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+
+        slotCalculationService.getAvailableSlots(masterId, date, List.of(serviceA));
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator).calculateAvailableSlots(
+                any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
+    }
+
+    /** Active assignment with a caller-chosen id, so multiple chained ids can be stubbed distinctly. */
+    private static MasterServiceAssignment assignment(
+            UUID masterId, UUID serviceId, int baseMinutes, int bufferMinutes) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(baseMinutes)
+                .bufferMinutesAfter(bufferMinutes)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(serviceId)
+                .serviceDefinition(sd)
+                .master(master)
+                .isActive(true)
+                .build();
     }
 }

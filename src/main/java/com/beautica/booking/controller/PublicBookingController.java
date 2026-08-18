@@ -8,7 +8,9 @@ import com.beautica.booking.dto.GuestBookingResponse;
 import com.beautica.booking.service.BookingCancellationService;
 import com.beautica.booking.service.BookingSlugService;
 import com.beautica.booking.service.GuestBookingService;
+import com.beautica.booking.service.SlotCalculationService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
@@ -69,9 +71,12 @@ public class PublicBookingController {
     }
 
     /**
-     * Available slots for a given service on a given date (Phase 13.3). Slot
-     * generation is per-service (duration differs), so {@code serviceId} is required.
-     * No auth required. Past / over-window dates are rejected as 400 in the service.
+     * Available slots for a given service (or several, as one back-to-back visit) on a given date
+     * (Phase 13.3 / BE-7). Slot generation is per-service (duration differs), so {@code serviceId} is
+     * required. It is a repeatable query param: {@code ?serviceId=a&serviceId=b} sizes each slot to the
+     * SUM of the services' effective durations (a multi-service visit); a single {@code ?serviceId=x}
+     * binds to a 1-element list and returns the exact legacy single-service (cached) result. No auth
+     * required. Past / over-window dates are rejected as 400 in the service.
      */
     @GetMapping("/{slug}/availability")
     public ResponseEntity<List<AvailableSlotResponse>> availability(
@@ -80,8 +85,17 @@ public class PublicBookingController {
             @Pattern(regexp = "^[a-z0-9][a-z0-9\\-]*[a-z0-9]$")
             String slug,
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
-            @RequestParam @NotNull UUID serviceId) {
-        return ResponseEntity.ok(guestBookingService.availableSlots(slug, date, serviceId));
+            @RequestParam("serviceId")
+            @NotEmpty(message = "at least one serviceId is required")
+            @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+                    message = "at most 10 services can be booked in a single visit")
+            List<UUID> serviceId) {
+        // N=1 routes to the cached single-service overload (byte-for-byte legacy); N>1 to the summed-block
+        // multi-service overload (BE-7). Mirrors MasterController's BE-2 slot endpoint.
+        List<AvailableSlotResponse> slots = serviceId.size() == 1
+                ? guestBookingService.availableSlots(slug, date, serviceId.get(0))
+                : guestBookingService.availableSlots(slug, date, serviceId);
+        return ResponseEntity.ok(slots);
     }
 
     /**

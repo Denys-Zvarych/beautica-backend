@@ -102,9 +102,9 @@ class SalonServiceCacheTest {
     void clearCache() {
         cacheManager.getCache("ownerSalons").clear();
         cacheManager.getCache("salon-detail").clear();
-        // Isolate search:salons from other tests — deactivateSalon clears the whole cache,
+        // Isolate search:salons:browse from other tests — deactivateSalon clears the whole cache,
         // so a leftover entry from a prior test would give a false-positive eviction assertion.
-        cacheManager.getCache("search:salons").clear();
+        cacheManager.getCache("search:salons:browse").clear();
     }
 
     @Test
@@ -238,7 +238,7 @@ class SalonServiceCacheTest {
     }
 
     @Test
-    @DisplayName("deactivateSalon evicts search:salons cache so a deactivated salon cannot be served from cache")
+    @DisplayName("deactivateSalon evicts search:salons:browse cache so a deactivated salon cannot be served from cache")
     void should_evictSearchSalonsCache_when_deactivateSalonCalled() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -251,24 +251,24 @@ class SalonServiceCacheTest {
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
-        // Seed the search:salons cache with a sentinel entry so we can confirm it is cleared.
+        // Seed the search:salons:browse cache with a sentinel entry so we can confirm it is cleared.
         // evictSearchSalonsCacheAfterCommit() calls cache.clear() — blanket eviction — so any
         // seeded key must return null after deactivateSalon returns.
         String sentinelKey = "q=nails&city=kyiv";
         Object sentinelValue = List.of("salon-result-stub");
-        cacheManager.getCache("search:salons").put(sentinelKey, sentinelValue);
+        cacheManager.getCache("search:salons:browse").put(sentinelKey, sentinelValue);
 
         // Confirm the seed is present before the eviction under test
-        assertThat(cacheManager.getCache("search:salons").get(sentinelKey))
-                .as("sentinel entry must be present in search:salons before deactivateSalon")
+        assertThat(cacheManager.getCache("search:salons:browse").get(sentinelKey))
+                .as("sentinel entry must be present in search:salons:browse before deactivateSalon")
                 .isNotNull();
 
         // Act
         salonService.deactivateSalon(ownerId, salonId);
 
-        // Assert — the entire search:salons cache was cleared
-        assertThat(cacheManager.getCache("search:salons").get(sentinelKey))
-                .as("search:salons cache must be fully cleared after deactivateSalon (blanket eviction)")
+        // Assert — the entire search:salons:browse cache was cleared
+        assertThat(cacheManager.getCache("search:salons:browse").get(sentinelKey))
+                .as("search:salons:browse cache must be fully cleared after deactivateSalon (blanket eviction)")
                 .isNull();
     }
 }

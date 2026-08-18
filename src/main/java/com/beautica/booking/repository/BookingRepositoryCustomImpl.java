@@ -1,6 +1,7 @@
 package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
@@ -96,6 +97,57 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         spec = applyDateRange(spec, from, toExclusive);
         spec = applyServiceFilter(spec, serviceIds);
         return findIdPage(spec, pageable);
+    }
+
+    // ── Phase 28.1/28.2 — GET /bookings/me?partition= (see BookingRepositoryCustom's class-level
+    // comment for why these are separate methods, never extra params on the three above) ────────
+
+    @Override
+    public Page<UUID> findIdsByMasterIdFilteredByPartition(
+            UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.masterIdEquals(masterId))
+                .and(BookingSpecifications.partition(partition, now));
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    @Override
+    public Page<UUID> findIdsBySalonIdsFilteredByPartition(
+            List<UUID> salonIds, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.salonIdIn(salonIds))
+                .and(BookingSpecifications.partition(partition, now));
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    @Override
+    public Page<UUID> findIdsByClientIdFilteredByPartition(
+            UUID clientId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.clientIdEquals(clientId))
+                .and(BookingSpecifications.partition(partition, now));
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    /**
+     * Phase 29.4 — public entry point onto the existing {@link #countMatching} helper (previously
+     * private, used only as {@link #findIdPage}'s deferred count supplier). Exposed verbatim —
+     * same {@link CriteriaQuery}-building logic, no new query shape — so {@code
+     * BookingService#getUnclosedCount} gets exactly one {@code SELECT COUNT(*)} statement for an
+     * arbitrary caller-composed {@link Specification}.
+     */
+    @Override
+    public long count(Specification<Booking> spec) {
+        return countMatching(spec);
     }
 
     /**

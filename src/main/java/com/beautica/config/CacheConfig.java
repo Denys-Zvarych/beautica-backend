@@ -1,5 +1,7 @@
 package com.beautica.config;
 
+import com.beautica.client.service.ClientPassportService;
+import com.beautica.search.service.SearchCacheNames;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
@@ -11,6 +13,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -51,6 +54,38 @@ import java.util.concurrent.TimeUnit;
 @EnableCaching(order = Ordered.HIGHEST_PRECEDENCE)
 public class CacheConfig {
 
+    /** Bounded, cross-user-shared location-only discovery pages — unchanged sizing. */
+    private static final int SEARCH_BROWSE_MAX_ENTRIES = 500;
+    private static final long SEARCH_BROWSE_TTL_SECONDS = 60;
+
+    /**
+     * Unbounded free-text discovery keys: fewer entries (lower reuse per key) and a shorter
+     * TTL (free-text results tolerate staleness better than a browse listing).
+     */
+    private static final int SEARCH_QUERY_MAX_ENTRIES = 300;
+    private static final long SEARCH_QUERY_TTL_SECONDS = 30;
+
+    /**
+     * Filter-scoped {@code totalElements} memo (perf follow-up) — see
+     * {@link com.beautica.search.service.SearchCacheNames#MASTERS_TOTAL} for the full
+     * rationale. An entry is a single {@code Long}, so 1000 entries is negligible; the TTL
+     * matches {@link #SEARCH_BROWSE_TTL_SECONDS} since a stale total is tolerated for the
+     * same window as a stale browse page.
+     */
+    private static final int SEARCH_TOTAL_MAX_ENTRIES = 1000;
+    private static final long SEARCH_TOTAL_TTL_SECONDS = 60;
+
+    /**
+     * BEAUTY PASSPORT sizing. Named constants (not inline literals) so
+     * {@code ClientPassportCacheIT} can assert the LIVE cache's {@code maximumSize} /
+     * {@code expireAfterWrite} against the same symbols this config applies — a test asserting
+     * hard-coded 2000/10 would pass against a cache built by Caffeine's default (unbounded,
+     * never-expiring) builder only by coincidence, so the shared constant is what makes that
+     * assertion meaningful.
+     */
+    public static final int CLIENT_PASSPORT_MAX_ENTRIES = 2000;
+    public static final long CLIENT_PASSPORT_TTL_MINUTES = 10;
+
     /**
      * Per-cache TTL configuration using individual Caffeine caches.
      *
@@ -86,8 +121,18 @@ public class CacheConfig {
      *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
-     *   search:masters      — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
-     *   search:salons       — discovery results, first 5 pages only — 60 sec TTL, max 500 entries
+     *   search:masters:browse / search:salons:browse — location-only discovery pages, first 5
+     *                         pages only; bounded key space, shared across all callers —
+     *                         60 sec TTL, max 500 entries
+     *   search:masters:q / search:salons:q — free-text discovery pages, first 5 pages only;
+     *                         UNBOUNDED key space (one key per settled keystroke) —
+     *                         30 sec TTL, max 300 entries. Routed by SearchCacheResolver;
+     *                         split so free-text churn cannot evict shared browse pages
+     *   search:masters:total / search:salons:total — filter-scoped totalElements memo (perf
+     *                         follow-up); one entry per filter tuple (page/size excluded from
+     *                         the key), read/written directly via CacheManager inside
+     *                         SearchService (not @Cacheable) so it also covers page >= 5 —
+     *                         60 sec TTL, max 1000 entries. See SearchCacheNames#MASTERS_TOTAL
      *   portfolio           — per-entity portfolio listing, public unauthenticated GET — 5 min TTL, max 2000 entries
      *   reviews-by-master   — paginated review list per master, public endpoint — 5 min TTL, max 1000 entries
      *   reviews-by-salon    — paginated review list per salon, public endpoint — 5 min TTL, max 1000 entries
@@ -115,6 +160,34 @@ public class CacheConfig {
     @Bean
     public CacheManager cacheManager(ObjectProvider<MeterRegistry> meterRegistryProvider) {
         CaffeineCacheManager manager = new CaffeineCacheManager();
+        // DYNAMIC CACHE CREATION OFF (2026-08 security audit LOW — client-passport).
+        //
+        // A bare `new CaffeineCacheManager()` leaves `dynamic = true`: getCache(name) for an
+        // UNREGISTERED name silently mints a cache from Caffeine's DEFAULT builder — no
+        // maximumSize, no expireAfterWrite. Every registration below deliberately picks both, so
+        // that default is never a correct answer here; it is an unbounded retained-heap leak that
+        // fails silently. The specific trigger the audit raised: `client-passport` holds per-client
+        // PII-derived aggregates, and if its registration were renamed or dropped, @Cacheable
+        // would keep working against an unbounded, never-expiring cache while
+        // ClientPassportCacheEvictor's getCache() returned that SAME cache — so nothing would fail
+        // loudly and per-user data would be retained for the life of the JVM.
+        //
+        // Passing an EMPTY collection sets `dynamic = false` without pre-creating anything (Spring
+        // iterates the collection, then flips the flag), so it composes with registerCustomCache:
+        // every name registered below stays available, and only unregistered names change
+        // behaviour — from "silent unbounded cache" to a hard `IllegalArgumentException: Cannot
+        // find cache named 'X'` from Spring's cache interceptor.
+        //
+        // VERIFIED SAFE FOR THE EXISTING CACHES: every cache name declared by any
+        // @Cacheable/@CacheEvict/@CachePut in src/main (resolving the constants —
+        // SearchCacheNames.*, ClientPassportService.CLIENT_PASSPORT_CACHE, PORTFOLIO_CACHE,
+        // APPROVED_CATEGORIES_CACHE, BOOKABLE_CACHE, BOOKABLE_DAYS_CACHE, the location CACHE_*,
+        // PlatformCategoryOrderLookup.CACHE_NAME) and every name reaching a runtime
+        // cacheManager.getCache(...) call site (SearchService, SearchCacheResolver,
+        // SalonService/UserService via SearchCacheNames.MASTERS_ALL/SALONS_ALL, ReviewEventListener,
+        // MediaService, MasterService, ServiceCatalogService, MasterCachePrefixEvictor) is
+        // registered below. @WebMvcTest slices are unaffected — they do not load this class.
+        manager.setCacheNames(List.of());
         // Optional so pure @WebMvcTest slices (no actuator/metrics context) still wire the cache
         // manager; when a MeterRegistry is present the hot slot caches export hit-rate / eviction
         // gauges (Perf #5). getIfAvailable() returns the actuator-autoconfigured primary registry.
@@ -191,7 +264,7 @@ public class CacheConfig {
         // 500 entries, sync=true. Key is {masterId, masterServiceId, from, to}; the window portion
         // cannot be evicted per-date, so it is evicted by MASTER PREFIX on every schedule write
         // (MasterScheduleService#evictSlotsAfterCommit) AND every booking write
-        // (SlotCalculationService#evictBookableFutureSlotsByMaster, called from the booking-write
+        // (SlotCalculationService#evictMasterAvailabilityCaches, called from the booking-write
         // afterCommit hooks) — a new/cancelled booking anywhere in the horizon can flip the verdict.
         // Metered + raised cap (Perf #5). Key is {masterId, masterServiceId, from, to}: the booking
         // horizon window is fixed per call, so live cardinality is ~ (active masters × services they
@@ -211,7 +284,7 @@ public class CacheConfig {
         // yield different bookable-day sets. Mirrors master-service-bookable: 60-sec TTL, sync=true
         // (hot client-calendar key), metered. Evicted by MASTER PREFIX (the key's first element) on every
         // schedule write (MasterScheduleService#evictSlotsAfterCommit) AND every booking write
-        // (SlotCalculationService#evictBookableFutureSlotsByMaster) — a new/cancelled booking anywhere in
+        // (SlotCalculationService#evictMasterAvailabilityCaches) — a new/cancelled booking anywhere in
         // the window can flip a day from bookable to full. Cardinality is master × service × calendar
         // window (the mobile calendar pages by month), so it is sized like master-service-bookable.
         //
@@ -260,16 +333,72 @@ public class CacheConfig {
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
-        manager.registerCustomCache("search:masters",
+        // Discovery caches, SPLIT BY KEY POPULATION (perf + security audit 2026-07-29). Both
+        // auditors raised the same defect independently: one shared 500-entry cache per surface
+        // held two structurally different populations, and the unbounded one evicted the bounded
+        // one.
+        //
+        //  * BROWSE — location-only keys (city/district × category × sort × price × page).
+        //    Bounded by that product and SHARED ACROSS EVERY VISITOR, so each entry is
+        //    high-value: one load serves everybody who opens that district's discovery screen.
+        //    Keeps the previous 500 / 60 s sizing; nothing about this population changed.
+        //
+        //  * :q — free-text keys, UNBOUNDED in cardinality. An incremental search box settles
+        //    once per keystroke, so typing «ламінування вій» mints ~13 distinct keys of which
+        //    only the last is ever read again, and the discovery screen queries masters AND
+        //    salons. On the shared cache ~40 concurrent typers churned the whole 500-entry cap
+        //    inside the TTL, and what they evicted was not their own throwaway prefixes (never
+        //    read again anyway) but the reusable browse pages — so the observable symptom of an
+        //    undersized search cache was a latency regression on BROWSE, and an unauthenticated
+        //    caller varying q converted other users' cached pages back into DB work.
+        //    Sized 300 / 30 s: lower reuse justifies fewer entries, and free-text results are
+        //    more staleness-tolerant than a browse listing, so the shorter TTL costs little.
+        //
+        // Routing is per-request (SearchCacheResolver), keyed on whether the normalised q is
+        // present — the @Cacheable declares only the browse half. This split is also what makes
+        // the two hit-rate gauges interpretable: a single meter averaged two populations with
+        // completely different expected rates, which is exactly why the 500 cap could not be
+        // tuned from it. Each half now reports its own rate.
+        //
+        // BLANKET-EVICTION CONTRACT: SalonService.deactivateSalon and UserService's
+        // INDEPENDENT_MASTER name/locality writes clear discovery wholesale and MUST clear both
+        // halves — they iterate SearchCacheNames.SALONS_ALL / MASTERS_ALL for that reason.
+        registerMetered(manager, meterRegistry, SearchCacheNames.MASTERS_BROWSE,
                 Caffeine.newBuilder()
-                        .maximumSize(500)
-                        .expireAfterWrite(60, TimeUnit.SECONDS)
-                        .build());
-        manager.registerCustomCache("search:salons",
+                        .maximumSize(SEARCH_BROWSE_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_BROWSE_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.MASTERS_QUERY,
                 Caffeine.newBuilder()
-                        .maximumSize(500)
-                        .expireAfterWrite(60, TimeUnit.SECONDS)
-                        .build());
+                        .maximumSize(SEARCH_QUERY_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_QUERY_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.SALONS_BROWSE,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_BROWSE_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_BROWSE_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.SALONS_QUERY,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_QUERY_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_QUERY_TTL_SECONDS, TimeUnit.SECONDS));
+        // Filter-scoped totalElements memo (perf follow-up, architect decision — keyset/cursor
+        // pagination REJECTED as the fix; see SearchCacheNames.MASTERS_TOTAL Javadoc). Read and
+        // written directly through CacheManager inside SearchService (NOT @Cacheable — it is a
+        // read-then-maybe-skip, not a memoized return value), so it keeps working on page >= 5,
+        // the exact population the browse/query caches' `pageNumber < 5` condition leaves
+        // uncached. One entry per filter tuple (page/size excluded from the key), so a
+        // page=5..499 sweep against the SAME filter costs one probe instead of ~990.
+        //
+        // TRADE-OFF: a memoized total can go stale for up to SEARCH_TOTAL_TTL_SECONDS. Contained
+        // by using the memo ONLY to short-circuit an out-of-range page to an EMPTY page
+        // (offset >= total) — never to serve or shape data. Worst case is a transiently-empty
+        // tail page that self-heals within the TTL.
+        registerMetered(manager, meterRegistry, SearchCacheNames.MASTERS_TOTAL,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_TOTAL_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_TOTAL_TTL_SECONDS, TimeUnit.SECONDS));
+        registerMetered(manager, meterRegistry, SearchCacheNames.SALONS_TOTAL,
+                Caffeine.newBuilder()
+                        .maximumSize(SEARCH_TOTAL_MAX_ENTRIES)
+                        .expireAfterWrite(SEARCH_TOTAL_TTL_SECONDS, TimeUnit.SECONDS));
         // Phase 7.7 — public portfolio listing is read-mostly; the 5-min TTL bounds stale
         // exposure if an eviction is missed, and 2000 entries cover the most active
         // salons + masters for current scale.
@@ -302,6 +431,23 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(500)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
+                        .build());
+        // Phase 31.x / 2026-08 perf audit F3 — BEAUTY PASSPORT per client, keyed on the caller's
+        // OWN principal id (ClientPassportService#getPassport, @Cacheable(key = "#clientUserId",
+        // sync = true)). A miss costs 7 statements, 3 of them aggregations over the client's
+        // entire COMPLETED booking history, so this is the most expensive per-user read in the app.
+        // Evicted PER KEY, AFTER_COMMIT, by ClientPassportCacheEvictor on booking completion and
+        // review creation; the 10-minute TTL is only the backstop for a dropped eviction, not the
+        // primary invalidation path. 2000 entries covers the active client base at current scale.
+        //
+        // Registered under the CONSTANT, never a duplicated "client-passport" literal (2026-08
+        // security audit LOW): the @Cacheable, the evictor's getCache() and this registration are
+        // then the same symbol, so a rename cannot leave the registration behind pointing at a
+        // dead name. Sizing is asserted end-to-end by ClientPassportCacheIT.
+        manager.registerCustomCache(ClientPassportService.CLIENT_PASSPORT_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(CLIENT_PASSPORT_MAX_ENTRIES)
+                        .expireAfterWrite(CLIENT_PASSPORT_TTL_MINUTES, TimeUnit.MINUTES)
                         .build());
         // Phase 10.4 — KATOTTH locality taxonomy (~370 static reference rows, written
         // only by Flyway seed migrations). Long 24-hour TTL with NO @CacheEvict path:
@@ -371,7 +517,36 @@ public class CacheConfig {
                         .maximumSize(200)
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
+        assertCustomRegistration(manager, ClientPassportService.CLIENT_PASSPORT_CACHE);
         return manager;
+    }
+
+    /**
+     * Fails application startup if {@code cacheName} was not registered above as a CUSTOM cache
+     * (2026-08 security audit LOW).
+     *
+     * <p>Read together with the {@code setCacheNames(List.of())} call at the top of
+     * {@link #cacheManager}: that turns off dynamic creation, so an unregistered name resolves to
+     * {@code null} instead of an unbounded default cache — and this check converts that
+     * {@code null} into an {@code IllegalStateException} at context refresh rather than a lazy
+     * {@code IllegalArgumentException} on whichever request first touches the cache. Only names
+     * put into the manager's map by {@code registerCustomCache} can be present at this point,
+     * because nothing else has been able to create one.
+     *
+     * <p>Applied to {@code client-passport} specifically because it is the only cache here holding
+     * per-user PII-derived data — silently losing its sizing/TTL is a data-retention defect, not
+     * just a performance one. It is deliberately a targeted assertion rather than a reflective
+     * sweep of every {@code @Cacheable}: the {@code setCacheNames} flag already makes every OTHER
+     * missing registration fail loudly at first use.
+     */
+    private static void assertCustomRegistration(CaffeineCacheManager manager, String cacheName) {
+        if (!manager.getCacheNames().contains(cacheName)) {
+            throw new IllegalStateException(
+                    "Cache '" + cacheName + "' is not registered in CacheConfig. Dynamic cache "
+                            + "creation is disabled, so @Cacheable on this name would fail at "
+                            + "runtime; re-register it with an explicit maximumSize and "
+                            + "expireAfterWrite.");
+        }
     }
 
     /**

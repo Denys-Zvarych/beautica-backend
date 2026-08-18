@@ -4,11 +4,15 @@ import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.GuestBookingRequest;
 import com.beautica.booking.dto.GuestBookingResponse;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.Placeholders;
+import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.auth.phoneotp.GuestTokenProvider;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
@@ -35,7 +39,9 @@ import java.time.Clock;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -62,11 +68,13 @@ public class GuestBookingService {
     private final MasterRepository masterRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final BookingRepository bookingRepository;
+    private final AppointmentRepository appointmentRepository;
     private final SlotCalculationService slotCalculationService;
     private final NotificationOutboxService outboxService;
     private final SmsService smsService;
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final VisitPlanner visitPlanner;
     private final String frontendBaseUrl;
     private final Clock kyivClock;
 
@@ -75,22 +83,26 @@ public class GuestBookingService {
             MasterRepository masterRepository,
             MasterServiceRepository masterServiceRepository,
             BookingRepository bookingRepository,
+            AppointmentRepository appointmentRepository,
             SlotCalculationService slotCalculationService,
             NotificationOutboxService outboxService,
             SmsService smsService,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
+            VisitPlanner visitPlanner,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             Clock clock) {
         this.guestTokenProvider = guestTokenProvider;
         this.masterRepository = masterRepository;
         this.masterServiceRepository = masterServiceRepository;
         this.bookingRepository = bookingRepository;
+        this.appointmentRepository = appointmentRepository;
         this.slotCalculationService = slotCalculationService;
         this.outboxService = outboxService;
         this.smsService = smsService;
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
+        this.visitPlanner = visitPlanner;
         this.frontendBaseUrl = frontendBaseUrl;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
     }
@@ -106,6 +118,31 @@ public class GuestBookingService {
      */
     @Transactional(readOnly = true)
     public List<AvailableSlotResponse> availableSlots(String slug, LocalDate date, UUID serviceId) {
+        Master master = resolveMasterForDate(slug, date);
+        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceId);
+    }
+
+    /**
+     * Multi-service single-visit available-slot lookup for the guest booking page (BE-7). Sizes each
+     * candidate slot to the SUM of the ordered {@code serviceIds}' effective durations — one contiguous
+     * back-to-back block — so the guest sees exactly the slots a multi-service visit can occupy. The
+     * controller routes a single-element list to {@link #availableSlots(String, LocalDate, UUID)} (the
+     * cached legacy overload), so this path only ever handles {@code N>1}. No auth required.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> availableSlots(String slug, LocalDate date, List<UUID> serviceIds) {
+        Master master = resolveMasterForDate(slug, date);
+        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceIds);
+    }
+
+    /**
+     * Shared date-window guard + slug→active-master resolution for both availability overloads. Validates
+     * the requested {@code date} is within {@code [today, today + availabilityMaxDays]} in Kyiv time.
+     *
+     * @throws NotFoundException when the slug is unknown / master inactive (→ 404)
+     * @throws BusinessException with 400 when the date is in the past or too far ahead
+     */
+    private Master resolveMasterForDate(String slug, LocalDate date) {
         LocalDate today = LocalDate.now(kyivClock);
         if (date.isBefore(today)) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date is in the past");
@@ -113,10 +150,12 @@ public class GuestBookingService {
         if (date.isAfter(today.plusDays(smsProperties.getAvailabilityMaxDays()))) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "date too far ahead");
         }
-        Master master = masterRepository.findByBookingSlugWithUser(slug)
-                .filter(Master::isActive)
+        // No .filter(Master::isActive) here: findByBookingSlugWithUser's own JPQL already carries
+        // `AND m.isActive = true AND (s IS NULL OR s.isActive = true)` — the full MasterBookability
+        // rule — so the Optional is either empty or holds a bookable master. The filter was a
+        // strictly weaker duplicate of half that predicate. Guarded by MasterRepositoryBookingSlugTest.
+        return masterRepository.findByBookingSlugWithUser(slug)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
-        return slotCalculationService.getAvailableSlots(master.getId(), date, serviceId);
     }
 
     /**
@@ -141,10 +180,31 @@ public class GuestBookingService {
         // kyivClock and the injected clock share an Instant, so the zone is irrelevant here.
         BookingStartsAtValidator.validate(req.startsAt(), kyivClock);
 
+        // See resolveMasterForDate: the liveness + salon-active rule lives in the finder's JPQL,
+        // so no redundant .filter(Master::isActive) is applied on top of it.
         Master master = masterRepository.findByBookingSlugWithUser(slug)
-                .filter(Master::isActive)
                 .orElseThrow(() -> new NotFoundException("Booking page not found"));
 
+        // BE-7: a masterServiceIds list (even a single element) is a multi-service VISIT — ONE Appointment
+        // header + N chained CONFIRMED bookings sharing one cancel token and one reminder. A legacy
+        // serviceId-only request keeps the byte-for-byte single-booking path (appointment_id NULL). Exactly
+        // one of the two must be supplied; the DTO cannot express that XOR, so it is enforced here.
+        if (req.masterServiceIds() != null && !req.masterServiceIds().isEmpty()) {
+            return createGuestVisit(master, req, req.masterServiceIds(), guestPhone);
+        }
+        if (req.serviceId() == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "serviceId or masterServiceIds is required");
+        }
+        return createSingleServiceBooking(master, req, guestPhone);
+    }
+
+    /**
+     * Legacy single-service guest booking (byte-for-byte unchanged from Phase 13.3): resolves the one
+     * service, persists a CONFIRMED LINK {@code Booking} with {@code appointment_id} NULL, notifies the
+     * master, and — after commit — sends the confirmation SMS and evicts the slot caches.
+     */
+    private GuestBookingResponse createSingleServiceBooking(
+            Master master, GuestBookingRequest req, String guestPhone) {
         // findByMasterIdAndIdWithGraph filters WHERE ms.master.id = :masterId, so an
         // empty result means the service does not belong to this master (or does not
         // exist) — this IS the service-ownership check.
@@ -152,6 +212,19 @@ public class GuestBookingService {
                 .findByMasterIdAndIdWithGraph(master.getId(), req.serviceId())
                 .filter(MasterServiceAssignment::isActive)
                 .orElseThrow(() -> new NotFoundException("Service not available for this master"));
+
+        // SCHEDULE-FIT GATE (2026-08-11 HIGH) — the guest/LINK counterpart of the gate in
+        // BookingService#doCreateBooking, and deliberately NOT weaker: this endpoint is permitAll, so it
+        // is the EASIEST of the three create paths to hand a hand-crafted off-schedule start. Until this
+        // line the LINK path enforced only BookingStartsAtValidator (lead time + horizon) and the
+        // overlap check in persistBooking, so a guest could book a day-off or a lunch-break minute and
+        // land CONFIRMED on the master's calendar with a confirmation SMS. Same oracle the public
+        // availability endpoint (#availableSlots, just above) already serves to this very caller — so the
+        // page now accepts exactly what it offers. Run BEFORE the advisory lock in persistBooking.
+        // `msa` is handed through so the gate does not re-issue the findByMasterIdAndIdWithGraph resolved
+        // immediately above (Perf MEDIUM, 2026-08-11) — same persistence context, same instance.
+        BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, master.getId(), msa.getId(), msa, req.startsAt());
 
         Booking saved = persistBooking(master, msa, req, guestPhone);
 
@@ -161,6 +234,85 @@ public class GuestBookingService {
         registerAfterCommit(master, msa, saved, guestPhone, cancelUrl);
 
         return buildResponse(master, msa, saved, cancelUrl);
+    }
+
+    /**
+     * Guest multi-service single-visit create (BE-7) — the LINK counterpart of {@code AppointmentService}.
+     * Plans the chained items via the SHARED {@link VisitPlanner} (identical price/duration freeze,
+     * D4 buffer policy, Σ-cap and contiguity the APP path uses), guards the whole visit span under the
+     * per-master advisory lock (fused 3s timeout; NO client lock — a guest has no account to key one on),
+     * then persists ONE guest {@link Appointment} header (source LINK, {@code client_id} NULL, guest
+     * identity, one cancel token) plus N chained CONFIRMED {@link Booking} items atomically. Exactly ONE
+     * new-visit notification is enqueued; after commit ONE confirmation SMS is sent and the availability
+     * caches are evicted for every day/service the visit touches.
+     *
+     * <p><b>Per-item cancel tokens.</b> Each child booking is created via {@link Booking#guestBooking}
+     * and therefore carries its OWN random cancel token — required because {@code chk_bookings_guest_fields}
+     * (V91) mandates a non-null token on every CONFIRMED LINK row. Those per-item tokens are never
+     * surfaced; the guest holds only the visit-level token on the header, which cancels ALL items.
+     */
+    private GuestBookingResponse createGuestVisit(
+            Master master, GuestBookingRequest req, List<UUID> serviceIds, String guestPhone) {
+        OffsetDateTime firstStart = req.startsAt();
+        List<VisitPlanner.PlannedItem> items = visitPlanner.planChainedItems(master, serviceIds, firstStart);
+        OffsetDateTime lastEnd = items.get(items.size() - 1).endsAt();
+
+        // SCHEDULE-FIT GATE (2026-08-11 HIGH) — identical to the APP visit-create gate
+        // (AppointmentService#doCreateAppointment): the BE-2 N-service overload over the ordered
+        // serviceIds, never N per-item checks (each leg can fit alone while the CHAIN overruns the
+        // working window). Runs AFTER planChainedItems (unknown/foreign/inactive service still 404s
+        // first) and BEFORE the advisory lock, so an off-schedule guest request never contends for it.
+        // planChainedItems' OWN assignments are handed through (Perf MEDIUM, 2026-08-11) so the gate does
+        // not re-run findByMasterIdAndIdWithGraph once per chained service — identical to the APP path.
+        BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
+                slotCalculationService, master.getId(), serviceIds,
+                VisitPlanner.assignmentsOf(items), firstStart);
+
+        // Per-master advisory lock BEFORE the overlap check — same fused-timeout mechanism the single
+        // guest path uses (this endpoint is permitAll, so the 3s lock_timeout bounds the wait against the
+        // advisory-lock DoS class). No client lock: a guest has no account to serialize on.
+        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
+        if (lock == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+        // ONE span overlap check over [firstStart, lastEnd): the chained items are contiguous by
+        // construction, so their union equals the span (identical rationale to AppointmentService). The
+        // per-row no_overlapping_bookings GIST EXCLUDE still backstops each insert (the catch below → 409).
+        if (bookingRepository.existsOverlap(master.getId(), firstStart, lastEnd)) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        UUID cancelToken = UUID.randomUUID();
+        Appointment appointment = Appointment.guestAppointment(
+                master.getSalon(), req.name(), req.surname(), guestPhone, cancelToken);
+
+        List<Booking> children = new ArrayList<>(items.size());
+        for (VisitPlanner.PlannedItem item : items) {
+            Booking child = Booking.guestBooking(
+                    master, item.masterService(), master.getSalon(),
+                    item.startsAt(), item.endsAt(), item.price(), item.priceMax(),
+                    item.duration(), item.buffer(), req.name(), req.surname(), guestPhone);
+            child.setAppointment(appointment);
+            children.add(child);
+        }
+
+        List<Booking> saved;
+        try {
+            // The header is saved first so bookings.appointment_id resolves; the flush makes the EXCLUDE
+            // constraint authoritative — an overlapping chain rolls the whole visit back (atomic).
+            appointmentRepository.save(appointment);
+            saved = bookingRepository.saveAll(children);
+            bookingRepository.flush();
+        } catch (DataIntegrityViolationException e) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        }
+
+        // EXACTLY ONE new-visit notification (referencing the first item — never one per service).
+        outboxService.enqueueNewBooking(saved.get(0).getId());
+
+        String cancelUrl = buildCancelUrl(cancelToken.toString());
+        registerVisitAfterCommit(master, items, saved.get(0), guestPhone, cancelUrl);
+        return buildVisitResponse(master, appointment, saved.get(0), items, cancelUrl);
     }
 
     private String extractGuestPhone(String bearerToken) {
@@ -229,12 +381,42 @@ public class GuestBookingService {
         UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
         Runnable task = () -> {
             sendConfirmationSms(guestPhone, smsText);
-            slotCalculationService.evictAvailableSlots(
-                    master.getId(), saved.getStartsAt().toLocalDate(), msa.getId());
-            // A new guest booking changed occupancy → evict the master's free-slot bookability
-            // verdict (master-prefix; window keys can't be evicted per-date).
-            slotCalculationService.evictBookableFutureSlotsByMaster(master.getId());
+            // A new guest booking changed occupancy → evict the master's availability caches by
+            // master prefix. Not per (date, service): the booked time bounds the slots offered for
+            // EVERY service this master performs that day, not only the booked one.
+            slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             // A flipped verdict can add/remove a service from the salon catalogue (perf/security #2).
+            if (salonId != null) {
+                salonCatalogCacheEvictor.evict(salonId);
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    task.run();
+                }
+            });
+        } else {
+            task.run();
+        }
+    }
+
+    /**
+     * After-commit side-effects for a guest VISIT create (BE-7): ONE confirmation SMS (built from the
+     * first item, reusing the single-service template) plus availability-cache eviction — reusing the
+     * exact single-service eviction hook so a parallel reader cannot repopulate stale data mid-write.
+     * The visit occupies a contiguous block of the master's time, so the by-master sweep in
+     * {@link SlotCalculationService#evictMasterAvailabilityCaches} subsumes the per-{@code (date,
+     * service)} key set this method used to enumerate; the salon catalogue is evicted once.
+     */
+    private void registerVisitAfterCommit(Master master, List<VisitPlanner.PlannedItem> items,
+                                          Booking firstSaved, String guestPhone, String cancelUrl) {
+        String smsText = buildConfirmationSms(master, visitSmsServiceName(items), firstSaved, cancelUrl);
+        UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
+        Runnable task = () -> {
+            sendConfirmationSms(guestPhone, smsText);
+            slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
@@ -263,13 +445,50 @@ public class GuestBookingService {
 
     private String buildConfirmationSms(Master master, MasterServiceAssignment msa,
                                         Booking saved, String cancelUrl) {
+        return buildConfirmationSms(master, msa.getServiceDefinition().getName(), saved, cancelUrl);
+    }
+
+    /**
+     * Renders the guest confirmation SMS in ONE pass over the template — see
+     * {@link Placeholders#format}.
+     *
+     * <p>Chained {@link String#replace} was a template-injection vector here: {@code {serviceName}}
+     * was substituted BEFORE {@code {date}}, {@code {time}} and {@code {cancelUrl}}, so each later
+     * {@code replace} re-scanned the service name it had just written in. A provider who named a
+     * service {@code "Манікюр {cancelUrl}"} therefore got the guest's one-time cancellation link
+     * expanded a second time, in a position of their choosing, inside a message the guest reads as
+     * platform copy — and with {@code {date}}/{@code {time}} could rearrange the layout around it.
+     * A single pass copies substituted values out verbatim, so data can never become markup.
+     */
+    private String buildConfirmationSms(Master master, String serviceName,
+                                        Booking saved, String cancelUrl) {
         OffsetDateTime kyiv = saved.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
-        return smsProperties.getSms().getConfirmation()
-                .replace("{masterName}", masterName(master))
-                .replace("{serviceName}", msa.getServiceDefinition().getName())
-                .replace("{date}", DATE_FMT.format(kyiv))
-                .replace("{time}", TIME_FMT.format(kyiv))
-                .replace("{cancelUrl}", cancelUrl);
+        return Placeholders.format(smsProperties.getSms().getConfirmation(), Map.of(
+                "masterName", masterName(master),
+                "serviceName", serviceName,
+                "date", DATE_FMT.format(kyiv),
+                "time", TIME_FMT.format(kyiv),
+                "cancelUrl", cancelUrl));
+    }
+
+    /**
+     * The {@code {serviceName}} substitution for a multi-service visit's ONE confirmation SMS:
+     * the first service plus «та ще N послуг(и)» — e.g. «Стрижка та ще 2 послуги».
+     *
+     * <p>Deliberately NOT the full list. This SMS already carries the master name, date, time and a
+     * cancel URL; a Cyrillic segment is ~70 characters, so concatenating up to ten service names
+     * would push a routine booking several segments past the budget (and risk provider-side
+     * truncation of the cancel link, the one part of the message the guest cannot do without).
+     * A single-service visit ({@code items.size() == 1}) returns the bare service name — the
+     * pre-visit text, unchanged.
+     */
+    private static String visitSmsServiceName(List<VisitPlanner.PlannedItem> items) {
+        String first = items.get(0).masterService().getServiceDefinition().getName();
+        int remaining = items.size() - 1;
+        if (remaining <= 0) {
+            return first;
+        }
+        return first + " та ще " + UkrainianPlurals.servicesPhrase(remaining);
     }
 
     private GuestBookingResponse buildResponse(Master master, MasterServiceAssignment msa,
@@ -280,6 +499,26 @@ public class GuestBookingService {
                 masterName(master),
                 msa.getServiceDefinition().getName(),
                 saved.getDurationMinutesAtBooking(),
+                cancelUrl);
+    }
+
+    /**
+     * Visit response (BE-7): {@code appointmentId} identifies the visit, {@code bookingId} is its first
+     * chained item, {@code serviceName} the first service, and {@code durationMinutes} the SUM of the
+     * item service durations (buffers excluded — same meaning as the single path's field). The
+     * visit-level cancel token is embedded in {@code cancelUrl}.
+     */
+    private GuestBookingResponse buildVisitResponse(Master master, Appointment appointment,
+                                                    Booking firstSaved, List<VisitPlanner.PlannedItem> items,
+                                                    String cancelUrl) {
+        int totalDuration = items.stream().mapToInt(VisitPlanner.PlannedItem::duration).sum();
+        return new GuestBookingResponse(
+                firstSaved.getId(),
+                appointment.getId(),
+                firstSaved.getStartsAt(),
+                masterName(master),
+                items.get(0).masterService().getServiceDefinition().getName(),
+                totalDuration,
                 cancelUrl);
     }
 

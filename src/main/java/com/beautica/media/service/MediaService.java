@@ -389,19 +389,47 @@ public class MediaService {
     // ---------------------------------------------------------- SEC-2 sweeper
 
     /**
-     * Purge every R2 blob uploaded by the given user, then delete the corresponding
-     * {@code media_files} rows. Must be called BEFORE a {@code users} row is deleted —
-     * otherwise the {@code ON DELETE CASCADE} on {@code media_files.uploader_id}
-     * fires first and leaves R2 objects orphaned with no DB pointer to recover them.
+     * Purge every R2 blob owned by the given user, then drop the DB pointers to them.
+     * Must be called BEFORE a {@code users} row is deleted — otherwise the
+     * {@code ON DELETE CASCADE} on {@code media_files.uploader_id} fires first and leaves
+     * R2 objects orphaned with no DB pointer to recover them.
      *
-     * <p>R2 deletion is best-effort per row: a failure on one row is logged at WARN
-     * and the loop continues, so a transient R2 outage does not abort the whole sweep.
-     * After every R2 attempt, all rows are deleted from the DB in a single batch.
+     * <p><b>Covers BOTH blob families a user owns</b> (Anti-Bug Playbook §O8):
+     * <ul>
+     *   <li>every {@code media_files} row uploaded by them (portfolio photos), and</li>
+     *   <li>their avatar — which lives in {@code users.avatar_r2_key}, NOT in
+     *       {@code media_files}: {@link #uploadAvatar} writes the key straight onto the
+     *       {@code users} row and never inserts a {@code MediaFile}. A media-rows-only
+     *       sweep therefore left the avatar blob publicly retrievable forever after
+     *       account deletion, at a URL every provider the client ever booked with holds
+     *       (it is emitted as {@code clientAvatarUrl} on {@code BookingDetailResponse}).</li>
+     * </ul>
+     *
+     * <p>R2 deletion is best-effort throughout — mirroring the pre-existing per-row policy
+     * rather than introducing a second one: a failure is logged at WARN and the sweep
+     * continues, so a transient R2 outage cannot abort it and strand the remaining blobs.
+     * The DB pointer is dropped either way, and that carries an honest downside: when the R2
+     * delete FAILS, this method still nulls the pointer, leaving the blob in R2 with no DB
+     * key left to reconcile against — an ORPHANED blob. That is the accepted cost of a
+     * teardown that always completes and is safe to re-run; the alternative (keep the pointer
+     * on R2 failure) is worse, because it re-exposes a deleted user's photo at a live,
+     * retrievable URL. Ordering is always R2-first-then-DB, so aside from that accepted orphan
+     * the only other outcome is a crash landing between the two steps, which leaves a pointer
+     * to an already-gone blob (harmless) — never a live pointer to a deleted blob. Durable
+     * orphan reconciliation (a delete log or a periodic bucket-vs-DB sweep) is intentionally
+     * out of scope until an account-deletion flow actually calls this method.
+     *
+     * <p>The avatar sweep runs FIRST, before the {@code rows.isEmpty()} short-circuit below —
+     * a user with an avatar but no portfolio photos is the common case for a {@code CLIENT}
+     * and must not fall through the early return.
      *
      * <p><b>Wiring contract (out of scope for Phase 7.5):</b> a future user-deletion
      * flow must call this method before deleting the {@code users} row.
      */
     public void deleteByUploader(UUID uploaderId) {
+        // Step 0 — avatar blob (users.avatar_r2_key), which is NOT a media_files row.
+        sweepAvatar(uploaderId);
+
         // Step 1 — read tx: collect the rows. Connection released before any R2 call.
         List<MediaFile> rows = txRead(() -> mediaRepo.findByUploaderId(uploaderId));
         if (rows.isEmpty()) {
@@ -440,6 +468,46 @@ public class MediaService {
                 cache.evictIfPresent(key);
             }
         }
+    }
+
+    /**
+     * Avatar half of {@link #deleteByUploader}: purge the {@code users.avatar_r2_key} blob
+     * and null both avatar columns.
+     *
+     * <p>Deliberately tolerant where {@link #deleteAvatar} is strict. {@code deleteAvatar}
+     * serves an authenticated request and 404s on a missing user; this runs inside a
+     * teardown sweep that must be safe to re-run and safe to call when the {@code users} row
+     * has already gone (e.g. a retried deletion), so an absent user is a no-op. Same
+     * tolerance the media-rows sweep already applies via its {@code rows.isEmpty()} return.
+     */
+    private void sweepAvatar(UUID uploaderId) {
+        // Read tx: capture the key, release the connection before the R2 round-trip.
+        String key = txRead(() -> userRepo.findById(uploaderId)
+                .map(User::getAvatarR2Key)
+                .orElse(null));
+        if (key == null) {
+            return;
+        }
+
+        // R2 delete OUTSIDE any transaction, best-effort — same policy as the row loop.
+        try {
+            r2.deleteFile(key);
+        } catch (RuntimeException ex) {
+            // Key embeds the user UUID — omit it from the log to keep PII out of aggregators.
+            log.warn("R2 delete failed during deleteByUploader avatar sweep (uploader={}, key=[key omitted]): {}",
+                    uploaderId, ex.getClass().getSimpleName());
+        }
+
+        // Write tx: clear the pointers on a fresh load, so no detached entity crosses the
+        // network round-trip above.
+        txWrite.execute(status -> {
+            userRepo.findById(uploaderId).ifPresent(u -> {
+                u.setAvatarR2Key(null);
+                u.setAvatarUrl(null);
+                userRepo.save(u);
+            });
+            return null;
+        });
     }
 
     // -------------------------------------------------------------- internals

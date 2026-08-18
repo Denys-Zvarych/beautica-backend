@@ -544,7 +544,12 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .containsExactlyElementsOf(expectedAssignmentIdOrder);
     }
 
-    // ── existsActiveServiceForMaster (first-time bulk-setup precondition) ─────────
+    // ── existsActiveServiceForMaster (menu-emptiness predicate) ──────────────────
+    //
+    // This backed the old "bulk setup is first-time only" precondition, removed when bulk create
+    // became additive. The query itself is retained as a menu-emptiness predicate, and these
+    // tests keep pinning its two-level semantics: an assignment counts only when BOTH the
+    // assignment and its definition are active.
 
     @Test
     @DisplayName("should_returnTrue_when_masterHasAnActiveServiceWithActiveDefinition")
@@ -561,7 +566,7 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         boolean hasActive = masterServiceRepository.existsActiveServiceForMaster(master.getId());
 
         assertThat(hasActive)
-                .as("an active assignment on an active definition must block first-time bulk setup")
+                .as("an active assignment on an active definition means the master's menu is non-empty")
                 .isTrue();
     }
 
@@ -572,15 +577,15 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
         boolean hasActive = masterServiceRepository.existsActiveServiceForMaster(master.getId());
 
         assertThat(hasActive)
-                .as("a master with zero assignments is eligible for first-time bulk setup")
+                .as("a master with zero assignments has an empty menu")
                 .isFalse();
     }
 
     @Test
     @DisplayName("should_returnFalse_when_onlyAssignmentReferencesSoftDeletedDefinition")
     void should_returnFalse_when_onlyAssignmentReferencesSoftDeletedDefinition() {
-        // A soft-deleted definition must NOT count as an active service — otherwise a master
-        // who deleted all their services could never re-run the first-time bulk flow.
+        // A soft-deleted definition must NOT count as an active service — a master who deleted
+        // all their services has an empty menu, not a menu of tombstones.
         ServiceDefinition softDeletedDef = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())

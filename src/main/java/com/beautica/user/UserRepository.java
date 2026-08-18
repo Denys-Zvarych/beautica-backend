@@ -21,6 +21,23 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     @Query("SELECT u.salonId FROM User u WHERE u.id = :userId")
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
 
+    // findCreatedAtById was removed by the 2026-08 perf audit (F2): its only caller,
+    // ClientPassportService, now reads the registration instant AND the authored-review count
+    // in a single statement via ClientAggregationRepository.findStanding. Do not reinstate a
+    // standalone created_at lookup for the passport — that reintroduces the serial round trip.
+
+    /**
+     * Narrow projection backing the scalar half of {@code GET /users/me/rating} (Phase 27.6) —
+     * reads only the two rating aggregate columns, never the full {@link User} entity (which
+     * carries {@code passwordHash} and other PII this endpoint must never touch, even in-memory).
+     *
+     * <p>The endpoint's per-star {@code ratingDistribution} (Phase 27.x) is fetched separately via
+     * {@code ClientReviewRepository#countBySubjectClientIdGroupByRating} and zero-filled by
+     * {@code UserService.getMyRating} — this query is not widened to cover it.
+     */
+    @Query("SELECT u.avgRating AS avgRating, u.reviewCount AS reviewCount FROM User u WHERE u.id = :userId")
+    Optional<UserRatingProjection> findRatingById(@Param("userId") UUID userId);
+
     /**
      * Backs {@link com.beautica.common.security.AuthorizationService#adminBelongsToSalon} —
      * mirrors {@code MasterRepository.existsByIdAndSalonId}, scoped additionally by role so a

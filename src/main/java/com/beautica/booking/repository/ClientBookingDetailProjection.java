@@ -25,8 +25,22 @@ import java.util.UUID;
  * salon's own column is {@code NULL} — reusing the already-joined {@code s}/{@code mu} aliases, no
  * extra join. <b>Do not use {@code COALESCE(s.locationNote, mu.locationNote)} here</b> — {@code
  * COALESCE} falls through to the master's own value whenever the salon's column is {@code NULL},
- * which for a salon-employed master leaks the master's personal data (e.g. their home door code)
- * onto a salon booking. Nullable — most providers never set one.
+ * which for a salon booking leaks the master's personal data (e.g. their home door code).
+ * Nullable — most providers never set one.
+ *
+ * <p><b>Phase 242 — {@code s} is {@code LEFT JOIN b.salon}, the BOOKING's own salon snapshot.</b>
+ * It used to be {@code LEFT JOIN m.salon} (the master's LIVE affiliation), which meant that after
+ * a master rotated salons a client opening an OLD booking was served the NEW salon's
+ * {@code locationNote} — premises-access information for a salon they never booked at. The alias
+ * was re-pointed, not added: {@code s} is referenced only by {@code s.name} and the five
+ * {@code CASE WHEN} columns, so the query still carries 7 joins. The {@code CASE WHEN} /
+ * ternary shape above is untouched and must stay — only the salon it keys off changed. A booking
+ * made at a salon always carries a non-null {@code bookings.salon_id} (the column dates from
+ * {@code V18__create_bookings.sql:8}), so {@code s.id IS NULL} means "this visit genuinely was at
+ * the master's own address", which is when the master's own row is the correct answer.
+ *
+ * <p>{@code salonId} ({@code b.salon.id}, Phase B2) therefore now resolves through this same
+ * alias: it and {@code salonName} share one source and can no longer disagree.
  *
  * <p><b>Locality is FK ids, not labels.</b> JPQL cannot resolve the taxonomy {@code name_uk}
  * labels — that is the {@code DiscoveryLocationResolver} M2 seam's job (§E: batch-resolved in
@@ -35,8 +49,9 @@ import java.util.UUID;
  * master's own user row — mirroring {@code SearchService}); the service stamps the resolved
  * labels onto the response DTO in-memory.
  *
- * <p>{@code canReview} is NOT stored here: it is derived by the service as
- * {@code status == COMPLETED && !reviewExists}, keeping the truth-table logic in one place.
+ * <p>{@code canReview} is NOT stored here: it is derived by the service from {@code status},
+ * {@code endsAt}, {@code reviewExists} and whether a registered client exists — see {@code
+ * BookingService#canReview} and {@code BookingClosureRule#isReviewEligible} for the truth table.
  *
  * <p>{@code priceMaxAtBooking} is read straight off {@code b} — the frozen snapshot column added
  * by V119, the companion to {@code priceAtBooking}'s floor. It needs no join and no derivation:
@@ -81,6 +96,41 @@ public record ClientBookingDetailProjection(
         String locationNote,
         String categoryName,
         boolean reviewExists,
-        BigDecimal priceMaxAtBooking
+        BigDecimal priceMaxAtBooking,
+        // BE-5: the visit (appointments) this booking belongs to, or null for a legacy single-service
+        // booking. SELECT-only via the FK column (b.appointment.id), never a join — a null FK yields
+        // null here and the row is NOT filtered out, so every legacy booking still appears with a
+        // null appointmentId. Populates BookingDetailResponse.appointmentId on the CLIENT
+        // GET /bookings/me projection path.
+        UUID appointmentId,
+        // The client's own avatar, read as b.client.avatarUrl off the ALREADY-PRESENT `JOIN
+        // b.client` — no additional join, no additional query. Present here purely so the shared
+        // BookingDetailResponse does not diverge by role: the PROVIDER path populates
+        // clientAvatarUrl (that is the feature — the master timeline's client photo), so leaving
+        // it null here would make one endpoint return a field whose emptiness encodes the
+        // CALLER's role rather than the data. On this CLIENT-scoped path the value is simply the
+        // caller's own photo. Appended last, after the UUID appointmentId, for the same
+        // compile-time-slip-detection reason as priceMaxAtBooking above.
+        String clientAvatarUrl,
+        // Phase B1: the master's denormalized rating aggregate, selected as `m.avgRating` /
+        // `m.reviewCount` off the ALREADY-PRESENT `JOIN b.master m` — no additional join, no
+        // additional query, no live aggregation (the columns are maintained on write by
+        // ReviewRepository#recalculateMasterRating). Selected RAW, on purpose: the
+        // zero-review-to-null normalisation lives in BookingDetailResponse#masterAvgRatingOrNull
+        // so this path and the entity path run the SAME branch rather than a JPQL CASE WHEN here
+        // and a Java ternary there, which is precisely how two mappers drift. Appended last, after
+        // the String clientAvatarUrl, for the same compile-time-slip-detection reason as
+        // priceMaxAtBooking above.
+        BigDecimal masterAvgRating,
+        int masterReviewCount,
+        // Phase B2: the booking's OWN salon snapshot, selected as `b.salon.id` — an implicit
+        // identifier path on a @ManyToOne, which reads the FK column already on the `bookings` row
+        // and adds NO join (the same SELECT-only shape as appointmentId above; a null FK yields
+        // null here and the row is NOT filtered out, so an independent master's booking still
+        // appears). It is the salon the review is stamped with (ReviewService#createReview), hence
+        // the salon aggregate a client must invalidate. Since phase 242 the `s` alias is itself
+        // `LEFT JOIN b.salon`, so `s.id` would now give the same answer — the explicit `b.salon.id`
+        // is kept because it needs no join at all and states the intent at the point of use.
+        UUID salonId
 ) {
 }

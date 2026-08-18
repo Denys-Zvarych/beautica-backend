@@ -39,6 +39,8 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -266,15 +268,60 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — 200 when ?page is exactly 500 (at @Max ceiling, accepted)")
-    void should_return200_when_pageAtMaxCeiling() throws Exception {
-        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(500, 20), 0L);
+    @DisplayName("GET /api/v1/search/masters — 200 when ?page is the LAST page inside the 10000-result window (page=499, size=20)")
+    void should_return200_when_pageAtResultWindowCeiling() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(499, 20), 0L);
         when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
 
-        log.debug("Act: GET {} with page=500 — exactly at @Max(500), must be accepted (200)", MASTERS_URL);
+        // 499 * 20 + 20 == 10 000 — exactly ON the SearchResultWindow bound, so accepted.
+        log.debug("Act: GET {} with page=499&size=20 — offset+size == 10000, must be accepted (200)", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "499")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when page*size exceeds the 10000-result window (page=500, size=20)")
+    void should_return400_when_pageAndSizeExceedResultWindow() throws Exception {
+        // Both fields are individually legal (page <= @Max(500), size <= @Max(100)); it is the
+        // PRODUCT that is rejected — 500 * 20 + 20 == 10 020 > 10 000. Must be a 400 in the
+        // standard envelope, never a silent clamp to a 200 (see SearchResultWindow).
+        log.debug("Act: GET {} with page=500&size=20 — offset+size == 10020, must be rejected (400)", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
                         .param("page", "500")
                         .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 400 when page*size exceeds the window at the size ceiling (page=100, size=100)")
+    void should_return400_when_resultWindowExceededAtSizeCeiling() throws Exception {
+        // 100 * 100 + 100 == 10 100 > 10 000. page=100 is far below @Max(500), so only the
+        // product check can reject this — the per-field caps cannot.
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "100")
+                        .param("size", "100")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when ?page=500 stays inside the window at size=1 (product, not ordinal, is the bound)")
+    void should_return200_when_pageAtOrdinalCeilingButInsideWindow() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(500, 1), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        // 500 * 1 + 1 == 501, well inside the window — proves the window is enforced on the
+        // PRODUCT and page's @Max(500) was not simply lowered.
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "500")
+                        .param("size", "1")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
@@ -663,18 +710,126 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/salons — 200 when ?page is exactly 500 (at @Max ceiling, accepted)")
-    void should_return200_when_pageAtMaxCeiling_forSalonSearch() throws Exception {
-        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(500, 20), 0L);
+    @DisplayName("GET /api/v1/search/salons — 200 when ?page is the LAST page inside the 10000-result window (page=499, size=20)")
+    void should_return200_when_pageAtResultWindowCeiling_forSalonSearch() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(499, 20), 0L);
         when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class))).thenReturn(page);
 
-        log.debug("Act: GET {} with page=500 — exactly at @Max(500), must be accepted (200)", SALONS_URL);
+        log.debug("Act: GET {} with page=499&size=20 — offset+size == 10000, must be accepted (200)", SALONS_URL);
         mockMvc.perform(get(SALONS_URL)
-                        .param("page", "500")
+                        .param("page", "499")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when page*size exceeds the 10000-result window (page=500, size=20)")
+    void should_return400_when_pageAndSizeExceedResultWindow_forSalonSearch() throws Exception {
+        // Mirrors the master boundary — the salon path is the more expensive of the two
+        // (correlated q EXISTS), so the window matters at least as much here.
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "500")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 400 when page*size exceeds the window at the size ceiling (page=100, size=100)")
+    void should_return400_when_resultWindowExceededAtSizeCeiling_forSalonSearch() throws Exception {
+        // Salon parity for the master-side case: page=100 is far below @Max(500), so only
+        // the PRODUCT check can reject 100 * 100 + 100 == 10 100.
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "100")
+                        .param("size", "100")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — 200 when ?page=500 stays inside the window at size=1 (product, not ordinal, is the bound)")
+    void should_return200_when_pageAtOrdinalCeilingButInsideWindow_forSalonSearch() throws Exception {
+        Page<SalonSearchResult> page = new PageImpl<>(List.of(), PageRequest.of(500, 1), 0L);
+        when(searchService.searchSalons(any(SalonSearchRequest.class), any(Pageable.class)))
+                .thenReturn(page);
+
+        // 500 * 1 + 1 == 501, far inside the window. If the bound were on the page
+        // ORDINAL rather than the product this would 400 — it must not.
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "500")
+                        .param("size", "1")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    // ── result window — the ERROR KEY and the no-clamp guarantee ───────────────
+    //
+    // The boundary matrix above asserts status codes only. Two properties were
+    // unpinned: WHICH constraint rejected the request (a page=500&size=20 rejection
+    // would look identical if it came from the page @Max, so the tests could not tell
+    // the product bound from the ordinal one), and that an over-window request is
+    // never quietly served from a clamped page.
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — the over-window 400 names the withinResultWindow constraint in the standard envelope")
+    void should_reportWithinResultWindowErrorKey_when_masterRequestExceedsWindow() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "100")
+                        .param("size", "100")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                // The @AssertTrue property name — this is what distinguishes the PRODUCT
+                // bound from the per-field @Max(500)/@Max(100) caps, both of which pass here.
+                .andExpect(jsonPath("$.errors.withinResultWindow").exists())
+                .andExpect(jsonPath("$.errors.withinResultWindow").value(
+                        org.hamcrest.Matchers.containsString("10000")))
+                .andExpect(jsonPath("$.errors.page").doesNotExist())
+                .andExpect(jsonPath("$.errors.size").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — the over-window 400 names the withinResultWindow constraint too")
+    void should_reportWithinResultWindowErrorKey_when_salonRequestExceedsWindow() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "100")
+                        .param("size", "100")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.withinResultWindow").exists());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — an over-window request is REJECTED, never clamped: the service is not invoked at all")
+    void should_notInvokeService_when_masterRequestExceedsWindow() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("page", "500")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        // A silent clamp would return HTTP 200 with a page the caller never asked for,
+        // so a client paging forward would see a full page, believe more pages exist and
+        // loop. Validation must reject BEFORE the search runs.
+        verify(searchService, never()).searchMasters(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/salons — an over-window request is REJECTED, never clamped: the service is not invoked at all")
+    void should_notInvokeService_when_salonRequestExceedsWindow() throws Exception {
+        mockMvc.perform(get(SALONS_URL)
+                        .param("page", "500")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest());
+
+        verify(searchService, never()).searchSalons(any(SalonSearchRequest.class), any(Pageable.class));
     }
 
     @Test
@@ -743,12 +898,65 @@ class SearchControllerTest {
     @DisplayName("GET /api/v1/search/masters — 400 when q contains a control character (@Pattern)")
     void should_return400_when_qHasControlChar() throws Exception {
         mockMvc.perform(get(MASTERS_URL)
-                        .param("q", "<script>")
+                        // A real control character (BEL) is the ONLY character class the
+                        // relaxed @Pattern still rejects.
+                        .param("q", "abc" + (char) 7 + "def")
                         .param("page", "0")
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when q contains a Ukrainian apostrophe (the U+0027 ban was a real bug: В'ячеслав, Мар'яна)")
+    void should_return200_when_qContainsUkrainianApostrophe() throws Exception {
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "В'ячеслав")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 when q contains angle brackets / quotes: they are bound as a JDBC parameter, never interpolated or reflected into HTML")
+    void should_return200_when_qHasHtmlSpecialCharacters() throws Exception {
+        // The former @Pattern banned < > " ' as a "SQL-injection defence". It
+        // bought nothing (q is bound as :q0…:q3 and the response is JSON) while
+        // rejecting every Ukrainian apostrophe name, so the ban was removed.
+        Page<MasterSearchResult> empty = new PageImpl<>(List.of(), PageRequest.of(0, 20), 0L);
+        when(searchService.searchMasters(any(), any(Pageable.class))).thenReturn(empty);
+
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "<script>")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/search/masters — 200 + empty page + the frozen Ukrainian helper message when q is below the 3-character floor")
+    void should_return200WithHelperMessage_when_qBelowMinimumLength() throws Exception {
+        mockMvc.perform(get(MASTERS_URL)
+                        .param("q", "Ру")
+                        .param("page", "0")
+                        .param("size", "20")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Введіть щонайменше 3 символи"))
+                .andExpect(jsonPath("$.data.totalElements").value(0))
+                .andExpect(jsonPath("$.data.data").isEmpty());
+
+        // The search is never executed — the answer is known at the boundary.
+        verify(searchService, never()).searchMasters(any(), any(Pageable.class));
     }
 
     @Test

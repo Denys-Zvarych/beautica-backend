@@ -3,19 +3,25 @@ package com.beautica.booking;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.TimeZones;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,8 +52,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * ({@code "mbmsf-salon-master-"} vs {@code "mbbd-salon-master-"}) — that field is never read back
  * by any caller (both suites address the master purely via {@link SalonFixture#masterId()}), so it
  * was safe to unify on a single generic prefix rather than threading a caller-supplied one through.
+ *
+ * <p><b>{@code public} (cycle-2 audit finding 5).</b> The class and the handful of members below
+ * used cross-package by {@code com.beautica.booking.service.AppointmentClientLegCancelConcurrencyIT}
+ * / {@code AppointmentCrossPathTransitionConcurrencyIT} are {@code public} specifically so those
+ * two concurrency regression tests can live in {@code com.beautica.booking.service} — the same
+ * package as {@code AppointmentTransitionService} — which in turn lets the header-lock methods they
+ * {@code @SpyBean} stay package-private instead of being forced {@code public} purely for test
+ * reachability. This is test-only source ({@code src/test}), never shipped.
  */
-class BookingTestFixtures {
+public class BookingTestFixtures {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
@@ -56,7 +70,7 @@ class BookingTestFixtures {
     private final ObjectMapper objectMapper;
     private final PasswordEncoder passwordEncoder;
 
-    BookingTestFixtures(
+    public BookingTestFixtures(
             TestRestTemplate restTemplate,
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
@@ -68,7 +82,7 @@ class BookingTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
-    UUID createUser(String email, String role, UUID salonId) {
+    public UUID createUser(String email, String role, UUID salonId) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
@@ -77,7 +91,7 @@ class BookingTestFixtures {
         return id;
     }
 
-    UUID createIndependentMaster(String email) {
+    public UUID createIndependentMaster(String email) {
         UUID userId = createUser(email, "INDEPENDENT_MASTER", null);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -87,14 +101,28 @@ class BookingTestFixtures {
         return masterId;
     }
 
-    UUID createIndependentMasterService(UUID masterId) {
+    public UUID createIndependentMasterService(UUID masterId) {
+        return createIndependentMasterService(masterId, "Test Service");
+    }
+
+    /**
+     * Same as {@link #createIndependentMasterService(UUID)} but with a caller-chosen service NAME.
+     *
+     * <p>Added for {@code com.beautica.notification.MultiServiceNotificationIT}: the no-arg variant
+     * hardcodes {@code 'Test Service'}, so a three-service visit seeded through it gives all three
+     * items the SAME name — an assertion that "every service of the visit is named in the e-mail"
+     * would then pass verbatim against the very bug it exists to catch (only the lead service is
+     * rendered, three times over). A fixture value that cannot move the assertion is not a fixture,
+     * it is a false pass. Every other caller keeps the old constant through the delegate above.
+     */
+    public UUID createIndependentMasterService(UUID masterId, String serviceName) {
         UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, userId, serviceName, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
@@ -149,7 +177,7 @@ class BookingTestFixtures {
                 UUID.class, ownerType, ownerId);
     }
 
-    String tokenFor(String email) throws Exception {
+    public String tokenFor(String email) throws Exception {
         ResponseEntity<String> resp = restTemplate.postForEntity(
                 "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
         assertThat(resp.getStatusCode()).as("login must succeed for %s", email).isEqualTo(HttpStatus.OK);
@@ -157,7 +185,7 @@ class BookingTestFixtures {
                 .data().accessToken();
     }
 
-    HttpHeaders bearerHeaders(String token) {
+    public HttpHeaders bearerHeaders(String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -191,6 +219,125 @@ class BookingTestFixtures {
                         + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
                 masterId, masterUserId, salonId);
         return new SalonFixture(salonId, ownerEmail, masterId, masterEmail);
+    }
+
+    // ── visit (appointment) fixtures ─────────────────────────────────────────
+    //
+    // Extracted here per the Q4 "extraction overdue" threshold: AppointmentReviewIT and
+    // AppointmentTransitionIT each carried a byte-identical addWorkingHoursForEveryDay plus a
+    // near-identical "create master + client + N services + post POST /appointments" block that
+    // differed only in the generated email prefix, the service count, and how many of the
+    // resulting ids each suite happened to keep. The record below is the UNION of the two local
+    // {@code Visit} records, so both call sites read the accessors they already used.
+    //
+    // NOT moved: each suite's own assertion/inspection helpers (childIdsOf, itemStatus,
+    // postVisitRaw, patchServiceDecline, …) — those are genuinely suite-specific and force-merging
+    // them would couple two unrelated test surfaces.
+
+    private static final String APPOINTMENTS_URL = "/api/v1/appointments";
+
+    /**
+     * A created CONFIRMED visit plus every id/token either caller needs to drive and inspect it —
+     * the union of the two local {@code Visit} records this replaces.
+     */
+    public record VisitFixture(UUID id, String clientToken, UUID clientId, UUID masterId, String masterToken) {}
+
+    /**
+     * Creates an INDEPENDENT_MASTER + CLIENT and posts a CONFIRMED visit of {@code serviceCount}
+     * chained services through the REAL {@code POST /appointments} endpoint — the one the mobile app
+     * uses for EVERY booking. {@code serviceCount == 1} is deliberately supported and is the
+     * dominant production shape: {@code CreateAppointmentRequest.masterServiceIds} is
+     * {@code @NotEmpty}, not {@code size > 1}, so a single-service booking still gets a full
+     * Appointment header with {@code bookings.appointment_id} set.
+     *
+     * @param emailPrefix per-suite, per-test discriminator woven into the generated emails (e.g.
+     *                    {@code "appt-rev-sibling"}) so concurrent suites never collide on the
+     *                    users unique index
+     */
+    public VisitFixture createConfirmedVisit(String emailPrefix, int serviceCount) throws Exception {
+        return createConfirmedVisit(
+                emailPrefix, Collections.nCopies(serviceCount, "Test Service"));
+    }
+
+    /**
+     * Same as {@link #createConfirmedVisit(String, int)} but with one caller-chosen service NAME per
+     * chained item — see {@link #createIndependentMasterService(UUID, String)} for why a
+     * notification test cannot use the shared {@code 'Test Service'} constant. The visit is chained
+     * in list order, and {@code POST /appointments} preserves that order, so
+     * {@code serviceNames.get(0)} is the visit's lead service.
+     */
+    public VisitFixture createConfirmedVisit(String emailPrefix, List<String> serviceNames) throws Exception {
+        String masterEmail = emailPrefix + "-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = createIndependentMaster(masterEmail);
+        String clientEmail = emailPrefix + "-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = createUser(clientEmail, "CLIENT", null);
+        List<UUID> serviceIds = new ArrayList<>(serviceNames.size());
+        for (String serviceName : serviceNames) {
+            serviceIds.add(createIndependentMasterService(masterId, serviceName));
+        }
+        addWorkingHoursForEveryDay(masterId);
+        String clientToken = tokenFor(clientEmail);
+        String masterToken = tokenFor(masterEmail);
+
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
+        // Body via ObjectMapper (§Q16) rather than string concatenation, so a fixture value can
+        // never silently corrupt the JSON.
+        String body = objectMapper.writeValueAsString(Map.of(
+                "masterId", masterId.toString(),
+                "masterServiceIds", serviceIds.stream().map(UUID::toString).toList(),
+                "startsAt", startsAt.toOffsetDateTime().toString()));
+        HttpHeaders headers = bearerHeaders(clientToken);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> created = restTemplate.exchange(
+                APPOINTMENTS_URL, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+        assertThat(created.getStatusCode())
+                .as("visit setup must succeed — body: %s", created.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        JsonNode data = objectMapper.readTree(created.getBody()).path("data");
+
+        return new VisitFixture(
+                UUID.fromString(data.path("id").asText()), clientToken, clientId, masterId, masterToken);
+    }
+
+    /**
+     * Drops the outbox rows a visit CREATE enqueues, so a transition suite's STATUS_CHANGED
+     * assertions measure only what the TRANSITION under test enqueued.
+     *
+     * <p>Creating a visit enqueues two rows against its lead booking — {@code NEW_BOOKING} for the
+     * provider and {@code STATUS_CHANGED} for the client's «Бронювання підтверджено» — exactly the
+     * pair the single-service create path has always enqueued
+     * ({@code BookingService#doCreateBooking}). Create-time cardinality is owned by
+     * {@code AppointmentCreateIT} and {@code MultiServiceNotificationIT}, which assert it directly;
+     * counting it in a transition suite would silently inflate every assertion there.
+     *
+     * <p>Extracted here (Q4 two-occurrence threshold) from the byte-identical private copies
+     * {@code AppointmentTransitionIT} and {@code BookingAppointmentChildTransitionGuardIT} each
+     * grew in the same commit — a third copy is exactly how these drift.
+     */
+    public void dropCreateTimeNotifications(UUID appointmentId) {
+        jdbcTemplate.update(
+                "DELETE FROM notification_outbox WHERE aggregate_id IN "
+                        + "(SELECT id FROM bookings WHERE appointment_id = ?)",
+                appointmentId);
+    }
+
+    /**
+     * Open-ended weekly schedule with all seven ISO weekdays 08:00–20:00 so a near-future visit can
+     * be booked on any day.
+     */
+    public void addWorkingHoursForEveryDay(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to) "
+                        + "VALUES (?, ?, DATE '2020-01-01', NULL)",
+                scheduleId, masterId);
+        for (int day = 1; day <= 7; day++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                            + "VALUES (?, ?, ?, '08:00', '20:00')",
+                    UUID.randomUUID(), scheduleId, day);
+        }
     }
 
     UUID createSalonService(UUID salonId, UUID masterId) {

@@ -28,6 +28,17 @@ import java.util.List;
  *
  * <p>The {@code @Size} caps bound the payload: {@code intervals} ≤ 6 (window-with-breaks),
  * {@code times} ≤ 24 (one discrete slot per hour of a day is already generous).
+ *
+ * <p><b>Phase 15.12 — {@code windowStart}/{@code windowEnd} (optional, display-only).</b> The editor models
+ * a day as ONE window (від–до) with breaks carved out, but only the resulting {@code intervals} are stored,
+ * and breaks are rebuilt from the GAPS BETWEEN them. A break flush against an edge of the window leaves no
+ * gap (09:00–18:00 minus a 09:00–10:00 break == the single interval {@code [10:00–18:00]}), so it vanishes
+ * on reload. Sending the window lets the client derive breaks as {@code window MINUS intervals} and recover
+ * edge-flush ones. The bounds are <b>metadata only</b>: {@code intervals} remains the single canonical
+ * source of availability and the slot/booking engine never reads the window. Both fields null (the legacy
+ * shape — behaves exactly as before) or both set; see {@link #isWindowConsistent()}. Meaningful only for an
+ * {@link WeekdayMode#INTERVAL} day with ≥1 interval — on a day off or an {@code EXPLICIT_TIMES} day the
+ * service persists {@code null} and ignores whatever was supplied.
  */
 public record WeeklyScheduleDayRequest(
         @Min(value = 1, message = "Day of week must be between 1 (Monday) and 7 (Sunday)")
@@ -37,12 +48,21 @@ public record WeeklyScheduleDayRequest(
         // null = INTERVAL (default) for backward compatibility with pre-15.8 clients.
         WeekdayMode mode,
 
+        // The element-level @NotNull is load-bearing, not decoration: Hibernate Validator's @Valid cascade
+        // SKIPS null elements, so without it `{"intervals":[null]}` passes Bean Validation and NPEs in the
+        // service (assertIntervalsNonOverlapping / resolveWindow dereference each dto) — a 500 where the
+        // caller deserves a 400. Mirrors the sibling `times` list, which has always declared it.
         @Valid
         @Size(max = 6, message = "A day may have at most 6 intervals")
-        List<WorkIntervalDto> intervals,
+        List<@NotNull(message = "An interval must not be null") WorkIntervalDto> intervals,
 
         @Size(max = 24, message = "A day may have at most 24 discrete times")
-        List<@NotNull(message = "A discrete time must not be null") LocalTime> times
+        List<@NotNull(message = "A discrete time must not be null") LocalTime> times,
+
+        // Phase 15.12 — both null (legacy/omitted) or both set. Display-only; never widens/narrows slots.
+        LocalTime windowStart,
+
+        LocalTime windowEnd
 ) {
 
     /**
@@ -50,7 +70,17 @@ public record WeeklyScheduleDayRequest(
      * call shape for callers (and the wire contract) that predate the {@code mode}/{@code times} fields.
      */
     public WeeklyScheduleDayRequest(int dayOfWeek, List<WorkIntervalDto> intervals) {
-        this(dayOfWeek, WeekdayMode.INTERVAL, intervals, null);
+        this(dayOfWeek, WeekdayMode.INTERVAL, intervals, null, null, null);
+    }
+
+    /**
+     * Pre-15.12 convenience constructor: the {@code mode}/{@code intervals}/{@code times} shape that predates
+     * the display-only working-window bounds. Keeps every existing caller compiling unchanged with a
+     * {@code null} window (i.e. verbatim pre-15.12 behaviour).
+     */
+    public WeeklyScheduleDayRequest(
+            int dayOfWeek, WeekdayMode mode, List<WorkIntervalDto> intervals, List<LocalTime> times) {
+        this(dayOfWeek, mode, intervals, times, null, null);
     }
 
     /** The effective mode: an absent {@code mode} defaults to {@link WeekdayMode#INTERVAL}. */
@@ -72,5 +102,23 @@ public record WeeklyScheduleDayRequest(
             case INTERVAL -> !hasTimes;
             case EXPLICIT_TIMES -> hasTimes && !hasIntervals;
         };
+    }
+
+    /**
+     * Phase 15.12: shape of the optional working-window bounds — both omitted (legacy/absent) or both
+     * present, and strictly ordered when present (no zero-length, no midnight crossing, matching the locked
+     * Phase 15.x no-cross-midnight interval contract).
+     *
+     * <p>Only the SHAPE is checked here. <b>Containment</b> — the window must contain every interval of the
+     * day — needs the interval list AND the resolved mode, so it lives in {@code MasterScheduleService}
+     * alongside the intra-day overlap rule (and is mirrored there defensively, as every other rule in this
+     * record is).
+     */
+    @AssertTrue(message =
+            "windowStart and windowEnd must both be provided or both omitted, and windowEnd must be "
+                    + "after windowStart")
+    public boolean isWindowConsistent() {
+        return (windowStart == null) == (windowEnd == null)
+                && (windowStart == null || windowEnd.isAfter(windowStart));
     }
 }

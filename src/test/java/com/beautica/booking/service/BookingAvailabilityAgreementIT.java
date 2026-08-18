@@ -1,18 +1,27 @@
 package com.beautica.booking.service;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.booking.dto.AppointmentCancelRequest;
 import com.beautica.booking.dto.AvailableSlotResponse;
+import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.CreateBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
+import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.master.dto.MasterWorkingDayResponse;
 import com.beautica.master.dto.ScheduleOverrideRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
+import com.beautica.master.entity.WeekdayMode;
 import com.beautica.master.service.MasterScheduleService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 
@@ -92,6 +101,22 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
 
     @Autowired
     private Clock kyivClock;
+
+    /** Cases 11–16 only — the REAL booking-write path, so the afterCommit eviction hook fires. */
+    @Autowired
+    private BookingService bookingService;
+
+    /** Case 17 only — the appointment (multi-service visit) analogue of the booking-write path. */
+    @Autowired
+    private AppointmentTransitionService appointmentTransitionService;
+
+    /** Case 18 only — the GUEST (LINK) cancel-by-token path, a third writer into the same sweep. */
+    @Autowired
+    private BookingCancellationService bookingCancellationService;
+
+    /** Cases 11–18 only — read-only inspection of the live {@code available-slots} Caffeine cache. */
+    @Autowired
+    private CacheManager cacheManager;
 
     // ── the two endpoints, called through the genuine pipeline ──────────────────────────────
 
@@ -336,6 +361,310 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7b — EXPLICIT_TIMES day: the DECLARED times ARE the slot set (2026-08-11 HIGH-1 fix)
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("case 7b — an EXPLICIT_TIMES override declaring 13:00 and 15:00 offers EXACTLY those two "
+            + "starts for a 60-min service — no fabricated 13:30/14:00, and 15:00 is NOT swallowed")
+    void should_offerExactlyTheDeclaredTimes_when_dayIsExplicitTimes() {
+        LocalDate day = TODAY.plusDays(11);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        // The resolver projects this day as the DERIVED window [13:00..15:00] (a display artifact) plus
+        // the declared times. Striding that window on the 30-min grid used to offer 13:00/13:30/14:00 —
+        // two starts the master never declared — while 15:00, which they DID declare, could never be
+        // offered at all: it is the window END, so nothing can start there and still fit.
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(13, 0), LocalTime.of(15, 0))));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("the declared times ARE the slot set — never a grid across the derived window")
+                .containsExactly(LocalTime.of(13, 0), LocalTime.of(15, 0));
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days agrees: the day has declared times that survive every filter")
+                .isTrue();
+
+        // A day declaring exactly ONE time projects a DEGENERATE derived window (min == max), which the
+        // interval walk rejected outright (workEnd == workStart → no slots), so such a day could not be
+        // booked at all. Its own master/date, so the assertion is not served from a warm cache entry.
+        Master solo = seedIndependentMaster();
+        UUID soloSvc = addService(solo, 60, 0);
+        masterScheduleService.upsertOverride(solo.userId(), solo.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(LocalTime.of(13, 0))));
+
+        assertThat(slotStarts(solo.masterId(), day, soloSvc))
+                .as("a single declared time is bookable — its derived window is a zero-length point")
+                .containsExactly(LocalTime.of(13, 0));
+    }
+
+    /**
+     * <b>Scope note (mutation-tested 2026-08-11).</b> This is an AGREEMENT pin, not a fix-regression pin:
+     * with the {@code isExplicitTimes} switch reverted it stays GREEN, because a lone declared time
+     * projects a degenerate {@code [13:00..13:00]} derived window from which the interval walk also
+     * yields nothing. That is fine for what it asserts — day gate ⇔ slot list on a negative day — but do
+     * not read it as protecting the declared-times routing. Cases 7b/7d/7f do that, and all three go red
+     * against that revert.
+     */
+    @Test
+    @DisplayName("case 7c — day-gate agreement on an EXPLICIT_TIMES day whose ONLY declared time is "
+            + "already booked: working=FALSE and /slots EMPTY (both agree)")
+    void should_agreeDayUnavailable_when_theOnlyDeclaredTimeIsTaken() {
+        LocalDate day = TODAY.plusDays(12);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        // A single declared time — the case whose derived window is DEGENERATE (min == max), which the
+        // interval walk rejected outright, so such a day could never be booked at all.
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(LocalTime.of(13, 0))));
+
+        // NB: no read before the booking is inserted — the first slotStarts call would populate the
+        // `available-slots` cache, and a raw JDBC insert evicts nothing. The "a lone declared time is
+        // bookable" half of this contract is asserted in case 7b on its own master.
+        insertBooking(m.masterId(), svc, seedClient(), day, LocalTime.of(13, 0), LocalTime.of(14, 0), "CONFIRMED");
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("/slots — the only declared time is taken, so nothing is offered")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days MUST agree: a day whose declared times all fail the filters is "
+                        + "non-working — the day gate and the slot list share one predicate")
+                .isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7f — PARTIALLY booked EXPLICIT_TIMES day: the survivors are still DECLARED times
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The positive half of the day-gate/slot-list agreement on an EXPLICIT_TIMES day, and the case
+     * case 7c cannot pin. 7c seeds a day with ONE declared time and books it, then asserts empty +
+     * {@code working = false} — a verdict the PRE-FIX interval walk also returns, because a lone
+     * declared time projects a degenerate {@code [13:00..13:00]} window that yields nothing either way.
+     * 7c is a sound agreement pin, but it is green against the bug and cannot detect a regression of it.
+     *
+     * <p>Here two times are declared and only the first is booked. The fix offers the remaining DECLARED
+     * time (15:00); the interval walk offers 14:00 — a start the master never declared, produced by
+     * striding the derived window across the freed grid. Same day, same booking, opposite answers, so
+     * the assertion discriminates.
+     */
+    @Test
+    @DisplayName("case 7f — booking ONE of two declared times leaves the OTHER declared time (15:00) on "
+            + "offer, never a grid start (14:00) the master never declared")
+    void should_offerTheRemainingDeclaredTime_when_oneOfTwoDeclaredTimesIsBooked() {
+        LocalDate day = TODAY.plusDays(15);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(13, 0), LocalTime.of(15, 0))));
+        // NB: seeded BEFORE any read — a raw JDBC insert evicts no `available-slots` cache entry, so a
+        // read here would poison the assertions below (same trap case 7c documents).
+        insertBooking(m.masterId(), svc, seedClient(), day,
+                LocalTime.of(13, 0), LocalTime.of(14, 0), "CONFIRMED");
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("13:00 is taken; 15:00 is the only other DECLARED time and it survives. 14:00 is "
+                        + "what the derived-window grid would fabricate once 13:00–14:00 frees up — it "
+                        + "must not appear, because the master never offered it.")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days agrees — a declared time still survives every filter")
+                .isTrue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7g/7h/7i — EXPLICIT_TIMES: a booking that RUNS THROUGH a later declared time eats it
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // An EXPLICIT_TIMES day emits exactly the declared times, and its ONLY end bound is the same Kyiv
+    // civil day — there is deliberately no rule that a service must finish before the next declared time
+    // (locked 2026-08-11: an unreachable declared time is the master's own responsibility, and there is no
+    // warning at declaration time by product decision). So a master who declares 10:00 and 11:00 and then
+    // sells a 4-hour service at 10:00 has, without being told, closed the whole day.
+    //
+    // Case 7f already books ONE of two declared times, but with a 60-min service against declared
+    // 13:00/15:00 — the booking ends at 14:00 and touches nothing. These three cases are the first
+    // anywhere to seed a booking whose half-open [starts_at, ends_at) span strictly CONTAINS a later
+    // declared time, which is the interior branch of the declared walk's overlap test.
+
+    @Test
+    @DisplayName("case 7g — a 4-hour booking at the 10:00 declared time swallows the 11:00 one: /slots "
+            + "EMPTY and working=FALSE, for a 30-min request as well as a 4-hour one")
+    void should_agreeDayUnavailable_when_aLongBookingSwallowsTheOtherDeclaredTime() {
+        LocalDate day = TODAY.plusDays(16);
+
+        Master m = seedIndependentMaster();
+        UUID svc4h = addService(m, 240, 0);
+        UUID svc30 = addService(m, 30, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        // Seeded BEFORE any read — a raw JDBC insert evicts no `available-slots` entry (see case 7c).
+        insertBooking(m.masterId(), svc4h, seedClient(), day,
+                LocalTime.of(10, 0), LocalTime.of(14, 0), "CONFIRMED");
+
+        // A 30-min request is the strongest form of the assertion: the NEXT client's own duration cannot
+        // rescue a start that already lies inside an occupied range, because a candidate's end is always
+        // after its start, which is already after the booking's start. A day gate that tested only "does
+        // a booking START on this declared time?" would still offer 11:00 here.
+        assertThat(slotStarts(m.masterId(), day, svc30))
+                .as("11:00 is strictly inside the booked [10:00,14:00) — a 30-min request does not fit "
+                        + "'between' anything, because the declared walk offers declared times only")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc30))
+                .as("working-days MUST agree — both declared times are consumed")
+                .isFalse();
+
+        assertThat(slotStarts(m.masterId(), day, svc4h))
+                .as("the same verdict for the 4-hour service the booking itself used")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc4h))
+                .as("agreement invariant on the second service too")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("case 7h — THRESHOLD: a 60-min booking at 10:00 ends exactly on the 11:00 declared time "
+            + "(still offered, day TRUE); a 61-min one overruns it (empty, day FALSE)")
+    void should_gateTheLaterDeclaredTimeOnExactOverrun_atTheOneMinuteBoundary() {
+        LocalDate fits = TODAY.plusDays(17);
+        LocalDate overruns = TODAY.plusDays(18);
+
+        Master m = seedIndependentMaster();
+        UUID svc60 = addService(m, 60, 0);   // what the NEXT client asks for, on both days
+        UUID svc61 = addService(m, 61, 0);   // the one-minute-longer service booked on the second day
+        UUID client = seedClient();
+        for (LocalDate day : List.of(fits, overruns)) {
+            masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                    new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                            WeekdayMode.EXPLICIT_TIMES, null,
+                            List.of(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        }
+        insertBooking(m.masterId(), svc60, client, fits,
+                LocalTime.of(10, 0), LocalTime.of(11, 0), "CONFIRMED");
+        insertBooking(m.masterId(), svc61, client, overruns,
+                LocalTime.of(10, 0), LocalTime.of(11, 1), "CONFIRMED");
+
+        assertThat(slotStarts(m.masterId(), fits, svc60))
+                .as("the booking ends exactly where the 11:00 declared time starts; the overlap test is "
+                        + "strict on both sides, so 11:00 survives (10:00 itself is taken)")
+                .containsExactly(LocalTime.of(11, 0));
+        assertThat(bookableDay(m.masterId(), fits, svc60))
+                .as("working-days agrees — one declared time is still reachable")
+                .isTrue();
+
+        assertThat(slotStarts(m.masterId(), overruns, svc60))
+                .as("ONE minute of overrun puts 11:00 strictly inside [10:00,11:01) and kills the whole "
+                        + "day. This pair is what separates a strict overlap test from an inclusive one.")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), overruns, svc60))
+                .as("working-days agrees — nothing left to reach")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("case 7i — bufferMinutesAfter counts toward the overrun: a 60-min service with a 10-min "
+            + "buffer booked at 10:00 ends 11:10 and consumes the 11:00 declared time")
+    void should_countBufferTowardTheOverrun_when_aDeclaredTimeFollowsABufferedBooking() {
+        LocalDate day = TODAY.plusDays(19);
+
+        Master m = seedIndependentMaster();
+        UUID svcPlain = addService(m, 60, 0);        // what the next client asks for
+        UUID svcBuffered = addService(m, 60, 10);    // 60 min of work + a 10-min buffer after it
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(10, 0), LocalTime.of(11, 0))));
+        // Persisted exactly as BookingService does it: ends_at = starts_at + duration + buffer.
+        insertBufferedBooking(m.masterId(), svcBuffered, seedClient(), day, LocalTime.of(10, 0), 60, 10);
+
+        assertThat(slotStarts(m.masterId(), day, svcPlain))
+                .as("the SAME 60-min service that leaves 11:00 bookable with no buffer (case 7h) consumes "
+                        + "it once its 10-min buffer is folded into ends_at — 11:10 > 11:00")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svcPlain))
+                .as("working-days agrees — the buffer closed the day")
+                .isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 7d/7e — EXPLICIT_TIMES END BOUND: a declared time must FINISH inside its own Kyiv day
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // The end bound is the one filter with no counterpart on an interval day: an interval carries a real
+    // endTime, an EXPLICIT_TIMES day does not, so the walk falls back to "ends by this date's Kyiv
+    // midnight". It is asserted at the unit tier (TimeSlotCalculatorTest, incl. both DST days), but the
+    // unit tier cannot see whether SlotCalculationService actually ROUTES an explicit-times day here —
+    // the same day also carries a DERIVED [min..max] window that the interval walk would happily consume
+    // and answer differently.
+    //
+    // What each case actually pins, end to end on real Postgres (mutation-tested 2026-08-11):
+    //   * 7d pins the ROUTING **and** the bound. Its two declared times project a real [23:00..23:30]
+    //     window that the reverted interval walk consumes differently, so 7d goes RED against the
+    //     `isExplicitTimes` revert; the withheld 23:30 is the end bound itself.
+    //   * 7e pins the END BOUND ONLY — on BOTH endpoints, which is its job. Its lone declared time
+    //     projects a DEGENERATE [23:30..23:30] window from which the interval walk also yields nothing,
+    //     so 7e stays GREEN against that revert and does NOT discriminate the routing switch. Same
+    //     limitation, same cause, as case 7c's scope note above records for itself. It keeps its place
+    //     as the negative-day agreement pin for the bound: working=FALSE and /slots EMPTY must agree
+    //     when the only declared time cannot finish inside its own civil day.
+    // Routing regressions are covered by cases 7b/7d/7f — all three go red against that revert.
+
+    @Test
+    @DisplayName("case 7d — an EXPLICIT_TIMES day declaring 23:00 and 23:30 offers only 23:00 for a "
+            + "60-min service: 23:30 cannot finish inside its own Kyiv day")
+    void should_withholdDeclaredTimeThatCannotFinishInsideTheKyivDay() {
+        LocalDate day = TODAY.plusDays(13);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(23, 0), LocalTime.of(23, 30))));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("23:00 + 60 min ends exactly at midnight and is kept; 23:30 would run into the next "
+                        + "civil day and is withheld. The schedule model forbids cross-midnight ranges, "
+                        + "so this is the strictest bound the domain asserts.")
+                .containsExactly(LocalTime.of(23, 0));
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days agrees — one declared time survives every filter")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("case 7e — an EXPLICIT_TIMES day whose ONLY declared time cannot finish inside the Kyiv "
+            + "day: working=FALSE and /slots EMPTY (both agree)")
+    void should_agreeDayUnavailable_when_theOnlyDeclaredTimeOverrunsTheKyivDay() {
+        LocalDate day = TODAY.plusDays(14);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(LocalTime.of(23, 30))));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("/slots — the single declared time cannot fit a 60-min service before midnight")
+                .isEmpty();
+        assertThat(bookableDay(m.masterId(), day, svc))
+                .as("working-days MUST agree: hasDeclaredSlot applies the SAME day-end bound the slot "
+                        + "list does, so the day gate cannot advertise a day that yields nothing")
+                .isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
     // Case 8 — DAY_OFF override closes the date in the availability mode too (day FALSE, empty)
     // ════════════════════════════════════════════════════════════════════════════════════════
 
@@ -415,6 +744,389 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 11/12 — CACHE: the consumed declared time must disappear for EVERY service, at once
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // Cases 7g/7h/7i prove the CALCULATION withholds a consumed declared time. They seed their
+    // bookings with raw JDBC and read `/slots` once, so they never touch the `available-slots`
+    // cache — a correct calculator behind a stale cache still ships the bug the user reported.
+    //
+    // These two cases are the only ones anywhere that drive a REAL booking write (BookingService,
+    // real transaction, real afterCommit hook) and then re-read `/slots` through the REAL Caffeine
+    // cache with NO sleep and NO TTL wait. What they pin:
+    //
+    //   * case 11 — CROSS-SERVICE eviction. `available-slots` is keyed {masterId, date,
+    //     masterServiceId}, so booking service A leaves service B's entry untouched unless the
+    //     write sweeps the whole master prefix. Before the fix the write evicted only the BOOKED
+    //     service's key, so for up to the 60-second TTL a second client browsing service B was
+    //     still offered the time service A had just consumed.
+    //   * case 12 — eviction on CONFIRMED -> NOT_COMPLETED, a transition that FREES a slot (the
+    //     occupancy predicate is `status = 'CONFIRMED'` only) and evicted nothing at all before
+    //     the fix. No-show carries no temporal guard, so the booking here is deliberately FUTURE:
+    //     its slot must return to the picker immediately.
+    //
+    // Both assert the OUTCOME (which wall-clocks `/slots` offers) and, as the mechanism guard, that
+    // the warm read really did populate the cache — without that a green could mean "nothing was
+    // ever cached" rather than "the eviction reached it".
+
+    @Test
+    @DisplayName("case 11 — a booking on service A that runs through the 12:00 declared time removes "
+            + "12:00 from service B's ALREADY-CACHED slot list on the very next read (no TTL wait)")
+    void should_evictASecondServicesCachedSlots_when_aBookingOnServiceAConsumesADeclaredTime() {
+        LocalDate day = TODAY.plusDays(20);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 120, 0);  // booked at 11:00 → runs to 13:00, swallowing 12:00
+        UUID svcB = addService(m, 30, 0);   // the OTHER service, whose cached list must move too
+        UUID client = seedClient();
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0))));
+
+        // 1) Warm service B's cache entry — this is the list a second client is holding.
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("an unbooked EXPLICIT_TIMES day offers all three declared times to service B")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — the read above really was cached, so a STALE second read is "
+                        + "possible and this test cannot pass vacuously")
+                .isEqualTo(1);
+
+        // 2) A REAL booking on service A, through BookingService's own transaction, so the
+        //    afterCommit eviction hook fires exactly as it does in production.
+        bookingService.createBooking(client, null, new CreateBookingRequest(
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null));
+
+        // 3) The outcome the user asked for — immediately, with no sleep and no TTL expiry.
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("12:00 is strictly inside the booked [11:00,13:00) and 11:00 is its start, so both "
+                        + "vanish from service B at once; 15:00 is untouched, which proves this is a "
+                        + "recomputation and not a blanket cache wipe or an empty-list failure")
+                .containsExactly(LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("case 12 — marking a FUTURE booking NOT_COMPLETED returns its 11:00 slot to the "
+            + "already-cached slot list on the very next read (no TTL wait)")
+    void should_restoreTheFreedSlotImmediately_when_aFutureBookingIsMarkedNotCompleted() {
+        LocalDate day = TODAY.plusDays(21);
+
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        UUID client = seedClient();
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null,
+                        List.of(LocalTime.of(11, 0), LocalTime.of(15, 0))));
+
+        UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
+                m.masterId(), svc, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+        // Isolation, so this case fails for exactly ONE reason. The create above ran the schedule-fit
+        // gate, which populated this master's `available-slots` key with the PRE-booking list; clearing
+        // here means the warm read below is unambiguously fresh and case 12 pins the no-show eviction
+        // alone, never the create-path eviction that case 11 owns.
+        clearSlotCache();
+
+        // 1) Warm the cache with the POST-booking picture: 11:00 is taken.
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("the CONFIRMED booking occupies 11:00")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — the taken-slot list above is genuinely cached, so failing to "
+                        + "evict below would serve it again")
+                .isEqualTo(1);
+
+        // 2) CONFIRMED -> NOT_COMPLETED drops the row out of the `status = 'CONFIRMED'` occupancy
+        //    predicate, i.e. it FREES 11:00. The booking is still in the future — no-show has no
+        //    temporal guard — so the slot is genuinely re-bookable.
+        bookingService.notCompleteBooking(m.userId(), bookingId,
+                new StatusUpdateRequest(CancellationReason.CLIENT_NO_SHOW, null));
+
+        assertThat(slotStarts(m.masterId(), day, svc))
+                .as("11:00 is bookable again on the very next read — not 60 seconds later")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("case 13 — completing an IN-PROGRESS booking early returns its unused 17:00–19:00 tail "
+            + "to the already-cached slot list on the very next read (no TTL wait)")
+    void should_returnTheUnusedTailImmediately_when_anInProgressBookingIsCompletedEarly() {
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 60, 0);
+        UUID client = seedClient();
+        seedInterval(m.masterId(), TODAY, TODAY, TODAY.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(20, 0));
+        // Started at 17:00, "now" is 17:20, ends 19:00 — genuinely IN PROGRESS. Raw JDBC because no
+        // create path can produce an already-started booking. assertElapsedForComplete admits it
+        // (it tests `now >= startsAt`, never `now >= endsAt`), so the provider may close it early.
+        UUID bookingId = insertBookingReturningId(m.masterId(), svc, client, TODAY,
+                LocalTime.of(17, 0), LocalTime.of(19, 0));
+
+        // 1) Warm the cache: everything up to 19:00 is occupied, and the 17:35 cutoff has eaten the
+        //    rest of the pre-19:00 grid, so 19:00 is the only start a 60-min service can take.
+        assertThat(slotStarts(m.masterId(), TODAY, svc))
+                .as("the in-progress booking occupies the calendar until 19:00")
+                .containsExactly(LocalTime.of(19, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — that list is genuinely cached, so failing to evict below would "
+                        + "serve it again")
+                .isEqualTo(1);
+
+        // 2) Complete it early. CONFIRMED -> COMPLETED leaves the `status = 'CONFIRMED'` occupancy
+        //    predicate, so the unused 17:20–19:00 tail becomes bookable again.
+        bookingService.completeBooking(m.userId(), bookingId);
+
+        assertThat(slotStarts(m.masterId(), TODAY, svc))
+                .as("the freed tail reappears on the very next read — 17:30 stays out because it is "
+                        + "below the 17:35 cutoff, which proves the list was RECOMPUTED against the "
+                        + "live clock rather than merely widened")
+                .containsExactly(LocalTime.of(18, 0), LocalTime.of(18, 30), LocalTime.of(19, 0));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Cases 14–18 — CACHE: the SAME cross-service proof for every remaining occupancy-freeing
+    // transition, and for the two non-BookingService writers into the same sweep
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // Cases 11–13 pinned create / not-complete / complete. Cancel, decline, reschedule and the
+    // appointment-level + guest analogues route through the identical
+    // SlotCalculationService#evictMasterAvailabilityCaches by-master sweep, but were covered only
+    // by Mockito verifies — which prove the CALL is written, never that the sweep actually reaches
+    // a live Caffeine entry keyed on a DIFFERENT service than the one written. These five close
+    // that asymmetry:
+    //
+    //   * case 14 — cancel   (BookingService#cancelBooking,     client-initiated → CANCELLED)
+    //   * case 15 — decline  (BookingService#declineBooking,    provider-initiated → DECLINED)
+    //   * case 16 — reschedule (BookingService#rescheduleBooking) — a MOVE, so BOTH halves are
+    //     asserted off ONE post-write read: the vacated time returns AND the target time goes.
+    //   * case 17 — whole-visit cancel (AppointmentTransitionService#cancelAppointment) — the
+    //     appointment-level analogue, whose eviction lives in its OWN registerEviction hook.
+    //   * case 18 — guest cancel-by-token (BookingCancellationService#cancel) — the third writer,
+    //     whose eviction lives inside registerAfterCommitSms, downstream of the SMS attempt.
+    //
+    // Every case follows cases 11–13's shape exactly: warm a SECOND service's slot list, guard
+    // that the warm read genuinely populated the cache, drive the REAL service-level transition,
+    // then re-read IMMEDIATELY — no sleep, no TTL wait. Each expected list keeps at least one
+    // declared time the transition never touched, so an empty-list/blanket-failure cannot pass.
+
+    @Test
+    @DisplayName("case 14 — a CLIENT cancel of the service-A booking returns 11:00 and 12:00 to "
+            + "service B's ALREADY-CACHED slot list on the very next read (no TTL wait)")
+    void should_evictASecondServicesCachedSlots_when_theClientCancelsTheBooking() {
+        LocalDate day = TODAY.plusDays(22);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 120, 0);  // booked 11:00 → runs to 13:00, swallowing 12:00
+        UUID svcB = addService(m, 30, 0);   // the OTHER service, whose cached list must move too
+        UUID client = seedClient();
+        seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+
+        UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+        // Isolation (case 12's reasoning verbatim): the create above already swept this master's
+        // keys, so clearing here makes the warm read below unambiguously fresh and this case pin
+        // the CANCEL eviction alone, never the create-path eviction case 11 owns.
+        clearSlotCache();
+
+        // 1) Warm service B's entry with the POST-booking picture a second client would hold.
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("the CONFIRMED 11:00–13:00 booking on service A hides 11:00 and 12:00 from service B")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — service B's taken-slot list is genuinely cached, so failing "
+                        + "to evict below would serve it again")
+                .isEqualTo(1);
+
+        // 2) CONFIRMED -> CANCELLED leaves the `status = 'CONFIRMED'` occupancy predicate, i.e. it
+        //    FREES the master's 11:00–13:00 block for every service he performs.
+        bookingService.cancelBooking(client, bookingId,
+                new CancelBookingRequest(CancellationReason.CLIENT_CANCELLED, null));
+
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("both freed declared times are bookable on service B on the very next read — not "
+                        + "60 seconds later; 15:00 was never consumed and is still offered, which "
+                        + "proves a recomputation rather than an empty-list failure")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("case 15 — a PROVIDER decline of the service-A booking returns 11:00 and 12:00 to "
+            + "service B's ALREADY-CACHED slot list on the very next read (no TTL wait)")
+    void should_evictASecondServicesCachedSlots_when_theProviderDeclinesTheBooking() {
+        LocalDate day = TODAY.plusDays(23);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 120, 0);
+        UUID svcB = addService(m, 30, 0);
+        UUID client = seedClient();
+        seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+
+        UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+        clearSlotCache();
+
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("the CONFIRMED 11:00–13:00 booking on service A hides 11:00 and 12:00 from service B")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — service B's taken-slot list is genuinely cached, so failing "
+                        + "to evict below would serve it again")
+                .isEqualTo(1);
+
+        // CONFIRMED -> DECLINED, the provider-initiated sibling of case 14's client cancel: a
+        // different status and a different actor, but the same freed occupancy.
+        bookingService.declineBooking(m.userId(), bookingId,
+                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null));
+
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("the declined block is bookable on service B on the very next read; 15:00 "
+                        + "survives, which proves a recomputation rather than an empty-list failure")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("case 16 — rescheduling the service-A booking 11:00 → 13:00 both RETURNS 11:00 and "
+            + "REMOVES 13:00 from service B's ALREADY-CACHED slot list, on one single next read")
+    void should_moveBothSidesOfASecondServicesCachedSlots_when_theBookingIsRescheduled() {
+        LocalDate day = TODAY.plusDays(24);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 60, 0);   // 11:00 → 12:00, moved to 13:00 → 14:00
+        UUID svcB = addService(m, 30, 0);
+        UUID client = seedClient();
+        seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(13, 0), LocalTime.of(15, 0));
+
+        UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+        clearSlotCache();
+
+        // 1) Warm service B's entry with the pre-move picture: 11:00 taken, 13:00 and 15:00 free.
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("before the move service A occupies 11:00 only")
+                .containsExactly(LocalTime.of(13, 0), LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — the pre-move list is genuinely cached, so a half-eviction "
+                        + "(old date only, or new date only) would be observable below")
+                .isEqualTo(1);
+
+        // 2) The MOVE. One by-master sweep has to cover BOTH the vacated 11:00 and the newly
+        //    occupied 13:00 — a per-key eviction that forgot either side fails exactly one half of
+        //    the single assertion below.
+        bookingService.rescheduleBooking(client, bookingId, new RescheduleBookingRequest(
+                day.atTime(13, 0).atZone(TimeZones.KYIV).toOffsetDateTime()));
+
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("ONE post-move read shows both halves at once: 11:00 came back (old side "
+                        + "freed) and 13:00 went away (new side occupied); 15:00 is untouched, so "
+                        + "this is a recomputation and not a blanket wipe")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("case 17 — cancelling a whole multi-service VISIT returns both its 11:00 and 12:00 "
+            + "legs to a third service's ALREADY-CACHED slot list on the very next read")
+    void should_evictAThirdServicesCachedSlots_when_aWholeAppointmentIsCancelled() {
+        LocalDate day = TODAY.plusDays(25);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 60, 0);   // visit leg 1 — 11:00 → 12:00
+        UUID svcB = addService(m, 60, 0);   // visit leg 2 — 12:00 → 13:00
+        UUID svcC = addService(m, 30, 0);   // the OBSERVER service, booked by nobody
+        UUID client = seedClient();
+        seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+
+        // Raw JDBC, matching this suite's fixture convention: the visit must already exist before
+        // the warm read, and seeding it directly keeps this case pinned to the CANCEL eviction
+        // alone rather than to AppointmentService's create-path eviction.
+        UUID appointmentId = insertConfirmedAppointment(client);
+        insertAppointmentItem(appointmentId, m.masterId(), svcA, client, day,
+                LocalTime.of(11, 0), LocalTime.of(12, 0));
+        insertAppointmentItem(appointmentId, m.masterId(), svcB, client, day,
+                LocalTime.of(12, 0), LocalTime.of(13, 0));
+
+        // 1) Warm the THIRD service's entry — neither leg's own service, so only a by-master sweep
+        //    can reach it.
+        assertThat(slotStarts(m.masterId(), day, svcC))
+                .as("the two CONFIRMED visit legs occupy 11:00–13:00, hiding both from service C")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — service C's taken-slot list is genuinely cached, so failing "
+                        + "to evict below would serve it again")
+                .isEqualTo(1);
+
+        // 2) The whole-visit client cancel — header + every item to CANCELLED, evicting through
+        //    AppointmentTransitionService's own after-commit hook, not BookingService's.
+        appointmentTransitionService.cancelAppointment(client, appointmentId,
+                new AppointmentCancelRequest(null));
+
+        assertThat(slotStarts(m.masterId(), day, svcC))
+                .as("both cancelled legs are bookable on service C on the very next read; 15:00 "
+                        + "survives, which proves a recomputation rather than an empty-list failure")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
+    }
+
+    @Test
+    @DisplayName("case 18 — a GUEST cancelling by one-time token returns the 11:00 slot to a second "
+            + "service's ALREADY-CACHED slot list on the very next read (no TTL wait)")
+    void should_evictASecondServicesCachedSlots_when_aGuestCancelsByToken() {
+        LocalDate day = TODAY.plusDays(26);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 60, 0);   // the guest's booking — 11:00 → 12:00
+        UUID svcB = addService(m, 30, 0);   // the OTHER service, whose cached list must move too
+        seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(15, 0));
+
+        // A LINK booking carrying a live cancel_token (V91's chk_bookings_guest_fields shape). The
+        // day is 26 days out, far beyond the 2-hour cancellation window, so `isCancellable` admits it.
+        UUID cancelToken = insertGuestBookingWithCancelToken(m.masterId(), svcA, day,
+                LocalTime.of(11, 0), LocalTime.of(12, 0));
+
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("the guest's CONFIRMED 11:00 booking hides 11:00 from service B")
+                .containsExactly(LocalTime.of(15, 0));
+        assertThat(cachedSlotEntryCount(m.masterId()))
+                .as("mechanism guard — service B's taken-slot list is genuinely cached, so failing "
+                        + "to evict below would serve it again")
+                .isEqualTo(1);
+
+        // The public guest cancel: token consumed atomically, then the after-commit hook fires the
+        // SMS and the SAME by-master availability sweep. No SMS provider is configured under the
+        // test profile, so the send throws and is swallowed by design — the eviction must still run.
+        bookingCancellationService.cancel(cancelToken);
+
+        assertThat(slotStarts(m.masterId(), day, svcB))
+                .as("the guest-freed 11:00 is bookable on service B on the very next read; 15:00 "
+                        + "survives, which proves a recomputation rather than an empty-list failure")
+                .containsExactly(LocalTime.of(11, 0), LocalTime.of(15, 0));
+    }
+
+    /**
+     * Live entries of the {@code available-slots} Caffeine cache whose key's FIRST element is this
+     * master — the exact predicate {@link com.beautica.common.cache.MasterCachePrefixEvictor} sweeps.
+     * Read-only: it never mutates the cache, so it cannot influence the behavioural assertions it sits
+     * beside.
+     */
+    private long cachedSlotEntryCount(UUID masterId) {
+        var caffeine = (com.github.benmanes.caffeine.cache.Cache<?, ?>) slotCache().getNativeCache();
+        return caffeine.asMap().keySet().stream()
+                .filter(k -> k instanceof List<?> parts && !parts.isEmpty() && masterId.equals(parts.get(0)))
+                .count();
+    }
+
+    /** Test-fixture reset of the slot cache — see its one caller (case 12) for why it is needed. */
+    private void clearSlotCache() {
+        slotCache().clear();
+    }
+
+    private Cache slotCache() {
+        Cache springCache = cacheManager.getCache("available-slots");
+        assertThat(springCache).as("the available-slots cache must be registered in the test context")
+                .isNotNull();
+        return springCache;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
     // Fixtures (raw JDBC — pins exact dates/intervals/bookings the write path would reshape)
     // ════════════════════════════════════════════════════════════════════════════════════════
 
@@ -461,6 +1173,62 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                 UUID.randomUUID(), scheduleId, isoDow, start, end);
     }
 
+    /**
+     * An {@code EXPLICIT_TIMES} schedule override declaring exactly {@code times} on {@code day} —
+     * the shape cases 14–18 all need (a day whose offered starts are enumerable to the minute, so
+     * an expected slot list can be written literally). Extracted for the new cases only; cases
+     * 11/12 keep their inline {@code upsertOverride} so their assertions stay byte-for-byte as
+     * originally reviewed.
+     */
+    private void seedExplicitTimesDay(Master m, LocalDate day, LocalTime... times) {
+        masterScheduleService.upsertOverride(m.userId(), m.masterId(),
+                new ScheduleOverrideRequest(day, ScheduleExceptionKind.CUSTOM_HOURS,
+                        WeekdayMode.EXPLICIT_TIMES, null, List.of(times)));
+    }
+
+    /** A CONFIRMED, APP-sourced multi-service visit header (case 17). */
+    private UUID insertConfirmedAppointment(UUID clientId) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO appointments (id, client_id, status, booking_source, "
+                + "created_at, updated_at) VALUES (?, ?, 'CONFIRMED', 'APP', NOW(), NOW())", id, clientId);
+        return id;
+    }
+
+    /**
+     * One CONFIRMED leg of a visit — an ordinary booking row additionally pointing at the
+     * appointment header (V125's {@code bookings.appointment_id}), which is what makes
+     * {@code AppointmentTransitionService} treat it as a child rather than a standalone booking.
+     */
+    private void insertAppointmentItem(UUID appointmentId, UUID masterId, UUID masterServiceId,
+                                       UUID clientId, LocalDate date, LocalTime start, LocalTime end) {
+        UUID id = UUID.randomUUID();
+        insertBooking(masterId, masterServiceId, clientId, date, start, end, "CONFIRMED", id);
+        jdbcTemplate.update("UPDATE bookings SET appointment_id = ? WHERE id = ?", appointmentId, id);
+    }
+
+    /**
+     * A guest (LINK) booking with a live one-time {@code cancel_token}, satisfying V91's
+     * {@code chk_bookings_guest_fields} LINK branch (client_id NULL, guest name + E.164 phone
+     * present, token non-null while CONFIRMED). Returns the token case 18 then presents to
+     * {@code BookingCancellationService.cancel}.
+     */
+    private UUID insertGuestBookingWithCancelToken(UUID masterId, UUID masterServiceId,
+                                                   LocalDate date, LocalTime start, LocalTime end) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime endsAt = date.atTime(end).atZone(TimeZones.KYIV).toOffsetDateTime();
+        int minutes = (int) Duration.between(startsAt, endsAt).toMinutes();
+        UUID cancelToken = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, "
+                        + "status, starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, guest_name, guest_phone, "
+                        + "cancel_token, created_at, updated_at) "
+                        + "VALUES (?, NULL, ?, ?, 'CONFIRMED', ?, ?, ?, ?, 0, 'LINK', 'Guest', "
+                        + "'+380501234567', ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, masterServiceId, startsAt, endsAt, PRICE, minutes,
+                cancelToken);
+        return cancelToken;
+    }
+
     /** A CLIENT user to satisfy the APP-booking CHECK (client_id NOT NULL, guest fields NULL). */
     private UUID seedClient() {
         UUID id = UUID.randomUUID();
@@ -473,6 +1241,22 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
     /** An APP booking occupying {@code [start, end)} Kyiv-civil time on {@code date} in the given status. */
     private void insertBooking(UUID masterId, UUID masterServiceId, UUID clientId, LocalDate date,
                                LocalTime start, LocalTime end, String status) {
+        insertBooking(masterId, masterServiceId, clientId, date, start, end, status, UUID.randomUUID());
+    }
+
+    /**
+     * As {@link #insertBooking}, but hands back the id — case 13 has to name the row it then drives
+     * through {@code BookingService.completeBooking}.
+     */
+    private UUID insertBookingReturningId(UUID masterId, UUID masterServiceId, UUID clientId,
+                                          LocalDate date, LocalTime start, LocalTime end) {
+        UUID id = UUID.randomUUID();
+        insertBooking(masterId, masterServiceId, clientId, date, start, end, "CONFIRMED", id);
+        return id;
+    }
+
+    private void insertBooking(UUID masterId, UUID masterServiceId, UUID clientId, LocalDate date,
+                               LocalTime start, LocalTime end, String status, UUID bookingId) {
         OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
         OffsetDateTime endsAt = date.atTime(end).atZone(TimeZones.KYIV).toOffsetDateTime();
         int minutes = (int) Duration.between(startsAt, endsAt).toMinutes();
@@ -480,8 +1264,27 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
                         + "buffer_minutes_at_booking, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NOW(), NOW())",
-                UUID.randomUUID(), clientId, masterId, masterServiceId, status,
+                bookingId, clientId, masterId, masterServiceId, status,
                 startsAt, endsAt, PRICE, minutes);
+    }
+
+    /**
+     * A booking persisted the way {@code BookingService} persists one when the service carries a buffer:
+     * {@code ends_at = starts_at + duration + bufferMinutesAfter} (BookingService:1842), with the buffer
+     * recorded in {@code buffer_minutes_at_booking}. The slot walk subtracts the persisted
+     * {@code [starts_at, ends_at)} span, so the buffer occupies the master exactly as the work does —
+     * which is why a buffer can consume a later declared time (case 7i).
+     */
+    private void insertBufferedBooking(UUID masterId, UUID masterServiceId, UUID clientId, LocalDate date,
+                                       LocalTime start, int durationMinutes, int bufferMinutes) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime endsAt = startsAt.plusMinutes((long) durationMinutes + bufferMinutes);
+        jdbcTemplate.update("INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), clientId, masterId, masterServiceId,
+                startsAt, endsAt, PRICE, durationMinutes, bufferMinutes);
     }
 
     /**

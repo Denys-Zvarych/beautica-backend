@@ -18,6 +18,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -65,9 +67,9 @@ class NotificationServiceTest {
         Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
         String bookingId = booking.getId().toString();
 
-        service.notifyNewBooking(booking);
+        service.notifyNewBooking(BookingVisit.single(booking));
 
-        verify(emailService).sendNewBookingEmail(anyString(), eq(booking));
+        verify(emailService).sendNewBookingEmail(anyString(), eq(BookingVisit.single(booking)));
         verify(pushService).sendToUser(
                 eq(masterUserId),
                 eq("Нове бронювання"),
@@ -83,7 +85,7 @@ class NotificationServiceTest {
         Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
         ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyNewBooking(booking);
+        service.notifyNewBooking(BookingVisit.single(booking));
 
         verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
         assertThat(bodyCaptor.getValue()).contains("Тест Клієнт").contains("Тест послуга");
@@ -101,9 +103,9 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMock(masterUserId, "Олена", "Коваль");
         ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyNewBooking(booking);
+        service.notifyNewBooking(BookingVisit.single(booking));
 
-        verify(emailService).sendNewBookingEmail(anyString(), eq(booking));
+        verify(emailService).sendNewBookingEmail(anyString(), eq(BookingVisit.single(booking)));
         verify(pushService).sendToUser(eq(masterUserId), anyString(), bodyCaptor.capture(), any(Map.class));
         assertThat(bodyCaptor.getValue())
                 .as("push body must carry the guest's name, not throw or read a null client")
@@ -121,9 +123,9 @@ class NotificationServiceTest {
         Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.CONFIRMED);
         String bookingId = booking.getId().toString();
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
-        verify(emailService).sendBookingConfirmedEmail(anyString(), eq(booking));
+        verify(emailService).sendBookingConfirmedEmail(anyString(), eq(BookingVisit.single(booking)));
         verify(pushService).sendToUser(
                 eq(clientUserId),
                 eq("Бронювання підтверджено"),
@@ -143,7 +145,7 @@ class NotificationServiceTest {
         Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
         String bookingId = booking.getId().toString();
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(emailService).sendBookingDeclinedEmail(anyString(), eq(booking));
         verify(pushService).sendToUser(
@@ -164,7 +166,7 @@ class NotificationServiceTest {
     void should_sendExactlyOneSms_when_guestBookingDeclined() {
         Booking booking = buildGuestBookingMockForDecline("Майстер зачинений сьогодні через хворобу");
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService, org.mockito.Mockito.times(1)).send(eq("+380501234567"), anyString());
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
@@ -177,7 +179,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("Майстер захворів");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         assertThat(textCaptor.getValue())
@@ -187,12 +189,42 @@ class NotificationServiceTest {
     }
 
     @Test
+    @DisplayName("a provider-chosen service name containing a template placeholder is emitted "
+            + "LITERALLY in the guest decline SMS — it must not be expanded into a second, fabricated "
+            + "date/time line")
+    void should_notExpandAPlaceholderInsideAServiceName_when_theGuestDeclineSmsIsBuilt() {
+        // The call-site twin of GuestBookingServiceTest's confirmation-SMS case. buildGuestDeclineSms
+        // substituted {serviceName} BEFORE {date}/{time} with chained String.replace, so each later
+        // replace re-scanned the name it had just written in. A service named "Манікюр {date} о {time}"
+        // therefore rendered a SECOND, provider-positioned date/time line inside copy the guest reads
+        // as platform text — and the guest decline SMS is the ONLY channel a guest has (no account for
+        // email/push), so there is nothing to cross-check it against.
+        Booking booking = buildGuestBookingMockForDecline(null, "Манікюр {date} о {time}");
+        ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verify(smsService).send(anyString(), textCaptor.capture());
+        String sms = textCaptor.getValue();
+        assertThat(sms)
+                .as("the literal braces from the DATA must survive as text, never be expanded. sms=%s", sms)
+                .contains("Манікюр {date} о {time}");
+        assertThat(countOccurrences(sms, "01.08.2026"))
+                .as("the real date appears exactly once, where the TEMPLATE puts it. sms=%s", sms)
+                .isEqualTo(1);
+        assertThat(countOccurrences(sms, "10:00"))
+                .as("the real time appears exactly once — a provider must not be able to fabricate a "
+                        + "second appointment time. sms=%s", sms)
+                .isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("Phase 25.7: the guest decline SMS truncates a long provider note to 120 characters")
     void should_truncateNote_when_guestBookingDeclinedSmsNoteExceeds120Chars() {
         Booking booking = buildGuestBookingMockForDecline("А".repeat(500));
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String noteSegment = textCaptor.getValue().substring(textCaptor.getValue().indexOf("Причина: "));
@@ -207,7 +239,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline(null);
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(eq("+380501234567"), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -227,7 +259,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("   ");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(eq("+380501234567"), textCaptor.capture());
         assertThat(textCaptor.getValue())
@@ -243,7 +275,7 @@ class NotificationServiceTest {
                 "Master is sick, see https://evil.example.com/phish?x=1 for a refund and www.another-evil.test/y too");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -266,7 +298,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("перевірте beautica-verify.com для деталей");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -286,7 +318,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("Вибачте. Захворіла.");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         assertThat(textCaptor.getValue())
@@ -303,7 +335,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("Уточнення тут: beautica-verify.com. Дякуємо.");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -324,7 +356,7 @@ class NotificationServiceTest {
                 "see evil-phish.xyz or evil-phish.top or evil-phish.click for details");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -345,7 +377,7 @@ class NotificationServiceTest {
                         + "EVIL.COM sub.evil.co.uk hxxp://evil.com/path see you soon");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -367,7 +399,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("contact x@evil.com for a refund please");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -385,7 +417,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("visit 1.2.3.4/login or just 1.2.3.4 for info");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String text = textCaptor.getValue();
@@ -402,7 +434,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("Sorry. Ill today. Let's reschedule.");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         assertThat(textCaptor.getValue())
@@ -417,7 +449,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline("Прийду о 15.30");
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         assertThat(textCaptor.getValue())
@@ -434,7 +466,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline(note);
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         assertThat(textCaptor.getValue())
@@ -450,7 +482,7 @@ class NotificationServiceTest {
         String adversarial = "a.".repeat(500); // 1000 chars, no valid trailing TLD/structure anywhere
         Booking booking = buildGuestBookingMockForDecline(adversarial);
 
-        assertTimeout(Duration.ofMillis(50), () -> service.notifyBookingStatusChanged(booking));
+        assertTimeout(Duration.ofMillis(50), () -> service.notifyBookingStatusChanged(BookingVisit.single(booking)));
 
         verify(smsService).send(anyString(), anyString());
     }
@@ -469,7 +501,7 @@ class NotificationServiceTest {
         UUID clientUserId = UUID.randomUUID();
         Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(emailService).sendBookingDeclinedEmail(anyString(), eq(booking));
         verify(booking, never()).getProviderComment();
@@ -487,7 +519,7 @@ class NotificationServiceTest {
         Booking booking = buildGuestBookingMockForDecline(longComment);
         ArgumentCaptor<String> textCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService).send(anyString(), textCaptor.capture());
         String noteSegment = textCaptor.getValue().substring(textCaptor.getValue().indexOf("Причина: ") + "Причина: ".length());
@@ -506,7 +538,7 @@ class NotificationServiceTest {
         UUID clientUserId = UUID.randomUUID();
         Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(smsService, never()).send(anyString(), anyString());
     }
@@ -522,7 +554,7 @@ class NotificationServiceTest {
             Booking booking = buildGuestBookingMock(UUID.randomUUID(), "Олена", "Коваль");
             when(booking.getStatus()).thenReturn(status);
 
-            service.notifyBookingStatusChanged(booking);
+            service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
             verify(smsService, never()).send(anyString(), anyString());
             verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
@@ -540,7 +572,7 @@ class NotificationServiceTest {
     void should_notSendEmailOrPush_when_statusCompleted() {
         Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.COMPLETED);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(emailService, never()).sendBookingConfirmedEmail(anyString(), any());
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
@@ -552,7 +584,7 @@ class NotificationServiceTest {
     void should_notSendEmailOrPush_when_statusNotCompleted() {
         Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.NOT_COMPLETED);
 
-        service.notifyBookingStatusChanged(booking);
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
 
         verify(emailService, never()).sendBookingConfirmedEmail(anyString(), any());
         verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
@@ -661,6 +693,73 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // notifyClosureReminder (Phase 29.5)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("notifyClosureReminder targets the PROVIDER (email + push), never the client")
+    void should_targetProviderWithBookingUrl_when_notifyClosureReminderCalled() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+        String bookingId = booking.getId().toString();
+        String expectedUrl = FRONTEND_BASE_URL + "/bookings/" + bookingId;
+        ArgumentCaptor<String> urlCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClosureReminder(booking);
+
+        // Email is addressed to the MASTER (provider), never the client — this is a work-queue
+        // nudge, not a customer-facing message.
+        verify(emailService).sendClosureReminderEmail(eq("master@example.com"), eq(booking), urlCaptor.capture());
+        assertThat(urlCaptor.getValue()).isEqualTo(expectedUrl);
+        assertThat(urlCaptor.getValue()).startsWith("https://");
+        // Never routed to the client-facing review email.
+        verify(emailService, never()).sendReviewRequestEmail(anyString(), any(), anyString());
+
+        // Push is delivered to the PROVIDER's user id with a CLOSURE_REMINDER payload.
+        verify(pushService).sendToUser(
+                eq(masterUserId),
+                eq("Позначте візит"),
+                anyString(),
+                eq(Map.of("type", "CLOSURE_REMINDER", "bookingId", bookingId))
+        );
+        verifyNoMoreInteractions(smsService);
+    }
+
+    @Test
+    @DisplayName("notifyClosureReminder falls back to the guest identity (no NPE) for a null-client guest booking")
+    void should_useGuestIdentity_when_notifyClosureReminderForGuestBooking() {
+        // A guest (LINK) booking still has a real master to nudge — only the client account is
+        // absent (V89 chk_bookings_guest_fields) — so unlike notifyReviewRequested this must NOT
+        // no-op; it must still notify the provider, using the guest's name in the copy.
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildGuestBookingMock(masterUserId, "Олена", "Коваль");
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClosureReminder(booking);
+
+        verify(emailService).sendClosureReminderEmail(anyString(), eq(booking), anyString());
+        verify(pushService).sendToUser(eq(masterUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .as("push body must carry the guest's name, not throw or read a null client")
+                .contains("Олена Коваль");
+    }
+
+    @Test
+    @DisplayName("notifyClosureReminder truncates the push body when the service name is very long")
+    void should_truncatePushBody_when_notifyClosureReminderServiceNameExceeds256Chars() {
+        Booking booking = buildBookingMock(UUID.randomUUID(), UUID.randomUUID(), BookingStatus.CONFIRMED);
+        when(booking.getMasterService().getServiceDefinition().getName()).thenReturn("А".repeat(500));
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyClosureReminder(booking);
+
+        verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
+        String body = bodyCaptor.getValue();
+        assertThat(body.length()).isLessThanOrEqualTo(256);
+        assertThat(body).endsWith("…");
+    }
+
+    // -------------------------------------------------------------------------
     // sendInviteEmail
     // -------------------------------------------------------------------------
 
@@ -681,6 +780,173 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // Multi-service visit — ONE notification naming the whole visit
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("notifyNewBooking pushes the numeral phrase «3 послуги», not just the lead service, "
+            + "when the visit carries three services")
+    void should_pushServiceCountPhrase_when_notifyNewBookingForMultiServiceVisit() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+        BookingVisit visit = visitOf(lead, 3);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyNewBooking(visit);
+
+        verify(emailService).sendNewBookingEmail(anyString(), eq(visit));
+        verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .as("a 3-service visit must be announced as a count, never as the lead service alone")
+                .contains("3 послуги")
+                .doesNotContain("забронював Тест послуга");
+    }
+
+    @Test
+    @DisplayName("notifyNewBooking uses the «послуг» genitive-plural form when the visit carries five services")
+    void should_pushGenitivePluralForm_when_notifyNewBookingForFiveServiceVisit() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyNewBooking(visitOf(lead, 5));
+
+        verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue()).contains("5 послуг").doesNotContain("5 послуги");
+    }
+
+    @Test
+    @DisplayName("notifyBookingStatusChanged CONFIRMED pushes the numeral phrase for a multi-service "
+            + "visit and forwards the whole visit to the confirmation email")
+    void should_pushServiceCountPhrase_when_multiServiceVisitConfirmed() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.CONFIRMED);
+        BookingVisit visit = visitOf(lead, 2);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(visit);
+
+        verify(emailService).sendBookingConfirmedEmail(anyString(), eq(visit));
+        verify(pushService).sendToUser(eq(clientUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue()).contains("2 послуги");
+    }
+
+    @Test
+    @DisplayName("a single-service visit still pushes the SERVICE NAME — the pre-visit wording is unchanged")
+    void should_pushServiceName_when_notifyNewBookingForSingleServiceVisit() {
+        UUID masterUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(masterUserId, UUID.randomUUID(), BookingStatus.CONFIRMED);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyNewBooking(BookingVisit.single(booking));
+
+        verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .isEqualTo("Клієнт Тест Клієнт забронював Тест послуга")
+                .doesNotContain("послуги")
+                .doesNotContain("послуг ");
+    }
+
+    @Test
+    @DisplayName("a DECLINED item of a multi-service visit names ONLY the declined service — a "
+            + "decline is enqueued per item, so naming the whole visit would misreport it")
+    void should_nameOnlyTheDeclinedService_when_oneItemOfAMultiServiceVisitIsDeclined() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
+        BookingVisit visit = visitOf(lead, 3);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(visit);
+
+        // The counterpart of the CONFIRMED case above, and the guard on the asymmetry the
+        // production comment documents: CONFIRMED is enqueued ONCE per visit so it must name every
+        // service, DECLINED is enqueued per item so it must NOT. Without this, a "make it
+        // consistent" refactor routing DECLINED through bookedSubject() would tell the client
+        // «Ваше бронювання на 3 послуги скасовано» when only one service was actually cancelled.
+        verify(emailService).sendBookingDeclinedEmail(anyString(), eq(lead));
+        verify(pushService).sendToUser(eq(clientUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .isEqualTo("Ваше бронювання на Тест послуга скасовано")
+                .doesNotContain("3 послуги");
+    }
+
+    @Test
+    @DisplayName("a WHOLE-VISIT decline names EVERY cancelled service — the client must not be left "
+            + "believing the rest of the visit still stands")
+    void should_nameEveryService_when_theWholeVisitIsDeclined() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
+        // The counterpart of the per-item case above, and the OTHER half of the asymmetry:
+        // AppointmentTransitionService#declineAppointment moves the header AND every item to
+        // DECLINED but enqueues ONE STATUS_CHANGED against items.get(0). Naming only that lead —
+        // the pre-fix behaviour — told the client one service was cancelled while the whole visit
+        // was gone, and they turned up for the rest.
+        BookingVisit visit = wholeVisitDecline(lead, 3);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(visit);
+
+        verify(emailService).sendVisitDeclinedEmail(anyString(), eq(visit));
+        verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any(Booking.class));
+        verify(pushService).sendToUser(eq(clientUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue()).isEqualTo("Ваше бронювання на 3 послуги скасовано");
+    }
+
+    @Test
+    @DisplayName("a single-service visit whose appointment header is DECLINED keeps the pre-visit "
+            + "decline wording — one service, named")
+    void should_keepTheSingleServiceDeclineWording_when_aOneItemVisitHeaderIsDeclined() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
+        BookingVisit visit = wholeVisitDecline(lead, 1);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifyBookingStatusChanged(visit);
+
+        verify(emailService).sendBookingDeclinedEmail(anyString(), eq(lead));
+        verify(pushService).sendToUser(eq(clientUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue()).isEqualTo("Ваше бронювання на Тест послуга скасовано");
+    }
+
+    /**
+     * A visit of {@code size} chained bookings sharing {@code lead}'s master/client — only the
+     * item count and per-item service names matter to the copy under test, so the siblings are
+     * minimal mocks ordered an hour apart.
+     *
+     * <p>Carries NO appointment status, which is what makes it a PER-ITEM event: see
+     * {@link #wholeVisitDecline(Booking, int)} for the whole-visit twin.
+     */
+    private static BookingVisit visitOf(Booking lead, int size) {
+        OffsetDateTime base = OffsetDateTime.parse("2026-06-15T10:00:00Z");
+        lenient().when(lead.getStartsAt()).thenReturn(base);
+        List<Booking> items = new ArrayList<>();
+        items.add(lead);
+        for (int i = 1; i < size; i++) {
+            Booking sibling = mock(Booking.class);
+            lenient().when(sibling.getId()).thenReturn(UUID.randomUUID());
+            lenient().when(sibling.getStartsAt()).thenReturn(base.plusHours(i));
+            ServiceDefinition sd = mock(ServiceDefinition.class);
+            lenient().when(sd.getName()).thenReturn("Послуга " + i);
+            MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
+            lenient().when(msa.getServiceDefinition()).thenReturn(sd);
+            lenient().when(sibling.getMasterService()).thenReturn(msa);
+            items.add(sibling);
+        }
+        return BookingVisit.of(lead, items);
+    }
+
+    /**
+     * The same shape as {@link #visitOf(Booking, int)} but stamped with a {@code DECLINED}
+     * appointment header — the signal that says "the provider cancelled the WHOLE visit", which the
+     * item rows alone cannot express. The resolver stamps this in production; here it is set
+     * explicitly so the branch is exercised without a repository.
+     */
+    private static BookingVisit wholeVisitDecline(Booking lead, int size) {
+        BookingVisit perItem = visitOf(lead, size);
+        return BookingVisit.of(lead, perItem.items(), BookingStatus.DECLINED);
+    }
+
+    // -------------------------------------------------------------------------
     // Push body safety — null & length
     // -------------------------------------------------------------------------
 
@@ -693,7 +959,7 @@ class NotificationServiceTest {
         when(booking.getMasterService().getServiceDefinition().getName()).thenReturn(longServiceName);
         ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyNewBooking(booking);
+        service.notifyNewBooking(BookingVisit.single(booking));
 
         verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
         String body = bodyCaptor.getValue();
@@ -709,7 +975,7 @@ class NotificationServiceTest {
         when(booking.getClient().getFirstName()).thenReturn(null);
         ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
 
-        service.notifyNewBooking(booking);
+        service.notifyNewBooking(BookingVisit.single(booking));
 
         verify(pushService).sendToUser(any(UUID.class), anyString(), bodyCaptor.capture(), any(Map.class));
         assertThat(bodyCaptor.getValue()).doesNotContain("null");
@@ -785,6 +1051,15 @@ class NotificationServiceTest {
      * name, the service name, and the given {@code providerComment} (Phase 25.7).
      */
     private Booking buildGuestBookingMockForDecline(String providerComment) {
+        return buildGuestBookingMockForDecline(providerComment, "Тест послуга");
+    }
+
+    /**
+     * Same as {@link #buildGuestBookingMockForDecline(String)} but with a caller-chosen service
+     * NAME — the one field a provider controls and the only untrusted input reaching the decline
+     * SMS template. Every other caller keeps the shared constant through the delegate above.
+     */
+    private Booking buildGuestBookingMockForDecline(String providerComment, String serviceName) {
         Booking booking = mock(Booking.class);
         // lenient: only read on the (untested-here) blank-guestPhone warning branch.
         lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
@@ -802,11 +1077,19 @@ class NotificationServiceTest {
         lenient().when(booking.getMaster()).thenReturn(master);
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
-        lenient().when(sd.getName()).thenReturn("Тест послуга");
+        lenient().when(sd.getName()).thenReturn(serviceName);
         MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
         lenient().when(msa.getServiceDefinition()).thenReturn(sd);
         lenient().when(booking.getMasterService()).thenReturn(msa);
 
         return booking;
+    }
+
+    private static int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        for (int i = haystack.indexOf(needle); i >= 0; i = haystack.indexOf(needle, i + needle.length())) {
+            count++;
+        }
+        return count;
     }
 }

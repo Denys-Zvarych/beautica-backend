@@ -93,17 +93,44 @@ public class NotificationOutboxService {
     }
 
     /**
-     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2).
-     *
-     * <p>The drained event notifies the provider (master / salon-admin) that the client
-     * moved the booking and it is awaiting re-approval at the new time.
+     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2), defaulting to
+     * CLIENT-initiated (Phase 27.3 — see the 2-arg overload). Convenience overload kept so any
+     * existing caller that is unconditionally client-side need not pass the flag.
      *
      * @param bookingId the UUID of the rescheduled booking
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public void enqueueBookingRescheduled(UUID bookingId) {
+        enqueueBookingRescheduled(bookingId, false);
+    }
+
+    /**
+     * Enqueues a {@code BOOKING_RESCHEDULED} notification entry (Phase 19.2), recording WHO moved
+     * the booking (Phase 27.3 — reschedule widened to providers).
+     *
+     * <p>The drained event notifies whichever party did NOT initiate the move: a client-initiated
+     * reschedule notifies the provider (master / salon-admin), unchanged pre-27.3 behaviour; a
+     * provider-initiated reschedule notifies the client instead — see
+     * {@code NotificationOutboxDrainWorker}'s {@code BOOKING_RESCHEDULED} case and
+     * {@code NotificationService#notifyBookingRescheduledClient}.
+     *
+     * <p>The payload is a small, unencrypted JSON object ({@code {"initiatedBy":"PROVIDER"}} or
+     * {@code {"initiatedBy":"CLIENT"}}) — the same plain-payload mechanism {@code save}'s third
+     * argument already supports (only {@code INVITE} needs {@link OutboxPayloadCipher} sealing;
+     * this carries no secret). An absent/null payload on an older PENDING row (written before this
+     * overload existed) is read by the drain worker as CLIENT-initiated — see
+     * {@code NotificationOutboxDrainWorker#resolveRescheduleInitiator} — for backward compatibility.
+     *
+     * @param bookingId          the UUID of the rescheduled booking
+     * @param initiatedByProvider {@code true} when a provider (salon owner / assigned salon admin
+     *                             / independent master) moved the booking, {@code false} when the
+     *                             client did
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueBookingRescheduled(UUID bookingId, boolean initiatedByProvider) {
         Objects.requireNonNull(bookingId, "bookingId must not be null");
-        save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, null);
+        String payload = writeJson(Map.of("initiatedBy", initiatedByProvider ? "PROVIDER" : "CLIENT"));
+        save(OutboxEventType.BOOKING_RESCHEDULED, bookingId, payload);
     }
 
     /**
@@ -179,6 +206,31 @@ public class NotificationOutboxService {
                 "salonName", salonName,
                 "inviteUrlSealed", sealedInviteUrl));
         save(OutboxEventType.INVITE, inviteTokenId, payload);
+    }
+
+    /**
+     * Enqueues a {@code CLOSURE_REMINDER} notification entry (Phase 29.5).
+     *
+     * <p>Writes exactly ONE row into {@code notification_outbox} and performs no other write —
+     * in particular, unlike {@link #enqueueReviewRequested(UUID)} (called from inside {@code
+     * BookingService#completeBooking}, i.e. from a transaction that has just mutated {@code
+     * booking.status}), this method is called from NO such place. It is invoked only by {@code
+     * com.beautica.booking.closure.ClosureReminderClaimService}, itself called only for booking
+     * ids an atomic native claim statement already {@code RETURNING}'d — this method never reads
+     * or writes {@code bookings.status}. See {@code ClosureReminderArchitectureTest}, the
+     * mechanical guard for that invariant.
+     *
+     * <p>Recipient resolution (the PROVIDER, never the client) lives in {@code
+     * NotificationService#notifyClosureReminder}, not here — this method only writes the outbox
+     * row; the drain worker re-hydrates the full {@link com.beautica.booking.entity.Booking}
+     * graph at send time, so no client PII is duplicated into the outbox payload.
+     *
+     * @param bookingId the UUID of the booking still awaiting provider closure
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueClosureReminder(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.CLOSURE_REMINDER, bookingId, null);
     }
 
     // --- private helpers ---

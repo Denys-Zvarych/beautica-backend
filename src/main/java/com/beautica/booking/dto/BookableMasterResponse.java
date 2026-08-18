@@ -32,6 +32,13 @@ public record BookableMasterResponse(
         String lastName,
         String professionalTitle,
         String avatarUrl,
+        /**
+         * {@code null} when {@link #reviewCount} is 0 — see
+         * {@link BookingDetailResponse#masterAvgRatingOrNull}. Field-name parity with
+         * {@link com.beautica.master.dto.MasterSummaryResponse} (see this record's javadoc) is
+         * only useful if the VALUES agree too, so both run the same normalisation
+         * (Phase 240 audit, Finding 3).
+         */
         BigDecimal avgRating,
         int reviewCount
 ) {
@@ -50,7 +57,8 @@ public record BookableMasterResponse(
                 master.getUser().getLastName(),
                 master.getUser().getProfessionalTitle(),
                 master.getUser().getAvatarUrl(),
-                master.getAvgRating(),
+                BookingDetailResponse.masterAvgRatingOrNull(
+                        master.getReviewCount(), master.getAvgRating()),
                 master.getReviewCount()
         );
     }
