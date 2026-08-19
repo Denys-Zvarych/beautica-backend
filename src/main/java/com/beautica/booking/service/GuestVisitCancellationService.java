@@ -13,10 +13,8 @@ import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.service.NotificationOutboxService;
-import com.beautica.notification.sms.SmsService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -52,7 +50,6 @@ import java.util.UUID;
  * SMS is dispatched only {@code afterCommit} — a rolled-back cancel sends nothing.
  */
 @Service
-@Slf4j
 public class GuestVisitCancellationService {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
@@ -61,7 +58,7 @@ public class GuestVisitCancellationService {
     private final AppointmentRepository appointmentRepository;
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
-    private final SmsService smsService;
+    private final BookingSmsDispatcher bookingSmsDispatcher;
     private final SlotCalculationService slotCalculationService;
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -71,7 +68,7 @@ public class GuestVisitCancellationService {
             AppointmentRepository appointmentRepository,
             BookingRepository bookingRepository,
             NotificationOutboxService outboxService,
-            SmsService smsService,
+            BookingSmsDispatcher bookingSmsDispatcher,
             SlotCalculationService slotCalculationService,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
@@ -79,7 +76,7 @@ public class GuestVisitCancellationService {
         this.appointmentRepository = appointmentRepository;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
-        this.smsService = smsService;
+        this.bookingSmsDispatcher = bookingSmsDispatcher;
         this.slotCalculationService = slotCalculationService;
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
@@ -184,13 +181,17 @@ public class GuestVisitCancellationService {
         String smsText = buildCancellationSms(first);
 
         Runnable task = () -> {
-            sendCancellationSms(phone, smsText);
+            // EVICTION FIRST, DISPATCH SECOND — see BookingCancellationService#registerAfterCommitSms
+            // for why this order is load-bearing and why it was reversed (perf LOW, 2026-08-19).
+            //
             // Cancelling FREES the master's time, which widens the slots offered for every service
             // this master performs on those dates — swept by master prefix, not per (date, service).
             slotCalculationService.evictMasterAvailabilityCaches(masterId);
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
+            bookingSmsDispatcher.dispatch(
+                    BookingSmsDispatcher.Kind.GUEST_VISIT_CANCELLATION, phone, smsText);
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -201,16 +202,6 @@ public class GuestVisitCancellationService {
             });
         } else {
             task.run();
-        }
-    }
-
-    private void sendCancellationSms(String phone, String smsText) {
-        try {
-            smsService.send(phone, smsText);
-        } catch (RuntimeException e) {
-            // The visit is already committed as CANCELLED — an SMS-provider failure must not fail the
-            // request. Log the cause class only (never the phone or text).
-            log.warn("Guest visit cancellation SMS failed: {}", e.getClass().getSimpleName());
         }
     }
 

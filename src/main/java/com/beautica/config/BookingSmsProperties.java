@@ -50,8 +50,30 @@ public class BookingSmsProperties {
         return sms;
     }
 
-    /** SMS body templates. */
+    /** SMS body templates, plus the platform-wide outbound-SMS gate. */
     public static class Sms {
+
+        /**
+         * The single "are we spending SMS money" switch (Phase 22.7). <b>Default {@code false}</b>,
+         * and every committed profile declares it {@code false} explicitly — including
+         * {@code local}. Railway override at release: {@code APP_BOOKING_SMS_ENABLED=true}.
+         *
+         * <p>Governs <b>all</b> outbound booking SMS at once — walk-in confirmation, guest
+         * confirmation, 24h reminder, cancellation and provider decline — because it is consumed
+         * by {@code SmsConfig}, which uses it to pick the {@code SmsService} bean itself
+         * ({@code NoOpSmsService} when off, {@code TurbosmsService} when on) rather than by any
+         * individual sender. No call site reads this field; if you find yourself adding an
+         * {@code if} on it, the gate has been misunderstood.
+         *
+         * <p>Sibling vendor/money gates, deliberately separate so each can be released on its own
+         * schedule: {@code FIREBASE_ENABLED} (push, {@code FirebaseConfig}) and
+         * {@code app.cloudflare-r2.enabled} (media, {@code S3Config}).
+         *
+         * <p>Distinct from {@code app.sms.turbosms.token}: a blank token means "unconfigured" and
+         * throws loudly on the first send, whereas this flag off means "deliberately silent" and
+         * never throws.
+         */
+        private boolean enabled = false;
 
         /**
          * Confirmation template. Placeholders: {@code {masterName}},
@@ -72,12 +94,63 @@ public class BookingSmsProperties {
                         + "{serviceName} у {masterName}\n"
                         + "Завтра о {time}";
 
+        /**
+         * Walk-in (STAFF-sourced) confirmation template — the SMS a master's own walk-in client
+         * receives after the provider keys the appointment in (Phase 22.7). Placeholders:
+         * {@code {masterName}}, {@code {serviceName}}, {@code {date}}, {@code {time}}.
+         *
+         * <p><b>Carries no {@code {cancelUrl}}, and must never gain one.</b> A STAFF booking has
+         * {@code cancel_token = NULL} by the V137 CHECK — self-service cancellation is a LINK-path
+         * capability — so there is no token to build a URL from. The closing line therefore routes
+         * the client back to the master by phone, which is how the booking was made in the first
+         * place. A {@code {cancelUrl}} added here would render literally, as the placeholder text,
+         * in a real client's message.
+         *
+         * <p>Kept separate from {@link #confirmation} rather than reusing it with an empty
+         * {@code cancelUrl}: that would leave a dangling «Скасувати: » label with nothing after it,
+         * the exact defect {@link #declineReason} exists to avoid on the decline path.
+         *
+         * <h4>This literal is the SINGLE source of the copy (QA MEDIUM, 2026-08-18)</h4>
+         * It shipped duplicated: an identical block scalar at {@code app.booking.sms.
+         * walk-in-confirmation} in {@code application.yml} overrode it in every profile, so
+         * mutating this default changed nothing observable anywhere — two sources of truth for one
+         * user-visible string, one of them dead. The yml key has been REMOVED; only a pointer
+         * comment remains there. Re-adding {@code walk-in-confirmation:} to any profile silently
+         * makes this field dead again, so add it only to genuinely OVERRIDE this text, never to
+         * restate it.
+         *
+         * <p>Every sibling template in this class still carries its yml twin and is therefore
+         * yml-driven — that duplication is pre-existing and outside this change's scope — so when
+         * editing copy, check which of the two homes is live for the template being touched.
+         */
+        private String walkInConfirmation =
+                "Beautica: Запис підтверджено!\n"
+                        + "{masterName}, {serviceName}\n"
+                        + "{date} о {time}\n\n"
+                        + "Скасувати — за телефоном майстра.";
+
         public String getConfirmation() {
             return confirmation;
         }
 
         public void setConfirmation(String confirmation) {
             this.confirmation = confirmation;
+        }
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getWalkInConfirmation() {
+            return walkInConfirmation;
+        }
+
+        public void setWalkInConfirmation(String walkInConfirmation) {
+            this.walkInConfirmation = walkInConfirmation;
         }
 
         /**

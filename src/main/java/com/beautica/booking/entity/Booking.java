@@ -4,6 +4,7 @@ import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.common.AuditableEntity;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -27,6 +28,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 import org.hibernate.annotations.DynamicUpdate;
+import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
@@ -121,7 +123,11 @@ import java.util.UUID;
                 // partial index (V125): "fetch all rows of this multi-service visit" lookup.
                 // JPA cannot encode WHERE appointment_id IS NOT NULL — the predicate lives in V125
                 // only; this annotation mirrors the column for reader accuracy, not enforcement.
-                @Index(name = "idx_bookings_appointment", columnList = "appointment_id")
+                @Index(name = "idx_bookings_appointment", columnList = "appointment_id"),
+                // partial index (V137): "bookings created by staff member X" + the ON DELETE RI lookup for
+                // created_by_user_id. JPA cannot encode WHERE created_by_user_id IS NOT NULL — the predicate
+                // lives in V137 only; documentation, not enforcement.
+                @Index(name = "idx_bookings_created_by", columnList = "created_by_user_id")
         }
 )
 // Root-cause fix (G1, cycle-7 audit 2026-08-03) for the entity-staleness/terminal-state-
@@ -295,6 +301,38 @@ public class Booking extends AuditableEntity {
     @Column(name = "reminder_sent", nullable = false)
     private boolean reminderSent;
 
+    // ── Staff-booking provenance (Phase 22.1 / V137) ──────────────────────────
+    /**
+     * The staff user (SALON_OWNER / SALON_ADMIN) who keyed this booking in, or {@code null}
+     * for a self-service APP/LINK booking and for all pre-V137 history.
+     *
+     * <p>Orthogonal to {@link #bookingSource}: the enum says <em>what kind</em> of booking
+     * this is, this column says <em>which human</em> created it. That is why STAFF is a
+     * single source value rather than a family of them.
+     *
+     * <p>Stored as a raw id, deliberately NOT a {@code @ManyToOne User} — nothing on the
+     * booking read path renders the creating staff member, so an association here would only
+     * add a lazy proxy (and an N+1 risk) to every booking load. The FK integrity lives in the
+     * DB ({@code REFERENCES users(id) ON DELETE RESTRICT}, V137).
+     *
+     * <p>{@code RESTRICT}, not {@code SET NULL}: the column exists for attribution, and a NULLed
+     * creator is indistinguishable from a pre-V137 row that never had one — so {@code SET NULL}
+     * would let deleting the account under suspicion erase the audit trail undetectably. Nothing
+     * in the app hard-deletes a user today (accounts are deactivated), so this constraint is
+     * unreachable in practice; a future GDPR erasure flow must anonymise the creating user rather
+     * than delete the row. See V137's comment for the full rationale.
+     *
+     * <p>Nullability is deliberately NOT enforced by {@code chk_bookings_guest_fields} — it is
+     * a soft, application-layer expectation for STAFF rows only.
+     *
+     * <p>{@code @JsonIgnore} for the same reason {@link #cancelToken} carries it: this is an
+     * internal identifier (which employee keyed the booking in) that no client-facing DTO renders,
+     * so a stray entity-return can never leak it.
+     */
+    @JsonIgnore
+    @Column(name = "created_by_user_id")
+    private UUID createdByUserId;
+
     // ── Multi-service single-visit aggregate (BE-1 / V125) ────────────────────
     // Nullable by design: a legacy single-service booking has no appointment (appointment_id stays
     // NULL). A multi-service visit (BE-3) groups its N chained booking rows under one Appointment
@@ -357,6 +395,107 @@ public class Booking extends AuditableEntity {
                 .cancelToken(UUID.randomUUID())
                 .reminderSent(false)
                 .build();
+    }
+
+    /**
+     * Factory for an auto-confirmed staff walk-in (STAFF) booking — a walk-in / phone booking
+     * entered by a {@code SALON_OWNER}/{@code SALON_ADMIN} on behalf of one of their masters.
+     *
+     * <p>Mirrors the walk-in mode of the DB CHECK {@code chk_bookings_guest_fields} (V137):
+     * no {@code client} FK, all three identity fields required, and {@code cancelToken} left
+     * {@code null} (a staff booking has no self-service guest cancel link). Enforcing it here
+     * as well means a half-populated STAFF row can never be constructed in code.
+     *
+     * <p>Unlike {@link #guestBooking}, {@code guestSurname} is <strong>required</strong>: the
+     * LINK flow treats a surname as optional, the staff walk-in flow does not (locked product
+     * decision). The two branches of the CHECK differ for exactly this reason.
+     *
+     * <p>The linked-platform-CLIENT identity mode is permitted by the V137 CHECK but is
+     * deferred at the service layer (re-scoped Phase 22.3); enabling it later needs a sibling
+     * factory here and <em>no</em> migration.
+     *
+     * <p>{@code status} is {@code CONFIRMED} at creation, identically to APP and LINK
+     * (track 24.x auto-confirm). Snapshot parameters match {@link #guestBooking} exactly so
+     * the 22.2 service fills them the same way.
+     *
+     * @param guestName         walk-in client's first name (required)
+     * @param guestSurname      walk-in client's last name (required — unlike the LINK flow)
+     * @param guestPhone        walk-in client's phone, E.164-normalised by the caller
+     *                          (required; {@code chk_bookings_guest_phone_format} rejects any
+     *                          other shape)
+     * @param createdByUserId   id of the staff user creating the booking (required)
+     * @param priceMaxAtBooking frozen RANGE ceiling, or {@code null} for a single price
+     *                          (see {@link #priceMaxAtBooking})
+     */
+    public static Booking staffBooking(
+            Master master,
+            MasterServiceAssignment masterService,
+            Salon salon,
+            OffsetDateTime startsAt,
+            OffsetDateTime endsAt,
+            BigDecimal priceAtBooking,
+            BigDecimal priceMaxAtBooking,
+            int durationMinutesAtBooking,
+            int bufferMinutesAtBooking,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            UUID createdByUserId) {
+        requireStaffWalkInIdentity(guestName, guestSurname, guestPhone, createdByUserId);
+        return Booking.builder()
+                // No client FK: the walk-in mode has no registered account
+                // (the V137 CHECK enforces STAFF walk-in => client_id NULL).
+                .master(master)
+                .masterService(masterService)
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(startsAt)
+                .endsAt(endsAt)
+                .priceAtBooking(priceAtBooking)
+                .priceMaxAtBooking(priceMaxAtBooking)
+                .durationMinutesAtBooking(durationMinutesAtBooking)
+                .bufferMinutesAtBooking(bufferMinutesAtBooking)
+                .bookingSource(BookingSource.STAFF)
+                .guestName(guestName)
+                .guestSurname(guestSurname)
+                .guestPhone(guestPhone)
+                // cancelToken stays null: no guest self-cancel link for a staff booking.
+                .createdByUserId(createdByUserId)
+                .reminderSent(false)
+                .build();
+    }
+
+    /**
+     * <b>{@code BusinessException(BAD_REQUEST)}, never {@code IllegalArgumentException}</b>
+     * (security LOW, 2026-08-18). {@code GlobalExceptionHandler} has no
+     * {@code IllegalArgumentException} handler, so one escaping this factory falls to the
+     * {@code Exception.class} catch-all: a <b>500 plus a full ERROR stack trace</b> for what is, by
+     * construction, a missing required input. These four values are the same ones the Phase 22.2
+     * command records reject as a 400 ({@code StaffBookingCommand}, {@code StaffClientRef.Guest},
+     * {@code StaffBookingScope}), so the status must agree rather than depend on which layer noticed.
+     *
+     * <p>No caller can reach these branches today — {@code StaffClientRef.Guest} rejects blank
+     * identity fields, {@code UkrainianPhoneNormalizer#toE164} rejects an unusable phone and
+     * {@code StaffBookingService} rejects a null actor before the load. That is exactly why the
+     * status matters: this is the backstop for the day a second caller appears, and a backstop that
+     * answers 500 is not one.
+     */
+    private static void requireStaffWalkInIdentity(
+            String guestName, String guestSurname, String guestPhone, UUID createdByUserId) {
+        requireStaffText(guestName, "guestName");
+        requireStaffText(guestSurname, "guestSurname");
+        requireStaffText(guestPhone, "guestPhone");
+        if (createdByUserId == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    "createdByUserId must not be null for a STAFF booking");
+        }
+    }
+
+    private static void requireStaffText(String value, String field) {
+        if (value == null || value.isBlank()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST,
+                    field + " must not be blank for a STAFF walk-in booking");
+        }
     }
 
     /**

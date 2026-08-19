@@ -11,7 +11,9 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.util.StringUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
 import java.util.UUID;
@@ -21,7 +23,8 @@ import java.util.UUID;
  * lock (the per-client advisory lock, or — since track 27.x's multi-service visit family — a
  * {@code SELECT ... FOR UPDATE} on the {@code appointments} header) or dispatch a note into a
  * client-facing notification channel: {@code POST /api/v1/bookings}, {@code POST
- * /api/v1/appointments} (BE-3 multi-service visit create), {@code PATCH
+ * /api/v1/appointments} (BE-3 multi-service visit create), {@code POST
+ * /api/v1/masters/&#123;masterId&#125;/bookings} (Phase 22.4 staff walk-in create), {@code PATCH
  * /api/v1/bookings/{bookingId}/{reschedule,cancel}}, {@code PATCH
  * /api/v1/bookings/{bookingId}/{decline,not-complete}}, the WHOLE {@code PATCH
  * /api/v1/appointments/{appointmentId}/*} mutation family ({@code cancel}, {@code decline},
@@ -30,12 +33,13 @@ import java.util.UUID;
  * verbs are matched by the identical {@code endsWith} suffix checks as their whole-visit siblings
  * and bucketed with them, never on a dedicated per-item budget — and {@code PUT
  * /api/v1/masters/{masterId}/overrides/{date}} (the schedule-override write, which can bulk-decline
- * every conflicting booking on a date). These map to THREE independent buckets with different
+ * every conflicting booking on a date). These map to FOUR independent buckets with different
  * capacities, because they close different threat models:
  *
  * <ul>
- *   <li><b>{@code bookingWriteBuckets}:</b> create/appointment-create/reschedule (both paths),
- *   plus cancel (both paths) and appointment-complete. All of these take a real row lock that can
+ *   <li><b>{@code bookingWriteBuckets}:</b> create/appointment-create/reschedule
+ *   (both paths), plus cancel (both paths) and appointment-complete. All of these take a real row
+ *   lock that can
  *   pin a Hikari connection under contention — either the per-client advisory lock
  *   ({@code BookingRepository.acquireClientAdvisoryLockWithTimeout}, salted by the CALLER'S OWN
  *   authenticated user id, so a single CLIENT account needs no IP diversity at all to serialize
@@ -83,6 +87,19 @@ import java.util.UUID;
  *   month-long vacation is realistically ~31 consecutive requests from one actor — which neither
  *   sibling bucket was sized for. See {@code RateLimitConfig#scheduleOverrideWriteCapacity}'s
  *   javadoc for the exact capacity and its justification.</li>
+ *   <li><b>{@code staffBookingSmsBuckets}:</b> {@code POST
+ *   /api/v1/masters/&#123;masterId&#125;/bookings} — the Phase 22.4 staff walk-in create, moved off
+ *   {@code bookingWriteBuckets} in Phase 22.7 (SEC MEDIUM, 2026-08-18). Two threat models overlap on
+ *   this one route and the tighter budget covers both: it takes the PER-MASTER advisory lock
+ *   ({@code BookingSlotLockGuard.lockMasterAndAssertFree}), keyed on the TARGET master rather than
+ *   the caller, so an unthrottled staff token degrades availability for every real CLIENT booking
+ *   that master; AND since 22.7 every success dispatches a Beautica-branded SMS, carrying a
+ *   provider-authored {@code serviceName}, to a staff-TYPED number that never consented. The second
+ *   is a strictly worse smishing surface than {@code bookingDeclineBuckets}' — decline at least
+ *   targets an already-OTP-verified guest — so it gets the same 10/60s shape, which being 3x tighter
+ *   than the create budget it left also still bounds the lock contention. Per-ACTOR only; the
+ *   per-RECIPIENT half lives in {@code StaffBookingService#assertWalkInSmsBudgetForPhone}, because
+ *   no per-actor bucket can bound an attacker holding several staff accounts.</li>
  * </ul>
  *
  * <p><b>Why user-keyed, unlike every bucket in {@link com.beautica.auth.filter.AuthRateLimitFilter}:</b>
@@ -122,18 +139,48 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** Prefix for the whole {@code /appointments/{id}/*} PATCH mutation family — see class Javadoc. */
     private static final String APPOINTMENTS_PATH_PREFIX = "/api/v1/appointments/";
     /**
-     * Prefix for {@code /masters/{masterId}/overrides/{date}} — the ONLY route on this prefix this
-     * filter covers is the {@code PUT} write (security audit finding 5); {@code GET .../overrides}
-     * (list) and {@code POST .../overrides/conflicts} (read-only preview) never decline anything and
-     * are deliberately left unmatched by {@link #selectRoute}'s method check below.
+     * Prefix shared by the TWO routes this filter covers under {@code /masters/}: the {@code PUT
+     * .../overrides/{date}} schedule-override write (security audit finding 5) and the {@code POST
+     * .../bookings} staff walk-in create (Phase 22.4). {@code GET .../overrides} (list) and
+     * {@code POST .../overrides/conflicts} (read-only preview) never decline anything and are
+     * deliberately left unmatched by {@link #selectRoute}'s method/suffix checks below.
      */
     private static final String MASTERS_PATH_PREFIX = "/api/v1/masters/";
     private static final String OVERRIDES_SEGMENT = "/overrides/";
+    /**
+     * Suffix of {@code POST /api/v1/masters/&#123;masterId&#125;/bookings} — Phase 22.4's staff
+     * walk-in create, throttled on the create/reschedule budget. Matched as
+     * {@code startsWith(MASTERS_PATH_PREFIX) && endsWith(BOOKINGS_SUFFIX)} rather than by segment
+     * count, consistent with every other route in {@link #selectRoute}.
+     *
+     * <p><b>Any future sub-path under {@code /masters/&#123;masterId&#125;/bookings} needs its own
+     * route entry in {@link #selectRoute}</b> — this suffix match ends at {@code "/bookings"}, so a
+     * hypothetical {@code POST .../bookings/bulk} (no such route exists today) would be silently
+     * unbucketed rather than inheriting this one.
+     */
+    private static final String BOOKINGS_SUFFIX = "/bookings";
     private static final String RESCHEDULE_SUFFIX = "/reschedule";
     private static final String CANCEL_SUFFIX = "/cancel";
     private static final String COMPLETE_SUFFIX = "/complete";
     private static final String DECLINE_SUFFIX = "/decline";
     private static final String NOT_COMPLETE_SUFFIX = "/not-complete";
+
+    // Resolves the DECODED + NORMALIZED request path for rule matching (see resolveMatchPath).
+    // urlDecode + removeSemicolonContent are UrlPathHelper defaults; set explicitly so the
+    // security-critical decode step is self-documenting and cannot be silently disabled by a
+    // future default change. Stateless after construction and thread-safe for the read-only
+    // getPathWithinApplication call, so a single shared static instance is correct.
+    // Identical to AuthRateLimitFilter#MATCH_PATH_HELPER — deliberately duplicated rather than
+    // hoisted to a shared util so each filter's security-critical matching input is visible at
+    // the site that depends on it; the two are named identically so they read as one pattern.
+    private static final UrlPathHelper MATCH_PATH_HELPER = createMatchPathHelper();
+
+    private static UrlPathHelper createMatchPathHelper() {
+        UrlPathHelper helper = new UrlPathHelper();
+        helper.setUrlDecode(true);
+        helper.setRemoveSemicolonContent(true);
+        return helper;
+    }
 
     /** {@code Retry-After} for the create/reschedule bucket — matches its 10s refill window. */
     private static final int CREATE_RESCHEDULE_RETRY_AFTER_SECONDS = 10;
@@ -147,19 +194,25 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      */
     private static final int SCHEDULE_OVERRIDE_RETRY_AFTER_SECONDS = 60;
 
+    /** {@code Retry-After} for the staff walk-in SMS-spend bucket — matches its 60s refill window. */
+    private static final int STAFF_BOOKING_SMS_RETRY_AFTER_SECONDS = 60;
+
     private final LoadingCache<String, Bucket> bookingWriteBuckets;
     private final LoadingCache<String, Bucket> bookingDeclineBuckets;
     private final LoadingCache<String, Bucket> scheduleOverrideWriteBuckets;
+    private final LoadingCache<String, Bucket> staffBookingSmsBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
             LoadingCache<String, Bucket> bookingWriteBuckets,
             LoadingCache<String, Bucket> bookingDeclineBuckets,
             LoadingCache<String, Bucket> scheduleOverrideWriteBuckets,
+            LoadingCache<String, Bucket> staffBookingSmsBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
         this.scheduleOverrideWriteBuckets = scheduleOverrideWriteBuckets;
+        this.staffBookingSmsBuckets = staffBookingSmsBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -188,11 +241,47 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
+     * Resolves the path used for throttle-rule matching from the request's DECODED and
+     * NORMALIZED path — mirroring how Spring MVC routes the request — instead of the raw,
+     * percent-encoded, un-normalized {@link HttpServletRequest#getRequestURI()}. Ported verbatim
+     * from {@code AuthRateLimitFilter#resolveMatchPath} (PR #95), which closed the identical
+     * bypass on the auth buckets; see that method's javadoc for the full rationale.
+     *
+     * <p>The servlet container hands back {@code getRequestURI()} exactly as received: still
+     * percent-encoded and not collapsed. Spring MVC, however, routes on the decoded/normalized
+     * path, so matching a rule on the raw URI let a caller reach a throttled handler with an
+     * equivalent spelling that skipped EVERY route in {@link #selectRoute} — e.g. {@code POST
+     * /api/v1/masters/&#123;id&#125;/booking%73} (routes to {@code StaffBookingController}, but
+     * {@code endsWith("/bookings")} is false, so no token is consumed), {@code PATCH
+     * /api/v1/bookings/&#123;id&#125;/declin%65} (the SMS-spend budget from Phase 22.7), or
+     * {@code PUT /api/v1/masters/&#123;id&#125;/override%73/&#123;date&#125;} (the bulk-decline
+     * budget). {@code StrictHttpFirewall} does NOT reject these: {@code %73}/{@code %65} are
+     * ordinary alphanumeric encodings, none of the trailing-slash / matrix-variable /
+     * encoded-slash shapes the firewall actually blocks.
+     *
+     * <p>This filter runs after {@code JwtAuthenticationFilter} but still BEFORE the
+     * {@code DispatcherServlet} parses and caches the request path, so
+     * {@code ServletRequestPathUtils.getCachedPath(request)} is not yet populated here. We
+     * therefore decode/normalize independently via {@link UrlPathHelper} (which percent-decodes
+     * ONCE, strips {@code ;matrix} content, and collapses duplicate slashes) and then fold any
+     * {@code .}/{@code ..} segments that survive decoding (e.g. {@code %2e%2e}) with
+     * {@link StringUtils#cleanPath}. {@code cleanPath} performs no decoding, so there is no
+     * double-decode (which would itself open a bypass), and unencoded paths pass through
+     * byte-for-byte so every existing rule's spelling still matches.
+     */
+    private String resolveMatchPath(HttpServletRequest request) {
+        return StringUtils.cleanPath(MATCH_PATH_HELPER.getPathWithinApplication(request));
+    }
+
+    /**
      * Maps a request to the bucket cache (and matching {@code Retry-After} value) it must be
      * throttled against, or {@code null} if this filter does not cover the request at all.
+     *
+     * <p>Matches on the DECODED + NORMALIZED path ({@link #resolveMatchPath}), never on the raw
+     * {@code getRequestURI()} — see that method for the bypass this closes.
      */
     private BucketRoute selectRoute(HttpServletRequest request) {
-        String path = request.getRequestURI();
+        String path = resolveMatchPath(request);
         String method = request.getMethod();
 
         // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
@@ -200,6 +289,19 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         // visit create is one token on the same threat model as a single-service create.
         if (HttpMethod.POST.matches(method) && (BOOKINGS_PATH.equals(path) || APPOINTMENTS_PATH.equals(path))) {
             return new BucketRoute(bookingWriteBuckets, CREATE_RESCHEDULE_RETRY_AFTER_SECONDS);
+        }
+        // POST /masters/{masterId}/bookings (Phase 22.4 staff walk-in create) — its OWN
+        // staffBookingSmsBuckets budget since Phase 22.7 made the route an SMS-SPEND path
+        // (SEC MEDIUM, 2026-08-18). It used to share bookingWriteBuckets on the lock-contention
+        // argument; that argument is still true and still covered, because the SMS budget (10/60s)
+        // is 3x TIGHTER than the create budget (5/10s => 30/min) and therefore binds first on this
+        // route. What the shared bucket did NOT cover is the money: 30 attacker-chosen, Beautica-
+        // branded SMS per minute per account, aimed at numbers that never consented — a worse
+        // surface than the decline path, which at least targets an OTP-verified guest and already
+        // has its own tighter bucket. See RateLimitConfig#staffBookingSmsCapacity.
+        if (HttpMethod.POST.matches(method) && path.startsWith(MASTERS_PATH_PREFIX)
+                && path.endsWith(BOOKINGS_SUFFIX)) {
+            return new BucketRoute(staffBookingSmsBuckets, STAFF_BOOKING_SMS_RETRY_AFTER_SECONDS);
         }
         // PUT /masters/{masterId}/overrides/{date} — its OWN bucket (2026-07-26 product decision
         // reversal, D6): an override-driven decline no longer carries a note or dispatches a

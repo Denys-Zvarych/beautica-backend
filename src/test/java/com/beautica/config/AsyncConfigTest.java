@@ -155,6 +155,76 @@ class AsyncConfigTest {
      * the tail of any batch over 508 — reminders whose {@code reminderSent} flag is already committed,
      * so nothing ever retries them.
      */
+    /**
+     * {@code smsSendExecutor} — the REQUEST-PATH SMS pool added by the Phase 22.7 hardening pass
+     * (backend-perf MEDIUM, 2026-08-18), today carrying the walk-in confirmation.
+     *
+     * <p>Its rejection policy is the exact opposite of {@link SmsReminderExecutor}'s, and that
+     * asymmetry is the whole reason the two pools are not merged (Anti-Bug §H-4 asks for
+     * consolidation of pools doing the same work; these do the same work for different submitters).
+     * The reminder pool is fed by a thread holding nothing, and a dropped reminder is unrecoverable,
+     * so it BLOCKS. This pool is fed from an {@code afterCommit} callback on the servlet thread —
+     * which still holds its pooled Hikari connection — so blocking it would re-create the very
+     * latency this pool exists to remove, and a dropped walk-in confirmation is the mildest failure
+     * available. Hence AbortPolicy, plus a structured drop log in {@code BookingSmsDispatcher}.
+     */
+    @Nested
+    @DisplayName("smsSendExecutor bean")
+    class SmsSendExecutor {
+
+        private final ThreadPoolTaskExecutor bean = (ThreadPoolTaskExecutor) asyncConfig.smsSendExecutor();
+        private final ThreadPoolExecutor pool = bean.getThreadPoolExecutor();
+
+        @Test
+        @DisplayName("smsSendExecutor — core equals max, so the advertised concurrency is the real one")
+        void should_makeCoreEqualMax_when_smsSendExecutorBuilt() {
+            assertThat(pool.getCorePoolSize())
+                    .as("core=%s below max=%s means a bounded-queue pool never grows until the queue "
+                                    + "is full — effective concurrency would be the core size",
+                            pool.getCorePoolSize(), pool.getMaximumPoolSize())
+                    .isEqualTo(pool.getMaximumPoolSize());
+            assertThat(pool.getMaximumPoolSize()).isEqualTo(4);
+            assertThat(pool.allowsCoreThreadTimeOut())
+                    .as("core=max without core timeout parks 4 idle threads forever")
+                    .isTrue();
+        }
+
+        /**
+         * The queue depth IS the bulkhead against a Turbosms outage (the residual concern behind the
+         * "no circuit breaker" finding): at the 5 s read cap this pool drains ~0.8 sends/s, so an
+         * outage fills 200 slots in bounded time and everything after that is dropped-and-logged
+         * instead of each send paying a full timeout on a request thread. An UNBOUNDED queue would
+         * remove that ceiling and turn the outage into a heap problem.
+         */
+        @Test
+        @DisplayName("smsSendExecutor — the queue is bounded at 200, which is the outage bulkhead")
+        void should_boundTheQueue_when_smsSendExecutorBuilt() {
+            assertThat(pool.getQueue().remainingCapacity())
+                    .as("smsSendExecutor queue capacity")
+                    .isEqualTo(200);
+        }
+
+        @Test
+        @DisplayName("smsSendExecutor — saturation ABORTS; it must never run the send on the caller")
+        void should_useAbortPolicy_when_smsSendExecutorSaturated() {
+            assertThat(pool.getRejectedExecutionHandler())
+                    .as("CallerRuns would put the blocking Turbosms call back on the request thread "
+                            + "this pool exists to free, and CallerBlocks would park that thread "
+                            + "while it still holds a pooled DB connection (Anti-Bug §H-2)")
+                    .isInstanceOf(ThreadPoolExecutor.AbortPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class)
+                    .isNotInstanceOf(AsyncConfig.CallerBlocksPolicy.class);
+        }
+
+        @Test
+        @DisplayName("smsSendExecutor — worker threads use the 'sms-send-' name prefix")
+        void should_nameWorkerThreadsWithSmsSendPrefix_when_taskSubmitted() throws InterruptedException {
+            assertThat(captureWorkerThreadName(bean))
+                    .as("smsSendExecutor worker thread name")
+                    .startsWith("sms-send-");
+        }
+    }
+
     @Nested
     @DisplayName("smsReminderExecutor bean")
     class SmsReminderExecutor {

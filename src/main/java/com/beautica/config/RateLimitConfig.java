@@ -249,6 +249,36 @@ public class RateLimitConfig {
 
     private static final Duration BOOKING_DECLINE_WINDOW = Duration.ofSeconds(60);
 
+    // Per-user cap for POST /api/v1/masters/{masterId}/bookings (the Phase 22.4 staff walk-in
+    // create). Its OWN bucket since Phase 22.7 made the route an SMS-SPEND path (SEC MEDIUM,
+    // 2026-08-18) — it used to share bookingWriteBuckets.
+    //
+    // Why it can no longer share bookingWriteBuckets: that budget (5/10s => 30/min) is sized for
+    // ADVISORY-LOCK CONTENTION, i.e. for bounding how many Hikari connections one account can park
+    // on a row lock. It is not an SMS budget, and 30 attacker-chosen SMS per minute per account is
+    // not one either. This route is a strictly worse smishing surface than the decline path that
+    // already has its own tighter bucket: decline targets an already-OTP-VERIFIED guest phone,
+    // whereas here a self-registered INDEPENDENT_MASTER with a 24/7 schedule can loop create/cancel
+    // and push Beautica-branded copy — carrying an attacker-chosen {serviceName} — at any Ukrainian
+    // number that never consented.
+    //
+    // Sizing mirrors bookingDeclineCapacity exactly (10/60s), and for the same reason: it is the
+    // established shape for "an authenticated write that dispatches an SMS to a phone the caller
+    // chose", generous for a provider keying in a morning's walk-ins in one sitting while removing
+    // the loop. Being 3x tighter than the create budget it replaced, it BINDS on this route, so the
+    // "one staff user's create budget must not be evadable by alternating POST /bookings with POST
+    // /masters/{id}/bookings" argument the shared bucket was chosen for still holds: alternating now
+    // buys the attacker the LOOSER of the two only for the non-spending route.
+    //
+    // This is the per-ACTOR half only. The per-RECIPIENT half — which no per-actor bucket can
+    // provide, since an attacker may hold several staff accounts — is
+    // StaffBookingService#assertWalkInSmsBudgetForPhone. Configurable so integration tests can raise
+    // the cap.
+    @Value("${app.rate-limit.staff-booking-sms-capacity:10}")
+    private long staffBookingSmsCapacity;
+
+    private static final Duration STAFF_BOOKING_SMS_WINDOW = Duration.ofSeconds(60);
+
     // Per-user cap for PUT /api/v1/masters/{masterId}/overrides/{date} (the schedule-override
     // write). Own bucket, deliberately NOT shared with bookingDeclineBuckets above (2026-07-26
     // product decision reversal, D6 — see that field's javadoc for why the two used to be one
@@ -666,6 +696,22 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-user bucket (see {@link #staffBookingSmsCapacity} field javadoc) for {@code POST
+     * /api/v1/masters/{masterId}/bookings} — the SMS-spend budget for the staff walk-in create,
+     * consumed by {@link BookingRateLimitFilter}'s flat one-token-per-request entry charge.
+     * {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket entry
+     * is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> staffBookingSmsBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                STAFF_BOOKING_SMS_WINDOW.plus(EVICTION_GRACE),
+                staffBookingSmsCapacity,
+                STAFF_BOOKING_SMS_WINDOW);
+    }
+
+    /**
      * Per-user bucket (see {@link #scheduleOverrideWriteCapacity} field javadoc) for
      * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}, consumed by
      * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
@@ -725,7 +771,8 @@ public class RateLimitConfig {
         // the same bookingWriteBuckets/bookingDeclineBuckets/scheduleOverrideWriteBuckets
         // singletons — unambiguous by construction.
         return new BookingRateLimitFilter(
-                bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(), objectMapper);
+                bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
+                staffBookingSmsBuckets(), objectMapper);
     }
 
     /**

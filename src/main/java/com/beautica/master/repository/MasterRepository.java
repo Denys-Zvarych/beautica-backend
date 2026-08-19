@@ -167,6 +167,38 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<Master> findByIdWithUserAndSalon(@Param("masterId") UUID masterId);
 
     /**
+     * The id of the master's salon, <b>but only when that salon is owned by {@code ownerId}</b> and
+     * still open — otherwise empty.
+     *
+     * <p>Used by {@code StaffBookingScopeResolver} on its ONE branch that has to disambiguate: a
+     * {@code SALON_OWNER} who owns more than one salon, creating a staff booking through
+     * {@code POST /masters/&#123;masterId&#125;/bookings}, which carries no {@code &#123;salonId&#125;}
+     * to pick with (phase-171 amendment A2).
+     *
+     * <p><b>The ownership predicate is inside the query on purpose.</b> The value feeds
+     * {@code StaffBookingScope.InSalon}, which {@code StaffBookingService#assertMasterInScope} then
+     * compares against the master's salon. A plain "read the master's salon id" projection would
+     * make that comparison a tautology; here the salon cannot be returned at all unless the actor
+     * owns it, so the emitted scope is always the caller's authority rather than the target's
+     * attribute. Do not add a non-owner-scoped variant beside it (§E-1).
+     *
+     * <p>{@code JOIN} (inner) is correct here rather than {@code LEFT JOIN}: a salon-less
+     * independent master has no owned salon to return, and empty is exactly the right answer.
+     *
+     * @param masterId the target master
+     * @param ownerId  the authenticated {@code SALON_OWNER}
+     */
+    @Query("""
+            SELECT s.id FROM Master m
+            JOIN m.salon s
+            WHERE m.id = :masterId
+              AND s.owner.id = :ownerId
+              AND s.isActive = true
+            """)
+    Optional<UUID> findSalonIdByIdAndSalonOwnerId(
+            @Param("masterId") UUID masterId, @Param("ownerId") UUID ownerId);
+
+    /**
      * Re-computes and persists {@code masters.min_effective_price} for a single
      * master as a single UPDATE — eliminates the load/mutate/save round-trip.
      *

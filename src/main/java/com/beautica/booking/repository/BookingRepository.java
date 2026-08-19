@@ -11,6 +11,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.sql.Date;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
@@ -422,6 +423,35 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             WHERE b.id IN :ids
             """)
     List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
+
+    /**
+     * How many {@code STAFF} walk-ins have been created for one recipient phone since {@code since}
+     * — the per-recipient SMS-spend cap enforced by
+     * {@code StaffBookingService#assertWalkInSmsBudgetForPhone} (SEC MEDIUM, 2026-08-18).
+     *
+     * <p>Counted in the DB rather than in an in-memory bucket so the limit survives a restart and
+     * holds across instances; {@code bookings} already records the exact fact being limited.
+     *
+     * <p><b>Every status counts, deliberately.</b> The cost being bounded is the CONFIRMATION SMS,
+     * which is dispatched at create time and cannot be recalled — so a create/cancel loop must not
+     * refund budget. Filtering to {@code CONFIRMED} would make cancelling the way to reset the cap,
+     * i.e. would hand the attacker the lever this query exists to remove.
+     *
+     * <p>{@code BookingSource.STAFF} scopes it to the walk-in path only: a guest (LINK) booking's
+     * phone is OTP-verified and already throttled by {@code PhoneOtpService}, and an APP booking has
+     * no {@code guestPhone} at all.
+     *
+     * <p>Served by {@code idx_bookings_guest_phone} plus the {@code created_at} predicate; it is a
+     * scalar COUNT, so no graph and no {@code Pageable} apply (Anti-Bug §E-3 concerns collection
+     * returns).
+     */
+    @Query("""
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.guestPhone = :phone
+              AND b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
+              AND b.createdAt > :since
+            """)
+    long countStaffWalkInsForPhoneSince(@Param("phone") String phone, @Param("since") Instant since);
 
     // ── Client booking-detail projection (Phase 19.3; sentinel removed Phase 26.7.1) ──
     /**

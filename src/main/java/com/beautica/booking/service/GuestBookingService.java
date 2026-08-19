@@ -18,21 +18,17 @@ import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.service.NotificationOutboxService;
-import com.beautica.notification.sms.SmsService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import io.jsonwebtoken.JwtException;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -58,7 +54,6 @@ import java.util.UUID;
  * on save is a final backstop mapped to 409.
  */
 @Service
-@Slf4j
 public class GuestBookingService {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
@@ -71,7 +66,7 @@ public class GuestBookingService {
     private final AppointmentRepository appointmentRepository;
     private final SlotCalculationService slotCalculationService;
     private final NotificationOutboxService outboxService;
-    private final SmsService smsService;
+    private final BookingSmsDispatcher bookingSmsDispatcher;
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final VisitPlanner visitPlanner;
@@ -86,7 +81,7 @@ public class GuestBookingService {
             AppointmentRepository appointmentRepository,
             SlotCalculationService slotCalculationService,
             NotificationOutboxService outboxService,
-            SmsService smsService,
+            BookingSmsDispatcher bookingSmsDispatcher,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
             VisitPlanner visitPlanner,
@@ -99,7 +94,7 @@ public class GuestBookingService {
         this.appointmentRepository = appointmentRepository;
         this.slotCalculationService = slotCalculationService;
         this.outboxService = outboxService;
-        this.smsService = smsService;
+        this.bookingSmsDispatcher = bookingSmsDispatcher;
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
         this.visitPlanner = visitPlanner;
@@ -271,16 +266,12 @@ public class GuestBookingService {
         // Per-master advisory lock BEFORE the overlap check — same fused-timeout mechanism the single
         // guest path uses (this endpoint is permitAll, so the 3s lock_timeout bounds the wait against the
         // advisory-lock DoS class). No client lock: a guest has no account to serialize on.
-        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
-        if (lock == null) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
-        }
+        //
         // ONE span overlap check over [firstStart, lastEnd): the chained items are contiguous by
         // construction, so their union equals the span (identical rationale to AppointmentService). The
         // per-row no_overlapping_bookings GIST EXCLUDE still backstops each insert (the catch below → 409).
-        if (bookingRepository.existsOverlap(master.getId(), firstStart, lastEnd)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        BookingSlotLockGuard.lockMasterAndAssertFree(
+                bookingRepository, master.getId(), firstStart, lastEnd);
 
         UUID cancelToken = UUID.randomUUID();
         Appointment appointment = Appointment.guestAppointment(
@@ -351,13 +342,12 @@ public class GuestBookingService {
         // BookingService.doCreateBooking, so check + insert are atomic (no TOCTOU race).
         // acquireAdvisoryLockWithTimeout() bounds this wait to 3s in the same round trip
         // (see class-level Javadoc above).
-        Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(master.getId());
-        if (lock == null) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
-        }
-        if (bookingRepository.existsOverlap(master.getId(), startsAt, endsAt)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        //
+        // Extracted to BookingSlotLockGuard in Phase 22.2 so the STAFF create path could reuse this
+        // lock/overlap/save sequence instead of becoming a third copy of it. Byte-for-byte the same
+        // repository calls, the same 409 message and the same DataIntegrityViolationException
+        // translation this method has always made — see that class's Javadoc.
+        BookingSlotLockGuard.lockMasterAndAssertFree(bookingRepository, master.getId(), startsAt, endsAt);
 
         // Freeze the RANGE ceiling beside the floor (V119), by the same rule and at the same
         // moment as the registered-client path (BookingService#doCreateBooking). Null = single
@@ -366,11 +356,7 @@ public class GuestBookingService {
                 master, msa, master.getSalon(), startsAt, endsAt,
                 price, BookingPriceRange.resolveCeiling(msa),
                 duration, buffer, req.name(), req.surname(), guestPhone);
-        try {
-            return bookingRepository.saveAndFlush(booking);
-        } catch (DataIntegrityViolationException e) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        return BookingSlotLockGuard.saveOrConflict(bookingRepository, booking);
     }
 
     private void registerAfterCommit(Master master, MasterServiceAssignment msa,
@@ -380,7 +366,16 @@ public class GuestBookingService {
         // null for an independent master (no salon catalogue entry).
         UUID salonId = saved.getSalon() != null ? saved.getSalon().getId() : null;
         Runnable task = () -> {
-            sendConfirmationSms(guestPhone, smsText);
+            // EVICTION FIRST, SEND SECOND — the order is load-bearing (perf MEDIUM, 2026-08-18).
+            // Both statements share one runnable, so putting the Turbosms round trip in front made
+            // a provider brown-out (up to the 5 s read cap, 3 s more on connect) delay a
+            // correctness-critical evict by that whole time, during which parallel readers can
+            // repopulate — and keep serving for the 60 s TTL — a slot this booking just consumed.
+            // The evict is in-memory and cannot block; the send could and did. The send is now a
+            // non-blocking hand-off to BookingSmsDispatcher, so the delay is gone at the source —
+            // but the ORDER stays as documented, because a future inline send here would silently
+            // restore the whole defect. Do not swap them back.
+            //
             // A new guest booking changed occupancy → evict the master's availability caches by
             // master prefix. Not per (date, service): the booked time bounds the slots offered for
             // EVERY service this master performs that day, not only the booked one.
@@ -389,17 +384,10 @@ public class GuestBookingService {
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
+            bookingSmsDispatcher.dispatch(
+                    BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);
         };
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    task.run();
-                }
-            });
-        } else {
-            task.run();
-        }
+        BookingAfterCommit.run(task);
     }
 
     /**
@@ -415,32 +403,16 @@ public class GuestBookingService {
         String smsText = buildConfirmationSms(master, visitSmsServiceName(items), firstSaved, cancelUrl);
         UUID salonId = master.getSalon() != null ? master.getSalon().getId() : null;
         Runnable task = () -> {
-            sendConfirmationSms(guestPhone, smsText);
+            // Eviction first, send second — see registerAfterCommit for why this order is
+            // load-bearing and must not be swapped back.
             slotCalculationService.evictMasterAvailabilityCaches(master.getId());
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
+            bookingSmsDispatcher.dispatch(
+                    BookingSmsDispatcher.Kind.GUEST_CONFIRMATION, guestPhone, smsText);
         };
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    task.run();
-                }
-            });
-        } else {
-            task.run();
-        }
-    }
-
-    private void sendConfirmationSms(String guestPhone, String smsText) {
-        try {
-            smsService.send(guestPhone, smsText);
-        } catch (RuntimeException e) {
-            // The booking is already committed and confirmed — an SMS-provider failure
-            // must not fail the request. Log the cause class only (never the phone or text).
-            log.warn("Guest confirmation SMS failed: {}", e.getClass().getSimpleName());
-        }
+        BookingAfterCommit.run(task);
     }
 
     private String buildConfirmationSms(Master master, MasterServiceAssignment msa,

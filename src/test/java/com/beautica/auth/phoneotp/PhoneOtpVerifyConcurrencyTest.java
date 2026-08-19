@@ -3,7 +3,7 @@ package com.beautica.auth.phoneotp;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.sms.OtpSmsSender;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -61,7 +61,7 @@ class PhoneOtpVerifyConcurrencyTest extends AbstractIntegrationTest {
     private JdbcTemplate jdbc;
 
     @MockBean
-    private SmsService smsService;
+    private OtpSmsSender otpSmsSender;
 
     private static String sha256Hex(String value) throws Exception {
         byte[] hash = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));

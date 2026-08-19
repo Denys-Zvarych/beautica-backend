@@ -11,10 +11,8 @@ import com.beautica.common.util.Placeholders;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.service.NotificationOutboxService;
-import com.beautica.notification.sms.SmsService;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -45,11 +43,11 @@ import java.util.UUID;
  * <p><b>Side-effect ordering.</b> The master-notification outbox row is written inside
  * the cancellation transaction (the outbox is delivered by the drain worker afterwards),
  * while the guest cancellation SMS is dispatched only {@code afterCommit} — a rolled-back
- * cancellation sends no SMS. SMS-provider failures are swallowed (cause class logged
- * only, never the phone or text) because the booking is already committed as CANCELLED.
+ * cancellation sends no SMS. The send itself is a non-blocking hand-off to
+ * {@link BookingSmsDispatcher}, which owns the swallow-and-log (cause class only, never the
+ * phone or text) because the booking is already committed as CANCELLED.
  */
 @Service
-@Slf4j
 public class BookingCancellationService {
 
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
@@ -58,7 +56,7 @@ public class BookingCancellationService {
     private final GuestVisitCancellationService guestVisitCancellationService;
     private final BookingRepository bookingRepository;
     private final NotificationOutboxService outboxService;
-    private final SmsService smsService;
+    private final BookingSmsDispatcher bookingSmsDispatcher;
     private final SlotCalculationService slotCalculationService;
     private final BookingSmsProperties smsProperties;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -68,7 +66,7 @@ public class BookingCancellationService {
             GuestVisitCancellationService guestVisitCancellationService,
             BookingRepository bookingRepository,
             NotificationOutboxService outboxService,
-            SmsService smsService,
+            BookingSmsDispatcher bookingSmsDispatcher,
             SlotCalculationService slotCalculationService,
             BookingSmsProperties smsProperties,
             SalonCatalogCacheEvictor salonCatalogCacheEvictor,
@@ -76,7 +74,7 @@ public class BookingCancellationService {
         this.guestVisitCancellationService = guestVisitCancellationService;
         this.bookingRepository = bookingRepository;
         this.outboxService = outboxService;
-        this.smsService = smsService;
+        this.bookingSmsDispatcher = bookingSmsDispatcher;
         this.slotCalculationService = slotCalculationService;
         this.smsProperties = smsProperties;
         this.salonCatalogCacheEvictor = salonCatalogCacheEvictor;
@@ -174,7 +172,13 @@ public class BookingCancellationService {
         UUID masterId = booking.getMaster().getId();
         UUID salonId = booking.getSalon() != null ? booking.getSalon().getId() : null;
         Runnable task = () -> {
-            sendCancellationSms(phone, smsText);
+            // EVICTION FIRST, DISPATCH SECOND — this order used to be the other way round, and the
+            // send was inline (perf LOW, 2026-08-19). A Turbosms brown-out (up to the 5 s read cap,
+            // 3 s more on connect) therefore delayed a correctness-critical evict by that whole
+            // time, on the request thread, while it still held its pooled connection — during which
+            // parallel readers could repopulate, and keep serving for the 60 s TTL, a slot this
+            // cancel just freed. Matches GuestBookingService#registerAfterCommit. Do not swap back.
+            //
             // Cancelling frees the master's time → the freed slot must reappear in the picker for
             // EVERY service this master performs that day (not just the cancelled one), and the
             // free-slot bookability verdict may flip (un-hiding a service). One by-master sweep.
@@ -183,6 +187,8 @@ public class BookingCancellationService {
             if (salonId != null) {
                 salonCatalogCacheEvictor.evict(salonId);
             }
+            bookingSmsDispatcher.dispatch(
+                    BookingSmsDispatcher.Kind.GUEST_CANCELLATION, phone, smsText);
         };
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -193,16 +199,6 @@ public class BookingCancellationService {
             });
         } else {
             task.run();
-        }
-    }
-
-    private void sendCancellationSms(String phone, String smsText) {
-        try {
-            smsService.send(phone, smsText);
-        } catch (RuntimeException e) {
-            // The booking is already committed as CANCELLED — an SMS-provider failure must
-            // not fail the request. Log the cause class only (never the phone or text).
-            log.warn("Guest cancellation SMS failed: {}", e.getClass().getSimpleName());
         }
     }
 

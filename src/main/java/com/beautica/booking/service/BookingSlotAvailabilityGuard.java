@@ -30,6 +30,14 @@ import java.util.UUID;
  */
 final class BookingSlotAvailabilityGuard {
 
+    /**
+     * The identical status and message the create-path overlap check and the GIST
+     * {@code no_overlapping_bookings} backstop already return for an unbookable time, so a rejected
+     * create surfaces one coherent conflict rather than leaking WHICH rule rejected it. Named once so
+     * the list-matching and existence-checking arms cannot drift apart.
+     */
+    private static final String SLOT_NOT_AVAILABLE = "Slot not available";
+
     private BookingSlotAvailabilityGuard() {
     }
 
@@ -68,6 +76,38 @@ final class BookingSlotAvailabilityGuard {
                 slotCalculationService.getAvailableSlots(
                         masterId, kyivDate(startsAt), masterServiceId, preloaded),
                 startsAt);
+    }
+
+    /**
+     * <b>STAFF create-path counterpart of {@link #assertStartsOnAvailableSlot}</b> (Phase 22.2) —
+     * identical oracle, identical comparison, identical 409, evaluated at the STAFF lead-time floor
+     * (minimum lead 0) instead of the client one (15 min).
+     *
+     * <p>The floor is the ONLY difference. Working hours, day-offs, custom-hours gaps, EXPLICIT_TIMES
+     * days, master/salon liveness and existing-booking occupancy are resolved by the same
+     * {@code computeAvailableSlots} core, so a staff booking can never be accepted on a day or in a
+     * gap a client booking would be refused — and vice versa, except inside the 15 minutes the
+     * locked walk-in rule deliberately opens up.
+     *
+     * <p><b>Asks {@link SlotCalculationService#isStaffSlotAvailable}, not
+     * {@link SlotCalculationService#getStaffAvailableSlots}</b> (perf LOW, 2026-08-18). The question
+     * is a boolean and the answer was a whole day's worth of {@code AvailableSlotResponse}, each
+     * holding two {@code ZonedDateTime}s, scanned once and discarded. ({@code SLOT_STEP} is 30
+     * minutes and a day's work intervals are disjoint, so a Kyiv day holds at most 48 grid positions
+     * in total; a realistic 9-12h working day yields 17-24.) The client path can
+     * afford to materialise that list because the {@code available-slots} cache amortises it across
+     * requests; the staff list is deliberately uncached, so this one paid the full cost on every
+     * create with zero reuse. {@code isStaffSlotAvailable} runs the identical pipeline and applies
+     * the identical start comparison inside the per-interval walk, so the verdict is unchanged — the
+     * equivalence is pinned by {@code BookingAvailabilityAgreementIT} case 19.
+     */
+    static void assertStaffStartsOnAvailableSlot(
+            SlotCalculationService slotCalculationService, UUID masterId, UUID masterServiceId,
+            MasterServiceAssignment preloaded, OffsetDateTime startsAt) {
+        if (!slotCalculationService.isStaffSlotAvailable(
+                masterId, kyivDate(startsAt), masterServiceId, preloaded, startsAt)) {
+            throw new BusinessException(HttpStatus.CONFLICT, SLOT_NOT_AVAILABLE);
+        }
     }
 
     /**
@@ -125,7 +165,7 @@ final class BookingSlotAvailabilityGuard {
         boolean onSchedule = slots.stream()
                 .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
         if (!onSchedule) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+            throw new BusinessException(HttpStatus.CONFLICT, SLOT_NOT_AVAILABLE);
         }
     }
 }

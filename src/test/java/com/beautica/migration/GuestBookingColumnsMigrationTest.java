@@ -59,7 +59,7 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("existing-style APP booking defaults booking_source to 'APP'")
     void should_defaultBookingSourceToApp_when_rowInsertedWithoutSource() {
-        Ids ids = seedGraph();
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update("""
                 INSERT INTO bookings (id, client_id, master_id, master_service_id, status, starts_at, ends_at,
@@ -76,7 +76,7 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("CHECK rejects a LINK booking missing guest_name / cancel_token")
     void should_rejectLinkBooking_when_guestFieldsMissing() {
-        Ids ids = seedGraph();
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
 
         assertThatThrownBy(() -> jdbcTemplate.update("""
                 INSERT INTO bookings (id, master_id, master_service_id, status, starts_at, ends_at,
@@ -91,7 +91,7 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("CHECK accepts a fully-populated LINK booking (client_id NULL + guest fields set)")
     void should_acceptLinkBooking_when_guestFieldsPresent() {
-        Ids ids = seedGraph();
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
         UUID bookingId = UUID.randomUUID();
 
         jdbcTemplate.update("""
@@ -110,7 +110,7 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("CHECK still rejects an ACTIVE LINK booking (CONFIRMED) with a NULL cancel_token")
     void should_rejectActiveLinkBooking_when_cancelTokenNull() {
-        Ids ids = seedGraph();
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
 
         assertThatThrownBy(() -> jdbcTemplate.update("""
                 INSERT INTO bookings (id, master_id, master_service_id, status, starts_at, ends_at,
@@ -125,7 +125,7 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("V91: CHECK accepts a terminal LINK booking (CANCELLED) with a NULL cancel_token")
     void should_acceptTerminalLinkBooking_when_cancelTokenNull() {
-        Ids ids = seedGraph();
+        BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
         UUID bookingId = UUID.randomUUID();
 
         jdbcTemplate.update("""
@@ -151,54 +151,4 @@ class GuestBookingColumnsMigrationTest extends AbstractIntegrationTest {
         return count != null && count == 1;
     }
 
-    /**
-     * Resolves a real, selectable {@code service_types.id} (V111 made this column NOT NULL).
-     * V89's guest-booking-column contract is orthogonal to which service type is used, so any
-     * active, APPROVED-category type satisfies the FK.
-     */
-    private UUID resolveServiceTypeId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT st.id FROM service_types st "
-                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
-                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
-    }
-
-    private record Ids(UUID clientId, UUID masterId, UUID masterServiceId) {}
-
-    private Ids seedGraph() {
-        UUID clientId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
-                        + "VALUES (?, ?, 'x', 'CLIENT', true, true)",
-                clientId, "client-" + clientId + "@beautica.test");
-
-        UUID masterUserId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified, first_name, last_name) "
-                        + "VALUES (?, ?, 'x', 'INDEPENDENT_MASTER', true, true, 'Марія', 'Левченко')",
-                masterUserId, "master-" + masterUserId + "@beautica.test");
-
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId);
-
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, "
-                        + "buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Манікюр', ?, 60, 350.00, 0, true, NOW(), NOW())",
-                serviceDefId, masterUserId, resolveServiceTypeId());
-
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId);
-
-        return new Ids(clientId, masterId, masterServiceId);
-    }
 }
