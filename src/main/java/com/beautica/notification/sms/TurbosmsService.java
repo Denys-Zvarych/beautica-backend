@@ -2,13 +2,12 @@ package com.beautica.notification.sms;
 
 import com.beautica.config.TurbosmsProperties;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
-import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.stereotype.Service;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
+import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -24,14 +23,22 @@ import java.util.Map;
  * <p><b>Logging discipline (security-critical, Anti-Bug §I-3).</b> Only the send
  * status and a masked recipient ({@code +380***XXXX}, last 4 digits) are logged.
  * The message text (may contain an OTP) and the Bearer token are NEVER logged.
+ * The masking rule itself moved to {@link PhoneMask} in Phase 22.7 so this class and
+ * {@link NoOpSmsService} cannot drift into two different definitions of "masked".
+ *
+ * <p><b>Not a {@code @Service} since Phase 22.7.</b> This bean is now registered
+ * conditionally by {@code SmsConfig}, and only when {@code app.booking.sms.enabled=true};
+ * otherwise {@link NoOpSmsService} occupies the {@link SmsService} injection point. Restoring
+ * a component-scan annotation here would register a SECOND {@code SmsService} bean and break
+ * every injection point at boot. The behaviour below is otherwise unchanged — in particular a
+ * blank token still throws, because "the gate is off" and "the credential is missing" are
+ * different situations and only the second is a misconfiguration.
  */
 @Slf4j
-@Service
 public class TurbosmsService implements SmsService {
 
     private static final String SUCCESS_STATUS = "OK";
     private static final String FAILURE_STATUS = "FAILED";
-    private static final int VISIBLE_TAIL_DIGITS = 4;
     /** Cap the TCP handshake so an unroutable Turbosms host fails fast (Anti-Bug §H / thread-pool starvation). */
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(3);
     /** Cap the response wait so a hung Turbosms endpoint cannot pin the calling thread indefinitely. */
@@ -46,12 +53,47 @@ public class TurbosmsService implements SmsService {
         // Build the client once (java-skill / Anti-Bug §C analogue: never per-request).
         // Explicit connect/read timeouts: JDK defaults are unbounded, so a hung provider
         // would otherwise hold the request/notification thread until the OS gives up.
-        ClientHttpRequestFactorySettings settings = ClientHttpRequestFactorySettings.defaults()
-                .withConnectTimeout(CONNECT_TIMEOUT)
-                .withReadTimeout(READ_TIMEOUT);
-        this.restClient = restClientBuilder
-                .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(settings))
+        //
+        // THE FACTORY IS NAMED EXPLICITLY, NOT LEFT TO ClientHttpRequestFactoryBuilder.detect() —
+        // two findings, one change (2026-08-18).
+        //
+        //  (1) A 503 was billed TWICE. detect() resolves the FIRST client on the classpath, and
+        //      `httpclient5` is on the TEST classpath (build.gradle.kts testImplementation) but not
+        //      the production one. Apache HC5 installs DefaultHttpRequestRetryStrategy, which treats
+        //      429 and 503 as retryable — the two codes an overloaded or rate-limited SMS gateway is
+        //      most likely to answer with. Turbosms bills per delivered message and this request
+        //      carries no idempotency key, so the silent retry was a duplicate charge AND a
+        //      duplicate message to a real client.
+        //  (2) Worse, that behaviour was TEST-ONLY. Production, with no HC5 present, already fell
+        //      back to the JDK client — so every assertion about retries, and about the
+        //      connect/read timeouts above, was verified against a factory production never used.
+        //      A defence that only exists under test is not a defence.
+        //
+        // Naming it fixes both: test and production now agree, the timeouts are verified where they
+        // actually run, and the JDK client does not retry a POST (it retries only connection-level
+        // failures on idempotent methods, and `jdk.httpclient.enableAllMethodRetry` is off by
+        // default). Do NOT restore detect(), and do NOT promote httpclient5 to `implementation`
+        // without re-pinning the retry strategy here — a billable send must never be repeated by
+        // infrastructure the call site cannot see.
+        //
+        // HTTP_1_1 is pinned, not left at the JDK default. HttpClient defaults to HTTP_2, which
+        // against a cleartext endpoint means an h2c upgrade attempt — and a server that does not
+        // speak it (WireMock's Jetty, among others) drops the connection, surfacing as a bare
+        // "EOF reached while reading". Turbosms is a plain JSON POST API and HTTP/1.1 is what this
+        // client has always spoken, so pinning it changes nothing except removing a negotiation
+        // that can only fail.
+        //
+        // Redirects are NEVER followed. A 3xx would make the client re-issue this exact billable
+        // POST at a location the call site never chose — the same "infrastructure repeats a paid
+        // send" class as the retry strategy documented above.
+        HttpClient httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .connectTimeout(CONNECT_TIMEOUT)
                 .build();
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
+        requestFactory.setReadTimeout(READ_TIMEOUT);
+        this.restClient = restClientBuilder.requestFactory(requestFactory).build();
         this.baseUrl = properties.getBaseUrl();
         this.token = properties.getToken();
         this.senderName = properties.getSenderName();
@@ -97,18 +139,8 @@ public class TurbosmsService implements SmsService {
         log.info("SMS send status={} to={}", SUCCESS_STATUS, mask(phoneE164));
     }
 
-    /**
-     * Masks a phone to {@code +380***XXXX} — keeps the leading {@code +380} (when
-     * present) and the last {@value #VISIBLE_TAIL_DIGITS} digits, hides the middle.
-     * Defensive against null/short input so logging can never NPE.
-     */
+    /** @see PhoneMask#mask(String) — the one masking rule, shared with {@link NoOpSmsService}. */
     private static String mask(String phone) {
-        if (phone == null || phone.isBlank()) {
-            return "+380***????";
-        }
-        String tail = phone.length() <= VISIBLE_TAIL_DIGITS
-                ? phone
-                : phone.substring(phone.length() - VISIBLE_TAIL_DIGITS);
-        return "+380***" + tail;
+        return PhoneMask.mask(phone);
     }
 }

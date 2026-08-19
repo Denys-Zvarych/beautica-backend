@@ -33,11 +33,11 @@ import java.util.UUID;
  * verbs are matched by the identical {@code endsWith} suffix checks as their whole-visit siblings
  * and bucketed with them, never on a dedicated per-item budget — and {@code PUT
  * /api/v1/masters/{masterId}/overrides/{date}} (the schedule-override write, which can bulk-decline
- * every conflicting booking on a date). These map to THREE independent buckets with different
+ * every conflicting booking on a date). These map to FOUR independent buckets with different
  * capacities, because they close different threat models:
  *
  * <ul>
- *   <li><b>{@code bookingWriteBuckets}:</b> create/appointment-create/<b>staff-create</b>/reschedule
+ *   <li><b>{@code bookingWriteBuckets}:</b> create/appointment-create/reschedule
  *   (both paths), plus cancel (both paths) and appointment-complete. All of these take a real row
  *   lock that can
  *   pin a Hikari connection under contention — either the per-client advisory lock
@@ -46,12 +46,7 @@ import java.util.UUID;
  *   every one of its own requests on the identical lock) or, for every {@code /appointments/**}
  *   route in this bucket, the {@code appointments} header's {@code SELECT ... FOR UPDATE}
  *   ({@code AppointmentRepository.lockHeaderRegardlessOfStatus} /
- *   {@code lockHeaderIfConfirmed}) plus the 5-way {@code JOIN FETCH} item load that follows it, or —
- *   for {@code POST /masters/&#123;masterId&#125;/bookings} — the PER-MASTER advisory lock
- *   ({@code BookingSlotLockGuard.lockMasterAndAssertFree}). That last one is keyed on the TARGET
- *   master, not on the caller, so an unthrottled staff token degrades availability for every real
- *   CLIENT booking that master, not merely for itself — which is why the staff create shares this
- *   bucket rather than going unbucketed (SEC MEDIUM, 2026-08-18).
+ *   {@code lockHeaderIfConfirmed}) plus the 5-way {@code JOIN FETCH} item load that follows it.
  *   Without a per-user throttle, N concurrent requests from one account (N greater than Hikari's
  *   {@code maximum-pool-size: 10}) park connections on the lock wait until the pool is exhausted
  *   and the whole app 503s for every other tenant — the lock-contention DoS this bucket closes
@@ -92,6 +87,19 @@ import java.util.UUID;
  *   month-long vacation is realistically ~31 consecutive requests from one actor — which neither
  *   sibling bucket was sized for. See {@code RateLimitConfig#scheduleOverrideWriteCapacity}'s
  *   javadoc for the exact capacity and its justification.</li>
+ *   <li><b>{@code staffBookingSmsBuckets}:</b> {@code POST
+ *   /api/v1/masters/&#123;masterId&#125;/bookings} — the Phase 22.4 staff walk-in create, moved off
+ *   {@code bookingWriteBuckets} in Phase 22.7 (SEC MEDIUM, 2026-08-18). Two threat models overlap on
+ *   this one route and the tighter budget covers both: it takes the PER-MASTER advisory lock
+ *   ({@code BookingSlotLockGuard.lockMasterAndAssertFree}), keyed on the TARGET master rather than
+ *   the caller, so an unthrottled staff token degrades availability for every real CLIENT booking
+ *   that master; AND since 22.7 every success dispatches a Beautica-branded SMS, carrying a
+ *   provider-authored {@code serviceName}, to a staff-TYPED number that never consented. The second
+ *   is a strictly worse smishing surface than {@code bookingDeclineBuckets}' — decline at least
+ *   targets an already-OTP-verified guest — so it gets the same 10/60s shape, which being 3x tighter
+ *   than the create budget it left also still bounds the lock contention. Per-ACTOR only; the
+ *   per-RECIPIENT half lives in {@code StaffBookingService#assertWalkInSmsBudgetForPhone}, because
+ *   no per-actor bucket can bound an attacker holding several staff accounts.</li>
  * </ul>
  *
  * <p><b>Why user-keyed, unlike every bucket in {@link com.beautica.auth.filter.AuthRateLimitFilter}:</b>
@@ -186,19 +194,25 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      */
     private static final int SCHEDULE_OVERRIDE_RETRY_AFTER_SECONDS = 60;
 
+    /** {@code Retry-After} for the staff walk-in SMS-spend bucket — matches its 60s refill window. */
+    private static final int STAFF_BOOKING_SMS_RETRY_AFTER_SECONDS = 60;
+
     private final LoadingCache<String, Bucket> bookingWriteBuckets;
     private final LoadingCache<String, Bucket> bookingDeclineBuckets;
     private final LoadingCache<String, Bucket> scheduleOverrideWriteBuckets;
+    private final LoadingCache<String, Bucket> staffBookingSmsBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
             LoadingCache<String, Bucket> bookingWriteBuckets,
             LoadingCache<String, Bucket> bookingDeclineBuckets,
             LoadingCache<String, Bucket> scheduleOverrideWriteBuckets,
+            LoadingCache<String, Bucket> staffBookingSmsBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
         this.scheduleOverrideWriteBuckets = scheduleOverrideWriteBuckets;
+        this.staffBookingSmsBuckets = staffBookingSmsBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -276,17 +290,18 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         if (HttpMethod.POST.matches(method) && (BOOKINGS_PATH.equals(path) || APPOINTMENTS_PATH.equals(path))) {
             return new BucketRoute(bookingWriteBuckets, CREATE_RESCHEDULE_RETRY_AFTER_SECONDS);
         }
-        // POST /masters/{masterId}/bookings (Phase 22.4 staff walk-in create) — the SAME
-        // bookingWriteBuckets budget as the two creates above, because it is the same threat model:
-        // StaffBookingService takes the per-master advisory lock that the CLIENT create path also
-        // takes, so an unthrottled staff token could queue unbounded contention on that lock and
-        // degrade availability for real clients booking the same master. From Phase 22.7 the route
-        // also becomes an SMS-spend path. Sharing the bucket (rather than minting a fourth) is
-        // deliberate: one staff user's create budget must not be evadable by alternating between
-        // POST /bookings and POST /masters/{id}/bookings.
+        // POST /masters/{masterId}/bookings (Phase 22.4 staff walk-in create) — its OWN
+        // staffBookingSmsBuckets budget since Phase 22.7 made the route an SMS-SPEND path
+        // (SEC MEDIUM, 2026-08-18). It used to share bookingWriteBuckets on the lock-contention
+        // argument; that argument is still true and still covered, because the SMS budget (10/60s)
+        // is 3x TIGHTER than the create budget (5/10s => 30/min) and therefore binds first on this
+        // route. What the shared bucket did NOT cover is the money: 30 attacker-chosen, Beautica-
+        // branded SMS per minute per account, aimed at numbers that never consented — a worse
+        // surface than the decline path, which at least targets an OTP-verified guest and already
+        // has its own tighter bucket. See RateLimitConfig#staffBookingSmsCapacity.
         if (HttpMethod.POST.matches(method) && path.startsWith(MASTERS_PATH_PREFIX)
                 && path.endsWith(BOOKINGS_SUFFIX)) {
-            return new BucketRoute(bookingWriteBuckets, CREATE_RESCHEDULE_RETRY_AFTER_SECONDS);
+            return new BucketRoute(staffBookingSmsBuckets, STAFF_BOOKING_SMS_RETRY_AFTER_SECONDS);
         }
         // PUT /masters/{masterId}/overrides/{date} — its OWN bucket (2026-07-26 product decision
         // reversal, D6): an override-driven decline no longer carries a note or dispatches a

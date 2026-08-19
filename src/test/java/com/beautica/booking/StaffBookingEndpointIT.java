@@ -1,50 +1,28 @@
 package com.beautica.booking;
 
-import com.beautica.AbstractIntegrationTest;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
-import com.beautica.common.ApiResponse;
-import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.master.dto.WeeklyScheduleDayRequest;
-import com.beautica.master.dto.WeeklyScheduleRequest;
-import com.beautica.master.dto.WorkIntervalDto;
-import com.beautica.master.service.MasterScheduleService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.apache.hc.core5.util.TimeValue;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
-import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
-import org.springframework.security.crypto.password.PasswordEncoder;
 
-import java.math.BigDecimal;
-import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
-import java.time.ZonedDateTime;
-import java.util.Arrays;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
 /**
@@ -78,80 +56,19 @@ import static org.mockito.Mockito.verifyNoInteractions;
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("StaffBookingEndpointIT — POST /masters/{masterId}/bookings over HTTP")
-class StaffBookingEndpointIT extends AbstractIntegrationTest {
+class StaffBookingEndpointIT extends AbstractStaffBookingIT {
 
-    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
-    private static final int DURATION_MINUTES = 60;
-    private static final BigDecimal PRICE = new BigDecimal("350.00");
-    private static final String RAW_PHONE = "050 123 45 67";
-    private static final String E164_PHONE = "+380501234567";
-
-    @Autowired
-    private TestRestTemplate restTemplate;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
-    @Autowired
-    private PasswordEncoder passwordEncoder;
-
-    @Autowired
-    private MasterScheduleService masterScheduleService;
-
-    /** Phase 22.7 owns the walk-in SMS. This phase must send none, in any configuration. */
+    /**
+     * Mocked at the INTERFACE, which is exactly the seam Phase 22.7's gate operates on: production
+     * resolves {@code NoOpSmsService} or {@code TurbosmsService} here depending on
+     * {@code app.booking.sms.enabled}, and no caller can tell which. Mocking it keeps this suite
+     * about the ENDPOINT — no Turbosms HTTP stub, no dependence on the flag's value.
+     */
     @MockBean
     private SmsService smsService;
 
     @MockBean
     private NotificationOutboxService notificationOutboxService;
-
-    /**
-     * ONE Apache HC5 pool for the whole class, closed in {@link #closeHttpFactory()}.
-     *
-     * <p>Two defects are fixed here at once (QA, Phase 22.4). The previous shape built
-     * {@code new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault())} inside
-     * {@code @BeforeEach}, so:
-     * <ol>
-     *   <li>it leaked one never-closed connection pool per test method, which under a warm Gradle
-     *       daemon accumulates across runs; and</li>
-     *   <li>more seriously, it OVERWROTE the factory {@code AbstractIntegrationTest#cleanDb}
-     *       installs on this very same {@code TestRestTemplate} bean — a factory deliberately
-     *       configured with ZERO retries and finite 10s timeouts because, in that method's own
-     *       words, "a rate-limit 429 that resets the socket will fail fast instead of hanging the
-     *       suite for 27 minutes". {@code HttpClients.createDefault()} restores both the default
-     *       retry strategy and unbounded read timeouts. This endpoint became rate-limited in
-     *       exactly this phase ({@code BookingRateLimitFilter}'s new
-     *       {@code POST /masters/{id}/bookings} route), so this class is the one that could least
-     *       afford to drop the protection.</li>
-     * </ol>
-     * The settings below mirror the base class's; a plain {@code SimpleClientHttpRequestFactory}
-     * cannot be used because it rejects PATCH.
-     */
-    private static final HttpComponentsClientHttpRequestFactory HTTP_FACTORY = createHttpFactory();
-
-    private static HttpComponentsClientHttpRequestFactory createHttpFactory() {
-        var client = HttpClients.custom()
-                .setRetryStrategy(new DefaultHttpRequestRetryStrategy(0, TimeValue.ZERO_MILLISECONDS))
-                .build();
-        var factory = new HttpComponentsClientHttpRequestFactory(client);
-        factory.setConnectionRequestTimeout(10_000);
-        factory.setConnectTimeout(10_000);
-        factory.setReadTimeout(10_000);
-        return factory;
-    }
-
-    @AfterAll
-    static void closeHttpFactory() throws Exception {
-        HTTP_FACTORY.destroy();
-    }
-
-    private Salon salon;
-
-    @BeforeEach
-    void setUp() {
-        restTemplate.getRestTemplate().setRequestFactory(HTTP_FACTORY);
-        salon = seedSalon();
-    }
 
     // ════════════════════════════════════════════════════════════════════════════════
     // The admitted rows
@@ -169,15 +86,15 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("SALON_OWNER books their own salon's master → 201, CONFIRMED/STAFF walk-in row")
         void should_return201AndPersistStaffRow_when_ownerBooksTheirOwnMaster() {
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(salon.ownerEmail), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
             Map<String, Object> row = onlyBooking();
             assertThat(row.get("status")).isEqualTo("CONFIRMED");
             assertThat(row.get("booking_source")).isEqualTo("STAFF");
-            assertThat(row.get("created_by_user_id")).isEqualTo(salon.ownerId);
-            assertThat(row.get("salon_id")).isEqualTo(salon.salonId);
+            assertThat(row.get("created_by_user_id")).isEqualTo(salon.ownerId());
+            assertThat(row.get("salon_id")).isEqualTo(salon.salonId());
             assertThat(row.get("client_id")).isNull();
             assertThat(row.get("cancel_token")).isNull();
             assertThat(row.get("guest_name")).isEqualTo("Марія");
@@ -190,14 +107,14 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("assigned SALON_ADMIN books the same master → 201 (admin = owner)")
         void should_return201_when_assignedAdminBooksASalonMaster() {
-            String adminEmail = insertUser("SALON_ADMIN", salon.salonId).email();
+            String adminEmail = insertUser("SALON_ADMIN", salon.salonId()).email();
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(adminEmail), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(adminEmail), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
             assertThat(onlyBooking().get("created_by_user_id"))
                     .as("attribution follows the acting admin, not the salon owner")
-                    .isNotEqualTo(salon.ownerId);
+                    .isNotEqualTo(salon.ownerId());
         }
 
         /**
@@ -221,14 +138,30 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
             assertThat(row.get("booking_source")).isEqualTo("STAFF");
         }
 
-        /** Phase 22.7 owns the walk-in SMS; this phase ships none, and no outbox row either. */
+        /**
+         * Phase 22.7 turned the "no SMS" half of this assertion inside out, deliberately.
+         *
+         * <p>22.4 shipped no walk-in SMS at all, so this test pinned {@code verifyNoInteractions} on
+         * both collaborators. 22.7 adds the send — but it adds it AT THE SEAM, so what changed is
+         * that {@code SmsService#send} is now always called, while whether anything is actually
+         * delivered is decided by which bean {@code SmsConfig} registered for
+         * {@code app.booking.sms.enabled} (off by default ⇒ {@code NoOpSmsService}, which logs and
+         * returns). Mocking the interface here is therefore the correct lens: it proves the call
+         * site fires with the right recipient without asserting anything about delivery, which is
+         * {@code SmsFeatureGateTest}'s and {@code WalkInBookingSmsIT}'s subject.
+         *
+         * <p>The notification half is UNCHANGED and still absolute: a staff booking enqueues no
+         * outbox row in any configuration.
+         */
         @Test
-        @DisplayName("a successful staff create sends no SMS and enqueues no notification")
-        void should_sendNothing_when_staffBookingSucceeds() {
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(salon.ownerEmail), tomorrowAtNoon());
+        @DisplayName("a successful staff create sends the walk-in SMS and enqueues no notification")
+        void should_sendWalkInSmsAndNoNotification_when_staffBookingSucceeds() {
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-            verifyNoInteractions(smsService, notificationOutboxService);
+            // E.164, matching the guest_phone column — not the "050 123 45 67" that was posted.
+            verify(smsService).send(eq(E164_PHONE), anyString());
+            verifyNoInteractions(notificationOutboxService);
         }
     }
 
@@ -258,10 +191,10 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("books a master in the salon that actually employs them, not the owner's other salon")
         void should_return201AndScopeToTheEmployingSalon_when_theOwnerOwnsSeveralSalons() {
-            UUID otherOwnedSalonId = seedExtraSalonFor(salon.ownerId);
+            UUID otherOwnedSalonId = seedExtraSalonFor(salon.ownerId());
 
             ResponseEntity<String> resp =
-                    create(salon.masterId, tokenFor(salon.ownerEmail), tomorrowAtNoon());
+                    create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode())
                     .as("a second owned salon must not make the route ambiguous — the master selects")
@@ -269,11 +202,11 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
             Map<String, Object> row = onlyBooking();
             assertThat(row.get("salon_id"))
                     .as("the scope is the owned salon employing this master")
-                    .isEqualTo(salon.salonId);
+                    .isEqualTo(salon.salonId());
             assertThat(row.get("salon_id"))
                     .as("and never the owner's other salon, which employs nobody")
                     .isNotEqualTo(otherOwnedSalonId);
-            assertThat(row.get("created_by_user_id")).isEqualTo(salon.ownerId);
+            assertThat(row.get("created_by_user_id")).isEqualTo(salon.ownerId());
         }
 
         /**
@@ -284,12 +217,12 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("still cannot reach a master of a salon they do not own")
         void should_reject403_when_aMultiSalonOwnerTargetsAForeignMaster() {
-            seedExtraSalonFor(salon.ownerId);
+            seedExtraSalonFor(salon.ownerId());
             Salon foreign = seedSalon();
 
             ResponseEntity<String> resp =
-                    create(foreign.masterId, foreign.masterServiceId,
-                            tokenFor(salon.ownerEmail), tomorrowAtNoon());
+                    create(foreign.masterId(), foreign.masterServiceId(),
+                            tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -309,7 +242,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         void should_reject403_when_ownerOfAnotherSalonBooksThisMaster() {
             Salon other = seedSalon();
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(other.ownerEmail), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(other.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -319,9 +252,9 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @DisplayName("admin of a DIFFERENT salon → 403")
         void should_reject403_when_adminOfAnotherSalonBooksThisMaster() {
             Salon other = seedSalon();
-            String foreignAdmin = insertUser("SALON_ADMIN", other.salonId).email();
+            String foreignAdmin = insertUser("SALON_ADMIN", other.salonId()).email();
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(foreignAdmin), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(foreignAdmin), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -350,7 +283,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         void should_reject403_when_independentMasterBooksASalonMaster() {
             Independent me = seedIndependentMaster();
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(me.email), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(me.email), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -373,7 +306,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         void should_reject403_when_callerIsAClient() {
             String clientEmail = insertUser("CLIENT", null).email();
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(clientEmail), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(clientEmail), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -388,7 +321,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @DisplayName("unknown masterId → 403, never 404")
         void should_reject403NotFound_when_masterDoesNotExist() {
             ResponseEntity<String> resp =
-                    create(UUID.randomUUID(), tokenFor(salon.ownerEmail), tomorrowAtNoon());
+                    create(UUID.randomUUID(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode())
                     .as("a 404 here would turn masterId into an existence oracle")
@@ -419,9 +352,9 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("a deactivated master → 403, never 22.2's 404 — the ordering guarantee")
         void should_reject403NotFound_when_theTargetMasterIsDeactivated() {
-            jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", salon.masterId);
+            jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", salon.masterId());
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(salon.ownerEmail), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode())
                     .as("a 404 here tells the caller the id exists — method security must run first")
@@ -438,9 +371,9 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("a master of a salon the owner has closed → 403, for that salon's own owner")
         void should_reject403_when_theMastersSalonHasBeenDeactivated() {
-            jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salon.salonId);
+            jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salon.salonId());
 
-            ResponseEntity<String> resp = create(salon.masterId, tokenFor(salon.ownerEmail), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -464,11 +397,11 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
             Salon other = seedSalon();
 
             String unknownMaster =
-                    create(UUID.randomUUID(), tokenFor(salon.ownerEmail), tomorrowAtNoon()).getBody();
+                    create(UUID.randomUUID(), tokenFor(salon.ownerEmail()), tomorrowAtNoon()).getBody();
             String foreignMaster =
-                    create(salon.masterId, tokenFor(other.ownerEmail), tomorrowAtNoon()).getBody();
+                    create(salon.masterId(), tokenFor(other.ownerEmail()), tomorrowAtNoon()).getBody();
             String deniedRole =
-                    create(salon.masterId, tokenFor(clientEmail), tomorrowAtNoon()).getBody();
+                    create(salon.masterId(), tokenFor(clientEmail), tomorrowAtNoon()).getBody();
 
             assertThat(foreignMaster)
                     .as("\"does not exist\" and \"exists but is not yours\" must be indistinguishable")
@@ -478,7 +411,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
                     .isEqualTo(unknownMaster);
             assertThat(unknownMaster)
                     .as("the uniform body must not echo the probed id back")
-                    .doesNotContain(salon.masterId.toString());
+                    .doesNotContain(salon.masterId().toString());
         }
 
         @Test
@@ -488,7 +421,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
             headers.setContentType(MediaType.APPLICATION_JSON);
 
             ResponseEntity<String> resp = restTemplate.postForEntity(
-                    url(salon.masterId), new HttpEntity<>(body(tomorrowAtNoon()), headers), String.class);
+                    url(salon.masterId()), new HttpEntity<>(body(tomorrowAtNoon()), headers), String.class);
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         }
@@ -506,7 +439,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @DisplayName("a start outside working hours → 409")
         void should_reject409_when_startIsOutsideWorkingHours() {
             ResponseEntity<String> resp = create(
-                    salon.masterId, tokenFor(salon.ownerEmail), tomorrowAt(LocalTime.of(6, 0)));
+                    salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAt(LocalTime.of(6, 0)));
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
             assertThat(bookingCount()).isZero();
@@ -515,11 +448,11 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("a second booking on the same window → 409")
         void should_reject409_when_theWindowIsAlreadyTaken() {
-            String token = tokenFor(salon.ownerEmail);
-            assertThat(create(salon.masterId, token, tomorrowAtNoon()).getStatusCode())
+            String token = tokenFor(salon.ownerEmail());
+            assertThat(create(salon.masterId(), token, tomorrowAtNoon()).getStatusCode())
                     .isEqualTo(HttpStatus.CREATED);
 
-            ResponseEntity<String> resp = create(salon.masterId, token, tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), token, tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
             assertThat(bookingCount()).isOne();
@@ -531,9 +464,9 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
             Independent other = seedIndependentMaster();
 
             ResponseEntity<String> resp = restTemplate.exchange(
-                    url(salon.masterId), org.springframework.http.HttpMethod.POST,
-                    new HttpEntity<>(body(tomorrowAtNoon(), other.masterServiceId),
-                            bearerHeaders(tokenFor(salon.ownerEmail))),
+                    url(salon.masterId()), org.springframework.http.HttpMethod.POST,
+                    new HttpEntity<>(body(tomorrowAtNoon(), other.masterServiceId()),
+                            bearerHeaders(tokenFor(salon.ownerEmail()))),
                     String.class);
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
@@ -544,9 +477,9 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         @DisplayName("a non-Ukrainian phone → 400 with no input echoed back")
         void should_reject400_when_phoneIsNotUkrainian() {
             ResponseEntity<String> resp = restTemplate.exchange(
-                    url(salon.masterId), org.springframework.http.HttpMethod.POST,
+                    url(salon.masterId()), org.springframework.http.HttpMethod.POST,
                     new HttpEntity<>(bodyWithPhone(tomorrowAtNoon(), "+15551234567"),
-                            bearerHeaders(tokenFor(salon.ownerEmail))),
+                            bearerHeaders(tokenFor(salon.ownerEmail()))),
                     String.class);
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -560,11 +493,11 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
             String malformed = """
                     {"masterServiceId":"%s","startsAt":"%s",
                      "guest":{"name":"Марія","phone":"%s"}}
-                    """.formatted(salon.masterServiceId, tomorrowAtNoon(), RAW_PHONE);
+                    """.formatted(salon.masterServiceId(), tomorrowAtNoon(), RAW_PHONE);
 
             ResponseEntity<String> resp = restTemplate.exchange(
-                    url(salon.masterId), org.springframework.http.HttpMethod.POST,
-                    new HttpEntity<>(malformed, bearerHeaders(tokenFor(salon.ownerEmail))),
+                    url(salon.masterId()), org.springframework.http.HttpMethod.POST,
+                    new HttpEntity<>(malformed, bearerHeaders(tokenFor(salon.ownerEmail()))),
                     String.class);
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -579,7 +512,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
     }
 
     private ResponseEntity<String> create(UUID masterId, String token, OffsetDateTime startsAt) {
-        return create(masterId, salon.masterServiceId, token, startsAt);
+        return create(masterId, salon.masterServiceId(), token, startsAt);
     }
 
     /** Overload for targets other than the default salon master, whose own service id differs. */
@@ -591,7 +524,7 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
     }
 
     private String body(OffsetDateTime startsAt) {
-        return body(startsAt, salon.masterServiceId);
+        return body(startsAt, salon.masterServiceId());
     }
 
     private String body(OffsetDateTime startsAt, UUID masterServiceId) {
@@ -605,76 +538,13 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
         return """
                 {"masterServiceId":"%s","startsAt":"%s",
                  "guest":{"name":"Марія","surname":"Левченко","phone":"%s"}}
-                """.formatted(salon.masterServiceId, startsAt, phone);
-    }
-
-    private HttpHeaders bearerHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return headers;
-    }
-
-    private String tokenFor(String email) {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).as("login must succeed for %s", email).isEqualTo(HttpStatus.OK);
-        try {
-            return objectMapper.readValue(resp.getBody(),
-                    new TypeReference<ApiResponse<AuthResponse>>() {}).data().accessToken();
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to parse login response for " + email, e);
-        }
-    }
-
-    // ── time ──────────────────────────────────────────────────────────────────────
-
-    /**
-     * Tomorrow 12:00 Kyiv: inside the seeded 09:00–17:00 window, aligned to the 30-minute slot grid
-     * (a locked product decision, 2026-08-11), and unambiguously in the future for {@code @Future}.
-     */
-    private OffsetDateTime tomorrowAtNoon() {
-        return tomorrowAt(LocalTime.NOON);
-    }
-
-    private OffsetDateTime tomorrowAt(LocalTime time) {
-        LocalDate tomorrow = LocalDate.now(TimeZones.KYIV).plusDays(1);
-        return ZonedDateTime.of(tomorrow, time, TimeZones.KYIV).toOffsetDateTime();
-    }
-
-    // ── seeding ───────────────────────────────────────────────────────────────────
-
-    private record Salon(UUID salonId, UUID ownerId, String ownerEmail, UUID masterId, UUID masterServiceId) {
+                """.formatted(salon.masterServiceId(), startsAt, phone);
     }
 
     private record Independent(UUID userId, String email, UUID masterId, UUID masterServiceId) {
     }
 
     private record Invited(UUID userId, String email, UUID masterId) {
-    }
-
-    private record SeededUser(UUID id, String email) {
-    }
-
-    /**
-     * An OWNER-OPERATED salon master ({@code master_type = 'SALON_OWNER'}), for the same reason
-     * {@code StaffBookingIT} picks that shape: seeding the weekly schedule goes through
-     * {@code enforceCanManageMasterSchedule}, whose invited-{@code SALON_MASTER} branch reads the
-     * actor's role from the {@code SecurityContext} — absent when a fixture calls the service
-     * directly. Nothing under test cares which master type it is.
-     */
-    private Salon seedSalon() {
-        SeededUser owner = insertUser("SALON_OWNER", null);
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                + "VALUES (?, ?, ?, true, NOW(), NOW())", salonId, owner.id(), "Salon-" + salonId);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, "
-                + "updated_at) VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
-                masterId, owner.id(), salonId);
-        UUID masterServiceId = insertService(masterId, "SALON", salonId);
-        giveWorkingHours(owner.id(), masterId);
-        return new Salon(salonId, owner.id(), owner.email(), masterId, masterServiceId);
     }
 
     /**
@@ -708,64 +578,11 @@ class StaffBookingEndpointIT extends AbstractIntegrationTest {
 
     /** An invited, read-only {@code SALON_MASTER} of the given salon — no schedule needed. */
     private Invited seedInvitedMaster(Salon salon) {
-        SeededUser user = insertUser("SALON_MASTER", salon.salonId);
+        SeededUser user = insertUser("SALON_MASTER", salon.salonId());
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update("INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, "
                 + "updated_at) VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, user.id(), salon.salonId);
+                masterId, user.id(), salon.salonId());
         return new Invited(user.id(), user.email(), masterId);
-    }
-
-    private SeededUser insertUser(String role, UUID salonId) {
-        UUID id = UUID.randomUUID();
-        String email = "staff-ep-" + id + "@beautica.test";
-        jdbcTemplate.update("INSERT INTO users (id, email, password_hash, role, salon_id, first_name, "
-                        + "last_name, is_active, email_verified) VALUES (?, ?, ?, ?, ?, 'Марія', 'Левченко', "
-                        + "true, true)",
-                id, email, passwordEncoder.encode(TEST_PASSWORD), role, salonId);
-        return new SeededUser(id, email);
-    }
-
-    private UUID insertService(UUID masterId, String ownerType, UUID ownerId) {
-        UUID serviceDefId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, "
-                        + "updated_at) VALUES (?, ?, ?, 'Манікюр', ?, ?, ?, 0, true, NOW(), NOW())",
-                serviceDefId, ownerType, ownerId, resolveServiceTypeId(), DURATION_MINUTES, PRICE);
-        UUID masterServiceId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, "
-                + "updated_at) VALUES (?, ?, ?, true, NOW(), NOW())", masterServiceId, masterId, serviceDefId);
-        return masterServiceId;
-    }
-
-    private UUID resolveServiceTypeId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT st.id FROM service_types st "
-                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
-                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
-    }
-
-    /** 09:00–17:00 on every ISO weekday, so "tomorrow" is a working day whatever day it is today. */
-    private void giveWorkingHours(UUID masterUserId, UUID masterId) {
-        List<WeeklyScheduleDayRequest> days = Arrays.stream(new int[]{1, 2, 3, 4, 5, 6, 7})
-                .mapToObj(dow -> new WeeklyScheduleDayRequest(dow,
-                        List.of(new WorkIntervalDto(LocalTime.of(9, 0), LocalTime.of(17, 0)))))
-                .toList();
-        masterScheduleService.upsertWeeklySchedule(masterUserId, masterId, null,
-                new WeeklyScheduleRequest(LocalDate.now(TimeZones.KYIV), null, days));
-    }
-
-    // ── assertions ────────────────────────────────────────────────────────────────
-
-    private int bookingCount() {
-        return jdbcTemplate.queryForObject("SELECT count(*) FROM bookings", Integer.class);
-    }
-
-    private Map<String, Object> onlyBooking() {
-        List<Map<String, Object>> rows = jdbcTemplate.queryForList("SELECT * FROM bookings");
-        assertThat(rows).hasSize(1);
-        return rows.get(0);
     }
 }

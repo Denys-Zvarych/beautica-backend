@@ -1,7 +1,7 @@
 package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.sms.OtpSmsSender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -31,6 +31,9 @@ import java.util.regex.Pattern;
  *       hashes in constant time via {@link MessageDigest#isEqual}.</li>
  *   <li>A per-phone rate limit (service layer) complements the per-IP Bucket4j layer
  *       on {@code POST /book/otp/send} — dual-layer defence.</li>
+ *   <li>The sender is {@link OtpSmsSender}, <b>not</b> {@code SmsService}: the guest OTP is an auth
+ *       credential and is deliberately outside the {@code app.booking.sms.enabled} money gate. See
+ *       {@link OtpSmsSender} and {@code SmsConfig} for the carve-out and the defect it closes.</li>
  * </ul>
  */
 @Service
@@ -48,19 +51,19 @@ public class PhoneOtpService {
     private final PhoneOtpRepository phoneOtpRepository;
     private final PhoneOtpAttemptRecorder attemptRecorder;
     private final GuestTokenProvider guestTokenProvider;
-    private final SmsService smsService;
+    private final OtpSmsSender otpSmsSender;
     private final SecureRandom secureRandom;
     private final Clock clock;
 
     public PhoneOtpService(PhoneOtpRepository phoneOtpRepository,
                            PhoneOtpAttemptRecorder attemptRecorder,
                            GuestTokenProvider guestTokenProvider,
-                           SmsService smsService,
+                           OtpSmsSender otpSmsSender,
                            Clock clock) {
         this.phoneOtpRepository = phoneOtpRepository;
         this.attemptRecorder = attemptRecorder;
         this.guestTokenProvider = guestTokenProvider;
-        this.smsService = smsService;
+        this.otpSmsSender = otpSmsSender;
         this.secureRandom = new SecureRandom();
         this.clock = clock;
     }
@@ -70,7 +73,8 @@ public class PhoneOtpService {
      * code, persists a fresh hashed code, and dispatches it by SMS.
      *
      * @throws BusinessException 400 on a malformed phone, 429 when the per-phone window
-     *                           cap is exceeded
+     *                           cap is exceeded, 503 when the provider could not be reached
+     *                           (see {@link #dispatchCode})
      */
     @Transactional
     public void sendOtp(String phone) {
@@ -92,8 +96,41 @@ public class PhoneOtpService {
         String codeHash = sha256Hex(code);
         phoneOtpRepository.save(PhoneOtp.issue(phone, codeHash, now.plus(OTP_TTL)));
 
-        smsService.send(phone, "Beautica: " + code + " — код підтвердження");
+        dispatchCode(phone, code);
         log.info("OTP sent to {}", maskPhone(phone));
+    }
+
+    /**
+     * Hands the code to the auth-channel sender, translating any provider failure into a clean
+     * <b>503</b> that rolls this transaction — and therefore the freshly persisted OTP row — back.
+     *
+     * <h4>Why NOT the booking paths' swallow-and-warn</h4>
+     * Every booking sender catches, logs and carries on, because the booking is already committed
+     * and a provider outage must not turn a successful create into a failed request. The OTP is the
+     * exact inverse: the row is worthless to a guest who never receives the code, and answering 200
+     * would recreate — from a different cause — the very silent-failure defect the
+     * {@link OtpSmsSender} carve-out exists to close. So the failure is surfaced, and the rollback
+     * is a feature: no orphan hash, and the per-phone window budget (which counts rows) is not burnt
+     * by an attempt that delivered nothing, so the guest may retry immediately.
+     *
+     * <h4>What is not done</h4>
+     * The send is NOT moved after commit. An after-commit send cannot report failure to the caller
+     * at all — the response is already written — which is the 200-and-nothing-happened shape again.
+     * The residual risk of sending before commit (code delivered, then the commit itself fails) is
+     * strictly smaller and unchanged from this method's original ordering.
+     *
+     * <p>Only the exception CLASS is logged, never the message (may echo the provider URL), never
+     * the code and never the unmasked phone (Anti-Bug §I). The 503 body is generic for the same
+     * reason.
+     */
+    private void dispatchCode(String phone, String code) {
+        try {
+            otpSmsSender.send(phone, "Beautica: " + code + " — код підтвердження");
+        } catch (RuntimeException e) {
+            log.warn("OTP send failed for {}: {}", maskPhone(phone), e.getClass().getSimpleName());
+            throw new BusinessException(
+                    HttpStatus.SERVICE_UNAVAILABLE, "Could not send the verification code");
+        }
     }
 
     /**

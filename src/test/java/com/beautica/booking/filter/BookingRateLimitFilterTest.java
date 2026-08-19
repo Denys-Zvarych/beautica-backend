@@ -76,7 +76,8 @@ class BookingRateLimitFilterTest {
      * and must not be affected by either sibling bucket's capacity at all.
      */
     private BookingRateLimitFilter filterWith(LoadingCache<String, Bucket> writeBuckets) {
-        return new BookingRateLimitFilter(writeBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+        return new BookingRateLimitFilter(
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -85,7 +86,8 @@ class BookingRateLimitFilterTest {
      * {@link #filterWith(LoadingCache)} for tests that only exercise the decline/not-complete path.
      */
     private BookingRateLimitFilter filterWithDeclineBuckets(LoadingCache<String, Bucket> declineBuckets) {
-        return new BookingRateLimitFilter(generousBuckets(), declineBuckets, generousBuckets(), OBJECT_MAPPER);
+        return new BookingRateLimitFilter(
+                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -94,7 +96,20 @@ class BookingRateLimitFilterTest {
      * tests that only exercise {@code PUT /masters/{masterId}/overrides/{date}}.
      */
     private BookingRateLimitFilter filterWithOverrideBuckets(LoadingCache<String, Bucket> overrideBuckets) {
-        return new BookingRateLimitFilter(generousBuckets(), generousBuckets(), overrideBuckets, OBJECT_MAPPER);
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), OBJECT_MAPPER);
+    }
+
+    /**
+     * Builds a filter with the given staff-walk-in SMS-spend bucket and UNRELATED, generously-sized
+     * siblings — the mirror of {@link #filterWith(LoadingCache)} for tests that only exercise
+     * {@code POST /masters/&#123;masterId&#125;/bookings}. That route left {@code bookingWriteBuckets}
+     * in Phase 22.7 (SEC MEDIUM, 2026-08-18) once it became an SMS-spend path, so a test asserting
+     * its throttle must now size THIS bucket; sizing the write bucket would assert nothing.
+     */
+    private BookingRateLimitFilter filterWithStaffSmsBuckets(LoadingCache<String, Bucket> staffSmsBuckets) {
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, OBJECT_MAPPER);
     }
 
     /** A bucket cache with effectively unlimited capacity — for the "other" bucket in a test. */
@@ -442,7 +457,8 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> writeBuckets = singleSlotBuckets();
         LoadingCache<String, Bucket> declineBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
-                new BookingRateLimitFilter(writeBuckets, declineBuckets, generousBuckets(), OBJECT_MAPPER);
+                new BookingRateLimitFilter(
+                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the create/reschedule bucket.
@@ -955,7 +971,8 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> declineBuckets = singleSlotBuckets();
         LoadingCache<String, Bucket> overrideBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
-                new BookingRateLimitFilter(generousBuckets(), declineBuckets, overrideBuckets, OBJECT_MAPPER);
+                new BookingRateLimitFilter(
+                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the decline bucket.
@@ -1066,13 +1083,20 @@ class BookingRateLimitFilterTest {
     // POST /bookings and POST /appointments both consumed bookingWriteBuckets. It is not just row
     // spam — StaffBookingService takes the PER-MASTER advisory lock the CLIENT create path also
     // takes, so one compromised staff token could queue unbounded contention on a master real
-    // clients are booking; from 22.7 it is an SMS-spend pump too.
+    // clients are booking.
+    //
+    // Phase 22.7 hardening moved it OFF bookingWriteBuckets and onto its own staffBookingSmsBuckets
+    // (10/60s, mirroring bookingDeclineBuckets): every success now dispatches a Beautica-branded SMS
+    // carrying a provider-authored serviceName to a staff-TYPED number that never consented, and a
+    // 30/min budget sized for advisory-lock contention is not an SMS budget. The new bucket being
+    // 3x tighter, it binds first and still bounds the lock contention the old one covered. The rows
+    // below therefore size the SMS bucket, and the Retry-After they assert is its 60s window.
     // -------------------------------------------------------------------------------------------
 
     @Test
-    @DisplayName("should_return429_when_staffBookingCreateBudgetExhausted")
-    void should_return429_when_staffBookingCreateBudgetExhausted() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+    @DisplayName("should_return429_when_staffCreateExceedsSmsSpendBudget")
+    void should_return429_when_staffCreateExceedsSmsSpendBudget() throws Exception {
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1089,30 +1113,50 @@ class BookingRateLimitFilterTest {
         filter.doFilterInternal(postStaffBooking(masterId), secondResponse, secondChain);
 
         assertThat(secondResponse.getStatus())
-                .as("POST /masters/{masterId}/bookings must be throttled on the create budget — it "
-                        + "previously had no bucket at all")
+                .as("POST /masters/{masterId}/bookings must be throttled on its own SMS-spend budget")
                 .isEqualTo(429);
-        assertThat(secondResponse.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(secondResponse.getHeader("Retry-After"))
+                .as("60, matching the SMS bucket's window — 10 would mean it is still on the "
+                        + "create budget and the reroute silently did not happen")
+                .isEqualTo("60");
         assertThat(secondChain.getRequest())
                 .as("a throttled staff create must NOT reach the per-master advisory lock")
                 .isNull();
     }
 
+    /**
+     * <b>Inverted by the 22.7 reroute, deliberately.</b> This row used to assert that the staff
+     * create SHARED {@code bookingWriteBuckets} with {@code POST /bookings}, so that alternating the
+     * two could not double a caller's create allowance. The two are now separate buckets, and that
+     * is safe for the reason the shared-bucket argument actually rested on: the SMS budget is the
+     * TIGHTER of the two, so alternating buys the attacker extra capacity only on the route that
+     * spends nothing. Asserted in both directions here, because "they are separate" is a claim that
+     * has to be true symmetrically or one of them is leaking into the other.
+     */
     @Test
-    @DisplayName("should_shareOneBucket_when_sameStaffAlternatesClientCreateAndStaffCreate")
-    void should_shareOneBucket_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
-        // The staff create must draw on the SAME per-user budget as POST /bookings, so a caller
-        // cannot double their create allowance by alternating the two routes.
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+    @DisplayName("should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate")
+    void should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
+        BookingRateLimitFilter filter = new BookingRateLimitFilter(
+                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
+        // Spend the whole client-create budget.
         filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());
 
         MockHttpServletResponse staffResponse = new MockHttpServletResponse();
         filter.doFilterInternal(postStaffBooking(UUID.randomUUID()), staffResponse, new MockFilterChain());
-
         assertThat(staffResponse.getStatus())
-                .as("the shared write bucket must already be exhausted by the earlier POST /bookings")
+                .as("an exhausted POST /bookings budget must not throttle the staff create — "
+                        + "different bucket, different threat model")
+                .isNotEqualTo(429);
+
+        // ...and now the staff budget is the exhausted one; the client create must NOT be affected
+        // either, which is the half that catches the two caches being accidentally the same object.
+        MockHttpServletResponse secondStaffResponse = new MockHttpServletResponse();
+        filter.doFilterInternal(
+                postStaffBooking(UUID.randomUUID()), secondStaffResponse, new MockFilterChain());
+        assertThat(secondStaffResponse.getStatus())
+                .as("the staff SMS budget is per-caller and now spent")
                 .isEqualTo(429);
     }
 
@@ -1121,7 +1165,7 @@ class BookingRateLimitFilterTest {
     void should_throttleAcrossMasters_when_sameStaffTargetsDifferentMasters() throws Exception {
         // The bucket is keyed on the CALLER, not on {masterId} — otherwise one token could spray
         // one create per master and evade the budget entirely.
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
 
         filter.doFilterInternal(postStaffBooking(UUID.randomUUID()), new MockHttpServletResponse(), new MockFilterChain());
@@ -1140,7 +1184,7 @@ class BookingRateLimitFilterTest {
     void should_passThrough_when_masterBookingsPathIsAReadNotACreate() throws Exception {
         // Guards the new startsWith/endsWith matcher against widening to the whole prefix: only the
         // POST is a create. A GET on the identical path must stay unthrottled.
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1156,7 +1200,7 @@ class BookingRateLimitFilterTest {
         MockHttpServletResponse createResponse = new MockHttpServletResponse();
         filter.doFilterInternal(postStaffBooking(masterId), createResponse, new MockFilterChain());
         assertThat(createResponse.getStatus())
-                .as("the write bucket must be untouched by the GETs above")
+                .as("the staff SMS bucket must be untouched by the GETs above")
                 .isNotEqualTo(429);
     }
 
@@ -1192,7 +1236,7 @@ class BookingRateLimitFilterTest {
     @Test
     @DisplayName("should_throttle_when_staffBookingCreatePathIsPercentEncoded")
     void should_throttle_when_staffBookingCreatePathIsPercentEncoded() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1203,9 +1247,9 @@ class BookingRateLimitFilterTest {
 
         assertThat(encodedResponse.getStatus())
                 .as("POST /masters/{id}/booking%73 routes to the staff create and must consume the "
-                        + "SAME already-exhausted write bucket as the plain spelling")
+                        + "SAME already-exhausted SMS-spend bucket as the plain spelling")
                 .isEqualTo(429);
-        assertThat(encodedResponse.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(encodedResponse.getHeader("Retry-After")).isEqualTo("60");
         assertThat(encodedChain.getRequest())
                 .as("a throttled encoded staff create must NOT reach the per-master advisory lock")
                 .isNull();
@@ -1336,7 +1380,7 @@ class BookingRateLimitFilterTest {
     @Test
     @DisplayName("the staff create is throttled when its /masters/ PREFIX segment is percent-encoded")
     void should_throttle_when_theStaffCreatePrefixSegmentIsPercentEncoded() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1348,9 +1392,9 @@ class BookingRateLimitFilterTest {
         assertThat(response.getStatus())
                 .as("POST /api/v1/master%%73/{id}/bookings satisfies endsWith(\"/bookings\") but not a "
                         + "raw startsWith(\"/api/v1/masters/\") — it must still consume the SAME "
-                        + "already-exhausted write bucket")
+                        + "already-exhausted SMS-spend bucket")
                 .isEqualTo(429);
-        assertThat(response.getHeader("Retry-After")).isEqualTo("10");
+        assertThat(response.getHeader("Retry-After")).isEqualTo("60");
         assertThat(chain.getRequest())
                 .as("a throttled prefix-encoded staff create must NOT reach the per-master advisory lock")
                 .isNull();
@@ -1359,7 +1403,7 @@ class BookingRateLimitFilterTest {
     @Test
     @DisplayName("the staff create is throttled when a matrix parameter is hung off the master segment")
     void should_throttle_when_theStaffCreatePathCarriesAMatrixParameter() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1370,7 +1414,7 @@ class BookingRateLimitFilterTest {
 
         assertThat(response.getStatus())
                 .as("setRemoveSemicolonContent(true) is load-bearing, not cosmetic: /masters/{id};v=1/"
-                        + "bookings reaches the same handler and must consume the SAME write bucket")
+                        + "bookings reaches the same handler and must consume the SAME SMS-spend bucket")
                 .isEqualTo(429);
         assertThat(chain.getRequest()).isNull();
     }
@@ -1378,7 +1422,7 @@ class BookingRateLimitFilterTest {
     @Test
     @DisplayName("the staff create is throttled when the path carries a duplicated slash")
     void should_throttle_when_theStaffCreatePathHasADuplicatedSlash() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1389,22 +1433,23 @@ class BookingRateLimitFilterTest {
 
         assertThat(response.getStatus())
                 .as("UrlPathHelper's slash collapse is the third normalization resolveMatchPath relies "
-                        + "on; /api/v1//masters/{id}/bookings must consume the SAME write bucket")
+                        + "on; /api/v1//masters/{id}/bookings must consume the SAME SMS-spend bucket")
                 .isEqualTo(429);
         assertThat(chain.getRequest()).isNull();
     }
 
     /**
      * Phase 22.4 put a SECOND rule on the {@code /api/v1/masters/} prefix, immediately above the
-     * schedule-override rule, and the two deliberately hold DIFFERENT budgets (10s vs 60s
-     * {@code Retry-After}). The existing suite pins override≠decline but never override≠write, so
-     * an over-broad staff-create rule — {@code contains("/bookings")}, a dropped method check, a
-     * shared bucket argument — would have merged the two budgets with every test still green.
+     * schedule-override rule, and the two deliberately hold DIFFERENT buckets. The existing suite
+     * pins override≠decline but never override≠staff-create, so an over-broad staff-create rule —
+     * {@code contains("/bookings")}, a dropped method check, a shared bucket argument — would have
+     * merged the two budgets with every test still green. (Both now carry a 60s
+     * {@code Retry-After}, so the header no longer discriminates them; only this row does.)
      */
     @Test
     @DisplayName("exhausting the staff-create budget leaves the schedule-override budget untouched")
     void should_notShareBucket_when_staffCreateAndScheduleOverrideAreCalledBySameActor() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 
@@ -1439,7 +1484,7 @@ class BookingRateLimitFilterTest {
     @Test
     @DisplayName("a sub-path below the staff-create route consumes no token and is not bucketed")
     void should_passThrough_when_aSubPathBelowTheStaffCreateRouteIsPosted() throws Exception {
-        BookingRateLimitFilter filter = filterWith(singleSlotBuckets());
+        BookingRateLimitFilter filter = filterWithStaffSmsBuckets(singleSlotBuckets());
         authenticateAs(UUID.randomUUID());
         UUID masterId = UUID.randomUUID();
 

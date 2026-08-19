@@ -20,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
@@ -65,9 +66,24 @@ class BookingCancellationServiceTest {
     @BeforeEach
     void setUp() {
         service = new BookingCancellationService(
-                guestVisitCancellationService, bookingRepository, outboxService, smsService,
+                guestVisitCancellationService, bookingRepository, outboxService, smsDispatcher(),
                 slotCalculationService, new BookingSmsProperties(), salonCatalogCacheEvictor,
                 Clock.fixed(NOW.toInstant(), ZoneOffset.UTC));
+    }
+
+    /**
+     * The REAL {@link BookingSmsDispatcher} over the mocked {@link SmsService} seam, driven by a
+     * {@link SyncTaskExecutor} — the same shape {@code StaffBookingServiceTest} uses, and the same
+     * shape the {@code test} profile wires in production code ({@code AsyncConfig#syncSmsSendExecutor}).
+     *
+     * <p>A mocked dispatcher would have been less work and strictly worse: every {@code
+     * verify(smsService)} row below would then assert only that a hand-off was requested, and a
+     * dispatcher that silently stopped sending would keep them all green. Running the real one inline
+     * keeps those rows meaning "the message was sent", exactly as before the hand-off was introduced,
+     * while still proving the service holds no {@code SmsService} of its own.
+     */
+    private BookingSmsDispatcher smsDispatcher() {
+        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
     }
 
     // ── getInfo ──────────────────────────────────────────────────────────────

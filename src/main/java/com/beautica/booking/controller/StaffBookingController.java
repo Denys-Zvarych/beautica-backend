@@ -59,10 +59,21 @@ import java.util.UUID;
  * spoofable actor would destroy the audit trail. See {@link CreateStaffBookingRequest} for the
  * fields deliberately absent from the wire shape.
  *
- * <h2>Not here</h2>
- * No notification and no SMS. The walk-in SMS is Phase 22.7 (built in full, gated OFF), and no
- * outbox enqueue is specified for a staff booking — inventing one now would risk double-notifying
- * when 22.7 lands. <b>Open product question, flagged not decided:</b> a master currently gets a
+ * <h2>What this endpoint dispatches</h2>
+ * <b>One SMS to the walk-in client</b>, after the transaction commits: the confirmation added in
+ * Phase 22.7, sent to the phone number the caller typed in. Whether it actually leaves the building
+ * depends on {@code app.booking.sms.enabled} ({@code false} in every committed profile, flipped at
+ * release), which selects the {@code SmsService} bean in {@code SmsConfig} — no code here branches
+ * on it. Delivery is best-effort and never affects the response: the 201 is identical either way and
+ * carries no field reporting the outcome.
+ *
+ * <p>This is a consent-relevant fact, so it is stated in the OpenAPI {@code description} too — the
+ * provider keying in someone else's number is the party who needs to know a message will be sent.
+ * Both statements said "No SMS or notification is sent by this endpoint" until 2026-08-18, which
+ * 22.7 had made false.
+ *
+ * <p><b>Still no notification.</b> No outbox enqueue is specified for a staff booking, in any
+ * configuration. <b>Open product question, flagged not decided:</b> a master currently gets a
  * calendar row and no message when someone books on their behalf.
  */
 @RestController
@@ -93,7 +104,12 @@ public class StaffBookingController {
                     is derived from the caller, never from the request. The booking is created
                     CONFIRMED with source STAFF, no cancel token, and created_by_user_id set to the
                     caller. The guest phone is normalised to E.164 server-side; non-Ukrainian
-                    numbers are rejected. No SMS or notification is sent by this endpoint.""",
+                    numbers are rejected.
+
+                    A confirmation SMS is dispatched to that phone number after the booking is
+                    committed, subject to the platform-wide app.booking.sms.enabled switch. Delivery
+                    is best-effort: it never changes the response, and no field here reports whether
+                    a message was sent. No push or email notification is sent by this endpoint.""",
             security = @SecurityRequirement(name = "bearerAuth"))
     @ApiResponses({
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
@@ -112,6 +128,11 @@ public class StaffBookingController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409",
                     description = "Start is off-schedule or the window is already taken",
+                    content = @io.swagger.v3.oas.annotations.media.Content()),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429",
+                    description = "SMS-spend throttle: too many walk-in creates from this account, "
+                            + "or too many recently for this phone number",
                     content = @io.swagger.v3.oas.annotations.media.Content())
     })
     public ResponseEntity<ApiResponse<BookingResponse>> createStaffBooking(

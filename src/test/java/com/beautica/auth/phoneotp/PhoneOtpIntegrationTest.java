@@ -3,7 +3,7 @@ package com.beautica.auth.phoneotp;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.sms.OtpSmsSender;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -50,7 +50,7 @@ class PhoneOtpIntegrationTest extends AbstractIntegrationTest {
     private JdbcTemplate jdbc;
 
     @MockBean
-    private SmsService smsService;
+    private OtpSmsSender otpSmsSender;
 
     private static String sha256Hex(String value) throws Exception {
         byte[] hash = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
@@ -74,7 +74,7 @@ class PhoneOtpIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.OK);
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
-        verify(smsService).send(eq(PHONE), smsText.capture());
+        verify(otpSmsSender).send(eq(PHONE), smsText.capture());
         String code = smsText.getValue().replaceAll(".*?(\\d{6}).*", "$1");
 
         Map<String, Object> row = jdbc.queryForMap(
@@ -93,7 +93,7 @@ class PhoneOtpIntegrationTest extends AbstractIntegrationTest {
                 "/api/v1/book/otp/send", json("{\"phone\":\"" + PHONE + "\"}"), String.class);
 
         ArgumentCaptor<String> smsText = ArgumentCaptor.forClass(String.class);
-        verify(smsService).send(eq(PHONE), smsText.capture());
+        verify(otpSmsSender).send(eq(PHONE), smsText.capture());
         String code = smsText.getValue().replaceAll(".*?(\\d{6}).*", "$1");
 
         ResponseEntity<String> verify = restTemplate.postForEntity(

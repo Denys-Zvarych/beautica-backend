@@ -6,9 +6,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -148,7 +148,18 @@ class ReminderExecutorProfileOverrideTest {
      */
     record ReminderPools(TaskExecutor dispatch, TaskExecutor send) {
 
-        @Configuration(proxyBeanMethods = false)
+        /**
+         * {@code @TestConfiguration}, not {@code @Configuration} (QA LOW, 2026-08-19): this class
+         * sits in {@code com.beautica.config}, inside the package {@code @SpringBootApplication}
+         * component-scans, so a plain {@code @Configuration} registers this {@code ReminderPools}
+         * bean into EVERY {@code @SpringBootTest} context in the suite. Inert today only because the
+         * bean type is inert — the sibling {@code SmsSendExecutorProfileOverrideTest} proved the
+         * failure mode by declaring an {@code SmsService} the same way and taking ~80 unrelated
+         * integration tests down at boot. Boot's {@code TestTypeExcludeFilter} keeps
+         * {@code @TestConfiguration} out of that scan; {@code withUserConfiguration} still registers
+         * it explicitly here.
+         */
+        @TestConfiguration(proxyBeanMethods = false)
         static class Config {
             @Bean
             ReminderPools reminderPools(

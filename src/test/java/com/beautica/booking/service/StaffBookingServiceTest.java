@@ -12,11 +12,15 @@ import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.sms.SmsDeliveryException;
+import com.beautica.notification.sms.SmsService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
@@ -28,6 +32,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -72,6 +77,9 @@ class StaffBookingServiceTest {
     private static final String RAW_PHONE = "050 123 45 67";
     private static final String E164_PHONE = "+380501234567";
     private static final BigDecimal BASE_PRICE = new BigDecimal("350.00");
+
+    /** The platform-curated {@code ServiceType.nameUk} — the ONLY service string the SMS may carry. */
+    private static final String PLATFORM_SERVICE_NAME = "Манікюр";
     private static final int BASE_DURATION = 60;
     private static final int BUFFER = 15;
 
@@ -80,8 +88,30 @@ class StaffBookingServiceTest {
     @Mock private BookingRepository bookingRepository;
     @Mock private SlotCalculationService slotCalculationService;
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    /**
+     * Phase 22.7. Mocked at the INTERFACE, which is exactly how production sees it: the
+     * {@code app.booking.sms.enabled} gate picks the implementation in {@code SmsConfig}, so this
+     * service holds a real sender or a {@code NoOpSmsService} and cannot tell which. Nothing here
+     * touches the flag, and that absence is asserted below.
+     */
+    @Mock private SmsService smsService;
 
     private StaffBookingService service;
+
+    /**
+     * The REAL {@link BookingSmsDispatcher} over the mocked seam, driven by a {@link SyncTaskExecutor}.
+     *
+     * <p>Phase 22.7 hardening moved the send off the request thread, so the service now depends on
+     * the dispatcher rather than on {@link SmsService} directly. Wiring the real dispatcher (rather
+     * than mocking it) keeps every {@code verify(smsService)} assertion in this suite meaning what it
+     * meant before — "this recipient, this body, actually reached the sender" — and additionally
+     * covers the dispatcher's own swallow-the-failure contract, which a mock would delete. The
+     * synchronous executor is the same stand-in {@code AsyncConfig} registers under the {@code test}
+     * profile, so ordering is deterministic here for the same reason it is there.
+     */
+    private BookingSmsDispatcher bookingSmsDispatcher() {
+        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
+    }
 
     private final UUID masterId = UUID.randomUUID();
     private final UUID masterServiceId = UUID.randomUUID();
@@ -94,6 +124,7 @@ class StaffBookingServiceTest {
         service = new StaffBookingService(
                 masterRepository, bookingRepository, slotCalculationService,
                 salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
+                bookingSmsDispatcher(), new BookingSmsProperties(),
                 Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
@@ -632,6 +663,195 @@ class StaffBookingServiceTest {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Walk-in confirmation SMS (Phase 22.7)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The service-side half of the 22.7 gate. What is asserted here is deliberately NOT "was an SMS
+     * delivered" — that depends on which {@code SmsService} bean {@code SmsConfig} picked, which is
+     * {@code SmsFeatureGateTest}'s subject. What is asserted is that this service always calls the
+     * seam, with the right recipient and the right copy, and that a failure at the seam cannot
+     * reach the caller.
+     */
+    @Nested
+    @DisplayName("Walk-in confirmation SMS")
+    class WalkInConfirmationSms {
+
+        @Test
+        @DisplayName("should_sendConfirmationToTheNormalisedGuestPhone_when_bookingCommitted")
+        void should_sendConfirmationToTheNormalisedGuestPhone_when_bookingCommitted() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            // E.164, not the "050 123 45 67" the staff member typed — the SMS must reach the same
+            // number the DB stored, or the client is told nothing and nobody notices.
+            verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+
+        /**
+         * The custom service name is attacker-authored text and must never reach a branded SMS
+         * (security LOW, 2026-08-19).
+         *
+         * <p>A walk-in confirmation goes to a Ukrainian number that never opted in — the recipient's
+         * only signal that it is legitimate is the Beautica branding. {@code ServiceDefinition.name}
+         * is 100 characters of free text a self-registered provider chooses
+         * ({@code CreateServiceDefinitionRequest}: {@code @Size(max = 100)} plus a
+         * no-control-characters {@code @Pattern}, and nothing else), and at the walk-in rate limit
+         * that is hundreds of attacker-authored SMS an hour to distinct strangers once
+         * {@code app.booking.sms.enabled} flips at release. {@code Placeholders#format} already stops
+         * such a value becoming template MARKUP; it cannot stop the value from BEING the payload.
+         *
+         * <p>So the copy renders {@code ServiceType.nameUk}, which is platform-authored taxonomy.
+         * Both halves are asserted: the platform name is present AND the hostile string is absent —
+         * the second is the one that fails if someone "restores" the custom name alongside it.
+         */
+        @Test
+        @DisplayName("should_usePlatformServiceTypeName_when_masterSetCustomServiceName")
+        void should_usePlatformServiceTypeName_when_masterSetCustomServiceName() {
+            String hostile = "УВАГА! Ваш запис скасовано, деталі: beautica-support.example/win";
+            stubHappyPath(salonMaster(), assignmentWithCustomServiceName(hostile));
+
+            create(command(guest(RAW_PHONE)));
+
+            assertThat(captureSmsText())
+                    .as("the branded SMS must carry the platform taxonomy name, never the "
+                            + "provider's own string")
+                    .contains(PLATFORM_SERVICE_NAME)
+                    .doesNotContain(hostile)
+                    .doesNotContain("beautica-support.example");
+        }
+
+        @Test
+        @DisplayName("should_renderMasterServiceDateAndTimeInKyivCivilTime_when_sending")
+        void should_renderMasterServiceDateAndTimeInKyivCivilTime_when_sending() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            assertThat(captureSmsText())
+                    .contains("Марія Левченко")
+                    .contains("Манікюр")
+                    // START is 2026-06-10T12:00+03:00 — the client reads a wall clock, not the UTC
+                    // instant the column stores.
+                    .contains("10.06.2026")
+                    .contains("12:00");
+        }
+
+        @Test
+        @DisplayName("should_omitAnyCancelLink_when_sending")
+        void should_omitAnyCancelLink_when_sending() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            // A STAFF booking has cancel_token = NULL (V137), so there is nothing to link to. Both
+            // an actual URL and an unsubstituted placeholder would be defects a client would see.
+            assertThat(captureSmsText())
+                    .doesNotContain("http")
+                    .doesNotContain("{cancelUrl}")
+                    .doesNotContain("Скасувати: ");
+        }
+
+        @Test
+        @DisplayName("should_stillReturnTheBooking_when_smsProviderFails")
+        void should_stillReturnTheBooking_when_smsProviderFails() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            org.mockito.Mockito.doThrow(new SmsDeliveryException("provider down"))
+                    .when(smsService).send(any(), any());
+
+            BookingResponse response = create(command(guest(RAW_PHONE)));
+
+            // The booking is committed before the send is attempted; a vendor outage must not turn a
+            // successful create into a failed request (GuestBookingService#sendConfirmationSms).
+            assertThat(response.id()).isEqualTo(captureSaved().getId());
+            assertThat(captureSaved().getStatus()).isEqualTo(BookingStatus.CONFIRMED);
+        }
+
+        @Test
+        @DisplayName("should_callTheSeamRegardless_when_theFeatureFlagIsOff")
+        void should_callTheSeamRegardless_when_theFeatureFlagIsOff() {
+            BookingSmsProperties properties = new BookingSmsProperties();
+            properties.getSms().setEnabled(false);
+            service = new StaffBookingService(
+                    masterRepository, bookingRepository, slotCalculationService,
+                    salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
+                    bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC));
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            // Suppression is the BEAN's job, never this call site's. If someone adds an
+            // `if (properties.isEnabled())` here, the gate stops being un-forgettable at the next
+            // new call site — which is the whole reason 22.7 gated the seam instead of the callers.
+            verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+
+        private String captureSmsText() {
+            ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+            verify(smsService).send(eq(E164_PHONE), captor.capture());
+            return captor.getValue();
+        }
+    }
+
+    /**
+     * The per-RECIPIENT SMS-spend cap (SEC MEDIUM, 2026-08-18) — the half no per-actor rate-limit
+     * bucket can provide, because an attacker may hold several staff accounts and several masters.
+     *
+     * <p>Note what these rows are careful about: the count is taken on the NORMALISED phone (so the
+     * two spellings of one number share a budget) and BEFORE the advisory lock (so a throttled
+     * request never contends for it), and the 429 body names no phone number.
+     */
+    @Nested
+    @DisplayName("Per-phone walk-in SMS budget")
+    class PerPhoneSmsBudget {
+
+        @Test
+        @DisplayName("should_return429_when_thisPhoneAlreadyHitTheWalkInBudget")
+        void should_return429_when_thisPhoneAlreadyHitTheWalkInBudget() {
+            stubMasterAndAssignment(salonMaster(), assignment(null, null));
+            stubStaffSlotAvailable(START);
+            when(bookingRepository.countStaffWalkInsForPhoneSince(eq(E164_PHONE), any())).thenReturn(5L);
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
+                    .isInstanceOf(BusinessException.class)
+                    .as("a 429 must not confirm to a prober that this number was booked recently")
+                    .hasMessageNotContaining(E164_PHONE)
+                    .extracting(e -> ((BusinessException) e).getStatus())
+                    .isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+
+            // Nothing was written and no SMS was attempted — and, critically, the per-master
+            // advisory lock was never taken, so a throttled caller cannot queue contention on it.
+            verify(bookingRepository, never()).save(any());
+            verifyNoInteractions(smsService);
+        }
+
+        @Test
+        @DisplayName("should_countTheNormalisedPhone_when_staffTypedItWithSpaces")
+        void should_countTheNormalisedPhone_when_staffTypedItWithSpaces() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            // Counting "050 123 45 67" verbatim would let the same number be alternated between
+            // spellings to buy a second budget — the cap must key on what the DB actually stores.
+            verify(bookingRepository).countStaffWalkInsForPhoneSince(eq(E164_PHONE), any());
+        }
+
+        @Test
+        @DisplayName("should_allowTheCreate_when_thePhoneIsOneBelowTheBudget")
+        void should_allowTheCreate_when_thePhoneIsOneBelowTheBudget() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            when(bookingRepository.countStaffWalkInsForPhoneSince(eq(E164_PHONE), any())).thenReturn(4L);
+
+            // The boundary in the admitting direction: 4 prior sends is inside the budget of 5, so a
+            // strict-vs-non-strict comparison error would show up here rather than only in prod.
+            assertThat(create(command(guest(RAW_PHONE))).status()).isEqualTo(BookingStatus.CONFIRMED);
+            verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────────
 
     private StaffClientRef.Guest guest(String phone) {
@@ -752,18 +972,48 @@ class StaffBookingServiceTest {
     }
 
     private MasterServiceAssignment assignmentOf(Master master, BigDecimal priceOverride, Integer durationOverride) {
-        ServiceDefinition def = ServiceDefinition.builder()
-                .name("Манікюр")
-                .baseDurationMinutes(BASE_DURATION)
-                .bufferMinutesAfter(BUFFER)
-                .basePrice(BASE_PRICE)
-                .build();
+        ServiceDefinition def = serviceDefinition("Манікюр");
         return MasterServiceAssignment.builder()
                 .id(masterServiceId)
                 .master(master)
                 .serviceDefinition(def)
                 .priceOverride(priceOverride)
                 .durationOverrideMinutes(durationOverride)
+                .isActive(true)
+                .build();
+    }
+
+    /**
+     * A service definition whose PROVIDER-SET custom name is {@code customName} and whose
+     * PLATFORM-SET taxonomy name is always {@link #PLATFORM_SERVICE_NAME}. The two are separable on
+     * purpose: {@code StaffBookingService#platformServiceName} must read the second, and a fixture
+     * that set both to the same string could not tell the two apart (Anti-Bug — a fixture value that
+     * defangs the assertion).
+     *
+     * <p>The default {@code customName} equals the platform name, so every pre-existing row in this
+     * suite keeps asserting the copy it always asserted; only
+     * {@link WalkInConfirmationSms#should_usePlatformServiceTypeName_when_masterSetCustomServiceName}
+     * pulls them apart.
+     */
+    private ServiceDefinition serviceDefinition(String customName) {
+        return ServiceDefinition.builder()
+                .name(customName)
+                .serviceType(ServiceType.builder()
+                        .nameUk(PLATFORM_SERVICE_NAME)
+                        .slug("manikur")
+                        .build())
+                .baseDurationMinutes(BASE_DURATION)
+                .bufferMinutesAfter(BUFFER)
+                .basePrice(BASE_PRICE)
+                .build();
+    }
+
+    /** Same as {@link #assignment} but with a provider-chosen custom service name. */
+    private MasterServiceAssignment assignmentWithCustomServiceName(String customName) {
+        return MasterServiceAssignment.builder()
+                .id(masterServiceId)
+                .master(salonMaster())
+                .serviceDefinition(serviceDefinition(customName))
                 .isActive(true)
                 .build();
     }

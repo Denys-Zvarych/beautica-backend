@@ -7,24 +7,32 @@ import com.beautica.booking.dto.StaffBookingScope;
 import com.beautica.booking.dto.StaffClientRef;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
+import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -82,22 +90,61 @@ import java.util.UUID;
  * derived. Exactly ONE booking row is written, never a sibling. {@code priceMaxAtBooking} is a
  * snapshot taken here and never re-derived. "Now" comes only from the injected {@link Clock}.
  *
+ * <h2>The walk-in confirmation SMS (Phase 22.7)</h2>
+ * Added here, after commit, and <b>with no reference anywhere to the feature flag</b>. The gate
+ * {@code app.booking.sms.enabled} is applied once, in {@code SmsConfig}, by choosing which
+ * {@code SmsService} bean exists at all — so {@link BookingSmsDispatcher}, which this class hands the
+ * message to, holds the real collaborator in production and a log-only {@code NoOpSmsService}
+ * everywhere else and cannot tell the difference. An {@code if (properties.isEnabled())} here would
+ * defeat that design and re-open the "the next call site forgets the gate" failure it exists to
+ * close. See {@link #registerWalkInConfirmationSms}.
+ *
+ * <p>Because the send now costs real money, the create is also SMS-spend throttled on two
+ * independent axes: per staff actor by {@code staffBookingSmsBuckets} (the filter), and per
+ * RECIPIENT by {@link #assertWalkInSmsBudgetForPhone} here. Neither subsumes the other — see that
+ * method and {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW}.
+ *
  * <h2>Not here</h2>
- * No SMS and no notification. The walk-in confirmation SMS is Phase 22.7 (shipped disabled), and
- * the phase doc's step list for this service ends at "return {@code BookingResponse}" — no outbox
- * enqueue is specified for a staff booking, and inventing one now would risk double-notifying when
- * 22.7 lands. Flagged rather than guessed.
+ * No notification. No outbox enqueue is specified for a staff booking by 22.4, and inventing one
+ * would risk double-notifying a track that has not decided its provider-side copy. Flagged rather
+ * than guessed.
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class StaffBookingService {
+
+    /** Kyiv civil date rendered for the client, matching {@code GuestBookingService}'s SMS copy. */
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm");
 
     private final MasterRepository masterRepository;
     private final BookingRepository bookingRepository;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final VisitPlanner visitPlanner;
+    private final BookingSmsDispatcher bookingSmsDispatcher;
+    private final BookingSmsProperties smsProperties;
     private final Clock clock;
+
+    /**
+     * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
+     * per-phone window — the second half of the SMS-spend defence whose first half is
+     * {@code staffBookingSmsBuckets} in {@code RateLimitConfig} (SEC MEDIUM, 2026-08-18).
+     *
+     * <p>The bucket caps how fast ONE staff account can spend; this caps how much any ONE Ukrainian
+     * number can be made to receive, no matter how many staff accounts, masters or salons are used
+     * to do it. Without it a self-registered {@code INDEPENDENT_MASTER} with a 24/7 schedule could
+     * loop create/cancel and push Beautica-branded copy — with an attacker-chosen {@code
+     * serviceName} inside it — at a number that never consented.
+     *
+     * <p>Counted in the DATABASE rather than in a Caffeine bucket on purpose: the count must survive
+     * a restart and hold across instances, and {@code bookings} already records exactly the fact
+     * being limited. 5 per hour clears every legitimate shape (a client rebooked after a cancel, a
+     * family sharing one number, a corrected time) by a wide margin while removing the loop.
+     */
+    private static final long MAX_WALK_INS_PER_PHONE_PER_WINDOW = 5;
+    private static final Duration WALK_IN_PHONE_WINDOW = Duration.ofHours(1);
 
     /**
      * Creates one {@code CONFIRMED}, {@code STAFF}-sourced booking for an account-less walk-in
@@ -130,6 +177,9 @@ public class StaffBookingService {
      *                             an unparseable phone;
      *                             409 — off-schedule start, or a window that collides with an
      *                             existing {@code CONFIRMED} booking;
+     *                             429 — this walk-in phone has already received
+     *                             {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW} confirmations inside
+     *                             {@link #WALK_IN_PHONE_WINDOW};
      *                             501 — an {@link StaffClientRef.ExistingClient} subject (Phase 22.3)
      */
     @Transactional
@@ -190,6 +240,10 @@ public class StaffBookingService {
         // the DATABASE, so a staff-typed "050 123 45 67" is rejected as a 500-shaped constraint
         // violation, not stored. See UkrainianPhoneNormalizer.
         String guestPhone = UkrainianPhoneNormalizer.toE164(guest.phone());
+        // AFTER normalisation, so "050 123 45 67" and "+380501234567" cannot be alternated to buy a
+        // second budget; BEFORE the advisory lock, so a throttled request never contends for the
+        // lock every other request against this master queues on.
+        assertWalkInSmsBudgetForPhone(guestPhone);
 
         BookingSlotLockGuard.lockMasterAndAssertFree(
                 bookingRepository, master.getId(), item.startsAt(), item.endsAt());
@@ -202,7 +256,33 @@ public class StaffBookingService {
                 actorId));
 
         registerSlotEviction(master.getId(), salonIdOf(saved));
+        // Rendered NOW, inside the transaction, while `master` and `item` are still managed — the
+        // callback runs after the persistence context closes, so touching a lazy association from
+        // there would be a LazyInitializationException.
+        registerWalkInConfirmationSms(
+                guestPhone,
+                buildWalkInConfirmationSms(
+                        master,
+                        platformServiceName(item.masterService().getServiceDefinition()),
+                        saved));
         return BookingResponse.from(saved, OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC));
+    }
+
+    /**
+     * Enforces {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW} walk-ins per recipient per
+     * {@link #WALK_IN_PHONE_WINDOW} — see those fields for the threat model and the sizing.
+     *
+     * <p>A {@code 429}, matching {@code PhoneOtpService}'s per-phone verdict, and with a message
+     * that names no number: the response must not confirm to a prober that a given phone has been
+     * booked recently.
+     */
+    private void assertWalkInSmsBudgetForPhone(String guestPhone) {
+        long recent = bookingRepository.countStaffWalkInsForPhoneSince(
+                guestPhone, clock.instant().minus(WALK_IN_PHONE_WINDOW));
+        if (recent >= MAX_WALK_INS_PER_PHONE_PER_WINDOW) {
+            throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS,
+                    "Too many walk-in bookings for this phone — please try again later");
+        }
     }
 
     /**
@@ -323,5 +403,106 @@ public class StaffBookingService {
                 salonCatalogCacheEvictor.evict(salonId);
             }
         });
+    }
+
+    /**
+     * Sends the walk-in client their confirmation, after commit (Phase 22.7).
+     *
+     * <p><b>Its own registration, not folded into {@link #registerSlotEviction}.</b> The two
+     * side-effects are independent and neither may be able to suppress the other: a provider call
+     * sharing a {@link Runnable} with cache eviction puts a network round trip in front of a
+     * correctness-critical evict, and an eviction failure would silently skip the client's only
+     * notification. Separate synchronizations, separate blast radii.
+     *
+     * <p><b>After commit</b> because an SMS is not retractable: sending inside the transaction
+     * would tell a client about a booking a later rollback erases.
+     *
+     * <p><b>Not on the request thread</b> (backend-perf MEDIUM, 2026-08-18). An {@code afterCommit}
+     * callback runs on the thread that committed — here the servlet thread, before the 201 is
+     * written and while it still holds its pooled Hikari connection — so an inline
+     * {@code smsService.send} put the whole Turbosms round trip (up to the 5 s read cap) into this
+     * endpoint's p99. {@link BookingSmsDispatcher} takes the hand-off; the catch, the log discipline
+     * and the "a provider outage must never fail a committed booking" guarantee all live there now,
+     * one caller removed from any transaction. See that class for why the eviction-before-send
+     * ordering and the never-fail-the-booking invariant are preserved.
+     *
+     * <p>Whether anything actually leaves the building is not this method's business — see the
+     * class Javadoc.
+     */
+    private void registerWalkInConfirmationSms(String guestPhone, String smsText) {
+        BookingAfterCommit.run(() -> bookingSmsDispatcher.dispatch(
+                BookingSmsDispatcher.Kind.WALK_IN_CONFIRMATION, guestPhone, smsText));
+    }
+
+    /**
+     * Renders the walk-in confirmation copy in ONE pass over the template.
+     *
+     * <p>{@link Placeholders#format} rather than chained {@link String#replace} for the reason
+     * documented on {@code GuestBookingService#buildConfirmationSms}: sequential replacement
+     * re-scans values it has already substituted, so a provider who names a service
+     * {@code "Манікюр {time}"} could rewrite the rest of a message the client reads as platform
+     * copy. A single pass copies substituted values out verbatim, so data can never become markup.
+     *
+     * <p>The date and time are the Kyiv civil values — the client reads a wall clock, not the UTC
+     * instant the column stores.
+     *
+     * <p>{@code serviceName} is the PLATFORM name — see {@link #platformServiceName}.
+     */
+    private String buildWalkInConfirmationSms(Master master, String serviceName, Booking saved) {
+        OffsetDateTime kyiv = saved.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+        return Placeholders.format(smsProperties.getSms().getWalkInConfirmation(), Map.of(
+                "masterName", masterName(master),
+                "serviceName", serviceName,
+                "date", DATE_FMT.format(kyiv),
+                "time", TIME_FMT.format(kyiv)));
+    }
+
+    /**
+     * The PLATFORM-curated Ukrainian display name of the booked service type — deliberately NOT
+     * {@link ServiceDefinition#getName()} (security LOW, 2026-08-19).
+     *
+     * <h4>Why the custom name may not go into this message</h4>
+     * A walk-in confirmation is the one piece of Beautica copy that reaches a phone which never
+     * opted in: the number is typed by the provider, and the recipient's only signal that the
+     * message is legitimate is the branding. {@code ServiceDefinition.name} is a self-registered
+     * provider's free text — {@code CreateServiceDefinitionRequest} accepts 100 characters of any
+     * non-control string — so a hostile account could put its own call to action into a branded SMS
+     * and, at the per-account rate limit, address it to hundreds of distinct strangers an hour once
+     * {@code app.booking.sms.enabled} flips at release. {@link Placeholders#format} stops that value
+     * from becoming template MARKUP; it cannot stop the value from BEING the payload.
+     *
+     * <p>{@code ServiceType.nameUk} closes the channel outright rather than filtering it: the
+     * taxonomy is platform-authored (created through the internal service-type endpoints, not by
+     * providers), so nothing an account controls reaches the wire. It is also what the provider
+     * would have got anyway — {@code ServiceCatalogService#resolveCreateName} already defaults a
+     * blank custom name to exactly this string.
+     *
+     * <p>Reading it costs one extra lazy load, taken INSIDE the transaction with the assignment
+     * still managed. Both hops are non-null by schema ({@code service_type_id} is NOT NULL with an
+     * {@code optional = false} {@code @ManyToOne}; {@code name_uk} is NOT NULL), so no fallback is
+     * reachable and none is written — a silent fallback to the custom name would re-open the vector
+     * for exactly the rows an attacker can create.
+     *
+     * <p>Not applied to {@code masterName}: a provider's own name is required content the client
+     * needs in order to recognise the booking, and it is already narrowed by {@code @NoDigits} plus
+     * the no-control-character pattern on every registration DTO. Removing it is a product decision,
+     * not a hardening one.
+     */
+    private static String platformServiceName(ServiceDefinition definition) {
+        return definition.getServiceType().getNameUk();
+    }
+
+    /**
+     * «Ім'я Прізвище» for the SMS, null-safe on either half.
+     *
+     * <p>Deliberately a private copy of {@code GuestBookingService#masterName} rather than a shared
+     * helper: four booking services already carry this same three-line formatter and consolidating
+     * all of them is a refactor of its own, outside a phase whose subject is a feature gate.
+     */
+    private static String masterName(Master master) {
+        User u = master.getUser();
+        String first = u.getFirstName() == null ? "" : u.getFirstName().trim();
+        String last = u.getLastName() == null ? "" : u.getLastName().trim();
+        return (first + " " + last).trim();
     }
 }

@@ -76,6 +76,13 @@ app:
   outbox:
     # Local dev only — never use in prod. Generate prod value with: openssl rand -base64 32
     payload-key: ${OUTBOX_PAYLOAD_KEY}
+  booking:
+    sms:
+      # Phase 22.7 — restated here, not inherited, so a developer reading only the local profile
+      # can see that no SMS leaves this machine: SmsConfig wires NoOpSmsService and every send is
+      # logged instead of billed. Hardcoded false with NO env placeholder — unlike the base
+      # profile, local must not be flippable by a stray shell export.
+      enabled: false
 
 springdoc:
   api-docs:

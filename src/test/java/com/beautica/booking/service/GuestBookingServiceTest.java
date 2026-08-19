@@ -22,8 +22,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.task.SyncTaskExecutor;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
@@ -72,10 +74,25 @@ class GuestBookingServiceTest {
     void setUp() {
         service = new GuestBookingService(
                 guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
-                appointmentRepository, slotCalculationService, outboxService, smsService,
+                appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC));
+    }
+
+    /**
+     * The REAL {@link BookingSmsDispatcher} over the mocked {@link SmsService} seam, driven by a
+     * {@link SyncTaskExecutor} — the same shape {@code StaffBookingServiceTest} uses, and the same
+     * shape the {@code test} profile wires in production code ({@code AsyncConfig#syncSmsSendExecutor}).
+     *
+     * <p>A mocked dispatcher would have been less work and strictly worse: every {@code
+     * verify(smsService)} row below would then assert only that a hand-off was requested, and a
+     * dispatcher that silently stopped sending would keep them all green. Running the real one inline
+     * keeps those rows meaning "the message was sent", exactly as before the hand-off was introduced,
+     * while still proving the service holds no {@code SmsService} of its own.
+     */
+    private BookingSmsDispatcher smsDispatcher() {
+        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
     }
 
     @Test
@@ -112,6 +129,35 @@ class GuestBookingServiceTest {
         // setBookingLockTimeout()+acquireAdvisoryLock() pair IS the regression guard that the
         // timeout ceiling is still applied before the lock wait.
         verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
+    }
+
+    /**
+     * <b>The availability evict must run BEFORE the SMS, not after</b> (perf MEDIUM, 2026-08-18).
+     *
+     * <p>Both side-effects share ONE after-commit runnable, and the send was its first statement.
+     * A Turbosms brown-out therefore delayed a correctness-critical eviction by up to the full
+     * 3 s connect + 5 s read budget, and for that whole time parallel readers could repopulate — and
+     * then keep serving for the 60 s cache TTL — a slot this very booking had just consumed. That is
+     * precisely the double-book window {@code BookingAfterCommit} exists to close, reopened from the
+     * inside by an unrelated network call. The evict is in-memory and cannot block; the send can.
+     *
+     * <p>Ordering, not mere presence, is the property — so this is an {@link InOrder} assertion.
+     * Every other row in this suite verifies both collaborators independently and would stay green
+     * with the statements swapped back, which is how the defect survived to be found by review.
+     */
+    @Test
+    @DisplayName("should evict the availability caches BEFORE the confirmation SMS is attempted")
+    void should_evictAvailabilityCachesBeforeSendingTheConfirmation_when_bookingCreated() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
+
+        InOrder inOrder = org.mockito.Mockito.inOrder(slotCalculationService, smsService);
+        inOrder.verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
+        inOrder.verify(smsService).send(eq(GUEST_PHONE), anyString());
     }
 
     @Test
