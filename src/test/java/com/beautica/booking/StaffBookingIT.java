@@ -501,6 +501,33 @@ class StaffBookingIT extends AbstractIntegrationTest {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Locked-rule regressions (Phase 22.5 Gap 2) — per-BOOKING isolation
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Locked-rule regressions")
+    class LockedRuleRegressions {
+
+        /**
+         * Per-BOOKING rule (CLAUDE.md Domain Rules — {@code project_completion_is_per_service}):
+         * every transition, including a create, touches exactly ONE booking row. A staff create
+         * against the same master must never mutate a prior booking for that master — snapshotting
+         * the sibling's full row before and after is the only way to prove "untouched" rather than
+         * merely "still present."
+         */
+        @Test
+        @DisplayName("a staff create never touches a sibling booking for the same master")
+        void should_leaveSiblingBookingUntouched_when_creatingAnotherStaffBooking() {
+            BookingResponse sibling = create(salon, command(salon, kyiv(TODAY, 9, 0), salon.salonId()));
+            Map<String, Object> siblingBefore = bookingRow(sibling.id());
+
+            create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
+
+            assertThat(bookingRow(sibling.id())).isEqualTo(siblingBefore);
+        }
+    }
+
     // ── fixtures ──────────────────────────────────────────────────────────────────
 
     /**
