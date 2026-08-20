@@ -134,12 +134,12 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
             Independent solo = seedIndependentMaster();
 
             ResponseEntity<String> resp =
-                    create(solo.masterId, solo.masterServiceId, tokenFor(solo.email), tomorrowAtNoon());
+                    create(solo.masterId(), solo.masterServiceId(), tokenFor(solo.email()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
             Map<String, Object> row = onlyBooking();
             assertThat(row.get("salon_id")).isNull();
-            assertThat(row.get("created_by_user_id")).isEqualTo(solo.userId);
+            assertThat(row.get("created_by_user_id")).isEqualTo(solo.userId());
             assertThat(row.get("booking_source")).isEqualTo("STAFF");
             // The self-notify case: even though actor == recipient here, no outbox row is enqueued —
             // see the owner-path test below for why (StaffBookingService's "Not here" Javadoc).
@@ -280,7 +280,7 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
             Independent someoneElse = seedIndependentMaster();
 
             ResponseEntity<String> resp = create(
-                    someoneElse.masterId, someoneElse.masterServiceId, tokenFor(me.email), tomorrowAtNoon());
+                    someoneElse.masterId(), someoneElse.masterServiceId(), tokenFor(me.email()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -291,7 +291,7 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
         void should_reject403_when_independentMasterBooksASalonMaster() {
             Independent me = seedIndependentMaster();
 
-            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(me.email), tomorrowAtNoon());
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(me.email()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
             assertThat(bookingCount()).isZero();
@@ -549,9 +549,6 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
                 """.formatted(salon.masterServiceId(), startsAt, phone);
     }
 
-    private record Independent(UUID userId, String email, UUID masterId, UUID masterServiceId) {
-    }
-
     private record Invited(UUID userId, String email, UUID masterId) {
     }
 
@@ -572,16 +569,6 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
         jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
                 + "VALUES (?, ?, ?, true, NOW(), NOW())", salonId, ownerId, "Salon-" + salonId);
         return salonId;
-    }
-
-    private Independent seedIndependentMaster() {
-        SeededUser user = insertUser("INDEPENDENT_MASTER", null);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
-                + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())", masterId, user.id());
-        UUID masterServiceId = insertService(masterId, "INDEPENDENT_MASTER", user.id());
-        giveWorkingHours(user.id(), masterId);
-        return new Independent(user.id(), user.email(), masterId, masterServiceId);
     }
 
     /** An invited, read-only {@code SALON_MASTER} of the given salon — no schedule needed. */

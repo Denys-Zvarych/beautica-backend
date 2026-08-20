@@ -286,6 +286,26 @@ public class BookingService {
      * because the mobile card could not trust a flag that was a constant. Do not re-derive this
      * conjunction at either call site.
      *
+     * <p><b>The {@code hasClient} conjunct is load-bearing on the DETAIL path only, and is
+     * deliberately retained as defence-in-depth on the listing path</b> (QA GAP 3, 2026-08-20 —
+     * documented, not "fixed"). {@link #loadProviderReviewBatch} already drops every
+     * {@code b.getClient() == null} row from its candidate set at {@code loadProviderReviewBatch}'s
+     * first statement, so such a row can never enter {@code withAuthority} and arrives here with
+     * {@code hasProviderAuthority == false} — the conjunction is already {@code false} one term
+     * earlier and this term is unreachable for it. {@link #computeProviderCanReviewClient} has no
+     * such pre-filter: it derives authority from the actor's relationship to the MASTER/SALON, which
+     * a guest or STAFF walk-in booking satisfies exactly as well as an account-bound one, so on
+     * {@code GET /bookings/&#123;id&#125;} this term is the ONLY thing standing between a COMPLETED
+     * walk-in and a {@code true} the {@code POST /client-reviews} write endpoint would then reject
+     * (there is no {@code users} row to attach a {@code ClientReview} to).
+     *
+     * <p>The practical consequence, and the reason this is written down: a regression that deletes
+     * this single conjunct is INVISIBLE to every listing test, because the batch pre-filter makes
+     * the removal a no-op there. It was measured — mutation M6 of the Phase 22.5 read-path pass
+     * dropped this term and killed no test in {@code StaffBookingReadPathIT}'s listing suite.
+     * {@code StaffBookingReadPathIT.BookingDetail} exists to close that hole and is the suite that
+     * fails when this term goes; keep a detail-path assertion on the flag alive.
+     *
      * <p>{@code clientReviewExists} is a {@link BooleanSupplier}, not a {@code boolean}, so the
      * detail path keeps paying its {@code client_reviews} probe ONLY when the cheap in-memory
      * conjuncts have not already decided the answer — the short-circuit that keeps
@@ -1147,6 +1167,12 @@ public class BookingService {
      */
     private ProviderReviewBatch loadProviderReviewBatch(
             Role role, UUID actorUserId, List<Booking> page) {
+        // This b.getClient() != null pre-filter is what makes providerCanReviewClient's own
+        // hasClient conjunct unreachable on THIS path — a guest/STAFF row never reaches
+        // withAuthority, so it is already false by the authority term. That redundancy is retained
+        // on purpose; see providerCanReviewClient's javadoc for why (the detail path has no such
+        // pre-filter, so the conjunct is load-bearing there) and for the mutation that proved a
+        // listing test can never detect its removal.
         List<Booking> candidates = page.stream()
                 .filter(b -> b.getClient() != null
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))

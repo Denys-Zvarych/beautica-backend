@@ -159,6 +159,18 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
     protected record SeededUser(UUID id, String email) {
     }
 
+    /**
+     * A solo master and everything needed to authenticate as them and book against them.
+     *
+     * <p>Promoted here (with {@link #seedIndependentMaster()}) when {@link StaffBookingReadPathIT}
+     * became the second suite in this hierarchy to need a salon-less master — the Q4
+     * two-occurrence threshold. It was private to {@link StaffBookingEndpointIT}; privacy is not a
+     * licence to copy, and a second hand-written copy of a fixture is exactly how the two suites
+     * end up disagreeing about what "an independent master" is while both stay green.
+     */
+    protected record Independent(UUID userId, String email, UUID masterId, UUID masterServiceId) {
+    }
+
     // ── seeding ───────────────────────────────────────────────────────────────────
 
     /**
@@ -215,6 +227,21 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
         jdbcTemplate.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, "
                 + "updated_at) VALUES (?, ?, ?, true, NOW(), NOW())", masterServiceId, masterId, serviceDefId);
         return masterServiceId;
+    }
+
+    /**
+     * A salon-less {@code INDEPENDENT_MASTER} with one service and the same seven-day 09:00–17:00
+     * schedule {@link #seedSalon()} gives its master, so "tomorrow at noon" is bookable against
+     * either. See {@link Independent} for why this lives on the base class.
+     */
+    protected Independent seedIndependentMaster() {
+        SeededUser user = insertUser("INDEPENDENT_MASTER", null);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
+                + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())", masterId, user.id());
+        UUID masterServiceId = insertService(masterId, "INDEPENDENT_MASTER", user.id());
+        giveWorkingHours(user.id(), masterId);
+        return new Independent(user.id(), user.email(), masterId, masterServiceId);
     }
 
     /** 09:00–17:00 on every ISO weekday, so "tomorrow" is a working day whatever day it is today. */

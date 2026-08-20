@@ -517,6 +517,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@code findIdsByMasterIdFiltered}/{@code findIdsBySalonIdsFiltered} +
      * {@code findAllByIdsWithGraph} two-query pattern exactly.
      *
+     * <p><b>{@code JOIN b.client} is an INNER join here on purpose, and that is not the bug it is on
+     * {@link #findByIdWithFullGraph}.</b> This query serves the CLIENT listing only, whose ID page
+     * is {@code b.client.id = :clientId} — so every id it is ever handed already has a client. A
+     * null-client row ({@code booking_source} {@code 'LINK'} guest or {@code 'STAFF'} walk-in, V89 /
+     * V137 {@code chk_bookings_guest_fields}: {@code client_id IS NULL}) can therefore never reach
+     * this method's {@code :ids}, and the inner join is a structural assertion of that rather than a
+     * silent filter. Recorded because "inner JOIN b.client" reads like the CRITICAL track-24.7
+     * finding on the provider-side graph queries: it is not, and a future auditor should not chase a
+     * missing walk-in here (QA GAP 4, 2026-08-20). If this projection is ever reused by a provider
+     * or mixed-scope listing, the join must become {@code LEFT JOIN} in the same change.
+     *
      * <p><b>Discovery locality is district-primary via the salon link</b> — the salon's
      * city/district/address wins when the master is salon-employed, else the master's own
      * user row. This mirrors {@code SearchService}'s {@code COALESCE(salon, user)} rule so
