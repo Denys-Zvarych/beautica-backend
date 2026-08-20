@@ -150,6 +150,14 @@ public class Appointment extends AuditableEntity {
     @Column(name = "guest_phone", length = 20)
     private String guestPhone;
 
+    // Which staff user keyed this visit in (Phase 22.8 / V139). Orthogonal to bookingSource — the
+    // enum answers "what kind of visit", this column answers "which human created it". Null for
+    // every APP/LINK header; populated on every STAFF header by staffAppointment(...) below. Plain
+    // UUID, not a @ManyToOne User — mirrors Booking.createdByUserId byte-for-byte so no read path is
+    // tempted to lazily fetch a creator it never renders.
+    @Column(name = "created_by_user_id")
+    private UUID createdByUserId;
+
     /**
      * Factory for an auto-confirmed guest (LINK) multi-service visit header (BE-7). Enforces the LINK
      * invariant (guest identity + cancel token non-null, no registered client) before the row exists —
@@ -192,6 +200,52 @@ public class Appointment extends AuditableEntity {
                 .guestSurname(guestSurname)
                 .guestPhone(guestPhone)
                 .cancelToken(cancelToken)
+                .build();
+    }
+
+    /**
+     * Factory for an auto-confirmed STAFF walk-in multi-service visit header (Phase 22.9) — the
+     * provider-created counterpart of {@link #guestAppointment}. Enforces the STAFF walk-in invariant
+     * before the row exists, mirroring {@link Booking#staffBooking} and the DB CHECK
+     * {@code chk_appointment_guest_fields} (V139).
+     *
+     * <p><b>No cancel token.</b> Unlike a LINK visit, a staff-created visit carries NO guest
+     * self-cancel link — the V139 STAFF branch requires {@code cancel_token IS NULL}. Only the
+     * provider closes it, through a management endpoint. This is the same rule
+     * {@code Booking.staffBooking} applies to the child rows, so header and children agree.
+     *
+     * <p><b>Surname is REQUIRED</b>, unlike the LINK branch where it stays optional (V91's
+     * rationale). The two branches intentionally differ; do not unify them.
+     *
+     * <p>Reuses {@link Booking#requireStaffWalkInIdentity} rather than re-implementing the guard —
+     * the REUSE-FIRST move that keeps the header and its chained child rows from drifting on what
+     * "blank" means. Do not copy the blank checks here.
+     *
+     * @param salon           the visit's salon, or {@code null} for an independent-master visit
+     * @param guestName       walk-in first name (required, non-blank)
+     * @param guestSurname    walk-in last name (required, non-blank — unlike the LINK flow)
+     * @param guestPhone      walk-in phone, E.164-normalised BY THE CALLER
+     *                        ({@code chk_appointment_guest_phone_format} rejects any other shape)
+     * @param createdByUserId id of the staff user creating the visit (required)
+     */
+    public static Appointment staffAppointment(
+            Salon salon,
+            String guestName,
+            String guestSurname,
+            String guestPhone,
+            UUID createdByUserId) {
+        Booking.requireStaffWalkInIdentity(guestName, guestSurname, guestPhone, createdByUserId);
+        return Appointment.builder()
+                // No client FK: the walk-in mode has no registered account
+                // (the V139 CHECK enforces STAFF walk-in => client_id NULL).
+                .salon(salon)
+                .status(BookingStatus.CONFIRMED)
+                .bookingSource(BookingSource.STAFF)
+                .guestName(guestName)
+                .guestSurname(guestSurname)
+                .guestPhone(guestPhone)
+                // cancelToken stays null: no guest self-cancel link for a staff visit.
+                .createdByUserId(createdByUserId)
                 .build();
     }
 }

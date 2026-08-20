@@ -479,8 +479,13 @@ public class Booking extends AuditableEntity {
      * {@code StaffBookingService} rejects a null actor before the load. That is exactly why the
      * status matters: this is the backstop for the day a second caller appears, and a backstop that
      * answers 500 is not one.
+     *
+     * <p><b>Package-private, not private</b> (Phase 22.9): {@link Appointment#staffAppointment} in
+     * this same package reuses this exact validation for the visit header, so the header and its
+     * chained child rows cannot drift on what "blank" means. Do not fork a copy onto
+     * {@code Appointment} — see that factory's javadoc.
      */
-    private static void requireStaffWalkInIdentity(
+    static void requireStaffWalkInIdentity(
             String guestName, String guestSurname, String guestPhone, UUID createdByUserId) {
         requireStaffText(guestName, "guestName");
         requireStaffText(guestSurname, "guestSurname");

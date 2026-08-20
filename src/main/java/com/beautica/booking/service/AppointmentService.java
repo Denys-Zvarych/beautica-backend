@@ -168,7 +168,10 @@ public class AppointmentService {
      *
      * <p>Package-private (not {@code private}) so {@code AppointmentTransitionService.rescheduleAppointment}
      * (BE-4) can reuse it verbatim to build the re-planned visit's response, instead of
-     * duplicating the discovery-label lookup a second time.
+     * duplicating the discovery-label lookup a second time. {@code StaffBookingService} (Phase 22.14)
+     * is a third caller, for the identical reason: a staff-created visit's response is the same
+     * {@link AppointmentDetailResponse} shape a client visit's is, so its create path reuses this
+     * enrichment rather than hand-rolling a second mapper.
      */
     AppointmentDetailResponse enrich(Appointment appointment, List<Booking> items) {
         Master master = items.get(0).getMaster();

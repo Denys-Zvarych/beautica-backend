@@ -1,10 +1,11 @@
 package com.beautica.booking.service;
 
 import com.beautica.auth.Role;
-import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
 import com.beautica.booking.dto.StaffBookingScope;
 import com.beautica.booking.dto.StaffClientRef;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -43,6 +44,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -51,6 +53,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -86,6 +89,7 @@ class StaffBookingServiceTest {
     @Mock private com.beautica.master.repository.MasterRepository masterRepository;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private BookingRepository bookingRepository;
+    @Mock private com.beautica.booking.repository.AppointmentRepository appointmentRepository;
     @Mock private SlotCalculationService slotCalculationService;
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     /**
@@ -95,6 +99,15 @@ class StaffBookingServiceTest {
      * touches the flag, and that absence is asserted below.
      */
     @Mock private SmsService smsService;
+
+    /**
+     * Phase 22.14. Mocked, not wired real: {@code AppointmentService#enrich} is a full graph-to-DTO
+     * mapper with its own collaborator ({@code DiscoveryLocationResolver}) and its own dedicated unit
+     * suite — re-testing it here would duplicate coverage rather than isolate
+     * {@link StaffBookingService}. What this suite proves is that {@code enrich} is CALLED, with the
+     * header and the saved chain, not what it returns.
+     */
+    @Mock private AppointmentService appointmentService;
 
     private StaffBookingService service;
 
@@ -115,6 +128,9 @@ class StaffBookingServiceTest {
 
     private final UUID masterId = UUID.randomUUID();
     private final UUID masterServiceId = UUID.randomUUID();
+    /** The 2nd and 3rd legs of a multi-service visit (Phase 22.12) — {@link MultiServiceVisit}. */
+    private final UUID masterServiceId2 = UUID.randomUUID();
+    private final UUID masterServiceId3 = UUID.randomUUID();
     private final UUID salonId = UUID.randomUUID();
     private final UUID masterUserId = UUID.randomUUID();
     private final UUID staffUserId = UUID.randomUUID();
@@ -122,10 +138,16 @@ class StaffBookingServiceTest {
     @BeforeEach
     void setUp() {
         service = new StaffBookingService(
-                masterRepository, bookingRepository, slotCalculationService,
+                masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                 salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                 bookingSmsDispatcher(), new BookingSmsProperties(),
-                Clock.fixed(NOW, ZoneOffset.UTC));
+                Clock.fixed(NOW, ZoneOffset.UTC), appointmentService);
+        // Lenient: rejection-path tests never reach the enrich() call, and MockitoExtension's
+        // default STRICT_STUBS would otherwise flag this as an unnecessary stub for every one of
+        // them. The return value is a placeholder — no test in this suite asserts on its content;
+        // see the appointmentService field javadoc for why that assertion belongs to enrich's own
+        // suite instead.
+        lenient().when(appointmentService.enrich(any(), any())).thenReturn(stubAppointmentDetailResponse());
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
@@ -141,7 +163,7 @@ class StaffBookingServiceTest {
         void should_persistConfirmedStaffBooking_when_requestIsValid() {
             stubHappyPath(salonMaster(), assignment(null, null));
 
-            BookingResponse response = create(command(guest(RAW_PHONE)));
+            AppointmentDetailResponse response = create(command(guest(RAW_PHONE)));
 
             Booking saved = captureSaved();
             assertThat(saved.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
@@ -149,7 +171,11 @@ class StaffBookingServiceTest {
             assertThat(saved.getCreatedByUserId()).isEqualTo(staffUserId);
             assertThat(saved.getClient()).as("a walk-in has no account (V137 STAFF branch)").isNull();
             assertThat(saved.getCancelToken()).as("no guest self-cancel link for a staff booking").isNull();
-            assertThat(response.status()).isEqualTo(BookingStatus.CONFIRMED);
+            assertThat(response.status())
+                    .as("the visit response comes straight from the mocked AppointmentService#enrich "
+                            + "seam — see should_enrichWithHeaderAndSavedChain_when_visitCreated for "
+                            + "the assertion that enrich is called with the real persisted state")
+                    .isEqualTo(BookingStatus.CONFIRMED);
         }
 
         @Test
@@ -269,7 +295,7 @@ class StaffBookingServiceTest {
                     .isInstanceOf(ForbiddenException.class)
                     .hasMessage("Master does not belong to this account");
 
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         /**
@@ -298,7 +324,7 @@ class StaffBookingServiceTest {
                     .isInstanceOf(ForbiddenException.class)
                     .hasMessage("Master does not belong to this account");
 
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         /**
@@ -319,7 +345,7 @@ class StaffBookingServiceTest {
                     .isInstanceOf(ForbiddenException.class)
                     .hasMessage("Master does not belong to this account");
 
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
     }
 
@@ -361,7 +387,7 @@ class StaffBookingServiceTest {
                     .isEqualTo(HttpStatus.BAD_REQUEST);
 
             verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         @Test
@@ -399,7 +425,7 @@ class StaffBookingServiceTest {
                     .isEqualTo(HttpStatus.CONFLICT);
 
             verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         @Test
@@ -414,7 +440,7 @@ class StaffBookingServiceTest {
                     .isInstanceOf(BusinessException.class)
                     .hasMessage("Slot not available");
 
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         @Test
@@ -470,7 +496,7 @@ class StaffBookingServiceTest {
                     .isInstanceOf(ForbiddenException.class)
                     .hasMessage("Master does not belong to this salon");
 
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         /**
@@ -494,7 +520,7 @@ class StaffBookingServiceTest {
                     .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
 
             verify(bookingRepository, never()).existsOverlap(any(), any(), any());
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
 
         /**
@@ -516,7 +542,7 @@ class StaffBookingServiceTest {
             stubStaffSlotAvailable(START);
             when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
             when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
-            when(bookingRepository.saveAndFlush(any(Booking.class)))
+            when(bookingRepository.saveAll(any()))
                     .thenThrow(new DataIntegrityViolationException("no_overlapping_bookings"));
 
             assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
@@ -555,7 +581,7 @@ class StaffBookingServiceTest {
                     .extracting(e -> ((BusinessException) e).getStatus())
                     .isEqualTo(HttpStatus.NOT_IMPLEMENTED);
 
-            verify(bookingRepository, never()).saveAndFlush(any());
+            verify(bookingRepository, never()).saveAll(any());
         }
     }
 
@@ -761,11 +787,12 @@ class StaffBookingServiceTest {
             org.mockito.Mockito.doThrow(new SmsDeliveryException("provider down"))
                     .when(smsService).send(any(), any());
 
-            BookingResponse response = create(command(guest(RAW_PHONE)));
+            AppointmentDetailResponse response = create(command(guest(RAW_PHONE)));
 
             // The booking is committed before the send is attempted; a vendor outage must not turn a
-            // successful create into a failed request (GuestBookingService#sendConfirmationSms).
-            assertThat(response.id()).isEqualTo(captureSaved().getId());
+            // successful create into a failed request (GuestBookingService#sendConfirmationSms) — the
+            // call returns normally (no exception propagated) and the row is CONFIRMED regardless.
+            assertThat(response).isNotNull();
             assertThat(captureSaved().getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         }
 
@@ -775,9 +802,9 @@ class StaffBookingServiceTest {
             BookingSmsProperties properties = new BookingSmsProperties();
             properties.getSms().setEnabled(false);
             service = new StaffBookingService(
-                    masterRepository, bookingRepository, slotCalculationService,
+                    masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                     salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
-                    bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC));
+                    bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService);
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
@@ -786,6 +813,68 @@ class StaffBookingServiceTest {
             // `if (properties.isEnabled())` here, the gate stops being un-forgettable at the next
             // new call site — which is the whole reason 22.7 gated the seam instead of the callers.
             verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+
+        /**
+         * The byte-identical N = 1 golden string (D3, Phase 22.13) — widening the builder to accept
+         * a service LIST must not perturb the single-service rendering by even one character.
+         * {@code should_renderMasterServiceDateAndTimeInKyivCivilTime_when_sending} above already
+         * checks the individual fragments; this pins the WHOLE string so any stray character (a
+         * misplaced space, a changed line break) shows up here even if every fragment still matches.
+         */
+        @Test
+        @DisplayName("should_renderByteIdenticalBody_when_singleService")
+        void should_renderByteIdenticalBody_when_singleService() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            assertThat(captureSmsText()).isEqualTo(
+                    "Beautica: Запис підтверджено!\n"
+                            + "Марія Левченко, Манікюр\n"
+                            + "10.06.2026 о 12:00\n\n"
+                            + "Скасувати — за телефоном майстра.");
+        }
+
+        /**
+         * D3: name the first service, count the rest — never the full list, and never one SMS per
+         * service. A count-only assertion (verifying {@code smsService.send} was invoked exactly
+         * once) would pass even with the pre-22.13 first-service-only text, since a 3-service visit
+         * still sends exactly one message either way; only inspecting the BODY proves the copy
+         * actually widened.
+         */
+        @Test
+        @DisplayName("should_nameFirstServiceAndCountTheRest_when_threeServiceVisitCreated")
+        void should_nameFirstServiceAndCountTheRest_when_threeServiceVisitCreated() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            assertThat(captureSmsText())
+                    .as("first service named, plural-correct count of the remaining two")
+                    .contains(PLATFORM_SERVICE_NAME + " та ще 2 послуги")
+                    .as("the rendered date/time are the VISIT's own start (firstStart), unchanged "
+                            + "by widening the builder to accept the whole chain")
+                    .contains("10.06.2026")
+                    .contains("12:00");
+        }
+
+        /**
+         * The budget query is consulted ONCE per visit, never once per chained service — a per-item
+         * call would be exactly the row-vs-visit confusion
+         * {@code BookingRepository#countStaffWalkInVisitsForPhoneSince} exists to remove, restated at
+         * the call-site level. The query's own row-vs-visit correctness is proved where the real SQL
+         * runs: {@code V138WalkInPhoneIndexMigrationTest} and {@code WalkInBookingSmsEnabledIT}.
+         */
+        @Test
+        @DisplayName("should_checkTheBudgetOnce_when_threeServiceVisitCreated")
+        void should_checkTheBudgetOnce_when_threeServiceVisitCreated() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            verify(bookingRepository, org.mockito.Mockito.times(1))
+                    .countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any());
         }
 
         private String captureSmsText() {
@@ -812,7 +901,7 @@ class StaffBookingServiceTest {
         void should_return429_when_thisPhoneAlreadyHitTheWalkInBudget() {
             stubMasterAndAssignment(salonMaster(), assignment(null, null));
             stubStaffSlotAvailable(START);
-            when(bookingRepository.countStaffWalkInsForPhoneSince(eq(E164_PHONE), any())).thenReturn(5L);
+            when(bookingRepository.countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any())).thenReturn(5L);
 
             assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
                     .isInstanceOf(BusinessException.class)
@@ -836,19 +925,226 @@ class StaffBookingServiceTest {
 
             // Counting "050 123 45 67" verbatim would let the same number be alternated between
             // spellings to buy a second budget — the cap must key on what the DB actually stores.
-            verify(bookingRepository).countStaffWalkInsForPhoneSince(eq(E164_PHONE), any());
+            verify(bookingRepository).countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any());
         }
 
         @Test
         @DisplayName("should_allowTheCreate_when_thePhoneIsOneBelowTheBudget")
         void should_allowTheCreate_when_thePhoneIsOneBelowTheBudget() {
             stubHappyPath(salonMaster(), assignment(null, null));
-            when(bookingRepository.countStaffWalkInsForPhoneSince(eq(E164_PHONE), any())).thenReturn(4L);
+            when(bookingRepository.countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any())).thenReturn(4L);
 
             // The boundary in the admitting direction: 4 prior sends is inside the budget of 5, so a
             // strict-vs-non-strict comparison error would show up here rather than only in prod.
             assertThat(create(command(guest(RAW_PHONE))).status()).isEqualTo(BookingStatus.CONFIRMED);
             verify(smsService).send(eq(E164_PHONE), any(String.class));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Multi-service visits (Phase 22.12) — one header + N chained bookings
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Multi-service visits")
+    class MultiServiceVisit {
+
+        /**
+         * D2's locked decision, pinned at the unit tier: N = 1 is NOT special-cased, so even a
+         * single-service command still produces an {@code appointments} header. Mutation-check RED
+         * by reintroducing a {@code size == 1} short-circuit around the header build.
+         */
+        @Test
+        @DisplayName("should_createOneHeaderAndOneBooking_when_singleService")
+        void should_createOneHeaderAndOneBooking_when_singleService() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            verify(appointmentRepository).save(any(Appointment.class));
+            List<Booking> saved = captureSavedBookings();
+            assertThat(saved).hasSize(1);
+            assertThat(saved.get(0).getAppointment()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("should_createOneHeaderAndThreeBookings_when_threeServices")
+        void should_createOneHeaderAndThreeBookings_when_threeServices() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            ArgumentCaptor<Appointment> appointmentCaptor = ArgumentCaptor.forClass(Appointment.class);
+            verify(appointmentRepository).save(appointmentCaptor.capture());
+            List<Booking> saved = captureSavedBookings();
+            assertThat(saved).hasSize(3);
+            assertThat(saved).allSatisfy(b -> assertThat(b.getAppointment()).isSameAs(appointmentCaptor.getValue()));
+        }
+
+        @Test
+        @DisplayName("should_chainStartsAndEnds_when_multipleServices")
+        void should_chainStartsAndEnds_when_multipleServices() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            List<Booking> saved = captureSavedBookings();
+            assertThat(saved.get(0).getStartsAt()).isEqualTo(START);
+            assertThat(saved.get(1).getStartsAt())
+                    .as("item i starts exactly at item i-1's end")
+                    .isEqualTo(saved.get(0).getEndsAt());
+            assertThat(saved.get(2).getStartsAt()).isEqualTo(saved.get(1).getEndsAt());
+        }
+
+        /**
+         * Mutation-check RED by removing {@code setAppointment} from the loop in
+         * {@code StaffBookingService#createStaffBooking}.
+         */
+        @Test
+        @DisplayName("should_linkEveryBookingToTheHeader_when_multipleServices")
+        void should_linkEveryBookingToTheHeader_when_multipleServices() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            ArgumentCaptor<Appointment> appointmentCaptor = ArgumentCaptor.forClass(Appointment.class);
+            verify(appointmentRepository).save(appointmentCaptor.capture());
+            assertThat(captureSavedBookings())
+                    .extracting(Booking::getAppointment)
+                    .containsOnly(appointmentCaptor.getValue());
+        }
+
+        /**
+         * Mutation-check RED by passing {@code items.get(0).endsAt()} as {@code to} — the ONE span
+         * check must cover the whole chain, not just the first item.
+         */
+        @Test
+        @DisplayName("should_lockAndCheckOverlapOverWholeSpan_when_multipleServices")
+        void should_lockAndCheckOverlapOverWholeSpan_when_multipleServices() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            OffsetDateTime lastEnd = START.plusMinutes(3L * (BASE_DURATION + BUFFER));
+            verify(bookingRepository).existsOverlap(eq(masterId), eq(START), eq(lastEnd));
+        }
+
+        @Test
+        @DisplayName("should_callSlotGuardOnce_when_multipleServices")
+        void should_callSlotGuardOnce_when_multipleServices() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            verify(slotCalculationService, org.mockito.Mockito.times(1)).isStaffVisitSlotAvailable(
+                    eq(masterId), any(LocalDate.class), eq(List.of(masterServiceId, masterServiceId2, masterServiceId3)),
+                    any(), eq(START));
+        }
+
+        @Test
+        @DisplayName("should_stampCreatedByUserIdOnHeaderAndEveryBooking")
+        void should_stampCreatedByUserIdOnHeaderAndEveryBooking() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            ArgumentCaptor<Appointment> appointmentCaptor = ArgumentCaptor.forClass(Appointment.class);
+            verify(appointmentRepository).save(appointmentCaptor.capture());
+            assertThat(appointmentCaptor.getValue().getCreatedByUserId()).isEqualTo(staffUserId);
+            assertThat(captureSavedBookings())
+                    .extracting(Booking::getCreatedByUserId)
+                    .containsOnly(staffUserId);
+        }
+
+        @Test
+        @DisplayName("should_evictSlotsOnce_when_multipleServices")
+        void should_evictSlotsOnce_when_multipleServices() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            verify(slotCalculationService, org.mockito.Mockito.times(1)).evictMasterAvailabilityCaches(masterId);
+            verify(salonCatalogCacheEvictor, org.mockito.Mockito.times(1)).evict(salonId);
+        }
+
+        /**
+         * The multi-service counterpart of {@code Rejections
+         * #should_reject409_when_theDatabaseRejectsTheInsertAsOverlapping} — a GIST violation on ANY
+         * chained row must map to the same 409, and no downstream side effect (cache eviction, SMS)
+         * may fire for a visit that was never actually committed.
+         */
+        @Test
+        @DisplayName("should_map409AndFireNoSideEffects_when_saveAllViolatesOverlapExclude")
+        void should_map409AndFireNoSideEffects_when_saveAllViolatesOverlapExclude() {
+            stubMasterAndThreeAssignments();
+            stubStaffSlotAvailable(START);
+            when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
+            when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+            when(bookingRepository.saveAll(any()))
+                    .thenThrow(new DataIntegrityViolationException("no_overlapping_bookings"));
+
+            assertThatThrownBy(() -> create(threeServiceCommand()))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessage("Slot not available")
+                    .extracting(e -> ((BusinessException) e).getStatus())
+                    .isEqualTo(HttpStatus.CONFLICT);
+
+            verifyNoInteractions(salonCatalogCacheEvictor, smsService);
+            verify(slotCalculationService, never()).evictMasterAvailabilityCaches(any());
+        }
+
+        @Test
+        @DisplayName("should_sendExactlyOneSms_when_threeServiceVisitCreated")
+        void should_sendExactlyOneSms_when_threeServiceVisitCreated() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            verify(smsService, org.mockito.Mockito.times(1)).send(eq(E164_PHONE), any(String.class));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Visit response (Phase 22.14) — reuses AppointmentService#enrich, never a second mapper
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Visit response")
+    class VisitResponse {
+
+        /**
+         * REUSE-FIRST, pinned: the create path must hand {@code enrich} the REAL persisted header and
+         * the REAL saved chain — not a re-derived or partial substitute — so the returned
+         * {@code AppointmentDetailResponse} reflects exactly what was committed. Mutation-check RED
+         * by handing {@code enrich} an empty or re-built list instead of {@code saved}.
+         */
+        @Test
+        @DisplayName("should_enrichWithTheHeaderAndTheSavedChain_when_visitCreated")
+        void should_enrichWithTheHeaderAndTheSavedChain_when_visitCreated() {
+            stubThreeServiceVisit();
+
+            create(threeServiceCommand());
+
+            List<Booking> saved = captureSavedBookings();
+            ArgumentCaptor<Appointment> appointmentCaptor = ArgumentCaptor.forClass(Appointment.class);
+            verify(appointmentService).enrich(appointmentCaptor.capture(), eq(saved));
+            assertThat(appointmentCaptor.getValue().getBookingSource()).isEqualTo(BookingSource.STAFF);
+        }
+
+        /**
+         * The service returns exactly what {@code enrich} produces — no post-processing, no field
+         * dropped or substituted on the way out.
+         */
+        @Test
+        @DisplayName("should_returnWhatEnrichReturns_when_visitCreated")
+        void should_returnWhatEnrichReturns_when_visitCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            AppointmentDetailResponse stub = stubAppointmentDetailResponse();
+            when(appointmentService.enrich(any(), any())).thenReturn(stub);
+
+            AppointmentDetailResponse response = create(command(guest(RAW_PHONE)));
+
+            assertThat(response).isSameAs(stub);
         }
     }
 
@@ -867,9 +1163,17 @@ class StaffBookingServiceTest {
         return commandAt(START, scope, client);
     }
 
+    /** Single-service command — the shape almost every existing case needs (N = 1). */
     private StaffBookingCommand commandAt(
             OffsetDateTime startsAt, StaffBookingScope scope, StaffClientRef client) {
-        return new StaffBookingCommand(scope, masterId, masterServiceId, startsAt, client);
+        return commandWithServices(List.of(masterServiceId), startsAt, scope, client);
+    }
+
+    /** Multi-service command — the N &gt; 1 visit shape (Phase 22.12). */
+    private StaffBookingCommand commandWithServices(
+            List<UUID> masterServiceIds, OffsetDateTime startsAt, StaffBookingScope scope,
+            StaffClientRef client) {
+        return new StaffBookingCommand(scope, masterId, masterServiceIds, startsAt, client);
     }
 
     /**
@@ -877,7 +1181,7 @@ class StaffBookingServiceTest {
      * field (security MEDIUM, 2026-08-18) — so no request-body mapping in Phase 22.4 can reach
      * {@code bookings.created_by_user_id}. Every call in this suite goes through here.
      */
-    private BookingResponse create(StaffBookingCommand cmd) {
+    private AppointmentDetailResponse create(StaffBookingCommand cmd) {
         return createAs(staffUserId, cmd);
     }
 
@@ -887,8 +1191,43 @@ class StaffBookingServiceTest {
      * legitimately have — the suite used to pass an unrelated {@code staffUserId} there, which is a
      * combination the service now refuses and the real world never produces.
      */
-    private BookingResponse createAs(UUID actorId, StaffBookingCommand cmd) {
+    private AppointmentDetailResponse createAs(UUID actorId, StaffBookingCommand cmd) {
         return service.createStaffBooking(cmd, actorId);
+    }
+
+    /**
+     * A placeholder {@link AppointmentDetailResponse} — the mocked {@link #appointmentService}'s
+     * {@code enrich(...)} return value. No test in this suite asserts on its content (see the
+     * {@code appointmentService} field javadoc), so every field bar {@code status} is an arbitrary
+     * valid value.
+     */
+    private static AppointmentDetailResponse stubAppointmentDetailResponse() {
+        java.time.ZonedDateTime start = START.atZoneSameInstant(com.beautica.common.TimeZones.KYIV);
+        return new AppointmentDetailResponse(
+                UUID.randomUUID(),                       // id
+                BookingStatus.CONFIRMED,                 // status
+                UUID.randomUUID(),                        // masterId
+                "Марія",                                  // masterFirstName
+                "Левченко",                                // masterLastName
+                null,                                      // masterProfessionalTitle
+                null,                                      // masterAvatarUrl
+                Role.SALON_MASTER,                         // masterType
+                null,                                       // salonName
+                start,                                       // startsAt
+                start.plusMinutes(BASE_DURATION),            // endsAt
+                BASE_DURATION,                                // totalDurationMinutes
+                BASE_PRICE,                                    // totalPrice
+                null,                                           // totalPriceMax
+                null,                                            // clientComment
+                java.time.OffsetDateTime.now(ZoneOffset.UTC),     // createdAt
+                List.of(),                                         // items
+                null,                                               // providerComment
+                null,                                               // clientCancellationNote
+                null,                                               // cityLabel
+                null,                                               // districtLabel
+                null,                                               // street
+                null,                                               // buildingNo
+                null);                                              // locationNote
     }
 
     private void stubHappyPath(Master master, MasterServiceAssignment msa) {
@@ -904,7 +1243,9 @@ class StaffBookingServiceTest {
     }
 
     /**
-     * Stubs the STAFF schedule-fit oracle. Note the method: {@code isStaffSlotAvailable}, NOT any
+     * Stubs the STAFF WHOLE-CHAIN schedule-fit oracle. Note the method:
+     * {@code isStaffVisitSlotAvailable}, NOT {@code isStaffSlotAvailable} (Phase 22.12 — the
+     * single-service guard has zero call sites in production now) and NOT any
      * {@code getAvailableSlots} overload — a staff create must consult the ZERO-lead oracle, and
      * stubbing a client-facing one here would leave the real call unstubbed (Mockito's {@code false}
      * default → 409), which is exactly how this test catches the service silently reverting to the
@@ -912,30 +1253,42 @@ class StaffBookingServiceTest {
      *
      * <p>The stub is start-SPECIFIC ({@code eq(startsAt)}): the gate asks about one instant, so a
      * service that asked about a different one — a mis-derived Kyiv civil date, say — would get the
-     * unstubbed {@code false} and 409 rather than passing on a wildcard.
+     * unstubbed {@code false} and 409 rather than passing on a wildcard. The id list and preloaded
+     * assignment list are wildcarded so this one stub serves both the single- and multi-service
+     * fixtures in this suite.
      */
     private void stubStaffSlotAvailable(OffsetDateTime startsAt) {
-        when(slotCalculationService.isStaffSlotAvailable(
-                eq(masterId), any(LocalDate.class), eq(masterServiceId),
-                nullable(MasterServiceAssignment.class), eq(startsAt)))
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                eq(masterId), any(LocalDate.class), any(), any(), eq(startsAt)))
                 .thenReturn(true);
     }
 
+    /**
+     * {@code saveAll} + implicit {@code flush} (Phase 22.12 — {@code BookingSlotLockGuard
+     * #saveOrConflict(repo, Booking)} now delegates to the list overload, so even a single-service
+     * fixture goes through {@code saveAll}, never {@code saveAndFlush}).
+     */
     private void stubLockFreeAndSave() {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
-        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(inv -> {
-            Booking booking = inv.getArgument(0);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> {
+            List<Booking> bookings = inv.getArgument(0);
             // @CreationTimestamp is a Hibernate flush-time hook, so an unpersisted entity has none —
             // BookingResponse.from reads it. Set it here rather than making the entity mutable.
-            ReflectionTestUtils.setField(booking, "createdAt", NOW);
-            return booking;
+            bookings.forEach(b -> ReflectionTestUtils.setField(b, "createdAt", NOW));
+            return bookings;
         });
     }
 
+    /** The FIRST saved booking — the shape almost every single-service assertion needs. */
     private Booking captureSaved() {
-        ArgumentCaptor<Booking> captor = ArgumentCaptor.forClass(Booking.class);
-        verify(bookingRepository).saveAndFlush(captor.capture());
+        return captureSavedBookings().get(0);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Booking> captureSavedBookings() {
+        ArgumentCaptor<List<Booking>> captor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(captor.capture());
         return captor.getValue();
     }
 
@@ -969,6 +1322,38 @@ class StaffBookingServiceTest {
 
     private MasterServiceAssignment assignment(BigDecimal priceOverride, Integer durationOverride) {
         return assignmentOf(salonMaster(), priceOverride, durationOverride);
+    }
+
+    /** A second/third leg fixture for {@link MultiServiceVisit} — same duration/price, own id. */
+    private MasterServiceAssignment assignmentWithId(UUID id) {
+        return MasterServiceAssignment.builder()
+                .id(id)
+                .master(salonMaster())
+                .serviceDefinition(serviceDefinition("Манікюр"))
+                .isActive(true)
+                .build();
+    }
+
+    /** The ordered 3-service command {@link MultiServiceVisit} chains. */
+    private StaffBookingCommand threeServiceCommand() {
+        return new StaffBookingCommand(new StaffBookingScope.InSalon(salonId), masterId,
+                List.of(masterServiceId, masterServiceId2, masterServiceId3), START, guest(RAW_PHONE));
+    }
+
+    private void stubMasterAndThreeAssignments() {
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster()));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
+                .thenReturn(Optional.of(assignmentWithId(masterServiceId)));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId2))
+                .thenReturn(Optional.of(assignmentWithId(masterServiceId2)));
+        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId3))
+                .thenReturn(Optional.of(assignmentWithId(masterServiceId3)));
+    }
+
+    private void stubThreeServiceVisit() {
+        stubMasterAndThreeAssignments();
+        stubStaffSlotAvailable(START);
+        stubLockFreeAndSave();
     }
 
     private MasterServiceAssignment assignmentOf(Master master, BigDecimal priceOverride, Integer durationOverride) {

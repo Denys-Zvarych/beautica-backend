@@ -100,14 +100,18 @@ class GuestBookingServiceTest {
     void should_createConfirmedGuestBooking_when_slotIsFree() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        ArgumentCaptor<Booking> savedCaptor = ArgumentCaptor.forClass(Booking.class);
-        when(bookingRepository.saveAndFlush(savedCaptor.capture())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
 
-        Booking saved = savedCaptor.getValue();
+        // Phase 22.12: BookingSlotLockGuard#saveOrConflict(repo, Booking) now delegates to the
+        // list overload (saveAll + flush) so the constraint-violation → 409 mapping cannot drift
+        // between the single-service and visit create paths — see that class's Javadoc.
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        Booking saved = savedCaptor.getValue().get(0);
         assertThat(saved.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(saved.getBookingSource()).isEqualTo(BookingSource.LINK);
         assertThat(saved.getGuestName()).isEqualTo("Олена");
@@ -150,7 +154,7 @@ class GuestBookingServiceTest {
     void should_evictAvailabilityCachesBeforeSendingTheConfirmation_when_bookingCreated() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
 
         service.createGuestBooking("Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
@@ -180,7 +184,7 @@ class GuestBookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
 
-        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(bookingRepository, never()).saveAll(any());
         verifyNoInteractions(smsService);
         // Lock timeout must still be set even when the slot turns out to be taken — it is
         // fused into the same statement as the lock acquisition attempt, which is the first
@@ -244,7 +248,7 @@ class GuestBookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
 
-        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(bookingRepository, never()).saveAll(any());
         verifyNoInteractions(smsService);
     }
 
@@ -268,7 +272,7 @@ class GuestBookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
 
-        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(bookingRepository, never()).saveAll(any());
         verifyNoInteractions(smsService);
     }
 
@@ -425,7 +429,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService(serviceId, "Манікюр {cancelUrl} {date}")));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
-        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
         stubSlotAvailable(startsAt);
 
         GuestBookingResponse response = service.createGuestBooking(

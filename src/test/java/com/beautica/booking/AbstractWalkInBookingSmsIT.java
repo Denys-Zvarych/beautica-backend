@@ -213,14 +213,25 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
      * {@code createdAt} differ by construction, so raw-body equality is not the property anyone
      * means). Both concrete classes call this on their 201.
      */
+    /**
+     * Phase 22.14 — the 201 body is {@code AppointmentDetailResponse}, the visit, not a single
+     * {@code BookingResponse}: {@code data.id} is the appointment header and the per-service name
+     * moved to {@code data.items[0].serviceName}.
+     */
     protected void assertConfirmedWalkInBody(ResponseEntity<String> resp) {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         JsonNode data = readJson(resp.getBody()).path("data");
         assertThat(data.path("status").asText()).isEqualTo("CONFIRMED");
-        assertThat(data.path("serviceName").asText()).isEqualTo(SERVICE_NAME);
+        assertThat(data.path("items")).hasSize(1);
+        assertThat(data.path("items").path(0).path("serviceName").asText()).isEqualTo(SERVICE_NAME);
         assertThat(data.path("id").asText())
-                .as("the created row's id comes back whatever the SMS gate did")
+                .as("the created visit's id comes back whatever the SMS gate did")
                 .isNotBlank();
+        assertThat(data.path("guestName").isMissingNode())
+                .as("D2 — the walk-in's own name/phone are deliberately absent from the create "
+                        + "response; the caller typed them seconds ago")
+                .isTrue();
+        assertThat(data.path("guestPhone").isMissingNode()).isTrue();
         assertThat(resp.getBody())
                 .as("no field ever tells the caller whether a message left the building")
                 .doesNotContain("smsSent")
@@ -280,12 +291,23 @@ abstract class AbstractWalkInBookingSmsIT extends AbstractStaffBookingIT {
 
     // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-    /** {@code POST /api/v1/masters/{masterId}/bookings} — the STAFF walk-in create. */
+    /** {@code POST /api/v1/masters/{masterId}/bookings} — the single-service STAFF walk-in create. */
     protected ResponseEntity<String> createWalkIn(OffsetDateTime startsAt) {
+        return createWalkIn(startsAt, List.of(salon.masterServiceId()));
+    }
+
+    /**
+     * Multi-service overload (Phase 22.13) — an N-service walk-in for the SMS-per-visit /
+     * budget-per-visit rows, which need a real chained visit rather than N single-service creates.
+     */
+    protected ResponseEntity<String> createWalkIn(OffsetDateTime startsAt, List<UUID> masterServiceIds) {
+        String idsJson = masterServiceIds.stream()
+                .map(id -> "\"" + id + "\"")
+                .collect(java.util.stream.Collectors.joining(","));
         String body = """
-                {"masterServiceId":"%s","startsAt":"%s",
+                {"masterServiceIds":[%s],"startsAt":"%s",
                  "guest":{"name":"%s","surname":"%s","phone":"%s"}}
-                """.formatted(salon.masterServiceId(), startsAt, GUEST_NAME, GUEST_SURNAME, RAW_PHONE);
+                """.formatted(idsJson, startsAt, GUEST_NAME, GUEST_SURNAME, RAW_PHONE);
         return restTemplate.exchange(
                 "/api/v1/masters/" + salon.masterId() + "/bookings", HttpMethod.POST,
                 new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);

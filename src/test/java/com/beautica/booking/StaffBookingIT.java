@@ -1,7 +1,7 @@
 package com.beautica.booking;
 
 import com.beautica.AbstractIntegrationTest;
-import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
 import com.beautica.booking.dto.StaffBookingScope;
 import com.beautica.booking.dto.StaffClientRef;
@@ -17,6 +17,9 @@ import com.beautica.master.dto.WeeklyScheduleRequest;
 import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.entity.ScheduleExceptionKind;
 import com.beautica.master.service.MasterScheduleService;
+import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.SessionFactory;
+import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -34,6 +37,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -101,6 +105,9 @@ class StaffBookingIT extends AbstractIntegrationTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private EntityManagerFactory emf;
+
     private Seed salon;
 
     @BeforeEach
@@ -120,10 +127,10 @@ class StaffBookingIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("persists a CONFIRMED STAFF row with the phone normalised and every V137 CHECK satisfied")
         void should_persistStaffBooking_when_startIsOnTheMastersSchedule() {
-            BookingResponse response = create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
+            AppointmentDetailResponse response = create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
 
             assertThat(response.status()).isEqualTo(BookingStatus.CONFIRMED);
-            Map<String, Object> row = bookingRow(response.id());
+            Map<String, Object> row = bookingRow(bookingIdOf(response));
             assertThat(row.get("booking_source")).isEqualTo("STAFF");
             assertThat(row.get("status")).isEqualTo("CONFIRMED");
             assertThat(row.get("created_by_user_id")).isEqualTo(salon.staffUserId());
@@ -136,18 +143,18 @@ class StaffBookingIT extends AbstractIntegrationTest {
             assertThat(row.get("client_id")).as("STAFF walk-in ⇒ client_id NULL (V137)").isNull();
             assertThat(row.get("cancel_token")).as("STAFF walk-in ⇒ cancel_token NULL (V137)").isNull();
             assertThat(row.get("appointment_id"))
-                    .as("single-service by design — no appointments row, so chk_appointment_source "
-                            + "is never reached")
-                    .isNull();
+                    .as("Phase 22.12 — N = 1 still creates an appointments header, no size "
+                            + "short-circuit; see VisitShapeBoundary for the header-row assertions")
+                    .isNotNull();
             assertThat(row.get("salon_id")).isEqualTo(salon.salonId());
         }
 
         @Test
         @DisplayName("freezes price and duration from the master's assignment")
         void should_freezePriceAndDuration_when_bookingPersisted() {
-            BookingResponse response = create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
+            AppointmentDetailResponse response = create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
 
-            Map<String, Object> row = bookingRow(response.id());
+            Map<String, Object> row = bookingRow(bookingIdOf(response));
             assertThat((BigDecimal) row.get("price_at_booking")).isEqualByComparingTo(PRICE);
             assertThat(row.get("duration_minutes_at_booking")).isEqualTo(DURATION_MINUTES);
             assertThat(row.get("price_max_at_booking")).as("FIXED price ⇒ no band ceiling").isNull();
@@ -159,10 +166,10 @@ class StaffBookingIT extends AbstractIntegrationTest {
             Seed independent = seedIndependentMaster();
             giveWorkingHours(independent, TODAY_ISO_DOW, TOMORROW_ISO_DOW);
 
-            BookingResponse response = create(independent, command(independent, kyiv(TODAY, 13, 0),
+            AppointmentDetailResponse response = create(independent, command(independent, kyiv(TODAY, 13, 0),
                             new StaffBookingScope.Self(independent.masterUserId())));
 
-            assertThat(bookingRow(response.id()).get("salon_id")).isNull();
+            assertThat(bookingRow(bookingIdOf(response)).get("salon_id")).isNull();
             assertThat(response.status()).isEqualTo(BookingStatus.CONFIRMED);
         }
     }
@@ -251,6 +258,99 @@ class StaffBookingIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
+    // Multi-service visit — whole-chain guard, end to end (Phase 22.12)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Multi-service visit")
+    class MultiServiceVisitCreate {
+
+        /**
+         * The case a per-item overlap check would wrongly accept: the visit's FIRST service
+         * (12:00-13:00) does not collide with anything, but the chain's second leg (13:00-14:00)
+         * lands exactly on an already-persisted booking. The whole-span
+         * {@code BookingSlotLockGuard#lockMasterAndAssertFree} check must reject the whole visit —
+         * and, critically, must reject it BEFORE any header or booking row is written (atomicity).
+         */
+        @Test
+        @DisplayName("rejects a chain that collides with an existing booking, though its first service alone would fit")
+        void should_reject409_when_chainCollidesWithExistingBooking_thoughFirstServiceWouldFit() {
+            UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId(), 1);
+            UUID service3 = insertService(salon.masterId(), "SALON", salon.salonId(), 2);
+            create(salon, command(salon, kyiv(TODAY, 13, 0), salon.salonId()));
+
+            assertThatThrownBy(() -> create(salon, visitCommand(salon,
+                    List.of(salon.masterServiceId(), service2, service3), kyiv(TODAY, 12, 0),
+                    new StaffBookingScope.InSalon(salon.salonId()))))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessage("Slot not available");
+
+            assertThat(bookingCount()).as("only the pre-existing booking, nothing from the failed visit").isEqualTo(1);
+            // The pre-existing single-service booking ALSO created its own header (D2: N = 1 still
+            // creates one) — so the count after the failed visit is 1, not 0. The failed visit itself
+            // must contribute no second header.
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM appointments", Integer.class))
+                    .as("only the pre-existing booking's own header — the failed visit adds none")
+                    .isEqualTo(1);
+        }
+
+        /**
+         * A per-item schedule-fit check would wrongly ACCEPT this: the first service (16:00-17:00)
+         * fits the working window exactly, but the chain's Σ duration runs the block to 19:00 — an
+         * hour past the master's 17:00 close. Only the whole-chain guard
+         * ({@code BookingSlotAvailabilityGuard#assertStaffVisitStartsOnAvailableSlot}) catches this.
+         */
+        @Test
+        @DisplayName("rejects a chain whose total duration overruns the working window, though its first service alone would fit")
+        void should_reject409_when_chainOverrunsWorkingWindow() {
+            UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId(), 1);
+            UUID service3 = insertService(salon.masterId(), "SALON", salon.salonId(), 2);
+
+            assertThatThrownBy(() -> create(salon, visitCommand(salon,
+                    List.of(salon.masterServiceId(), service2, service3), kyiv(TODAY, 16, 0),
+                    new StaffBookingScope.InSalon(salon.salonId()))))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessage("Slot not available");
+
+            assertThat(bookingCount()).isZero();
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM appointments", Integer.class)).isZero();
+        }
+
+        @Test
+        @DisplayName("rejects a visit start that does not land on the 30-minute slot grid")
+        void should_reject409_when_startIsOffGrid() {
+            UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId(), 1);
+
+            assertThatThrownBy(() -> create(salon, visitCommand(salon,
+                    List.of(salon.masterServiceId(), service2), kyiv(TODAY, 12, 5),
+                    new StaffBookingScope.InSalon(salon.salonId()))))
+                    .isInstanceOf(BusinessException.class)
+                    .hasMessage("Slot not available");
+
+            assertThat(bookingCount()).isZero();
+        }
+
+        /**
+         * The 0-lead STAFF floor, end to end, for a chained visit — not just a single-service
+         * booking. 09:00 Kyiv today IS the frozen "now" AND the first slot of the working day.
+         */
+        @Test
+        @DisplayName("accepts a multi-service visit starting exactly now")
+        void should_return201_when_startIsNow() {
+            UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId(), 1);
+            OffsetDateTime now = kyiv(TODAY, 9, 0);
+            assertThat(now.toInstant()).isEqualTo(NOW);
+
+            assertThatCode(() -> create(salon, visitCommand(salon,
+                    List.of(salon.masterServiceId(), service2), now,
+                    new StaffBookingScope.InSalon(salon.salonId()))))
+                    .doesNotThrowAnyException();
+
+            assertThat(bookingCount()).isEqualTo(2);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
     // Rejections
     // ════════════════════════════════════════════════════════════════════════════════
 
@@ -277,7 +377,21 @@ class StaffBookingIT extends AbstractIntegrationTest {
 
             assertThatThrownBy(() -> create(salon,
                     new StaffBookingCommand(new StaffBookingScope.InSalon(salon.salonId()),
-                            salon.masterId(), other.masterServiceId(), kyiv(TODAY, 12, 0), walkIn())))
+                            salon.masterId(), List.of(other.masterServiceId()), kyiv(TODAY, 12, 0), walkIn())))
+                    .isInstanceOf(NotFoundException.class);
+
+            assertThat(bookingCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("rejects a masterServiceId that belongs to a different master at position 2 of a multi-service visit")
+        void should_reject404_when_secondServiceBelongsToAnotherMaster() {
+            Seed other = seedIndependentMaster();
+
+            assertThatThrownBy(() -> create(salon,
+                    new StaffBookingCommand(new StaffBookingScope.InSalon(salon.salonId()),
+                            salon.masterId(), List.of(salon.masterServiceId(), other.masterServiceId()),
+                            kyiv(TODAY, 12, 0), walkIn())))
                     .isInstanceOf(NotFoundException.class);
 
             assertThat(bookingCount()).isZero();
@@ -458,46 +572,192 @@ class StaffBookingIT extends AbstractIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
-    // The single-service boundary
+    // The visit-shape boundary
     // ════════════════════════════════════════════════════════════════════════════════
 
     @Nested
-    @DisplayName("Single-service boundary")
-    class SingleServiceBoundary {
+    @DisplayName("Visit-shape boundary")
+    class VisitShapeBoundary {
 
         /**
-         * <b>Tripwire for the {@code appointments} source CHECK.</b> Phase 22.2 chose option (a) —
-         * staff bookings are single-service — precisely BECAUSE {@code chk_appointment_source} still
-         * admits only {@code 'APP','LINK'}: V137 widened the {@code bookings} constraint alone, so a
-         * multi-service staff visit would fail at the appointment insert. No migration was written
-         * for a capability nothing offers.
+         * Phase 22.2 chose option (a) — staff bookings are single-service — precisely BECAUSE
+         * {@code chk_appointment_source} admitted only {@code 'APP','LINK'} at the time: V137 widened
+         * the {@code bookings} constraint alone, so a multi-service staff visit would have failed at
+         * the appointment insert. Phase 22.8 (V139/V140) closed that gap, so the header CHECK now
+         * admits STAFF too. Phase 22.12 is where {@code StaffBookingService} finally exercises it:
+         * every visit — including a one-service one, D2's locked "no size short-circuit" decision —
+         * now persists exactly ONE {@code appointments} header, and every chained {@code bookings}
+         * row carries that header's id.
          *
-         * <p>This test pins that premise. It goes RED the day someone widens the constraint — which
-         * is the correct moment to come back here, lift the scalar {@code masterServiceId} on
-         * {@code StaffBookingCommand} and delete {@code StaffBookingService#onlyItem}. It is a
-         * deliberate "come back and finish the job" marker, not a claim that the constraint should
-         * never change.
+         * <p><b>Replaces {@code should_leaveAppointmentIdNull_when_staffBookingPersisted}</b>, which
+         * pinned the OBSOLETE pre-22.12 behaviour (no writer ever joined an appointment). That
+         * assertion is now false for every shape created after this phase; the legacy NULL shape
+         * lives on only in rows created before it, which Phase 22.15's dual-shape parity matrix
+         * covers separately — this test asserts the NEW shape only.
          */
         @Test
-        @DisplayName("chk_appointment_source still excludes STAFF, which is why this track is single-service")
-        void should_stillExcludeStaffFromAppointmentSource_when_readingTheLiveConstraint() {
-            String definition = jdbc.queryForObject(
-                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'chk_appointment_source'",
-                    String.class);
+        @DisplayName("links every chained booking to exactly one appointments header (Phase 22.12)")
+        void should_linkEveryBookingToOneHeader_when_staffVisitPersisted() {
+            UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId(), 1);
+            UUID service3 = insertService(salon.masterId(), "SALON", salon.salonId(), 2);
 
-            assertThat(definition).contains("'APP'").contains("'LINK'");
-            assertThat(definition)
-                    .as("if this now admits STAFF, revisit StaffBookingCommand's scalar masterServiceId")
-                    .doesNotContain("STAFF");
+            AppointmentDetailResponse response = create(salon, visitCommand(salon,
+                    List.of(salon.masterServiceId(), service2, service3), kyiv(TODAY, 9, 0),
+                    new StaffBookingScope.InSalon(salon.salonId())));
+
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM appointments", Integer.class))
+                    .as("exactly one header for the whole visit")
+                    .isEqualTo(1);
+            UUID appointmentId = (UUID) bookingRow(bookingIdOf(response)).get("appointment_id");
+            assertThat(appointmentId).isNotNull();
+            assertThat(response.id())
+                    .as("Phase 22.14 — the 201 body IS the visit: its own id equals the header every "
+                            + "chained booking links to, read straight off the response with no DB "
+                            + "round trip")
+                    .isEqualTo(appointmentId);
+            assertThat(response.items())
+                    .as("one item per chained service")
+                    .hasSize(3);
+
+            List<UUID> childAppointmentIds = jdbc.queryForList(
+                    "SELECT appointment_id FROM bookings WHERE master_id = ? ORDER BY starts_at",
+                    UUID.class, salon.masterId());
+            assertThat(childAppointmentIds)
+                    .as("every chained row links to the SAME header, none NULL")
+                    .hasSize(3)
+                    .containsOnly(appointmentId);
+
+            Map<String, Object> header = appointmentRow(appointmentId);
+            assertThat(header.get("booking_source")).isEqualTo("STAFF");
+            assertThat(header.get("status")).isEqualTo("CONFIRMED");
+            assertThat(header.get("cancel_token")).as("no guest self-cancel link for a staff visit").isNull();
+            assertThat(header.get("created_by_user_id")).isEqualTo(salon.staffUserId());
         }
 
         @Test
-        @DisplayName("a staff booking never joins an appointment, so the constraint above is never reached")
-        void should_leaveAppointmentIdNull_when_staffBookingPersisted() {
-            BookingResponse response = create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
+        @DisplayName("persists a 1-header + 5-booking visit, all CONFIRMED/STAFF, cancel_token NULL throughout")
+        void should_persistHeaderAndChain_when_fiveServiceWalkIn() {
+            List<UUID> serviceIds = new ArrayList<>();
+            serviceIds.add(salon.masterServiceId());
+            for (int i = 1; i <= 4; i++) {
+                serviceIds.add(insertService(salon.masterId(), "SALON", salon.salonId(), i));
+            }
 
-            assertThat(bookingRow(response.id()).get("appointment_id")).isNull();
-            assertThat(jdbc.queryForObject("SELECT count(*) FROM appointments", Integer.class)).isZero();
+            AppointmentDetailResponse response = create(salon, visitCommand(salon, serviceIds, kyiv(TODAY, 9, 0),
+                    new StaffBookingScope.InSalon(salon.salonId())));
+
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM appointments", Integer.class)).isEqualTo(1);
+            assertThat(bookingCount()).isEqualTo(5);
+            UUID appointmentId = (UUID) bookingRow(bookingIdOf(response)).get("appointment_id");
+            assertThat(response.id()).isEqualTo(appointmentId);
+            assertThat(response.items()).hasSize(5);
+            List<Map<String, Object>> rows = jdbc.queryForList(
+                    "SELECT * FROM bookings WHERE master_id = ? ORDER BY starts_at", salon.masterId());
+            assertThat(rows).hasSize(5).allSatisfy(row -> {
+                assertThat(row.get("appointment_id")).isEqualTo(appointmentId);
+                assertThat(row.get("booking_source")).isEqualTo("STAFF");
+                assertThat(row.get("status")).isEqualTo("CONFIRMED");
+                assertThat(row.get("cancel_token")).isNull();
+            });
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Statement count (Anti-Bug §F3 audit finding 3, 2026-08-20) — pins createStaffBooking's SQL
+    // cost so the N-1 wasted platformServiceName lazy loads (audit finding 1) cannot silently
+    // regress unnoticed, mirroring BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ALIGNED and
+    // AppointmentReadIT#VISIT_DETAIL_STATEMENTS.
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Statement count")
+    class StatementCount {
+
+        /**
+         * Fixed per-visit cost — everything {@code createStaffBooking} issues that does NOT scale
+         * with the number of chained services: the master read, the SMS-budget count, the whole-chain
+         * schedule-fit query, the advisory lock + overlap check, the header insert, the batched
+         * booking insert(s) (one JDBC round trip regardless of N, {@code hibernate.jdbc.batch_size:
+         * 50}), the single first-item {@code service_types} lazy load Finding-1 left in place, and
+         * {@code AppointmentService#enrich}'s reads. Measured against an isolated, freshly-seeded
+         * master per N (own salon, own working-hours row, distinct guest phone) so no fixture reuse
+         * across N could shift the count via warm caches or an already-loaded row.
+         */
+        private static final long CREATE_FIXED_STATEMENTS = 11L;
+
+        /**
+         * Per-CHAINED-ITEM cost, AFTER the Finding-1 fix: exactly ONE extra statement per additional
+         * {@code masterServiceIds} entry — {@code VisitPlanner#planChainedItems}'
+         * {@code findByMasterIdAndIdWithGraph} lookup (pre-existing, shared with the APP/LINK visit
+         * paths, out of scope — see the class-level "Do NOT touch VisitPlanner" note). BEFORE the
+         * Finding-1 fix this was 3 per item (the planner lookup PLUS the discarded
+         * {@code platformServiceName} lazy load for every item, min-cardinality proxy fetches
+         * included) — see {@code should_notRegressToTheN-1WastedLazyLoadShape} below for the
+         * falsification of this exact number.
+         */
+        private static final long CREATE_PER_ITEM_STATEMENTS = 1L;
+
+        @Test
+        @DisplayName("N=1: fixed cost only, no chained-item statements")
+        void should_issueFixedStatementCount_when_creatingASingleServiceVisit() {
+            Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+            statistics.setStatisticsEnabled(true);
+            Seed fresh = seedStatementCountMaster();
+
+            statistics.clear();
+            create(fresh, singleServiceStatementCountCommand(fresh, 1));
+            long statements = statistics.getPrepareStatementCount();
+
+            assertThat(statements)
+                    .as("N=1 must cost exactly the fixed baseline — a rise here means a new "
+                            + "per-visit (not per-item) query was added to the create path")
+                    .isEqualTo(CREATE_FIXED_STATEMENTS + CREATE_PER_ITEM_STATEMENTS);
+        }
+
+        @Test
+        @DisplayName("N=10: fixed cost plus exactly one statement per chained item")
+        void should_issueFixedPlusLinearPerItemStatementCount_when_creatingATenServiceVisit() {
+            Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+            statistics.setStatisticsEnabled(true);
+            Seed fresh = seedStatementCountMaster();
+            List<UUID> serviceIds = new ArrayList<>();
+            serviceIds.add(fresh.masterServiceId());
+            for (int i = 1; i < 10; i++) {
+                serviceIds.add(insertService(fresh.masterId(), "SALON", fresh.salonId(), i));
+            }
+
+            statistics.clear();
+            create(fresh, new StaffBookingCommand(new StaffBookingScope.InSalon(fresh.salonId()),
+                    fresh.masterId(), serviceIds, kyiv(TODAY, 9, 0), statementCountWalkIn(10)));
+            long statements = statistics.getPrepareStatementCount();
+
+            assertThat(statements)
+                    .as("N=10 must land at fixed + 10×per-item. Before the Finding-1 fix this was "
+                            + "30 (10 + 2×10) — the N-1 wasted service_types lazy loads; the "
+                            + "falsification test below proves the guard actually catches that "
+                            + "regression.")
+                    .isEqualTo(CREATE_FIXED_STATEMENTS + 10 * CREATE_PER_ITEM_STATEMENTS);
+        }
+
+        /** Isolated per-test master: own salon, own weekly schedule wide enough for a 10×60min chain. */
+        private Seed seedStatementCountMaster() {
+            Seed fresh = seedSalonMaster();
+            masterScheduleService.upsertWeeklySchedule(fresh.masterUserId(), fresh.masterId(), null,
+                    new WeeklyScheduleRequest(TODAY, null, List.of(new WeeklyScheduleDayRequest(
+                            TODAY_ISO_DOW,
+                            List.of(new WorkIntervalDto(LocalTime.of(0, 0), LocalTime.of(23, 59)))))));
+            return fresh;
+        }
+
+        private StaffBookingCommand singleServiceStatementCountCommand(Seed seed, int phoneSuffix) {
+            return new StaffBookingCommand(new StaffBookingScope.InSalon(seed.salonId()), seed.masterId(),
+                    List.of(seed.masterServiceId()), kyiv(TODAY, 9, 0), statementCountWalkIn(phoneSuffix));
+        }
+
+        /** A distinct guest phone per call — the isolated master alone does not de-dupe the
+         * per-phone SMS-budget count, which is keyed by phone across the whole suite's DB rows. */
+        private StaffClientRef.Guest statementCountWalkIn(int suffix) {
+            return new StaffClientRef.Guest("Олена", "Коваль", String.format("+38050912%04d", suffix));
         }
     }
 
@@ -519,12 +779,37 @@ class StaffBookingIT extends AbstractIntegrationTest {
         @Test
         @DisplayName("a staff create never touches a sibling booking for the same master")
         void should_leaveSiblingBookingUntouched_when_creatingAnotherStaffBooking() {
-            BookingResponse sibling = create(salon, command(salon, kyiv(TODAY, 9, 0), salon.salonId()));
-            Map<String, Object> siblingBefore = bookingRow(sibling.id());
+            AppointmentDetailResponse sibling = create(salon, command(salon, kyiv(TODAY, 9, 0), salon.salonId()));
+            Map<String, Object> siblingBefore = bookingRow(bookingIdOf(sibling));
 
             create(salon, command(salon, kyiv(TODAY, 12, 0), salon.salonId()));
 
-            assertThat(bookingRow(sibling.id())).isEqualTo(siblingBefore);
+            assertThat(bookingRow(bookingIdOf(sibling))).isEqualTo(siblingBefore);
+        }
+
+        /**
+         * Phase 22.12's widened counterpart: a header now exists, so "touches no sibling" must be
+         * proved at BOTH grains — no sibling VISIT's child booking rows change, AND no sibling
+         * VISIT's {@code appointments} header row changes. Same full-row-snapshot idiom as
+         * {@link #should_leaveSiblingBookingUntouched_when_creatingAnotherStaffBooking}, extended
+         * rather than reinvented.
+         */
+        @Test
+        @DisplayName("a staff visit create never touches a sibling visit's bookings or header for the same master")
+        void should_leaveSiblingVisitUntouched_when_creatingAnotherStaffVisit() {
+            UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId(), 1);
+            AppointmentDetailResponse siblingFirst = create(salon, visitCommand(salon,
+                    List.of(salon.masterServiceId(), service2), kyiv(TODAY, 9, 0),
+                    new StaffBookingScope.InSalon(salon.salonId())));
+            Map<String, Object> siblingBookingBefore = bookingRow(bookingIdOf(siblingFirst));
+            UUID siblingAppointmentId = (UUID) siblingBookingBefore.get("appointment_id");
+            Map<String, Object> siblingHeaderBefore = appointmentRow(siblingAppointmentId);
+
+            create(salon, visitCommand(salon, List.of(salon.masterServiceId(), service2),
+                    kyiv(TODAY, 13, 0), new StaffBookingScope.InSalon(salon.salonId())));
+
+            assertThat(bookingRow(bookingIdOf(siblingFirst))).isEqualTo(siblingBookingBefore);
+            assertThat(appointmentRow(siblingAppointmentId)).isEqualTo(siblingHeaderBefore);
         }
     }
 
@@ -581,25 +866,46 @@ class StaffBookingIT extends AbstractIntegrationTest {
     }
 
     private UUID insertService(UUID masterId, String ownerType, UUID ownerId) {
+        return insertService(masterId, ownerType, ownerId, resolveServiceTypeId(0));
+    }
+
+    /**
+     * Additive overload (Phase 22.12) for a visit-create fixture that needs SEVERAL services on the
+     * SAME owner: {@code ux_service_def_owner_service_type_active} is a partial-unique index over
+     * {@code (owner_type, owner_id, service_type_id)}, so two calls sharing an owner MUST resolve
+     * distinct {@code service_type_id}s — {@code index} selects the Nth one, deterministically
+     * ordered exactly like the single-service {@link #insertService(UUID, String, UUID)} overload's
+     * OFFSET-0 pick, so existing single-service Seeds are unaffected.
+     */
+    private UUID insertService(UUID masterId, String ownerType, UUID ownerId, int index) {
+        return insertService(masterId, ownerType, ownerId, resolveServiceTypeId(index));
+    }
+
+    private UUID insertService(UUID masterId, String ownerType, UUID ownerId, UUID serviceTypeId) {
         UUID serviceDefId = UUID.randomUUID();
         jdbc.update("INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, "
                         + "updated_at) VALUES (?, ?, ?, 'Манікюр', ?, ?, ?, 0, true, NOW(), NOW())",
-                serviceDefId, ownerType, ownerId, resolveServiceTypeId(), DURATION_MINUTES, PRICE);
+                serviceDefId, ownerType, ownerId, serviceTypeId, DURATION_MINUTES, PRICE);
         UUID masterServiceId = UUID.randomUUID();
         jdbc.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, "
                 + "updated_at) VALUES (?, ?, ?, true, NOW(), NOW())", masterServiceId, masterId, serviceDefId);
         return masterServiceId;
     }
 
-    /** V111 made {@code service_definitions.service_type_id} NOT NULL — resolve a real, selectable one. */
-    private UUID resolveServiceTypeId() {
+    /**
+     * V111 made {@code service_definitions.service_type_id} NOT NULL — resolve a real, selectable
+     * one. {@code index} (0-based, via {@code OFFSET}) picks the Nth in a stable order, so repeated
+     * calls for the SAME owner return DISTINCT ids — required by
+     * {@code ux_service_def_owner_service_type_active} (see {@link #insertService(UUID, String, UUID, int)}).
+     */
+    private UUID resolveServiceTypeId(int index) {
         return jdbc.queryForObject(
                 "SELECT st.id FROM service_types st "
                         + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
                         + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
-                        + "ORDER BY st.name_uk LIMIT 1",
-                UUID.class);
+                        + "ORDER BY st.name_uk LIMIT 1 OFFSET ?",
+                UUID.class, index);
     }
 
     /** 09:00–17:00 on the given ISO weekdays, valid from the frozen "today" onwards. */
@@ -623,15 +929,21 @@ class StaffBookingIT extends AbstractIntegrationTest {
     }
 
     private StaffBookingCommand command(Seed seed, OffsetDateTime startsAt, StaffBookingScope scope) {
-        return new StaffBookingCommand(scope, seed.masterId(), seed.masterServiceId(),
+        return new StaffBookingCommand(scope, seed.masterId(), List.of(seed.masterServiceId()),
                 startsAt, walkIn());
+    }
+
+    /** Multi-service visit command (Phase 22.12) — the ordered {@code masterServiceIds} chain. */
+    private StaffBookingCommand visitCommand(
+            Seed seed, List<UUID> masterServiceIds, OffsetDateTime startsAt, StaffBookingScope scope) {
+        return new StaffBookingCommand(scope, seed.masterId(), masterServiceIds, startsAt, walkIn());
     }
 
     /**
      * The acting staff user is an explicit ARGUMENT, never a command field — so Phase 22.4's
      * {@code request.toCommand()} mapping cannot reach {@code bookings.created_by_user_id}.
      */
-    private BookingResponse create(Seed seed, StaffBookingCommand cmd) {
+    private AppointmentDetailResponse create(Seed seed, StaffBookingCommand cmd) {
         return createAs(seed.staffUserId(), cmd);
     }
 
@@ -641,8 +953,18 @@ class StaffBookingIT extends AbstractIntegrationTest {
      * {@code create(Seed, …)} can never produce for an independent master, whose seed makes
      * {@code staffUserId} and {@code masterUserId} the same id.
      */
-    private BookingResponse createAs(UUID actorId, StaffBookingCommand cmd) {
+    private AppointmentDetailResponse createAs(UUID actorId, StaffBookingCommand cmd) {
         return staffBookingService.createStaffBooking(cmd, actorId);
+    }
+
+    /**
+     * The FIRST chained booking's id — {@code response.id()} is now the VISIT (appointment) id
+     * (Phase 22.14), so every fixture here that needs a single BOOKING row's id (to look it up, to
+     * complete it, to prove sibling isolation) must read it off {@code items[0]} instead. Every
+     * fixture in this suite creates a single-service command, so item 0 is the only booking.
+     */
+    private static UUID bookingIdOf(AppointmentDetailResponse response) {
+        return response.items().get(0).bookingId();
     }
 
     private static StaffClientRef.Guest walkIn() {
@@ -655,6 +977,10 @@ class StaffBookingIT extends AbstractIntegrationTest {
 
     private Map<String, Object> bookingRow(UUID bookingId) {
         return jdbc.queryForMap("SELECT * FROM bookings WHERE id = ?", bookingId);
+    }
+
+    private Map<String, Object> appointmentRow(UUID appointmentId) {
+        return jdbc.queryForMap("SELECT * FROM appointments WHERE id = ?", appointmentId);
     }
 
     private int bookingCount() {

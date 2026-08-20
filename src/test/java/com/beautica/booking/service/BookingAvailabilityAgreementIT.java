@@ -1193,6 +1193,104 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                 .isEqualTo(inList);
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 20 — the STAFF chained-visit existence check answers exactly what the STAFF chained
+    // slot list would (Phase 22.10 — the whole-chain counterpart of case 19)
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>Chained boolean-vs-list equivalence pin.</b> {@link SlotCalculationService#isStaffVisitSlotAvailable}
+     * must agree, position for position, with a scan of {@link SlotCalculationService#getStaffAvailableSlots(
+     * UUID, LocalDate, List, List)} for the SAME ordered {@code masterServiceIds}, exactly as case 19 pins the
+     * single-service pair. Two services (30-min + 45-min, no buffer) chain to a 75-minute Σ-duration block on a
+     * 09:00–18:00 interval day.
+     *
+     * <p><b>Also proves the whole-chain semantics are real, not just that the two staff methods agree with
+     * each other (D2.1).</b> On a narrow 13:00–14:00 interval, 13:30 fits {@code svcA} (30 min) ALONE with
+     * 30 minutes to spare — a per-item check on the first service would wrongly accept it — but the CHAIN'S
+     * 75 minutes overruns the 60-minute interval, so both the chained boolean and the chained list must
+     * refuse 13:30. The mechanism guard below asserts the per-item single-service check genuinely WOULD
+     * accept it, so the refusal is provably coming from the whole-chain oracle, not from the fixture
+     * happening to reject everything.
+     */
+    @Test
+    @DisplayName("case 20 — isStaffVisitSlotAvailable ⇔ getStaffAvailableSlots(list) membership on the "
+            + "chained Σ-duration block, including a start that fits the FIRST service but not the whole chain")
+    void should_agreeWithTheStaffChainedSlotList_when_answeringTheVisitExistenceCheck() {
+        // A day far enough out that the 17:20 frozen "now" cutoff never enters into it — this case
+        // isolates the WINDOW-FIT rule (D2.1), not the lead-time floor (that is case 19's job).
+        LocalDate wideDay = TODAY.plusDays(30);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 30, 0);
+        UUID svcB = addService(m, 45, 0);
+        List<UUID> chain = List.of(svcA, svcB);
+        seedInterval(m.masterId(), wideDay, wideDay, wideDay.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(18, 0));
+
+        assertThat(staffVisitSlotStarts(m.masterId(), wideDay, chain))
+                .as("the last 75-min-block start of the day is 16:30 (16:30+75=17:45); the next grid "
+                        + "position, 17:00, would end 18:15 > 18:00 and is refused")
+                .contains(LocalTime.of(16, 30));
+
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(16, 30));  // offered
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(17, 0));   // grid, chain overruns
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(16, 45));  // off the 30-min grid
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(8, 30));   // outside the interval
+
+        // The D2.1 case: 13:30 fits svcA (30 min) alone with room to spare, but the CHAIN'S 75 minutes
+        // does not fit a 13:00–14:00 interval. A per-item check on svcA would wrongly accept it.
+        LocalDate narrowDay = TODAY.plusDays(11);
+        seedInterval(m.masterId(), narrowDay, narrowDay, narrowDay.getDayOfWeek().getValue(),
+                LocalTime.of(13, 0), LocalTime.of(14, 0));
+        assertThat(staffVisitSlotStarts(m.masterId(), narrowDay, chain))
+                .as("no 75-min chain start fits a 60-min interval")
+                .isEmpty();
+        assertThat(slotCalculationService.isStaffSlotAvailable(m.masterId(), narrowDay, svcA, null,
+                narrowDay.atTime(13, 30).atZone(TimeZones.KYIV).toOffsetDateTime()))
+                .as("mechanism guard — the per-item single-service check WOULD wrongly accept 13:30 "
+                        + "(svcA alone fits); this is exactly why the guard must never fall back to it")
+                .isTrue();
+        assertStaffVisitAgreement(m.masterId(), narrowDay, chain, LocalTime.of(13, 30));
+
+        // EXPLICIT_TIMES day — the other arm of the isExplicitTimes switch both methods branch on.
+        LocalDate declaredDay = TODAY.plusDays(12);
+        seedExplicitTimesDay(m, declaredDay, LocalTime.of(13, 0), LocalTime.of(15, 0), LocalTime.of(16, 30));
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(13, 0));  // declared, fits
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(15, 0));  // declared, fits
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(16, 30)); // declared, fits (ends 17:45, same day)
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(14, 0));  // never declared
+    }
+
+    /** The STAFF (zero-lead) chained-visit slot-list start wall-clocks for a single date. */
+    private List<LocalTime> staffVisitSlotStarts(UUID masterId, LocalDate date, List<UUID> masterServiceIds) {
+        return slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceIds, null)
+                .stream()
+                .map(s -> s.startsAt().toLocalTime())
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * The invariant Phase 22.10 must preserve: the boolean the STAFF create-path chain gate asks equals
+     * the membership test over the materialised STAFF chained slot list — for this exact start, on this
+     * exact date, through the same real pipeline.
+     */
+    private void assertStaffVisitAgreement(UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+                                           LocalTime start) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+
+        boolean inList = slotCalculationService
+                .getStaffAvailableSlots(masterId, date, masterServiceIds, null).stream()
+                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
+        boolean existenceCheck = slotCalculationService
+                .isStaffVisitSlotAvailable(masterId, date, masterServiceIds, null, startsAt);
+
+        assertThat(existenceCheck)
+                .as("isStaffVisitSlotAvailable must equal list membership at %s on %s", start, date)
+                .isEqualTo(inList);
+    }
+
     private long cachedSlotEntryCount(UUID masterId) {
         var caffeine = (com.github.benmanes.caffeine.cache.Cache<?, ?>) slotCache().getNativeCache();
         return caffeine.asMap().keySet().stream()

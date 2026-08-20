@@ -3,6 +3,7 @@ package com.beautica.booking;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
+import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
+import java.math.BigDecimal;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.util.Map;
@@ -499,7 +501,7 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
         @DisplayName("a missing walk-in surname → 400 before any authorization-independent work")
         void should_reject400_when_surnameIsMissing() {
             String malformed = """
-                    {"masterServiceId":"%s","startsAt":"%s",
+                    {"masterServiceIds":["%s"],"startsAt":"%s",
                      "guest":{"name":"Марія","phone":"%s"}}
                     """.formatted(salon.masterServiceId(), tomorrowAtNoon(), RAW_PHONE);
 
@@ -510,6 +512,120 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
             assertThat(bookingCount()).isZero();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // The 201 body (Phase 22.14) — AppointmentDetailResponse, persisted AND returned
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("Visit body")
+    class VisitBody {
+
+        @Test
+        @DisplayName("owner books a salon master → the 201 body is the persisted visit")
+        void should_persistAndReturnVisit_when_ownerBooksSalonMaster() throws Exception {
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+            assertThat(data.path("items")).hasSize(1);
+            UUID appointmentId = UUID.fromString(data.path("id").asText());
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT count(*) FROM appointments WHERE id = ?", Integer.class, appointmentId))
+                    .as("the id the response carries is a REAL, persisted header")
+                    .isEqualTo(1);
+            UUID bookingId = UUID.fromString(data.path("items").get(0).path("bookingId").asText());
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT appointment_id FROM bookings WHERE id = ?", UUID.class, bookingId))
+                    .isEqualTo(appointmentId);
+        }
+
+        @Test
+        @DisplayName("independent master books themselves → the 201 body is the persisted visit")
+        void should_persistAndReturnVisit_when_independentMasterBooksSelf() throws Exception {
+            Independent solo = seedIndependentMaster();
+
+            ResponseEntity<String> resp =
+                    create(solo.masterId(), solo.masterServiceId(), tokenFor(solo.email()), tomorrowAtNoon());
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+            assertThat(data.path("items")).hasSize(1);
+            assertThat(data.path("salonName").isNull())
+                    .as("an independent master's visit carries no salon")
+                    .isTrue();
+        }
+
+        /**
+         * The admin-of-another-salon 403 is already pinned at the STATUS/body-uniformity level by
+         * {@code Denied#should_reject403_when_adminOfAnotherSalonBooksThisMaster} — not repeated here
+         * verbatim; this suite's own contribution is the VISIT-shaped 201 body above, which is what
+         * actually changed in this phase.
+         */
+
+        @Test
+        @DisplayName("no service was a range → totalPriceMax is null")
+        void should_returnTotalPriceMaxNull_when_noServiceWasARange() throws Exception {
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
+
+            JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+            assertThat(data.path("totalPriceMax").isNull())
+                    .as("a single-price visit renders totalPrice alone")
+                    .isTrue();
+            assertThat(new BigDecimal(data.path("totalPrice").asText())).isEqualByComparingTo(PRICE);
+        }
+
+        /**
+         * The visit-total range rule (already proved for {@code AppointmentService} — BE-3) inherited
+         * for FREE by the staff path via {@code enrich(...)} reuse, and must not be re-derived here:
+         * one FIXED-price service (350.00) plus one RANGE service (200.00-400.00) sums to
+         * {@code totalPrice = 550.00} and {@code totalPriceMax = 350.00 + 400.00 = 750.00} — the FIXED
+         * item's own price contributes to the ceiling exactly as it does to the floor.
+         */
+        @Test
+        @DisplayName("any service was a range → totalPriceMax is the summed ceiling")
+        void should_returnSummedTotalPriceMax_when_anyServiceWasARange() throws Exception {
+            UUID rangeService = insertRangeService(salon.masterId(), "SALON", salon.salonId(),
+                    new BigDecimal("200.00"), new BigDecimal("400.00"));
+            String body = """
+                    {"masterServiceIds":["%s","%s"],"startsAt":"%s",
+                     "guest":{"name":"Марія","surname":"Левченко","phone":"%s"}}
+                    """.formatted(salon.masterServiceId(), rangeService, tomorrowAtNoon(), RAW_PHONE);
+
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    url(salon.masterId()), org.springframework.http.HttpMethod.POST,
+                    new HttpEntity<>(body, bearerHeaders(tokenFor(salon.ownerEmail()))), String.class);
+
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+            JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+            assertThat(new BigDecimal(data.path("totalPrice").asText()))
+                    .isEqualByComparingTo(new BigDecimal("550.00"));
+            assertThat(data.path("totalPriceMax").isNull()).isFalse();
+            assertThat(new BigDecimal(data.path("totalPriceMax").asText()))
+                    .isEqualByComparingTo(new BigDecimal("750.00"));
+        }
+
+        /**
+         * A RANGE-priced service, additive to {@link AbstractStaffBookingIT#insertService}: same
+         * shape, plus {@code price_type = 'RANGE'} and a {@code price_max} ceiling.
+         */
+        private UUID insertRangeService(
+                UUID masterId, String ownerType, UUID ownerId, BigDecimal basePrice, BigDecimal priceMax) {
+            UUID serviceDefId = UUID.randomUUID();
+            UUID serviceTypeId = resolveUnusedServiceTypeId(ownerType, ownerId);
+            jdbcTemplate.update(
+                    "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                            + "base_duration_minutes, base_price, price_type, price_max, "
+                            + "buffer_minutes_after, is_active, created_at, updated_at) "
+                            + "VALUES (?, ?, ?, 'Педикюр', ?, ?, ?, 'RANGE', ?, 0, true, NOW(), NOW())",
+                    serviceDefId, ownerType, ownerId, serviceTypeId, DURATION_MINUTES, basePrice, priceMax);
+            UUID masterServiceId = UUID.randomUUID();
+            jdbcTemplate.update("INSERT INTO master_services (id, master_id, service_def_id, is_active, "
+                            + "created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
+                    masterServiceId, masterId, serviceDefId);
+            return masterServiceId;
         }
     }
 
@@ -537,14 +653,14 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
 
     private String body(OffsetDateTime startsAt, UUID masterServiceId) {
         return """
-                {"masterServiceId":"%s","startsAt":"%s",
+                {"masterServiceIds":["%s"],"startsAt":"%s",
                  "guest":{"name":"Марія","surname":"Левченко","phone":"%s"}}
                 """.formatted(masterServiceId, startsAt, RAW_PHONE);
     }
 
     private String bodyWithPhone(OffsetDateTime startsAt, String phone) {
         return """
-                {"masterServiceId":"%s","startsAt":"%s",
+                {"masterServiceIds":["%s"],"startsAt":"%s",
                  "guest":{"name":"Марія","surname":"Левченко","phone":"%s"}}
                 """.formatted(salon.masterServiceId(), startsAt, phone);
     }

@@ -195,4 +195,177 @@ class BookingSlotAvailabilityGuardTest {
                 .isEqualTo(KYIV_DAY)
                 .isNotEqualTo(SENT_OFFSET_DAY);
     }
+
+    // ── STAFF whole-chain visit guard (Phase 22.10) ──────────────────────────────
+
+    /** "Now" for the STAFF 0-minute-floor tests — an ordinary Kyiv instant, no offset trickery. */
+    /** Same Kyiv civil date as {@link #KYIV_DAY}, so it can share stubs keyed on that date. */
+    private static final OffsetDateTime NOW_KYIV = OffsetDateTime.parse("2026-08-18T11:00:00+03:00");
+
+    private final UUID secondMasterServiceId = UUID.randomUUID();
+
+    @Test
+    @DisplayName("staff visit — accepted when the chain starts on a slot and the whole block fits the "
+            + "working window")
+    void should_pass_when_staffVisitStartsOnGridAndChainFitsWorkingWindow() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, KYIV_DAY, serviceIds, preloadedChain, NOW_KYIV))
+                .thenReturn(true);
+
+        assertThatCode(() -> BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain, NOW_KYIV))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("staff visit — 409 when the chain's first start is off the slot grid")
+    void should_throw409_when_staffVisitFirstStartOffGrid() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, KYIV_DAY, serviceIds, preloadedChain, NOW_KYIV))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain, NOW_KYIV))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Slot not available")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    /**
+     * D2's fatal case, pinned at the guard boundary: item 0 fits ALONE, but the ORACLE the guard must
+     * call — {@code isStaffVisitSlotAvailable}, which judges the whole Σ-duration block — says the chain
+     * does not fit. A guard mutated to ask a per-item check on item 0 instead (e.g.
+     * {@code isStaffSlotAvailable(..., masterServiceId, ...)}) would find the item-0 stub answering
+     * {@code true} and wrongly accept — the exact defect D2 exists to rule out.
+     *
+     * <p><b>Mutation-check RED</b>: swap the guard's call for a single-service
+     * {@code isStaffSlotAvailable} check on item 0 and this test goes RED (see the falsification note in
+     * the phase report).
+     */
+    @Test
+    @DisplayName("staff visit — 409 when the chain overruns the working window, though the first "
+            + "service fits alone (the whole-chain case N per-item checks would wrongly accept)")
+    void should_throw409_when_chainOverrunsWorkingWindow_thoughFirstServiceFitsAlone() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        // Item 0 fits alone — a per-item check on it would wrongly pass.
+        lenient().when(slotCalculationService.isStaffSlotAvailable(
+                        eq(masterId), eq(KYIV_DAY), eq(masterServiceId), eq(preloaded), eq(NOW_KYIV)))
+                .thenReturn(true);
+        // The whole Σ-duration chain does not fit — the correct oracle for a chained visit.
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, KYIV_DAY, serviceIds, preloadedChain, NOW_KYIV))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain, NOW_KYIV))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Slot not available")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    /**
+     * The 0-minute STAFF floor, pinned by proving the guard calls the STAFF oracle and never the
+     * CLIENT-floor {@code assertVisitStartsOnAvailableSlot} path (which asks
+     * {@code getAvailableSlots(...)} and would reject a start inside the 15-minute window). The client
+     * oracle is stubbed to answer EMPTY — the pre-fix / mutated behaviour — so if the guard were rewritten
+     * to delegate to {@code assertVisitStartsOnAvailableSlot} this test goes RED on a spurious 409,
+     * exactly the mutation-check the phase doc calls for.
+     */
+    @Test
+    @DisplayName("staff visit — a chain starting exactly at \"now\" is accepted (0-minute STAFF floor) "
+            + "even where the 15-minute CLIENT floor would reject it")
+    void should_pass_when_startIsNowExactly() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, KYIV_DAY, serviceIds, preloadedChain, NOW_KYIV))
+                .thenReturn(true);
+        // The CLIENT-floor oracle finds nothing for the same instant — the 15-minute window a walk-in
+        // keyed in right now would be rejected by, and the wrong path this test must NOT take.
+        lenient().when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, serviceIds, preloadedChain))
+                .thenReturn(List.of());
+
+        assertThatCode(() -> BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain, NOW_KYIV))
+                .as("STAFF floor is 0 minutes — \"now\" is a legal walk-in start")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("staff visit — 409 when the requested start has already passed")
+    void should_throw409_when_startIsInThePast() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        OffsetDateTime aMinuteAgo = NOW_KYIV.minusMinutes(1);
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, KYIV_DAY, serviceIds, preloadedChain, aMinuteAgo))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain, aMinuteAgo))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Slot not available")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    @DisplayName("staff visit — the availability read is scoped by the KYIV civil date, not the sent offset")
+    void should_useKyivCivilDate_when_startSubmittedInAnotherOffset() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                eq(masterId), eq(KYIV_DAY), eq(serviceIds), eq(preloadedChain),
+                eq(JUST_AFTER_KYIV_MIDNIGHT_AS_UTC)))
+                .thenReturn(true);
+        lenient().when(slotCalculationService.isStaffVisitSlotAvailable(
+                        eq(masterId), eq(SENT_OFFSET_DAY), eq(serviceIds), eq(preloadedChain),
+                        eq(JUST_AFTER_KYIV_MIDNIGHT_AS_UTC)))
+                .thenReturn(false);
+
+        assertThatCode(() -> BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain,
+                JUST_AFTER_KYIV_MIDNIGHT_AS_UTC))
+                .doesNotThrowAnyException();
+
+        verify(slotCalculationService).isStaffVisitSlotAvailable(
+                eq(masterId), dateCaptor.capture(), eq(serviceIds), eq(preloadedChain),
+                eq(JUST_AFTER_KYIV_MIDNIGHT_AS_UTC));
+        assertThat(dateCaptor.getValue())
+                .isEqualTo(KYIV_DAY)
+                .isNotEqualTo(SENT_OFFSET_DAY);
+    }
+
+    @Test
+    @DisplayName("staff visit — the caller's preloaded assignment list is forwarded, not reloaded")
+    void should_passPreloadedAssignmentsThrough_when_plannerAlreadyResolvedThem() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        List<MasterServiceAssignment> preloadedChain =
+                List.of(preloaded, mock(MasterServiceAssignment.class));
+        when(slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, KYIV_DAY, serviceIds, preloadedChain, NOW_KYIV))
+                .thenReturn(true);
+
+        BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, preloadedChain, NOW_KYIV);
+
+        // Same list instance, element for element — VisitPlanner#planChainedItems's resolution is never
+        // re-fetched behind the guard's back.
+        verify(slotCalculationService)
+                .isStaffVisitSlotAvailable(eq(masterId), eq(KYIV_DAY), eq(serviceIds), eq(preloadedChain),
+                        eq(NOW_KYIV));
+    }
 }

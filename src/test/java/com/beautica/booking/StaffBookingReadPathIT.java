@@ -134,9 +134,9 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
     class WireContract {
 
         @Test
-        @DisplayName("a STAFF walk-in lists with clientId/clientAvatarUrl/appointmentId all null, "
-                + "the client name carried by the guest columns, and both review flags false — the "
-                + "field set no read-path test had ever seen a booking_source='STAFF' row produce")
+        @DisplayName("a STAFF walk-in lists with clientId/clientAvatarUrl null but appointmentId set "
+                + "(Phase 22.12), the client name carried by the guest columns, and both review "
+                + "flags false")
         void should_returnGuestIdentityAndNullAccountFields_when_providerListsAStaffBooking()
                 throws Exception {
             UUID bookingId = createStaffBooking(tomorrowAtNoon());
@@ -165,9 +165,13 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
                             + "and nothing to fall back TO, so the card renders the generic glyph")
                     .isTrue();
             assertThat(row.path("appointmentId").isNull())
-                    .as("chk_appointment_source admits only ('APP','LINK'), so a STAFF booking can "
-                            + "never join a multi-service visit — appointmentId must be null")
-                    .isTrue();
+                    .as("Phase 22.12 — N = 1 still creates an appointments header (D2's locked "
+                            + "no-size-short-circuit decision), so a walk-in created after this "
+                            + "phase now carries a non-null appointmentId, exactly like the "
+                            + "single-service APP/LINK case. It is asserted NOT-null here on "
+                            + "purpose: an assertion that appointmentId stays null would silently "
+                            + "start failing on production data and this suite would never notice")
+                    .isFalse();
             // Both flags are also false for a future-dated CONFIRMED booking of ANY shape, so on
             // THIS row they are documentation of the wire contract rather than a discriminating
             // check. The next test is the one that proves the false comes from the missing client.
@@ -493,8 +497,8 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
 
         @Test
         @DisplayName("a STAFF walk-in fetched by id returns the same wire contract the listing does "
-                + "— clientId/clientAvatarUrl/appointmentId null, name from the guest columns, both "
-                + "review flags false — on the per-row code path no read test had ever driven")
+                + "— clientId/clientAvatarUrl null but appointmentId set (Phase 22.12), name from "
+                + "the guest columns, both review flags false")
         void should_returnGuestIdentityAndNullAccountFields_when_providerFetchesAStaffBookingById()
                 throws Exception {
             UUID bookingId = createStaffBooking(tomorrowAtNoon());
@@ -522,9 +526,10 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
                     .as("no account means nothing to fall back TO, on this path as on the listing")
                     .isTrue();
             assertThat(row.path("appointmentId").isNull())
-                    .as("chk_appointment_source admits only ('APP','LINK'), so a STAFF booking can "
-                            + "never join a multi-service visit whichever endpoint reads it")
-                    .isTrue();
+                    .as("Phase 22.12 — N = 1 still creates an appointments header, so this walk-in's "
+                            + "appointmentId is set on the per-row detail path exactly as it is on "
+                            + "the listing path (same mapper, same underlying column)")
+                    .isFalse();
             // Both flags are false for a future-dated CONFIRMED booking of ANY shape, so here they
             // pin the wire contract only. The next test is the discriminating one.
             assertThat(row.path("canReview").asBoolean(true))
@@ -582,7 +587,16 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
 
     // ── staff-create helpers (the real endpoint) ─────────────────────────────────
 
-    /** Creates a walk-in on the base fixture's salon master, as its owner, and returns its id. */
+    /**
+     * Creates a SINGLE-SERVICE walk-in on the base fixture's salon master, as its owner, and returns
+     * its BOOKING id — not the visit id.
+     *
+     * <p>Phase 22.14 — the 201 body is now {@code AppointmentDetailResponse}, whose top-level
+     * {@code id} is the appointment (visit) header, not the row every caller of this helper reads by
+     * ({@code GET /bookings/{id}}, the day/list rails, {@code markCompleted}). Every command built
+     * here is single-service, so {@code items[0]} IS the one booking the visit contains — read the
+     * booking id off there instead of off the header.
+     */
     private UUID createStaffBooking(OffsetDateTime startsAt) throws Exception {
         return createStaffBooking(salon.masterId(), salon.masterServiceId(),
                 tokenFor(salon.ownerEmail()), startsAt);
@@ -592,7 +606,7 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
             UUID masterId, UUID masterServiceId, String token, OffsetDateTime startsAt)
             throws Exception {
         String body = """
-                {"masterServiceId":"%s","startsAt":"%s",
+                {"masterServiceIds":["%s"],"startsAt":"%s",
                  "guest":{"name":"%s","surname":"%s","phone":"%s"}}
                 """.formatted(masterServiceId, startsAt, GUEST_FIRST_NAME, GUEST_LAST_NAME, RAW_PHONE);
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -601,8 +615,8 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
         assertThat(resp.getStatusCode())
                 .as("walk-in setup must succeed — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
-        return UUID.fromString(
-                objectMapper.readTree(resp.getBody()).path("data").path("id").asText());
+        return UUID.fromString(objectMapper.readTree(resp.getBody())
+                .path("data").path("items").path(0).path("bookingId").asText());
     }
 
     // ── SQL fixtures ─────────────────────────────────────────────────────────────

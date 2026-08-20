@@ -4,6 +4,7 @@ import com.beautica.common.exception.BusinessException;
 import org.springframework.http.HttpStatus;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -34,35 +35,34 @@ import java.util.UUID;
  * a 400 whether the omission was the client's or the wiring's, so these mirror
  * {@link StaffClientRef.Guest}'s own choice rather than contradicting it five lines away.
  *
- * @param scope           the authority the booking is created under — {@link StaffBookingScope.InSalon}
+ * @param scope            the authority the booking is created under — {@link StaffBookingScope.InSalon}
  *                        for a salon caller, {@link StaffBookingScope.Self} for an independent master
  *                        booking themselves. Asserted against the loaded master by the service; NO
  *                        variant skips that assertion. The persisted {@code bookings.salon_id} is
  *                        still derived from {@code master.getSalon()}, never from this value.
- * @param masterId        the master whose calendar the booking lands on
- * @param masterServiceId a {@code MasterServiceAssignment} id — the same grain every other create
- *                        path uses. Loading it master-scoped IS the service-eligibility proof
- *                        ("does this master actually perform this service?").
- *                        <b>Scalar, not a list, deliberately</b>: staff bookings are single-service
- *                        in this track, because a multi-service visit would insert an
- *                        {@code appointments} row and {@code chk_appointment_source} (V124:54) still
- *                        admits only {@code 'APP','LINK'}. See {@code StaffBookingService}'s class
- *                        Javadoc.
- * @param startsAt        the requested start; validated against the STAFF lead-time rule (no past,
+ * @param masterId         the master whose calendar the booking lands on
+ * @param masterServiceIds the ORDERED list of {@code MasterServiceAssignment} ids to chain — the
+ *                        same grain every other create path uses. Loading each master-scoped IS the
+ *                        service-eligibility proof ("does this master actually perform this
+ *                        service?"). Widened from a scalar in Phase 22.11 (V139 lifted the
+ *                        {@code chk_appointment_source} restriction that used to confine a staff
+ *                        booking to a single service). Order is meaningful and duplicates are legal
+ *                        — see {@code VisitPlanner#planChainedItems}.
+ * @param startsAt         the requested start; validated against the STAFF lead-time rule (no past,
  *                        "now" allowed) and against the master's real working hours
- * @param client          who the booking is for — only {@link StaffClientRef.Guest} ships today
+ * @param client           who the booking is for — only {@link StaffClientRef.Guest} ships today
  */
 public record StaffBookingCommand(
         StaffBookingScope scope,
         UUID masterId,
-        UUID masterServiceId,
+        List<UUID> masterServiceIds,
         OffsetDateTime startsAt,
         StaffClientRef client
 ) {
     public StaffBookingCommand {
         scope = required(scope, "Booking scope");
         masterId = required(masterId, "masterId");
-        masterServiceId = required(masterServiceId, "masterServiceId");
+        masterServiceIds = required(masterServiceIds, "masterServiceIds");
         startsAt = required(startsAt, "startsAt");
         client = required(client, "client");
     }

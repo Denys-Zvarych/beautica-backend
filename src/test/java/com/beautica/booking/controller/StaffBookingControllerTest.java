@@ -3,7 +3,8 @@ package com.beautica.booking.controller;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
-import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.dto.AppointmentDetailResponse;
+import com.beautica.booking.dto.AppointmentItemResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
 import com.beautica.booking.dto.StaffBookingScope;
 import com.beautica.booking.dto.StaffClientRef;
@@ -318,10 +319,32 @@ class StaffBookingControllerTest {
         }
 
         @Test
+        @DisplayName("empty masterServiceIds list → 400")
+        void should_reject400_when_masterServiceIdsIsEmpty() throws Exception {
+            expectBadRequest("""
+                    {"masterServiceIds":[],"startsAt":"%s",
+                     "guest":{"name":"Марія","surname":"Левченко","phone":"050 123 45 67"}}
+                    """.formatted(future()));
+        }
+
+        /** {@code @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT)} — the cap is 10. */
+        @Test
+        @DisplayName("masterServiceIds over the 10-service cap → 400")
+        void should_reject400_when_masterServiceIdsExceedsTen() throws Exception {
+            String elevenIds = java.util.stream.IntStream.range(0, 11)
+                    .mapToObj(i -> "\"" + UUID.randomUUID() + "\"")
+                    .collect(java.util.stream.Collectors.joining(","));
+            expectBadRequest("""
+                    {"masterServiceIds":[%s],"startsAt":"%s",
+                     "guest":{"name":"Марія","surname":"Левченко","phone":"050 123 45 67"}}
+                    """.formatted(elevenIds, future()));
+        }
+
+        @Test
         @DisplayName("missing guest object → 400")
         void should_reject400_when_guestIsMissing() throws Exception {
             expectBadRequest("""
-                    {"masterServiceId":"%s","startsAt":"%s"}
+                    {"masterServiceIds":["%s"],"startsAt":"%s"}
                     """.formatted(MASTER_SERVICE_ID, future()));
         }
 
@@ -335,7 +358,7 @@ class StaffBookingControllerTest {
         @DisplayName("missing guest surname → 400")
         void should_reject400_when_guestSurnameIsMissing() throws Exception {
             expectBadRequest("""
-                    {"masterServiceId":"%s","startsAt":"%s",
+                    {"masterServiceIds":["%s"],"startsAt":"%s",
                      "guest":{"name":"Марія","phone":"050 123 45 67"}}
                     """.formatted(MASTER_SERVICE_ID, future()));
         }
@@ -344,7 +367,7 @@ class StaffBookingControllerTest {
         @DisplayName("missing guest phone → 400")
         void should_reject400_when_guestPhoneIsMissing() throws Exception {
             expectBadRequest("""
-                    {"masterServiceId":"%s","startsAt":"%s",
+                    {"masterServiceIds":["%s"],"startsAt":"%s",
                      "guest":{"name":"Марія","surname":"Левченко"}}
                     """.formatted(MASTER_SERVICE_ID, future()));
         }
@@ -379,7 +402,7 @@ class StaffBookingControllerTest {
         @DisplayName("missing startsAt → 400")
         void should_reject400_when_startsAtIsMissing() throws Exception {
             expectBadRequest("""
-                    {"masterServiceId":"%s","guest":{"name":"Марія","surname":"Левченко","phone":"050 123 45 67"}}
+                    {"masterServiceIds":["%s"],"guest":{"name":"Марія","surname":"Левченко","phone":"050 123 45 67"}}
                     """.formatted(MASTER_SERVICE_ID));
         }
 
@@ -400,7 +423,7 @@ class StaffBookingControllerTest {
                             .with(authenticatedAs(CALLER_ID, Role.SALON_OWNER))
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("""
-                                    {"masterServiceId":"%s","startsAt":"%s",
+                                    {"masterServiceIds":["%s"],"startsAt":"%s",
                                      "guest":{"name":"Марія","phone":"050 123 45 67"}}
                                     """.formatted(MASTER_SERVICE_ID, future())))
                     .andExpect(status().isBadRequest())
@@ -465,6 +488,94 @@ class StaffBookingControllerTest {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════
+    // The 201 body (Phase 22.14) — AppointmentDetailResponse, the SAME shape the client
+    // multi-service flow returns, never a hand-rolled second DTO
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("201 visit body")
+    class VisitResponseBody {
+
+        @Test
+        @DisplayName("three services → 201 with items.length() == 3, correct totals and per-item window")
+        void should_return201WithVisitBody_when_threeServices() throws Exception {
+            authorize();
+            when(staffBookingScopeResolver.resolve(any(), eq(MASTER_ID)))
+                    .thenReturn(new StaffBookingScope.InSalon(SALON_ID));
+            when(staffBookingService.createStaffBooking(any(), any())).thenReturn(stubResponse(3));
+
+            mockMvc.perform(post(URL)
+                            .with(authenticatedAs(CALLER_ID, Role.SALON_OWNER))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validBody()))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data.id").exists())
+                    .andExpect(jsonPath("$.data.items.length()").value(3))
+                    .andExpect(jsonPath("$.data.totalPrice").value(1050.00))
+                    .andExpect(jsonPath("$.data.totalDurationMinutes").value(180))
+                    .andExpect(jsonPath("$.data.items[0].startsAt").exists())
+                    .andExpect(jsonPath("$.data.items[0].endsAt").exists())
+                    .andExpect(jsonPath("$.data.items[1].startsAt").exists())
+                    .andExpect(jsonPath("$.data.items[2].endsAt").exists());
+        }
+
+        @Test
+        @DisplayName("one service → 201 with a single-item visit")
+        void should_return201WithSingleItemVisit_when_oneService() throws Exception {
+            authorize();
+            when(staffBookingScopeResolver.resolve(any(), eq(MASTER_ID)))
+                    .thenReturn(new StaffBookingScope.InSalon(SALON_ID));
+            when(staffBookingService.createStaffBooking(any(), any())).thenReturn(stubResponse(1));
+
+            mockMvc.perform(post(URL)
+                            .with(authenticatedAs(CALLER_ID, Role.SALON_OWNER))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validBody()))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data.items.length()").value(1));
+        }
+
+        /**
+         * D2, pinned: {@code AppointmentDetailResponse} has no {@code guestName}/{@code guestPhone}
+         * field at all — the caller typed those seconds ago and still holds them. Asserted via
+         * {@code doesNotExist()}, not merely "not equal to the typed value", so a later "helpful"
+         * addition of the field is caught even if it were populated correctly.
+         */
+        @Test
+        @DisplayName("the walk-in's own name/phone are never in the 201 body")
+        void should_notExposeGuestFields_when_visitCreated() throws Exception {
+            authorize();
+            when(staffBookingScopeResolver.resolve(any(), eq(MASTER_ID)))
+                    .thenReturn(new StaffBookingScope.InSalon(SALON_ID));
+            when(staffBookingService.createStaffBooking(any(), any())).thenReturn(stubResponse());
+
+            mockMvc.perform(post(URL)
+                            .with(authenticatedAs(CALLER_ID, Role.SALON_OWNER))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validBody()))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data.guestName").doesNotExist())
+                    .andExpect(jsonPath("$.data.guestPhone").doesNotExist());
+        }
+
+        @Test
+        @DisplayName("no cancelToken in the 201 body — a staff visit has none to carry")
+        void should_notExposeCancelToken_when_visitCreated() throws Exception {
+            authorize();
+            when(staffBookingScopeResolver.resolve(any(), eq(MASTER_ID)))
+                    .thenReturn(new StaffBookingScope.InSalon(SALON_ID));
+            when(staffBookingService.createStaffBooking(any(), any())).thenReturn(stubResponse());
+
+            mockMvc.perform(post(URL)
+                            .with(authenticatedAs(CALLER_ID, Role.SALON_OWNER))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(validBody()))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data.cancelToken").doesNotExist());
+        }
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────────
 
     private void authorize() {
@@ -489,26 +600,64 @@ class StaffBookingControllerTest {
 
     private static String body(String startsAt, String name, String surname, String phone) {
         return """
-                {"masterServiceId":"%s","startsAt":"%s",
+                {"masterServiceIds":["%s"],"startsAt":"%s",
                  "guest":{"name":"%s","surname":"%s","phone":"%s"}}
                 """.formatted(MASTER_SERVICE_ID, startsAt, name, surname, phone);
     }
 
     private static String bodyWithExtraField(String extraJsonFragment) {
         return """
-                {%s"masterServiceId":"%s","startsAt":"%s",
+                {%s"masterServiceIds":["%s"],"startsAt":"%s",
                  "guest":{"name":"Марія","surname":"Левченко","phone":"050 123 45 67"}}
                 """.formatted(extraJsonFragment, MASTER_SERVICE_ID, future());
     }
 
-    private static BookingResponse stubResponse() {
+    /** The single-service (N = 1) shape — the one almost every existing case here needs. */
+    private static AppointmentDetailResponse stubResponse() {
+        return stubResponse(1);
+    }
+
+    /**
+     * A visit response with {@code itemCount} chained services, back to back — REUSE-FIRST: one
+     * builder for both the N = 1 and N &gt; 1 shapes, rather than a near-duplicate second stub.
+     */
+    private static AppointmentDetailResponse stubResponse(int itemCount) {
         OffsetDateTime start = OffsetDateTime.now(ZoneOffset.UTC).plusDays(1);
-        return new BookingResponse(
-                UUID.randomUUID(), null, MASTER_ID, MASTER_SERVICE_ID, "Манікюр",
-                BookingStatus.CONFIRMED,
-                start.atZoneSameInstant(TimeZones.KYIV),
-                start.plusHours(1).atZoneSameInstant(TimeZones.KYIV),
-                new BigDecimal("350.00"), null, 60,
-                OffsetDateTime.now(ZoneOffset.UTC), null, false);
+        java.time.ZonedDateTime cursor = start.atZoneSameInstant(TimeZones.KYIV);
+        java.time.ZonedDateTime visitStart = cursor;
+        BigDecimal itemPrice = new BigDecimal("350.00");
+        List<AppointmentItemResponse> items = new java.util.ArrayList<>(itemCount);
+        for (int i = 0; i < itemCount; i++) {
+            java.time.ZonedDateTime itemEnd = cursor.plusHours(1);
+            items.add(new AppointmentItemResponse(
+                    UUID.randomUUID(), MASTER_SERVICE_ID, "Манікюр", BookingStatus.CONFIRMED,
+                    cursor, itemEnd, 60, itemPrice, null, null, null));
+            cursor = itemEnd;
+        }
+        return new AppointmentDetailResponse(
+                UUID.randomUUID(),                          // id (the visit/appointment id)
+                BookingStatus.CONFIRMED,                     // status
+                MASTER_ID,                                    // masterId
+                "Марія",                                       // masterFirstName
+                "Левченко",                                     // masterLastName
+                null,                                            // masterProfessionalTitle
+                null,                                            // masterAvatarUrl
+                Role.SALON_MASTER,                               // masterType
+                null,                                             // salonName
+                visitStart,                                        // startsAt
+                cursor,                                             // endsAt (last item's end)
+                itemCount * 60,                                     // totalDurationMinutes
+                itemPrice.multiply(BigDecimal.valueOf(itemCount)),   // totalPrice
+                null,                                                 // totalPriceMax
+                null,                                                 // clientComment
+                OffsetDateTime.now(ZoneOffset.UTC),                    // createdAt
+                items,                                                  // items
+                null,                                                   // providerComment
+                null,                                                   // clientCancellationNote
+                null,                                                   // cityLabel
+                null,                                                   // districtLabel
+                null,                                                   // street
+                null,                                                   // buildingNo
+                null);                                                  // locationNote
     }
 }

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -75,6 +76,28 @@ class WalkInBookingSmsIT extends AbstractWalkInBookingSmsIT {
     @DisplayName("gate off — the 201 body carries the same booking contract the enabled path returns")
     void should_returnTheSameConfirmedBookingContract_when_theGateIsOff() {
         assertConfirmedWalkInBody(createWalkIn(tomorrowAtNoon()));
+    }
+
+    /**
+     * Phase 22.13's gate-off counterpart to {@code WalkInBookingSmsEnabledIT
+     * #should_dispatchExactlyOneMessage_when_fiveServiceWalkIn}: a multi-service visit must make
+     * ZERO Turbosms requests with the flag off, exactly like the single-service row above — the
+     * widened per-visit message builder must not itself become a new, ungated call site.
+     */
+    @Test
+    @DisplayName("gate off — a multi-service walk-in create makes ZERO Turbosms requests")
+    void should_makeZeroTurbosmsRequests_when_multiServiceWalkInCreated() {
+        UUID service2 = insertService(salon.masterId(), "SALON", salon.salonId());
+        UUID service3 = insertService(salon.masterId(), "SALON", salon.salonId());
+
+        ResponseEntity<String> resp = createWalkIn(
+                tomorrowAtNoon(), List.of(salon.masterServiceId(), service2, service3));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        TURBOSMS.verify(0, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        assertThat(bookingCount())
+                .as("all three chained rows persist regardless of the SMS gate")
+                .isEqualTo(3);
     }
 
     @Test

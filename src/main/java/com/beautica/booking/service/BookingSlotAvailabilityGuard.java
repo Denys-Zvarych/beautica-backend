@@ -140,6 +140,39 @@ final class BookingSlotAvailabilityGuard {
     }
 
     /**
+     * <b>STAFF create-path counterpart of {@link #assertVisitStartsOnAvailableSlot}</b> (Phase 22.10) —
+     * identical oracle, identical comparison, identical 409, evaluated at the STAFF lead-time floor
+     * (minimum lead 0) instead of the client one (15 min). The floor is the ONLY difference, exactly as
+     * it is the only difference between {@link #assertStartsOnAvailableSlot} and
+     * {@link #assertStaffStartsOnAvailableSlot}.
+     *
+     * <p><b>Whole-chain, never N per-item checks (D2).</b> Items 2..N of a chained visit do not start on
+     * the {@code SLOT_STEP} grid at all — {@code VisitPlanner} chains each item to begin when the
+     * previous one ends, so a per-item check on item 2+ would reject essentially every legal
+     * multi-service walk-in. The chain is contiguous by construction at create time, so pinning the
+     * FIRST start against a block sized to the Σ of the ordered assignments' effective durations pins
+     * the whole block — the same reasoning {@link #assertVisitStartsOnAvailableSlot} already applies at
+     * the client floor, mirrored here at the staff floor. A per-item check would also wrongly ACCEPT a
+     * chain whose first service fits alone but whose tail runs past the working window.
+     *
+     * <p>Asks {@link SlotCalculationService#isStaffVisitSlotAvailable}, not a materialised list, for the
+     * same reason {@link #assertStaffStartsOnAvailableSlot} asks {@code isStaffSlotAvailable}: the staff
+     * list is deliberately uncached, so a chained visit is *more* expensive to materialise, not less.
+     *
+     * @param preloaded the PARALLEL assignment list {@code VisitPlanner#planChainedItems} already
+     *                  resolved (same size, same order as {@code masterServiceIds}) — see
+     *                  {@link #assertVisitStartsOnAvailableSlot}
+     */
+    static void assertStaffVisitStartsOnAvailableSlot(
+            SlotCalculationService slotCalculationService, UUID masterId, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt) {
+        if (!slotCalculationService.isStaffVisitSlotAvailable(
+                masterId, kyivDate(startsAt), masterServiceIds, preloaded, startsAt)) {
+            throw new BusinessException(HttpStatus.CONFLICT, SLOT_NOT_AVAILABLE);
+        }
+    }
+
+    /**
      * The Kyiv CIVIL date {@code startsAt} falls on — the date key every availability read is scoped by
      * ({@code SlotCalculationService} resolves the effective day, loads the day's bookings and generates
      * candidates entirely in {@link TimeZones#KYIV}).

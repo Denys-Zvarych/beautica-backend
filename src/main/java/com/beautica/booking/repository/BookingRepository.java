@@ -425,9 +425,23 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
 
     /**
-     * How many {@code STAFF} walk-ins have been created for one recipient phone since {@code since}
-     * — the per-recipient SMS-spend cap enforced by
-     * {@code StaffBookingService#assertWalkInSmsBudgetForPhone} (SEC MEDIUM, 2026-08-18).
+     * How many DISTINCT {@code STAFF} walk-in VISITS have been created for one recipient phone since
+     * {@code since} — the per-recipient SMS-spend cap enforced by
+     * {@code StaffBookingService#assertWalkInSmsBudgetForPhone} (SEC MEDIUM, 2026-08-18; widened to
+     * count visits rather than rows, Phase 22.13).
+     *
+     * <p><b>The unit is the VISIT, not the row.</b> {@code registerWalkInConfirmationSms} fires
+     * exactly once per visit regardless of its service count (Phase 22.13), so a query that counted
+     * {@code bookings} rows would let a single N-service walk-in burn N units of a budget that exists
+     * to cap MESSAGES: a 5-service visit would exhaust {@code MAX_WALK_INS_PER_PHONE_PER_WINDOW} by
+     * itself and 429 the very next legitimate walk-in for that phone for the rest of the window.
+     *
+     * <p>{@code coalesce(b.appointment_id, b.id)} is load-bearing. Pre-22.12 STAFF rows have
+     * {@code appointment_id = NULL} and each one IS its own visit — collapsing every NULL row into
+     * one {@code DISTINCT} bucket via a bare {@code appointment_id} would silently hand a prober an
+     * unlimited budget, since a NULL {@code appointment_id} means "no header", not "the same header".
+     * Falling back to the row's own {@code id} keeps every legacy row counted individually while every
+     * post-22.12 visit's N chained rows collapse to the one header they share.
      *
      * <p>Counted in the DB rather than in an in-memory bucket so the limit survives a restart and
      * holds across instances; {@code bookings} already records the exact fact being limited.
@@ -441,17 +455,25 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * phone is OTP-verified and already throttled by {@code PhoneOtpService}, and an APP booking has
      * no {@code guestPhone} at all.
      *
-     * <p>Served by {@code idx_bookings_guest_phone} plus the {@code created_at} predicate; it is a
-     * scalar COUNT, so no graph and no {@code Pageable} apply (Anti-Bug §E-3 concerns collection
-     * returns).
+     * <p>Native, not JPQL: {@code coalesce} over an FK id and a PK id is awkward to express in JPQL,
+     * and the predicate already mirrors {@code idx_bookings_staff_walkin_phone} (V138:
+     * {@code (guest_phone, created_at) WHERE booking_source = 'STAFF'}) expressed in SQL — served by
+     * that index for the range, then a per-row heap fetch of {@code appointment_id}. Not index-only,
+     * and deliberately not widened to make it so: the matched set is bounded by the cap this very
+     * query enforces, so the extra heap fetch is cheap by construction.
+     *
+     * <p>The row-counting predecessor of this query has been DELETED, not left beside this one — two
+     * counters with different denominators is precisely how a future edit re-introduces the
+     * row-vs-visit bug.
      */
-    @Query("""
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.guestPhone = :phone
-              AND b.bookingSource = com.beautica.booking.enums.BookingSource.STAFF
-              AND b.createdAt > :since
-            """)
-    long countStaffWalkInsForPhoneSince(@Param("phone") String phone, @Param("since") Instant since);
+    @Query(value = """
+            SELECT count(DISTINCT coalesce(b.appointment_id, b.id))
+              FROM bookings b
+             WHERE b.guest_phone = :phone
+               AND b.booking_source = 'STAFF'
+               AND b.created_at > :since
+            """, nativeQuery = true)
+    long countStaffWalkInVisitsForPhoneSince(@Param("phone") String phone, @Param("since") Instant since);
 
     // ── Client booking-detail projection (Phase 19.3; sentinel removed Phase 26.7.1) ──
     /**
