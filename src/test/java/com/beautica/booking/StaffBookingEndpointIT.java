@@ -115,6 +115,11 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
             assertThat(onlyBooking().get("created_by_user_id"))
                     .as("attribution follows the acting admin, not the salon owner")
                     .isNotEqualTo(salon.ownerId());
+            // No outbox row on ANY authorized path — StaffBookingService is explicit (see its class
+            // Javadoc, "Not here") that inventing a NEW_BOOKING enqueue would risk double-notifying a
+            // track whose provider-side copy is not yet decided. Pinned here too, not just on the
+            // owner path, so the admin path cannot silently regress ahead of that decision.
+            verifyNoInteractions(notificationOutboxService);
         }
 
         /**
@@ -136,6 +141,9 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
             assertThat(row.get("salon_id")).isNull();
             assertThat(row.get("created_by_user_id")).isEqualTo(solo.userId);
             assertThat(row.get("booking_source")).isEqualTo("STAFF");
+            // The self-notify case: even though actor == recipient here, no outbox row is enqueued —
+            // see the owner-path test below for why (StaffBookingService's "Not here" Javadoc).
+            verifyNoInteractions(notificationOutboxService);
         }
 
         /**
