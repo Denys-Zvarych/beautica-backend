@@ -69,6 +69,37 @@ final class BookingStartsAtValidator {
     }
 
     /**
+     * <b>Actor-dispatching overload (Phase 22.x reschedule parity).</b> Selects between the two floors
+     * ABOVE — {@link #validateStaff} (0 min) for a provider-initiated write, {@link #validate} (15 min)
+     * for a client-initiated one. It defines no floor of its own; both arms are the existing methods.
+     *
+     * <p><b>Why it exists.</b> Staff CREATE ({@code StaffBookingService}) already ran at the 0-minute
+     * floor while EVERY reschedule path ran at the client 15-minute floor, so a master moving a walk-in
+     * to "in 5 minutes" got {@code 400 "Booking must start at least 15 minutes from now"} — a start the
+     * very same master could have CREATED. The three reschedule entry points
+     * ({@code BookingService#rescheduleBooking}, {@code AppointmentTransitionService#rescheduleAppointment},
+     * {@code AppointmentTransitionService#rescheduleAppointmentItem}) each already compute
+     * {@code initiatedByProvider} to route authorization and the elapsed guard; they now route the floor
+     * through the SAME boolean rather than each inlining its own ternary.
+     *
+     * <p><b>Gated on the ACTOR, not on {@code booking.getSource()} (locked product decision).</b> A master
+     * moving ANY booking — walk-in or client-made — has the same "the client is standing right here"
+     * justification the walk-in CREATE floor was granted for. A CLIENT-initiated reschedule keeps the
+     * 15-minute floor untouched. Do not narrow this to {@code source == STAFF}.
+     *
+     * <p>Its counterpart in the slot layer is
+     * {@code BookingSlotAvailabilityGuard#assertStartsOnAvailableSlot(..., boolean)} — both layers must
+     * move together or the request merely swaps a {@code 400} for a {@code 409 "Slot not available"}.
+     */
+    static void validate(OffsetDateTime startsAt, Clock clock, boolean initiatedByProvider) {
+        if (initiatedByProvider) {
+            validateStaff(startsAt, clock);
+        } else {
+            validate(startsAt, clock);
+        }
+    }
+
+    /**
      * The {@link BookingWindow#MAX_DAYS_AHEAD} ceiling, identical for every create path — extracted
      * so the client and staff floors are the only thing that differs between them.
      */

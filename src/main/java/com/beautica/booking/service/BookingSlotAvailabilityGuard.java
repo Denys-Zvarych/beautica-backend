@@ -111,6 +111,35 @@ final class BookingSlotAvailabilityGuard {
     }
 
     /**
+     * <b>Actor-dispatching overload (reschedule parity)</b> — selects between
+     * {@link #assertStaffStartsOnAvailableSlot} (staff floor, minimum lead 0) and
+     * {@link #assertStartsOnAvailableSlot} (client floor, 15 min). It defines no oracle of its own;
+     * both arms are the existing methods above.
+     *
+     * <p><b>The slot layer must move with the validator layer.</b> Relaxing only
+     * {@link BookingStartsAtValidator} would swap the current {@code 400 "Booking must start at least 15
+     * minutes from now"} for a {@code 409 "Slot not available"} from THIS guard, because
+     * {@link SlotCalculationService#getAvailableSlots} generates its candidate list from
+     * {@code BookingWindow.minLead()} while {@link SlotCalculationService#isStaffSlotAvailable} uses
+     * {@link java.time.Duration#ZERO}. Two floors, one decision — see this parameter's twin on the
+     * validator.
+     *
+     * <p>Gated on the ACTOR ({@code actorRole != CLIENT}), never on {@code booking.getSource()} — locked
+     * product decision; see {@link BookingStartsAtValidator#validate(OffsetDateTime, java.time.Clock, boolean)}.
+     */
+    static void assertStartsOnAvailableSlot(
+            SlotCalculationService slotCalculationService, UUID masterId, UUID masterServiceId,
+            MasterServiceAssignment preloaded, OffsetDateTime startsAt, boolean initiatedByProvider) {
+        if (initiatedByProvider) {
+            assertStaffStartsOnAvailableSlot(
+                    slotCalculationService, masterId, masterServiceId, preloaded, startsAt);
+        } else {
+            assertStartsOnAvailableSlot(
+                    slotCalculationService, masterId, masterServiceId, preloaded, startsAt);
+        }
+    }
+
+    /**
      * Multi-service (BE-2) counterpart of {@link #assertStartsOnAvailableSlot}: the visit's FIRST start
      * must match a slot of the ordered {@code masterServiceIds}' chained block, whose length is the Σ of
      * their effective durations — see
@@ -169,6 +198,29 @@ final class BookingSlotAvailabilityGuard {
         if (!slotCalculationService.isStaffVisitSlotAvailable(
                 masterId, kyivDate(startsAt), masterServiceIds, preloaded, startsAt)) {
             throw new BusinessException(HttpStatus.CONFLICT, SLOT_NOT_AVAILABLE);
+        }
+    }
+
+    /**
+     * <b>Whole-chain actor-dispatching overload (reschedule parity)</b> — the multi-service twin of
+     * {@link #assertStartsOnAvailableSlot(SlotCalculationService, UUID, UUID, MasterServiceAssignment,
+     * OffsetDateTime, boolean)}, selecting between {@link #assertStaffVisitStartsOnAvailableSlot} (staff
+     * floor, minimum lead 0) and {@link #assertVisitStartsOnAvailableSlot} (client floor, 15 min).
+     * Defines no oracle of its own; both arms are the existing methods above.
+     *
+     * <p>Used by {@code AppointmentTransitionService#rescheduleAppointment}, where the WHOLE visit block
+     * moves — never N per-item checks, for the reason
+     * {@link #assertStaffVisitStartsOnAvailableSlot} spells out.
+     */
+    static void assertVisitStartsOnAvailableSlot(
+            SlotCalculationService slotCalculationService, UUID masterId, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt, boolean initiatedByProvider) {
+        if (initiatedByProvider) {
+            assertStaffVisitStartsOnAvailableSlot(
+                    slotCalculationService, masterId, masterServiceIds, preloaded, startsAt);
+        } else {
+            assertVisitStartsOnAvailableSlot(
+                    slotCalculationService, masterId, masterServiceIds, preloaded, startsAt);
         }
     }
 

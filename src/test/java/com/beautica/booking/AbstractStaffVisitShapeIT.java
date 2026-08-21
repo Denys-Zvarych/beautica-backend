@@ -58,17 +58,9 @@ abstract class AbstractStaffVisitShapeIT extends AbstractStaffBookingIT {
     protected static final String APPOINTMENTS_URL = "/api/v1/appointments";
     protected static final String CLIENT_REVIEWS_URL = "/api/v1/client-reviews";
 
-    /** Distinct from {@link #MASTER_FIRST_NAME}/{@link #MASTER_LAST_NAME} — an attribution bug
-     * cannot fail an assertion if guest and master share a name. */
-    protected static final String GUEST_FIRST_NAME = "Оксана";
-    protected static final String GUEST_LAST_NAME = "Гончар";
-
-    /** One walk-in visit of N chained services, however the concrete shape actually persists it. */
-    protected record Visit(UUID appointmentId, List<UUID> bookingIds) {
-        UUID booking(int i) {
-            return bookingIds.get(i);
-        }
-    }
+    // GUEST_FIRST_NAME/GUEST_LAST_NAME and the Visit record were promoted to
+    // AbstractStaffBookingIT (Q4 two-occurrence threshold) when StaffVisitItemRescheduleIT became
+    // the second suite in this hierarchy to need them — inherited from there, not redeclared.
 
     /** {@code true} for the NEW shape ({@code appointment_id} set, even at N = 1); {@code false}
      * for LEGACY ({@code appointment_id} always NULL — Phase 258 D2, no backfill). */

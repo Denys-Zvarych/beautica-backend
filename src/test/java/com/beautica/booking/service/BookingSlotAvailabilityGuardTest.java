@@ -368,4 +368,114 @@ class BookingSlotAvailabilityGuardTest {
                 .isStaffVisitSlotAvailable(eq(masterId), eq(KYIV_DAY), eq(serviceIds), eq(preloadedChain),
                         eq(NOW_KYIV));
     }
+
+    // ── ACTOR-DISPATCHING overloads (reschedule parity) ──────────────────────────
+    //
+    // The 6-arg overloads that route a RESCHEDULE to the staff oracle (initiatedByProvider) or the
+    // client one. Nothing referenced these before: every provider-initiated reschedule test targets a
+    // plusDays(2)-class time both floors accept, so routing them all to the client twin was
+    // indistinguishable from the fix.
+    //
+    // Every test below stubs the two oracles ASYMMETRICALLY — the arm that must NOT be taken answers
+    // "no such slot" (leniently, so it may legitimately go unused). A dispatch mutated to always take
+    // one arm therefore surfaces as the production symptom (a spurious 409 / a wrongly accepted
+    // start), never as a strict-stub mismatch.
+    //
+    // The reschedule callers hold no resolved assignment, so `preloaded` is null on both overloads
+    // here — the exact shape BookingService#rescheduleBooking and
+    // AppointmentTransitionService#reschedule{Appointment,AppointmentItem} pass.
+
+    private static final boolean PROVIDER = true;
+    private static final boolean CLIENT = false;
+
+    @Test
+    @DisplayName("single-service dispatch — a provider-initiated reschedule asks the STAFF oracle, so a "
+            + "start inside the 15-minute window the client list omits is still accepted")
+    void should_askStaffOracle_when_singleServiceRescheduleIsInitiatedByProvider() {
+        when(slotCalculationService.isStaffSlotAvailable(masterId, KYIV_DAY, masterServiceId, null, NOW_KYIV))
+                .thenReturn(true);
+        // The client-floor oracle offers nothing for this instant — the pre-fix behaviour, and the
+        // arm this call must NOT take.
+        lenient().when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, masterServiceId, null))
+                .thenReturn(List.of());
+
+        assertThatCode(() -> BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceId, null, NOW_KYIV, PROVIDER))
+                .as("routing a provider reschedule to the client oracle turns the relaxed floor into a "
+                        + "409 \"Slot not available\" instead of a 400 — the two layers must move together")
+                .doesNotThrowAnyException();
+
+        verify(slotCalculationService).isStaffSlotAvailable(masterId, KYIV_DAY, masterServiceId, null, NOW_KYIV);
+    }
+
+    @Test
+    @DisplayName("single-service dispatch — a CLIENT-initiated reschedule still asks the client oracle "
+            + "and 409s on a start it does not offer (the dispatch is not a blanket relaxation)")
+    void should_askClientOracle_when_singleServiceRescheduleIsInitiatedByClient() {
+        when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, masterServiceId, null))
+                .thenReturn(List.of());
+        // The staff oracle WOULD accept — so a dispatch mutated to always take the staff arm passes
+        // this start and this test goes red.
+        lenient().when(slotCalculationService.isStaffSlotAvailable(
+                        masterId, KYIV_DAY, masterServiceId, null, NOW_KYIV))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceId, null, NOW_KYIV, CLIENT))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Slot not available")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    @DisplayName("single-service dispatch — a provider-initiated reschedule the STAFF oracle rejects "
+            + "still 409s (the relaxed arm is a floor swap, not a bypass)")
+    void should_throw409_when_providerRescheduleIsRejectedByTheStaffOracle() {
+        when(slotCalculationService.isStaffSlotAvailable(masterId, KYIV_DAY, masterServiceId, null, NOW_KYIV))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
+                slotCalculationService, masterId, masterServiceId, null, NOW_KYIV, PROVIDER))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Slot not available");
+    }
+
+    @Test
+    @DisplayName("whole-visit dispatch — a provider-initiated visit reschedule asks the STAFF chain "
+            + "oracle, so a block starting inside the 15-minute window is accepted")
+    void should_askStaffChainOracle_when_visitRescheduleIsInitiatedByProvider() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        when(slotCalculationService.isStaffVisitSlotAvailable(masterId, KYIV_DAY, serviceIds, null, NOW_KYIV))
+                .thenReturn(true);
+        lenient().when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, serviceIds, null))
+                .thenReturn(List.of());
+
+        assertThatCode(() -> BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, null, NOW_KYIV, PROVIDER))
+                .as("AppointmentTransitionService#rescheduleAppointment reaches this overload — the "
+                        + "whole-visit route must relax with the single-booking one")
+                .doesNotThrowAnyException();
+
+        verify(slotCalculationService).isStaffVisitSlotAvailable(masterId, KYIV_DAY, serviceIds, null, NOW_KYIV);
+    }
+
+    @Test
+    @DisplayName("whole-visit dispatch — a CLIENT-initiated visit reschedule still asks the client chain "
+            + "oracle and 409s on a start it does not offer")
+    void should_askClientChainOracle_when_visitRescheduleIsInitiatedByClient() {
+        List<UUID> serviceIds = List.of(masterServiceId, secondMasterServiceId);
+        when(slotCalculationService.getAvailableSlots(masterId, KYIV_DAY, serviceIds, null))
+                .thenReturn(List.of());
+        lenient().when(slotCalculationService.isStaffVisitSlotAvailable(
+                        masterId, KYIV_DAY, serviceIds, null, NOW_KYIV))
+                .thenReturn(true);
+
+        assertThatThrownBy(() -> BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
+                slotCalculationService, masterId, serviceIds, null, NOW_KYIV, CLIENT))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Slot not available")
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
 }

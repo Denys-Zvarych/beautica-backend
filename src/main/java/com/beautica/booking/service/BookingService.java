@@ -1800,7 +1800,7 @@ public class BookingService {
                 : resolveBookingForClientReschedule(actorUserId, bookingId);
 
         OffsetDateTime newStartsAt = req.newStartsAt();
-        validateStartsAt(newStartsAt);
+        validateStartsAt(newStartsAt, initiatedByProvider);
 
         UUID masterId = booking.getMaster().getId();
         UUID masterServiceId = booking.getMasterService().getId();
@@ -1815,7 +1815,7 @@ public class BookingService {
         // No preloaded assignment here (Perf MEDIUM, 2026-08-11): the reschedule path holds only
         // booking.getMasterService(), an uninitialised LAZY proxy whose graph the availability read needs —
         // dereferencing it would cost the very query passing it is meant to save. null ⇒ plain reload.
-        assertStartsOnAvailableSlot(masterId, masterServiceId, null, newStartsAt);
+        assertStartsOnAvailableSlot(masterId, masterServiceId, null, newStartsAt, initiatedByProvider);
 
         // Duration + buffer are frozen at the original booking; mirror the create-path
         // end-time formula (duration + buffer) rather than recomputing from master_services.
@@ -2027,7 +2027,8 @@ public class BookingService {
                 .orElseThrow(() -> new NotFoundException("Master service not found"));
 
         OffsetDateTime startsAt = request.startsAt().toOffsetDateTime();
-        validateStartsAt(startsAt);
+        // false: the authenticated CLIENT/APP create path keeps the 15-minute floor, untouched.
+        validateStartsAt(startsAt, false);
 
         BigDecimal effectivePrice = msa.getPriceOverride() != null
                 ? msa.getPriceOverride()
@@ -2091,7 +2092,7 @@ public class BookingService {
         //
         // `msa` is handed through so the gate does not re-issue the findByMasterIdAndIdWithGraph this
         // method already ran at :1823 (Perf MEDIUM, 2026-08-11) — same persistence context, same instance.
-        assertStartsOnAvailableSlot(master.getId(), msa.getId(), msa, startsAt);
+        assertStartsOnAvailableSlot(master.getId(), msa.getId(), msa, startsAt, false);
 
         Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
         if (lockResult == null) {
@@ -2193,15 +2194,19 @@ public class BookingService {
      * shared bean (avoids a circular dependency with {@code AppointmentTransitionService}).
      */
     private void assertStartsOnAvailableSlot(
-            UUID masterId, UUID masterServiceId, MasterServiceAssignment preloaded, OffsetDateTime startsAt) {
+            UUID masterId, UUID masterServiceId, MasterServiceAssignment preloaded, OffsetDateTime startsAt,
+            boolean initiatedByProvider) {
         BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
-                slotCalculationService, masterId, masterServiceId, preloaded, startsAt);
+                slotCalculationService, masterId, masterServiceId, preloaded, startsAt, initiatedByProvider);
     }
 
-    private void validateStartsAt(OffsetDateTime startsAt) {
+    private void validateStartsAt(OffsetDateTime startsAt, boolean initiatedByProvider) {
         // Shared with GuestBookingService (DRY) so the authenticated and guest paths
         // enforce the identical lead-time floor + max-window cap.
-        BookingStartsAtValidator.validate(startsAt, clock);
+        //
+        // initiatedByProvider == true selects the STAFF floor (minimum lead 0) that walk-in CREATE
+        // already uses — gated on the ACTOR, never on booking.getSource(). CREATE callers pass false.
+        BookingStartsAtValidator.validate(startsAt, clock, initiatedByProvider);
     }
 
     /**
