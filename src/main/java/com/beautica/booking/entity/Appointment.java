@@ -67,7 +67,15 @@ import java.util.UUID;
                 // (V18/V113): stops a client-retry race persisting duplicate appointment headers. JPA
                 // cannot encode the WHERE idempotency_key IS NOT NULL AND status = 'CONFIRMED' predicate
                 // nor the partial-uniqueness — both live in V124's ux_appointments_client_idempotency_key_active.
-                @Index(name = "ux_appointments_client_idempotency_key_active", columnList = "client_id, idempotency_key")
+                @Index(name = "ux_appointments_client_idempotency_key_active", columnList = "client_id, idempotency_key"),
+                // partial index (V139): "visits created by staff member X" + the ON DELETE RI lookup
+                // for created_by_user_id — the header-level twin of bookings' idx_bookings_created_by
+                // (V137). JPA cannot encode WHERE created_by_user_id IS NOT NULL, and (per the note
+                // above) ddl-auto=validate does not check @Table(indexes=...) at all, so this
+                // annotation is documentation, not enforcement — V139 remains the source of truth.
+                // Mirrored here because an index present in the migration but absent from the entity
+                // is exactly the drift a reader of this class cannot see.
+                @Index(name = "idx_appointments_created_by", columnList = "created_by_user_id")
         }
 )
 @Getter

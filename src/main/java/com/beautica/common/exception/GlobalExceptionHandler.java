@@ -348,7 +348,9 @@ public class GlobalExceptionHandler {
      *
      * <p>Lock-timeout sources: currently only
      * {@code BookingRepository.acquireClientAdvisoryLockWithTimeout} /
-     * {@code acquireAdvisoryLock} / {@code acquireAdvisoryLockWithTimeout} and
+     * {@code acquireAdvisoryLock} / {@code acquireAdvisoryLockWithTimeout} /
+     * {@code acquireWalkInPhoneLock},
+     * {@code MasterServiceRepository.acquireBulkSetupLockWithTimeout} and
      * {@code AppointmentRepository.lockHeaderIfConfirmed} / {@code lockHeaderRegardlessOfStatus}, so
      * a flood of concurrent requests fails fast instead of parking a Hikari connection for the full
      * pool connection-timeout (booking advisory-lock DoS fix). This covers the authenticated booking

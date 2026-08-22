@@ -14,6 +14,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.sms.SmsService;
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.core.task.SyncTaskExecutor;
@@ -46,13 +48,14 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -147,7 +150,15 @@ class StaffBookingServiceTest {
         // them. The return value is a placeholder — no test in this suite asserts on its content;
         // see the appointmentService field javadoc for why that assertion belongs to enrich's own
         // suite instead.
-        lenient().when(appointmentService.enrich(any(), any())).thenReturn(stubAppointmentDetailResponse());
+        //
+        // The THREE-argument overload (perf LOW, 2026-08-22): the create path pre-resolves the
+        // discovery labels ABOVE the per-master advisory lock and hands them in, so the two-argument
+        // form is no longer reached from here at all. Stubbing the 2-arg form instead would leave
+        // the real 3-arg call unstubbed and returning null — see
+        // VisitResponse#should_hoistLabelResolutionAboveTheLock_when_visitCreated for the assertion
+        // that pins WHICH overload is used and what it is handed.
+        lenient().when(appointmentService.enrich(any(), any(), any()))
+                .thenReturn(stubAppointmentDetailResponse());
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
@@ -459,12 +470,18 @@ class StaffBookingServiceTest {
         void should_reject404_when_serviceIsNotAssignedToThatMaster() {
             when(masterRepository.findByIdWithUserAndSalon(masterId))
                     .thenReturn(Optional.of(salonMaster()));
-            when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
-                    .thenReturn(Optional.empty());
+            // The batch finder returns the rows it FOUND; a missing/foreign/inactive id simply is not
+            // among them, and the planner turns that size shortfall into the uniform 404.
+            when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(masterServiceId)))
+                    .thenReturn(List.of());
 
             assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
                     .isInstanceOf(NotFoundException.class)
-                    .hasMessage("Master service not found");
+                    .hasMessage("Master service not found")
+                    .as("unknown, foreign and inactive must stay indistinguishable — naming the id "
+                            + "would make the message an enumeration oracle over other providers' "
+                            + "catalogues")
+                    .hasMessageNotContaining(masterServiceId.toString());
         }
 
         @Test
@@ -928,6 +945,66 @@ class StaffBookingServiceTest {
             verify(bookingRepository).countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any());
         }
 
+        /**
+         * The TOCTOU fix (security MEDIUM, 2026-08-22), pinned at the unit tier as an ORDERING, which
+         * is the whole of the contract: a {@code pg_advisory_xact_lock} taken AFTER the count
+         * protects nothing at all, and a presence-only assertion ("the lock was acquired") stays
+         * green through exactly that regression. The live two-thread proof is
+         * {@code StaffBookingIT#should_rejectExcessConcurrentWalkIns_when_sameGuestPhone}.
+         *
+         * <p>The lock is keyed on the E.164 form for the same reason the count is — a lock on the raw
+         * string would be inert against the spelling alternation normalisation exists to defeat.
+         */
+        @Test
+        @DisplayName("should_lockThePhoneBeforeCountingIt_when_walkInCreated")
+        void should_lockThePhoneBeforeCountingIt_when_walkInCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            InOrder ordered = inOrder(bookingRepository);
+            ordered.verify(bookingRepository).acquireWalkInPhoneLock(E164_PHONE);
+            ordered.verify(bookingRepository).countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any());
+        }
+
+        /**
+         * Lock ORDER is phone (salt 1) → master (salt 0) on every path that takes both, matching the
+         * client → master order {@code BookingService} uses. One global ordering across the two paths
+         * is what makes an acquisition cycle — and hence a deadlock between a staff walk-in and a
+         * client booking on the same master — impossible. Swapping the two statements is a
+         * green-everywhere change without this row.
+         */
+        @Test
+        @DisplayName("should_takeThePhoneLockBeforeTheMasterLock_when_walkInCreated")
+        void should_takeThePhoneLockBeforeTheMasterLock_when_walkInCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            InOrder ordered = inOrder(bookingRepository);
+            ordered.verify(bookingRepository).acquireWalkInPhoneLock(E164_PHONE);
+            ordered.verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
+        }
+
+        /**
+         * A throttled request must not even take the phone lock's downstream work: the 429 short-
+         * circuits before the master lock, so a caller hammering one number cannot queue contention
+         * on the calendar every other request against that master waits on.
+         */
+        @Test
+        @DisplayName("should_neverTakeTheMasterLock_when_thePhoneBudgetIsAlreadySpent")
+        void should_neverTakeTheMasterLock_when_thePhoneBudgetIsAlreadySpent() {
+            stubMasterAndAssignment(salonMaster(), assignment(null, null));
+            stubStaffSlotAvailable(START);
+            when(bookingRepository.countStaffWalkInVisitsForPhoneSince(eq(E164_PHONE), any())).thenReturn(5L);
+
+            assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
+                    .isInstanceOf(BusinessException.class);
+
+            verify(bookingRepository).acquireWalkInPhoneLock(E164_PHONE);
+            verify(bookingRepository, never()).acquireAdvisoryLockWithTimeout(any());
+        }
+
         @Test
         @DisplayName("should_allowTheCreate_when_thePhoneIsOneBelowTheBudget")
         void should_allowTheCreate_when_thePhoneIsOneBelowTheBudget() {
@@ -1127,8 +1204,59 @@ class StaffBookingServiceTest {
 
             List<Booking> saved = captureSavedBookings();
             ArgumentCaptor<Appointment> appointmentCaptor = ArgumentCaptor.forClass(Appointment.class);
-            verify(appointmentService).enrich(appointmentCaptor.capture(), eq(saved));
+            verify(appointmentService).enrich(appointmentCaptor.capture(), eq(saved), any());
             assertThat(appointmentCaptor.getValue().getBookingSource()).isEqualTo(BookingSource.STAFF);
+        }
+
+        /**
+         * The pre-resolved-labels overload (perf LOW, 2026-08-22), pinned on both halves:
+         * {@code resolveVisitLabels} is asked for THIS visit's {@code (salon, masterUser)} pair, and
+         * the very instance it returned is what {@code enrich} receives. Handing {@code enrich}
+         * another visit's labels yields null city/district rather than wrong ones — a silent
+         * degradation nothing else in this suite would catch, since the mocked {@code enrich}'s
+         * return value is a fixed placeholder.
+         *
+         * <p>Mutation-check RED by reverting the call site to the two-argument {@code enrich}, or by
+         * passing a freshly resolved {@code DiscoveryLabels} instead of the hoisted one.
+         */
+        @Test
+        @DisplayName("should_hoistLabelResolutionAboveTheLock_when_visitCreated")
+        void should_hoistLabelResolutionAboveTheLock_when_visitCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+            DiscoveryLabels hoisted = new DiscoveryLabels(java.util.Map.of(), java.util.Map.of());
+            when(appointmentService.resolveVisitLabels(any(), any())).thenReturn(hoisted);
+
+            create(command(guest(RAW_PHONE)));
+
+            ArgumentCaptor<Salon> salonCaptor = ArgumentCaptor.forClass(Salon.class);
+            ArgumentCaptor<User> userCaptor = ArgumentCaptor.forClass(User.class);
+            verify(appointmentService).resolveVisitLabels(salonCaptor.capture(), userCaptor.capture());
+            assertThat(salonCaptor.getValue().getId())
+                    .as("the BOOKED salon wins the locality, exactly as enrich's own rule says")
+                    .isEqualTo(salonId);
+            assertThat(userCaptor.getValue().getId()).isEqualTo(masterUserId);
+            verify(appointmentService).enrich(any(), any(), eq(hoisted));
+        }
+
+        /**
+         * The lock window must contain no label resolution at all: the two taxonomy SELECTs are pure
+         * reads that every other request against this master would otherwise queue behind. Ordering,
+         * not merely presence, is the contract — a call that merely HAPPENS before the lock in the
+         * current source can be moved back under it without any presence-only assertion noticing.
+         *
+         * <p>Mutation-check RED by moving the {@code resolveVisitLabels} statement below
+         * {@code BookingSlotLockGuard.lockMasterAndAssertFree}.
+         */
+        @Test
+        @DisplayName("should_resolveLabelsBeforeTakingTheMasterLock_when_visitCreated")
+        void should_resolveLabelsBeforeTakingTheMasterLock_when_visitCreated() {
+            stubHappyPath(salonMaster(), assignment(null, null));
+
+            create(command(guest(RAW_PHONE)));
+
+            InOrder ordered = inOrder(appointmentService, bookingRepository);
+            ordered.verify(appointmentService).resolveVisitLabels(any(), any());
+            ordered.verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
         }
 
         /**
@@ -1140,7 +1268,7 @@ class StaffBookingServiceTest {
         void should_returnWhatEnrichReturns_when_visitCreated() {
             stubHappyPath(salonMaster(), assignment(null, null));
             AppointmentDetailResponse stub = stubAppointmentDetailResponse();
-            when(appointmentService.enrich(any(), any())).thenReturn(stub);
+            when(appointmentService.enrich(any(), any(), any())).thenReturn(stub);
 
             AppointmentDetailResponse response = create(command(guest(RAW_PHONE)));
 
@@ -1236,10 +1364,23 @@ class StaffBookingServiceTest {
         stubLockFreeAndSave();
     }
 
+    /**
+     * Stubs the master plus the single-service chain through {@link VisitPlanner}'s BATCH finder.
+     *
+     * <p>{@code findByMasterIdAndIdInWithGraph}, NOT the single-row {@code findByMasterIdAndIdWithGraph}
+     * (perf LOW, 2026-08-22): the planner resolves the whole DISTINCT id set in one round-trip, and
+     * N = 1 is not special-cased there. Stubbing the retired single-row finder here would leave the
+     * real call unstubbed — an empty batch result, hence the planner's uniform 404 — which is exactly
+     * how this fixture would catch a silent revert to the per-item lookup.
+     *
+     * <p>The id set is stubbed EXACTLY ({@code Set.of(masterServiceId)}), never {@code any()}: a
+     * planner that asked for a different — narrowed, widened or master-mismatched — set must miss
+     * this stub and 404 rather than being waved through by a wildcard.
+     */
     private void stubMasterAndAssignment(Master master, MasterServiceAssignment msa) {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
-                .thenReturn(Optional.of(msa));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(masterServiceId)))
+                .thenReturn(List.of(msa));
     }
 
     /**
@@ -1340,14 +1481,23 @@ class StaffBookingServiceTest {
                 List.of(masterServiceId, masterServiceId2, masterServiceId3), START, guest(RAW_PHONE));
     }
 
+    /**
+     * The 3-service chain, resolved in ONE batch round-trip — see {@link #stubMasterAndAssignment}
+     * for why the batch finder and an exact id set.
+     *
+     * <p>The returned list is deliberately in a DIFFERENT order from the command's id list (3, 1, 2):
+     * the planner must sequence the chain by {@code masterServiceIds}' own order and not by whatever
+     * order the query happened to return, so a fixture echoing the request order back could not tell
+     * the two apart.
+     */
     private void stubMasterAndThreeAssignments() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
-                .thenReturn(Optional.of(assignmentWithId(masterServiceId)));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId2))
-                .thenReturn(Optional.of(assignmentWithId(masterServiceId2)));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId3))
-                .thenReturn(Optional.of(assignmentWithId(masterServiceId3)));
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(
+                masterId, Set.of(masterServiceId, masterServiceId2, masterServiceId3)))
+                .thenReturn(List.of(
+                        assignmentWithId(masterServiceId3),
+                        assignmentWithId(masterServiceId),
+                        assignmentWithId(masterServiceId2)));
     }
 
     private void stubThreeServiceVisit() {

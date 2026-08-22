@@ -3,6 +3,7 @@ package com.beautica.booking.entity;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.salon.entity.Salon;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
@@ -116,5 +117,30 @@ class AppointmentStaffFactoryTest {
                 null, "Олена", "Коваль", "+380501234567", STAFF_ID);
 
         assertThat(appointment.getSalon()).isNull();
+    }
+
+    /**
+     * The half the null-salon case above cannot prove. It passes the SAME {@code null} the happy
+     * path at line 33 passes, so between them nothing ever observed a salon actually reaching the
+     * header — deleting {@code .salon(salon)} from {@code Appointment.staffAppointment} was green
+     * across the whole class. A salon-bound walk-in whose header lost its {@code salon_id} is a
+     * visit that vanishes from every salon-scoped query, so this is not cosmetic.
+     *
+     * <p>Mutation-check RED by dropping {@code salon} from the factory's builder chain. Its DB twin
+     * is {@code StaffBookingIT#should_linkEveryBookingToOneHeader_when_staffVisitPersisted}, which
+     * asserts the persisted {@code appointments.salon_id}.
+     */
+    @Test
+    @DisplayName("should carry the salon onto the header when the master is salon-bound")
+    void should_carryTheSalon_when_masterBelongsToASalon() {
+        Salon salon = Salon.builder().id(UUID.randomUUID()).isActive(true).build();
+
+        Appointment appointment = Appointment.staffAppointment(
+                salon, "Олена", "Коваль", "+380501234567", STAFF_ID);
+
+        assertThat(appointment.getSalon())
+                .as("the header must carry the booked salon, not drop it — a salon-less header is "
+                        + "invisible to every salon-scoped query")
+                .isSameAs(salon);
     }
 }

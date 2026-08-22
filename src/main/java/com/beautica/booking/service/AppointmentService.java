@@ -181,15 +181,61 @@ public class AppointmentService {
         // salon's street with the master's current salon's city after a rotation.
         Salon salon = items.get(0).getSalon();
         User masterUser = master.getUser();
-        UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
-        UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
 
-        DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
-                cityId == null ? List.of() : List.of(cityId),
-                districtId == null ? List.of() : List.of(districtId));
+        return enrich(appointment, items, resolveVisitLabels(salon, masterUser));
+    }
+
+    /**
+     * ADDITIVE overload of {@link #enrich(Appointment, List)} for a caller that has already
+     * resolved the discovery labels (perf LOW, 2026-08-22).
+     *
+     * <p>Exists solely so {@code StaffBookingService} can lift {@link #resolveVisitLabels}' two
+     * taxonomy SELECTs OUT of its per-master {@code pg_advisory_xact_lock} window: they are pure
+     * reads that need no lock, and the visit's locality is fully determined before the lock is
+     * taken. The two-argument form is unchanged and still resolves the labels itself, so every
+     * existing caller ({@code enrichCreated}, the BE-5 read path, {@code
+     * AppointmentTransitionService#rescheduleAppointment}) keeps working untouched — no required
+     * parameter was added to the current signature.
+     *
+     * <p>{@code labels} MUST have been produced by {@link #resolveVisitLabels} for the SAME visit's
+     * {@code (salon, masterUser)} pair; passing another visit's labels yields null city/district
+     * labels rather than wrong ones, because the lookup below re-derives the ids from {@code items}
+     * and a {@link DiscoveryLabels} miss returns {@code null}.
+     */
+    AppointmentDetailResponse enrich(
+            Appointment appointment, List<Booking> items, DiscoveryLabels labels) {
+        Salon salon = items.get(0).getSalon();
+        User masterUser = items.get(0).getMaster().getUser();
+        UUID cityId = visitCityId(salon, masterUser);
+        UUID districtId = visitDistrictId(salon, masterUser);
 
         return AppointmentDetailResponse.from(
                 appointment, items, labels.cityLabel(cityId), labels.districtLabel(districtId));
+    }
+
+    /**
+     * The district-primary discovery-label lookup for one visit, in ONE place so a caller that
+     * pre-resolves it (see {@link #enrich(Appointment, List, DiscoveryLabels)}) cannot drift from
+     * the rule {@code enrich} itself applies.
+     *
+     * <p>Both ids are plain {@code UUID} columns on {@link Salon} / {@link User}, so reading them
+     * costs nothing beyond the two taxonomy SELECTs {@code resolveLabels} issues (each skipped when
+     * its id is null).
+     */
+    DiscoveryLabels resolveVisitLabels(Salon salon, User masterUser) {
+        UUID cityId = visitCityId(salon, masterUser);
+        UUID districtId = visitDistrictId(salon, masterUser);
+        return discoveryLocationResolver.resolveLabels(
+                cityId == null ? List.of() : List.of(cityId),
+                districtId == null ? List.of() : List.of(districtId));
+    }
+
+    private static UUID visitCityId(Salon salon, User masterUser) {
+        return salon != null ? salon.getCityId() : masterUser.getCityId();
+    }
+
+    private static UUID visitDistrictId(Salon salon, User masterUser) {
+        return salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {

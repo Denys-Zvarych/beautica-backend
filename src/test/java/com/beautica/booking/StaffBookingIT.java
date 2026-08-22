@@ -38,9 +38,12 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -84,6 +87,10 @@ class StaffBookingIT extends AbstractIntegrationTest {
     private static final BigDecimal PRICE = new BigDecimal("350.00");
     private static final String RAW_PHONE = "050 123 45 67";
     private static final String E164_PHONE = "+380501234567";
+
+    /** Outcome tags for the concurrency race — see {@code WalkInPhoneBudgetConcurrency}. */
+    private static final String CREATED = "CREATED";
+    private static final String THROTTLED = String.valueOf(HttpStatus.TOO_MANY_REQUESTS.value());
 
     @TestConfiguration
     static class FrozenKyivClockConfig {
@@ -632,6 +639,14 @@ class StaffBookingIT extends AbstractIntegrationTest {
             assertThat(header.get("status")).isEqualTo("CONFIRMED");
             assertThat(header.get("cancel_token")).as("no guest self-cancel link for a staff visit").isNull();
             assertThat(header.get("created_by_user_id")).isEqualTo(salon.staffUserId());
+            assertThat(header.get("salon_id"))
+                    .as("the header must carry the booked salon — a salon-less STAFF header is "
+                            + "invisible to every salon-scoped query (findBookedDatesBySalonIds, the "
+                            + "owner rail). Nothing else in this suite or in "
+                            + "AppointmentStaffFactoryTest observed a NON-null salon reaching the "
+                            + "header, so dropping .salon(salon) from Appointment.staffAppointment "
+                            + "used to be green branch-wide")
+                    .isEqualTo(salon.salonId());
         }
 
         @Test
@@ -664,8 +679,10 @@ class StaffBookingIT extends AbstractIntegrationTest {
 
     // ════════════════════════════════════════════════════════════════════════════════
     // Statement count (Anti-Bug §F3 audit finding 3, 2026-08-20) — pins createStaffBooking's SQL
-    // cost so the N-1 wasted platformServiceName lazy loads (audit finding 1) cannot silently
-    // regress unnoticed, mirroring BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ALIGNED and
+    // cost so neither of the two N-scaling regressions it has already had can return unnoticed: the
+    // N-1 wasted platformServiceName lazy loads (audit finding 1, 2026-08-20) and VisitPlanner's
+    // per-id assignment lookup (perf LOW, 2026-08-22). Mirrors
+    // BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ALIGNED and
     // AppointmentReadIT#VISIT_DETAIL_STATEMENTS.
     // ════════════════════════════════════════════════════════════════════════════════
 
@@ -675,27 +692,61 @@ class StaffBookingIT extends AbstractIntegrationTest {
 
         /**
          * Fixed per-visit cost — everything {@code createStaffBooking} issues that does NOT scale
-         * with the number of chained services: the master read, the SMS-budget count, the whole-chain
-         * schedule-fit query, the advisory lock + overlap check, the header insert, the batched
-         * booking insert(s) (one JDBC round trip regardless of N, {@code hibernate.jdbc.batch_size:
-         * 50}), the single first-item {@code service_types} lazy load Finding-1 left in place, and
-         * {@code AppointmentService#enrich}'s reads. Measured against an isolated, freshly-seeded
-         * master per N (own salon, own working-hours row, distinct guest phone) so no fixture reuse
-         * across N could shift the count via warm caches or an already-loaded row.
+         * with the number of chained services:
+         * <ol>
+         *   <li>the master read ({@code findByIdWithUserAndSalon});</li>
+         *   <li>the per-PHONE advisory lock ({@code acquireWalkInPhoneLock}, security MEDIUM
+         *       2026-08-22 — the TOCTOU fix on the SMS budget);</li>
+         *   <li>the SMS-budget count ({@code countStaffWalkInVisitsForPhoneSince});</li>
+         *   <li>the planner's SINGLE batch assignment resolution
+         *       ({@code findByMasterIdAndIdInWithGraph}) — one statement for the whole DISTINCT id
+         *       set, whatever N is. This is the statement that used to be per-item;</li>
+         *   <li>the whole-chain schedule-fit query;</li>
+         *   <li>the per-MASTER advisory lock + the overlap check;</li>
+         *   <li>the header insert and the batched booking insert(s) — one JDBC round trip regardless
+         *       of N, {@code hibernate.jdbc.batch_size: 50};</li>
+         *   <li>the single first-item {@code service_types} lazy load Finding-1 left in place;</li>
+         *   <li>{@code AppointmentService#enrich}'s reads (its two taxonomy SELECTs are now resolved
+         *       through the pre-resolved-labels overload ABOVE the master lock — the same count,
+         *       outside the lock window).</li>
+         * </ol>
+         *
+         * <p><b>Re-baselined 2026-08-22, 11 &rarr; 13</b>, and both deltas are accounted for:
+         * {@code +1} for the new phone lock, and {@code +1} because the assignment resolution MOVED
+         * from the per-item column into this one (see {@link #CREATE_PER_ITEM_STATEMENTS}). No
+         * statement was added that is not named above.
+         *
+         * <p>Measured against an isolated, freshly-seeded master per N (own salon, own working-hours
+         * row, distinct guest phone) so no fixture reuse across N could shift the count via warm
+         * caches or an already-loaded row.
          */
-        private static final long CREATE_FIXED_STATEMENTS = 11L;
+        private static final long CREATE_FIXED_STATEMENTS = 13L;
 
         /**
-         * Per-CHAINED-ITEM cost, AFTER the Finding-1 fix: exactly ONE extra statement per additional
-         * {@code masterServiceIds} entry — {@code VisitPlanner#planChainedItems}'
-         * {@code findByMasterIdAndIdWithGraph} lookup (pre-existing, shared with the APP/LINK visit
-         * paths, out of scope — see the class-level "Do NOT touch VisitPlanner" note). BEFORE the
-         * Finding-1 fix this was 3 per item (the planner lookup PLUS the discarded
-         * {@code platformServiceName} lazy load for every item, min-cardinality proxy fetches
-         * included) — see {@code should_notRegressToTheN-1WastedLazyLoadShape} below for the
-         * falsification of this exact number.
+         * Per-CHAINED-ITEM cost: <b>ZERO</b>. Adding a service to the visit must not add a single
+         * statement.
+         *
+         * <p><b>History, because the number only means something against it.</b> This was 3 before
+         * the Finding-1 fix (the planner's per-id {@code findByMasterIdAndIdWithGraph} PLUS the
+         * discarded {@code platformServiceName} lazy load for every item, min-cardinality proxy
+         * fetches included), then 1 (the planner lookup alone), and is now 0 — {@code VisitPlanner}
+         * batch-loads the DISTINCT id set in one round trip (perf LOW, 2026-08-22), so assignment
+         * resolution is N-independent and its single statement lives in
+         * {@link #CREATE_FIXED_STATEMENTS} instead.
+         *
+         * <p><b>What falsifies it.</b> A zero here is the STRONGEST form of the anti-N+1 assertion,
+         * not a weakened one: {@link
+         * #should_issueFixedPlusLinearPerItemStatementCount_when_creatingATenServiceVisit} asserts
+         * N=10 costs exactly what N=1 costs, so any per-item statement at all separates the two
+         * tests immediately — a return to 1/item lands N=10 at 22, and the pre-Finding-1 3/item
+         * shape at 40, against an expected 13. That red/green pair was OBSERVED, in reverse, when
+         * the batch finder landed: this ledger read 21 at N=10 under the per-id planner and 13
+         * after, with N=1 unchanged at 13. There is no
+         * {@code should_notRegressToTheN-1WastedLazyLoadShape} test — an earlier revision of this
+         * javadoc cited one "below" that was never written; the N=1-vs-N=10 pair IS the
+         * falsification, and it needs no third test to be sharp.
          */
-        private static final long CREATE_PER_ITEM_STATEMENTS = 1L;
+        private static final long CREATE_PER_ITEM_STATEMENTS = 0L;
 
         @Test
         @DisplayName("N=1: fixed cost only, no chained-item statements")
@@ -710,12 +761,14 @@ class StaffBookingIT extends AbstractIntegrationTest {
 
             assertThat(statements)
                     .as("N=1 must cost exactly the fixed baseline — a rise here means a new "
-                            + "per-visit (not per-item) query was added to the create path")
+                            + "per-visit (not per-item) query was added to the create path; a fall "
+                            + "means one this ledger enumerates was removed and the enumeration in "
+                            + "CREATE_FIXED_STATEMENTS' javadoc no longer describes the code")
                     .isEqualTo(CREATE_FIXED_STATEMENTS + CREATE_PER_ITEM_STATEMENTS);
         }
 
         @Test
-        @DisplayName("N=10: fixed cost plus exactly one statement per chained item")
+        @DisplayName("N=10: still the fixed cost — zero statements per chained item")
         void should_issueFixedPlusLinearPerItemStatementCount_when_creatingATenServiceVisit() {
             Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
             statistics.setStatisticsEnabled(true);
@@ -732,10 +785,10 @@ class StaffBookingIT extends AbstractIntegrationTest {
             long statements = statistics.getPrepareStatementCount();
 
             assertThat(statements)
-                    .as("N=10 must land at fixed + 10×per-item. Before the Finding-1 fix this was "
-                            + "30 (10 + 2×10) — the N-1 wasted service_types lazy loads; the "
-                            + "falsification test below proves the guard actually catches that "
-                            + "regression.")
+                    .as("adding nine services must add ZERO statements. A per-id planner lookup "
+                            + "returning puts this at 22; the pre-Finding-1 shape at 40. This test "
+                            + "and its N=1 sibling asserting the SAME number is what makes the "
+                            + "ledger distinguish 0-per-item from 1-per-item at all")
                     .isEqualTo(CREATE_FIXED_STATEMENTS + 10 * CREATE_PER_ITEM_STATEMENTS);
         }
 
@@ -758,6 +811,124 @@ class StaffBookingIT extends AbstractIntegrationTest {
          * per-phone SMS-budget count, which is keyed by phone across the whole suite's DB rows. */
         private StaffClientRef.Guest statementCountWalkIn(int suffix) {
             return new StaffClientRef.Guest("Олена", "Коваль", String.format("+38050912%04d", suffix));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Per-phone SMS budget under concurrency (security MEDIUM, 2026-08-22)
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The live regression for the walk-in SMS-budget TOCTOU fix.
+     *
+     * <p>{@code assertWalkInSmsBudgetForPhone} counts, then the transaction inserts. At READ
+     * COMMITTED that pair is not atomic on anything: nothing in {@code bookings} locks a phone
+     * NUMBER, so C concurrent creates naming the same number all read the identical pre-burst count,
+     * all pass the {@code >= 5} check, and all commit — a 5/hour ceiling degrading to roughly
+     * {@code 5 + C} Beautica-branded messages at a number that never consented.
+     * {@code BookingRepository#acquireWalkInPhoneLock} closes it by serialising same-phone creates.
+     *
+     * <p><b>Why DISTINCT masters.</b> Every racer targets its own freshly-seeded master, so the
+     * per-MASTER advisory lock ({@code acquireAdvisoryLockWithTimeout}, salt 0) is uncontended and
+     * cannot serialise the racers for free. If they all shared one master, the master lock alone
+     * would produce the correct final count and the test would stay green with the phone lock
+     * deleted — it would be measuring the wrong lock. The only thing they share is the phone.
+     *
+     * <p>{@code app.booking.sms.enabled} is deliberately left at its default {@code false}: the
+     * budget check is unconditional at the call site (suppression is the SmsService bean's job —
+     * {@code StaffBookingServiceTest#should_callTheSeamRegardless_when_theFeatureFlagIsOff}), so the
+     * ceiling is enforced whether or not a message is actually dispatched. Flipping the flag would
+     * add a vendor stub to the race and prove nothing extra.
+     */
+    @Nested
+    @DisplayName("Per-phone walk-in budget — concurrency")
+    class WalkInPhoneBudgetConcurrency {
+
+        /** More racers than the budget, so the excess is what the assertion is about. */
+        private static final int RACERS = 8;
+
+        /**
+         * {@code StaffBookingService#MAX_WALK_INS_PER_PHONE_PER_WINDOW}, which is private. Restated
+         * rather than exposed: widening the production field's visibility purely for a test is worse
+         * than one duplicated literal, and if the two ever disagree this test fails loudly (the
+         * sequential boundary rows in {@code StaffBookingServiceTest.PerPhoneSmsBudget} pin the same
+         * number from the other side).
+         */
+        private static final int BUDGET = 5;
+
+        private static final String SHARED_PHONE = "+380509990001";
+
+        @Test
+        @DisplayName("N concurrent walk-ins at ONE phone across N distinct masters: exactly the "
+                + "budget commits, every excess racer is refused")
+        void should_rejectExcessConcurrentWalkIns_when_sameGuestPhone() throws Exception {
+            List<Seed> masters = new ArrayList<>();
+            for (int i = 0; i < RACERS; i++) {
+                Seed fresh = seedSalonMaster();
+                giveWorkingHours(fresh, TODAY_ISO_DOW);
+                masters.add(fresh);
+            }
+            OffsetDateTime startsAt = kyiv(TODAY, 12, 0);
+
+            CountDownLatch go = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(RACERS);
+            // Every racer records exactly one outcome, unconditionally — there is no
+            // `if (succeeded) count++` anywhere, so an implementation that lets everybody through
+            // cannot quietly satisfy this test: it lands RACERS "CREATED" tags against an expected
+            // BUDGET and fails on the frequency assertion below.
+            List<String> outcomes = Collections.synchronizedList(new ArrayList<>());
+
+            for (Seed target : masters) {
+                Thread.ofVirtual().start(() -> {
+                    try {
+                        go.await();
+                        createAs(target.staffUserId(), new StaffBookingCommand(
+                                new StaffBookingScope.InSalon(target.salonId()), target.masterId(),
+                                List.of(target.masterServiceId()), startsAt,
+                                new StaffClientRef.Guest("Олена", "Коваль", SHARED_PHONE)));
+                        outcomes.add(CREATED);
+                    } catch (BusinessException e) {
+                        outcomes.add(String.valueOf(e.getStatus().value()));
+                    } catch (Exception e) {
+                        outcomes.add("UNEXPECTED:" + e.getClass().getSimpleName() + ":" + e.getMessage());
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            go.countDown();
+            assertThat(done.await(120, TimeUnit.SECONDS))
+                    .as("every racer must finish — a timeout here is a deadlock, which is exactly "
+                            + "what the phone(salt 3) → master(salt 0) ordering exists to prevent")
+                    .isTrue();
+
+            assertThat(outcomes)
+                    .as("no racer may vanish, and no outcome may be anything but a create or the "
+                            + "budget's own 429 — a 409, a 500 or a lock timeout would mean this "
+                            + "test measured contention rather than the budget: %s", outcomes)
+                    .hasSize(RACERS)
+                    .containsOnly(CREATED, THROTTLED);
+            assertThat(Collections.frequency(outcomes, CREATED))
+                    .as("exactly the budget may commit. Without acquireWalkInPhoneLock the racers "
+                            + "all read the same pre-burst count of 0 and this rises toward %d — "
+                            + "outcomes: %s", RACERS, outcomes)
+                    .isEqualTo(BUDGET);
+            assertThat(Collections.frequency(outcomes, THROTTLED))
+                    .as("and every racer beyond the budget is refused, not silently dropped")
+                    .isEqualTo(RACERS - BUDGET);
+
+            assertThat(jdbc.queryForObject(
+                    "SELECT count(*) FROM appointments WHERE guest_phone = ?", Integer.class, SHARED_PHONE))
+                    .as("the DATABASE is the arbiter, not the returned statuses: exactly %d visits "
+                            + "for this number may exist", BUDGET)
+                    .isEqualTo(BUDGET);
+            assertThat(jdbc.queryForObject(
+                    "SELECT count(*) FROM bookings WHERE guest_phone = ? AND booking_source = 'STAFF'",
+                    Integer.class, SHARED_PHONE))
+                    .as("single-service commands, so one booking row per committed visit — a "
+                            + "mismatch here would mean a partial visit was persisted")
+                    .isEqualTo(BUDGET);
         }
     }
 

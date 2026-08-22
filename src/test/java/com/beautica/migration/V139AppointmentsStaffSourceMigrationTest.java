@@ -311,6 +311,30 @@ class V139AppointmentsStaffSourceMigrationTest extends AbstractIntegrationTest {
         assertStaffRowRejected(null, "Олена", null, "+380501234567", null);
     }
 
+    /**
+     * The surname twin of {@link #should_rejectStaffHeader_when_guestNameBlank}. V139:124 carries
+     * {@code btrim(guest_surname) &lt;&gt; ''} exactly as it does for {@code guest_name}, but only
+     * the NULL case was covered — so deleting the surname clause was a GREEN mutation while the
+     * identical deletion on the name side went red. Mutation-check RED by deleting
+     * {@code btrim(guest_surname) &lt;&gt; ''} from V139's STAFF branch.
+     */
+    @Test
+    @DisplayName("a STAFF walk-in header whose guest_surname is the empty string")
+    void should_rejectStaffHeader_when_guestSurnameBlank() {
+        assertStaffRowRejected(null, "Олена", "", "+380501234567", null);
+    }
+
+    /**
+     * Whitespace-only surname, distinct from the empty-string case for the same reason its
+     * {@code guest_name} sibling is: a guard written {@code <> ''} without {@code btrim} admits
+     * this row while still rejecting the empty string.
+     */
+    @Test
+    @DisplayName("a STAFF walk-in header whose guest_surname is whitespace only")
+    void should_rejectStaffHeader_when_guestSurnameWhitespaceOnly() {
+        assertStaffRowRejected(null, "Олена", "   ", "+380501234567", null);
+    }
+
     @Test
     @DisplayName("a STAFF header with neither a client_id nor any guest identity")
     void should_rejectStaffHeader_when_noIdentityAtAll() {

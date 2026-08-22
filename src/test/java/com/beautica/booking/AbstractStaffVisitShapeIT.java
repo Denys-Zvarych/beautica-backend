@@ -116,10 +116,20 @@ abstract class AbstractStaffVisitShapeIT extends AbstractStaffBookingIT {
                     .isTrue();
             assertThat(row.path("clientFirstName").asText(null)).isEqualTo(GUEST_FIRST_NAME);
             assertThat(row.path("clientLastName").asText(null)).isEqualTo(GUEST_LAST_NAME);
-            assertThat(row.path("appointmentId").isNull())
-                    .as("appointmentId is set iff this shape has a header (Phase 22.12 D2 — no "
-                            + "backfill, so a legacy row never gains one)")
-                    .isEqualTo(!hasAppointmentHeader());
+            // appointmentId is set iff this shape has a header (Phase 22.12 D2 — no backfill, so a
+            // legacy row never gains one). Asserted as a VALUE on the NEW arm, not as
+            // `isNull() == false`: Jackson's MissingNode.isNull() also answers false, so the
+            // negative form was satisfied by a mapper that dropped the field entirely — and this is
+            // the single assertion carrying 22.12's new-behaviour weight on this path.
+            if (hasAppointmentHeader()) {
+                assertThat(row.path("appointmentId").asText(null))
+                        .as("the NEW shape must serialize the header id it actually links to")
+                        .isEqualTo(visit.appointmentId().toString());
+            } else {
+                assertThat(row.path("appointmentId").isNull())
+                        .as("a legacy row has no header and must serialize an explicit null")
+                        .isTrue();
+            }
         }
 
         @Test

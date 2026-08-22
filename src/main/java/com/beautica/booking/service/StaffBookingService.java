@@ -17,6 +17,7 @@ import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
 import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
@@ -275,7 +276,36 @@ public class StaffBookingService {
         // AFTER normalisation, so "050 123 45 67" and "+380501234567" cannot be alternated to buy a
         // second budget; BEFORE the advisory lock, so a throttled request never contends for the
         // lock every other request against this master queues on.
+        //
+        // THIS CALL SITE MUST NOT MOVE BELOW lockMasterAndAssertFree (security MEDIUM, 2026-08-22).
+        // The method now takes a per-PHONE advisory lock (salt 3) of its own, so the acquisition
+        // order on this path is always phone → master (salt 0), mirroring the client(salt 1) →
+        // master(salt 0) order BookingService uses. No path anywhere takes the master lock first, so
+        // there is one global ordering and no acquisition cycle; swapping these two statements would
+        // create one. That phone lock is this transaction's FIRST advisory lock and therefore fuses
+        // the 3s lock_timeout the whole transaction then inherits.
         assertWalkInSmsBudgetForPhone(guestPhone);
+
+        // Read-only enrichment work HOISTED ABOVE the per-master lock (perf LOW, 2026-08-22). Both
+        // resolutions below are pure reads that need no lock, and both used to run after it — the
+        // platform service name is one lazy `service_types` load and the discovery labels are two
+        // SELECTs, so ~3 round-trips of lock-irrelevant work sat inside the window every other
+        // request against this master queues on. Nothing here depends on the lock's outcome, and
+        // both inputs (`items` from the planner, `master` with its user + salon JOIN FETCHed) are
+        // already resolved and managed at this point, so this is a pure move.
+        //
+        // Only the FIRST item's platform name is resolved (perf MEDIUM, 2026-08-20):
+        // visitServiceNamePhrase never reads past index 0, so resolving all N would issue N-1
+        // wasted `service_types` lazy loads. `items.size()` stands in for the discarded remainder.
+        String firstServiceName =
+                platformServiceName(items.get(0).masterService().getServiceDefinition());
+        // Same locality rule AppointmentService#enrich applies (booked salon wins, else the master's
+        // own user row), resolved through that class's own helper rather than a second copy here —
+        // `master.getSalon()` IS the instance handed into every Booking.staffBooking(...) below, and
+        // cityId/districtId are plain UUID columns on both entities, so this issues no extra load
+        // beyond resolveLabels' own two taxonomy SELECTs.
+        DiscoveryLabels labels =
+                appointmentService.resolveVisitLabels(master.getSalon(), master.getUser());
 
         // ONE span check over [firstStart, lastEnd), not N per-item checks: the chained items are
         // contiguous by construction AT CREATE TIME (VisitPlanner#assertContiguous), so the union of
@@ -316,13 +346,8 @@ public class StaffBookingService {
         // Rendered NOW, inside the transaction, while `master` and `items` are still managed — the
         // callback runs after the persistence context closes, so touching a lazy association from
         // there would be a LazyInitializationException. EXACTLY ONE SMS for the whole visit, naming
-        // the first service and counting the rest (Phase 22.13). Only the FIRST item's platform name
-        // is resolved (perf MEDIUM, 2026-08-20): visitServiceNamePhrase never reads past index 0, so
-        // resolving all N would issue N-1 wasted `service_types` lazy loads — platformServiceName is
-        // per-item DB work, not a free field read. `items.size()` stands in for the discarded
-        // remainder count.
-        String firstServiceName =
-                platformServiceName(items.get(0).masterService().getServiceDefinition());
+        // the first service and counting the rest (Phase 22.13). `firstServiceName` was resolved
+        // above the master lock; the rendering itself is pure string work.
         registerWalkInConfirmationSms(
                 guestPhone,
                 buildWalkInConfirmationSms(master, firstServiceName, items.size(), firstStart, lastEnd));
@@ -335,7 +360,11 @@ public class StaffBookingService {
         // into every `Booking.staffBooking(...)` call above — so no extra SELECT is issued and no
         // `findByAppointmentIdWithGraph` re-fetch is needed. `saved` is already ordered ascending by
         // startsAt (it mirrors `items`' chained order), matching `enrich`'s documented precondition.
-        return appointmentService.enrich(appointment, saved);
+        //
+        // The pre-resolved-labels overload (perf LOW, 2026-08-22) so `enrich`'s two taxonomy SELECTs
+        // do not run inside the per-master lock window — the two-argument form still resolves them
+        // itself and every other caller is unchanged.
+        return appointmentService.enrich(appointment, saved, labels);
     }
 
     /**
@@ -350,8 +379,23 @@ public class StaffBookingService {
      * <p>A {@code 429}, matching {@code PhoneOtpService}'s per-phone verdict, and with a message
      * that names no number: the response must not confirm to a prober that a given phone has been
      * booked recently.
+     *
+     * <h4>Why the lock is the FIRST statement (security MEDIUM, 2026-08-22)</h4>
+     * Count-then-insert is a classic TOCTOU: nothing in {@code bookings} locks the phone, so at
+     * READ COMMITTED C concurrent creates naming the same number all read the identical pre-burst
+     * count, all pass this check, and all insert — turning a 5/hour ceiling into ~{@code 5 + C}
+     * messages at a number that never consented. Not reachable today (no committed profile sets
+     * {@code app.booking.sms.enabled=true}) and fully live the moment that flag flips.
+     * {@link BookingRepository#acquireWalkInPhoneLock} serialises same-phone creates so the second
+     * caller counts the row the first committed. It is taken before the count, never after — a lock
+     * acquired after the read would protect nothing.
      */
     private void assertWalkInSmsBudgetForPhone(String guestPhone) {
+        // Serialises same-phone creates. The phone is ALREADY E.164-normalised at every call site
+        // (UkrainianPhoneNormalizer.toE164 runs first), so "050 123 45 67" and "+380501234567" key
+        // the SAME lock — a lock on the raw string would be inert against exactly the alternation
+        // the normalisation exists to defeat.
+        bookingRepository.acquireWalkInPhoneLock(guestPhone);
         long recent = bookingRepository.countStaffWalkInVisitsForPhoneSince(
                 guestPhone, clock.instant().minus(WALK_IN_PHONE_WINDOW));
         if (recent >= MAX_WALK_INS_PER_PHONE_PER_WINDOW) {

@@ -32,6 +32,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -312,12 +313,16 @@ class GuestBookingServiceTest {
         UUID thirdServiceId = UUID.randomUUID();
         when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
-                .thenReturn(Optional.of(masterService()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, secondServiceId))
-                .thenReturn(Optional.of(masterService(secondServiceId, "Педикюр")));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, thirdServiceId))
-                .thenReturn(Optional.of(masterService(thirdServiceId, "Брови")));
+        // The visit path resolves the whole chain through VisitPlanner, which batch-loads the
+        // DISTINCT id set in ONE round-trip (perf LOW, 2026-08-22) rather than one SELECT per id.
+        // Stubbing the exact set — not any() — is what keeps this stub falsifying a planner that
+        // silently narrowed or widened the id set it asks for.
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(
+                masterId, Set.of(serviceId, secondServiceId, thirdServiceId)))
+                .thenReturn(List.of(
+                        masterService(),
+                        masterService(secondServiceId, "Педикюр"),
+                        masterService(thirdServiceId, "Брови")));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -348,8 +353,10 @@ class GuestBookingServiceTest {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
-                .thenReturn(Optional.of(masterService()));
+        // Single-element masterServiceIds still goes through the planner's BATCH finder — N = 1 is
+        // not special-cased there either.
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId)))
+                .thenReturn(List.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));

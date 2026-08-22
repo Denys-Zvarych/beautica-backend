@@ -1295,6 +1295,58 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     Integer acquireAdvisoryLock(@Param("masterId") UUID masterId);
 
     /**
+     * Per-RECIPIENT-PHONE advisory lock serialising the walk-in SMS-budget check-then-insert
+     * ({@code StaffBookingService#assertWalkInSmsBudgetForPhone}) — security MEDIUM, 2026-08-22.
+     *
+     * <p><b>Why it exists.</b> {@link #countStaffWalkInVisitsForPhoneSince} followed by the insert
+     * is a read-then-write on a value no row locks: at READ COMMITTED, C concurrent creates naming
+     * the SAME number all observe the identical pre-burst count, all pass, and all insert — so the
+     * {@code MAX_WALK_INS_PER_PHONE_PER_WINDOW} ceiling degrades to roughly {@code cap + C}
+     * Beautica-branded messages at a number that never consented. Taking this lock first makes the
+     * count-and-insert atomic per phone: the second caller blocks until the first commits and then
+     * counts the row the first created.
+     *
+     * <p><b>Salt {@code 3} — a dedicated keyspace, disjoint from every other lock.</b> Salt
+     * {@code 0} is the per-master booking lock ({@link #acquireAdvisoryLock}), salt {@code 1} the
+     * per-client lock ({@link #acquireClientAdvisoryLockWithTimeout}) and salt {@code 2} the bulk
+     * service-setup lock — see the allocation table on
+     * {@code MasterServiceRepository#acquireBulkSetupLockWithTimeout}, and grep
+     * {@code hashtextextended} in {@code src/main} before claiming a new salt. This lock originally
+     * (wrongly) claimed salt {@code 1}, sharing the client-UUID keyspace. That never produced a
+     * wrong verdict — the lock key is not a data key, {@link #countStaffWalkInVisitsForPhoneSince}
+     * filters on real columns — but {@code hashtextextended} is non-cryptographic and computable
+     * offline, so a staff actor holding a client UUID from their own booking payloads could grind
+     * an E.164 preimage and intermittently 409 that client's creates. A disjoint salt removes the
+     * grind target outright (security LOW, 2026-08-22).
+     *
+     * <p><b>Lock ordering is phone → master on every path that takes both</b>, mirroring the
+     * client(salt 1) → master(salt 0) order {@code BookingService} uses: no path acquires the
+     * master lock before this one, so no acquisition cycle exists across the two orderings and no
+     * deadlock is introduced. The one caller must therefore keep taking this lock BEFORE
+     * {@code BookingSlotLockGuard.lockMasterAndAssertFree} — see
+     * {@code StaffBookingService#assertWalkInSmsBudgetForPhone}'s call-site comment.
+     *
+     * <p><b>The 3s {@code lock_timeout} is fused here, not inherited</b> (security MEDIUM,
+     * 2026-08-22). The staff create path takes no client lock, so this is the transaction's FIRST
+     * advisory lock and nothing has set {@code lock_timeout} yet — Postgres defaults it to
+     * {@code 0} (wait forever). The ceiling applied later by {@link #acquireAdvisoryLockWithTimeout}
+     * is useless to a caller still blocked here. This lock is taken BEFORE the count by design, so
+     * over-cap requests contend too: the cap bounds successful INSERTs, never lock acquisitions, and
+     * a provider flooding one number serialises unbounded requests that each park one of only 10
+     * Hikari connections ({@code BookingRateLimitFilter} concedes no per-actor bucket bounds an
+     * attacker holding several staff accounts). Hence the fused, transaction-scoped ceiling, exactly
+     * as on every other first-in-transaction advisory lock in this codebase. A wait beyond 3s aborts
+     * with {@code 55P03 lock_not_available} → {@code CannotAcquireLockException} → a clean 409.
+     */
+    @Query(value = """
+            SELECT 1 FROM (
+                SELECT set_config('lock_timeout', '3s', true),
+                       pg_advisory_xact_lock(hashtextextended(CAST(:phone AS text), 3))
+            ) sub
+            """, nativeQuery = true)
+    Integer acquireWalkInPhoneLock(@Param("phone") String phone);
+
+    /**
      * Fused, single-round-trip form of the per-master advisory lock for callers that take
      * ONLY the master lock (no client lock beforehand). Originally just
      * {@code GuestBookingService#persistBooking}; now also used by the no-client-lock (guest

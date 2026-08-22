@@ -48,8 +48,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       through the fallback in {@code BookingDetailResponse#from}. A provider whose calendar card
  *       renders {@code null} here has an unnamed appointment.</li>
  *   <li>{@code clientAvatarUrl} is {@code null} and has NO fallback (no account, no photo).</li>
- *   <li>{@code appointmentId} is {@code null} — {@code chk_appointment_source} still admits only
- *       {@code ('APP','LINK')}, so this track is structurally single-service.</li>
+ *   <li>{@code appointmentId} is <b>set</b> — V139 widened {@code chk_appointment_source} to admit
+ *       {@code 'STAFF'}, and Phase 22.12's D2 decision refuses to short-circuit on {@code N = 1}, so
+ *       every walk-in created after that phase carries an {@code appointments} header exactly like
+ *       the single-service APP/LINK case. (The pre-22.12 {@code appointment_id IS NULL} shape still
+ *       exists on old rows and is never backfilled — {@link AbstractStaffVisitShapeIT} is the suite
+ *       that covers BOTH shapes; this one reads only the new one.)</li>
  *   <li>{@code canReview} and {@code providerCanReviewClient} are both hard {@code false}, and stay
  *       false even once the visit is {@code COMPLETED} — the one status at which the same row shape
  *       WITH a registered client flips {@code providerCanReviewClient} to true.</li>
@@ -139,13 +143,14 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
                 + "flags false")
         void should_returnGuestIdentityAndNullAccountFields_when_providerListsAStaffBooking()
                 throws Exception {
-            UUID bookingId = createStaffBooking(tomorrowAtNoon());
+            Visit visit = createStaffVisit(salon.masterId(), salon.masterServiceId(),
+                    tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             JsonNode row = onlyRowOf(listMyBookings(tokenFor(salon.ownerEmail()), null, null));
 
             assertThat(row.path("id").asText())
                     .as("control: the listed row is the walk-in that was just created")
-                    .isEqualTo(bookingId.toString());
+                    .isEqualTo(visit.booking(0).toString());
             assertThat(row.path("clientId").isNull())
                     .as("a walk-in has no users row at all (V137 chk_bookings_guest_fields pins "
                             + "client_id IS NULL for a STAFF guest booking), so clientId must "
@@ -164,14 +169,15 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
                     .as("clientAvatarUrl has NO guest fallback: no account means no uploaded photo "
                             + "and nothing to fall back TO, so the card renders the generic glyph")
                     .isTrue();
-            assertThat(row.path("appointmentId").isNull())
+            assertThat(row.path("appointmentId").asText(null))
                     .as("Phase 22.12 — N = 1 still creates an appointments header (D2's locked "
                             + "no-size-short-circuit decision), so a walk-in created after this "
-                            + "phase now carries a non-null appointmentId, exactly like the "
-                            + "single-service APP/LINK case. It is asserted NOT-null here on "
-                            + "purpose: an assertion that appointmentId stays null would silently "
-                            + "start failing on production data and this suite would never notice")
-                    .isFalse();
+                            + "phase carries the header's OWN id, exactly like the single-service "
+                            + "APP/LINK case. Asserted as a VALUE, never as `isNull() == false`: "
+                            + "Jackson's MissingNode.isNull() also answers false, so the negative "
+                            + "form was satisfied by a mapper that dropped the field entirely — and "
+                            + "this is the single assertion carrying 22.12's new behaviour here")
+                    .isEqualTo(visit.appointmentId().toString());
             // Both flags are also false for a future-dated CONFIRMED booking of ANY shape, so on
             // THIS row they are documentation of the wire contract rather than a discriminating
             // check. The next test is the one that proves the false comes from the missing client.
@@ -501,13 +507,14 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
                 + "the guest columns, both review flags false")
         void should_returnGuestIdentityAndNullAccountFields_when_providerFetchesAStaffBookingById()
                 throws Exception {
-            UUID bookingId = createStaffBooking(tomorrowAtNoon());
+            Visit visit = createStaffVisit(salon.masterId(), salon.masterServiceId(),
+                    tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
-            JsonNode row = getBooking(tokenFor(salon.ownerEmail()), bookingId);
+            JsonNode row = getBooking(tokenFor(salon.ownerEmail()), visit.booking(0));
 
             assertThat(row.path("id").asText())
                     .as("control: the fetched row is the walk-in that was just created")
-                    .isEqualTo(bookingId.toString());
+                    .isEqualTo(visit.booking(0).toString());
             assertThat(row.path("clientId").isNull())
                     .as("clientId must serialize as null on the detail path too — findByIdWith"
                             + "FullGraph LEFT JOIN FETCHes the client precisely so a null-client row "
@@ -525,11 +532,13 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
             assertThat(row.path("clientAvatarUrl").isNull())
                     .as("no account means nothing to fall back TO, on this path as on the listing")
                     .isTrue();
-            assertThat(row.path("appointmentId").isNull())
-                    .as("Phase 22.12 — N = 1 still creates an appointments header, so this walk-in's "
-                            + "appointmentId is set on the per-row detail path exactly as it is on "
-                            + "the listing path (same mapper, same underlying column)")
-                    .isFalse();
+            assertThat(row.path("appointmentId").asText(null))
+                    .as("Phase 22.12 — N = 1 still creates an appointments header, so this walk-in "
+                            + "carries the header's OWN id on the per-row detail path exactly as it "
+                            + "does on the listing path (same mapper, same underlying column). "
+                            + "Asserted as a VALUE — see the listing test for why `isNull() == "
+                            + "false` was satisfied by a dropped field")
+                    .isEqualTo(visit.appointmentId().toString());
             // Both flags are false for a future-dated CONFIRMED booking of ANY shape, so here they
             // pin the wire contract only. The next test is the discriminating one.
             assertThat(row.path("canReview").asBoolean(true))
@@ -585,6 +594,67 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════════
+    // 7 — cross-tenant READ: a walk-in is not readable by a provider from another salon
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The IDOR half nothing covered on the READ side of a walk-in.
+     *
+     * <p>The foreign-owner / foreign-master 403 matrix exists only on the CREATE endpoint
+     * ({@code StaffBookingEndpointIT.Denied}); {@link AbstractStaffVisitShapeIT} covers
+     * {@code CLIENT → 403} only, which is a different guard (a CLIENT is refused by ownership, a
+     * foreign PROVIDER by salon/master scope); and {@code BookingDetailContractIT}'s cross-tenant row
+     * uses a client-bound booking. So the shape a walk-in read actually presents —
+     * {@code client_id IS NULL}, exactly what an "actor is the owning client OR actor has provider
+     * authority" predicate falls through — had never met a foreign provider.
+     *
+     * <p>Both directions are asserted, because they fail independently: the by-id fetch is the
+     * per-row authorization gate, while {@code /bookings/me}'s scope is a QUERY predicate. A
+     * listing that leaked the row would be an equally real cross-tenant read even with the detail
+     * gate intact.
+     */
+    @Nested
+    @DisplayName("Cross-tenant reads — a provider from another salon")
+    class ForeignProvider {
+
+        @Test
+        @DisplayName("GET /bookings/{id} by the owner of a DIFFERENT salon is 403 on a walk-in")
+        void should_return403_when_aForeignSalonOwnerFetchesAWalkInById() throws Exception {
+            UUID walkInId = createStaffBooking(tomorrowAtNoon());
+            Salon other = seedSalon();
+
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    BOOKINGS_URL + "/" + walkInId, HttpMethod.GET,
+                    new HttpEntity<>(bearerHeaders(tokenFor(other.ownerEmail()))), String.class);
+
+            assertThat(resp.getStatusCode())
+                    .as("a walk-in row is client-less, so the ownership half of the guard can never "
+                            + "match — provider scope is the only thing refusing this read. "
+                            + "body=%s", resp.getBody())
+                    .isEqualTo(HttpStatus.FORBIDDEN);
+        }
+
+        @Test
+        @DisplayName("GET /bookings/me for the owner of a DIFFERENT salon never lists the walk-in")
+        void should_omitTheWalkIn_when_aForeignSalonOwnerListsTheirCalendar() throws Exception {
+            UUID walkInId = createStaffBooking(tomorrowAtNoon());
+            Salon other = seedSalon();
+
+            List<UUID> foreignIds = idsOf(listMyBookings(tokenFor(other.ownerEmail()), null, null));
+            List<UUID> ownIds = idsOf(listMyBookings(tokenFor(salon.ownerEmail()), null, null));
+
+            assertThat(ownIds)
+                    .as("control: the row IS listable — so the absence below is scoping, not an "
+                            + "endpoint that lists nothing")
+                    .contains(walkInId);
+            assertThat(foreignIds)
+                    .as("the listing's scope predicate must exclude another salon's walk-in; a leak "
+                            + "here is a cross-tenant read even with the by-id gate intact")
+                    .doesNotContain(walkInId);
+        }
+    }
+
     // ── staff-create helpers (the real endpoint) ─────────────────────────────────
 
     /**
@@ -605,6 +675,24 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
     private UUID createStaffBooking(
             UUID masterId, UUID masterServiceId, String token, OffsetDateTime startsAt)
             throws Exception {
+        return createStaffVisit(masterId, masterServiceId, token, startsAt).booking(0);
+    }
+
+    /**
+     * The same create, returning BOTH ids — the header's and the single chained booking's.
+     *
+     * <p>Exists because the {@code appointmentId} wire assertions must compare a VALUE, and a helper
+     * that discards the header id forces those assertions into the "is it non-null" shape that
+     * Jackson's {@code MissingNode} silently satisfies. Not a second copy of the POST:
+     * {@link #createStaffBooking(UUID, UUID, String, OffsetDateTime)} delegates here.
+     *
+     * <p>{@code AbstractStaffBookingIT#postWalkIn} is NOT reused: it hardcodes the base fixture's
+     * guest name pair, while this suite's whole point is asserting attribution against its own
+     * deliberately-distinct {@link #GUEST_FIRST_NAME}/{@link #GUEST_LAST_NAME}.
+     */
+    private Visit createStaffVisit(
+            UUID masterId, UUID masterServiceId, String token, OffsetDateTime startsAt)
+            throws Exception {
         String body = """
                 {"masterServiceIds":["%s"],"startsAt":"%s",
                  "guest":{"name":"%s","surname":"%s","phone":"%s"}}
@@ -615,8 +703,10 @@ class StaffBookingReadPathIT extends AbstractStaffBookingIT {
         assertThat(resp.getStatusCode())
                 .as("walk-in setup must succeed — body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.CREATED);
-        return UUID.fromString(objectMapper.readTree(resp.getBody())
-                .path("data").path("items").path(0).path("bookingId").asText());
+        JsonNode data = objectMapper.readTree(resp.getBody()).path("data");
+        List<UUID> bookingIds = new ArrayList<>();
+        data.path("items").forEach(item -> bookingIds.add(UUID.fromString(item.path("bookingId").asText())));
+        return new Visit(UUID.fromString(data.path("id").asText()), bookingIds);
     }
 
     // ── SQL fixtures ─────────────────────────────────────────────────────────────
