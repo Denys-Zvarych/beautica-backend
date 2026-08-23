@@ -291,7 +291,16 @@ public class AppointmentService {
 
         // Client-conflict check over the WHOLE visit span, BEFORE the master lock is taken — same
         // precedence and rationale as the single-service create path.
-        assertNoClientConflict(clientId, firstStart, lastEnd);
+        //
+        // OVERRIDE (product decision 2026-08-22): same contract as
+        // BookingService#doCreateBooking's identical block — request.allowClientOverlap() skips
+        // ONLY this self-conflict check. The per-master advisory lock, existsOverlap and the
+        // no_overlapping_bookings EXCLUDE constraint below still run unconditionally; they protect a
+        // DIFFERENT client's claim on this master's slot, never this client's to waive. Defaults
+        // false, so an absent/omitted field reproduces today's behaviour byte-for-byte.
+        if (!request.allowClientOverlap()) {
+            assertNoClientConflict(clientId, firstStart, lastEnd);
+        }
 
         // SCHEDULE-FIT GATE (2026-08-11 HIGH) — the multi-service counterpart of the single-service
         // create gate in BookingService#doCreateBooking. Neither BookingStartsAtValidator above nor the

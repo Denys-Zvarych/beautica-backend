@@ -38,6 +38,50 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+/**
+ * Central {@code @ExceptionHandler} advice. Every handler below returns the wire contract
+ * directly; handlers for ordinary, expected user-level rejections (a duplicate email, a
+ * client double-booking themselves) log at DEBUG on purpose — they are flow control, not
+ * operational events.
+ *
+ * <h2>Do NOT try to suppress Spring's {@code WARN ... Resolved [SomeException: ...]} line</h2>
+ * That line is emitted by {@code AbstractHandlerExceptionResolver#logException} on the shared
+ * {@code ExceptionHandlerExceptionResolver}, and ONLY when its {@code warnLogCategory} has been
+ * set — which Spring Boot does solely when {@code spring.mvc.log-resolved-exception=true}.
+ * That property is <strong>not set anywhere in this repository</strong> and its framework
+ * default is {@code false}. The single thing that turns it on is
+ * <strong>spring-boot-devtools</strong>, whose {@code devtools-property-defaults.properties}
+ * ships {@code spring.mvc.log-resolved-exception=true} deliberately, so a developer running
+ * the app sees every exception the advice swallowed.
+ *
+ * <p>Consequences, verified empirically on 2026-08-23 by booting the {@code local} profile twice
+ * and firing the same two failing requests at it:
+ * <ul>
+ *   <li>plain {@code bootRun} &rarr; {@code WARN o.s.w.s.m.m.a.ExceptionHandlerExceptionResolver
+ *       - Resolved [...]} for every handled exception;</li>
+ *   <li>{@code bootRun --spring.devtools.add-properties=false} &rarr; identical responses,
+ *       <em>no</em> {@code Resolved} line at all.</li>
+ * </ul>
+ *
+ * <p>DevTools is declared {@code developmentOnly} and the {@code verifyNoDevtoolsInProd} Gradle
+ * task (wired into {@code check}) fails the build if it ever reaches
+ * {@code productionRuntimeClasspath}. So this WARN <strong>cannot occur on Railway</strong>, it
+ * does not fire under {@code @SpringBootTest} either (DevTools' {@code Restarter} is never
+ * initialised there, so the property defaults are not applied), and it therefore cannot be
+ * pinned by any test — a test asserting its absence would be green no matter what the code did.
+ *
+ * <p>A previous attempt added a {@code HIGHEST_PRECEDENCE HandlerExceptionResolver} that
+ * pre-empted Spring's resolver for {@link ClientBookingConflictException} and serialised the
+ * body by hand. It was reverted: it shipped production machinery to mute a developer-only log
+ * line, bypassed the {@code HttpMessageConverter} chain, and wrote the response without a
+ * charset — which would have turned the Cyrillic {@code serviceName}/{@code masterName} in
+ * {@link ClientBookingConflictResponse} into mojibake for the mobile conflict dialog.
+ *
+ * <p>If the local {@code Resolved [...]} chatter bothers you, silence it in your OWN
+ * environment — {@code --spring.devtools.add-properties=false}, or
+ * {@code logging.level.org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver=ERROR}
+ * in a personal config. Do not add application code for it.
+ */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
@@ -210,9 +254,10 @@ public class GlobalExceptionHandler {
     /**
      * Method-security denial (a {@code @PreAuthorize}/{@code @PostAuthorize} check failed),
      * surfaced by Spring's {@code AuthorizationManagerBeforeMethodInterceptor}. Without an
-     * explicit WARN line here the only trace is Spring's opaque
-     * {@code Resolved [AuthorizationDeniedException: Access Denied]}, which carries no path
-     * or principal and makes 403s impossible to triage.
+     * explicit WARN line here a 403 is untriageable in production: there is no trace at all,
+     * because Spring's {@code Resolved [AuthorizationDeniedException: Access Denied]} line —
+     * which carries no path or principal anyway — is DevTools-only and never reaches Railway
+     * (see the class javadoc).
      *
      * <p>Logs HTTP method + request URI + the principal's authorities + the non-PII subject
      * (the user id held in {@link Authentication#getDetails()}, set by

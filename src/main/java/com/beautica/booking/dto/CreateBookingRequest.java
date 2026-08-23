@@ -12,6 +12,17 @@ import java.util.UUID;
  *   {@code BookingService} additionally enforces future-date bounds using the injected {@link java.time.Clock}
  *   bean from {@code ClockConfig}. The two clocks are intentionally independent — Spring's validator
  *   provides the first-pass 400, the service provides authoritative booking-window enforcement.
+ * @param allowClientOverlap explicit, client-supplied opt-in (product decision 2026-08-22) to allow
+ *   this booking to overlap the client's OWN other CONFIRMED booking(s). Defaults to {@code false}
+ *   (a primitive {@code boolean}, so an absent field on the wire deserializes to {@code false} and
+ *   every existing caller is byte-for-byte unaffected). When {@code false}, behaviour is unchanged:
+ *   {@code BookingService#doCreateBooking} rejects a self-overlap with the usual
+ *   {@code ClientBookingConflictException} (409). When {@code true}, ONLY that self-conflict check
+ *   is skipped — the per-master {@code existsOverlap} check and the DB-level
+ *   {@code no_overlapping_bookings} EXCLUDE constraint (which protect a DIFFERENT client's booking
+ *   on the same master slot) still run exactly as before and can never be bypassed by this flag.
+ *   It is the client's own responsibility to avoid a self-overlap they did not intend — see the
+ *   locked product decision recorded on {@code BookingService#doCreateBooking}.
  */
 public record CreateBookingRequest(
         @NotNull(message = "Master ID is required") UUID masterId,
@@ -28,5 +39,6 @@ public record CreateBookingRequest(
         @Size(max = 1000, message = "Comment must be at most 1000 characters")
         @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
                 message = "Comment must not contain control characters other than line breaks and tabs")
-        String clientComment
+        String clientComment,
+        boolean allowClientOverlap
 ) {}

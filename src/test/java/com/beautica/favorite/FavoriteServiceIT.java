@@ -201,7 +201,7 @@ class FavoriteServiceIT extends AbstractIntegrationTest {
                 .withHour(11).withMinute(0).withSecond(0).withNano(0);
         ResponseEntity<String> booking = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
-                new HttpEntity<>(new CreateBookingRequest(master, masterServiceId, startsAt, null, null),
+                new HttpEntity<>(new CreateBookingRequest(master, masterServiceId, startsAt, null, null, false),
                         bearerHeaders(token)),
                 String.class);
 

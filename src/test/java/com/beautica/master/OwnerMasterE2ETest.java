@@ -258,7 +258,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         // Use Kyiv timezone explicitly so slot arithmetic matches the server's configured zone
         ZonedDateTime startsAt = ZonedDateTime.now(KYIV)
                 .plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var bookingReq = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var bookingReq = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
         ResponseEntity<String> bookingResp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(bookingReq, bearerHeaders(clientToken)),

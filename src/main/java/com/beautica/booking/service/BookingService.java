@@ -2066,7 +2066,17 @@ public class BookingService {
         // product decision — AND the shared per-master lock (contended by every other client
         // racing for the same popular master) is never touched for a conflict that is entirely
         // about this client's own calendar (backend-perf).
-        assertNoClientConflict(clientId, startsAt, endsAt);
+        //
+        // OVERRIDE (product decision 2026-08-22): request.allowClientOverlap() is an explicit,
+        // client-supplied opt-in to double-book THEMSELVES — "it's only the client's responsibility".
+        // Skips ONLY this self-conflict check. It changes nothing below: the per-master advisory
+        // lock, existsOverlap and the no_overlapping_bookings EXCLUDE constraint still run
+        // unconditionally, because they protect a DIFFERENT client's claim on this master's slot,
+        // which is never the requesting client's to waive. Defaults false (primitive boolean), so an
+        // absent/omitted field reproduces today's behaviour byte-for-byte.
+        if (!request.allowClientOverlap()) {
+            assertNoClientConflict(clientId, startsAt, endsAt);
+        }
 
         // SCHEDULE-FIT GATE (2026-08-11 HIGH). validateStartsAt above enforces only the lead-time floor
         // and the 180-day horizon; assertNoClientConflict enforces only the CLIENT's own calendar; the

@@ -310,7 +310,7 @@ class BookingRescheduleGuardChainIT extends AbstractIntegrationTest {
 
     private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId,
                                ZonedDateTime startsAt) throws Exception {
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,

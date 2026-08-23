@@ -41,7 +41,7 @@ class BookingCommentControlCharValidationTest {
     private static CreateBookingRequest createBookingWithComment(String comment) {
         return new CreateBookingRequest(
                 UUID.randomUUID(), UUID.randomUUID(),
-                ZonedDateTime.now().plusDays(2), null, comment);
+                ZonedDateTime.now().plusDays(2), null, comment, false);
     }
 
     private static CancelBookingRequest cancelWithComment(String comment) {

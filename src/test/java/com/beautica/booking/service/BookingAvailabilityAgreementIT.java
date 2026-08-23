@@ -796,7 +796,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         // 2) A REAL booking on service A, through BookingService's own transaction, so the
         //    afterCommit eviction hook fires exactly as it does in production.
         bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null));
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false));
 
         // 3) The outcome the user asked for — immediately, with no sleep and no TTL expiry.
         assertThat(slotStarts(m.masterId(), day, svcB))
@@ -821,7 +821,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         List.of(LocalTime.of(11, 0), LocalTime.of(15, 0))));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svc, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svc, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         // Isolation, so this case fails for exactly ONE reason. The create above ran the schedule-fit
         // gate, which populated this master's `available-slots` key with the PRE-booking list; clearing
         // here means the warm read below is unambiguously fresh and case 12 pins the no-show eviction
@@ -923,7 +923,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         // Isolation (case 12's reasoning verbatim): the create above already swept this master's
         // keys, so clearing here makes the warm read below unambiguously fresh and this case pin
         // the CANCEL eviction alone, never the create-path eviction case 11 owns.
@@ -963,7 +963,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         clearSlotCache();
 
         assertThat(slotStarts(m.masterId(), day, svcB))
@@ -998,7 +998,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(13, 0), LocalTime.of(15, 0));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         clearSlotCache();
 
         // 1) Warm service B's entry with the pre-move picture: 11:00 taken, 13:00 and 15:00 free.

@@ -357,7 +357,8 @@ class AppointmentItemCancelIT extends AbstractIntegrationTest {
         fixtures.createUser(otherClientEmail, "CLIENT", null);
         String otherClientToken = fixtures.tokenFor(otherClientEmail);
         var request = new com.beautica.booking.dto.CreateBookingRequest(
-                v.masterId(), masterServiceId, futureStart().atZoneSameInstant(java.time.ZoneOffset.UTC), null, null);
+                v.masterId(), masterServiceId, futureStart().atZoneSameInstant(java.time.ZoneOffset.UTC), null, null,
+                false);
         ResponseEntity<String> rebook = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(otherClientToken)), String.class);
