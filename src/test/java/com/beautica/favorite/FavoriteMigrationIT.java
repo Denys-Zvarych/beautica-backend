@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
+import com.beautica.favorite.dto.FavoriteSalonResponse;
 import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
@@ -25,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * {@code V92} schema (CHECK + UNIQUE), the {@code V134} widening that admits
  * {@code SERVICE} (Phase 31.3), the two native read projections and the JPA wish-list
  * page (Phase 31.4) against a real PostgreSQL, plus the service-layer idempotency and
- * per-client {@code lastServiceName} resolution. ASCII-only seed data.
+ * the mobile-Phase-111 address projection. ASCII-only seed data.
  *
  * <p>Validation runs at the repository/service layer (not over HTTP) so the test
  * stays focused on the persistence contract the migration introduces; the HTTP
@@ -85,56 +86,143 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                 clientId, FavoriteTargetType.SALON, salonId)).isTrue();
     }
 
-    // ── per-client lastServiceName resolution ────────────────────────────────────
+    // ── Phase 111: address projection + every MasterType is favouritable ─────────
+    //
+    // These two tests REPLACE should_resolveLastServiceName_perClient and
+    // should_notLeakOtherClientsBooking_inLastServiceName. Both pinned the LATERAL
+    // "latest booking for this (client, master) pair" subquery that fed lastServiceName;
+    // mobile Phase 111 removed the field, the LATERAL and the only client-scoped term in
+    // the projection, so there is no behaviour left for them to assert.
 
     @Test
-    @DisplayName("listMasterFavorites returns this client's latest booking service name, null when never booked")
-    void should_resolveLastServiceName_perClient() {
-        UUID clientId = createClient("booked-client@beautica.test");
+    @DisplayName("listMasterFavorites projects an INDEPENDENT_MASTER's OWN street address off users")
+    void should_projectMasterOwnAddress_when_listingMasterFavorites() {
+        UUID clientId = createClient("addr-client@beautica.test");
+        UUID master = createIndependentMaster("addr-independent-master@beautica.test");
+        jdbcTemplate.update(
+                "UPDATE users SET street = 'Master Street', building_no = '12B', "
+                        + "location_note = 'master note' WHERE id = "
+                        + "(SELECT user_id FROM masters WHERE id = ?)", master);
 
-        // Master A — this client has a completed booking → lastServiceName populated.
-        UUID masterA = createIndependentMaster("master-a@beautica.test");
-        UUID msA = createIndependentMasterService(masterA);
-        createCompletedBooking(clientId, masterA, msA);
-        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterA);
-
-        // Master B — favorited but never booked by this client → lastServiceName null.
-        UUID masterB = createIndependentMaster("master-b@beautica.test");
-        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterB);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, master);
 
         List<FavoriteMasterResponse> masters =
                 favoriteService.listMasterFavorites(clientId, Pageable.unpaged()).getContent();
 
-        assertThat(masters).hasSize(2);
-        FavoriteMasterResponse withBooking = masters.stream()
-                .filter(m -> m.masterId().equals(masterA)).findFirst().orElseThrow();
-        FavoriteMasterResponse withoutBooking = masters.stream()
-                .filter(m -> m.masterId().equals(masterB)).findFirst().orElseThrow();
+        assertThat(masters).hasSize(1);
+        // An INDEPENDENT_MASTER's address IS the discoverable location clients need — this is the
+        // one MasterType the locked per-role address matrix lets through, and the values come from
+        // `users`, never `salons`.
+        assertThat(masters.get(0))
+                .extracting(FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
+                        FavoriteMasterResponse::locationNote)
+                .containsExactly("Master Street", "12B", "master note");
+    }
 
-        assertThat(withBooking.lastServiceName()).isEqualTo("Test Service");
-        assertThat(withoutBooking.lastServiceName()).isNull();
+    /**
+     * 2026-08 re-audit MEDIUM — the locked per-role address matrix, enforced END TO END against
+     * real SQL. {@code FavoriteServiceTest} pins the masking against a hand-built projection row;
+     * only this test proves the {@code masters.master_type} column the rule reads is actually
+     * SELECTed, and at the index the service reads it from.
+     *
+     * <p>Both address sources are populated with DISTINCT values so the assertion cannot be
+     * satisfied accidentally: the salon's is what a wrong-table projection would return, the
+     * master's is what the pre-fix code returned. {@code null} is neither.
+     */
+    @Test
+    @DisplayName("listMasterFavorites nulls the address for a SALON_MASTER — the per-role matrix "
+            + "is enforced server-side, not by the client")
+    void should_nullMasterAddress_when_masterIsSalonAffiliated() {
+        UUID clientId = createClient("addr-mask-client@beautica.test");
+        UUID salonId = createSalon("addr-mask-owner@beautica.test");
+        jdbcTemplate.update(
+                "UPDATE salons SET street = 'Salon Street', building_no = '99', "
+                        + "location_note = 'salon note' WHERE id = ?", salonId);
+
+        UUID salonMaster = createSalonMaster(salonId, "addr-mask-salon-master@beautica.test");
+        jdbcTemplate.update(
+                "UPDATE users SET street = 'Master Street', building_no = '12B', "
+                        + "location_note = 'master note' WHERE id = "
+                        + "(SELECT user_id FROM masters WHERE id = ?)", salonMaster);
+
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, salonMaster);
+
+        List<FavoriteMasterResponse> masters =
+                favoriteService.listMasterFavorites(clientId, Pageable.unpaged()).getContent();
+
+        assertThat(masters).hasSize(1);
+        assertThat(masters.get(0))
+                .extracting(FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
+                        FavoriteMasterResponse::locationNote)
+                .containsOnlyNulls();
     }
 
     @Test
-    @DisplayName("lastServiceName is scoped to the asking client — another client's booking does not leak")
-    void should_notLeakOtherClientsBooking_inLastServiceName() {
-        UUID asking = createClient("asking-client@beautica.test");
-        UUID other = createClient("other-client@beautica.test");
+    @DisplayName("listSalonFavorites projects the salon's street address")
+    void should_projectSalonAddress_when_listingSalonFavorites() {
+        UUID clientId = createClient("salon-addr-client@beautica.test");
+        UUID salonId = createSalon("salon-addr-owner@beautica.test");
+        jdbcTemplate.update(
+                "UPDATE salons SET street = 'Derybasivska', building_no = '7', "
+                        + "location_note = '2nd floor' WHERE id = ?", salonId);
 
-        UUID master = createIndependentMaster("shared-master@beautica.test");
-        UUID ms = createIndependentMasterService(master);
-        // Only the OTHER client booked this master.
-        createCompletedBooking(other, master, ms);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
 
-        favoriteService.addFavorite(asking, FavoriteTargetType.MASTER, master);
+        var salons = favoriteService.listSalonFavorites(clientId, Pageable.unpaged()).getContent();
+
+        assertThat(salons).hasSize(1);
+        assertThat(salons.get(0))
+                .extracting(FavoriteSalonResponse::street, FavoriteSalonResponse::buildingNo,
+                        FavoriteSalonResponse::locationNote)
+                .containsExactly("Derybasivska", "7", "2nd floor");
+    }
+
+    /**
+     * The end-to-end form of the inverted rule: a salon-employed master survives BOTH the write
+     * guard and the read projection. The read query was already role-agnostic, but nothing could
+     * previously prove it — no such favourite row could exist to read back.
+     */
+    @Test
+    @DisplayName("a SALON_MASTER favourite round-trips through write validation AND the read projection")
+    void should_roundTripSalonMasterFavorite_when_favoritingSalonEmployedMaster() {
+        UUID clientId = createClient("roundtrip-client@beautica.test");
+        UUID salonId = createSalon("roundtrip-owner@beautica.test");
+        UUID salonMaster = createSalonMaster(salonId, "roundtrip-master@beautica.test");
+
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, salonMaster);
 
         List<FavoriteMasterResponse> masters =
-                favoriteService.listMasterFavorites(asking, Pageable.unpaged()).getContent();
+                favoriteService.listMasterFavorites(clientId, Pageable.unpaged()).getContent();
 
-        assertThat(masters).hasSize(1);
-        assertThat(masters.get(0).lastServiceName())
-                .as("the asking client never booked this master")
-                .isNull();
+        assertThat(masters).extracting(FavoriteMasterResponse::masterId)
+                .containsExactly(salonMaster);
+    }
+
+    /**
+     * The predicate that mobile Phase 111 promoted from a documented no-op to a live one. Before
+     * the role predicate was removed, no salon-affiliated master could be favourited, so
+     * {@code (m.salon_id IS NULL OR sal.is_active = true)} was unreachable. It now carries real
+     * weight: a closed salon's staff must not linger in a client's favourites.
+     */
+    @Test
+    @DisplayName("deactivating the salon hides its master from favourites but keeps the favourite row")
+    void should_hideSalonMasterFavorite_when_owningSalonDeactivated() {
+        UUID clientId = createClient("closed-salon-client@beautica.test");
+        UUID salonId = createSalon("closed-salon-owner@beautica.test");
+        UUID salonMaster = createSalonMaster(salonId, "closed-salon-master@beautica.test");
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, salonMaster);
+
+        // Note: deactivating the salon does NOT cascade to masters.is_active — that is precisely
+        // why the salon term in the WHERE clause is needed alongside the master term.
+        jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salonId);
+
+        assertThat(favoriteService.listMasterFavorites(clientId, Pageable.unpaged()).getContent())
+                .as("a closed salon's master must drop out of the list")
+                .isEmpty();
+        assertThat(favoriteRepository.existsByClientIdAndTargetTypeAndTargetId(
+                clientId, FavoriteTargetType.MASTER, salonMaster))
+                .as("the favourite row itself survives — no cleanup job, filtering is on read")
+                .isTrue();
     }
 
     // ── V134: SERVICE target_type (Phase 31.3) ──────────────────────────────────
@@ -233,10 +321,13 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
 
         assertThat(favorite.targetType()).isEqualTo(FavoriteTargetType.SERVICE);
 
-        // The same master as a MASTER target is still rejected — the asymmetry is deliberate.
-        assertThatThrownBy(() ->
-                favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, salonMaster))
-                .isInstanceOf(BusinessException.class);
+        // INVERTED by mobile Phase 111. The same master as a MASTER target used to be rejected
+        // with a 400 — that asymmetry is GONE, both arms now admit a salon-employed master.
+        // Asserted here rather than deleted so the reversal is visible at the exact site that
+        // documented the old rule.
+        assertThat(favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, salonMaster)
+                .targetType())
+                .isEqualTo(FavoriteTargetType.MASTER);
 
         List<FavoriteServiceResponse> wishList =
                 favoriteService.listServiceFavorites(clientId, Pageable.ofSize(20)).getContent();
@@ -653,15 +744,4 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         return masterServiceId;
     }
 
-    private void createCompletedBooking(UUID clientId, UUID masterId, UUID masterServiceId) {
-        jdbcTemplate.update(
-                "INSERT INTO bookings "
-                        + "(id, client_id, master_id, master_service_id, status, "
-                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
-                        + "buffer_minutes_at_booking, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, 'COMPLETED', "
-                        + "NOW() - interval '2 hours', NOW() - interval '1 hour', "
-                        + "500.00, 60, 0, NOW(), NOW())",
-                UUID.randomUUID(), clientId, masterId, masterServiceId);
-    }
 }

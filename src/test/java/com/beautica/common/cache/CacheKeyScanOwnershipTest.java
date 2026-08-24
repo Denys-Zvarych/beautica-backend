@@ -52,6 +52,12 @@ class CacheKeyScanOwnershipTest {
      * Routing it through the shared evictor would be wrong: that matches on a {@code List}'s first
      * element and would never match a String key — the mirror image of the original bug.
      *
+     * <p>{@code SalonStaffRatingListener} is the SAME exemption for the same cache. It evicts
+     * {@code reviews-by-salon} on a staff change (mobile Phase 111) with the identical
+     * {@code "salon:<uuid>:"} String-prefix predicate, against the identical
+     * {@code ReviewService#getSalonReviews} key format. Everything the paragraph above says about
+     * {@code ReviewEventListener} applies verbatim, including the contingency.
+     *
      * <p>The exemption is contingent on that key format. If {@code ReviewService}'s {@code @Cacheable}
      * key ever becomes an inline list, this entry must be removed and the listener migrated to the
      * shared evictor. Do not add entries here without checking the corresponding {@code @Cacheable}
@@ -59,7 +65,8 @@ class CacheKeyScanOwnershipTest {
      */
     private static final List<String> SCAN_OWNERS = List.of(
             "MasterCachePrefixEvictor.java",
-            "ReviewEventListener.java");
+            "ReviewEventListener.java",
+            "SalonStaffRatingListener.java");
 
     /** Code shapes that indicate a hand-rolled cache-key scan. */
     private static final List<String> SCAN_MARKERS = List.of(

@@ -193,21 +193,73 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     void recalculateMasterRating(@Param("masterId") UUID masterId);
 
     /**
-     * Salon-scoped symmetric twin of {@link #recalculateMasterRating}, added for Phase 13.6
-     * (Public Salon Profile). Same single-pass native aggregate, same COALESCE-to-zero
-     * no-reviews handling, same {@code clearAutomatically}/{@code flushAutomatically}
-     * contract. Called from {@link com.beautica.review.event.ReviewEventListener#onReviewCreated}
-     * only when the reviewed booking carried a non-null salon id.
+     * Recomputes {@code salons.avg_rating} / {@code salons.review_count} as the
+     * <b>EQUAL-WEIGHTED mean of the salon's active masters' salon-scoped ratings</b>.
+     *
+     * <h4>Formula (locked user decision, mobile Phase 111) — supersedes the Phase 13.6 one</h4>
+     * This method previously computed a flat {@code AVG(reviews.rating) WHERE salon_id = :salonId}
+     * — a per-REVIEW average, so a single high-volume master dominated the salon's headline
+     * number. It is now a two-level aggregate:
+     * <ol>
+     *   <li><b>Inner</b> — per master, the mean of that master's reviews carrying BOTH
+     *       {@code master_id = <that master>} AND {@code salon_id = :salonId}.</li>
+     *   <li><b>Outer</b> — the unweighted {@code AVG} of those per-master means. Each master
+     *       counts once regardless of review volume. <b>That equal weighting is the point of the
+     *       decision — do not "improve" it into a volume-weighted mean, which is exactly the
+     *       formula this replaced.</b></li>
+     * </ol>
+     *
+     * <h4>Salon-scoped, NOT lifetime — the load-bearing distinction</h4>
+     * The inner aggregate reads {@code reviews} rows filtered by {@code r.salon_id = :salonId}.
+     * It deliberately does NOT reuse {@code masters.avg_rating}, which
+     * {@link #recalculateMasterRating} maintains as a LIFETIME figure ({@code AVG(reviews) WHERE
+     * master_id = X}, no salon predicate). Reusing it would import reputation a master earned at
+     * a previous employer or while independent into this salon's rating. The
+     * {@code JOIN masters m ON m.id = r.master_id AND m.salon_id = :salonId} additionally
+     * restricts contributors to masters <b>currently attached</b> to this salon, and
+     * {@code m.is_active = true} drops departed/deactivated staff.
+     *
+     * <h4>{@code review_count} semantics — the number of underlying REVIEWS</h4>
+     * {@code cnt} is {@code SUM} of the per-master review counts, i.e. the count of the reviews
+     * that actually fed the average — <b>not</b> the number of contributing masters. The public
+     * salon profile prints it next to a star; "3 reviews" beside an average derived from 3
+     * masters holding 40 reviews between them would be a lie. It is therefore the count over the
+     * SAME row set the average is computed from, which is also what keeps it consistent with
+     * {@link #countBySalonIdGroupByRating} (that histogram carries the identical predicate, so it
+     * still sums to this number).
+     *
+     * <h4>Trigger contract — reviews are no longer the only input</h4>
+     * Because the contributing set is "the salon's currently-active masters", this number moves
+     * on STAFF changes with no review involved. It is therefore fired from two places:
+     * {@link com.beautica.review.event.ReviewEventListener#onReviewCreated} (a review was
+     * written against a salon-affiliated booking) and
+     * {@code com.beautica.review.event.SalonStaffRatingListener} (a master joined, left, was
+     * reactivated, or was rotated between salons). Both use the same fire-and-log-don't-fail
+     * contract in a {@code REQUIRES_NEW} transaction.
+     *
+     * <h4>Unchanged mechanics</h4>
+     * Still a single statement; still {@code COALESCE}-to-zero for the no-contributor case (an
+     * {@code AVG} over an empty set is {@code NULL}, and the DTO layer — not this column —
+     * converts a {@code review_count} of 0 back to a {@code null} rating rather than printing a
+     * fabricated {@code 0.00}); still {@code clearAutomatically}/{@code flushAutomatically} so a
+     * pending review INSERT is included and the {@code Salon} L1 entry is evicted afterwards.
      */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(value = """
             UPDATE salons s
                SET avg_rating   = agg.avg_rating,
                    review_count = agg.cnt
-              FROM (SELECT COALESCE(AVG(r.rating::numeric), 0) AS avg_rating,
-                           COUNT(*) AS cnt
-                      FROM reviews r
-                     WHERE r.salon_id = :salonId) agg
+              FROM (SELECT COALESCE(AVG(pm.master_avg), 0) AS avg_rating,
+                           COALESCE(SUM(pm.master_cnt), 0) AS cnt
+                      FROM (SELECT r.master_id,
+                                   AVG(r.rating::numeric) AS master_avg,
+                                   COUNT(*)               AS master_cnt
+                              FROM reviews r
+                              JOIN masters m ON m.id = r.master_id
+                             WHERE r.salon_id = :salonId
+                               AND m.salon_id = :salonId
+                               AND m.is_active = true
+                             GROUP BY r.master_id) pm) agg
              WHERE s.id = :salonId
             """, nativeQuery = true)
     void recalculateSalonRating(@Param("salonId") UUID salonId);
@@ -217,8 +269,25 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * {@code ratingDistribution}. Only buckets with at least one review are returned —
      * the service layer zero-fills the missing 1-5 buckets so every bucket is present in
      * the response (never omit a zero-count star rating).
+     *
+     * <p><b>Scoped to the salon's currently-active masters (mobile Phase 111).</b> The
+     * {@code JOIN r.master m} + {@code m.salon.id = :salonId} + {@code m.isActive = true}
+     * predicates are the SAME contributor set {@link #recalculateSalonRating} averages over.
+     * Without them the histogram would count every review ever written against this salon while
+     * the headline {@code avgRating}/{@code reviewCount} above it counted only the current
+     * staff's — so the bars would not sum to the number printed beside them the moment any
+     * reviewed master left. The two queries must be changed together; if one grows a predicate,
+     * the other does too.
      */
-    @Query("SELECT r.rating AS rating, COUNT(r) AS count FROM Review r WHERE r.salon.id = :salonId GROUP BY r.rating")
+    @Query("""
+            SELECT r.rating AS rating, COUNT(r) AS count
+            FROM Review r
+            JOIN r.master m
+            WHERE r.salon.id = :salonId
+              AND m.salon.id = :salonId
+              AND m.isActive = true
+            GROUP BY r.rating
+            """)
     List<RatingCountProjection> countBySalonIdGroupByRating(@Param("salonId") UUID salonId);
 
     /**

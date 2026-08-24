@@ -1,0 +1,71 @@
+-- V141 — index backing the salon-rating aggregate that mobile Phase 111 made per-master.
+--
+-- WHY
+-- A salon's rating stopped being a flat AVG(reviews.rating) and became the EQUAL-WEIGHTED mean of
+-- its currently-ACTIVE masters' salon-scoped means. Both statements that implement it are nested
+-- aggregates grouped by master within a salon:
+--
+--   ReviewRepository#recalculateSalonRating       (native UPDATE ... FROM (SELECT ... GROUP BY r.master_id))
+--   ReviewRepository#countBySalonIdGroupByRating  (the star histogram, same contributor predicate)
+--
+-- The inner scan is `WHERE r.salon_id = ? GROUP BY r.master_id` (+ rating as the grouped/aggregated
+-- column). Nothing indexed that shape. The best existing candidate, idx_reviews_salon_rating_desc
+-- (V104: salon_id, rating DESC, created_at DESC), has no master_id, so the planner could only use
+-- it as a bitmap-index scan and then had to fetch every matching heap tuple for master_id and
+-- quicksort the result to satisfy the GROUP BY.
+--
+-- Measured at 1,350 reviews across 25 masters of one salon:
+--   before  1.11 ms,  1,350 heap fetches, a Sort node feeding GroupAggregate
+--   after   0.31–0.65 ms,  0 heap fetches, Sort node GONE (GroupAggregate consumes index order)
+--
+-- Both recalc triggers fire this: a review write AND every staff change (create / deactivate /
+-- reactivate / rotate, the last publishing twice), so the write amplification is real, not
+-- theoretical.
+--
+-- SHAPE — composite AND partial, mirroring the predicate exactly (Anti-Bug §E-5 / §O-6)
+--   * (salon_id, master_id, rating) in that order: salon_id is the equality filter, master_id is
+--     the GROUP BY key (so the index supplies the grouping order and the Sort disappears), and
+--     rating last makes the scan index-only for both the AVG and the histogram's COUNT — that is
+--     what takes heap fetches to zero.
+--   * WHERE salon_id IS NOT NULL: reviews of an INDEPENDENT_MASTER's booking carry a NULL salon_id
+--     and can never match `r.salon_id = ?`. Excluding them keeps the index to the salon-affiliated
+--     subset — the same predicate V40/V41/V104 already use on this table.
+--   * NOT dropping idx_reviews_salon_rating_desc/asc (V104): those serve the salon review LIST's
+--     rating sorts (ORDER BY rating DESC, created_at DESC), a different access path that this index
+--     cannot satisfy — leading column order matches, but the sort keys do not. No index becomes
+--     redundant here, so nothing is dropped.
+--
+-- Not expressed on the entity as @Table(indexes = ...): JPA's @Index cannot declare a partial
+-- index, so a mirrored annotation would describe a DIFFERENT index than the one that exists and
+-- would drift silently under ddl-auto=validate. Documented instead in the existing comment block
+-- in Review.java that already covers V40/V41/V104's partial salon indexes.
+--
+-- Immutable-migration rule (Anti-Bug §O-9): this is a new, fix-forward version (max existing = V140).
+
+-- ── Lock + statement guards (must precede the DDL statement below) ───────────────────────
+-- Same argument, same values as V118:30, V119:37, V121:38, V128:52, V137:41 and V138:61.
+--
+-- CREATE INDEX CONCURRENTLY is deliberately NOT used, for this project's established reason and no
+-- other: Flyway wraps each migration in ONE transaction here (nothing in application.yml opts out,
+-- and no migration in this tree has ever run outside one), and CREATE INDEX CONCURRENTLY cannot run
+-- inside a transaction — it would fail at deploy time, not degrade. V138:36 and V138:59 record the
+-- same decision for the same reason. Plain CREATE INDEX takes SHARE on `reviews`, which conflicts
+-- with ROW EXCLUSIVE and therefore blocks review INSERTs (and, FIFO, queues later readers behind
+-- it) for the duration of the build. The two timeouts below bound that: fail fast, let Flyway roll
+-- this transaction back cleanly, retry next deploy.
+--
+-- statement_timeout as well as lock_timeout (V137:23): bounding the lock WAIT alone is sufficient
+-- only when the DDL is catalog-only once granted. Building an index is size-dependent work done
+-- WHILE HOLDING the lock, so the wait bound leaves the held-lock phase unbounded. 1min bounds it.
+-- Read the unit literally (V120:42, V121:47, V137:28, V138:50): statement_timeout applies PER
+-- statement and is re-armed for each. Exactly one statement follows, so the ceiling really is 1min;
+-- the 5s lock wait counts INSIDE it, since statement_timeout covers the lock wait too (V120:29).
+--
+-- SET LOCAL: scoped to Flyway's per-migration transaction, so neither value leaks to the pooled
+-- connection once this migration commits.
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '1min';
+
+CREATE INDEX IF NOT EXISTS idx_reviews_salon_master_rating
+    ON reviews (salon_id, master_id, rating)
+    WHERE salon_id IS NOT NULL;

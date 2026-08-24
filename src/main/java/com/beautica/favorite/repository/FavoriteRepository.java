@@ -28,9 +28,8 @@ import java.util.UUID;
  *
  * <h3>Read projections are native, locality-label-deferred</h3>
  * The two list queries are native SQL because they join across
- * {@code favorites → masters/salons → users/reviews} and (for masters) compute a
- * correlated per-client "latest booking service name" in a single statement (no
- * N+1, §E-2). They return raw {@code Object[]} rows; the service resolves the
+ * {@code favorites → masters/salons → users} and project locality FK ids plus raw
+ * address columns in a single statement (no N+1, §E-2). They return raw {@code Object[]} rows; the service resolves the
  * discovery-locality {@code name_uk} labels for the whole page through the M2
  * seam ({@code DiscoveryLocationResolver}) exactly as
  * {@code com.beautica.search.service.SearchService} does — the raw FK city/district
@@ -64,18 +63,58 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      *   <li>first_name</li>
      *   <li>last_name</li>
      *   <li>avatar_url ({@code users.avatar_url})</li>
-     *   <li>discovery_city_id ({@code COALESCE(sal.city_id, u.city_id)})</li>
-     *   <li>discovery_district_id ({@code COALESCE(sal.district_id, u.district_id)})</li>
+     *   <li>own_city_id ({@code users.city_id}) — the master's OWN locality</li>
+     *   <li>own_district_id ({@code users.district_id}) — the master's OWN locality</li>
      *   <li>avg_rating ({@code masters.avg_rating}, nullable)</li>
-     *   <li>last_service_name — <b>this client's</b> latest booking service name with
-     *       that master (any status, latest {@code starts_at}), or {@code null}</li>
+     *   <li>street ({@code users.street}, nullable)</li>
+     *   <li>building_no ({@code users.building_no}, nullable)</li>
+     *   <li>location_note ({@code users.location_note}, nullable)</li>
+     *   <li>master_type ({@code masters.master_type}, {@code NOT NULL}) — projected ONLY to drive
+     *       the address- AND locality-suppression rules in {@code FavoriteService#mapMasterRow};
+     *       it never reaches the response DTO (§I: no internal role/type values on the wire)</li>
+     *   <li>salon_city_id ({@code salons.city_id}, nullable — {@code NULL} both when the master
+     *       has no salon and when the salon has no recorded locality)</li>
+     *   <li>salon_district_id ({@code salons.district_id}, nullable, same two reasons)</li>
      * </ol>
+     *
+     * <p><b>Locality is NO LONGER {@code COALESCE}d in SQL</b> (2026-08 security re-audit LOW).
+     * Both sources are projected raw and the choice is made in the service by the SAME
+     * {@link com.beautica.master.entity.MasterType#disclosesOwnAddress} predicate that governs the
+     * street triple — <em>salon-locality-or-nothing</em> for an employed master,
+     * <em>own-locality</em> for an independent one. The former
+     * {@code COALESCE(sal.city_id, u.city_id)} fell through to the employed master's OWN city and
+     * district whenever the salon's {@code city_id} was {@code NULL} (it is nullable — {@code V54}
+     * line 62; legacy pre-Phase-10.3 salon rows carry none), printing exactly the locality
+     * {@code MasterDetailResponse#fromPublic} masks for those very types. That fall-through was
+     * unreachable while a role predicate kept salon masters out of this query; mobile Phase 111
+     * removed the predicate and made it live.</p>
+     *
+     * <p><b>Address columns come from {@code users}, never {@code salons}</b> (mobile Phase 111).
+     * They are the master's OWN address. They are projected for every master, but the SERVICE
+     * layer nulls them for any master type that fails
+     * {@link com.beautica.master.entity.MasterType#disclosesOwnAddress} — the same locked
+     * per-role address matrix {@code MasterDetailResponse.fromPublic} applies, evaluated in ONE
+     * place for both surfaces. An earlier revision of this query returned them unconditionally and
+     * left the suppression to the client; a client-side suppression is not a server-side control,
+     * and for a multi-salon owner {@code users.street} holds the most recently created salon's
+     * address, so the row could print salon B's street beside a master working in salon A.
+     * Note the contrast with the locality columns above: locality resolves through the SALON for
+     * an employed master ("where can I find this provider" — the salon's, or nothing), while the
+     * street triple is "this person's own address" and is suppressed outright. Both decisions run
+     * off the same predicate in {@code FavoriteService#mapMasterRow}.
+     *
+     * <p><b>{@code last_service_name} and its {@code LEFT JOIN LATERAL} were REMOVED</b> (mobile
+     * Phase 111): the approved favourites design no longer renders it, and the LATERAL existed
+     * solely to compute it. Removing it deletes the only per-row subquery in this statement, so
+     * the query is now a flat 3-table join — the pagination rationale below survives as a
+     * §J bound, no longer as a LATERAL-evaluation bound.
      *
      * <p>The {@code INNER JOIN masters} drops any stale favorite whose target master
      * was deleted (polymorphic, no FK) — the row simply disappears from the list.
-     * Only {@code INDEPENDENT_MASTER}-owned masters are favoritable, but the join is
-     * not role-filtered here: the service rejects a {@code SALON_MASTER} target at
-     * write time, so no such favorite row can exist to read back.
+     * The join is deliberately NOT role-filtered, and since mobile Phase 111 that is
+     * load-bearing rather than incidental: {@code FavoriteService#validateMasterTarget} now
+     * admits every {@code MasterType}, so {@code SALON_MASTER}- and {@code SALON_OWNER}-typed
+     * rows genuinely reach this query. Do not add a role predicate here.
      *
      * <p><b>{@code m.is_active = true} is load-bearing</b> (2026-08 security audit). A
      * favourite row survives its target's deactivation — there is no cleanup job — so the
@@ -87,41 +126,28 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * <p><b>{@code (m.salon_id IS NULL OR sal.is_active = true)} — defence in depth</b> (2026-08
      * security re-audit MEDIUM). {@code SalonService.deactivateSalon} does not cascade to
      * {@code masters.is_active}, so a closed salon's masters still read as active; the predicate
-     * is applied to every favourites surface so no list can outlive its salon. <b>On THIS query it
-     * is expected to be a no-op</b> — {@code validateMasterTarget} admits only
-     * {@code INDEPENDENT_MASTER} targets, whose {@code salon_id} is structurally {@code NULL}, so
-     * the {@code IS NULL} branch always fires. It is added anyway because that no-op-ness is a
-     * property of a rule in ANOTHER class ({@code FavoriteService}), and the SERVICE arm already
-     * proves those rules diverge (a {@code SALON_MASTER}'s service IS wish-listable). Cost is one
+     * is applied to every favourites surface so no list can outlive its salon. <b>Mobile Phase 111
+     * promoted this from a provable no-op to a live predicate.</b> It was previously documented as
+     * unreachable because {@code validateMasterTarget} admitted only {@code INDEPENDENT_MASTER}
+     * targets, whose {@code salon_id} is structurally {@code NULL}; that role predicate is gone,
+     * so a salon-employed master's favourite row now exists and this term is what stops a closed
+     * salon's staff from lingering in every client's favourites. The {@code IS NULL} branch stays
+     * mandatory: without it every independent master would vanish. Cost is one
      * {@code LEFT JOIN salons} in the count query; the paged query already joins {@code sal} for
-     * the {@code COALESCE}, so it costs nothing there. The {@code IS NULL} branch is mandatory,
-     * not cosmetic: without it every independent master — i.e. every row this query can return —
-     * would vanish.
+     * the salon-locality columns, so it costs nothing there.
      *
-     * <p><b>Anti-Bug audit LOW-1 (2026-07):</b> {@code COALESCE(sal.city_id, u.city_id)}
-     * below is intentional, not the fall-through class fixed in
-     * {@code BookingRepository.findClientBookingDetails} (19.3) — {@code Salon.cityId}
-     * itself CAN be null (legacy pre-Phase-10.3 rows, no {@code NOT NULL}), but that
-     * fact is irrelevant here: {@code FavoriteService.validateMasterTarget} rejects any
-     * target whose owning user role is not {@code INDEPENDENT_MASTER} with a 400
-     * <em>before</em> a favorite row is ever written, and an {@code INDEPENDENT_MASTER}'s
-     * {@code masters.salon_id} is structurally always {@code NULL}
-     * ({@code MasterService.createMasterForIndependentUser} never sets a salon). So
-     * {@code sal.*} is always {@code NULL} for every row this query can ever join,
-     * independent of any salon's actual {@code city_id}/{@code district_id} data —
-     * {@code COALESCE} and a {@code CASE WHEN sal.id IS NOT NULL …} guard are provably
-     * equivalent here. Pinned by
-     * {@code FavoriteServiceTest.should_throwBadRequest_when_targetIsSalonMaster}
-     * (write-time rejection, independent of any salon data).
-     *
-     * <p>{@code last_service_name} is a correlated {@code LATERAL} subquery taking the
-     * single most-recent booking for this {@code (client, master)} pair — one extra
-     * index-served lookup per favorited master (served by {@code
-     * idx_bookings_master_client_starts_at}, V93), evaluated inside the same statement
-     * (no per-row application round-trip).
+     * <p><b>Anti-Bug audit LOW-1 (2026-07) → re-audit LOW (2026-08), now RESOLVED.</b> The
+     * locality {@code COALESCE} was originally argued to be provably equivalent to a
+     * {@code CASE WHEN sal.id IS NOT NULL …} guard, on the ground that {@code sal.*} was always
+     * {@code NULL} for every joinable row. Mobile Phase 111 falsified that ground, and the
+     * follow-up argument — "a salon with no recorded locality should show the master's rather
+     * than nothing" — was wrong for the same reason the street triple is masked: for an employed
+     * master {@code users.city_id} is a private datum the locked matrix does not publish, and for
+     * a multi-salon owner it is not even the right salon's. Both are now projected raw and gated
+     * in the service; the fall-through is gone.
      *
      * <p><b>Pagination (§E-3, §J):</b> the result is bounded by {@code Pageable}
-     * (LIMIT/OFFSET) so the LATERAL runs at most {@code pageSize} times per request. The
+     * (LIMIT/OFFSET). The
      * stable {@code ORDER BY f.created_at DESC, f.target_id} is preserved as a total order
      * so paging never drops or duplicates a row across pages. The unbounded
      * {@link #findFavoriteMasterRows(UUID)} overload below exists only for the legacy
@@ -132,24 +158,19 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                    u.first_name             AS first_name,
                    u.last_name              AS last_name,
                    u.avatar_url             AS avatar_url,
-                   COALESCE(sal.city_id, u.city_id)         AS discovery_city_id,
-                   COALESCE(sal.district_id, u.district_id) AS discovery_district_id,
+                   u.city_id                AS own_city_id,
+                   u.district_id            AS own_district_id,
                    m.avg_rating             AS avg_rating,
-                   lb.service_name          AS last_service_name
+                   u.street                 AS street,
+                   u.building_no            AS building_no,
+                   u.location_note          AS location_note,
+                   m.master_type            AS master_type,
+                   sal.city_id              AS salon_city_id,
+                   sal.district_id          AS salon_district_id
             FROM favorites f
             JOIN masters m ON m.id = f.target_id
             JOIN users u ON u.id = m.user_id
             LEFT JOIN salons sal ON sal.id = m.salon_id
-            LEFT JOIN LATERAL (
-                SELECT sd.name AS service_name
-                FROM bookings b
-                JOIN master_services ms ON ms.id = b.master_service_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE b.master_id = f.target_id
-                  AND b.client_id = f.client_id
-                ORDER BY b.starts_at DESC
-                LIMIT 1
-            ) lb ON true
             WHERE f.client_id = :clientId
               AND f.target_type = 'MASTER'
               AND m.is_active = true
@@ -179,24 +200,19 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                    u.first_name             AS first_name,
                    u.last_name              AS last_name,
                    u.avatar_url             AS avatar_url,
-                   COALESCE(sal.city_id, u.city_id)         AS discovery_city_id,
-                   COALESCE(sal.district_id, u.district_id) AS discovery_district_id,
+                   u.city_id                AS own_city_id,
+                   u.district_id            AS own_district_id,
                    m.avg_rating             AS avg_rating,
-                   lb.service_name          AS last_service_name
+                   u.street                 AS street,
+                   u.building_no            AS building_no,
+                   u.location_note          AS location_note,
+                   m.master_type            AS master_type,
+                   sal.city_id              AS salon_city_id,
+                   sal.district_id          AS salon_district_id
             FROM favorites f
             JOIN masters m ON m.id = f.target_id
             JOIN users u ON u.id = m.user_id
             LEFT JOIN salons sal ON sal.id = m.salon_id
-            LEFT JOIN LATERAL (
-                SELECT sd.name AS service_name
-                FROM bookings b
-                JOIN master_services ms ON ms.id = b.master_service_id
-                JOIN service_definitions sd ON sd.id = ms.service_def_id
-                WHERE b.master_id = f.target_id
-                  AND b.client_id = f.client_id
-                ORDER BY b.starts_at DESC
-                LIMIT 1
-            ) lb ON true
             WHERE f.client_id = :clientId
               AND f.target_type = 'MASTER'
               AND m.is_active = true
@@ -215,14 +231,29 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      *   <li>avatar_url</li>
      *   <li>city_id</li>
      *   <li>district_id</li>
-     *   <li>avg_rating — {@code AVG(reviews.rating)} over the salon's reviews
-     *       ({@code null} when never reviewed; the {@code salons} table carries no
-     *       pre-computed rating column)</li>
+     *   <li>avg_rating — the PERSISTED {@code salons.avg_rating} column, surfaced as
+     *       {@code NULL} when {@code salons.review_count = 0}</li>
+     *   <li>street ({@code salons.street}, nullable)</li>
+     *   <li>building_no ({@code salons.building_no}, nullable)</li>
+     *   <li>location_note ({@code salons.location_note}, nullable)</li>
      * </ol>
      *
+     * <p><b>Rating source changed (mobile Phase 111).</b> This query previously computed a live
+     * {@code AVG(reviews.rating)} via a grouped {@code LEFT JOIN reviews}. It now reads the
+     * persisted {@code salons.avg_rating} column instead, because
+     * {@code ReviewRepository#recalculateSalonRating} redefined a salon's rating as the
+     * EQUAL-WEIGHTED mean of its active masters' salon-scoped means — a per-review average is no
+     * longer the same number. Keeping the old aggregate would have printed a different rating on
+     * the favourites card than on the salon's own public profile. The
+     * {@code CASE WHEN review_count = 0 THEN NULL} wrapper reproduces
+     * {@code ReviewService#getSalonReviewSummary}'s {@code reviewCount == 0 ? null : avgRating}
+     * rule exactly, so a never-reviewed salon still yields {@code null} rather than a fabricated
+     * {@code 0.00} (the recalc {@code COALESCE}s the empty aggregate to {@code 0}, not
+     * {@code NULL}). Dropping the join also removes the {@code GROUP BY}, so this is now a
+     * two-table join with no aggregation.
+     *
      * <p>The {@code INNER JOIN salons} drops any stale favorite whose target salon was
-     * deleted. Rating is a grouped {@code LEFT JOIN reviews} aggregate evaluated in the
-     * same statement (no N+1).
+     * deleted.
      *
      * <p><b>{@code s.is_active = true} is load-bearing</b> (2026-08 security audit), for the
      * same reason as {@link #findFavoriteMasterRows(UUID, Pageable)}: {@code salons.is_active}
@@ -240,14 +271,15 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                    s.avatar_url             AS avatar_url,
                    s.city_id                AS city_id,
                    s.district_id            AS district_id,
-                   AVG(r.rating)            AS avg_rating
+                   CASE WHEN s.review_count = 0 THEN NULL ELSE s.avg_rating END AS avg_rating,
+                   s.street                 AS street,
+                   s.building_no            AS building_no,
+                   s.location_note          AS location_note
             FROM favorites f
             JOIN salons s ON s.id = f.target_id
-            LEFT JOIN reviews r ON r.salon_id = s.id
             WHERE f.client_id = :clientId
               AND f.target_type = 'SALON'
               AND s.is_active = true
-            GROUP BY s.id, s.name, s.avatar_url, s.city_id, s.district_id, f.created_at
             ORDER BY f.created_at DESC, s.id
             """,
             countQuery = """
@@ -272,14 +304,15 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                    s.avatar_url             AS avatar_url,
                    s.city_id                AS city_id,
                    s.district_id            AS district_id,
-                   AVG(r.rating)            AS avg_rating
+                   CASE WHEN s.review_count = 0 THEN NULL ELSE s.avg_rating END AS avg_rating,
+                   s.street                 AS street,
+                   s.building_no            AS building_no,
+                   s.location_note          AS location_note
             FROM favorites f
             JOIN salons s ON s.id = f.target_id
-            LEFT JOIN reviews r ON r.salon_id = s.id
             WHERE f.client_id = :clientId
               AND f.target_type = 'SALON'
               AND s.is_active = true
-            GROUP BY s.id, s.name, s.avatar_url, s.city_id, s.district_id, f.created_at
             ORDER BY f.created_at DESC, s.id
             """, nativeQuery = true)
     List<Object[]> findFavoriteSalonRows(@Param("clientId") UUID clientId);

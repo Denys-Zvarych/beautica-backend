@@ -91,6 +91,12 @@ class MasterServiceTest {
     // different question, and one a mock can never answer: it is proven against the live @Cacheable
     // proxies in CachePrefixEvictionKeyShapeTest.
     @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+
+    // Mobile Phase 111: MasterService publishes a SalonStaffChangedEvent from every staff-set
+    // mutation so the salon's derived rating is recomputed. @InjectMocks must carry this or the
+    // publish call NPEs — a mock is correct here, the listener's own behaviour is unit-tested in
+    // com.beautica.review.event.SalonStaffRatingListenerTest.
+    @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
     // Phase 29.2 fallout: getMasterCalendar now resolves an absolute-instant "now" for
     // BookingResponse.awaitingClosure. A real fixed-value Clock (not a bare @Mock, which would
     // return null from #instant() and NPE) — the exact instant is irrelevant to every test in
@@ -206,6 +212,10 @@ class MasterServiceTest {
         assertThat(result.getSalon()).isEqualTo(salon);
         assertThat(result.isActive()).isTrue();
         verify(masterRepository).save(any(Master.class));
+        // Mobile Phase 111 — the invite-accept path is a staff-set change. A no-op for the
+        // average today (the new row has no reviews), fired for the uniform invariant.
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
     }
 
     @Test
@@ -492,6 +502,9 @@ class MasterServiceTest {
 
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor).evict(salonId);
+        // Mobile Phase 111 — the salon lost a contributor to its derived rating.
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
     }
 
     @Test
@@ -517,6 +530,8 @@ class MasterServiceTest {
 
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor).evict(salonId);
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
     }
 
     @Test
@@ -553,6 +568,10 @@ class MasterServiceTest {
                 .isTrue();
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor).evict(salonId);
+        // Mobile Phase 111 — unlike the create branches this genuinely moves the rating: the
+        // reactivated owner-as-master's prior reviews at this salon start counting again.
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
     }
 
     @Test
@@ -579,6 +598,11 @@ class MasterServiceTest {
 
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor, never()).evict(any());
+        // Mobile Phase 111 — publishSalonStaffChanged(null) is a documented no-op. Without this
+        // assertion, dropping the null guard would push a SalonStaffChangedEvent whose constructor
+        // rejects null and turn every independent-master deactivation into a 500, with the whole
+        // suite still green.
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
     }
 
     // ── upsertWorkingHours ─────────────────────────────────────────────────────
@@ -908,6 +932,10 @@ class MasterServiceTest {
         Salon salon = mock(Salon.class);
         when(salon.isActive()).thenReturn(true);
         when(salon.getOwner()).thenReturn(user);
+        // Was declared and never used. Stubbed now because the Phase 111 publish assertion below
+        // needs a real id — an unstubbed getId() returns null, publishSalonStaffChanged(null) is a
+        // no-op, and the assertion would silently degrade into "nothing was published".
+        when(salon.getId()).thenReturn(salonId);
 
         Master saved = Master.builder()
                 .user(user)
@@ -931,6 +959,11 @@ class MasterServiceTest {
         verify(masterRepository).save(any(Master.class));
         verify(userRepository, never()).findById(any());
         verify(salonRepository, never()).findById(any());
+        // Mobile Phase 111 — the CREATE branch of createMasterForOwner, the one publish site the
+        // rest of the suite never reached (the reactivation branch and the invite path each have
+        // their own test). An owner joining their own salon as a master is a staff-set change.
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
     }
 
     @Test
@@ -1027,6 +1060,11 @@ class MasterServiceTest {
 
         assertThat(result).isSameAs(existing);
         verify(masterRepository, never()).save(any());
+        // Mobile Phase 111 — the idempotent "already active" early return changes NO staff set, so
+        // it must not publish. MasterService's own comment says so; nothing asserted it. Firing
+        // here would recompute a salon's rating on every repeat owner-master call for no reason,
+        // and would blur what the event means for anyone reading the listener.
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
     }
 
     @Test

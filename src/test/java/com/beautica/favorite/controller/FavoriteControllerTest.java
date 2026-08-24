@@ -177,12 +177,20 @@ class FavoriteControllerTest {
                 .andExpect(jsonPath("$.success").value(false));
     }
 
+    /**
+     * RETARGETED by mobile Phase 111 (was {@code should_return400_when_targetIsSalonMaster}). A
+     * salon-employed master is no longer a rejected target, so the message this stubbed no longer
+     * exists; the surviving 400 on the MASTER arm is the INACTIVE guard. What this test actually
+     * pins is unchanged — that a {@code BusinessException(BAD_REQUEST)} from the service maps to
+     * a 400 body with {@code success=false}, not the domain rule itself (which
+     * {@code FavoriteServiceTest} owns).
+     */
     @Test
-    @DisplayName("POST /favorites — 400 when the target is a salon-employed master")
-    void should_return400_when_targetIsSalonMaster() throws Exception {
+    @DisplayName("POST /favorites — 400 when the target master is inactive")
+    void should_return400_when_targetMasterInactive() throws Exception {
         when(favoriteService.addFavorite(any(), any(), any()))
                 .thenThrow(new BusinessException(HttpStatus.BAD_REQUEST,
-                        "Only independent masters can be favorited"));
+                        "Only an active master can be favorited"));
 
         mockMvc.perform(post("/api/v1/favorites")
                         .with(asClient()).with(csrf())
@@ -250,7 +258,7 @@ class FavoriteControllerTest {
     void should_return200MasterPage_when_listMasters() throws Exception {
         var master = new FavoriteMasterResponse(
                 UUID.randomUUID(), "Maria", "Levchenko", "https://cdn/avatar.png",
-                "Kyiv", "Pechersk", 4.75, "Manicure");
+                "Kyiv", "Pechersk", 4.75, "Khreshchatyk St", "12B", "entry code 4321");
         when(favoriteService.listMasterFavorites(eq(clientId), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(master)));
 
@@ -259,7 +267,12 @@ class FavoriteControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.data.length()").value(1))
                 .andExpect(jsonPath("$.data.data[0].firstName").value("Maria"))
-                .andExpect(jsonPath("$.data.data[0].lastServiceName").value("Manicure"))
+                .andExpect(jsonPath("$.data.data[0].street").value("Khreshchatyk St"))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value("12B"))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value("entry code 4321"))
+                // Phase 111 removed lastServiceName from the design and the DTO — assert it is
+                // gone from the wire, not merely absent from the assertions above.
+                .andExpect(jsonPath("$.data.data[0].lastServiceName").doesNotExist())
                 .andExpect(jsonPath("$.data.totalElements").value(1));
 
         verify(favoriteService).listMasterFavorites(eq(clientId), any(Pageable.class));
@@ -281,7 +294,7 @@ class FavoriteControllerTest {
     void should_return200SalonPage_when_listSalons() throws Exception {
         var salon = new FavoriteSalonResponse(
                 UUID.randomUUID(), "Salon Bella", "https://cdn/s.png",
-                "Odesa", "Prymorskyi", 4.20);
+                "Odesa", "Prymorskyi", 4.20, "Derybasivska St", "7", "2nd floor");
         when(favoriteService.listSalonFavorites(eq(clientId), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(salon)));
 
@@ -289,7 +302,10 @@ class FavoriteControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.data.length()").value(1))
                 .andExpect(jsonPath("$.data.data[0].name").value("Salon Bella"))
-                .andExpect(jsonPath("$.data.data[0].avgRating").value(4.20));
+                .andExpect(jsonPath("$.data.data[0].avgRating").value(4.20))
+                .andExpect(jsonPath("$.data.data[0].street").value("Derybasivska St"))
+                .andExpect(jsonPath("$.data.data[0].buildingNo").value("7"))
+                .andExpect(jsonPath("$.data.data[0].locationNote").value("2nd floor"));
 
         verify(favoriteService).listSalonFavorites(eq(clientId), any(Pageable.class));
     }

@@ -61,8 +61,8 @@ import static org.mockito.Mockito.when;
  *
  * <p>All collaborators (repository, master/salon repositories, the M2
  * locality-label seam, {@link FavoritePersistenceService}) are mocked; the tests verify the
- * favoriting/unfavoriting business rules — idempotency, {@code SALON_MASTER} rejection,
- * missing-target {@code 404}, the concurrent-race fallback, {@code lastServiceName} resolution
+ * favoriting/unfavoriting business rules — idempotency, inactive-target rejection,
+ * missing-target {@code 404}, the concurrent-race fallback, projection-row mapping
  * and the no-N+1 label batching — without booting Hibernate. Because
  * {@code favoritePersistenceService} is a mock here, it has no real transaction to poison, so
  * these tests cannot see the aborted-transaction gap a genuine two-thread race exposes; that
@@ -123,7 +123,7 @@ class FavoriteServiceTest {
 
     /**
      * An assignment whose owning master's user carries {@code ownerRole} — used to prove the
-     * SERVICE arm applies NO role check (a SALON_MASTER's service IS wish-listable), unlike the
+     * SERVICE arm applies NO role check (a SALON_MASTER's service IS wish-listable), matching the
      * MASTER arm.
      */
     private static MasterServiceAssignment assignmentOwnedBy(Role ownerRole,
@@ -230,11 +230,61 @@ class FavoriteServiceTest {
                     .containsExactly(clientId, FavoriteTargetType.MASTER, targetId);
         }
 
+        /**
+         * INVERTED by mobile Phase 111 (was {@code should_throwBadRequest_when_targetIsSalonMaster},
+         * which asserted a 400). The role predicate is gone: a client may heart any provider they
+         * can book, so a salon-employed master is now a valid MASTER target. Kept — not deleted —
+         * so the reversal is visible in history and a reintroduced role check goes red here.
+         */
         @Test
-        @DisplayName("rejects a SALON_MASTER target with 400 and writes no row")
-        void should_throwBadRequest_when_targetIsSalonMaster() {
+        @DisplayName("persists a SALON_MASTER target — the role predicate was removed (Phase 111)")
+        void should_persist_when_targetIsSalonMaster() {
             when(masterRepository.findByIdWithUserAndSalon(targetId))
                     .thenReturn(Optional.of(masterOwnedBy(Role.SALON_MASTER)));
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.MASTER, targetId)).thenReturn(Optional.empty());
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenReturn(existingFavorite(clientId, FavoriteTargetType.MASTER, targetId));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId);
+
+            assertThat(response.targetId()).isEqualTo(targetId);
+            verify(favoritePersistenceService).persistNew(any(Favorite.class));
+        }
+
+        /**
+         * The second value the removed predicate rejected, and the subtler one: the check read
+         * {@code master.getUser().getRole()}, so a salon owner working as a master — user role
+         * {@code SALON_OWNER}, {@code MasterType.SALON_OWNER} — was rejected too, even though
+         * they are bookable. Removing the single predicate admits all three MasterTypes.
+         */
+        @Test
+        @DisplayName("persists a SALON_OWNER-as-master target (owner working as a master)")
+        void should_persist_when_targetIsOwnerAsMaster() {
+            when(masterRepository.findByIdWithUserAndSalon(targetId))
+                    .thenReturn(Optional.of(masterOwnedBy(Role.SALON_OWNER)));
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.MASTER, targetId)).thenReturn(Optional.empty());
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenReturn(existingFavorite(clientId, FavoriteTargetType.MASTER, targetId));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId);
+
+            assertThat(response.targetId()).isEqualTo(targetId);
+            verify(favoritePersistenceService).persistNew(any(Favorite.class));
+        }
+
+        /**
+         * The ACTIVE check is the ONE surviving 400 on this arm — pinned per role so removing the
+         * role predicate cannot be mistaken for removing the guard entirely.
+         */
+        @Test
+        @DisplayName("still rejects an INACTIVE master with 400 and writes no row, whatever the role")
+        void should_throwBadRequest_when_masterInactive() {
+            when(masterRepository.findByIdWithUserAndSalon(targetId))
+                    .thenReturn(Optional.of(masterOwnedBy(Role.SALON_MASTER, false)));
 
             assertThatThrownBy(() ->
                     favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId))
@@ -274,6 +324,56 @@ class FavoriteServiceTest {
                             .isEqualTo(HttpStatus.BAD_REQUEST));
 
             verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("rejects a MASTER of a DEACTIVATED salon with 400 — write-time and read-time "
+                + "must agree on one rule")
+        void should_throwBadRequest_when_masterSalonIsInactive() {
+            // 2026-08 re-audit LOW. SalonService.deactivateSalon does NOT cascade to
+            // masters.is_active, so the master row still reads active and only the salon's flag is
+            // false. Before this fix the write path checked master.isActive() alone: the POST
+            // returned 200 and stored a row findFavoriteMasterRows filters out for ever — a soft
+            // "is this account still active" oracle for a salon withdrawn from public view.
+            Master master = masterOwnedBy(Role.SALON_MASTER, true);
+            master.setSalon(Salon.builder().id(UUID.randomUUID()).isActive(false).build());
+            // Pin the verdict to the CANONICAL rule rather than a look-alike inline predicate:
+            // validateMasterTarget delegates to MasterBookability, exactly as validateServiceTarget
+            // does. Re-inline the check and let the two drift, and this precondition fails.
+            assertThat(MasterBookability.isBookable(master))
+                    .as("precondition: MasterBookability — the single canonical rule — must itself "
+                            + "call this master unbookable, so the 400 below is that rule's verdict")
+                    .isFalse();
+            when(masterRepository.findByIdWithUserAndSalon(targetId)).thenReturn(Optional.of(master));
+
+            assertThatThrownBy(() ->
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId))
+                    .isInstanceOf(BusinessException.class)
+                    .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
+                            .as("same 400 as the deactivated-master case — a client must not be "
+                                    + "able to tell 'master left' from 'salon closed'")
+                            .isEqualTo(HttpStatus.BAD_REQUEST));
+
+            verifyNoInteractions(favoritePersistenceService);
+        }
+
+        @Test
+        @DisplayName("still ALLOWS a MASTER of an ACTIVE salon — the salon guard must not reject "
+                + "every salon-employed master")
+        void should_persist_when_masterSalonIsActive() {
+            Master master = masterOwnedBy(Role.SALON_MASTER, true);
+            master.setSalon(Salon.builder().id(UUID.randomUUID()).isActive(true).build());
+            when(masterRepository.findByIdWithUserAndSalon(targetId)).thenReturn(Optional.of(master));
+            when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
+                    clientId, FavoriteTargetType.MASTER, targetId)).thenReturn(Optional.empty());
+            when(favoritePersistenceService.persistNew(any(Favorite.class)))
+                    .thenReturn(existingFavorite(clientId, FavoriteTargetType.MASTER, targetId));
+
+            FavoriteResponse response =
+                    favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, targetId);
+
+            assertThat(response.targetId()).isEqualTo(targetId);
+            verify(favoritePersistenceService).persistNew(any(Favorite.class));
         }
 
         @Test
@@ -883,15 +983,28 @@ class FavoriteServiceTest {
     @DisplayName("listMasterFavorites")
     class ListMasterFavorites {
 
+        /**
+         * Mobile Phase 111 reshaped this row: index 7 was {@code last_service_name}, it is now the
+         * first of the three address columns off {@code users}; the 2026-08 re-audit appended
+         * index 10, {@code masters.master_type}, which drives address suppression and never
+         * reaches the DTO, and then indices 11–12, {@code salons.city_id} /
+         * {@code salons.district_id}, when the locality {@code COALESCE} was replaced by the same
+         * type gate (indices 4–5 are now the master's OWN locality, no longer coalesced). The
+         * projection layout is index-matched by hand in {@code FavoriteService#mapMasterRow}, so
+         * this test's literal 13-element row IS the contract with
+         * {@code FavoriteRepository#findFavoriteMasterRows}.
+         */
         @Test
-        @DisplayName("maps every projection field and carries this client's lastServiceName")
-        void should_mapMasterRow_when_clientHasBookingWithMaster() {
+        @DisplayName("maps every projection field including an INDEPENDENT_MASTER's own street address")
+        void should_mapMasterRow_when_projectionRowIsComplete() {
             UUID masterId = UUID.randomUUID();
             UUID cityId = UUID.randomUUID();
             UUID districtId = UUID.randomUUID();
             Object[] row = {
                     masterId, "Марія", "Левченко", "https://cdn/avatar.png",
-                    cityId, districtId, new BigDecimal("4.75"), "Манікюр"
+                    cityId, districtId, new BigDecimal("4.75"),
+                    "вул. Хрещатик", "12Б", "код 4321", "INDEPENDENT_MASTER",
+                    null, null   // salon_city_id / salon_district_id — an independent has no salon
             };
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.<Object[]>of(row));
@@ -906,25 +1019,139 @@ class FavoriteServiceTest {
                     .extracting(FavoriteMasterResponse::masterId, FavoriteMasterResponse::firstName,
                             FavoriteMasterResponse::lastName, FavoriteMasterResponse::avatarUrl,
                             FavoriteMasterResponse::cityLabel, FavoriteMasterResponse::districtLabel,
-                            FavoriteMasterResponse::avgRating, FavoriteMasterResponse::lastServiceName)
+                            FavoriteMasterResponse::avgRating, FavoriteMasterResponse::street,
+                            FavoriteMasterResponse::buildingNo, FavoriteMasterResponse::locationNote)
                     .containsExactly(masterId, "Марія", "Левченко", "https://cdn/avatar.png",
-                            "Київ", "Печерський", 4.75, "Манікюр");
+                            "Київ", "Печерський", 4.75, "вул. Хрещатик", "12Б", "код 4321");
         }
 
         @Test
-        @DisplayName("leaves lastServiceName null when this client never booked the master")
-        void should_returnNullServiceName_when_clientNeverBookedMaster() {
+        @DisplayName("leaves every nullable projection column null rather than substituting a default")
+        void should_returnNulls_when_projectionColumnsAreNull() {
             UUID masterId = UUID.randomUUID();
-            Object[] row = {masterId, "Олена", "Коваль", null, null, null, null, null};
+            Object[] row = {masterId, "Олена", "Коваль", null, null, null, null, null, null, null,
+                    "INDEPENDENT_MASTER", null, null};
             when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
 
             List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
-            assertThat(result.get(0).lastServiceName()).isNull();
             assertThat(result.get(0).avgRating()).isNull();
             assertThat(result.get(0).cityLabel()).isNull();
+            assertThat(result.get(0).street()).isNull();
+            assertThat(result.get(0).buildingNo()).isNull();
+            assertThat(result.get(0).locationNote()).isNull();
+        }
+
+        /**
+         * 2026-08 re-audit MEDIUM — the locked per-role address matrix applies to THIS surface too.
+         *
+         * <p>Mirrors {@code MasterDetailResponseTest}'s three cases exactly (INDEPENDENT_MASTER
+         * unmasked, SALON_MASTER masked, SALON_OWNER masked), because both surfaces now evaluate
+         * the SAME predicate, {@code MasterType#disclosesOwnAddress}. Before the fix
+         * {@code GET /favorites/masters} returned {@code users.street} for every master type,
+         * leaving the suppression to the mobile client — and for a multi-salon owner that column
+         * holds the most recently created salon's address, so a master working in salon A was
+         * handed salon B's street.
+         *
+         * <p>The locality LABELS are asserted to survive on purpose: the matrix masks the address
+         * triple, not "where can I find this provider", which for an employed master legitimately
+         * resolves through the SALON. A fix that blanked both would pass a narrower test.
+         *
+         * <p>The third row pins the 2026-08 re-audit LOW: {@code salons.city_id} is nullable, and
+         * the query used to emit {@code COALESCE(sal.city_id, u.city_id)}, so an employed master
+         * in a salon with no recorded locality fell through to their OWN city/district — the very
+         * value {@code MasterDetailResponse#fromPublic} masks for that type. Salon-locality-or
+         * -NOTHING is now the rule, so the labels must come out {@code null} even though index
+         * 4/5 carry a resolvable id.
+         */
+        @Test
+        @DisplayName("nulls the street address for a salon-affiliated master (SALON_MASTER / SALON_OWNER)")
+        void should_nullStreetAddress_when_masterIsSalonAffiliated() {
+            UUID salonCityId = UUID.randomUUID();
+            UUID salonDistrictId = UUID.randomUUID();
+            UUID ownCityId = UUID.randomUUID();
+            UUID ownDistrictId = UUID.randomUUID();
+            // Employed, salon HAS a locality → the salon's labels are published.
+            Object[] salonMaster = {UUID.randomUUID(), "Ірина", "Бондар", null,
+                    ownCityId, ownDistrictId,
+                    new BigDecimal("4.50"), "вул. Хрещатик", "12Б", "код 4321", "SALON_MASTER",
+                    salonCityId, salonDistrictId};
+            Object[] salonOwner = {UUID.randomUUID(), "Олег", "Гриценко", null,
+                    ownCityId, ownDistrictId,
+                    new BigDecimal("4.90"), "вул. Січових Стрільців", "7", "2 поверх", "SALON_OWNER",
+                    salonCityId, salonDistrictId};
+            // Employed, salon has NO recorded locality → nothing, NOT the master's own.
+            Object[] localitylessSalonMaster = {UUID.randomUUID(), "Ганна", "Мороз", null,
+                    ownCityId, ownDistrictId,
+                    new BigDecimal("4.10"), "вул. Лесі Українки", "3", "домофон", "SALON_MASTER",
+                    null, null};
+            when(favoriteRepository.findFavoriteMasterRows(clientId))
+                    .thenReturn(List.of(salonMaster, salonOwner, localitylessSalonMaster));
+            // BOTH ids resolve to a label — so a fall-through to the master's own locality would
+            // print «Полтава» rather than silently yielding null and passing this test anyway.
+            when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                    .thenReturn(new DiscoveryLabels(
+                            Map.of(salonCityId, "Київ", ownCityId, "Полтава"),
+                            Map.of(salonDistrictId, "Печерський", ownDistrictId, "Київський")));
+
+            List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+            assertThat(result)
+                    .as("a salon-affiliated master's own users.street is the salon's business "
+                            + "address (or, for a multi-salon owner, the WRONG salon's) — the "
+                            + "server suppresses it, exactly as MasterDetailResponse.fromPublic does")
+                    .allSatisfy(r -> assertThat(r)
+                            .extracting(FavoriteMasterResponse::street,
+                                    FavoriteMasterResponse::buildingNo,
+                                    FavoriteMasterResponse::locationNote)
+                            .containsOnlyNulls());
+            assertThat(result).extracting(FavoriteMasterResponse::avgRating)
+                    .containsExactly(4.50, 4.90, 4.10);
+            assertThat(result.subList(0, 2))
+                    .as("the address triple is masked, but the SALON's locality still publishes — "
+                            + "or the card loses the 'where can I find them' line the matrix permits")
+                    .allSatisfy(r -> {
+                        assertThat(r.cityLabel()).isEqualTo("Київ");
+                        assertThat(r.districtLabel()).isEqualTo("Печерський");
+                    });
+            assertThat(result.get(2))
+                    .as("salon-locality-or-NOTHING: a salon with no recorded city must not fall "
+                            + "through to the employed master's own «Полтава»/«Київський»")
+                    .extracting(FavoriteMasterResponse::cityLabel,
+                            FavoriteMasterResponse::districtLabel)
+                    .containsOnlyNulls();
+        }
+
+        /**
+         * Fail-closed branch. A {@code NULL} or unrecognised {@code master_type} (an enum constant
+         * an older instance does not know, mid-rolling-deploy) must suppress the address rather
+         * than default to disclosure — and must not throw {@link IllegalArgumentException} out of a
+         * read endpoint as a 500.
+         */
+        @Test
+        @DisplayName("suppresses the address and does not throw when master_type is null or unknown")
+        void should_suppressAddress_when_masterTypeIsUnrecognised() {
+            Object[] nullType = {UUID.randomUUID(), "А", "А", null, null, null, null,
+                    "вул. Тестова", "1", "нотатка", null, null, null};
+            Object[] unknownType = {UUID.randomUUID(), "Б", "Б", null, null, null, null,
+                    "вул. Тестова", "2", "нотатка", "FUTURE_MASTER_TYPE", null, null};
+            when(favoriteRepository.findFavoriteMasterRows(clientId))
+                    .thenReturn(List.of(nullType, unknownType));
+            when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                    .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
+
+            List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+            assertThat(result)
+                    .as("unknown master type fails CLOSED — a missing street line is recoverable, "
+                            + "a leaked one is not")
+                    .allSatisfy(r -> assertThat(r)
+                            .extracting(FavoriteMasterResponse::street,
+                                    FavoriteMasterResponse::buildingNo,
+                                    FavoriteMasterResponse::locationNote)
+                            .containsOnlyNulls());
         }
 
         @Test
@@ -942,9 +1169,12 @@ class FavoriteServiceTest {
         @DisplayName("resolves locality labels exactly once for the whole page (batched, no N+1)")
         void should_resolveLabelsOnce_when_pageHasManyRows() {
             UUID cityId = UUID.randomUUID();
-            Object[] r1 = {UUID.randomUUID(), "A", "A", null, cityId, null, null, null};
-            Object[] r2 = {UUID.randomUUID(), "B", "B", null, cityId, null, null, null};
-            Object[] r3 = {UUID.randomUUID(), "C", "C", null, cityId, null, null, null};
+            Object[] r1 = {UUID.randomUUID(), "A", "A", null, cityId, null, null, null, null, null,
+                    "INDEPENDENT_MASTER", null, null};
+            Object[] r2 = {UUID.randomUUID(), "B", "B", null, null, null, null, null, null, null,
+                    "SALON_MASTER", cityId, null};
+            Object[] r3 = {UUID.randomUUID(), "C", "C", null, null, null, null, null, null, null,
+                    "SALON_OWNER", cityId, null};
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.of(r1, r2, r3));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
@@ -964,15 +1194,22 @@ class FavoriteServiceTest {
     @DisplayName("listSalonFavorites")
     class ListSalonFavorites {
 
+        /**
+         * Mobile Phase 111 extended this row from 6 to 9 columns (street/buildingNo/locationNote)
+         * and swapped index 5's source from a live {@code AVG(reviews.rating)} aggregate to the
+         * persisted {@code salons.avg_rating}. The mapper is index-matched by hand, so this
+         * literal row IS the contract with {@code FavoriteRepository#findFavoriteSalonRows}.
+         */
         @Test
-        @DisplayName("maps every salon projection field including the AVG(rating) aggregate")
+        @DisplayName("maps every salon projection field including the salon's street address")
         void should_mapSalonRow_when_salonReviewed() {
             UUID salonId = UUID.randomUUID();
             UUID cityId = UUID.randomUUID();
             UUID districtId = UUID.randomUUID();
-            // AVG() returns a Postgres numeric → mapped via Number.doubleValue().
+            // salons.avg_rating is a Postgres numeric → mapped via Number.doubleValue().
             Object[] row = {salonId, "Salon Bella", "https://cdn/s.png",
-                    cityId, districtId, new BigDecimal("4.20")};
+                    cityId, districtId, new BigDecimal("4.20"),
+                    "вул. Дерибасівська", "7", "2-й поверх"};
             when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(
@@ -983,16 +1220,25 @@ class FavoriteServiceTest {
             assertThat(result.get(0))
                     .extracting(FavoriteSalonResponse::salonId, FavoriteSalonResponse::name,
                             FavoriteSalonResponse::avatarUrl, FavoriteSalonResponse::cityLabel,
-                            FavoriteSalonResponse::districtLabel, FavoriteSalonResponse::avgRating)
+                            FavoriteSalonResponse::districtLabel, FavoriteSalonResponse::avgRating,
+                            FavoriteSalonResponse::street, FavoriteSalonResponse::buildingNo,
+                            FavoriteSalonResponse::locationNote)
                     .containsExactly(salonId, "Salon Bella", "https://cdn/s.png",
-                            "Одеса", "Приморський", 4.20);
+                            "Одеса", "Приморський", 4.20,
+                            "вул. Дерибасівська", "7", "2-й поверх");
         }
 
+        /**
+         * The query — not the mapper — is what turns a {@code review_count = 0} salon's persisted
+         * {@code 0.00} into {@code NULL} (see the {@code CASE WHEN} in
+         * {@code findFavoriteSalonRows}), so the row this test feeds already carries {@code null}
+         * at index 5. What is pinned here is that the mapper does not substitute a default.
+         */
         @Test
-        @DisplayName("leaves avgRating null when the salon has no reviews")
+        @DisplayName("leaves avgRating and the address columns null when the projection sends null")
         void should_returnNullRating_when_salonNeverReviewed() {
             UUID salonId = UUID.randomUUID();
-            Object[] row = {salonId, "New Salon", null, null, null, null};
+            Object[] row = {salonId, "New Salon", null, null, null, null, null, null, null};
             when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
@@ -1000,6 +1246,9 @@ class FavoriteServiceTest {
             List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
 
             assertThat(result.get(0).avgRating()).isNull();
+            assertThat(result.get(0).street()).isNull();
+            assertThat(result.get(0).buildingNo()).isNull();
+            assertThat(result.get(0).locationNote()).isNull();
         }
 
         @Test

@@ -40,6 +40,11 @@ import com.beautica.master.entity.Master;
  *   <li>{@code FavoriteService#validateServiceTarget} — {@code POST /favorites} (wish-list add).
  *       The one write path that deliberately admits {@code SALON_MASTER} services, so it is the
  *       one that can attach a closed salon's service to a client's wish list.</li>
+ *   <li>{@code FavoriteService#validateMasterTarget} — {@code POST /favorites} (favourite a
+ *       provider). Added by the 2026-08 re-audit: once mobile Phase 111 dropped that arm's role
+ *       predicate, salon-employed masters reached it, and checking only {@code isActive} let a
+ *       client store a favourite of a CLOSED salon's master that the list query then filters out —
+ *       a soft account-still-exists oracle. Write-time and read-time now carry the same rule.</li>
  * </ol>
  *
  * <h2>Derivative enforcers — the three reschedule routes</h2>
