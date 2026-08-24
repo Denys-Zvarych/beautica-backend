@@ -66,15 +66,22 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      *   <li>own_city_id ({@code users.city_id}) — the master's OWN locality</li>
      *   <li>own_district_id ({@code users.district_id}) — the master's OWN locality</li>
      *   <li>avg_rating ({@code masters.avg_rating}, nullable)</li>
-     *   <li>street ({@code users.street}, nullable)</li>
-     *   <li>building_no ({@code users.building_no}, nullable)</li>
-     *   <li>location_note ({@code users.location_note}, nullable)</li>
+     *   <li>own_street ({@code users.street}, nullable) — the master's OWN address</li>
+     *   <li>own_building_no ({@code users.building_no}, nullable) — OWN</li>
+     *   <li>own_location_note ({@code users.location_note}, nullable) — OWN</li>
      *   <li>master_type ({@code masters.master_type}, {@code NOT NULL}) — projected ONLY to drive
-     *       the address- AND locality-suppression rules in {@code FavoriteService#mapMasterRow};
+     *       the address- AND locality-source rules in {@code FavoriteService#mapMasterRow};
      *       it never reaches the response DTO (§I: no internal role/type values on the wire)</li>
      *   <li>salon_city_id ({@code salons.city_id}, nullable — {@code NULL} both when the master
      *       has no salon and when the salon has no recorded locality)</li>
      *   <li>salon_district_id ({@code salons.district_id}, nullable, same two reasons)</li>
+     *   <li>salon_id ({@code salons.id}, nullable — {@code NULL} exactly when the master has no
+     *       employing salon)</li>
+     *   <li>salon_name ({@code salons.name}, {@code NOT NULL} on the table, so {@code NULL} here
+     *       has the same single meaning as {@code salon_id})</li>
+     *   <li>salon_street ({@code salons.street}, nullable)</li>
+     *   <li>salon_building_no ({@code salons.building_no}, nullable)</li>
+     *   <li>salon_location_note ({@code salons.location_note}, nullable)</li>
      * </ol>
      *
      * <p><b>Locality is NO LONGER {@code COALESCE}d in SQL</b> (2026-08 security re-audit LOW).
@@ -89,19 +96,29 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * unreachable while a role predicate kept salon masters out of this query; mobile Phase 111
      * removed the predicate and made it live.</p>
      *
-     * <p><b>Address columns come from {@code users}, never {@code salons}</b> (mobile Phase 111).
-     * They are the master's OWN address. They are projected for every master, but the SERVICE
-     * layer nulls them for any master type that fails
-     * {@link com.beautica.master.entity.MasterType#disclosesOwnAddress} — the same locked
-     * per-role address matrix {@code MasterDetailResponse.fromPublic} applies, evaluated in ONE
-     * place for both surfaces. An earlier revision of this query returned them unconditionally and
-     * left the suppression to the client; a client-side suppression is not a server-side control,
-     * and for a multi-salon owner {@code users.street} holds the most recently created salon's
-     * address, so the row could print salon B's street beside a master working in salon A.
-     * Note the contrast with the locality columns above: locality resolves through the SALON for
-     * an employed master ("where can I find this provider" — the salon's, or nothing), while the
-     * street triple is "this person's own address" and is suppressed outright. Both decisions run
-     * off the same predicate in {@code FavoriteService#mapMasterRow}.
+     * <p><b>BOTH address sources are projected raw; the service picks one</b> (favourites
+     * affiliation fix). Indices 7–9 are the master's OWN address off {@code users}; indices 15–17
+     * are the EMPLOYING SALON's off {@code salons}. Neither is {@code COALESCE}d in SQL — the
+     * choice is made in {@code FavoriteService#mapMasterRow} by the SAME
+     * {@link com.beautica.master.entity.MasterType#disclosesOwnAddress} predicate that already
+     * governs the locality pair, so address and locality cannot resolve through different entities
+     * on one card. An independent master publishes their own address; a salon-affiliated master
+     * publishes their salon's, <em>salon-or-nothing</em> — never the employee's personal one.
+     *
+     * <p>Suppressing the employee's own row stays load-bearing for the reason it always was: a
+     * salon-employed master has no personal address to disclose, and {@code users.street} is not
+     * even reliably their workplace — for a multi-salon owner it holds the MOST RECENTLY CREATED
+     * salon's address, so the row could print salon B's street beside a master working in salon A.
+     * An earlier revision projected {@code users} unconditionally and left the suppression to the
+     * mobile client, which is not a server-side control. What changed since is only the fallback:
+     * the card now shows the SALON's street (public business data, already returned unmasked by
+     * {@link #findFavoriteSalonRows(UUID, Pageable)} and by the public salon profile) instead of
+     * showing nothing at all.
+     *
+     * <p><b>{@code sal.id} / {@code sal.name} (13, 14)</b> back the card's affiliation line —
+     * "works at &lt;salon&gt;", tappable through to the salon. They ride the {@code LEFT JOIN salons}
+     * that was already here for the locality columns, so they cost no extra join. {@code NULL} for
+     * an independent master, which is exactly what the client keys the line's presence off.
      *
      * <p><b>{@code last_service_name} and its {@code LEFT JOIN LATERAL} were REMOVED</b> (mobile
      * Phase 111): the approved favourites design no longer renders it, and the LATERAL existed
@@ -161,12 +178,17 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                    u.city_id                AS own_city_id,
                    u.district_id            AS own_district_id,
                    m.avg_rating             AS avg_rating,
-                   u.street                 AS street,
-                   u.building_no            AS building_no,
-                   u.location_note          AS location_note,
+                   u.street                 AS own_street,
+                   u.building_no            AS own_building_no,
+                   u.location_note          AS own_location_note,
                    m.master_type            AS master_type,
                    sal.city_id              AS salon_city_id,
-                   sal.district_id          AS salon_district_id
+                   sal.district_id          AS salon_district_id,
+                   sal.id                   AS salon_id,
+                   sal.name                 AS salon_name,
+                   sal.street               AS salon_street,
+                   sal.building_no          AS salon_building_no,
+                   sal.location_note        AS salon_location_note
             FROM favorites f
             JOIN masters m ON m.id = f.target_id
             JOIN users u ON u.id = m.user_id
@@ -203,12 +225,17 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                    u.city_id                AS own_city_id,
                    u.district_id            AS own_district_id,
                    m.avg_rating             AS avg_rating,
-                   u.street                 AS street,
-                   u.building_no            AS building_no,
-                   u.location_note          AS location_note,
+                   u.street                 AS own_street,
+                   u.building_no            AS own_building_no,
+                   u.location_note          AS own_location_note,
                    m.master_type            AS master_type,
                    sal.city_id              AS salon_city_id,
-                   sal.district_id          AS salon_district_id
+                   sal.district_id          AS salon_district_id,
+                   sal.id                   AS salon_id,
+                   sal.name                 AS salon_name,
+                   sal.street               AS salon_street,
+                   sal.building_no          AS salon_building_no,
+                   sal.location_note        AS salon_location_note
             FROM favorites f
             JOIN masters m ON m.id = f.target_id
             JOIN users u ON u.id = m.user_id

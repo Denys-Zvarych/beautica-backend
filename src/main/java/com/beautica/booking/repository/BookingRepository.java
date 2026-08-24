@@ -1512,4 +1512,130 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
             """)
     int consumeCancelToken(@Param("cancelToken") UUID cancelToken);
+
+    // ── last-booked category, batched per page (favourites category axis) ──────
+    //
+    // Both queries answer ONE question for a WHOLE page of providers: "for each of
+    // these providers, what platform category was the service in this client's most
+    // recent booking with them?" — the axis the favourites screen's category chips
+    // filter on. Read through com.beautica.booking.service.LastBookedCategoryLookup;
+    // no feature outside `booking` touches this repository directly.
+    //
+    // ONE STATEMENT PER PAGE, NOT PER ROW. The favourites list query used to carry a
+    // correlated LEFT JOIN LATERAL for the (since-deleted) `last_service_name`; it
+    // cost 9.11 ms per page and its removal took that page to 0.089 ms. That win is
+    // preserved by keeping this derivation OUT of the list statement entirely: the
+    // service fetches the page, then resolves the whole page's categories in a single
+    // additional round trip keyed on the ids it already holds. The list query itself
+    // is byte-for-byte unchanged.
+    //
+    // WHY A LATERAL IS STILL THE RIGHT SHAPE HERE. "Top 1 per provider" has two
+    // plans. `DISTINCT ON (master_id) … ORDER BY master_id, starts_at DESC` must
+    // materialise and sort EVERY booking the client has with any provider on the
+    // page: measured at 102 ms for a client with 100k bookings, with the sort
+    // spilling 6 MB to disk (`external merge`). The LATERAL below instead performs
+    // one top-1 index seek per provider — bounded by PAGE SIZE, indifferent to how
+    // deep the client's history runs. Measured on the same 100k-booking client with
+    // a 20-provider page: 0.879 ms (master) / 0.626 ms (salon), 20 loops × ~2 index
+    // rows, no sort spill. The forbidden pattern is a per-ROW subquery inside the
+    // list query, not a bounded LATERAL inside a dedicated batch statement.
+    //
+    // DRIVER TABLE, NOT `unnest(:ids)`. The LATERAL is driven off a PK `IN (:ids)`
+    // scan of masters/salons so the ids bind as a plain Collection<UUID> — the
+    // established native-query idiom in this file (see findBookedDatesBySalonIds).
+    // Binding a UUID[] for `unnest` has no precedent in this codebase and would be
+    // the only array-typed native parameter in it.
+    //
+    // INDEXES. Master arm: idx_bookings_master_client_starts_at (master_id,
+    // client_id, starts_at DESC), V93. Salon arm: idx_bookings_salon_client_starts_at
+    // (salon_id, client_id, starts_at DESC) WHERE both NOT NULL, V142 — added for
+    // exactly this query; without it the salon arm falls back to a `client_id` Filter
+    // over the salon's whole timeline. Both are exact left-prefix equality pairs plus
+    // the sort column.
+    //
+    // `sd.category IS NOT NULL` FILTERS THE RESULT, IT DOES NOT PICK THE BOOKING.
+    // It sits in the OUTER WHERE, after the LATERAL has already committed to the
+    // single most recent booking. So a client whose latest booking was of an
+    // uncategorised service (service_definitions.category is nullable) drops OUT of
+    // the map and surfaces as a null category — the definite article in "the most
+    // recent booking" is honoured. It deliberately does NOT skip backwards to an
+    // older booking that happens to carry a category; that would be a different rule
+    // ("most recent CATEGORISED booking") that neither the design nor the DTO states.
+    //
+    // NO STATUS PREDICATE, deliberately. The axis is "has this client booked here,
+    // and for what" — a CANCELLED or DECLINED booking is still booked history and
+    // still evidence of what the client comes to this provider for. Adding a status
+    // filter would silently widen the null rate the DTO contract already accepts.
+
+    /**
+     * Batched "category of the service in this client's most recent booking" for a page
+     * of MASTER ids — one statement per page, one top-1 index seek per master.
+     *
+     * <p>Rows: {@code [masters.id (UUID), service_definitions.category (String)]}. A master
+     * with no booking by this client, or whose most recent booked service carries no
+     * category, is ABSENT from the result rather than present with a {@code null} — callers
+     * read the absence as "no booked history yet". Read the block comment above this method
+     * for the plan, index and semantic rationale; it applies to both arms.
+     *
+     * <p>Callers MUST short-circuit on an empty {@code masterIds} — an empty {@code IN ()}
+     * list is a SQL syntax error, not an empty result.
+     *
+     * @param clientId  the favouriting client — this is THEIR history, never global. Scoping
+     *                  is mandatory and is the caller's responsibility to source from the
+     *                  authenticated principal (§E-4).
+     * @param masterIds the page's master ids; bounded by the caller's page size (§E-3)
+     */
+    @Query(value = """
+            SELECT m.id       AS provider_id,
+                   sd.category AS category_code
+            FROM masters m
+            CROSS JOIN LATERAL (
+                SELECT b.master_service_id
+                FROM bookings b
+                WHERE b.master_id = m.id
+                  AND b.client_id = :clientId
+                ORDER BY b.starts_at DESC, b.id DESC
+                LIMIT 1
+            ) lb
+            JOIN master_services msa ON msa.id = lb.master_service_id
+            JOIN service_definitions sd ON sd.id = msa.service_def_id
+            WHERE m.id IN (:masterIds)
+              AND sd.category IS NOT NULL
+            """, nativeQuery = true)
+    List<Object[]> findLastBookedCategoryByMasterIds(@Param("clientId") UUID clientId,
+                                                     @Param("masterIds") Collection<UUID> masterIds);
+
+    /**
+     * Salon counterpart of {@link #findLastBookedCategoryByMasterIds}, scoped to bookings
+     * placed AT that salon ({@code bookings.salon_id}), not to bookings with a master who
+     * happens to work there now.
+     *
+     * <p>{@code bookings.salon_id} is the salon stamped on the booking when it was created,
+     * so a master who has since moved salons does not retroactively move their history — the
+     * category stays attached to the place the client actually visited. It is {@code NULL}
+     * for every independent-master booking, which is why those rows can never match here and
+     * why V142's index is partial on it.
+     *
+     * <p>Rows, absence semantics, status handling and the {@code IN ()} short-circuit rule are
+     * identical to the master arm; see its javadoc and the block comment above it.
+     */
+    @Query(value = """
+            SELECT s.id       AS provider_id,
+                   sd.category AS category_code
+            FROM salons s
+            CROSS JOIN LATERAL (
+                SELECT b.master_service_id
+                FROM bookings b
+                WHERE b.salon_id = s.id
+                  AND b.client_id = :clientId
+                ORDER BY b.starts_at DESC, b.id DESC
+                LIMIT 1
+            ) lb
+            JOIN master_services msa ON msa.id = lb.master_service_id
+            JOIN service_definitions sd ON sd.id = msa.service_def_id
+            WHERE s.id IN (:salonIds)
+              AND sd.category IS NOT NULL
+            """, nativeQuery = true)
+    List<Object[]> findLastBookedCategoryBySalonIds(@Param("clientId") UUID clientId,
+                                                    @Param("salonIds") Collection<UUID> salonIds);
 }

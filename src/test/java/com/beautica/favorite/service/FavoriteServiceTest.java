@@ -11,6 +11,8 @@ import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.Favorite;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.FavoriteCategoryResolver.FavoriteCategories;
+import com.beautica.favorite.service.FavoriteCategoryResolver.FavoriteCategory;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
@@ -23,6 +25,7 @@ import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -41,6 +44,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,10 +52,13 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -94,11 +101,35 @@ class FavoriteServiceTest {
     @Mock
     private FavoritePersistenceService favoritePersistenceService;
 
+    @Mock
+    private FavoriteCategoryResolver favoriteCategoryResolver;
+
     @InjectMocks
     private FavoriteService favoriteService;
 
     private final UUID clientId = UUID.randomUUID();
     private final UUID targetId = UUID.randomUUID();
+
+    /**
+     * Default the category axis to "nobody on this page has booked history", so the ~13
+     * pre-existing list tests — which predate the axis and assert nothing about it — keep
+     * exercising the mapping they were written for instead of NPE-ing on a null carrier.
+     *
+     * <p>{@code lenient()} because the majority of tests in this class never reach a list path
+     * at all (they cover add/remove/validation), and because the category tests below REPLACE
+     * these stubs with their own; under strict stubs either would fail the run for an
+     * unnecessary stubbing rather than for the behaviour under test.
+     *
+     * <p>Empty is the honest default, not a convenience: a client who has favourited a provider
+     * without booking them is the COMMON case this DTO pair is nullable for.
+     */
+    @BeforeEach
+    void defaultToNoBookedCategories() {
+        lenient().when(favoriteCategoryResolver.resolveForMasters(any(), anyCollection()))
+                .thenReturn(FavoriteCategories.empty());
+        lenient().when(favoriteCategoryResolver.resolveForSalons(any(), anyCollection()))
+                .thenReturn(FavoriteCategories.empty());
+    }
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -985,14 +1016,16 @@ class FavoriteServiceTest {
 
         /**
          * Mobile Phase 111 reshaped this row: index 7 was {@code last_service_name}, it is now the
-         * first of the three address columns off {@code users}; the 2026-08 re-audit appended
-         * index 10, {@code masters.master_type}, which drives address suppression and never
-         * reaches the DTO, and then indices 11–12, {@code salons.city_id} /
+         * first of the three OWN address columns off {@code users}; the 2026-08 re-audit appended
+         * index 10, {@code masters.master_type}, which drives the address/locality SOURCE choice
+         * and never reaches the DTO, and then indices 11–12, {@code salons.city_id} /
          * {@code salons.district_id}, when the locality {@code COALESCE} was replaced by the same
          * type gate (indices 4–5 are now the master's OWN locality, no longer coalesced). The
-         * projection layout is index-matched by hand in {@code FavoriteService#mapMasterRow}, so
-         * this test's literal 13-element row IS the contract with
-         * {@code FavoriteRepository#findFavoriteMasterRows}.
+         * favourites-affiliation fix appended indices 13–17 — {@code salons.id}, {@code name},
+         * {@code street}, {@code building_no}, {@code location_note} — the salon-side counterpart
+         * of 7–9. The projection layout is index-matched by hand in
+         * {@code FavoriteService#mapMasterRow}, so this test's literal 18-element row IS the
+         * contract with {@code FavoriteRepository#findFavoriteMasterRows}.
          */
         @Test
         @DisplayName("maps every projection field including an INDEPENDENT_MASTER's own street address")
@@ -1004,7 +1037,9 @@ class FavoriteServiceTest {
                     masterId, "Марія", "Левченко", "https://cdn/avatar.png",
                     cityId, districtId, new BigDecimal("4.75"),
                     "вул. Хрещатик", "12Б", "код 4321", "INDEPENDENT_MASTER",
-                    null, null   // salon_city_id / salon_district_id — an independent has no salon
+                    // 11–17: salon locality, identity and address — an independent has no salon,
+                    // so the LEFT JOIN yields NULL for every one of them.
+                    null, null, null, null, null, null, null
             };
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.<Object[]>of(row));
@@ -1019,10 +1054,16 @@ class FavoriteServiceTest {
                     .extracting(FavoriteMasterResponse::masterId, FavoriteMasterResponse::firstName,
                             FavoriteMasterResponse::lastName, FavoriteMasterResponse::avatarUrl,
                             FavoriteMasterResponse::cityLabel, FavoriteMasterResponse::districtLabel,
-                            FavoriteMasterResponse::avgRating, FavoriteMasterResponse::street,
+                            FavoriteMasterResponse::avgRating,
+                            FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName,
+                            FavoriteMasterResponse::street,
                             FavoriteMasterResponse::buildingNo, FavoriteMasterResponse::locationNote)
+                    .as("an independent master publishes their OWN address and carries no "
+                            + "affiliation — a null salonId/salonName is what the client keys the "
+                            + "«works at …» line off")
                     .containsExactly(masterId, "Марія", "Левченко", "https://cdn/avatar.png",
-                            "Київ", "Печерський", 4.75, "вул. Хрещатик", "12Б", "код 4321");
+                            "Київ", "Печерський", 4.75, null, null,
+                            "вул. Хрещатик", "12Б", "код 4321");
         }
 
         @Test
@@ -1030,7 +1071,7 @@ class FavoriteServiceTest {
         void should_returnNulls_when_projectionColumnsAreNull() {
             UUID masterId = UUID.randomUUID();
             Object[] row = {masterId, "Олена", "Коваль", null, null, null, null, null, null, null,
-                    "INDEPENDENT_MASTER", null, null};
+                    "INDEPENDENT_MASTER", null, null, null, null, null, null, null};
             when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
@@ -1042,51 +1083,71 @@ class FavoriteServiceTest {
             assertThat(result.get(0).street()).isNull();
             assertThat(result.get(0).buildingNo()).isNull();
             assertThat(result.get(0).locationNote()).isNull();
+            assertThat(result.get(0).salonId()).isNull();
+            assertThat(result.get(0).salonName()).isNull();
         }
 
         /**
-         * 2026-08 re-audit MEDIUM — the locked per-role address matrix applies to THIS surface too.
+         * The locked per-role address matrix applies to THIS surface too (2026-08 re-audit
+         * MEDIUM), and the favourites-affiliation fix pins the OTHER half of it: which address a
+         * salon-affiliated master's card DOES show.
          *
-         * <p>Mirrors {@code MasterDetailResponseTest}'s three cases exactly (INDEPENDENT_MASTER
-         * unmasked, SALON_MASTER masked, SALON_OWNER masked), because both surfaces now evaluate
-         * the SAME predicate, {@code MasterType#disclosesOwnAddress}. Before the fix
-         * {@code GET /favorites/masters} returned {@code users.street} for every master type,
-         * leaving the suppression to the mobile client — and for a multi-salon owner that column
-         * holds the most recently created salon's address, so a master working in salon A was
-         * handed salon B's street.
+         * <p>The rule is one predicate, {@code MasterType#disclosesOwnAddress}, shared with
+         * {@code MasterDetailResponse#fromPublic}: an INDEPENDENT_MASTER discloses their own
+         * address; a SALON_MASTER / SALON_OWNER discloses their SALON's — never the employee's
+         * personal one. Before the fix this surface emitted {@code users.street} for every master
+         * type and left the suppression to the mobile client (not a server-side control, and for
+         * a multi-salon owner that column holds the WRONG salon's street). The fix after that
+         * over-corrected to nothing at all, so the card could not tell a client where to go.
          *
-         * <p>The locality LABELS are asserted to survive on purpose: the matrix masks the address
-         * triple, not "where can I find this provider", which for an employed master legitimately
-         * resolves through the SALON. A fix that blanked both would pass a narrower test.
+         * <p><b>The fixture makes the two addresses DISJOINT on purpose.</b> Every row carries a
+         * distinct {@code users} address AND a distinct {@code salons} address, so each assertion
+         * can fail three ways: reading the wrong column emits the master's own street, dropping
+         * the branch emits {@code null}, and crossing the rows emits another salon's. A fixture
+         * that reused one string for both sources would pass whichever column the mapper read.
          *
-         * <p>The third row pins the 2026-08 re-audit LOW: {@code salons.city_id} is nullable, and
-         * the query used to emit {@code COALESCE(sal.city_id, u.city_id)}, so an employed master
-         * in a salon with no recorded locality fell through to their OWN city/district — the very
-         * value {@code MasterDetailResponse#fromPublic} masks for that type. Salon-locality-or
-         * -NOTHING is now the rule, so the labels must come out {@code null} even though index
-         * 4/5 carry a resolvable id.
+         * <p>The locality LABELS are asserted alongside because the SAME predicate picks them —
+         * a fix that resolved the address through the salon but the locality through the user (or
+         * vice versa) would print a card whose street and city belong to different entities.
+         *
+         * <p>The third row pins the no-fall-through rule for BOTH field groups: its salon has
+         * neither a recorded locality nor a recorded address ({@code salons.city_id} and the
+         * street triple are all nullable — {@code V54} line 62, {@code Salon} lines 82–88), and
+         * the master underneath has both. Salon-or-NOTHING: those cells must come out {@code null}
+         * even though indices 4/5 and 7–9 carry perfectly resolvable values. Its
+         * {@code salonId}/{@code salonName} still publish — knowing WHERE someone works does not
+         * depend on that salon having filled in its street.
          */
         @Test
-        @DisplayName("nulls the street address for a salon-affiliated master (SALON_MASTER / SALON_OWNER)")
-        void should_nullStreetAddress_when_masterIsSalonAffiliated() {
+        @DisplayName("publishes the SALON's address, identity and locality — never the employee's "
+                + "own — for a salon-affiliated master (SALON_MASTER / SALON_OWNER)")
+        void should_publishSalonAddress_when_masterIsSalonAffiliated() {
             UUID salonCityId = UUID.randomUUID();
             UUID salonDistrictId = UUID.randomUUID();
             UUID ownCityId = UUID.randomUUID();
             UUID ownDistrictId = UUID.randomUUID();
-            // Employed, salon HAS a locality → the salon's labels are published.
+            UUID salonAId = UUID.randomUUID();
+            UUID salonBId = UUID.randomUUID();
+            UUID salonCId = UUID.randomUUID();
+            // Employed, salon HAS a locality AND an address → both are published, the master's
+            // own «вул. Хрещатик» is not.
             Object[] salonMaster = {UUID.randomUUID(), "Ірина", "Бондар", null,
                     ownCityId, ownDistrictId,
                     new BigDecimal("4.50"), "вул. Хрещатик", "12Б", "код 4321", "SALON_MASTER",
-                    salonCityId, salonDistrictId};
+                    salonCityId, salonDistrictId,
+                    salonAId, "Салон Bella", "вул. Володимирська", "40", "3 поверх"};
             Object[] salonOwner = {UUID.randomUUID(), "Олег", "Гриценко", null,
                     ownCityId, ownDistrictId,
                     new BigDecimal("4.90"), "вул. Січових Стрільців", "7", "2 поверх", "SALON_OWNER",
-                    salonCityId, salonDistrictId};
-            // Employed, salon has NO recorded locality → nothing, NOT the master's own.
+                    salonCityId, salonDistrictId,
+                    salonBId, "Салон Mocha", "просп. Свободи", "15", "вхід з двору"};
+            // Employed, salon has NO recorded locality and NO recorded address → nothing for
+            // either group, NOT the master's own.
             Object[] localitylessSalonMaster = {UUID.randomUUID(), "Ганна", "Мороз", null,
                     ownCityId, ownDistrictId,
                     new BigDecimal("4.10"), "вул. Лесі Українки", "3", "домофон", "SALON_MASTER",
-                    null, null};
+                    null, null,
+                    salonCId, "Салон Nord", null, null, null};
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.of(salonMaster, salonOwner, localitylessSalonMaster));
             // BOTH ids resolve to a label — so a fall-through to the master's own locality would
@@ -1099,44 +1160,66 @@ class FavoriteServiceTest {
             List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
             assertThat(result)
-                    .as("a salon-affiliated master's own users.street is the salon's business "
-                            + "address (or, for a multi-salon owner, the WRONG salon's) — the "
-                            + "server suppresses it, exactly as MasterDetailResponse.fromPublic does")
-                    .allSatisfy(r -> assertThat(r)
-                            .extracting(FavoriteMasterResponse::street,
-                                    FavoriteMasterResponse::buildingNo,
-                                    FavoriteMasterResponse::locationNote)
-                            .containsOnlyNulls());
-            assertThat(result).extracting(FavoriteMasterResponse::avgRating)
-                    .containsExactly(4.50, 4.90, 4.10);
-            assertThat(result.subList(0, 2))
-                    .as("the address triple is masked, but the SALON's locality still publishes — "
-                            + "or the card loses the 'where can I find them' line the matrix permits")
-                    .allSatisfy(r -> {
-                        assertThat(r.cityLabel()).isEqualTo("Київ");
-                        assertThat(r.districtLabel()).isEqualTo("Печерський");
-                    });
+                    .as("no row may echo the employee's own users.street — for a multi-salon owner "
+                            + "that column is not even the right salon's address")
+                    .extracting(FavoriteMasterResponse::street)
+                    .doesNotContain("вул. Хрещатик", "вул. Січових Стрільців", "вул. Лесі Українки");
+            assertThat(result.get(0))
+                    .as("the employing salon's identity AND address, so the card can say where to go")
+                    .extracting(FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName,
+                            FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
+                            FavoriteMasterResponse::locationNote,
+                            FavoriteMasterResponse::cityLabel,
+                            FavoriteMasterResponse::districtLabel)
+                    .containsExactly(salonAId, "Салон Bella", "вул. Володимирська", "40",
+                            "3 поверх", "Київ", "Печерський");
+            assertThat(result.get(1))
+                    .as("a SALON_OWNER working as a master resolves through their salon exactly "
+                            + "like a SALON_MASTER — one predicate, not two")
+                    .extracting(FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName,
+                            FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
+                            FavoriteMasterResponse::locationNote,
+                            FavoriteMasterResponse::cityLabel,
+                            FavoriteMasterResponse::districtLabel)
+                    .containsExactly(salonBId, "Салон Mocha", "просп. Свободи", "15",
+                            "вхід з двору", "Київ", "Печерський");
             assertThat(result.get(2))
-                    .as("salon-locality-or-NOTHING: a salon with no recorded city must not fall "
-                            + "through to the employed master's own «Полтава»/«Київський»")
-                    .extracting(FavoriteMasterResponse::cityLabel,
+                    .as("salon-or-NOTHING for BOTH groups: a salon with no recorded address or "
+                            + "city must not fall through to the employee's own «вул. Лесі "
+                            + "Українки» / «Полтава»")
+                    .extracting(FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
+                            FavoriteMasterResponse::locationNote,
+                            FavoriteMasterResponse::cityLabel,
                             FavoriteMasterResponse::districtLabel)
                     .containsOnlyNulls();
+            assertThat(result.get(2))
+                    .as("…but the affiliation still publishes — knowing WHERE someone works does "
+                            + "not depend on that salon having filled in its street")
+                    .extracting(FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName)
+                    .containsExactly(salonCId, "Салон Nord");
+            assertThat(result).extracting(FavoriteMasterResponse::avgRating)
+                    .containsExactly(4.50, 4.90, 4.10);
         }
 
         /**
          * Fail-closed branch. A {@code NULL} or unrecognised {@code master_type} (an enum constant
-         * an older instance does not know, mid-rolling-deploy) must suppress the address rather
-         * than default to disclosure — and must not throw {@link IllegalArgumentException} out of a
-         * read endpoint as a 500.
+         * an older instance does not know, mid-rolling-deploy) must take the SALON branch rather
+         * than default to disclosing the master's own row — and must not throw
+         * {@link IllegalArgumentException} out of a read endpoint as a 500.
+         *
+         * <p>Both fixture rows carry a populated {@code users} address and NULL salon columns, so
+         * "fails closed" is observable as {@code null} on the wire while the own-row values sit
+         * right there at indices 7–9 for a mis-branch to grab.
          */
         @Test
         @DisplayName("suppresses the address and does not throw when master_type is null or unknown")
         void should_suppressAddress_when_masterTypeIsUnrecognised() {
             Object[] nullType = {UUID.randomUUID(), "А", "А", null, null, null, null,
-                    "вул. Тестова", "1", "нотатка", null, null, null};
+                    "вул. Тестова", "1", "нотатка", null,
+                    null, null, null, null, null, null, null};
             Object[] unknownType = {UUID.randomUUID(), "Б", "Б", null, null, null, null,
-                    "вул. Тестова", "2", "нотатка", "FUTURE_MASTER_TYPE", null, null};
+                    "вул. Тестова", "2", "нотатка", "FUTURE_MASTER_TYPE",
+                    null, null, null, null, null, null, null};
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.of(nullType, unknownType));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
@@ -1150,7 +1233,9 @@ class FavoriteServiceTest {
                     .allSatisfy(r -> assertThat(r)
                             .extracting(FavoriteMasterResponse::street,
                                     FavoriteMasterResponse::buildingNo,
-                                    FavoriteMasterResponse::locationNote)
+                                    FavoriteMasterResponse::locationNote,
+                                    FavoriteMasterResponse::salonId,
+                                    FavoriteMasterResponse::salonName)
                             .containsOnlyNulls());
         }
 
@@ -1170,11 +1255,13 @@ class FavoriteServiceTest {
         void should_resolveLabelsOnce_when_pageHasManyRows() {
             UUID cityId = UUID.randomUUID();
             Object[] r1 = {UUID.randomUUID(), "A", "A", null, cityId, null, null, null, null, null,
-                    "INDEPENDENT_MASTER", null, null};
+                    "INDEPENDENT_MASTER", null, null, null, null, null, null, null};
             Object[] r2 = {UUID.randomUUID(), "B", "B", null, null, null, null, null, null, null,
-                    "SALON_MASTER", cityId, null};
+                    "SALON_MASTER", cityId, null,
+                    UUID.randomUUID(), "Салон Bella", null, null, null};
             Object[] r3 = {UUID.randomUUID(), "C", "C", null, null, null, null, null, null, null,
-                    "SALON_OWNER", cityId, null};
+                    "SALON_OWNER", cityId, null,
+                    UUID.randomUUID(), "Салон Mocha", null, null, null};
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.of(r1, r2, r3));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
@@ -1260,6 +1347,231 @@ class FavoriteServiceTest {
 
             assertThat(result).isEmpty();
             verifyNoInteractions(discoveryLocationResolver);
+        }
+    }
+
+    /**
+     * The CATEGORY AXIS — the pair the approved favourites design's chips filter on, present
+     * identically on both DTOs so one chip row filters the whole screen.
+     *
+     * <h4>Fixture discipline: every row gets a DIFFERENT category</h4>
+     * Each test below gives its three providers three distinct {@code (code, label)} pairs and
+     * asserts each row receives ITS OWN. That is what makes the assertions falsifiable: a
+     * mapper that keyed the lookup off the wrong row, resolved the whole page to the first
+     * match, or crossed the master and salon arms would emit a visibly different pair rather
+     * than the same one everywhere. A fixture that reused one category for the page would pass
+     * under all four of those bugs.
+     *
+     * <p>The codes and labels are also mutually disjoint strings, so a {@code code}/{@code label}
+     * swap in the DTO constructor (both fields are {@code String}, so the compiler will not
+     * catch it) fails loudly instead of silently transposing.
+     */
+    @Nested
+    @DisplayName("category axis (categoryCode / categoryLabel)")
+    class CategoryAxis {
+
+        /** A minimal 18-column masters projection row — only index 0 and the type gate matter here. */
+        private Object[] masterRow(UUID masterId, String masterType) {
+            return new Object[] {
+                    masterId, "Марія", "Левченко", null, null, null, null,
+                    null, null, null, masterType,
+                    null, null, null, null, null, null, null
+            };
+        }
+
+        /** A minimal 9-column salons projection row — only index 0 matters here. */
+        private Object[] salonRow(UUID salonId) {
+            return new Object[] {salonId, "Salon", null, null, null, null, null, null, null};
+        }
+
+        private void noLocalityLabels() {
+            when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                    .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
+        }
+
+        @Test
+        @DisplayName("stamps each master's OWN category, never another row's")
+        void should_stampPerMasterCategory_when_pageHasDistinctCategories() {
+            UUID nails = UUID.randomUUID();
+            UUID hair = UUID.randomUUID();
+            UUID brows = UUID.randomUUID();
+            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(
+                    masterRow(nails, "INDEPENDENT_MASTER"),
+                    masterRow(hair, "INDEPENDENT_MASTER"),
+                    masterRow(brows, "INDEPENDENT_MASTER")));
+            noLocalityLabels();
+            when(favoriteCategoryResolver.resolveForMasters(eq(clientId), anyCollection()))
+                    .thenReturn(new FavoriteCategories(Map.of(
+                            nails, new FavoriteCategory("MANICURE", "Манікюр"),
+                            hair, new FavoriteCategory("HAIRCUT", "Стрижка"),
+                            brows, new FavoriteCategory("BROWS", "Брови"))));
+
+            List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+            assertThat(result)
+                    .extracting(FavoriteMasterResponse::masterId,
+                            FavoriteMasterResponse::categoryCode,
+                            FavoriteMasterResponse::categoryLabel)
+                    .as("each card carries the category of ITS OWN last booked service; a "
+                            + "lookup keyed off the wrong row would repeat one pair down the page")
+                    .containsExactly(
+                            tuple(nails, "MANICURE", "Манікюр"),
+                            tuple(hair, "HAIRCUT", "Стрижка"),
+                            tuple(brows, "BROWS", "Брови"));
+        }
+
+        @Test
+        @DisplayName("stamps each salon's OWN category — the salon arm is not null-by-design")
+        void should_stampPerSalonCategory_when_pageHasDistinctCategories() {
+            UUID makeupSalon = UUID.randomUUID();
+            UUID lashSalon = UUID.randomUUID();
+            UUID unbooked = UUID.randomUUID();
+            when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(
+                    salonRow(makeupSalon), salonRow(lashSalon), salonRow(unbooked)));
+            when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                    .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
+            when(favoriteCategoryResolver.resolveForSalons(eq(clientId), anyCollection()))
+                    .thenReturn(new FavoriteCategories(Map.of(
+                            makeupSalon, new FavoriteCategory("MAKEUP", "Макіяж"),
+                            lashSalon, new FavoriteCategory("EYELASH", "Вії"))));
+
+            List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
+
+            assertThat(result)
+                    .extracting(FavoriteSalonResponse::salonId,
+                            FavoriteSalonResponse::categoryCode,
+                            FavoriteSalonResponse::categoryLabel)
+                    .as("the design puts BOTH kinds on one axis, so a salon the client HAS "
+                            + "booked at carries a category; only the unbooked third row is null")
+                    .containsExactly(
+                            tuple(makeupSalon, "MAKEUP", "Макіяж"),
+                            tuple(lashSalon, "EYELASH", "Вії"),
+                            tuple(unbooked, null, null));
+        }
+
+        /**
+         * The high-null-rate case the DTO is nullable FOR. Favouriting normally precedes
+         * booking, so a client who hearts a provider they have never booked with is the common
+         * path, not an edge case — and the field must come out {@code null} rather than being
+         * back-filled from the master's profile or service menu, which would file them under a
+         * category the client never actually booked.
+         */
+        @Test
+        @DisplayName("yields null on BOTH fields when the client has no booked history with the master")
+        void should_returnNullCategory_when_masterNeverBooked() {
+            UUID masterId = UUID.randomUUID();
+            when(favoriteRepository.findFavoriteMasterRows(clientId))
+                    .thenReturn(List.<Object[]>of(masterRow(masterId, "INDEPENDENT_MASTER")));
+            noLocalityLabels();
+            when(favoriteCategoryResolver.resolveForMasters(eq(clientId), anyCollection()))
+                    .thenReturn(FavoriteCategories.empty());
+
+            List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+            assertThat(result.get(0).categoryCode()).isNull();
+            assertThat(result.get(0).categoryLabel()).isNull();
+        }
+
+        /**
+         * The category is keyed on the MASTER even when every other "where do I find them"
+         * field on the card resolves through the employing salon. The two field groups answer
+         * different questions — "what do I come to this PERSON for" vs. "where are they" — and
+         * a mapper that reused {@code disclosesOwnAddress} for the category, or keyed the
+         * lookup off {@code row[13]} (salon id), would hand this card the salon's pair.
+         *
+         * <p>The fixture makes that bug visible: the salon id is ALSO present in the category
+         * map, under a different category. Reading the wrong key returns «Макіяж» instead of
+         * «Манікюр» rather than returning null, so the test fails on a wrong value, not on an
+         * absence that a null-safe mapper could mask.
+         */
+        @Test
+        @DisplayName("keys the category on the MASTER, not on the employing salon")
+        void should_keyCategoryOnMaster_when_masterIsSalonAffiliated() {
+            UUID masterId = UUID.randomUUID();
+            UUID salonId = UUID.randomUUID();
+            Object[] row = masterRow(masterId, "SALON_MASTER");
+            row[13] = salonId;
+            row[14] = "Salon Bella";
+            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(row));
+            noLocalityLabels();
+            when(favoriteCategoryResolver.resolveForMasters(eq(clientId), anyCollection()))
+                    .thenReturn(new FavoriteCategories(Map.of(
+                            masterId, new FavoriteCategory("MANICURE", "Манікюр"),
+                            salonId, new FavoriteCategory("MAKEUP", "Макіяж"))));
+
+            List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+            assertThat(result.get(0))
+                    .extracting(FavoriteMasterResponse::salonId,
+                            FavoriteMasterResponse::categoryCode,
+                            FavoriteMasterResponse::categoryLabel)
+                    .as("the card resolves its ADDRESS through the salon but its CATEGORY "
+                            + "through the master — reading row[13] instead would say Макіяж")
+                    .containsExactly(salonId, "MANICURE", "Манікюр");
+        }
+
+        /**
+         * §E no N+1. The whole point of this axis being a separate statement is that it is
+         * resolved ONCE for the page; the deleted {@code lastServiceName} {@code LATERAL} it
+         * replaces cost 9.11 ms a page precisely because it ran per row.
+         *
+         * <p>Asserting the call COUNT alone would not catch a per-row implementation that
+         * batched by accident, so the captured argument is asserted to contain EVERY id on the
+         * page — a resolver invoked once with only the first id is the same bug wearing a
+         * batch's clothes.
+         */
+        @Test
+        @DisplayName("resolves the whole page's categories in ONE call carrying every provider id")
+        void should_batchCategoryResolution_when_pageHasManyMasters() {
+            UUID first = UUID.randomUUID();
+            UUID second = UUID.randomUUID();
+            UUID third = UUID.randomUUID();
+            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(
+                    masterRow(first, "INDEPENDENT_MASTER"),
+                    masterRow(second, "INDEPENDENT_MASTER"),
+                    masterRow(third, "INDEPENDENT_MASTER")));
+            noLocalityLabels();
+
+            favoriteService.listMasterFavorites(clientId);
+
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<Collection<UUID>> ids = ArgumentCaptor.forClass(Collection.class);
+            verify(favoriteCategoryResolver, times(1)).resolveForMasters(eq(clientId), ids.capture());
+            assertThat(ids.getValue())
+                    .as("one call for the page, carrying every id on it — not one call per row, "
+                            + "and not one call carrying a single id")
+                    .containsExactlyInAnyOrder(first, second, third);
+        }
+
+        /**
+         * §E-4 ownership scoping. The derivation reads {@code bookings}, so the client id it is
+         * given decides WHOSE history leaks. It must be the favouriting principal the service
+         * was called with — a global "what is this master usually booked for" would expose
+         * other clients' booking history one category at a time.
+         */
+        @Test
+        @DisplayName("scopes the derivation to the favouriting client, not to the provider")
+        void should_scopeCategoryToFavouritingClient_when_listingSalons() {
+            UUID salonId = UUID.randomUUID();
+            when(favoriteRepository.findFavoriteSalonRows(clientId))
+                    .thenReturn(List.<Object[]>of(salonRow(salonId)));
+            when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
+                    .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
+
+            favoriteService.listSalonFavorites(clientId);
+
+            verify(favoriteCategoryResolver).resolveForSalons(eq(clientId), anyCollection());
+            verify(favoriteCategoryResolver, never()).resolveForMasters(any(), anyCollection());
+        }
+
+        @Test
+        @DisplayName("never touches the category resolver for an empty page")
+        void should_skipCategoryResolution_when_pageIsEmpty() {
+            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.of());
+
+            favoriteService.listMasterFavorites(clientId);
+
+            verifyNoInteractions(favoriteCategoryResolver);
         }
     }
 }

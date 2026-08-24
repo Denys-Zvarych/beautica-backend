@@ -20,6 +20,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * Testcontainers integration test for the favorites persistence contract — exercises the
@@ -117,22 +118,30 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                 .extracting(FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
                         FavoriteMasterResponse::locationNote)
                 .containsExactly("Master Street", "12B", "master note");
+        assertThat(masters.get(0))
+                .as("an independent master has no employing salon, so the affiliation pair the "
+                        + "card's «works at …» line keys off must be absent")
+                .extracting(FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName)
+                .containsOnlyNulls();
     }
 
     /**
-     * 2026-08 re-audit MEDIUM — the locked per-role address matrix, enforced END TO END against
-     * real SQL. {@code FavoriteServiceTest} pins the masking against a hand-built projection row;
-     * only this test proves the {@code masters.master_type} column the rule reads is actually
-     * SELECTed, and at the index the service reads it from.
+     * The locked per-role address matrix, enforced END TO END against real SQL.
+     * {@code FavoriteServiceTest} pins the branch against a hand-built projection row; only this
+     * test proves the {@code masters.master_type} column the rule reads — and the five
+     * {@code salons} columns it switches to — are actually SELECTed, and at the indices the
+     * service reads them from.
      *
      * <p>Both address sources are populated with DISTINCT values so the assertion cannot be
-     * satisfied accidentally: the salon's is what a wrong-table projection would return, the
-     * master's is what the pre-fix code returned. {@code null} is neither.
+     * satisfied accidentally: 'Salon Street' is what the card must now show, 'Master Street' is
+     * what the pre-masking code returned and what a wrong-column read would return today, and
+     * {@code null} is what the over-corrected intermediate version returned. All three are
+     * distinguishable, so every wrong answer fails.
      */
     @Test
-    @DisplayName("listMasterFavorites nulls the address for a SALON_MASTER — the per-role matrix "
-            + "is enforced server-side, not by the client")
-    void should_nullMasterAddress_when_masterIsSalonAffiliated() {
+    @DisplayName("listMasterFavorites publishes the SALON's address and identity for a "
+            + "SALON_MASTER — never the employee's own users row")
+    void should_publishSalonAddress_when_masterIsSalonAffiliated() {
         UUID clientId = createClient("addr-mask-client@beautica.test");
         UUID salonId = createSalon("addr-mask-owner@beautica.test");
         jdbcTemplate.update(
@@ -152,9 +161,15 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
 
         assertThat(masters).hasSize(1);
         assertThat(masters.get(0))
+                .as("the employing salon's business address — public data already returned "
+                        + "unmasked by listSalonFavorites and by the public salon profile")
                 .extracting(FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
                         FavoriteMasterResponse::locationNote)
-                .containsOnlyNulls();
+                .containsExactly("Salon Street", "99", "salon note");
+        assertThat(masters.get(0))
+                .as("the affiliation line: the client navigates on salonId, never by parsing a name")
+                .extracting(FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName)
+                .containsExactly(salonId, "Test Salon");
     }
 
     @Test
@@ -647,7 +662,431 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         assertThat(favoriteRepository.count()).isZero();
     }
 
+    // ── category axis: the batched last-booked-service derivation ────────────────
+
+    /**
+     * The core rule, against real SQL: of several bookings with one master, the category comes
+     * from the MOST RECENT one.
+     *
+     * <p><b>The fixture is built so a wrong answer is a DIFFERENT string, not an absence.</b>
+     * The master performs two services in two different platform categories and the client has
+     * booked both, so every plausible bug produces a visibly wrong value rather than a null a
+     * lenient assertion could wave through:
+     * <ul>
+     *   <li>{@code ORDER BY starts_at ASC} (a flipped sort) → {@code HAIRDRESSING}</li>
+     *   <li>dropping the {@code LIMIT 1} / picking an arbitrary row → non-deterministic between
+     *       the two, so the test flaps rather than passing</li>
+     *   <li>reading {@code service_types.platform_category_name} instead of
+     *       {@code service_definitions.category} → whatever the seeded type carries, not
+     *       {@code NAIL_SERVICE}</li>
+     * </ul>
+     * The label is asserted alongside the code because they resolve through different
+     * mechanisms — the code off {@code service_definitions}, the label off the cached
+     * {@code platform_categories} list — so a card can never show one without the other.
+     */
+    @Test
+    @DisplayName("the master category comes from the client's MOST RECENT booking, not their first")
+    void should_deriveMasterCategoryFromLatestBooking_when_clientBookedSeveralServices() {
+        UUID clientId = createClient("cat-latest-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-latest-master@beautica.test");
+        UUID oldService = createIndependentMasterService(masterId);
+        UUID newService = createIndependentMasterService(masterId);
+        setCategory(oldService, "HAIRDRESSING");
+        setCategory(newService, "NAIL_SERVICE");
+        createBooking(clientId, masterId, oldService, null, 30);
+        createBooking(clientId, masterId, newService, null, 1);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).categoryCode())
+                .as("yesterday's nail appointment, not last month's haircut")
+                .isEqualTo("NAIL_SERVICE");
+        assertThat(result.get(0).categoryLabel()).isEqualTo("Нігтьовий сервіс");
+    }
+
+    /**
+     * §E-4 against real SQL. The derivation reads {@code bookings}, a table with rows for every
+     * client, and the repository finder is unscoped by itself — the {@code client_id} term in
+     * the {@code LATERAL} is the only thing keeping one client's history out of another's card.
+     *
+     * <p>The other client's booking is deliberately the MOST RECENT row for this master and
+     * carries a DIFFERENT category, so dropping the {@code client_id} predicate does not merely
+     * widen the result — it actively overwrites the asking client's answer with a stranger's.
+     * A fixture where both clients booked the same category, or where the other client's
+     * booking was older, would pass with the predicate removed.
+     */
+    @Test
+    @DisplayName("the master category ignores OTHER clients' more recent bookings with that master")
+    void should_scopeMasterCategoryToAskingClient_when_anotherClientBookedMoreRecently() {
+        UUID clientId = createClient("cat-scope-client@beautica.test");
+        UUID stranger = createClient("cat-scope-stranger@beautica.test");
+        UUID masterId = createIndependentMaster("cat-scope-master@beautica.test");
+        UUID mine = createIndependentMasterService(masterId);
+        UUID theirs = createIndependentMasterService(masterId);
+        setCategory(mine, "NAIL_SERVICE");
+        setCategory(theirs, "HAIRDRESSING");
+        createBooking(clientId, masterId, mine, null, 10);
+        createBooking(stranger, masterId, theirs, null, 1);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result.get(0).categoryCode())
+                .as("the stranger's newer HAIRDRESSING booking must not reach this client's card")
+                .isEqualTo("NAIL_SERVICE");
+    }
+
+    /**
+     * The salon arm, keyed on {@code bookings.salon_id}. The design puts both kinds on one axis,
+     * so this must resolve for a salon exactly as it does for a master — it is null only when
+     * the client has no booked history at that salon, never null-by-design.
+     */
+    @Test
+    @DisplayName("the salon category comes from the client's most recent booking AT that salon")
+    void should_deriveSalonCategoryFromLatestBooking_when_clientBookedAtSalon() {
+        UUID clientId = createClient("cat-salon-client@beautica.test");
+        UUID salonId = createSalon("cat-salon-owner@beautica.test");
+        UUID masterId = createSalonMaster(salonId, "cat-salon-master@beautica.test");
+        UUID oldService = createSalonMasterService(masterId, salonId, true, true);
+        UUID newService = createSalonMasterService(masterId, salonId, true, true);
+        setCategory(oldService, "NAIL_SERVICE");
+        setCategory(newService, "LASH_EXTENSIONS");
+        createBooking(clientId, masterId, oldService, salonId, 20);
+        createBooking(clientId, masterId, newService, salonId, 2);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
+
+        List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).categoryCode()).isEqualTo("LASH_EXTENSIONS");
+        assertThat(result.get(0).categoryLabel()).isEqualTo("Нарощення вій");
+    }
+
+    /**
+     * §E-4 for the SALON arm — the mirror of
+     * {@link #should_scopeMasterCategoryToAskingClient_when_anotherClientBookedMoreRecently}.
+     *
+     * <p>This test exists because the salon arm's {@code b.client_id = :clientId} predicate was
+     * otherwise unpinned: every other salon-category test uses a single client, so deleting that
+     * term from the {@code LATERAL} in
+     * {@link com.beautica.booking.repository.BookingRepository#findLastBookedCategoryBySalonIds}
+     * leaves them all green while the master arm alone goes red. A future edit to one arm would
+     * ship another client's booked category onto this client's salon card, unnoticed.
+     *
+     * <p>Fixture shape, as on the master arm: the stranger's booking is the MOST RECENT row for
+     * this salon and carries a DIFFERENT category, so dropping the predicate does not merely
+     * widen the result — it overwrites the asking client's answer with the stranger's. The
+     * stranger books a DIFFERENT master of the same salon so the assertion turns purely on
+     * {@code salon_id} + {@code client_id}, never on a master-scoped accident.
+     */
+    @Test
+    @DisplayName("the salon category ignores OTHER clients' more recent bookings at that salon")
+    void should_scopeSalonCategoryToAskingClient_when_anotherClientBookedMoreRecently() {
+        UUID clientId = createClient("cat-salon-scope-client@beautica.test");
+        UUID stranger = createClient("cat-salon-scope-stranger@beautica.test");
+        UUID salonId = createSalon("cat-salon-scope-owner@beautica.test");
+        UUID myMaster = createSalonMaster(salonId, "cat-salon-scope-m1@beautica.test");
+        UUID theirMaster = createSalonMaster(salonId, "cat-salon-scope-m2@beautica.test");
+        UUID mine = createSalonMasterService(myMaster, salonId, true, true);
+        UUID theirs = createSalonMasterService(theirMaster, salonId, true, true);
+        setCategory(mine, "NAIL_SERVICE");
+        setCategory(theirs, "HAIRDRESSING");
+        createBooking(clientId, myMaster, mine, salonId, 10);
+        createBooking(stranger, theirMaster, theirs, salonId, 1);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
+
+        List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).categoryCode())
+                .as("the stranger's newer HAIRDRESSING booking at this salon must not reach "
+                        + "this client's card")
+                .isEqualTo("NAIL_SERVICE");
+        assertThat(result.get(0).categoryLabel()).isEqualTo("Нігтьовий сервіс");
+    }
+
+    /**
+     * The common case the pair is nullable FOR: hearting a provider comes BEFORE booking them,
+     * so most favourites start with no derivable category. This is accepted design behaviour —
+     * the client hides categories with no rows — and must not be papered over with a fallback
+     * derived from the master's service menu or profile, which would file them under a category
+     * this client has never actually booked.
+     */
+    @Test
+    @DisplayName("both category fields are null when the client has never booked the favourited master")
+    void should_returnNullCategory_when_favouritedBeforeEverBooking() {
+        UUID clientId = createClient("cat-null-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-null-master@beautica.test");
+        UUID service = createIndependentMasterService(masterId);
+        setCategory(service, "NAIL_SERVICE");
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).categoryCode())
+                .as("the master OFFERS a NAIL_SERVICE, but this client has not booked it — the "
+                        + "axis is booked history, not the service menu")
+                .isNull();
+        assertThat(result.get(0).categoryLabel()).isNull();
+    }
+
+    /**
+     * <b>The both-or-neither rule, end to end against the REAL category vocabulary.</b>
+     *
+     * <p>{@code FavoriteCategoryResolverTest#should_dropBothFields_when_categoryNotSelectable}
+     * pins the rule against a mocked label resolver and an invented
+     * {@code "DEACTIVATED_CATEGORY"} code. That proves the branch exists; it cannot prove a
+     * stale code is REACHABLE, because the mock decides what is selectable.
+     *
+     * <p>It is reachable, and this repository already contains a live example.
+     * {@code service_definitions.category} is a denormalised {@code platform_categories.name}
+     * with NO foreign key (V64), and V74 renamed three of V64's seven original seeds IN PLACE —
+     * {@code MANICURE -> NAIL_SERVICE}, {@code HAIRCUT -> HAIRDRESSING},
+     * {@code EYELASH -> LASH_EXTENSIONS}. Any {@code service_definitions} row still carrying a
+     * pre-V74 slug therefore holds a code that resolves to no label at all. That is exactly what
+     * happened during this feature's development: fixtures written against the old names came
+     * back blank, and the blanking was diagnosed as correct — but only OBSERVED, never pinned.
+     * This test pins it.
+     *
+     * <p><b>Why the assertion cannot be defanged.</b> {@code MANICURE} is a real string the
+     * database will happily store and the derivation will happily return; the pair is blanked by
+     * {@code FavoriteCategoryResolver} alone. Emitting the code with a {@code null} label — the
+     * obvious "simplification" of the pairing loop — would hand the client a chip identity it
+     * cannot draw and cannot match against its own approved-category vocabulary, and would pass
+     * every other test in this class. The companion master carries a CURRENT slug so the
+     * suppression is visibly per-PROVIDER: a resolver that bailed out of the whole page on one
+     * unresolvable code would blank both rows and still satisfy a single-row version of this.
+     */
+    @Test
+    @DisplayName("both category fields are null when the booked service carries a pre-V74 slug "
+            + "that is no longer a selectable category — and only that provider is blanked")
+    void should_returnNullCategory_when_bookedCategoryIsNoLongerSelectable() {
+        UUID clientId = createClient("cat-stale-client@beautica.test");
+        UUID staleMaster = createIndependentMaster("cat-stale-master@beautica.test");
+        UUID liveMaster = createIndependentMaster("cat-live-master@beautica.test");
+        UUID staleService = createIndependentMasterService(staleMaster);
+        UUID liveService = createIndependentMasterService(liveMaster);
+        // V64's original slug. V74 renamed it to NAIL_SERVICE in place, so no platform_categories
+        // row answers to it any more — the code survives in service_definitions only because the
+        // column has no FK.
+        setCategory(staleService, "MANICURE");
+        setCategory(liveService, "NAIL_SERVICE");
+        createBooking(clientId, staleMaster, staleService, null, 3);
+        createBooking(clientId, liveMaster, liveService, null, 3);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, staleMaster);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, liveMaster);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result)
+                .as("a code outside the current vocabulary is dropped WITH its missing label — "
+                        + "never emitted half-resolved — while the companion master's current "
+                        + "slug still resolves, so the suppression is per provider, not per page")
+                .extracting(FavoriteMasterResponse::masterId,
+                        FavoriteMasterResponse::categoryCode,
+                        FavoriteMasterResponse::categoryLabel)
+                .containsExactlyInAnyOrder(
+                        tuple(staleMaster, null, null),
+                        tuple(liveMaster, "NAIL_SERVICE", "Нігтьовий сервіс"));
+    }
+
+    /**
+     * <b>"The most recent booking", not "the most recent CATEGORISED booking".</b>
+     *
+     * <p>{@code sd.category IS NOT NULL} sits in the OUTER {@code WHERE} of both arms, AFTER the
+     * {@code LATERAL} has already committed to a single booking — so a client whose latest
+     * booking was of an uncategorised service drops out of the map and surfaces as {@code null}.
+     * It deliberately does NOT skip backwards to an older booking that happens to carry a
+     * category; that would be a different rule, and neither the design nor the DTO states it.
+     *
+     * <p>Moving that one predicate INSIDE the {@code LATERAL} is a plausible, one-line
+     * "optimisation" — it reads like a filter that belongs next to the join it filters — and it
+     * silently changes the answer. Nothing else in the suite can see it: every other category
+     * test gives every booking a category, so the predicate never fires and both placements are
+     * indistinguishable. This is the only fixture where the two disagree, and they disagree
+     * loudly — {@code null} versus {@code NAIL_SERVICE}, not a shrug.
+     *
+     * <p>The categorised booking is deliberately the OLDER one. If it were newer the test would
+     * pass under both placements.
+     */
+    @Test
+    @DisplayName("both category fields are null when the client's MOST RECENT booking was an "
+            + "uncategorised service — the derivation does not skip back to an older categorised one")
+    void should_returnNullCategory_when_latestBookedServiceIsUncategorised() {
+        UUID clientId = createClient("cat-uncat-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-uncat-master@beautica.test");
+        UUID categorised = createIndependentMasterService(masterId);
+        UUID uncategorised = createIndependentMasterService(masterId);
+        setCategory(categorised, "NAIL_SERVICE");
+        clearCategory(uncategorised);
+        createBooking(clientId, masterId, categorised, null, 30);
+        createBooking(clientId, masterId, uncategorised, null, 1);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).categoryCode())
+                .as("the definite article in \"THE most recent booking\" is honoured: yesterday's "
+                        + "uncategorised visit wins and yields null. Returning NAIL_SERVICE here "
+                        + "means `sd.category IS NOT NULL` moved inside the LATERAL and the rule "
+                        + "silently became \"most recent CATEGORISED booking\"")
+                .isNull();
+        assertThat(result.get(0).categoryLabel()).isNull();
+    }
+
+    /**
+     * <b>The {@code SALON_OWNER} arm of the NEW salon-address behaviour, end to end.</b>
+     *
+     * <p>{@code MasterType.SALON_OWNER} takes the same non-independent branch as
+     * {@code SALON_MASTER}, and {@code FavoriteServiceTest} covers it against a hand-built
+     * projection row — but every Testcontainers fixture for the address rule used
+     * {@code SALON_MASTER}, so no test proved a real {@code masters.master_type = 'SALON_OWNER'}
+     * value survives the round trip through {@code MasterType#fromProjection} at index 10 and
+     * lands on the salon branch. An owner working as a master is a first-class provider on this
+     * screen and is the case the original defect was reported against.
+     *
+     * <p><b>The fixture reproduces the real bug, not an abstraction of it.</b> A multi-salon
+     * owner's {@code users} row carries the MOST RECENTLY CREATED salon's address — that is WHY
+     * the pre-fix code shipped the wrong street. So the owner here genuinely owns two salons,
+     * works as a master at the FIRST, and has the SECOND's street stamped on their {@code users}
+     * row exactly as production would leave it. Three distinct streets, three distinguishable
+     * wrong answers: reading {@code users} emits the other salon's street, dropping the branch
+     * emits {@code null}, and crossing to the wrong salon row emits the second salon's.
+     */
+    @Test
+    @DisplayName("listMasterFavorites publishes the EMPLOYING salon's address for a SALON_OWNER "
+            + "working as a master — never the other salon's street off their users row")
+    void should_publishSalonAddress_when_masterIsSalonOwner() {
+        UUID clientId = createClient("owner-addr-client@beautica.test");
+        UUID employingSalon = createSalon("owner-addr-owner@beautica.test");
+        jdbcTemplate.update(
+                "UPDATE salons SET name = 'Employing Salon', street = 'Employing Street', "
+                        + "building_no = '1', location_note = 'employing note' WHERE id = ?",
+                employingSalon);
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, employingSalon);
+        // The SECOND salon, created later by the same owner — the one whose address production
+        // leaves sitting on users.street, and the wrong answer the pre-fix code returned.
+        createSecondSalonFor(ownerUserId, "Other Salon");
+        jdbcTemplate.update(
+                "UPDATE users SET street = 'Other Salon Street', building_no = '99', "
+                        + "location_note = 'other note' WHERE id = ?", ownerUserId);
+
+        UUID ownerMaster = createOwnerAsMaster(employingSalon, ownerUserId);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, ownerMaster);
+
+        List<FavoriteMasterResponse> masters =
+                favoriteService.listMasterFavorites(clientId, Pageable.unpaged()).getContent();
+
+        assertThat(masters).hasSize(1);
+        assertThat(masters.get(0))
+                .as("SALON_OWNER resolves through the EMPLOYING salon exactly as SALON_MASTER "
+                        + "does — one predicate, not two — so the card sends the client to the "
+                        + "salon this owner actually works at")
+                .extracting(FavoriteMasterResponse::street, FavoriteMasterResponse::buildingNo,
+                        FavoriteMasterResponse::locationNote,
+                        FavoriteMasterResponse::salonId, FavoriteMasterResponse::salonName)
+                .containsExactly("Employing Street", "1", "employing note",
+                        employingSalon, "Employing Salon");
+        assertThat(masters.get(0).street())
+                .as("the reported defect verbatim: users.street holds the LAST-created salon's "
+                        + "address, so echoing it sends the client to the wrong building")
+                .isNotEqualTo("Other Salon Street");
+    }
+
     // ── seed helpers (ASCII data) ────────────────────────────────────────────────
+
+    /**
+     * Stamps {@code service_definitions.category} on the definition behind a
+     * {@code master_services} assignment. The column is a denormalised
+     * {@code platform_categories.name} with no FK (V64), which is exactly why the value written
+     * here has to be a real seeded category name for the label to resolve.
+     *
+     * <p><b>Use the CURRENT taxonomy, not V64's original seven seeds.</b> V74 renamed those in
+     * place — {@code MANICURE -> NAIL_SERVICE}, {@code HAIRCUT -> HAIRDRESSING},
+     * {@code EYELASH -> LASH_EXTENSIONS} — so writing a V64 name here produces a code that
+     * resolves to no label, and {@code FavoriteCategoryResolver}'s both-or-neither rule then
+     * (correctly) blanks the whole pair. A fixture written against the old names fails as a
+     * silent {@code null}, which reads like a broken derivation rather than a stale fixture.
+     */
+    private void setCategory(UUID masterServiceId, String categoryName) {
+        jdbcTemplate.update(
+                "UPDATE service_definitions SET category = ? WHERE id = "
+                        + "(SELECT service_def_id FROM master_services WHERE id = ?)",
+                categoryName, masterServiceId);
+    }
+
+    /**
+     * Clears {@code service_definitions.category} — the column is a plain nullable
+     * {@code VARCHAR(100)} (V6), so an uncategorised service is a legitimate persisted state,
+     * not a broken row. Written as literal SQL rather than {@code setCategory(id, null)} because
+     * an untyped JDBC null on a {@code VARCHAR} assignment is a driver-dependent coin flip.
+     */
+    private void clearCategory(UUID masterServiceId) {
+        jdbcTemplate.update(
+                "UPDATE service_definitions SET category = NULL WHERE id = "
+                        + "(SELECT service_def_id FROM master_services WHERE id = ?)",
+                masterServiceId);
+    }
+
+    /**
+     * A second salon under an EXISTING owner, so a multi-salon owner can be built. {@code
+     * is_primary} defaults to {@code false} (V56) and is left alone, so the partial unique index
+     * {@code idx_salons_owner_primary} is not tripped by a second row.
+     */
+    private UUID createSecondSalonFor(UUID ownerUserId, String name) {
+        UUID salonId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, street, building_no, location_note, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'Other Salon Street', '99', 'other note', true, NOW(), NOW())",
+                salonId, ownerUserId, name);
+        return salonId;
+    }
+
+    /**
+     * A {@code SALON_OWNER} who also works as a master — {@code masters.master_type =
+     * 'SALON_OWNER'} with {@code salon_id} set, hung off the salon's OWN owner user rather than
+     * a fresh one, which is what makes the multi-salon {@code users.street} case reproducible.
+     * The complement of {@link #createSalonMaster(UUID, String)}, which builds an invited
+     * employee.
+     */
+    private UUID createOwnerAsMaster(UUID salonId, UUID ownerUserId) {
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', 0.00, 0, true, NOW(), NOW())",
+                masterId, ownerUserId, salonId);
+        return masterId;
+    }
+
+    /**
+     * A past {@code COMPLETED} booking {@code daysAgo} days back.
+     *
+     * <p>{@code COMPLETED} rather than {@code CONFIRMED} so several bookings for one master can
+     * coexist without tripping the {@code no_overlapping_bookings} GiST exclusion constraint,
+     * which applies only to {@code CONFIRMED} rows. The derivation carries no status predicate
+     * — booked history is booked history — so the choice does not affect what is under test.
+     *
+     * @param salonId stamped on the booking for the salon arm; {@code null} for an independent
+     *                master, mirroring what the booking paths actually write
+     */
+    private void createBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                               UUID salonId, int daysAgo) {
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, created_at, updated_at, booking_source) "
+                        + "VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW() - (? || ' days')::interval, "
+                        + "NOW() - (? || ' days')::interval + interval '1 hour', 500.00, 60, 0, "
+                        + "NOW(), NOW(), 'APP')",
+                UUID.randomUUID(), clientId, masterId, masterServiceId, salonId, daysAgo, daysAgo);
+    }
 
     private UUID createClient(String email) {
         UUID id = UUID.randomUUID();

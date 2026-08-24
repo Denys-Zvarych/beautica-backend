@@ -256,9 +256,15 @@ class FavoriteControllerTest {
     @Test
     @DisplayName("GET /favorites/masters — 200 paged list bound to the principal id")
     void should_return200MasterPage_when_listMasters() throws Exception {
+        UUID salonId = UUID.randomUUID();
         var master = new FavoriteMasterResponse(
                 UUID.randomUUID(), "Maria", "Levchenko", "https://cdn/avatar.png",
-                "Kyiv", "Pechersk", 4.75, "Khreshchatyk St", "12B", "entry code 4321");
+                "Kyiv", "Pechersk", 4.75, salonId, "Salon Bella",
+                "Khreshchatyk St", "12B", "entry code 4321",
+                // Deliberately NOT the same category the salon fixture below uses: the two
+                // arms serialise through separate DTOs, and identical fixture values would let
+                // a copy-paste error between them pass unnoticed.
+                "HAIRCUT", "Стрижка");
         when(favoriteService.listMasterFavorites(eq(clientId), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(master)));
 
@@ -270,9 +276,19 @@ class FavoriteControllerTest {
                 .andExpect(jsonPath("$.data.data[0].street").value("Khreshchatyk St"))
                 .andExpect(jsonPath("$.data.data[0].buildingNo").value("12B"))
                 .andExpect(jsonPath("$.data.data[0].locationNote").value("entry code 4321"))
+                // The affiliation line the card renders for a salon-employed master. It never
+                // rendered before this pair existed on the DTO, so assert BOTH reach the wire —
+                // salonName alone would leave the client parsing an id out of a display name.
+                .andExpect(jsonPath("$.data.data[0].salonId").value(salonId.toString()))
+                .andExpect(jsonPath("$.data.data[0].salonName").value("Salon Bella"))
                 // Phase 111 removed lastServiceName from the design and the DTO — assert it is
                 // gone from the wire, not merely absent from the assertions above.
                 .andExpect(jsonPath("$.data.data[0].lastServiceName").doesNotExist())
+                // The category FILTER axis. Both halves must reach the wire: the client keys
+                // its chip identity off the code and draws the chip from the label, so a DTO
+                // that serialised only one would render an unlabelled or unmatchable chip.
+                .andExpect(jsonPath("$.data.data[0].categoryCode").value("HAIRCUT"))
+                .andExpect(jsonPath("$.data.data[0].categoryLabel").value("Стрижка"))
                 .andExpect(jsonPath("$.data.totalElements").value(1));
 
         verify(favoriteService).listMasterFavorites(eq(clientId), any(Pageable.class));
@@ -294,7 +310,8 @@ class FavoriteControllerTest {
     void should_return200SalonPage_when_listSalons() throws Exception {
         var salon = new FavoriteSalonResponse(
                 UUID.randomUUID(), "Salon Bella", "https://cdn/s.png",
-                "Odesa", "Prymorskyi", 4.20, "Derybasivska St", "7", "2nd floor");
+                "Odesa", "Prymorskyi", 4.20, "Derybasivska St", "7", "2nd floor",
+                "MANICURE", "Манікюр");
         when(favoriteService.listSalonFavorites(eq(clientId), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(salon)));
 
@@ -305,7 +322,12 @@ class FavoriteControllerTest {
                 .andExpect(jsonPath("$.data.data[0].avgRating").value(4.20))
                 .andExpect(jsonPath("$.data.data[0].street").value("Derybasivska St"))
                 .andExpect(jsonPath("$.data.data[0].buildingNo").value("7"))
-                .andExpect(jsonPath("$.data.data[0].locationNote").value("2nd floor"));
+                .andExpect(jsonPath("$.data.data[0].locationNote").value("2nd floor"))
+                // The salon arm carries the SAME category axis as the master arm — the approved
+                // design filters both kinds through one chip row, so a salon DTO that omitted
+                // these would make every chip hide every salon.
+                .andExpect(jsonPath("$.data.data[0].categoryCode").value("MANICURE"))
+                .andExpect(jsonPath("$.data.data[0].categoryLabel").value("Манікюр"));
 
         verify(favoriteService).listSalonFavorites(eq(clientId), any(Pageable.class));
     }
