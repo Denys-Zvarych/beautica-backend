@@ -1,11 +1,15 @@
 package com.beautica.booking.dto;
 
+import com.beautica.booking.service.SlotCalculationService;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Future;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -39,10 +43,19 @@ import java.util.UUID;
  * {@link StaffBookingCommand} carries no comment, and {@code Booking#staffBooking} has nowhere to
  * put one. Flagged rather than invented.
  *
- * @param masterServiceId the {@code MasterServiceAssignment} the booking is placed against — the
- *                        same grain every other create path uses. Scalar, not a list: a staff
- *                        booking is single-service while {@code chk_appointment_source} excludes
- *                        {@code STAFF} (see {@code StaffBookingService}'s class Javadoc).
+ * @param masterServiceIds the ORDERED list of {@code MasterServiceAssignment} ids the booking
+ *                        chains, in the exact order they are performed — the same grain and the
+ *                        same ordering contract {@link CreateAppointmentRequest#masterServiceIds()}
+ *                        uses. The chain starts at {@code startsAt}; each subsequent service begins
+ *                        when the previous one's effective duration plus its own after-buffer has
+ *                        elapsed (Phase 22.11 — V139 lifted the {@code chk_appointment_source}
+ *                        restriction that used to confine a staff booking to a single service; see
+ *                        {@code StaffBookingService}'s class Javadoc). Duplicates are permitted
+ *                        verbatim — the same service twice is a valid visit. Bounded by
+ *                        {@code @Size(max = }{@value SlotCalculationService#MAX_SERVICES_PER_VISIT}
+ *                        {@code )}, the same cap {@link CreateAppointmentRequest} enforces; the
+ *                        list is never de-duplicated or reordered on the way to
+ *                        {@link StaffBookingCommand}.
  * @param startsAt        the requested start. {@code @Future} is the first-pass 400 against the
  *                        default Bean Validation (system) clock, exactly as
  *                        {@link CreateBookingRequest} and {@code GuestBookingRequest} do;
@@ -58,9 +71,15 @@ import java.util.UUID;
 @Schema(description = "Creates a CONFIRMED, STAFF-sourced booking for a walk-in client on a master's calendar.")
 public record CreateStaffBookingRequest(
 
-        @NotNull(message = "Service ID is required")
-        @Schema(description = "MasterService (assignment) id the master performs.")
-        UUID masterServiceId,
+        @NotEmpty(message = "At least one service is required")
+        @Size(max = SlotCalculationService.MAX_SERVICES_PER_VISIT,
+              message = "A visit may contain at most {max} services")
+        @Schema(description = "Ordered services performed back-to-back by this master, in the order "
+                            + "they are performed. Duplicates are permitted — the same service twice "
+                            + "is a valid visit. The chain starts at startsAt; each subsequent "
+                            + "service begins when the previous one's effective duration plus its "
+                            + "own after-buffer has elapsed.")
+        List<@NotNull(message = "Service ID must not be null") UUID> masterServiceIds,
 
         @NotNull(message = "Start time is required")
         @Future(message = "Start time must be in the future")
@@ -87,7 +106,9 @@ public record CreateStaffBookingRequest(
         return new StaffBookingCommand(
                 scope,
                 masterId,
-                masterServiceId,
+                // Verbatim — order is the performance order and duplicates are legal, so this must
+                // never sort or de-duplicate. List.copyOf for immutability, nothing more.
+                List.copyOf(masterServiceIds),
                 startsAt,
                 // Raw, un-normalised: UkrainianPhoneNormalizer runs inside StaffBookingService so
                 // exactly one component owns phone format (see GuestClientDto#phone).

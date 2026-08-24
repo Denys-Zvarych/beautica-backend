@@ -409,7 +409,7 @@ class AppointmentRescheduleIT extends AbstractIntegrationTest {
 
     private UUID createLegacyBooking(String clientToken, UUID masterId, UUID masterServiceId,
             OffsetDateTime startsAt) throws Exception {
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt.atZoneSameInstant(java.time.ZoneOffset.UTC), null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt.atZoneSameInstant(java.time.ZoneOffset.UTC), null, null, false);
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(clientToken)), String.class);

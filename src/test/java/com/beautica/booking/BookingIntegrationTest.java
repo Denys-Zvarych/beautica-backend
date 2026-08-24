@@ -129,7 +129,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         addWorkingHoursForEveryDay(masterId);
 
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
 
         log.debug("Act: POST {} with valid CLIENT token — must return 201", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -152,7 +152,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("POST /bookings — 401 when no Authorization header is present")
     void should_return401_when_noTokenOnCreateBooking() {
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null, null);
+        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null, null, false);
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -176,7 +176,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         String ownerToken = loginAndGetToken(ownerEmail);
 
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null, null);
+        var request = new CreateBookingRequest(UUID.randomUUID(), UUID.randomUUID(), startsAt, null, null, false);
 
         log.debug("Act: POST {} with SALON_OWNER token — must return 403", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -406,7 +406,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         createBooking(clientAToken, masterId, masterServiceId, startsAt);
 
         log.debug("Act: second booking by clientB at same slot — must return 409");
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
         ResponseEntity<String> secondResponse = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(clientBToken)),
@@ -494,7 +494,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: POST a start the gate has just been told is free, racing a blocker committed "
                 + "between the gate's read and the overlap check");
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(request, bearerHeaders(clientToken)),
@@ -897,7 +897,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         UUID existingBookingId = createBooking(clientToken, masterAId, masterAServiceId, startsAt);
 
         // Same client, same time window, a completely DIFFERENT master/salon.
-        var request = new CreateBookingRequest(masterBId, masterBServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterBId, masterBServiceId, startsAt, null, null, false);
         log.debug("Act: POST {} — client already holds a booking with master A at this time, "
                 + "now booking master B at the same time", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1010,7 +1010,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         // Master B booking starts exactly at 11:00 — the half-open interval means this must
         // NOT be treated as a conflict with the client's own 10:00–11:00 master-A booking.
         ZonedDateTime backToBackStart = startsAt.plusHours(1);
-        var request = new CreateBookingRequest(masterBId, masterBServiceId, backToBackStart, null, null);
+        var request = new CreateBookingRequest(masterBId, masterBServiceId, backToBackStart, null, null, false);
         log.debug("Act: POST {} — new booking starts exactly when the client's other booking ends", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
@@ -1044,7 +1044,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         // 11:00 is BEFORE the existing booking's duration-derived end (11:30) but AFTER its
         // start (10:00) — only a duration-aware overlap check catches this.
         ZonedDateTime overlappingStart = startsAt.plusHours(1);
-        var request = new CreateBookingRequest(masterBId, masterBServiceId, overlappingStart, null, null);
+        var request = new CreateBookingRequest(masterBId, masterBServiceId, overlappingStart, null, null, false);
         log.debug("Act: POST {} — requested start falls inside the existing booking's "
                 + "duration-derived window, not at its literal start time", BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1086,7 +1086,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         // Client A now requests master A at `slot`: master A is busy AND client A has a
         // conflict — the client-conflict check must win (it runs first, before the master
         // lock is even acquired).
-        var request = new CreateBookingRequest(masterAId, masterAServiceId, slot, null, null);
+        var request = new CreateBookingRequest(masterAId, masterAServiceId, slot, null, null, false);
         log.debug("Act: POST {} — both master-busy and client-conflict conditions hold simultaneously",
                 BOOKINGS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1264,7 +1264,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
     private UUID createBooking(String clientToken, UUID masterId, UUID masterServiceId,
                                ZonedDateTime startsAt) throws Exception {
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,

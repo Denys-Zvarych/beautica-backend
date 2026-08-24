@@ -205,6 +205,22 @@ class BookingStaffFactoryTest {
                         ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
     }
 
+    /**
+     * Phase 22.9 widened {@code requireStaffWalkInIdentity} from {@code private} to
+     * package-private so {@link Appointment#staffAppointment} could reuse it. This pins that the
+     * visibility change did not also weaken enforcement on the ORIGINAL caller — the shared helper
+     * still guards the child booking exactly as before.
+     */
+    @Test
+    @DisplayName("should still reject a blank identity when called through Booking's own factory")
+    void should_stillRejectBlankIdentity_when_calledThroughBookingFactory() {
+        assertThatThrownBy(() -> staffBooking("", "Коваль", "+380501234567", STAFF_ID))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("guestName")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
     private static Booking staffBooking(String name, String surname, String phone, UUID staffId) {
         return Booking.staffBooking(
                 null,   // master / masterService / salon are opaque FKs to this factory —

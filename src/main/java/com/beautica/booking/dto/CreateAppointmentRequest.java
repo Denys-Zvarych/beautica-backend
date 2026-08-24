@@ -33,6 +33,14 @@ import java.util.UUID;
  *   {@code @Size}) so {@code " a"} and {@code "a"} map to the same bucket (§L).
  * @param clientComment optional booking-creation note for the whole visit — same {@code @Size} +
  *   control-char ban as {@link CreateBookingRequest#clientComment()}.
+ * @param allowClientOverlap explicit, client-supplied opt-in (product decision 2026-08-22) to allow
+ *   this visit to overlap the client's OWN other CONFIRMED booking(s). Same contract as
+ *   {@link CreateBookingRequest#allowClientOverlap()}: defaults to {@code false} (primitive
+ *   {@code boolean}, so an absent field deserializes to {@code false} and existing callers are
+ *   unaffected); when {@code true}, only {@code AppointmentService}'s
+ *   {@code assertNoClientConflict} self-conflict check is skipped — the per-master
+ *   {@code existsOverlap} check and the {@code no_overlapping_bookings} EXCLUDE constraint still run
+ *   unconditionally and protect a different client's booking regardless of this flag.
  */
 public record CreateAppointmentRequest(
         @NotNull(message = "Master ID is required") UUID masterId,
@@ -57,5 +65,7 @@ public record CreateAppointmentRequest(
         @Size(max = 1000, message = "Comment must be at most 1000 characters")
         @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
                 message = "Comment must not contain control characters other than line breaks and tabs")
-        String clientComment
+        String clientComment,
+
+        boolean allowClientOverlap
 ) {}

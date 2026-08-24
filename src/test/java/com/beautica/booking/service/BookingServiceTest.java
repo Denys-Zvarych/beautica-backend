@@ -277,7 +277,8 @@ class BookingServiceTest {
                 masterServiceId,
                 ZonedDateTime.now(clock).plusHours(2),
                 null,
-                null
+                null,
+                false
         );
     }
 
@@ -628,7 +629,8 @@ class BookingServiceTest {
                 masterServiceId,
                 ZonedDateTime.now(clock).minusMinutes(10),
                 null,
-                null
+                null,
+                false
         );
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, pastRequest))
@@ -648,7 +650,8 @@ class BookingServiceTest {
                 masterServiceId,
                 ZonedDateTime.now(clock).plusMinutes(14),
                 null,
-                null
+                null,
+                false
         );
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, request))
@@ -674,7 +677,8 @@ class BookingServiceTest {
                 masterServiceId,
                 ZonedDateTime.now(clock).plusMinutes(15),
                 null,
-                null
+                null,
+                false
         );
         stubCreateSlotAvailable(request.startsAt());
 
@@ -695,7 +699,8 @@ class BookingServiceTest {
                 masterServiceId,
                 ZonedDateTime.now(clock).plusDays(181),
                 null,
-                null
+                null,
+                false
         );
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, farFutureRequest))

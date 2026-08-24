@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,6 +39,43 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     Optional<MasterServiceAssignment> findByMasterIdAndIdWithGraph(
             @Param("masterId") UUID masterId,
             @Param("id") UUID id);
+
+    /**
+     * BATCH form of {@link #findByMasterIdAndIdWithGraph} — same master scoping, same fetch graph,
+     * one round-trip for the whole set (perf LOW, 2026-08-22).
+     *
+     * <p>Exists for {@code VisitPlanner#planChainedItems}, which resolved one assignment per
+     * {@code masterServiceIds} entry inside its chaining loop: N sequential single-row SELECTs, and
+     * because duplicate ids are a locked-legal input, the same service booked ten times issued ten
+     * byte-identical statements. The planner now passes the DISTINCT id set here and resolves each
+     * chain position from the returned map.
+     *
+     * <p><b>Not a non-graph variant beside a graph one</b> (§E-1): this carries the identical
+     * {@code LEFT JOIN FETCH ms.serviceDefinition} / {@code JOIN FETCH ms.master m} /
+     * {@code LEFT JOIN FETCH m.salon} graph, for the identical reasons documented on the single-row
+     * method — {@code m.salon} MUST stay {@code LEFT} or every {@code INDEPENDENT_MASTER} drops out.
+     * The single-row form is kept because ~6 other call sites resolve exactly one assignment and
+     * would otherwise pay a collection round-trip for it.
+     *
+     * <p><b>Bounded by construction</b> (§E-3): the only caller applies
+     * {@code SlotCalculationService#MAX_SERVICES_PER_VISIT} before calling, so {@code ids} is never
+     * unbounded. All fetches are to-one — columns, not rows — so there is no cartesian risk.
+     *
+     * <p>Returns only the rows that exist and belong to {@code masterId}; it does NOT filter on
+     * {@code isActive} (mirroring the single-row method, whose callers apply their own
+     * {@code .filter(MasterServiceAssignment::isActive)}), and it says nothing about which ids were
+     * missing — the caller is responsible for turning any shortfall into its own uniform 404.
+     */
+    @Query("""
+            SELECT ms FROM MasterServiceAssignment ms
+            LEFT JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.master m
+            LEFT JOIN FETCH m.salon
+            WHERE m.id = :masterId AND ms.id IN :ids
+            """)
+    List<MasterServiceAssignment> findByMasterIdAndIdInWithGraph(
+            @Param("masterId") UUID masterId,
+            @Param("ids") Collection<UUID> ids);
 
     /**
      * Loads one assignment by its own id with {@code serviceDefinition} and {@code master}
@@ -232,6 +270,8 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      *   <li>{@code 1} — booking per-CLIENT conflict lock
      *       ({@code BookingRepository#acquireClientAdvisoryLockWithTimeout})</li>
      *   <li>{@code 2} — this bulk service-setup lock</li>
+     *   <li>{@code 3} — staff walk-in per-RECIPIENT-PHONE SMS-budget lock
+     *       ({@code BookingRepository#acquireWalkInPhoneLock})</li>
      * </ul>
      *
      * <p>Salt {@code 2} replaced an earlier salt {@code 0} (bulk-additive re-audit). Keyed on the

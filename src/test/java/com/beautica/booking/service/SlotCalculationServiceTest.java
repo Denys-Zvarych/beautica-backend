@@ -1600,7 +1600,8 @@ class SlotCalculationServiceTest {
 
         List<String> offenders = controllers.stream()
                 .filter(f -> read(f).contains("getStaffAvailableSlots")
-                        || read(f).contains("isStaffSlotAvailable"))
+                        || read(f).contains("isStaffSlotAvailable")
+                        || read(f).contains("isStaffVisitSlotAvailable"))
                 .map(Path::toString)
                 .sorted()
                 .toList();

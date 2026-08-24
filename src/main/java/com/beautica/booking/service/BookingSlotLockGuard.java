@@ -7,6 +7,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -78,10 +79,29 @@ final class BookingSlotLockGuard {
      *
      * <p>The flush is what makes the constraint authoritative inside the transaction; deferring it
      * to commit would move the violation outside this translation.
+     *
+     * <p>Delegates to the list overload ({@link #saveOrConflict(BookingRepository, List)}) with a
+     * single-element list — the ONE place that knows the constraint-violation → 409 mapping, kept
+     * to one implementation rather than two (Phase 22.12). This signature is unchanged so every
+     * existing single-row caller is untouched.
      */
     static Booking saveOrConflict(BookingRepository bookingRepository, Booking booking) {
+        return saveOrConflict(bookingRepository, List.of(booking)).get(0);
+    }
+
+    /**
+     * Multi-row counterpart of {@link #saveOrConflict(BookingRepository, Booking)} (Phase 22.12) —
+     * {@code saveAll} + one {@code flush}, inside the same try/catch, so a whole chained visit is
+     * saved and constraint-checked atomically: either every row survives the flush or none does, and
+     * a GIST EXCLUDE violation on ANY row surfaces as the same {@code 409 "Slot not available"} the
+     * single-row path returns. Never fork this method — {@link #saveOrConflict(BookingRepository, Booking)}
+     * delegates here so the mapping cannot drift between the single-service and visit create paths.
+     */
+    static List<Booking> saveOrConflict(BookingRepository bookingRepository, List<Booking> bookings) {
         try {
-            return bookingRepository.saveAndFlush(booking);
+            List<Booking> saved = bookingRepository.saveAll(bookings);
+            bookingRepository.flush();
+            return saved;
         } catch (DataIntegrityViolationException e) {
             throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
         }

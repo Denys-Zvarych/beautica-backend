@@ -1,11 +1,13 @@
 package com.beautica.booking.service;
 
 import com.beautica.booking.domain.MasterBookability;
-import com.beautica.booking.dto.BookingResponse;
+import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
 import com.beautica.booking.dto.StaffBookingScope;
 import com.beautica.booking.dto.StaffClientRef;
+import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.TimeZones;
 import com.beautica.common.exception.BusinessException;
@@ -13,7 +15,9 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.Placeholders;
 import com.beautica.common.util.UkrainianPhoneNormalizer;
+import com.beautica.common.util.UkrainianPlurals;
 import com.beautica.config.BookingSmsProperties;
+import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
@@ -29,8 +33,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -63,7 +67,8 @@ import java.util.UUID;
  *       {@code bufferMinutesAfter} / {@code BookingPriceRange#resolveCeiling} arithmetic is the
  *       snapshot rule, so a staff booking's frozen columns cannot drift from a client booking's;</li>
  *   <li><b>working hours / day-off / gap containment</b> —
- *       {@link BookingSlotAvailabilityGuard#assertStaffStartsOnAvailableSlot}, which runs the same
+ *       {@link BookingSlotAvailabilityGuard#assertStaffVisitStartsOnAvailableSlot}, the WHOLE-CHAIN
+ *       (Phase 22.10/22.12) counterpart of the single-service guard, which runs the same
  *       {@code SlotCalculationService} effective-day oracle every other create path is proved
  *       against;</li>
  *   <li><b>double-book</b> — {@link BookingSlotLockGuard}, shared verbatim with
@@ -71,24 +76,32 @@ import java.util.UUID;
  *   <li><b>lead time / horizon</b> — {@code BookingStartsAtValidator#validateStaff}.</li>
  * </ul>
  *
- * <h2>Single-service, and why (the {@code appointments} CHECK)</h2>
- * {@link StaffBookingCommand} carries a scalar {@code masterServiceId}, so a staff booking is always
- * ONE {@code bookings} row with {@code appointment_id} NULL. That is a decision, not an omission: a
- * multi-service visit persists an {@code appointments} header, and
- * {@code chk_appointment_source} (V124:54 — note the SINGULAR table name, the phase doc calls it
- * {@code chk_appointments_source}) still admits only {@code ('APP','LINK')}. V137 widened the
- * {@code bookings} constraint alone, deliberately. A multi-service staff visit would therefore fail
- * at the appointment insert, so it is refused before any write ({@link #onlyItem}) and no migration
- * is introduced for a capability nothing offers — the approved mobile design is a single-service
- * wizard. Widening {@code chk_appointment_source} is the FIRST thing a future multi-service staff
- * track must ship; {@code StaffBookingIT} pins the constraint's current shape so that day goes red
- * loudly instead of at runtime.
+ * <h2>Multi-service visits (Phase 22.11/22.12)</h2>
+ * {@link StaffBookingCommand} carries an ORDERED {@code masterServiceIds} list, so a staff-created
+ * visit is exactly the shape {@code AppointmentService#doCreateAppointment} produces: ONE
+ * {@code appointments} header (born via {@link Appointment#staffAppointment}) plus N chained
+ * {@code bookings} rows, every one linked by {@code appointment_id}. This is possible because V139
+ * widened {@code chk_appointment_source} to admit {@code 'STAFF'} alongside {@code 'APP','LINK'} —
+ * before that migration this class refused any multi-service create outright (a since-deleted
+ * single-item collapse, Phase 22.11) rather than risk failing at the appointment insert.
+ *
+ * <p><b>N = 1 still creates a header — no size-based short-circuit</b> (locked decision, mirrors
+ * {@code doCreateAppointment}'s own lack of one). One code path means a bug can only exist in one
+ * place, and the two shapes — a legacy pre-track single-service row with {@code appointment_id}
+ * NULL, and every visit created after this phase, header-linked — must BOTH keep working forever;
+ * there is no backfill of the legacy shape (Phase 22.12 D2). {@code StaffBookingReadPathIT} proves
+ * neither shape regresses the walk-in "never reviewable" rule.
+ *
+ * <p>The per-BOOKING rule is unchanged by any of this: cancel, reschedule, decline and feedback each
+ * still touch exactly ONE {@code bookings} row, never a sibling, never the whole visit — the header
+ * is a grouping label, not a second transition surface. See CLAUDE.md's locked
+ * {@code project_completion_is_per_service} decision.
  *
  * <h2>Locked domain rules honoured here</h2>
- * The booking is born {@code CONFIRMED} via {@code Booking#staffBooking} (track 24.x: every booking
- * is). There is no status-writing path of any kind — {@code AWAITING_CLOSURE} stays read-time
- * derived. Exactly ONE booking row is written, never a sibling. {@code priceMaxAtBooking} is a
- * snapshot taken here and never re-derived. "Now" comes only from the injected {@link Clock}.
+ * Every booking in the visit is born {@code CONFIRMED} via {@code Booking#staffBooking} (track
+ * 24.x: every booking is). There is no status-writing path of any kind — {@code AWAITING_CLOSURE}
+ * stays read-time derived. {@code priceMaxAtBooking} is a per-item snapshot taken here and never
+ * re-derived. "Now" comes only from the injected {@link Clock}.
  *
  * <h2>The walk-in confirmation SMS (Phase 22.7)</h2>
  * Added here, after commit, and <b>with no reference anywhere to the feature flag</b>. The gate
@@ -120,12 +133,21 @@ public class StaffBookingService {
 
     private final MasterRepository masterRepository;
     private final BookingRepository bookingRepository;
+    private final AppointmentRepository appointmentRepository;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     private final VisitPlanner visitPlanner;
     private final BookingSmsDispatcher bookingSmsDispatcher;
     private final BookingSmsProperties smsProperties;
     private final Clock clock;
+    /**
+     * REUSE-FIRST (Phase 22.14): the visit-detail enrichment (master summary, Kyiv-zoned window,
+     * price/duration totals, discovery labels) is owned by {@link AppointmentService#enrich}, which
+     * this class calls rather than re-implementing. {@code enrich} is package-private specifically so
+     * a second writer in this package can reuse it verbatim instead of duplicating the
+     * {@code DiscoveryLocationResolver} lookup — see that method's Javadoc.
+     */
+    private final AppointmentService appointmentService;
 
     /**
      * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
@@ -147,35 +169,43 @@ public class StaffBookingService {
     private static final Duration WALK_IN_PHONE_WINDOW = Duration.ofHours(1);
 
     /**
-     * Creates one {@code CONFIRMED}, {@code STAFF}-sourced booking for an account-less walk-in
-     * client.
+     * Creates one {@code CONFIRMED}, {@code STAFF}-sourced VISIT for an account-less walk-in
+     * client: one {@code appointments} header plus N chained {@code bookings} rows, one per
+     * ordered {@code masterServiceIds} entry (Phase 22.12). N = 1 still produces a header — see the
+     * class Javadoc's "Multi-service visits" section; there is no size-based short-circuit.
      *
-     * <p><b>Order is load-bearing</b>, and mirrors {@code BookingService#doCreateBooking}'s:
-     * cheap non-DB guards, then the master, then the assignment (both 404-shaped), then lead time,
-     * then schedule fit, and only then the per-master advisory lock — so a request that is
-     * off-schedule, or for a service the master does not perform, never contends for the lock every
-     * other request against that master is queued on.
+     * <p><b>Order is load-bearing</b>, and mirrors {@code BookingService#doCreateBooking}'s /
+     * {@code AppointmentService#doCreateAppointment}'s: cheap non-DB guards, then the master, then
+     * the chain resolution (both 404-shaped), then lead time, then schedule fit over the WHOLE
+     * chain, and only then the per-master advisory lock — so a request that is off-schedule, or for
+     * a service the master does not perform, never contends for the lock every other request
+     * against that master is queued on.
      *
      * @param cmd     the fully-resolved command — every field of which may legitimately originate in
      *                the request body
      * @param actorId the authenticated staff user keying the booking in, persisted to
-     *                {@code bookings.created_by_user_id} (V137) as the ONLY audit trail a staff
-     *                booking carries. <b>A separate parameter on purpose</b> (security MEDIUM,
-     *                2026-08-18): while it sat on {@link StaffBookingCommand} beside the
-     *                client-supplied values, 22.4's natural {@code request.toCommand()} mapping was
-     *                one field away from letting a caller attribute a walk-in to a different staff
-     *                user. The controller MUST source it from the security context.
+     *                {@code bookings.created_by_user_id} AND {@code appointments.created_by_user_id}
+     *                (V137/V139) as the ONLY audit trail a staff visit carries. <b>A separate
+     *                parameter on purpose</b> (security MEDIUM, 2026-08-18): while it sat on
+     *                {@link StaffBookingCommand} beside the client-supplied values, 22.4's natural
+     *                {@code request.toCommand()} mapping was one field away from letting a caller
+     *                attribute a walk-in to a different staff user. The controller MUST source it
+     *                from the security context.
      * @throws NotFoundException   404 — unknown/inactive master (or a master whose salon is closed),
-     *                             or a {@code masterServiceId} that is unknown, foreign or inactive.
-     *                             Both are deliberately indistinguishable from each other's message.
+     *                             or any {@code masterServiceIds} entry that is unknown, foreign or
+     *                             inactive. Both are deliberately indistinguishable from each
+     *                             other's message.
      * @throws ForbiddenException  403 — the master is outside the command's {@link StaffBookingScope}
      *                             (wrong salon, a {@code Self} scope naming a user other than
      *                             {@code actorId}, or not the self-booking master), or
      *                             {@code actorId} is absent
-     * @throws BusinessException   400 — past {@code startsAt}, beyond the 180-day horizon, missing
+     * @throws BusinessException   400 — past {@code startsAt}, beyond the 180-day horizon, an empty
+     *                             or over-cap {@code masterServiceIds} list, a chain whose total
+     *                             duration exceeds
+     *                             {@code SlotCalculationService#MAX_TOTAL_DURATION_MINUTES}, missing
      *                             walk-in name/surname/phone, a control character in either name, or
      *                             an unparseable phone;
-     *                             409 — off-schedule start, or a window that collides with an
+     *                             409 — an off-schedule start, or a span that collides with an
      *                             existing {@code CONFIRMED} booking;
      *                             429 — this walk-in phone has already received
      *                             {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW} confirmations inside
@@ -183,7 +213,7 @@ public class StaffBookingService {
      *                             501 — an {@link StaffClientRef.ExistingClient} subject (Phase 22.3)
      */
     @Transactional
-    public BookingResponse createStaffBooking(StaffBookingCommand cmd, UUID actorId) {
+    public AppointmentDetailResponse createStaffBooking(StaffBookingCommand cmd, UUID actorId) {
         // §B shape: a missing principal is a 403, never a 500 from a null slipping into the insert
         // and tripping the created_by_user_id NOT NULL at flush.
         if (actorId == null) {
@@ -218,22 +248,25 @@ public class StaffBookingService {
         BookingStartsAtValidator.validateStaff(cmd.startsAt(), clock);
 
         // Service eligibility (404 for unknown/foreign/inactive) AND the price/duration/buffer/
-        // priceMax snapshot, both from the shared planner — see the class Javadoc.
-        VisitPlanner.PlannedItem item = onlyItem(
-                visitPlanner.planChainedItems(master, List.of(cmd.masterServiceId()), cmd.startsAt()));
+        // priceMax snapshot per item, chained back-to-back — the same shared planner the APP and
+        // LINK visit paths use, so a staff visit's frozen columns cannot drift from theirs. N = 1 is
+        // NOT special-cased: a one-service list still returns a one-element chain here, exactly as
+        // AppointmentService#doCreateAppointment never special-cases N = 1 either.
+        List<VisitPlanner.PlannedItem> items =
+                visitPlanner.planChainedItems(master, cmd.masterServiceIds(), cmd.startsAt());
+        OffsetDateTime firstStart = items.get(0).startsAt();
+        OffsetDateTime lastEnd = items.get(items.size() - 1).endsAt();
 
-        // The new guarantee this phase adds: the start must be a real slot in the master's resolved
-        // schedule — not a day-off, not a custom-hours gap, not an off-grid minute. `item`'s
-        // assignment is handed through so the gate does not re-issue the finder the planner just ran.
-        // The gate asks an EXISTENCE question (perf LOW, 2026-08-18): the client path amortises a
-        // materialised whole-day slot list through the `available-slots` cache, but the staff list is
-        // uncached, so building the whole day's AvailableSlotResponse list to answer one boolean was
-        // paid on every single create with zero reuse. (Sizing: SLOT_STEP is 30 minutes and a day's
-        // work intervals are disjoint, so a Kyiv day holds at most 48 grid positions; a realistic
-        // 9-12h working day yields 17-24 objects, each holding two ZonedDateTimes.)
-        BookingSlotAvailabilityGuard.assertStaffStartsOnAvailableSlot(
-                slotCalculationService, master.getId(), item.masterService().getId(),
-                item.masterService(), cmd.startsAt());
+        // The new guarantee Phase 22.10 added: the FIRST start must be a real slot in the master's
+        // resolved schedule for the WHOLE chained block — not a day-off, not a custom-hours gap, not
+        // an off-grid minute, and not a chain whose tail runs past the working window even though
+        // the first service alone would fit. `items`' assignments are handed through (in the SAME
+        // order as masterServiceIds) so the gate does not re-issue the finder the planner just ran.
+        // Whole-chain, never N per-item checks — see BookingSlotAvailabilityGuard's Javadoc for why
+        // a per-item check would wrongly accept an overrunning chain.
+        BookingSlotAvailabilityGuard.assertStaffVisitStartsOnAvailableSlot(
+                slotCalculationService, master.getId(), cmd.masterServiceIds(),
+                VisitPlanner.assignmentsOf(items), cmd.startsAt());
 
         StaffClientRef.Guest guest = requireWalkIn(cmd.client());
         // MUST precede the insert: chk_bookings_guest_phone_format (V89) enforces ^\+[0-9]{6,18}$ in
@@ -243,41 +276,127 @@ public class StaffBookingService {
         // AFTER normalisation, so "050 123 45 67" and "+380501234567" cannot be alternated to buy a
         // second budget; BEFORE the advisory lock, so a throttled request never contends for the
         // lock every other request against this master queues on.
+        //
+        // THIS CALL SITE MUST NOT MOVE BELOW lockMasterAndAssertFree (security MEDIUM, 2026-08-22).
+        // The method now takes a per-PHONE advisory lock (salt 3) of its own, so the acquisition
+        // order on this path is always phone → master (salt 0), mirroring the client(salt 1) →
+        // master(salt 0) order BookingService uses. No path anywhere takes the master lock first, so
+        // there is one global ordering and no acquisition cycle; swapping these two statements would
+        // create one. That phone lock is this transaction's FIRST advisory lock and therefore fuses
+        // the 3s lock_timeout the whole transaction then inherits.
         assertWalkInSmsBudgetForPhone(guestPhone);
 
-        BookingSlotLockGuard.lockMasterAndAssertFree(
-                bookingRepository, master.getId(), item.startsAt(), item.endsAt());
+        // Read-only enrichment work HOISTED ABOVE the per-master lock (perf LOW, 2026-08-22). Both
+        // resolutions below are pure reads that need no lock, and both used to run after it — the
+        // platform service name is one lazy `service_types` load and the discovery labels are two
+        // SELECTs, so ~3 round-trips of lock-irrelevant work sat inside the window every other
+        // request against this master queues on. Nothing here depends on the lock's outcome, and
+        // both inputs (`items` from the planner, `master` with its user + salon JOIN FETCHed) are
+        // already resolved and managed at this point, so this is a pure move.
+        //
+        // Only the FIRST item's platform name is resolved (perf MEDIUM, 2026-08-20):
+        // visitServiceNamePhrase never reads past index 0, so resolving all N would issue N-1
+        // wasted `service_types` lazy loads. `items.size()` stands in for the discarded remainder.
+        String firstServiceName =
+                platformServiceName(items.get(0).masterService().getServiceDefinition());
+        // Same locality rule AppointmentService#enrich applies (booked salon wins, else the master's
+        // own user row), resolved through that class's own helper rather than a second copy here —
+        // `master.getSalon()` IS the instance handed into every Booking.staffBooking(...) below, and
+        // cityId/districtId are plain UUID columns on both entities, so this issues no extra load
+        // beyond resolveLabels' own two taxonomy SELECTs.
+        DiscoveryLabels labels =
+                appointmentService.resolveVisitLabels(master.getSalon(), master.getUser());
 
-        Booking saved = BookingSlotLockGuard.saveOrConflict(bookingRepository, Booking.staffBooking(
-                master, item.masterService(), master.getSalon(),
-                item.startsAt(), item.endsAt(), item.price(), item.priceMax(),
-                item.duration(), item.buffer(),
-                guest.name(), guest.surname(), guestPhone,
-                actorId));
+        // ONE span check over [firstStart, lastEnd), not N per-item checks: the chained items are
+        // contiguous by construction AT CREATE TIME (VisitPlanner#assertContiguous), so the union of
+        // their intervals is exactly this span — identical reasoning and identical span to
+        // AppointmentService#doCreateAppointment's overlap check. Holds only for THIS transaction; a
+        // later per-item reschedule legally separates items with gaps, so this argument must never
+        // be reused to justify a single span check on a read or reschedule path.
+        BookingSlotLockGuard.lockMasterAndAssertFree(bookingRepository, master.getId(), firstStart, lastEnd);
 
-        registerSlotEviction(master.getId(), salonIdOf(saved));
-        // Rendered NOW, inside the transaction, while `master` and `item` are still managed — the
+        Appointment appointment = Appointment.staffAppointment(
+                master.getSalon(), guest.name(), guest.surname(), guestPhone, actorId);
+
+        List<Booking> bookings = new ArrayList<>(items.size());
+        for (VisitPlanner.PlannedItem item : items) {
+            Booking booking = Booking.staffBooking(
+                    master, item.masterService(), master.getSalon(),
+                    item.startsAt(), item.endsAt(), item.price(), item.priceMax(),
+                    item.duration(), item.buffer(),
+                    guest.name(), guest.surname(), guestPhone,
+                    actorId);
+            // Set post-construction (D4, Phase 22.12): additive, not a new factory parameter — see
+            // Booking#appointment's Javadoc. The window in which the entity is un-linked is purely
+            // local and is never flushed in that state.
+            booking.setAppointment(appointment);
+            bookings.add(booking);
+        }
+
+        // Header saved first so the FK bookings.appointment_id resolves; saveOrConflict's list
+        // overload does saveAll + one flush inside the SAME try/catch the single-row path uses, so a
+        // no_overlapping_bookings violation on ANY item maps to the identical 409 — no partial visit
+        // is ever persisted (atomic, one transaction).
+        appointmentRepository.save(appointment);
+        List<Booking> saved = BookingSlotLockGuard.saveOrConflict(bookingRepository, bookings);
+
+        // ONCE per visit, not once per item: all N rows share one master and one salon, so N calls
+        // would evict the same two keys N times for nothing.
+        registerSlotEviction(master.getId(), salonIdOf(saved.get(0)));
+        // Rendered NOW, inside the transaction, while `master` and `items` are still managed — the
         // callback runs after the persistence context closes, so touching a lazy association from
-        // there would be a LazyInitializationException.
+        // there would be a LazyInitializationException. EXACTLY ONE SMS for the whole visit, naming
+        // the first service and counting the rest (Phase 22.13). `firstServiceName` was resolved
+        // above the master lock; the rendering itself is pure string work.
         registerWalkInConfirmationSms(
                 guestPhone,
-                buildWalkInConfirmationSms(
-                        master,
-                        platformServiceName(item.masterService().getServiceDefinition()),
-                        saved));
-        return BookingResponse.from(saved, OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC));
+                buildWalkInConfirmationSms(master, firstServiceName, items.size(), firstStart, lastEnd));
+
+        // REUSE-FIRST (Phase 22.14): the visit-detail enrichment is AppointmentService#enrich's job,
+        // not a second mapper here. `saved` already carries everything `enrich` dereferences —
+        // `master`/`master.getUser()` and every item's `masterService.serviceDefinition` were loaded
+        // (with FETCH joins) by VisitPlanner/findByIdWithUserAndSalon earlier in THIS transaction and
+        // are still managed, and `booking.getSalon()` is the SAME `master.getSalon()` instance handed
+        // into every `Booking.staffBooking(...)` call above — so no extra SELECT is issued and no
+        // `findByAppointmentIdWithGraph` re-fetch is needed. `saved` is already ordered ascending by
+        // startsAt (it mirrors `items`' chained order), matching `enrich`'s documented precondition.
+        //
+        // The pre-resolved-labels overload (perf LOW, 2026-08-22) so `enrich`'s two taxonomy SELECTs
+        // do not run inside the per-master lock window — the two-argument form still resolves them
+        // itself and every other caller is unchanged.
+        return appointmentService.enrich(appointment, saved, labels);
     }
 
     /**
-     * Enforces {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW} walk-ins per recipient per
+     * Enforces {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW} walk-in VISITS per recipient per
      * {@link #WALK_IN_PHONE_WINDOW} — see those fields for the threat model and the sizing.
+     *
+     * <p>Counts VISITS, not rows (Phase 22.13): {@code registerWalkInConfirmationSms} fires once per
+     * visit whatever its service count, so the budget it feeds must be denominated the same way —
+     * see {@link BookingRepository#countStaffWalkInVisitsForPhoneSince} for the {@code coalesce}
+     * reasoning.
      *
      * <p>A {@code 429}, matching {@code PhoneOtpService}'s per-phone verdict, and with a message
      * that names no number: the response must not confirm to a prober that a given phone has been
      * booked recently.
+     *
+     * <h4>Why the lock is the FIRST statement (security MEDIUM, 2026-08-22)</h4>
+     * Count-then-insert is a classic TOCTOU: nothing in {@code bookings} locks the phone, so at
+     * READ COMMITTED C concurrent creates naming the same number all read the identical pre-burst
+     * count, all pass this check, and all insert — turning a 5/hour ceiling into ~{@code 5 + C}
+     * messages at a number that never consented. Not reachable today (no committed profile sets
+     * {@code app.booking.sms.enabled=true}) and fully live the moment that flag flips.
+     * {@link BookingRepository#acquireWalkInPhoneLock} serialises same-phone creates so the second
+     * caller counts the row the first committed. It is taken before the count, never after — a lock
+     * acquired after the read would protect nothing.
      */
     private void assertWalkInSmsBudgetForPhone(String guestPhone) {
-        long recent = bookingRepository.countStaffWalkInsForPhoneSince(
+        // Serialises same-phone creates. The phone is ALREADY E.164-normalised at every call site
+        // (UkrainianPhoneNormalizer.toE164 runs first), so "050 123 45 67" and "+380501234567" key
+        // the SAME lock — a lock on the raw string would be inert against exactly the alternation
+        // the normalisation exists to defeat.
+        bookingRepository.acquireWalkInPhoneLock(guestPhone);
+        long recent = bookingRepository.countStaffWalkInVisitsForPhoneSince(
                 guestPhone, clock.instant().minus(WALK_IN_PHONE_WINDOW));
         if (recent >= MAX_WALK_INS_PER_PHONE_PER_WINDOW) {
             throw new BusinessException(HttpStatus.TOO_MANY_REQUESTS,
@@ -346,23 +465,6 @@ public class StaffBookingService {
                 }
             }
         }
-    }
-
-    /**
-     * Asserts the planned visit is exactly one service — the single-service invariant the
-     * {@code chk_appointment_source} CHECK forces on this track (see the class Javadoc).
-     *
-     * <p>Unreachable today because {@link StaffBookingCommand} carries a scalar
-     * {@code masterServiceId}, which is the point: the invariant is enforced by the TYPE, and this
-     * is the assertion that catches the day someone widens the command to a list without shipping
-     * the migration first. A clear 400 beats a constraint violation surfacing as a 500.
-     */
-    private static VisitPlanner.PlannedItem onlyItem(List<VisitPlanner.PlannedItem> items) {
-        if (items.size() != 1) {
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "A staff booking must contain exactly one service");
-        }
-        return items.get(0);
     }
 
     /**
@@ -435,7 +537,8 @@ public class StaffBookingService {
     }
 
     /**
-     * Renders the walk-in confirmation copy in ONE pass over the template.
+     * Renders the ONE walk-in confirmation SMS for the whole visit, in ONE pass over the template
+     * (Phase 22.13).
      *
      * <p>{@link Placeholders#format} rather than chained {@link String#replace} for the reason
      * documented on {@code GuestBookingService#buildConfirmationSms}: sequential replacement
@@ -443,18 +546,64 @@ public class StaffBookingService {
      * {@code "Манікюр {time}"} could rewrite the rest of a message the client reads as platform
      * copy. A single pass copies substituted values out verbatim, so data can never become markup.
      *
-     * <p>The date and time are the Kyiv civil values — the client reads a wall clock, not the UTC
-     * instant the column stores.
+     * <p>{@code date}/{@code time} render {@code startsAt} — the Kyiv civil values of the VISIT's own
+     * start, {@code firstStart}, never a later item's. That is unchanged at N = 1 (byte-identical to
+     * the pre-22.13 rendering — the walk-in template carries no end-time placeholder, mirroring
+     * {@code GuestBookingService}'s own multi-service confirmation, which likewise never renders an
+     * end time). {@code endsAt} is still accepted and validated here — the caller MUST pass
+     * {@code lastEnd} (the visit's own {@code [firstStart, lastEnd)} span), never
+     * {@code items.get(0).endsAt()} — so a future template that surfaces the visit's finish time
+     * cannot silently inherit a wrong value from this method's call sites.
      *
-     * <p>{@code serviceName} is the PLATFORM name — see {@link #platformServiceName}.
+     * <p>{@code firstServiceName} is the PLATFORM name of the visit's first item, in performance
+     * order — see {@link #platformServiceName}. {@code totalServiceCount} is the visit's item count
+     * ({@code items.size()}, never re-derived from a materialised name list). {@link
+     * #visitServiceNamePhrase} collapses the pair to "first service, count the rest" (D3): a
+     * single-service visit renders the bare name, unchanged; an N ≥ 2 visit appends «та ще N
+     * послуг(и)» via {@link UkrainianPlurals}, never the full list — the same space/segment-budget
+     * rule {@code GuestBookingService#visitSmsServiceName} already applies to the client-facing
+     * confirmation.
+     *
+     * <p>Only the FIRST item's name is ever resolved by the caller (perf MEDIUM, 2026-08-20): this
+     * method never reads past the first name, so a fully-materialised {@code List<String>} of every
+     * item's platform name would cost N−1 wasted {@code service_types} lazy loads for a value this
+     * method discards.
      */
-    private String buildWalkInConfirmationSms(Master master, String serviceName, Booking saved) {
-        OffsetDateTime kyiv = saved.getStartsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+    private String buildWalkInConfirmationSms(
+            Master master, String firstServiceName, int totalServiceCount,
+            OffsetDateTime startsAt, OffsetDateTime endsAt) {
+        if (endsAt.isBefore(startsAt)) {
+            // Defensive invariant, never client-triggered: VisitPlanner#assertContiguous already
+            // guarantees lastEnd >= firstStart for any chain that reaches this method.
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Visit end precedes its own start");
+        }
+        OffsetDateTime kyiv = startsAt.atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
         return Placeholders.format(smsProperties.getSms().getWalkInConfirmation(), Map.of(
                 "masterName", masterName(master),
-                "serviceName", serviceName,
+                "serviceName", visitServiceNamePhrase(firstServiceName, totalServiceCount),
                 "date", DATE_FMT.format(kyiv),
                 "time", TIME_FMT.format(kyiv)));
+    }
+
+    /**
+     * D3's "name the first service, count the rest": {@code ("Манікюр", 1)} → {@code "Манікюр"}
+     * (byte-identical to the pre-22.13 single-service rendering); {@code ("Манікюр", 3)} →
+     * {@code "Манікюр та ще 2 послуги"}. Mirrors {@code GuestBookingService#visitSmsServiceName}'s
+     * shape exactly (first name + count of the rest, never the full list) — REUSE of the pattern, not
+     * a fork, since the two methods differ only in WHICH name source they read (platform taxonomy
+     * here, provider-custom there).
+     *
+     * <p>{@link UkrainianPlurals#servicesPhrase}, not hand-rolled pluralisation: Ukrainian numeral
+     * agreement is one/few/many, so a naive {@code " та ще " + n + " послуги"} is wrong for both 5
+     * ("послуг") and 1 (which never reaches this branch — see below).
+     */
+    private static String visitServiceNamePhrase(String firstServiceName, int totalServiceCount) {
+        int remaining = totalServiceCount - 1;
+        if (remaining <= 0) {
+            return firstServiceName;
+        }
+        return firstServiceName + " та ще " + UkrainianPlurals.servicesPhrase(remaining);
     }
 
     /**

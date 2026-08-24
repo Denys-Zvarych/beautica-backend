@@ -10,7 +10,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.TestPropertySource;
 
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
@@ -264,6 +267,115 @@ class WalkInBookingSmsEnabledIT extends AbstractWalkInBookingSmsIT {
                 .contains("Нагадуємо")
                 .contains(SERVICE_NAME);
         assertThat(onlyBooking().get("reminder_sent")).isEqualTo(true);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Phase 22.13 — one SMS per VISIT, and the per-phone budget counts visits, not rows
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The headline row: a 5-service walk-in must still send exactly ONE Turbosms request, and its
+     * BODY must actually widen to name every service beyond the first — a bare call-count assertion
+     * would pass even against the pre-22.13 first-service-only text, since a 3+-service visit sent
+     * exactly one message either way (see {@code StaffBookingServiceTest} for the mutation-check that
+     * moving the call inside the per-item loop turns count-only assertions red; this row is the
+     * complementary "count alone is not enough" proof).
+     */
+    @Test
+    @DisplayName("flag on — a 5-service visit dispatches exactly ONE message naming the first service "
+            + "and counting the rest")
+    void should_dispatchExactlyOneMessage_when_fiveServiceWalkIn() throws Exception {
+        String firstServicePlatformName = platformServiceName();
+        List<UUID> masterServiceIds = new ArrayList<>();
+        masterServiceIds.add(salon.masterServiceId());
+        for (int i = 0; i < 4; i++) {
+            masterServiceIds.add(insertService(salon.masterId(), "SALON", salon.salonId()));
+        }
+
+        assertThat(createWalkIn(tomorrowAtNoon(), masterServiceIds).getStatusCode())
+                .isEqualTo(HttpStatus.CREATED);
+
+        TURBOSMS.verify(1, postRequestedFor(urlEqualTo(TURBOSMS_PATH)));
+        JsonNode sent = sentTurbosmsPayload();
+        assertThat(sent.path("recipients").get(0).asText())
+                .as("normalised to E.164 for the multi-service visit too, exactly as the "
+                        + "single-service row already proves — the phone-normalisation step does "
+                        + "not depend on how many services the visit chains")
+                .isEqualTo(E164_PHONE);
+        assertThat(sent.path("sms").path("text").asText())
+                .as("D3 — first service named, plural-correct «та ще N послуг(и)» for the rest")
+                .contains(firstServicePlatformName + " та ще 4 послуги");
+    }
+
+    /**
+     * D1 — the per-phone budget is denominated in VISITS: five visits (mixed service counts) for one
+     * recipient exhaust {@code MAX_WALK_INS_PER_PHONE_PER_WINDOW}, and the SIXTH — whatever its own
+     * service count — 429s. If the budget still counted ROWS, the 5-service visit created first would
+     * alone exhaust the cap and the very next (single-service) visit would 429 instead of the sixth.
+     */
+    @Test
+    @DisplayName("flag on — five visits (one multi-service) exhaust the per-phone budget; the sixth 429s")
+    void should_allowFiveVisitsThenReject429_when_sameRecipientAcrossMixedVisitSizes() {
+        List<UUID> firstVisitServiceIds = new ArrayList<>();
+        firstVisitServiceIds.add(salon.masterServiceId());
+        firstVisitServiceIds.add(insertService(salon.masterId(), "SALON", salon.salonId()));
+        firstVisitServiceIds.add(insertService(salon.masterId(), "SALON", salon.salonId()));
+
+        // Visit #1 — three services back to back, 09:00-12:00 (3 x 60 min, 0 buffer).
+        assertThat(createWalkIn(tomorrowAt(LocalTime.of(9, 0)), firstVisitServiceIds).getStatusCode())
+                .as("visit #1 (3 services) — if rows were still the unit, this alone would exhaust "
+                        + "the 5-per-hour budget")
+                .isEqualTo(HttpStatus.CREATED);
+        // Visits #2-5 — single service each, starting where visit #1's span ends so none collides.
+        for (int hour = 12; hour <= 15; hour++) {
+            assertThat(createWalkIn(tomorrowAt(LocalTime.of(hour, 0))).getStatusCode())
+                    .as("visit #%d of 5", hour - 10)
+                    .isEqualTo(HttpStatus.CREATED);
+        }
+
+        ResponseEntity<String> sixth = createWalkIn(tomorrowAt(LocalTime.of(16, 0)));
+
+        assertThat(sixth.getStatusCode())
+                .as("the sixth VISIT for this recipient — five were admitted, whatever their own "
+                        + "service counts, so the cap is denominated in visits, not rows")
+                .isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    /**
+     * D1's coalesce contract, at the wire: two PRE-22.12-shaped rows (no {@code appointments} header
+     * at all) for one recipient must each count as their own visit — the same property
+     * {@code V138WalkInPhoneIndexMigrationTest} pins at the query tier, repeated here end to end so a
+     * regression shows up against the real create path too, not only against a hand-built query.
+     */
+    @Test
+    @DisplayName("flag on — two legacy appointment-less rows for a phone count as two visits toward its budget")
+    void should_notCountLegacyNullAppointmentRowsAsOne() {
+        insertLegacyStaffWalkIn(E164_PHONE, tomorrowAt(LocalTime.of(6, 0)));
+        insertLegacyStaffWalkIn(E164_PHONE, tomorrowAt(LocalTime.of(7, 0)));
+
+        // Three MORE real visits should still fit: 2 legacy + 3 real = 5, inside the budget.
+        assertThat(createWalkIn(tomorrowAt(LocalTime.of(9, 0))).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(createWalkIn(tomorrowAt(LocalTime.of(10, 0))).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(createWalkIn(tomorrowAt(LocalTime.of(11, 0))).getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        // The SIXTH visit overall (2 legacy + 3 real + this one) must 429 — had the two legacy NULL-
+        // appointment rows collapsed into one DISTINCT group, this sixth visit would still be admitted.
+        ResponseEntity<String> sixth = createWalkIn(tomorrowAt(LocalTime.of(12, 0)));
+        assertThat(sixth.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    /** A pre-22.12-shaped STAFF row: {@code appointment_id} is NOT bound, so it stays NULL. */
+    private void insertLegacyStaffWalkIn(String phone, OffsetDateTime startsAt) {
+        jdbcTemplate.update("""
+                INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, starts_at,
+                    ends_at, price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking,
+                    booking_source, guest_name, guest_surname, guest_phone, cancel_token,
+                    created_by_user_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 60, 0, 'STAFF', 'Олена', 'Коваль', ?,
+                    NULL, ?, NOW(), NOW())
+                """,
+                UUID.randomUUID(), salon.masterId(), salon.masterServiceId(), salon.salonId(),
+                startsAt, startsAt.plusMinutes(60), phone, salon.ownerId());
     }
 
     /**

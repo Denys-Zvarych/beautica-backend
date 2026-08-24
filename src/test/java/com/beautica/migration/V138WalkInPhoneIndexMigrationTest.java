@@ -15,9 +15,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 /**
  * Contract test for {@code V138__bookings_staff_walkin_phone_index.sql} and for the ONE query it
- * exists to serve, {@code BookingRepository#countStaffWalkInsForPhoneSince} — the per-recipient
+ * exists to serve, {@code BookingRepository#countStaffWalkInVisitsForPhoneSince} — the per-recipient
  * walk-in SMS-spend cap enforced by {@code StaffBookingService#assertWalkInSmsBudgetForPhone}
- * (QA MEDIUM, 2026-08-19).
+ * (QA MEDIUM, 2026-08-19; query widened from a row-count to a visit-count, Phase 22.13).
  *
  * <h2>Why the index and the query are ONE contract, tested in one class</h2>
  * The index is partial ({@code WHERE booking_source = 'STAFF'}) and composite
@@ -49,15 +49,38 @@ class V138WalkInPhoneIndexMigrationTest extends AbstractIntegrationTest {
      * so a persisted entity always lands at "now" and the {@code since} window could never be
      * exercised from the JPA side. {@code status} is likewise set verbatim, which is the point of the
      * cancelled-still-counts rows.
+     *
+     * <p>{@code appointment_id} is the LAST bound parameter, nullable — every pre-existing call site
+     * in this class binds {@code NULL}, which is exactly the pre-22.12 legacy shape the coalesce
+     * fallback exists for (Phase 22.13).
+     *
+     * <p>{@code starts_at}/{@code ends_at} carry a bound minute offset (twice — once per column) ON
+     * TOP of the fixed {@code +1 day} base: {@code no_overlapping_bookings} (V113) excludes
+     * CONFIRMED rows on the SAME {@code master_id} whose spans overlap, and the coalesce tests below
+     * insert MULTIPLE CONFIRMED rows for one master in one test method — a fixed literal window
+     * would collide with itself on the second row. Every pre-existing single-CONFIRMED-row call site
+     * passes {@code 0}, which reproduces the old fixed window exactly.
      */
     private static final String INSERT_BOOKING = """
             INSERT INTO bookings (id, master_id, master_service_id, status, starts_at, ends_at,
                 price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking,
                 booking_source, guest_name, guest_surname, guest_phone, cancel_token,
-                created_by_user_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day 1 hour',
+                created_by_user_id, created_at, updated_at, appointment_id)
+            VALUES (?, ?, ?, ?,
+                NOW() + INTERVAL '1 day' + make_interval(mins => ?),
+                NOW() + INTERVAL '1 day 1 hour' + make_interval(mins => ?),
                 350.00, 60, 0, ?, 'Олена', 'Коваль', ?, CAST(? AS uuid), ?,
-                NOW() - make_interval(mins => ?), NOW())
+                NOW() - make_interval(mins => ?), NOW(), CAST(? AS uuid))
+            """;
+
+    /**
+     * A STAFF appointment header satisfying {@code chk_appointment_guest_fields}'s walk-in branch —
+     * the FK {@code bookings.appointment_id} resolves against this table (V125).
+     */
+    private static final String INSERT_APPOINTMENT = """
+            INSERT INTO appointments (id, status, booking_source, guest_name, guest_surname,
+                guest_phone, cancel_token, created_by_user_id, created_at, updated_at)
+            VALUES (?, 'CONFIRMED', 'STAFF', 'Олена', 'Коваль', ?, NULL, ?, NOW(), NOW())
             """;
 
     @Autowired
@@ -113,7 +136,7 @@ class V138WalkInPhoneIndexMigrationTest extends AbstractIntegrationTest {
      * refunded or silently widened.
      */
     @Nested
-    @DisplayName("countStaffWalkInsForPhoneSince")
+    @DisplayName("countStaffWalkInVisitsForPhoneSince")
     class CountStaffWalkIns {
 
         private BookingMigrationFixtures.Ids ids;
@@ -132,6 +155,58 @@ class V138WalkInPhoneIndexMigrationTest extends AbstractIntegrationTest {
                     .as("the baseline — every negative row below is only meaningful because this one "
                             + "counts")
                     .isEqualTo(1);
+        }
+
+        /**
+         * The Phase 22.13 coalesce contract, D1's sharpest case, written first per the phase doc.
+         * Two rows sharing ONE {@code appointments} header (a post-22.12 multi-service visit) must
+         * collapse to ONE visit — the unit the confirmation SMS is denominated in, since exactly one
+         * message is sent for the whole visit regardless of its service count.
+         *
+         * <p>Mutation-check RED by dropping the {@code coalesce(..., b.id)} fallback down to a bare
+         * {@code appointment_id}: that would still pass THIS row (both rows share the id), which is
+         * exactly why {@link #should_countLegacyNullAppointmentRowsIndividually_when_theySharePhoneButNoHeader}
+         * exists beside it — the fallback's failure mode is invisible unless both rows are checked.
+         */
+        @Test
+        @DisplayName("two bookings sharing one appointment header count as ONE visit")
+        void should_countAsOneVisit_when_twoBookingsShareOneAppointmentHeader() {
+            UUID appointmentId = UUID.randomUUID();
+            jdbcTemplate.update(INSERT_APPOINTMENT, appointmentId, PHONE, ids.staffUserId());
+            // Distinct offsets: both rows are CONFIRMED on the same master, so a shared window would
+            // collide on no_overlapping_bookings — chained services of a real visit ARE contiguous in
+            // production, but that adjacency plays no role in what this row proves.
+            insertLinked("CONFIRMED", "STAFF", PHONE, 20, appointmentId, 0);
+            insertLinked("CONFIRMED", "STAFF", PHONE, 10, appointmentId, 90);
+
+            assertThat(countSinceAnHourAgo(PHONE))
+                    .as("one appointments header, whatever its chained row count, is ONE confirmation "
+                            + "SMS and must consume exactly one budget unit")
+                    .isEqualTo(1);
+        }
+
+        /**
+         * D1's other half: two PRE-22.12-shaped rows (no header at all, {@code appointment_id NULL})
+         * for the same phone must count as TWO visits — each legacy row IS its own visit. This is
+         * what makes the {@code coalesce(..., b.id)} fallback load-bearing rather than decorative:
+         * dropping it collapses every NULL {@code appointment_id} into ONE {@code DISTINCT} group
+         * (SQL {@code NULL}s are indistinguishable from each other under {@code coalesce} but NOT
+         * under grouping unless coalesced to a per-row-unique value), silently handing a prober an
+         * unlimited budget after the first legacy-shaped row. Mutation-check RED by making that exact
+         * edit.
+         */
+        @Test
+        @DisplayName("two legacy rows with no appointment header count as TWO visits, not one")
+        void should_countLegacyNullAppointmentRowsIndividually_when_theySharePhoneButNoHeader() {
+            // Distinct offsets: two CONFIRMED rows on the same master must not collide on
+            // no_overlapping_bookings — unrelated to the NULL-appointment_id shape under test.
+            insertLinked("CONFIRMED", "STAFF", PHONE, 20, null, 0);
+            insertLinked("CONFIRMED", "STAFF", PHONE, 10, null, 90);
+
+            assertThat(countSinceAnHourAgo(PHONE))
+                    .as("no appointment_id to coalesce on other than each row's OWN id — every legacy "
+                            + "STAFF row is its own visit")
+                    .isEqualTo(2);
         }
 
         @Test
@@ -188,20 +263,40 @@ class V138WalkInPhoneIndexMigrationTest extends AbstractIntegrationTest {
          * {@code java.sql.Timestamp}: the JVM here runs on {@code Europe/Kyiv} while the container is
          * UTC, so a JDBC-bound local timestamp would land the row hours away from where the test
          * meant it and the window rows would pass or fail for a timezone reason.
+         *
+         * <p>Legacy shape: {@code appointment_id = NULL} — every row is its own visit. The fixed
+         * {@code +1 day} window (offset 0) is safe here because every EXISTING call site inserts at
+         * most one CONFIRMED row per test method.
          */
         private void insert(String status, String source, String phone, int createdMinutesAgo) {
+            insertLinked(status, source, phone, createdMinutesAgo, null, 0);
+        }
+
+        /**
+         * {@code appointmentId} is nullable — {@code null} reproduces every existing call site's
+         * legacy (pre-22.12) shape; a real id links the row to a header exactly as
+         * {@code StaffBookingService#createStaffBooking} does for a post-22.12 visit.
+         *
+         * @param startOffsetMinutes shifts {@code starts_at}/{@code ends_at} away from the class's
+         *                           fixed {@code +1 day} window, so two CONFIRMED rows for the same
+         *                           master inserted in one test do not collide on
+         *                           {@code no_overlapping_bookings} — irrelevant to every OTHER
+         *                           status, which the exclude constraint does not cover at all.
+         */
+        private void insertLinked(String status, String source, String phone, int createdMinutesAgo,
+                UUID appointmentId, int startOffsetMinutes) {
             // chk_bookings_guest_fields (V91/V137): a non-terminal LINK row MUST carry a cancel
             // token, and a STAFF row must NOT — a staff booking has no self-service cancel link.
             // Hard-coding NULL for both would make the LINK row uninsertable and silently turn the
             // "a LINK booking does not count" row into a fixture error.
             UUID cancelToken = "LINK".equals(source) ? UUID.randomUUID() : null;
             jdbcTemplate.update(INSERT_BOOKING, UUID.randomUUID(), ids.masterId(),
-                    ids.masterServiceId(), status, source, phone, cancelToken, ids.staffUserId(),
-                    createdMinutesAgo);
+                    ids.masterServiceId(), status, startOffsetMinutes, startOffsetMinutes,
+                    source, phone, cancelToken, ids.staffUserId(), createdMinutesAgo, appointmentId);
         }
 
         private long countSinceAnHourAgo(String phone) {
-            return bookingRepository.countStaffWalkInsForPhoneSince(
+            return bookingRepository.countStaffWalkInVisitsForPhoneSince(
                     phone, Instant.now().minus(60, ChronoUnit.MINUTES));
         }
     }

@@ -294,6 +294,36 @@ public class SlotCalculationService {
     }
 
     /**
+     * <b>STAFF chained-visit slot list (Phase 22.10)</b> — the N-service twin of
+     * {@link #getStaffAvailableSlots(UUID, LocalDate, UUID, MasterServiceAssignment)}, sized to the Σ of
+     * the ordered assignments' effective durations exactly as {@link #getAvailableSlots(UUID, LocalDate,
+     * List, List)} is for the client floor. Delegates to the SAME {@link #computeAvailableSlots(UUID,
+     * LocalDate, List, List, Duration)} core at {@link Duration#ZERO}, so it can never disagree with the
+     * single-service staff list about anything but list size.
+     *
+     * <p><b>Not the create-path gate.</b> The create path's schedule-fit check is
+     * {@link #isStaffVisitSlotAvailable}, which answers the same question as a boolean without
+     * materialising this list — see that method's Javadoc for why. This method's only current caller is
+     * {@code BookingAvailabilityAgreementIT} case 20 (the equivalence pin the single-service list is
+     * exempted for in the same way — see the CONTRACT note below), and, like the single-service overload
+     * it mirrors, it is deliberately shaped to also serve a future staff-only chained-slots endpoint.
+     *
+     * <h2>CONTRACT — <b>never wire this into a client-facing controller</b> (security LOW, 2026-08-18)</h2>
+     * Same reasoning and same enforcement as {@link #getStaffAvailableSlots(UUID, LocalDate, UUID,
+     * MasterServiceAssignment)}: a {@code Duration.ZERO} floor offered on a client-reachable route would
+     * let self-service clients see slots inside the 15-minute window they are then 409'd for booking.
+     * {@code SlotCalculationServiceTest#should_haveNoControllerCaller_when_scanningForGetStaffAvailableSlots}
+     * also scans for this method's name.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> getStaffAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded) {
+        assertServiceIds(masterServiceIds);
+        return computeAvailableSlots(masterId, date, masterServiceIds, preloaded, Duration.ZERO);
+    }
+
+    /**
      * <b>STAFF schedule-fit EXISTENCE check (perf LOW, 2026-08-18)</b> — "is {@code startsAt} one of
      * the slots {@link #getStaffAvailableSlots} would offer for this master + service on this date?",
      * answered without materialising that list.
@@ -337,8 +367,64 @@ public class SlotCalculationService {
     public boolean isStaffSlotAvailable(
             UUID masterId, LocalDate date, UUID masterServiceId, MasterServiceAssignment preloaded,
             OffsetDateTime startsAt) {
-        return resolveDayAvailability(masterId, date, List.of(masterServiceId),
-                preloaded != null ? List.of(preloaded) : null)
+        return containsStaffStart(masterId, date, List.of(masterServiceId),
+                preloaded != null ? List.of(preloaded) : null, startsAt);
+    }
+
+    /**
+     * <b>STAFF chained-visit schedule-fit EXISTENCE check (Phase 22.10)</b> — the whole-chain twin of
+     * {@link #isStaffSlotAvailable}, asking whether {@code startsAt} matches a slot of the ordered
+     * {@code masterServiceIds}' chained block (Σ of their effective durations), evaluated at the STAFF
+     * lead-time floor, without materialising {@link #getStaffAvailableSlots(UUID, LocalDate, List,
+     * List)}'s list.
+     *
+     * <p><b>Whole-chain, never N per-item checks — this is load-bearing, not a style preference.</b>
+     * {@code VisitPlanner} chains item <i>i</i> to begin where item <i>i-1</i> ends, so items 2..N sit at
+     * arbitrary, generally off-grid offsets by construction. Asking this method (or
+     * {@link #isStaffSlotAvailable}) about item 2's own start would return {@code false} for a
+     * perfectly legal visit. The correct — and only — question is whether the visit's FIRST start
+     * matches a slot of the chain's whole block, exactly as {@link #getAvailableSlots(UUID, LocalDate,
+     * List, List)} already asks at the client floor. Pinning the first start pins the whole block
+     * because the items are contiguous by construction at create time. A per-item check would also
+     * wrongly ACCEPT a chain whose first service fits alone but whose Σ duration overruns the master's
+     * working window — the exact case {@code BookingSlotAvailabilityGuardTest} and
+     * {@code BookingAvailabilityAgreementIT} case 20 pin RED against.
+     *
+     * <p><b>Shares the identical boolean core as {@link #isStaffSlotAvailable}</b>
+     * ({@link #containsStaffStart}) — the single-service method wraps its one id/assignment in a
+     * singleton list and calls the same private core this method calls directly, mirroring exactly how
+     * {@link #getAvailableSlots(UUID, LocalDate, UUID, MasterServiceAssignment)} and
+     * {@link #getAvailableSlots(UUID, LocalDate, List, List)} both delegate to the shared
+     * {@link #computeAvailableSlots(UUID, LocalDate, List, List, Duration)} core. So the two staff
+     * existence checks can never disagree on anything but list size, exactly as the materialising pair
+     * cannot — pinned by {@code BookingAvailabilityAgreementIT} case 20 (chained counterpart of case 19).
+     *
+     * @param preloaded the PARALLEL assignment list {@code VisitPlanner#planChainedItems} already
+     *                  resolved (same size, same order as {@code masterServiceIds}) — same "managed
+     *                  instance loaded in THIS transaction" contract as every other {@code preloaded}
+     *                  parameter in this class
+     * @return {@code true} iff a generated staff slot for the whole chain starts at exactly
+     *         {@code startsAt}
+     */
+    @Transactional(readOnly = true)
+    public boolean isStaffVisitSlotAvailable(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt) {
+        assertServiceIds(masterServiceIds);
+        return containsStaffStart(masterId, date, masterServiceIds, preloaded, startsAt);
+    }
+
+    /**
+     * Shared boolean core behind both STAFF existence checks — {@link #isStaffSlotAvailable} (single
+     * service, wraps its id/assignment in a singleton list) and {@link #isStaffVisitSlotAvailable}
+     * (whole chain, calls this directly). Mirrors exactly how {@link #computeAvailableSlots(UUID,
+     * LocalDate, List, List, Duration)} is the one materialising core both list-arity entry points of
+     * {@link #getAvailableSlots(UUID, LocalDate, List, List)} delegate to.
+     */
+    private boolean containsStaffStart(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt) {
+        return resolveDayAvailability(masterId, date, masterServiceIds, preloaded)
                 .map(day -> dayFreeRangesContainStart(
                         date, day.effective(), day.totalDuration(), day.occupied(),
                         // STAFF floor: minimum lead 0, so the cutoff IS the request's single `now`.

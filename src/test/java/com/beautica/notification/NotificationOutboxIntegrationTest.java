@@ -138,7 +138,7 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
                 .isZero();
 
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(1).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
 
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
@@ -315,7 +315,7 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
         // Create the booking via the real path (writes a NEW_BOOKING row), then drop it so the
         // assertion targets only the reschedule event.
         ZonedDateTime startsAt = ZonedDateTime.now().plusDays(2).withHour(10).withMinute(0).withSecond(0).withNano(0);
-        var createReq = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var createReq = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
         ResponseEntity<String> createResp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,
                 new HttpEntity<>(createReq, bearerHeaders(clientToken)), String.class);
@@ -533,7 +533,7 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
     }
 
     private UUID createBookingAt(String clientToken, UUID masterId, UUID masterServiceId, ZonedDateTime startsAt) throws Exception {
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 BOOKINGS_URL, HttpMethod.POST,

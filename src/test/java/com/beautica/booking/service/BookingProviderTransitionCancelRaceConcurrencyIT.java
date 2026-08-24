@@ -251,7 +251,7 @@ class BookingProviderTransitionCancelRaceConcurrencyIT extends AbstractIntegrati
 
     private UUID createStandaloneBooking(
             String clientToken, UUID masterId, UUID masterServiceId, ZonedDateTime startsAt) throws Exception {
-        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null);
+        var request = new CreateBookingRequest(masterId, masterServiceId, startsAt, null, null, false);
         HttpHeaders headers = fixtures.bearerHeaders(clientToken);
         headers.setContentType(MediaType.APPLICATION_JSON);
         ResponseEntity<String> resp = restTemplate.exchange(

@@ -17,7 +17,9 @@ import org.apache.hc.core5.util.TimeValue;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -150,13 +152,37 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
         restTemplate.getRestTemplate().setRequestFactory(HTTP_FACTORY);
     }
 
+    /** Distinct from {@link #MASTER_FIRST_NAME}/{@link #MASTER_LAST_NAME} — an attribution bug
+     * cannot fail an assertion if guest and master share a name. */
+    protected static final String GUEST_FIRST_NAME = "Оксана";
+    protected static final String GUEST_LAST_NAME = "Гончар";
+
     // ── fixture records ───────────────────────────────────────────────────────────
 
     protected record Salon(UUID salonId, UUID ownerId, String ownerEmail, UUID masterId,
                            UUID masterServiceId, String bookingSlug) {
     }
 
+    /** One walk-in visit of N chained services, however the concrete shape actually persists it. */
+    protected record Visit(UUID appointmentId, List<UUID> bookingIds) {
+        UUID booking(int i) {
+            return bookingIds.get(i);
+        }
+    }
+
     protected record SeededUser(UUID id, String email) {
+    }
+
+    /**
+     * A solo master and everything needed to authenticate as them and book against them.
+     *
+     * <p>Promoted here (with {@link #seedIndependentMaster()}) when {@link StaffBookingReadPathIT}
+     * became the second suite in this hierarchy to need a salon-less master — the Q4
+     * two-occurrence threshold. It was private to {@link StaffBookingEndpointIT}; privacy is not a
+     * licence to copy, and a second hand-written copy of a fixture is exactly how the two suites
+     * end up disagreeing about what "an independent master" is while both stay green.
+     */
+    protected record Independent(UUID userId, String email, UUID masterId, UUID masterServiceId) {
     }
 
     // ── seeding ───────────────────────────────────────────────────────────────────
@@ -217,6 +243,21 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
         return masterServiceId;
     }
 
+    /**
+     * A salon-less {@code INDEPENDENT_MASTER} with one service and the same seven-day 09:00–17:00
+     * schedule {@link #seedSalon()} gives its master, so "tomorrow at noon" is bookable against
+     * either. See {@link Independent} for why this lives on the base class.
+     */
+    protected Independent seedIndependentMaster() {
+        SeededUser user = insertUser("INDEPENDENT_MASTER", null);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update("INSERT INTO masters (id, user_id, master_type, is_active, created_at, updated_at) "
+                + "VALUES (?, ?, 'INDEPENDENT_MASTER', true, NOW(), NOW())", masterId, user.id());
+        UUID masterServiceId = insertService(masterId, "INDEPENDENT_MASTER", user.id());
+        giveWorkingHours(user.id(), masterId);
+        return new Independent(user.id(), user.email(), masterId, masterServiceId);
+    }
+
     /** 09:00–17:00 on every ISO weekday, so "tomorrow" is a working day whatever day it is today. */
     protected void giveWorkingHours(UUID masterUserId, UUID masterId) {
         List<WeeklyScheduleDayRequest> days = Arrays.stream(new int[]{1, 2, 3, 4, 5, 6, 7})
@@ -245,6 +286,41 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
                     new TypeReference<ApiResponse<AuthResponse>>() {}).data().accessToken();
         } catch (Exception e) {
             throw new IllegalStateException("Failed to parse login response for " + email, e);
+        }
+    }
+
+    /**
+     * Creates a walk-in VISIT through the real {@code POST /masters/&#123;masterId&#125;/bookings}
+     * endpoint — {@code Appointment} header + N chained {@code bookings} rows, even at N = 1
+     * (Phase 258 D2, no size short-circuit).
+     *
+     * <p>Promoted here from {@code VisitStaffBookingShapeIT} when {@link StaffVisitItemRescheduleIT}
+     * became the second suite in this hierarchy to need a real walk-in visit (Q4 two-occurrence
+     * threshold). A second hand-written copy is exactly how two suites end up disagreeing about what
+     * "a walk-in visit" is while both stay green.
+     */
+    protected Visit postWalkIn(UUID masterId, List<UUID> masterServiceIds, String token, OffsetDateTime startsAt) {
+        String idsJson = masterServiceIds.stream()
+                .map(id -> "\"" + id + "\"")
+                .collect(java.util.stream.Collectors.joining(","));
+        String body = """
+                {"masterServiceIds":[%s],"startsAt":"%s",
+                 "guest":{"name":"%s","surname":"%s","phone":"%s"}}
+                """.formatted(idsJson, startsAt, GUEST_FIRST_NAME, GUEST_LAST_NAME, RAW_PHONE);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/masters/" + masterId + "/bookings", HttpMethod.POST,
+                new HttpEntity<>(body, bearerHeaders(token)), String.class);
+        assertThat(resp.getStatusCode())
+                .as("walk-in visit setup must succeed — body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        try {
+            var data = objectMapper.readTree(resp.getBody()).path("data");
+            UUID appointmentId = UUID.fromString(data.path("id").asText());
+            List<UUID> bookingIds = new java.util.ArrayList<>();
+            data.path("items").forEach(item -> bookingIds.add(UUID.fromString(item.path("bookingId").asText())));
+            return new Visit(appointmentId, bookingIds);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to parse visit response: " + resp.getBody(), e);
         }
     }
 

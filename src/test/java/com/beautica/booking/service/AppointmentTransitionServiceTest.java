@@ -917,12 +917,32 @@ class AppointmentTransitionServiceTest {
         setIdViaReflection(itemClient, clientId); // User has no @Builder — id needs reflection
     }
 
-    /** Stubs the single-service schedule-fit oracle so {@code newStartsAt} resolves to an on-schedule slot. */
+    /**
+     * Stubs the CLIENT single-service schedule-fit oracle (15-minute lead floor) so {@code newStartsAt}
+     * resolves to an on-schedule slot.
+     *
+     * <p>Deliberately NOT the staff oracle: a provider-initiated reschedule now runs at the STAFF floor
+     * and therefore asks {@code isStaffSlotAvailable} instead — see {@link #stubStaffItemSlotAvailable}.
+     * Under {@code MockitoExtension}'s default STRICT_STUBS, stubbing both here would fail every test
+     * with {@code UnnecessaryStubbingException}, so the two actor paths get one stub each.
+     */
     private void stubItemSlotAvailable(OffsetDateTime newStartsAt) {
         AvailableSlotResponse slot = new AvailableSlotResponse(
                 newStartsAt.atZoneSameInstant(KYIV), newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
         when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(masterServiceId), isNull()))
                 .thenReturn(List.of(slot));
+    }
+
+    /**
+     * PROVIDER counterpart of {@link #stubItemSlotAvailable} — the STAFF (minimum-lead-0) oracle a
+     * provider-initiated per-item reschedule routes to, mirroring the walk-in CREATE path. Boolean, not
+     * a materialised slot list, because {@code BookingSlotAvailabilityGuard} asks
+     * {@code isStaffSlotAvailable} on this branch.
+     */
+    private void stubStaffItemSlotAvailable(OffsetDateTime newStartsAt) {
+        when(slotCalculationService.isStaffSlotAvailable(
+                eq(masterId), any(), eq(masterServiceId), isNull(), eq(newStartsAt)))
+                .thenReturn(true);
     }
 
     @Test
@@ -988,7 +1008,8 @@ class AppointmentTransitionServiceTest {
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
-        stubItemSlotAvailable(newStartsAt);
+        // Provider-initiated ⇒ the STAFF (minimum-lead-0) oracle, matching walk-in CREATE.
+        stubStaffItemSlotAvailable(newStartsAt);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // F1 freshness re-check (cycle-6 audit 2026-08-03): target is still CONFIRMED post-lock.
         when(bookingRepository.existsConfirmedById(targetId)).thenReturn(true);
