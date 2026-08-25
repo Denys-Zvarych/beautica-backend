@@ -1,5 +1,6 @@
 package com.beautica.favorite.dto;
 
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -54,42 +55,41 @@ import java.util.UUID;
  * subquery was deleted from {@code FavoriteRepository#findFavoriteMasterRows} with it; nothing
  * else read it.
  *
- * <h4>{@code categoryCode} / {@code categoryLabel} — the FILTER axis, not a card field</h4>
- * The approved design's category chips select on this pair, and the design defines it as
- * <em>derived server-side from the last booked service, so both kinds filter through one
- * axis</em> — hence the identical pair on {@link FavoriteSalonResponse}. It is NOT a
- * reinstatement of {@code lastServiceName}: the card renders neither field. The card never
- * showed a service; the FILTER is by category. The client's per-category counts are read only
- * to decide which chips exist.
+ * <h4>{@code categories} — the FILTER axis, not a card field</h4>
+ * The approved design's category chips select on this list, and the axis was reversed from a
+ * client-booking-history derivation to an OFFERING derivation: it is now every distinct platform
+ * category this master actually performs an ACTIVE service in, not the category of whatever this
+ * client last happened to book. The card still renders neither field — the FILTER is by category,
+ * the card never was. See {@code FavoriteCategoryResolver}'s class javadoc for the full rationale
+ * of the reversal, and this pair's {@link FavoriteSalonResponse} counterpart for the salon arm.
  *
  * <p>Resolved by {@code FavoriteCategoryResolver} in one batched statement for the whole page —
- * never a per-row subquery on the list projection, which is exactly what the deleted
- * {@code LATERAL} was.
+ * never a per-row subquery on the list projection, and never per-provider entity hydration.
  *
- * <p><b>Both are nullable, and null is COMMON.</b> Favouriting normally precedes booking, so a
- * client who hearts a provider they have never booked with gets {@code null} on both — that is
- * the design's accepted behaviour, not a defect, and the client hides categories with no rows.
- * {@code null} means "no booked history with this provider yet". No profile- or
- * offering-derived fallback is substituted to avoid the null: filing a provider under a
- * category the client never actually booked would answer a different question than the chip
- * asks. The two fields are always both present or both {@code null}.
+ * <p><b>Empty, never {@code null}.</b> A master with no active categorisable service (a brand-new
+ * profile, or one whose only services are all inactive) publishes an empty list — the client
+ * iterates directly, with no null-check of its own. This replaced an earlier {@code null}-pair
+ * contract keyed on client booking history; a master who has never been booked by ANYONE still
+ * publishes their real offering here, because the axis no longer asks "what has this client
+ * booked" at all.
  *
- * <p><b>Singular by design decision.</b> A provider who performs services in several categories
- * appears under only the one they were last booked for, and can therefore be hidden by a chip
- * they also match. This is a known, accepted consequence of the approved specification; a
- * plural {@code List<FavoriteCategory>} with client-side ANY matching was considered and NOT
- * adopted. Do not re-raise it as a defect.
+ * <p><b>Both-or-neither per entry.</b> A category code whose display label cannot currently be
+ * resolved (deactivated or never-approved) contributes NO entry to the list, rather than an entry
+ * with a {@code null} label — a chip that cannot be drawn is not a choice. This also inherits
+ * {@code PlatformCategoryLabelResolver}'s selectability gate for free: a PENDING or deactivated
+ * category is invisible here exactly as it is invisible to search, so the two surfaces cannot
+ * disagree about which categories exist.
  *
- * @param avgRating     master's aggregate rating, {@code null} when never reviewed
- * @param salonId       employing salon's id, {@code null} for an independent master
- * @param salonName     employing salon's name, {@code null} for an independent master
- * @param categoryCode  {@code platform_categories.name} (e.g. {@code MANICURE}) of the service
- *                      in this client's most recent booking with this master — the value
- *                      denormalised into {@code service_definitions.category}, not the
- *                      {@code BIGSERIAL} id, and the same vocabulary
- *                      {@code ApprovedCategoryResponse.name} publishes
- * @param categoryLabel that category's Ukrainian {@code platform_categories.display_name}
- *                      (e.g. «Манікюр»)
+ * <p><b>Plural by design decision (reversed from an earlier singular contract).</b> A provider
+ * who performs services in several categories now appears under every one of them, so several
+ * chips can each surface the same card. This was a deliberate product reversal of the previous
+ * "one category, the last booked one" rule — see {@code FavoriteCategoryResolver}'s javadoc.
+ *
+ * @param avgRating master's aggregate rating, {@code null} when never reviewed
+ * @param salonId   employing salon's id, {@code null} for an independent master
+ * @param salonName employing salon's name, {@code null} for an independent master
+ * @param categories every distinct platform category this master performs an active service in,
+ *                   ordered by display label; empty (never {@code null}) when the master has none
  */
 public record FavoriteMasterResponse(
         UUID masterId,
@@ -104,7 +104,6 @@ public record FavoriteMasterResponse(
         String street,
         String buildingNo,
         String locationNote,
-        String categoryCode,
-        String categoryLabel
+        List<FavoriteCategoryView> categories
 ) {
 }

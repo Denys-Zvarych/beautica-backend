@@ -4,6 +4,7 @@ import com.beautica.AbstractDataJpaTest;
 import com.beautica.auth.Role;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.CatalogCategory;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -678,5 +679,121 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 .extracting(a -> a.getServiceDefinition().getId())
                 .containsExactly(serviceDefinition.getId())
                 .doesNotContain(softDeletedDef.getId());
+    }
+
+    // ── findDistinctOfferedCategoriesByMasterIds / findDistinctOfferedCategoriesBySalonIds ──────
+    // (favourites category axis). These pin the DISTINCT keyword directly against the raw
+    // Object[] rows at the REPOSITORY boundary, on purpose bypassing FavoriteCategoryResolver.
+    //
+    // FavoriteCategoryResolver#pair folds each provider's returned codes into a java.util.Set
+    // before building its FavoriteCategoryView list (`Set<String> offered = new HashSet<>(codes)`),
+    // so a repository query that dropped its DISTINCT would still pass every
+    // FavoriteCategoryResolverTest and FavoriteMigrationIT assertion — the in-memory Set masks
+    // the duplicate rows before anything asserts on them. A missing DISTINCT is real regardless:
+    // it inflates the row count OfferedCategoryLookup folds per page (a master/salon with many
+    // services in one category multiplies rows, not categories), so the row COUNT returned here,
+    // not the final chip list, is the only place this SQL-level contract can actually fail.
+
+    @Test
+    @DisplayName("should_returnOneRow_when_masterOffersSameCategoryThroughTwoServices")
+    void should_returnOneRow_when_masterOffersSameCategoryThroughTwoServices() {
+        ServiceDefinition second = ServiceDefinition.builder()
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(master.getId())
+                .name("Second Manicure Service")
+                .category("MANICURE")
+                .baseDurationMinutes(45)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("300.00"))
+                .serviceType(persistServiceType("Класичний манікюр", "Classic Manicure"))
+                .isActive(true)
+                .build();
+        em.persist(second);
+
+        MasterServiceAssignment firstAssignment = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(serviceDefinition).isActive(true).build();
+        MasterServiceAssignment secondAssignment = MasterServiceAssignment.builder()
+                .master(master).serviceDefinition(second).isActive(true).build();
+        em.persist(firstAssignment);
+        em.persist(secondAssignment);
+        em.flush();
+        em.clear();
+
+        List<Object[]> rows =
+                masterServiceRepository.findDistinctOfferedCategoriesByMasterIds(List.of(master.getId()));
+
+        assertThat(rows)
+                .as("two ACTIVE services in the SAME category must collapse to ONE (master, category) "
+                        + "row at the SQL level — a dropped DISTINCT returns two identical rows here even "
+                        + "though FavoriteCategoryResolver's downstream Set silently absorbs the duplicate")
+                .hasSize(1);
+        assertThat(rows.get(0)[0]).isEqualTo(master.getId());
+        assertThat(rows.get(0)[1]).isEqualTo("MANICURE");
+    }
+
+    @Test
+    @DisplayName("should_returnOneRow_when_twoMastersOfSameSalonOfferSameCategory")
+    void should_returnOneRow_when_twoMastersOfSameSalonOfferSameCategory() {
+        User owner = new User(
+                "salon-owner-" + UUID.randomUUID() + "@example.com",
+                "$2a$10$hashedpassword",
+                Role.SALON_OWNER,
+                "Salon",
+                "Owner",
+                "+380501111111");
+        em.persist(owner);
+        Salon salon = Salon.builder().owner(owner).name("Dedup Salon").isActive(true).build();
+        em.persist(salon);
+
+        User masterUserA = new User(
+                "salon-master-a-" + UUID.randomUUID() + "@example.com",
+                "$2a$10$hashedpassword", Role.SALON_MASTER, "Master", "A", "+380502222222");
+        em.persist(masterUserA);
+        Master masterA = Master.builder()
+                .user(masterUserA).salon(salon).masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO).reviewCount(0).isActive(true).build();
+        em.persist(masterA);
+
+        User masterUserB = new User(
+                "salon-master-b-" + UUID.randomUUID() + "@example.com",
+                "$2a$10$hashedpassword", Role.SALON_MASTER, "Master", "B", "+380503333333");
+        em.persist(masterUserB);
+        Master masterB = Master.builder()
+                .user(masterUserB).salon(salon).masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO).reviewCount(0).isActive(true).build();
+        em.persist(masterB);
+
+        ServiceDefinition salonService = ServiceDefinition.builder()
+                .ownerType(OwnerType.SALON)
+                .ownerId(salon.getId())
+                .name("Salon Manicure")
+                .category("MANICURE")
+                .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("450.00"))
+                .serviceType(persistServiceType("Салонний манікюр", "Salon Manicure"))
+                .isActive(true)
+                .build();
+        em.persist(salonService);
+
+        MasterServiceAssignment assignmentA = MasterServiceAssignment.builder()
+                .master(masterA).serviceDefinition(salonService).isActive(true).build();
+        MasterServiceAssignment assignmentB = MasterServiceAssignment.builder()
+                .master(masterB).serviceDefinition(salonService).isActive(true).build();
+        em.persist(assignmentA);
+        em.persist(assignmentB);
+        em.flush();
+        em.clear();
+
+        List<Object[]> rows =
+                masterServiceRepository.findDistinctOfferedCategoriesBySalonIds(List.of(salon.getId()));
+
+        assertThat(rows)
+                .as("two DIFFERENT masters of the same salon performing the SAME category must "
+                        + "collapse to ONE (salon, category) row at the SQL level — a dropped DISTINCT "
+                        + "returns two identical rows here")
+                .hasSize(1);
+        assertThat(rows.get(0)[0]).isEqualTo(salon.getId());
+        assertThat(rows.get(0)[1]).isEqualTo("MANICURE");
     }
 }

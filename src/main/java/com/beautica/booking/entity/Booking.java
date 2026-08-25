@@ -68,14 +68,18 @@ import java.util.UUID;
                 // JPA cannot encode WHERE booking_source='LINK' AND reminder_sent=FALSE —
                 // predicate lives in V89 only; do NOT treat this annotation as authoritative.
                 @Index(name = "idx_bookings_reminder", columnList = "starts_at"),
-                // composite index (V93): per-client "latest booking" LATERAL subquery in
-                // FavoriteRepository.findFavoriteMasterRows. JPA cannot encode the DESC sort
-                // direction — V93 declares starts_at DESC; this annotation mirrors the columns for
-                // reader accuracy only. It is documentation, not enforcement: empirically verified
-                // (Phase 26.8 audit), Hibernate 6.5's ddl-auto=validate does NOT check
-                // @Table(indexes=...) against the real schema — see the note at
-                // idx_bookings_master_service_starts_at below for the full finding.
-                @Index(name = "idx_bookings_master_client_starts_at", columnList = "master_id, client_id, starts_at"),
+                // idx_bookings_master_client_starts_at (V93) served the per-client "latest
+                // booking" LATERAL subquery formerly in FavoriteRepository.findFavoriteMasterRows.
+                // DROPPED by V144 once the favourites category axis was reversed from "last
+                // booked category" to "every category the provider offers" — that LATERAL (and
+                // its salon-arm sibling) was the only query ever combining (master_id, client_id)
+                // in one predicate, and it was deleted along with LastBookedCategoryLookup. Do NOT
+                // re-add this @Index entry without also re-creating the migration: Hibernate 6.5's
+                // ddl-auto=validate does NOT check @Table(indexes=...) against the real schema, so
+                // an orphaned annotation here would be silently cosmetic, not caught at boot.
+                // Removing the annotation is still required so the entity doesn't lie about the
+                // schema to the next reader; the regression guard is
+                // BookingReviewQueryIndexesMigrationTest's direct pg_indexes check.
                 // composite index (V95, widened by V117): BookingRepository.findClientBookingDetails
                 // unfiltered shape — WHERE client_id = ? ORDER BY starts_at DESC, id ASC. JPA cannot
                 // encode the DESC sort direction nor the trailing id tiebreaker column order — V117

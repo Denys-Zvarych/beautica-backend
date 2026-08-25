@@ -11,8 +11,8 @@ import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.Favorite;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.dto.FavoriteCategoryView;
 import com.beautica.favorite.service.FavoriteCategoryResolver.FavoriteCategories;
-import com.beautica.favorite.service.FavoriteCategoryResolver.FavoriteCategory;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
@@ -111,8 +111,8 @@ class FavoriteServiceTest {
     private final UUID targetId = UUID.randomUUID();
 
     /**
-     * Default the category axis to "nobody on this page has booked history", so the ~13
-     * pre-existing list tests — which predate the axis and assert nothing about it — keep
+     * Default the category axis to "nobody on this page offers anything categorisable", so the
+     * ~13 pre-existing list tests — which predate the axis and assert nothing about it — keep
      * exercising the mapping they were written for instead of NPE-ing on a null carrier.
      *
      * <p>{@code lenient()} because the majority of tests in this class never reach a list path
@@ -120,14 +120,15 @@ class FavoriteServiceTest {
      * these stubs with their own; under strict stubs either would fail the run for an
      * unnecessary stubbing rather than for the behaviour under test.
      *
-     * <p>Empty is the honest default, not a convenience: a client who has favourited a provider
-     * without booking them is the COMMON case this DTO pair is nullable for.
+     * <p>An empty list is the honest default, not a convenience: this axis is no longer
+     * client-scoped, so {@link FavoriteCategoryResolver#resolveForMasters} /
+     * {@code #resolveForSalons} no longer take a {@code clientId} argument.
      */
     @BeforeEach
-    void defaultToNoBookedCategories() {
-        lenient().when(favoriteCategoryResolver.resolveForMasters(any(), anyCollection()))
+    void defaultToNoOfferedCategories() {
+        lenient().when(favoriteCategoryResolver.resolveForMasters(anyCollection()))
                 .thenReturn(FavoriteCategories.empty());
-        lenient().when(favoriteCategoryResolver.resolveForSalons(any(), anyCollection()))
+        lenient().when(favoriteCategoryResolver.resolveForSalons(anyCollection()))
                 .thenReturn(FavoriteCategories.empty());
     }
 
@@ -1351,23 +1352,21 @@ class FavoriteServiceTest {
     }
 
     /**
-     * The CATEGORY AXIS — the pair the approved favourites design's chips filter on, present
-     * identically on both DTOs so one chip row filters the whole screen.
+     * The CATEGORY AXIS — the list the approved favourites design's chips filter on, present
+     * identically on both DTOs so one chip row filters the whole screen. Reversed from a
+     * single, client-booking-derived pair to a list of every category the provider actually
+     * OFFERS; see {@link FavoriteCategoryResolver}'s class javadoc for the full rationale.
      *
      * <h4>Fixture discipline: every row gets a DIFFERENT category</h4>
-     * Each test below gives its three providers three distinct {@code (code, label)} pairs and
-     * asserts each row receives ITS OWN. That is what makes the assertions falsifiable: a
-     * mapper that keyed the lookup off the wrong row, resolved the whole page to the first
-     * match, or crossed the master and salon arms would emit a visibly different pair rather
-     * than the same one everywhere. A fixture that reused one category for the page would pass
-     * under all four of those bugs.
-     *
-     * <p>The codes and labels are also mutually disjoint strings, so a {@code code}/{@code label}
-     * swap in the DTO constructor (both fields are {@code String}, so the compiler will not
-     * catch it) fails loudly instead of silently transposing.
+     * Each test below gives its providers distinct {@code (code, label)} pairs and asserts each
+     * row receives ITS OWN. That is what makes the assertions falsifiable: a mapper that keyed
+     * the lookup off the wrong row, resolved the whole page to the first match, or crossed the
+     * master and salon arms would emit a visibly different result rather than the same one
+     * everywhere. A fixture that reused one category for the page would pass under all three of
+     * those bugs.
      */
     @Nested
-    @DisplayName("category axis (categoryCode / categoryLabel)")
+    @DisplayName("category axis (categories)")
     class CategoryAxis {
 
         /** A minimal 18-column masters projection row — only index 0 and the type gate matter here. */
@@ -1390,8 +1389,8 @@ class FavoriteServiceTest {
         }
 
         @Test
-        @DisplayName("stamps each master's OWN category, never another row's")
-        void should_stampPerMasterCategory_when_pageHasDistinctCategories() {
+        @DisplayName("stamps each master's OWN categories, never another row's")
+        void should_stampPerMasterCategories_when_pageHasDistinctCategories() {
             UUID nails = UUID.randomUUID();
             UUID hair = UUID.randomUUID();
             UUID brows = UUID.randomUUID();
@@ -1400,93 +1399,86 @@ class FavoriteServiceTest {
                     masterRow(hair, "INDEPENDENT_MASTER"),
                     masterRow(brows, "INDEPENDENT_MASTER")));
             noLocalityLabels();
-            when(favoriteCategoryResolver.resolveForMasters(eq(clientId), anyCollection()))
+            when(favoriteCategoryResolver.resolveForMasters(anyCollection()))
                     .thenReturn(new FavoriteCategories(Map.of(
-                            nails, new FavoriteCategory("MANICURE", "Манікюр"),
-                            hair, new FavoriteCategory("HAIRCUT", "Стрижка"),
-                            brows, new FavoriteCategory("BROWS", "Брови"))));
+                            nails, List.of(new FavoriteCategoryView("MANICURE", "Манікюр")),
+                            hair, List.of(new FavoriteCategoryView("HAIRCUT", "Стрижка")),
+                            brows, List.of(new FavoriteCategoryView("BROWS", "Брови")))));
 
             List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
             assertThat(result)
-                    .extracting(FavoriteMasterResponse::masterId,
-                            FavoriteMasterResponse::categoryCode,
-                            FavoriteMasterResponse::categoryLabel)
-                    .as("each card carries the category of ITS OWN last booked service; a "
-                            + "lookup keyed off the wrong row would repeat one pair down the page")
+                    .as("each card carries the categories of ITS OWN offering; a lookup keyed "
+                            + "off the wrong row would repeat one list down the page")
+                    .extracting(FavoriteMasterResponse::masterId, FavoriteMasterResponse::categories)
                     .containsExactly(
-                            tuple(nails, "MANICURE", "Манікюр"),
-                            tuple(hair, "HAIRCUT", "Стрижка"),
-                            tuple(brows, "BROWS", "Брови"));
+                            tuple(nails, List.of(new FavoriteCategoryView("MANICURE", "Манікюр"))),
+                            tuple(hair, List.of(new FavoriteCategoryView("HAIRCUT", "Стрижка"))),
+                            tuple(brows, List.of(new FavoriteCategoryView("BROWS", "Брови"))));
         }
 
         @Test
-        @DisplayName("stamps each salon's OWN category — the salon arm is not null-by-design")
-        void should_stampPerSalonCategory_when_pageHasDistinctCategories() {
+        @DisplayName("stamps each salon's OWN categories")
+        void should_stampPerSalonCategories_when_pageHasDistinctCategories() {
             UUID makeupSalon = UUID.randomUUID();
             UUID lashSalon = UUID.randomUUID();
-            UUID unbooked = UUID.randomUUID();
+            UUID emptySalon = UUID.randomUUID();
             when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(
-                    salonRow(makeupSalon), salonRow(lashSalon), salonRow(unbooked)));
+                    salonRow(makeupSalon), salonRow(lashSalon), salonRow(emptySalon)));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
-            when(favoriteCategoryResolver.resolveForSalons(eq(clientId), anyCollection()))
+            when(favoriteCategoryResolver.resolveForSalons(anyCollection()))
                     .thenReturn(new FavoriteCategories(Map.of(
-                            makeupSalon, new FavoriteCategory("MAKEUP", "Макіяж"),
-                            lashSalon, new FavoriteCategory("EYELASH", "Вії"))));
+                            makeupSalon, List.of(new FavoriteCategoryView("MAKEUP", "Макіяж")),
+                            lashSalon, List.of(new FavoriteCategoryView("EYELASH", "Вії")))));
 
             List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
 
             assertThat(result)
-                    .extracting(FavoriteSalonResponse::salonId,
-                            FavoriteSalonResponse::categoryCode,
-                            FavoriteSalonResponse::categoryLabel)
-                    .as("the design puts BOTH kinds on one axis, so a salon the client HAS "
-                            + "booked at carries a category; only the unbooked third row is null")
+                    .as("the design puts BOTH kinds on one axis; the third salon offers nothing "
+                            + "categorisable and gets an empty list, never null")
+                    .extracting(FavoriteSalonResponse::salonId, FavoriteSalonResponse::categories)
                     .containsExactly(
-                            tuple(makeupSalon, "MAKEUP", "Макіяж"),
-                            tuple(lashSalon, "EYELASH", "Вії"),
-                            tuple(unbooked, null, null));
+                            tuple(makeupSalon, List.of(new FavoriteCategoryView("MAKEUP", "Макіяж"))),
+                            tuple(lashSalon, List.of(new FavoriteCategoryView("EYELASH", "Вії"))),
+                            tuple(emptySalon, List.of()));
         }
 
         /**
-         * The high-null-rate case the DTO is nullable FOR. Favouriting normally precedes
-         * booking, so a client who hearts a provider they have never booked with is the common
-         * path, not an edge case — and the field must come out {@code null} rather than being
-         * back-filled from the master's profile or service menu, which would file them under a
-         * category the client never actually booked.
+         * The empty case the list is EMPTY-FOR, not the high-null-rate case the old singular
+         * contract had: a provider with no active categorisable service publishes an empty list,
+         * never {@code null} — the client iterates directly with no null-check of its own.
          */
         @Test
-        @DisplayName("yields null on BOTH fields when the client has no booked history with the master")
-        void should_returnNullCategory_when_masterNeverBooked() {
+        @DisplayName("categories is EMPTY, never null, when the master offers nothing categorisable")
+        void should_returnEmptyCategories_when_masterOffersNothing() {
             UUID masterId = UUID.randomUUID();
             when(favoriteRepository.findFavoriteMasterRows(clientId))
                     .thenReturn(List.<Object[]>of(masterRow(masterId, "INDEPENDENT_MASTER")));
             noLocalityLabels();
-            when(favoriteCategoryResolver.resolveForMasters(eq(clientId), anyCollection()))
+            when(favoriteCategoryResolver.resolveForMasters(anyCollection()))
                     .thenReturn(FavoriteCategories.empty());
 
             List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
-            assertThat(result.get(0).categoryCode()).isNull();
-            assertThat(result.get(0).categoryLabel()).isNull();
+            assertThat(result.get(0).categories()).isNotNull().isEmpty();
         }
 
         /**
-         * The category is keyed on the MASTER even when every other "where do I find them"
+         * The category axis is keyed on the MASTER even when every other "where do I find them"
          * field on the card resolves through the employing salon. The two field groups answer
-         * different questions — "what do I come to this PERSON for" vs. "where are they" — and
-         * a mapper that reused {@code disclosesOwnAddress} for the category, or keyed the
-         * lookup off {@code row[13]} (salon id), would hand this card the salon's pair.
+         * different questions — "what does this PERSON do" vs. "where are they" — and a mapper
+         * that reused {@code disclosesOwnAddress} for the category, or keyed the lookup off
+         * {@code row[13]} (salon id), would hand this card the salon's categories.
          *
          * <p>The fixture makes that bug visible: the salon id is ALSO present in the category
          * map, under a different category. Reading the wrong key returns «Макіяж» instead of
-         * «Манікюр» rather than returning null, so the test fails on a wrong value, not on an
+         * «Манікюр» rather than returning empty, so the test fails on a wrong value, not on an
          * absence that a null-safe mapper could mask.
          */
         @Test
-        @DisplayName("keys the category on the MASTER, not on the employing salon")
-        void should_keyCategoryOnMaster_when_masterIsSalonAffiliated() {
+        @DisplayName("keys the categories on the MASTER, not on the employing salon")
+        void should_keyCategoriesOnMaster_when_masterIsSalonAffiliated() {
             UUID masterId = UUID.randomUUID();
             UUID salonId = UUID.randomUUID();
             Object[] row = masterRow(masterId, "SALON_MASTER");
@@ -1494,20 +1486,18 @@ class FavoriteServiceTest {
             row[14] = "Salon Bella";
             when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(row));
             noLocalityLabels();
-            when(favoriteCategoryResolver.resolveForMasters(eq(clientId), anyCollection()))
+            when(favoriteCategoryResolver.resolveForMasters(anyCollection()))
                     .thenReturn(new FavoriteCategories(Map.of(
-                            masterId, new FavoriteCategory("MANICURE", "Манікюр"),
-                            salonId, new FavoriteCategory("MAKEUP", "Макіяж"))));
+                            masterId, List.of(new FavoriteCategoryView("MANICURE", "Манікюр")),
+                            salonId, List.of(new FavoriteCategoryView("MAKEUP", "Макіяж")))));
 
             List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
             assertThat(result.get(0))
-                    .extracting(FavoriteMasterResponse::salonId,
-                            FavoriteMasterResponse::categoryCode,
-                            FavoriteMasterResponse::categoryLabel)
-                    .as("the card resolves its ADDRESS through the salon but its CATEGORY "
+                    .as("the card resolves its ADDRESS through the salon but its CATEGORIES "
                             + "through the master — reading row[13] instead would say Макіяж")
-                    .containsExactly(salonId, "MANICURE", "Манікюр");
+                    .extracting(FavoriteMasterResponse::salonId, FavoriteMasterResponse::categories)
+                    .containsExactly(salonId, List.of(new FavoriteCategoryView("MANICURE", "Манікюр")));
         }
 
         /**
@@ -1536,7 +1526,7 @@ class FavoriteServiceTest {
 
             @SuppressWarnings("unchecked")
             ArgumentCaptor<Collection<UUID>> ids = ArgumentCaptor.forClass(Collection.class);
-            verify(favoriteCategoryResolver, times(1)).resolveForMasters(eq(clientId), ids.capture());
+            verify(favoriteCategoryResolver, times(1)).resolveForMasters(ids.capture());
             assertThat(ids.getValue())
                     .as("one call for the page, carrying every id on it — not one call per row, "
                             + "and not one call carrying a single id")
@@ -1544,14 +1534,16 @@ class FavoriteServiceTest {
         }
 
         /**
-         * §E-4 ownership scoping. The derivation reads {@code bookings}, so the client id it is
-         * given decides WHOSE history leaks. It must be the favouriting principal the service
-         * was called with — a global "what is this master usually booked for" would expose
-         * other clients' booking history one category at a time.
+         * Arm separation. The two arms key on different collaborator methods — a salon listing
+         * must route to {@code resolveForSalons} and never to {@code resolveForMasters}, and
+         * vice versa. Unlike the booking-history axis this replaced, there is no client-scoping
+         * concern left to pin here: "what a provider offers" is not a fact about the asking
+         * client, which is why {@code resolveForSalons}/{@code resolveForMasters} no longer take
+         * a {@code clientId} argument at all.
          */
         @Test
-        @DisplayName("scopes the derivation to the favouriting client, not to the provider")
-        void should_scopeCategoryToFavouritingClient_when_listingSalons() {
+        @DisplayName("routes a salon listing to the salon resolver method and never the master one")
+        void should_useSalonResolverMethod_when_listingSalons() {
             UUID salonId = UUID.randomUUID();
             when(favoriteRepository.findFavoriteSalonRows(clientId))
                     .thenReturn(List.<Object[]>of(salonRow(salonId)));
@@ -1560,8 +1552,8 @@ class FavoriteServiceTest {
 
             favoriteService.listSalonFavorites(clientId);
 
-            verify(favoriteCategoryResolver).resolveForSalons(eq(clientId), anyCollection());
-            verify(favoriteCategoryResolver, never()).resolveForMasters(any(), anyCollection());
+            verify(favoriteCategoryResolver).resolveForSalons(anyCollection());
+            verify(favoriteCategoryResolver, never()).resolveForMasters(anyCollection());
         }
 
         @Test

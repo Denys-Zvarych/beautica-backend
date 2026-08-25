@@ -7,10 +7,16 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Contract test for the three query-path indexes added by the 19.x perf work:
+ * Contract test for the query-path indexes added by the 19.x perf work, plus V144's later
+ * drop of the one V93 built:
  * <ul>
- *   <li>{@code V93} → {@code idx_bookings_master_client_starts_at} on {@code bookings}
- *       (master_id, client_id, starts_at DESC) — the favorites LATERAL top-1 lookup.</li>
+ *   <li>{@code V93} → CREATE {@code idx_bookings_master_client_starts_at} on {@code bookings}
+ *       (master_id, client_id, starts_at DESC) — the favorites LATERAL top-1 lookup.
+ *       {@code V144} → DROP it: the favourites category axis was reversed from "last booked
+ *       category" to "every category the provider offers", which deleted the only query
+ *       (the master-arm LATERAL, in {@code BookingRepository}) that ever combined
+ *       {@code (master_id, client_id)} in one predicate. See V144's header for the full
+ *       consumer audit.</li>
  *   <li>{@code V95} → {@code idx_bookings_client_starts_at} on {@code bookings}
  *       (client_id, starts_at DESC) — the {@code GET /bookings/me} ORDER BY without a
  *       Sort node.</li>
@@ -21,12 +27,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Per QA playbook Q21, "Flyway applied with no error" proves nothing about a
  * migration's actual outcome. This test pins each declared index's EXISTENCE directly via
- * {@code pg_indexes} on the migrated chain, and asserts the redundant single-column
- * {@code idx_reviews_client_id} V96 DROPs is GONE. Fully read-only and order-independent;
- * {@code cleanDb()} never touches catalog metadata, so no fixture or cleanup is required.
- * ASCII-only.
+ * {@code pg_indexes} on the migrated chain (or, for V93/V144, its ABSENCE — a DROP is an
+ * irreversible production change and deserves the same guard as any CREATE), and asserts
+ * the redundant single-column {@code idx_reviews_client_id} V96 DROPs is GONE. Fully
+ * read-only and order-independent; {@code cleanDb()} never touches catalog metadata, so no
+ * fixture or cleanup is required. ASCII-only.
  */
-@DisplayName("V93/V95/V96 migration — booking + review query-path indexes")
+@DisplayName("V93/V95/V96/V144 migration — booking + review query-path indexes")
 class BookingReviewQueryIndexesMigrationTest extends AbstractIntegrationTest {
 
     private static final String INDEX_EXISTS_QUERY = """
@@ -52,19 +59,20 @@ class BookingReviewQueryIndexesMigrationTest extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject(INDEX_DEF_QUERY, String.class, table, indexName);
     }
 
-    // ── V93 — idx_bookings_master_client_starts_at ────────────────────────────────
+    // ── V93/V144 — idx_bookings_master_client_starts_at created then dropped ──────
 
     @Test
-    @DisplayName("idx_bookings_master_client_starts_at exists on bookings(master_id, client_id, starts_at DESC)")
-    void should_createMasterClientStartsAtIndex_when_v93Applied() {
+    @DisplayName("idx_bookings_master_client_starts_at no longer exists (V144 drop — the "
+            + "favorites category axis reversal deleted its only consumer)")
+    void should_dropMasterClientStartsAtIndex_when_v144Applied() {
         assertThat(indexExists("bookings", "idx_bookings_master_client_starts_at"))
-                .as("V93 composite index for the favorites LATERAL top-1 lookup")
-                .isTrue();
-        assertThat(indexDef("bookings", "idx_bookings_master_client_starts_at"))
-                .as("idx_bookings_master_client_starts_at must cover (master_id, client_id, starts_at)")
-                .contains("master_id")
-                .contains("client_id")
-                .contains("starts_at");
+                .as("V93 built this composite for the favorites LATERAL top-1 lookup "
+                        + "(master_id, client_id, starts_at DESC). The category axis was reversed "
+                        + "from \"last booked category\" to \"every category the provider offers\", "
+                        + "which deleted BookingRepository's master-arm LATERAL finder along with "
+                        + "LastBookedCategoryLookup — the only query that ever combined "
+                        + "(master_id, client_id) in one predicate. V144 must have dropped it.")
+                .isFalse();
     }
 
     // ── V95 — idx_bookings_client_starts_at ───────────────────────────────────────

@@ -68,14 +68,15 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
      * constant.
      *
      * <p><b>Why the exact value moved from 1 to 2.</b> The favourites screen gained a category
-     * FILTER axis ({@code categoryCode} / {@code categoryLabel}), derived from the platform
-     * category of the client's most recent booking with each provider. That derivation is a
-     * SECOND statement, issued once per page against the ids the projection already returned —
-     * deliberately not a term in the list query itself. The obvious alternative, a correlated
-     * {@code LATERAL} inside the projection, is exactly what the deleted {@code lastServiceName}
-     * did: it cost 9.11 ms a page, and removing it took the page to 0.089 ms. Keeping the
-     * derivation in its own page-bounded statement preserves that, at a measured ~0.9 ms of
-     * top-1 index seeks.
+     * FILTER axis ({@code categories}), derived from every distinct platform category each
+     * provider actually OFFERS (an active service in an active assignment) — reversed from an
+     * earlier design that derived it from the client's most recent booking with each provider;
+     * see {@code FavoriteCategoryResolver}'s class javadoc for the full rationale. That
+     * derivation is a SECOND statement, issued once per page against the ids the projection
+     * already returned — deliberately not a term in the list query itself. The obvious
+     * alternative, a correlated {@code LATERAL} inside the projection, is exactly what the
+     * deleted {@code lastServiceName} did: it cost 9.11 ms a page, and removing it took the page
+     * to 0.089 ms. Keeping the derivation in its own page-bounded statement preserves that.
      *
      * <p>The label half of the axis adds NOTHING here: it resolves off the already-{@code
      * @Cacheable} {@code platform-category-order} list, so it issues no statement at all. If this
@@ -103,9 +104,12 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Seeds {@code n} favorited independent masters for a fresh client — each with a COMPLETED
-     * booking, so the category derivation has real history to resolve and cannot report a
-     * flattering count by finding nothing to do — then measures one page.
+     * Seeds {@code n} favorited independent masters for a fresh client — each with an active
+     * service, so the category derivation has a real offering to resolve and cannot report a
+     * flattering count by finding nothing to do — then measures one page. A COMPLETED booking is
+     * also seeded per master; it is no longer what the category derivation reads (that reversed
+     * to the offering, not the booking), but it is kept so this fixture still exercises a
+     * favourited master with real booking history too.
      */
     private long countMasterListStatements(String tag, int n) {
         UUID clientId = createClient("fav-masters-" + tag + "@beautica.test");

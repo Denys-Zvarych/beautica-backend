@@ -72,14 +72,17 @@ import java.util.UUID;
  * ids never reach the response DTO.
  *
  * <h3>Category axis (batched, one statement per page)</h3>
- * Both list reads also stamp the approved design's category filter axis
- * ({@code categoryCode} / {@code categoryLabel}) via {@link FavoriteCategoryResolver}, derived
- * from the platform category of the service in this client's most recent booking with each
- * provider. Like the locality labels it is resolved once for the whole page from the ids the
- * projection already returned — <b>one extra statement, never a per-row subquery</b>. The list
- * projection queries themselves are unchanged; reintroducing this as a {@code LATERAL} inside
- * them is what the deleted {@code lastServiceName} did, at 9.11 ms a page. Nulls are common and
- * expected (favouriting precedes booking) — see {@link FavoriteMasterResponse}'s javadoc.
+ * Both list reads also stamp the approved design's category filter axis ({@code categories})
+ * via {@link FavoriteCategoryResolver}, derived from every distinct platform category the
+ * provider actually OFFERS (an active service the provider — or, for a salon, an active
+ * master of the salon — performs), not from this client's booking history. Like the
+ * locality labels it is resolved once for the whole page from the ids the projection already
+ * returned — one extra statement, never a per-row subquery. The list projection queries
+ * themselves are unchanged; reintroducing this as a {@code LATERAL} inside them is what the
+ * deleted {@code lastServiceName} did, at 9.11 ms a page. An empty list (never {@code null})
+ * is common and expected for a provider with no active categorisable service — see
+ * {@link FavoriteMasterResponse}'s javadoc for the full rationale of this axis, including why
+ * it is no longer scoped to the favouriting client.
  */
 @Service
 @RequiredArgsConstructor
@@ -137,7 +140,7 @@ public class FavoriteService {
             return rows.map(row -> (FavoriteMasterResponse) null);
         }
         DiscoveryLabels labels = resolveMasterLabels(rows.getContent());
-        FavoriteCategories categories = resolveMasterCategories(clientUserId, rows.getContent());
+        FavoriteCategories categories = resolveMasterCategories(rows.getContent());
         return rows.map(row -> mapMasterRow(row, labels, categories));
     }
 
@@ -155,7 +158,7 @@ public class FavoriteService {
             return rows.map(row -> (FavoriteSalonResponse) null);
         }
         DiscoveryLabels labels = resolveLabels(rows.getContent(), 3, 4);
-        FavoriteCategories categories = resolveSalonCategories(clientUserId, rows.getContent());
+        FavoriteCategories categories = resolveSalonCategories(rows.getContent());
         return rows.map(row -> mapSalonRow(row, labels, categories));
     }
 
@@ -173,7 +176,7 @@ public class FavoriteService {
         }
 
         DiscoveryLabels labels = resolveMasterLabels(rows);
-        FavoriteCategories categories = resolveMasterCategories(clientUserId, rows);
+        FavoriteCategories categories = resolveMasterCategories(rows);
         List<FavoriteMasterResponse> results = new ArrayList<>(rows.size());
         for (Object[] row : rows) {
             results.add(mapMasterRow(row, labels, categories));
@@ -194,7 +197,7 @@ public class FavoriteService {
         }
 
         DiscoveryLabels labels = resolveLabels(rows, 3, 4);
-        FavoriteCategories categories = resolveSalonCategories(clientUserId, rows);
+        FavoriteCategories categories = resolveSalonCategories(rows);
         List<FavoriteSalonResponse> results = new ArrayList<>(rows.size());
         for (Object[] row : rows) {
             results.add(mapSalonRow(row, labels, categories));
@@ -462,34 +465,35 @@ public class FavoriteService {
     }
 
     /**
-     * Batch-resolves the CATEGORY axis for a favorited-MASTERS page — the pair the approved
-     * design's chips filter on, derived from each master's most recent booking by THIS client.
+     * Batch-resolves the CATEGORY axis for a favorited-MASTERS page — the chip set the approved
+     * design's filter selects on, derived from every distinct platform category each master
+     * actually OFFERS (an active service in an active assignment), not from any client's booking
+     * history.
      *
-     * <p>One statement for the whole page (§E no N+1), issued AFTER the page rows are in hand
-     * and keyed on the ids they carry. It is deliberately not a term in
+     * <p>One statement for the whole page (§E no N+1), issued AFTER the page rows are in hand and
+     * keyed on the ids they carry. It is deliberately not a term in
      * {@code FavoriteRepository#findFavoriteMasterRows}: that query carried a per-row
      * {@code LATERAL} for the old {@code lastServiceName} and cost 9.11 ms a page until it was
      * deleted, taking the page to 0.089 ms. Keeping the derivation in a separate, page-bounded
-     * statement preserves that: the list projection is byte-for-byte unchanged and the added
-     * cost is a flat ~0.9 ms of top-1 index seeks, bounded by page size rather than by how deep
-     * the client's booking history runs.
+     * statement preserves that: the list projection is byte-for-byte unchanged.
      *
      * <p>Index 0 is the master id — the same column the DTO publishes as {@code masterId}, so
      * the lookup key and the row identity cannot drift apart.
      *
-     * <p>{@code clientUserId} is the authenticated principal the controller passed down; it is
-     * this client's OWN history, never a global "what is this master usually booked for" (§E-4).
+     * <p>No {@code clientId} is passed: unlike the booking-history axis this replaced, "what a
+     * master offers" is not a fact about the asking client — it is the same answer for anyone.
      */
-    private FavoriteCategories resolveMasterCategories(UUID clientUserId, List<Object[]> rows) {
-        return favoriteCategoryResolver.resolveForMasters(clientUserId, providerIdsOf(rows));
+    private FavoriteCategories resolveMasterCategories(List<Object[]> rows) {
+        return favoriteCategoryResolver.resolveForMasters(providerIdsOf(rows));
     }
 
     /**
-     * Salon counterpart of {@link #resolveMasterCategories(UUID, List)} — index 0 of the salons
-     * projection is the salon id. Scoped to bookings placed AT that salon, and to this client.
+     * Salon counterpart of {@link #resolveMasterCategories(List)} — index 0 of the salons
+     * projection is the salon id. Scoped to the LOCKED "salon offering = master-performed only"
+     * domain rule, not to any client's bookings.
      */
-    private FavoriteCategories resolveSalonCategories(UUID clientUserId, List<Object[]> rows) {
-        return favoriteCategoryResolver.resolveForSalons(clientUserId, providerIdsOf(rows));
+    private FavoriteCategories resolveSalonCategories(List<Object[]> rows) {
+        return favoriteCategoryResolver.resolveForSalons(providerIdsOf(rows));
     }
 
     /**
@@ -599,12 +603,11 @@ public class FavoriteService {
                 buildingNo,
                 locationNote,
                 // The category axis is keyed on the MASTER, not on the employing salon: the
-                // chip answers "what do I come to this PERSON for". A salon-affiliated master
-                // therefore keeps their own category even though their address block resolves
+                // chips answer "what does this PERSON do". A salon-affiliated master therefore
+                // keeps their own offered categories even though their address block resolves
                 // through the salon — the two field groups answer different questions and the
                 // disclosesOwnAddress predicate above governs only the address one.
-                categories.code(masterId),
-                categories.label(masterId)
+                categories.categories(masterId)
         );
     }
 
@@ -667,8 +670,7 @@ public class FavoriteService {
                 street,
                 buildingNo,
                 locationNote,
-                categories.code(salonId),
-                categories.label(salonId)
+                categories.categories(salonId)
         );
     }
 }

@@ -7,6 +7,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.favorite.dto.AddFavoriteRequest;
+import com.beautica.favorite.dto.FavoriteCategoryView;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
@@ -263,8 +264,10 @@ class FavoriteControllerTest {
                 "Khreshchatyk St", "12B", "entry code 4321",
                 // Deliberately NOT the same category the salon fixture below uses: the two
                 // arms serialise through separate DTOs, and identical fixture values would let
-                // a copy-paste error between them pass unnoticed.
-                "HAIRCUT", "Стрижка");
+                // a copy-paste error between them pass unnoticed. Two entries, so the wire
+                // format is proven to be a LIST, not a lone pair with a plural name.
+                List.of(new FavoriteCategoryView("HAIRCUT", "Стрижка"),
+                        new FavoriteCategoryView("MANICURE", "Манікюр")));
         when(favoriteService.listMasterFavorites(eq(clientId), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(master)));
 
@@ -284,11 +287,15 @@ class FavoriteControllerTest {
                 // Phase 111 removed lastServiceName from the design and the DTO — assert it is
                 // gone from the wire, not merely absent from the assertions above.
                 .andExpect(jsonPath("$.data.data[0].lastServiceName").doesNotExist())
-                // The category FILTER axis. Both halves must reach the wire: the client keys
-                // its chip identity off the code and draws the chip from the label, so a DTO
-                // that serialised only one would render an unlabelled or unmatchable chip.
-                .andExpect(jsonPath("$.data.data[0].categoryCode").value("HAIRCUT"))
-                .andExpect(jsonPath("$.data.data[0].categoryLabel").value("Стрижка"))
+                // The category FILTER axis is now a LIST — both halves of EVERY entry must
+                // reach the wire: the client keys its chip identity off each code and draws
+                // the chip from its label, so a DTO that serialised only one per entry would
+                // render an unlabelled or unmatchable chip.
+                .andExpect(jsonPath("$.data.data[0].categories.length()").value(2))
+                .andExpect(jsonPath("$.data.data[0].categories[0].code").value("HAIRCUT"))
+                .andExpect(jsonPath("$.data.data[0].categories[0].label").value("Стрижка"))
+                .andExpect(jsonPath("$.data.data[0].categories[1].code").value("MANICURE"))
+                .andExpect(jsonPath("$.data.data[0].categories[1].label").value("Манікюр"))
                 .andExpect(jsonPath("$.data.totalElements").value(1));
 
         verify(favoriteService).listMasterFavorites(eq(clientId), any(Pageable.class));
@@ -311,7 +318,7 @@ class FavoriteControllerTest {
         var salon = new FavoriteSalonResponse(
                 UUID.randomUUID(), "Salon Bella", "https://cdn/s.png",
                 "Odesa", "Prymorskyi", 4.20, "Derybasivska St", "7", "2nd floor",
-                "MANICURE", "Манікюр");
+                List.of(new FavoriteCategoryView("MANICURE", "Манікюр")));
         when(favoriteService.listSalonFavorites(eq(clientId), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(salon)));
 
@@ -323,11 +330,12 @@ class FavoriteControllerTest {
                 .andExpect(jsonPath("$.data.data[0].street").value("Derybasivska St"))
                 .andExpect(jsonPath("$.data.data[0].buildingNo").value("7"))
                 .andExpect(jsonPath("$.data.data[0].locationNote").value("2nd floor"))
-                // The salon arm carries the SAME category axis as the master arm — the approved
-                // design filters both kinds through one chip row, so a salon DTO that omitted
-                // these would make every chip hide every salon.
-                .andExpect(jsonPath("$.data.data[0].categoryCode").value("MANICURE"))
-                .andExpect(jsonPath("$.data.data[0].categoryLabel").value("Манікюр"));
+                // The salon arm carries the SAME category axis shape as the master arm — the
+                // approved design filters both kinds through one chip row, so a salon DTO that
+                // omitted these would make every chip hide every salon.
+                .andExpect(jsonPath("$.data.data[0].categories.length()").value(1))
+                .andExpect(jsonPath("$.data.data[0].categories[0].code").value("MANICURE"))
+                .andExpect(jsonPath("$.data.data[0].categories[0].label").value("Манікюр"));
 
         verify(favoriteService).listSalonFavorites(eq(clientId), any(Pageable.class));
     }

@@ -2,6 +2,7 @@ package com.beautica.favorite;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.favorite.dto.FavoriteCategoryView;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
 import com.beautica.favorite.dto.FavoriteResponse;
 import com.beautica.favorite.dto.FavoriteSalonResponse;
@@ -662,281 +663,285 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         assertThat(favoriteRepository.count()).isZero();
     }
 
-    // ── category axis: the batched last-booked-service derivation ────────────────
+    // ── category axis: the batched OFFERED-categories derivation ─────────────────
+    //
+    // Reversed product decision: the axis used to be the single category of the client's most
+    // recently BOOKED service with a provider. It is now every distinct platform category a
+    // provider actually OFFERS (an ACTIVE service in an ACTIVE assignment) — not client-scoped
+    // at all. See FavoriteCategoryResolver's class javadoc for the full rationale.
 
     /**
-     * The core rule, against real SQL: of several bookings with one master, the category comes
-     * from the MOST RECENT one.
-     *
-     * <p><b>The fixture is built so a wrong answer is a DIFFERENT string, not an absence.</b>
-     * The master performs two services in two different platform categories and the client has
-     * booked both, so every plausible bug produces a visibly wrong value rather than a null a
-     * lenient assertion could wave through:
-     * <ul>
-     *   <li>{@code ORDER BY starts_at ASC} (a flipped sort) → {@code HAIRDRESSING}</li>
-     *   <li>dropping the {@code LIMIT 1} / picking an arbitrary row → non-deterministic between
-     *       the two, so the test flaps rather than passing</li>
-     *   <li>reading {@code service_types.platform_category_name} instead of
-     *       {@code service_definitions.category} → whatever the seeded type carries, not
-     *       {@code NAIL_SERVICE}</li>
-     * </ul>
-     * The label is asserted alongside the code because they resolve through different
-     * mechanisms — the code off {@code service_definitions}, the label off the cached
-     * {@code platform_categories} list — so a card can never show one without the other.
+     * The core positive case, against real SQL: a master performing active services in TWO
+     * distinct categories publishes BOTH, ordered by display label — not the last one created,
+     * not an arbitrary DB order.
      */
     @Test
-    @DisplayName("the master category comes from the client's MOST RECENT booking, not their first")
-    void should_deriveMasterCategoryFromLatestBooking_when_clientBookedSeveralServices() {
-        UUID clientId = createClient("cat-latest-client@beautica.test");
-        UUID masterId = createIndependentMaster("cat-latest-master@beautica.test");
-        UUID oldService = createIndependentMasterService(masterId);
-        UUID newService = createIndependentMasterService(masterId);
-        setCategory(oldService, "HAIRDRESSING");
-        setCategory(newService, "NAIL_SERVICE");
-        createBooking(clientId, masterId, oldService, null, 30);
-        createBooking(clientId, masterId, newService, null, 1);
+    @DisplayName("the master's categories are every distinct platform category an active service offers")
+    void should_listEveryOfferedCategory_when_masterHasSeveralActiveServices() {
+        UUID clientId = createClient("cat-offer-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-offer-master@beautica.test");
+        UUID nails = createIndependentMasterService(masterId);
+        UUID lashes = createIndependentMasterService(masterId);
+        setCategory(nails, "NAIL_SERVICE");
+        setCategory(lashes, "LASH_EXTENSIONS");
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
 
         List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
         assertThat(result).hasSize(1);
-        assertThat(result.get(0).categoryCode())
-                .as("yesterday's nail appointment, not last month's haircut")
-                .isEqualTo("NAIL_SERVICE");
-        assertThat(result.get(0).categoryLabel()).isEqualTo("Нігтьовий сервіс");
+        assertThat(result.get(0).categories())
+                .extracting(FavoriteCategoryView::code, FavoriteCategoryView::label)
+                .as("both offered categories appear, ordered by Ukrainian display label "
+                        + "(\"Нарощення вій\" before \"Нігтьовий сервіс\"), not creation order")
+                .containsExactly(
+                        tuple("LASH_EXTENSIONS", "Нарощення вій"),
+                        tuple("NAIL_SERVICE", "Нігтьовий сервіс"));
     }
 
     /**
-     * §E-4 against real SQL. The derivation reads {@code bookings}, a table with rows for every
-     * client, and the repository finder is unscoped by itself — the {@code client_id} term in
-     * the {@code LATERAL} is the only thing keeping one client's history out of another's card.
-     *
-     * <p>The other client's booking is deliberately the MOST RECENT row for this master and
-     * carries a DIFFERENT category, so dropping the {@code client_id} predicate does not merely
-     * widen the result — it actively overwrites the asking client's answer with a stranger's.
-     * A fixture where both clients booked the same category, or where the other client's
-     * booking was older, would pass with the predicate removed.
+     * A master performing the SAME category through two different services publishes ONE chip,
+     * not two — {@code DISTINCT} in the repository query, proven against real Postgres rather
+     * than assumed from the JPQL text.
      */
     @Test
-    @DisplayName("the master category ignores OTHER clients' more recent bookings with that master")
-    void should_scopeMasterCategoryToAskingClient_when_anotherClientBookedMoreRecently() {
-        UUID clientId = createClient("cat-scope-client@beautica.test");
-        UUID stranger = createClient("cat-scope-stranger@beautica.test");
-        UUID masterId = createIndependentMaster("cat-scope-master@beautica.test");
-        UUID mine = createIndependentMasterService(masterId);
-        UUID theirs = createIndependentMasterService(masterId);
-        setCategory(mine, "NAIL_SERVICE");
-        setCategory(theirs, "HAIRDRESSING");
-        createBooking(clientId, masterId, mine, null, 10);
-        createBooking(stranger, masterId, theirs, null, 1);
+    @DisplayName("two active services in the SAME category collapse to one chip, not two")
+    void should_deduplicateCategory_when_twoServicesShareOneCategory() {
+        UUID clientId = createClient("cat-dedupe-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-dedupe-master@beautica.test");
+        UUID first = createIndependentMasterService(masterId);
+        UUID second = createIndependentMasterService(masterId);
+        setCategory(first, "NAIL_SERVICE");
+        setCategory(second, "NAIL_SERVICE");
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
 
         List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
-        assertThat(result.get(0).categoryCode())
-                .as("the stranger's newer HAIRDRESSING booking must not reach this client's card")
-                .isEqualTo("NAIL_SERVICE");
+        assertThat(result.get(0).categories())
+                .extracting(FavoriteCategoryView::code)
+                .containsExactly("NAIL_SERVICE");
     }
 
     /**
-     * The salon arm, keyed on {@code bookings.salon_id}. The design puts both kinds on one axis,
-     * so this must resolve for a salon exactly as it does for a master — it is null only when
-     * the client has no booked history at that salon, never null-by-design.
+     * The empty case the list is nullable-FOR under the old contract but is now simply empty —
+     * never {@code null} — for a provider with no active categorisable service at all.
      */
     @Test
-    @DisplayName("the salon category comes from the client's most recent booking AT that salon")
-    void should_deriveSalonCategoryFromLatestBooking_when_clientBookedAtSalon() {
-        UUID clientId = createClient("cat-salon-client@beautica.test");
-        UUID salonId = createSalon("cat-salon-owner@beautica.test");
-        UUID masterId = createSalonMaster(salonId, "cat-salon-master@beautica.test");
-        UUID oldService = createSalonMasterService(masterId, salonId, true, true);
-        UUID newService = createSalonMasterService(masterId, salonId, true, true);
-        setCategory(oldService, "NAIL_SERVICE");
-        setCategory(newService, "LASH_EXTENSIONS");
-        createBooking(clientId, masterId, oldService, salonId, 20);
-        createBooking(clientId, masterId, newService, salonId, 2);
+    @DisplayName("categories is an EMPTY list, never null, when the master has no active service")
+    void should_returnEmptyCategories_when_masterHasNoActiveService() {
+        UUID clientId = createClient("cat-none-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-none-master@beautica.test");
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).categories()).isNotNull().isEmpty();
+    }
+
+    /**
+     * Only ACTIVE assignments count. A master whose only categorised service is wired through a
+     * DEACTIVATED {@code master_services} row must not surface that category — the master
+     * "offers" only what is currently bookable, mirroring every other bookable-only predicate in
+     * this codebase.
+     */
+    @Test
+    @DisplayName("a category behind a DEACTIVATED assignment is excluded, its active sibling is not")
+    void should_excludeCategory_when_assignmentIsInactive() {
+        UUID clientId = createClient("cat-inactive-assign-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-inactive-assign-master@beautica.test");
+        UUID inactiveOne = createIndependentMasterService(masterId);
+        UUID activeOne = createIndependentMasterService(masterId);
+        setCategory(inactiveOne, "HAIRDRESSING");
+        setCategory(activeOne, "NAIL_SERVICE");
+        jdbcTemplate.update("UPDATE master_services SET is_active = false WHERE id = ?", inactiveOne);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result.get(0).categories())
+                .extracting(FavoriteCategoryView::code)
+                .as("the deactivated assignment's HAIRDRESSING must not appear; the active "
+                        + "NAIL_SERVICE assignment still does")
+                .containsExactly("NAIL_SERVICE");
+    }
+
+    /**
+     * Only ACTIVE service definitions count, independent of the assignment's own flag —
+     * {@code ServiceCatalogService#deactivateServiceDefinition} soft-deletes the definition
+     * without touching the assignment row, so this combination is a real reachable state, not a
+     * synthetic one (mirrors the identical rule already pinned on the SERVICE favourite-target
+     * validation).
+     */
+    @Test
+    @DisplayName("a category behind a soft-deleted service DEFINITION is excluded, even with an active assignment")
+    void should_excludeCategory_when_definitionIsInactive() {
+        UUID clientId = createClient("cat-inactive-def-client@beautica.test");
+        UUID masterId = createIndependentMaster("cat-inactive-def-master@beautica.test");
+        UUID deleted = createIndependentMasterService(masterId);
+        UUID live = createIndependentMasterService(masterId);
+        setCategory(deleted, "HAIRDRESSING");
+        setCategory(live, "NAIL_SERVICE");
+        jdbcTemplate.update(
+                "UPDATE service_definitions SET is_active = false WHERE id = "
+                        + "(SELECT service_def_id FROM master_services WHERE id = ?)",
+                deleted);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+
+        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+
+        assertThat(result.get(0).categories())
+                .extracting(FavoriteCategoryView::code)
+                .containsExactly("NAIL_SERVICE");
+    }
+
+    /**
+     * The salon arm, against the LOCKED "salon offering = master-performed only" domain rule: a
+     * category surfaces for a salon when at least one of its currently active masters performs
+     * an active, salon-owned service in it — contributed by TWO DIFFERENT masters of the same
+     * salon here, so the derivation is proven to aggregate across the whole roster, not just one
+     * master's menu.
+     */
+    @Test
+    @DisplayName("the salon's categories are every distinct category an active master of it performs")
+    void should_deriveSalonCategories_when_differentActiveMastersPerformDifferentCategories() {
+        UUID clientId = createClient("cat-salon-offer-client@beautica.test");
+        UUID salonId = createSalon("cat-salon-offer-owner@beautica.test");
+        UUID nailMaster = createSalonMaster(salonId, "cat-salon-offer-m1@beautica.test");
+        UUID lashMaster = createSalonMaster(salonId, "cat-salon-offer-m2@beautica.test");
+        UUID nailService = createSalonMasterService(nailMaster, salonId, true, true);
+        UUID lashService = createSalonMasterService(lashMaster, salonId, true, true);
+        setCategory(nailService, "NAIL_SERVICE");
+        setCategory(lashService, "LASH_EXTENSIONS");
         favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
 
         List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
 
         assertThat(result).hasSize(1);
-        assertThat(result.get(0).categoryCode()).isEqualTo("LASH_EXTENSIONS");
-        assertThat(result.get(0).categoryLabel()).isEqualTo("Нарощення вій");
+        assertThat(result.get(0).categories())
+                .extracting(FavoriteCategoryView::code, FavoriteCategoryView::label)
+                .containsExactly(
+                        tuple("LASH_EXTENSIONS", "Нарощення вій"),
+                        tuple("NAIL_SERVICE", "Нігтьовий сервіс"));
     }
 
     /**
-     * §E-4 for the SALON arm — the mirror of
-     * {@link #should_scopeMasterCategoryToAskingClient_when_anotherClientBookedMoreRecently}.
-     *
-     * <p>This test exists because the salon arm's {@code b.client_id = :clientId} predicate was
-     * otherwise unpinned: every other salon-category test uses a single client, so deleting that
-     * term from the {@code LATERAL} in
-     * {@link com.beautica.booking.repository.BookingRepository#findLastBookedCategoryBySalonIds}
-     * leaves them all green while the master arm alone goes red. A future edit to one arm would
-     * ship another client's booked category onto this client's salon card, unnoticed.
-     *
-     * <p>Fixture shape, as on the master arm: the stranger's booking is the MOST RECENT row for
-     * this salon and carries a DIFFERENT category, so dropping the predicate does not merely
-     * widen the result — it overwrites the asking client's answer with the stranger's. The
-     * stranger books a DIFFERENT master of the same salon so the assertion turns purely on
-     * {@code salon_id} + {@code client_id}, never on a master-scoped accident.
+     * The "master-performed only" rule's core assertion: a salon-owned, ACTIVE service with NO
+     * assignment at all (nobody currently performs it) contributes NO chip, exactly as it is
+     * absent from the public catalogue.
      */
     @Test
-    @DisplayName("the salon category ignores OTHER clients' more recent bookings at that salon")
-    void should_scopeSalonCategoryToAskingClient_when_anotherClientBookedMoreRecently() {
-        UUID clientId = createClient("cat-salon-scope-client@beautica.test");
-        UUID stranger = createClient("cat-salon-scope-stranger@beautica.test");
-        UUID salonId = createSalon("cat-salon-scope-owner@beautica.test");
-        UUID myMaster = createSalonMaster(salonId, "cat-salon-scope-m1@beautica.test");
-        UUID theirMaster = createSalonMaster(salonId, "cat-salon-scope-m2@beautica.test");
-        UUID mine = createSalonMasterService(myMaster, salonId, true, true);
-        UUID theirs = createSalonMasterService(theirMaster, salonId, true, true);
-        setCategory(mine, "NAIL_SERVICE");
-        setCategory(theirs, "HAIRDRESSING");
-        createBooking(clientId, myMaster, mine, salonId, 10);
-        createBooking(stranger, theirMaster, theirs, salonId, 1);
+    @DisplayName("a salon-owned service nobody currently performs contributes no category")
+    void should_excludeSalonCategory_when_noMasterPerformsTheService() {
+        UUID clientId = createClient("cat-salon-unperformed-client@beautica.test");
+        UUID salonId = createSalon("cat-salon-unperformed-owner@beautica.test");
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, base_price, buffer_minutes_after, category, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'SALON', ?, 'Unperformed Service', ?, 60, 500.00, 0, "
+                        + "'NAIL_SERVICE', true, NOW(), NOW())",
+                UUID.randomUUID(), salonId, resolveUnusedServiceTypeId("SALON", salonId));
         favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
 
         List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
 
-        assertThat(result).hasSize(1);
-        assertThat(result.get(0).categoryCode())
-                .as("the stranger's newer HAIRDRESSING booking at this salon must not reach "
-                        + "this client's card")
-                .isEqualTo("NAIL_SERVICE");
-        assertThat(result.get(0).categoryLabel()).isEqualTo("Нігтьовий сервіс");
+        assertThat(result.get(0).categories()).isEmpty();
     }
 
     /**
-     * The common case the pair is nullable FOR: hearting a provider comes BEFORE booking them,
-     * so most favourites start with no derivable category. This is accepted design behaviour —
-     * the client hides categories with no rows — and must not be papered over with a fallback
-     * derived from the master's service menu or profile, which would file them under a category
-     * this client has never actually booked.
+     * The master-performed-only rule's other half: a DEACTIVATED master's still-active
+     * assignment and still-active service definition must not contribute a chip.
+     * {@code SalonService.deactivateSalon} style gaps aside, an inactive master is simply not
+     * "currently performing" anything.
      */
     @Test
-    @DisplayName("both category fields are null when the client has never booked the favourited master")
-    void should_returnNullCategory_when_favouritedBeforeEverBooking() {
-        UUID clientId = createClient("cat-null-client@beautica.test");
-        UUID masterId = createIndependentMaster("cat-null-master@beautica.test");
-        UUID service = createIndependentMasterService(masterId);
+    @DisplayName("a category performed only by a DEACTIVATED master is excluded from the salon's chips")
+    void should_excludeSalonCategory_when_performingMasterIsInactive() {
+        UUID clientId = createClient("cat-salon-inactive-master-client@beautica.test");
+        UUID salonId = createSalon("cat-salon-inactive-master-owner@beautica.test");
+        UUID master = createSalonMaster(salonId, "cat-salon-inactive-master-m@beautica.test");
+        UUID service = createSalonMasterService(master, salonId, true, true);
         setCategory(service, "NAIL_SERVICE");
-        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
+        jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", master);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonId);
 
-        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
+        List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
 
-        assertThat(result).hasSize(1);
-        assertThat(result.get(0).categoryCode())
-                .as("the master OFFERS a NAIL_SERVICE, but this client has not booked it — the "
-                        + "axis is booked history, not the service menu")
-                .isNull();
-        assertThat(result.get(0).categoryLabel()).isNull();
+        assertThat(result.get(0).categories())
+                .as("the master left, so the salon no longer offers NAIL_SERVICE through them")
+                .isEmpty();
+    }
+
+    /**
+     * Cross-salon leak guard — the mirror of what
+     * {@code MasterServiceRepository#findBookableAssignmentsBySalon} already protects for the
+     * catalogue. A master of salon A is (incorrectly, but this is exactly the state the
+     * predicate must defend against) assigned to a service DEFINITION owned by salon B. Neither
+     * salon may show the resulting category: salon A because the service it lists is not its
+     * own, salon B because none of ITS active masters performs it.
+     */
+    @Test
+    @DisplayName("an assignment pointing at a DIFFERENT salon's service leaks its category to NEITHER salon")
+    void should_notLeakCategory_when_assignmentCrossesSalons() {
+        UUID clientId = createClient("cat-cross-salon-client@beautica.test");
+        UUID salonA = createSalon("cat-cross-salon-a@beautica.test");
+        UUID salonB = createSalon("cat-cross-salon-b@beautica.test");
+        UUID masterOfA = createSalonMaster(salonA, "cat-cross-salon-master@beautica.test");
+        // Service DEFINITION owned by salon B, but the only assignment performing it belongs to
+        // a master of salon A — the exact cross-salon shape the predicate must reject.
+        UUID crossedService = createSalonMasterService(masterOfA, salonB, true, true);
+        setCategory(crossedService, "NAIL_SERVICE");
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonA);
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salonB);
+
+        List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
+
+        assertThat(result)
+                .as("salon A: the performing master is theirs, but the service isn't. Salon B: "
+                        + "the service is theirs, but no active master of theirs performs it")
+                .extracting(FavoriteSalonResponse::salonId, r -> r.categories().isEmpty())
+                .containsExactlyInAnyOrder(tuple(salonA, true), tuple(salonB, true));
     }
 
     /**
      * <b>The both-or-neither rule, end to end against the REAL category vocabulary.</b>
      *
-     * <p>{@code FavoriteCategoryResolverTest#should_dropBothFields_when_categoryNotSelectable}
-     * pins the rule against a mocked label resolver and an invented
-     * {@code "DEACTIVATED_CATEGORY"} code. That proves the branch exists; it cannot prove a
-     * stale code is REACHABLE, because the mock decides what is selectable.
-     *
-     * <p>It is reachable, and this repository already contains a live example.
-     * {@code service_definitions.category} is a denormalised {@code platform_categories.name}
+     * <p>{@code service_definitions.category} is a denormalised {@code platform_categories.name}
      * with NO foreign key (V64), and V74 renamed three of V64's seven original seeds IN PLACE —
      * {@code MANICURE -> NAIL_SERVICE}, {@code HAIRCUT -> HAIRDRESSING},
      * {@code EYELASH -> LASH_EXTENSIONS}. Any {@code service_definitions} row still carrying a
-     * pre-V74 slug therefore holds a code that resolves to no label at all. That is exactly what
-     * happened during this feature's development: fixtures written against the old names came
-     * back blank, and the blanking was diagnosed as correct — but only OBSERVED, never pinned.
-     * This test pins it.
+     * pre-V74 slug therefore holds a code that resolves to no label at all — reachable because
+     * the column has no FK to enforce currency.
      *
      * <p><b>Why the assertion cannot be defanged.</b> {@code MANICURE} is a real string the
-     * database will happily store and the derivation will happily return; the pair is blanked by
-     * {@code FavoriteCategoryResolver} alone. Emitting the code with a {@code null} label — the
-     * obvious "simplification" of the pairing loop — would hand the client a chip identity it
-     * cannot draw and cannot match against its own approved-category vocabulary, and would pass
-     * every other test in this class. The companion master carries a CURRENT slug so the
-     * suppression is visibly per-PROVIDER: a resolver that bailed out of the whole page on one
-     * unresolvable code would blank both rows and still satisfy a single-row version of this.
+     * database will happily store and the derivation will happily return; the entry is dropped
+     * by {@code FavoriteCategoryResolver} alone. Emitting the code with a {@code null} label —
+     * the obvious "simplification" — would hand the client a chip identity it cannot draw. The
+     * companion service carries a CURRENT slug so the suppression is visibly per-CATEGORY, not
+     * per-provider: a resolver that bailed out on one unresolvable code must not blank the whole
+     * master's list.
      */
     @Test
-    @DisplayName("both category fields are null when the booked service carries a pre-V74 slug "
-            + "that is no longer a selectable category — and only that provider is blanked")
-    void should_returnNullCategory_when_bookedCategoryIsNoLongerSelectable() {
+    @DisplayName("a stale pre-V74 category code is dropped from the list; the master's other, current category survives")
+    void should_dropStaleCategory_when_codeIsNoLongerSelectable() {
         UUID clientId = createClient("cat-stale-client@beautica.test");
-        UUID staleMaster = createIndependentMaster("cat-stale-master@beautica.test");
-        UUID liveMaster = createIndependentMaster("cat-live-master@beautica.test");
-        UUID staleService = createIndependentMasterService(staleMaster);
-        UUID liveService = createIndependentMasterService(liveMaster);
-        // V64's original slug. V74 renamed it to NAIL_SERVICE in place, so no platform_categories
-        // row answers to it any more — the code survives in service_definitions only because the
-        // column has no FK.
-        setCategory(staleService, "MANICURE");
-        setCategory(liveService, "NAIL_SERVICE");
-        createBooking(clientId, staleMaster, staleService, null, 3);
-        createBooking(clientId, liveMaster, liveService, null, 3);
-        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, staleMaster);
-        favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, liveMaster);
-
-        List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
-
-        assertThat(result)
-                .as("a code outside the current vocabulary is dropped WITH its missing label — "
-                        + "never emitted half-resolved — while the companion master's current "
-                        + "slug still resolves, so the suppression is per provider, not per page")
-                .extracting(FavoriteMasterResponse::masterId,
-                        FavoriteMasterResponse::categoryCode,
-                        FavoriteMasterResponse::categoryLabel)
-                .containsExactlyInAnyOrder(
-                        tuple(staleMaster, null, null),
-                        tuple(liveMaster, "NAIL_SERVICE", "Нігтьовий сервіс"));
-    }
-
-    /**
-     * <b>"The most recent booking", not "the most recent CATEGORISED booking".</b>
-     *
-     * <p>{@code sd.category IS NOT NULL} sits in the OUTER {@code WHERE} of both arms, AFTER the
-     * {@code LATERAL} has already committed to a single booking — so a client whose latest
-     * booking was of an uncategorised service drops out of the map and surfaces as {@code null}.
-     * It deliberately does NOT skip backwards to an older booking that happens to carry a
-     * category; that would be a different rule, and neither the design nor the DTO states it.
-     *
-     * <p>Moving that one predicate INSIDE the {@code LATERAL} is a plausible, one-line
-     * "optimisation" — it reads like a filter that belongs next to the join it filters — and it
-     * silently changes the answer. Nothing else in the suite can see it: every other category
-     * test gives every booking a category, so the predicate never fires and both placements are
-     * indistinguishable. This is the only fixture where the two disagree, and they disagree
-     * loudly — {@code null} versus {@code NAIL_SERVICE}, not a shrug.
-     *
-     * <p>The categorised booking is deliberately the OLDER one. If it were newer the test would
-     * pass under both placements.
-     */
-    @Test
-    @DisplayName("both category fields are null when the client's MOST RECENT booking was an "
-            + "uncategorised service — the derivation does not skip back to an older categorised one")
-    void should_returnNullCategory_when_latestBookedServiceIsUncategorised() {
-        UUID clientId = createClient("cat-uncat-client@beautica.test");
-        UUID masterId = createIndependentMaster("cat-uncat-master@beautica.test");
-        UUID categorised = createIndependentMasterService(masterId);
-        UUID uncategorised = createIndependentMasterService(masterId);
-        setCategory(categorised, "NAIL_SERVICE");
-        clearCategory(uncategorised);
-        createBooking(clientId, masterId, categorised, null, 30);
-        createBooking(clientId, masterId, uncategorised, null, 1);
+        UUID masterId = createIndependentMaster("cat-stale-master@beautica.test");
+        UUID staleOne = createIndependentMasterService(masterId);
+        UUID liveOne = createIndependentMasterService(masterId);
+        // V64's original slug for what V74 renamed to NAIL_SERVICE. No platform_categories row
+        // answers to it any more, but the column has no FK so it persists happily.
+        setCategory(staleOne, "MANICURE");
+        setCategory(liveOne, "HAIRDRESSING");
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, masterId);
 
         List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
-        assertThat(result).hasSize(1);
-        assertThat(result.get(0).categoryCode())
-                .as("the definite article in \"THE most recent booking\" is honoured: yesterday's "
-                        + "uncategorised visit wins and yields null. Returning NAIL_SERVICE here "
-                        + "means `sd.category IS NOT NULL` moved inside the LATERAL and the rule "
-                        + "silently became \"most recent CATEGORISED booking\"")
-                .isNull();
-        assertThat(result.get(0).categoryLabel()).isNull();
+        assertThat(result.get(0).categories())
+                .as("MANICURE resolves to no label and is dropped; HAIRDRESSING survives")
+                .extracting(FavoriteCategoryView::code)
+                .containsExactly("HAIRDRESSING");
     }
+
 
     /**
      * <b>The {@code SALON_OWNER} arm of the NEW salon-address behaviour, end to end.</b>
