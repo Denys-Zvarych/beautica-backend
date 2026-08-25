@@ -19,7 +19,7 @@ import static org.mockito.Mockito.when;
  * no Spring context needed, the masking rule lives entirely in this static factory.
  *
  * <p>Regression guard for the conditional-masking change: {@code phoneNumber} is
- * unconditionally masked for every {@link MasterType}, while street/buildingNo/locationNote/
+ * unconditionally masked for every {@link MasterType}, while city/street/buildingNo/locationNote/
  * cityId/oblastId/districtId are masked only for {@link MasterType#SALON_MASTER} and
  * {@link MasterType#SALON_OWNER} — an {@link MasterType#INDEPENDENT_MASTER}'s address is the
  * discoverable business location clients need, so it now survives {@code fromPublic()} unmasked.
@@ -52,6 +52,8 @@ class MasterDetailResponseTest {
 
         assertThat(publicView.phoneNumber())
                 .as("phoneNumber must be masked for every master type").isNull();
+        assertThat(publicView.city())
+                .as("INDEPENDENT_MASTER city must survive fromPublic() unmasked").isEqualTo(full.city());
         assertThat(publicView.street())
                 .as("INDEPENDENT_MASTER street must survive fromPublic() unmasked").isEqualTo(full.street());
         assertThat(publicView.buildingNo())
@@ -76,6 +78,9 @@ class MasterDetailResponseTest {
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 
         assertThat(publicView.phoneNumber()).as("phoneNumber must be masked").isNull();
+        // `city` is users.city — a denormalised mirror of cities.name_uk written beside cityId.
+        // Masking the UUID while echoing the human-readable name would suppress nothing.
+        assertThat(publicView.city()).as("SALON_MASTER city must be masked").isNull();
         assertThat(publicView.street()).as("SALON_MASTER street must be masked").isNull();
         assertThat(publicView.buildingNo()).as("SALON_MASTER buildingNo must be masked").isNull();
         assertThat(publicView.locationNote()).as("SALON_MASTER locationNote must be masked").isNull();
@@ -93,6 +98,7 @@ class MasterDetailResponseTest {
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 
         assertThat(publicView.phoneNumber()).as("phoneNumber must be masked").isNull();
+        assertThat(publicView.city()).as("SALON_OWNER city must be masked").isNull();
         assertThat(publicView.street()).as("SALON_OWNER street must be masked").isNull();
         assertThat(publicView.buildingNo()).as("SALON_OWNER buildingNo must be masked").isNull();
         assertThat(publicView.locationNote()).as("SALON_OWNER locationNote must be masked").isNull();
@@ -112,7 +118,8 @@ class MasterDetailResponseTest {
         assertThat(publicView.masterId()).isEqualTo(full.masterId());
         assertThat(publicView.firstName()).isEqualTo(full.firstName());
         assertThat(publicView.lastName()).isEqualTo(full.lastName());
-        assertThat(publicView.city()).isEqualTo(full.city());
+        // `city` is deliberately absent from this list: it is an ADDRESS field (a denormalised
+        // mirror of cities.name_uk), masked per MasterType by the three type-specific tests above.
         assertThat(publicView.bio()).isEqualTo(full.bio());
         assertThat(publicView.instagram()).isEqualTo(full.instagram());
         assertThat(publicView.professionalTitle()).isEqualTo(full.professionalTitle());

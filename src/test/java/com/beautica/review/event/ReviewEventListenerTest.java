@@ -5,7 +5,7 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.beautica.config.CacheConfig;
-import com.beautica.review.repository.ReviewRepository;
+import com.beautica.review.service.RatingRecalculationService;
 import com.beautica.review.service.ReviewService;
 import com.beautica.booking.repository.BookingRepository;
 import com.github.benmanes.caffeine.cache.Cache;
@@ -24,6 +24,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionSynchronizationUtils;
@@ -42,8 +43,16 @@ import static org.mockito.Mockito.verify;
 @ExtendWith(MockitoExtension.class)
 class ReviewEventListenerTest {
 
+    /**
+     * The listener's collaborator is no longer {@code ReviewRepository} directly: the
+     * {@code REQUIRES_NEW} boundary moved onto {@link RatingRecalculationService} so the
+     * interceptor's commit (and the {@code UnexpectedRollbackException} it raises after a failed
+     * UPDATE) lands INSIDE the listener's try/catch instead of escaping past it. Mocking the
+     * collaborator therefore mocks the real seam — and lets a test simulate the interceptor's own
+     * throw, which a repository mock structurally cannot.
+     */
     @Mock
-    private ReviewRepository reviewRepository;
+    private RatingRecalculationService ratingRecalculationService;
 
     @Mock
     private CacheManager cacheManager;
@@ -84,7 +93,7 @@ class ReviewEventListenerTest {
         ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
-                .when(reviewRepository).recalculateMasterRating(masterId);
+                .when(ratingRecalculationService).recalculateMasterRating(masterId);
         // cacheManager.getCache() is reached only from the afterCompletion callback, which fires
         // when a REAL transaction completes. initSynchronization() above makes the callback
         // register but never fire, so no cacheManager stub is needed here. The eviction itself is
@@ -111,7 +120,7 @@ class ReviewEventListenerTest {
         // Arrange
         UUID masterId = UUID.randomUUID();
         ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null);
-        // No stub for reviewRepository.recalculateMasterRating — default Mockito void stub is fine.
+        // No stub for ratingRecalculationService.recalculateMasterRating — default Mockito void stub is fine.
         // No stub for cacheManager — the afterCompletion callback only fires on real TX completion.
 
         // Act + Assert
@@ -133,7 +142,7 @@ class ReviewEventListenerTest {
 
         reviewEventListener.onReviewCreated(event);
 
-        verify(reviewRepository).recalculateSalonRating(salonId);
+        verify(ratingRecalculationService).recalculateSalonRating(salonId);
     }
 
     @Test
@@ -144,7 +153,7 @@ class ReviewEventListenerTest {
 
         reviewEventListener.onReviewCreated(event);
 
-        verify(reviewRepository, never()).recalculateSalonRating(any());
+        verify(ratingRecalculationService, never()).recalculateSalonRating(any());
     }
 
     @Test
@@ -155,7 +164,7 @@ class ReviewEventListenerTest {
         ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
-                .when(reviewRepository).recalculateSalonRating(salonId);
+                .when(ratingRecalculationService).recalculateSalonRating(salonId);
 
         assertThatNoException()
                 .as("exception from recalculateSalonRating must not propagate out of onReviewCreated")
@@ -180,11 +189,45 @@ class ReviewEventListenerTest {
         ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), salonId, null);
 
         doThrow(new RuntimeException("simulated DB timeout"))
-                .when(reviewRepository).recalculateSalonRating(salonId);
+                .when(ratingRecalculationService).recalculateSalonRating(salonId);
 
         reviewEventListener.onReviewCreated(event);
 
-        verify(reviewRepository).recalculateMasterRating(masterId);
+        verify(ratingRecalculationService).recalculateMasterRating(masterId);
+    }
+
+    /**
+     * Pins the containment fix itself, not merely "an exception was swallowed".
+     *
+     * <p>{@link org.springframework.transaction.UnexpectedRollbackException} is thrown by
+     * {@code TransactionInterceptor#commitTransactionAfterReturning}, i.e. by the PROXY, after the
+     * annotated method has already returned normally. While {@code @Transactional(REQUIRES_NEW)}
+     * sat on {@code onReviewCreated} itself, that throw happened outside every try block in this
+     * class and escaped into {@code triggerAfterCommit} of the outer review-INSERT transaction —
+     * which has no catch — turning a committed review POST into a 500 with the review persisted.
+     * Moving the boundary onto {@code RatingRecalculationService} puts that commit across a proxy
+     * INSIDE the try below. The mock stands in for that proxy, so throwing from it reproduces the
+     * exact escape path.
+     *
+     * <p>Revert the boundary and this test goes red; a plain-RuntimeException test would not.
+     */
+    @Test
+    @DisplayName("should_notPropagate_when_recalcProxyThrowsUnexpectedRollback")
+    void should_notPropagate_when_recalcProxyThrowsUnexpectedRollback() {
+        UUID masterId = UUID.randomUUID();
+        ReviewCreatedEvent event = new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null);
+
+        doThrow(new UnexpectedRollbackException("Transaction silently rolled back"))
+                .when(ratingRecalculationService).recalculateMasterRating(masterId);
+
+        assertThatNoException()
+                .as("the REQUIRES_NEW interceptor's own commit failure must be contained by the "
+                    + "listener's catch, never escape into the outer transaction's afterCommit")
+                .isThrownBy(() -> reviewEventListener.onReviewCreated(event));
+
+        assertThat(listAppender.list)
+                .anyMatch(e -> e.getLevel() == Level.ERROR
+                               && e.getFormattedMessage().contains("UnexpectedRollbackException"));
     }
 
     // ── Cache eviction isolation (FIX 14) ─────────────────────────────────────
@@ -201,8 +244,8 @@ class ReviewEventListenerTest {
     @DisplayName("evictMasterReviewPages — per-master isolation with real Caffeine cache")
     class CacheEvictionIsolationTest {
 
-        @MockBean ReviewRepository         reviewRepository;
-        @MockBean ApplicationEventPublisher eventPublisher;
+        @MockBean RatingRecalculationService ratingRecalculationService;
+        @MockBean ApplicationEventPublisher  eventPublisher;
 
         @Autowired ReviewEventListener reviewEventListener;
         @Autowired CacheManager        cacheManager;
@@ -261,7 +304,7 @@ class ReviewEventListenerTest {
 
             // Act — fire a ReviewCreatedEvent for masterA only
             // Call evictMasterReviewPages indirectly via onReviewCreated.
-            // The listener calls reviewRepository.recalculateMasterRating (which we ignore)
+            // The listener calls ratingRecalculationService.recalculateMasterRating (which we ignore)
             // then calls evictMasterReviewPages(masterA).
             fireReviewCreated(new ReviewCreatedEvent(masterA, UUID.randomUUID(), null, null));
 
@@ -498,7 +541,7 @@ class ReviewEventListenerTest {
             UUID masterId = UUID.randomUUID();
             detail.put(masterId, "cached-profile");
             doThrow(new RuntimeException("simulated DB timeout"))
-                    .when(reviewRepository).recalculateMasterRating(masterId);
+                    .when(ratingRecalculationService).recalculateMasterRating(masterId);
 
             fireReviewCreated(new ReviewCreatedEvent(masterId, UUID.randomUUID(), null, null));
 

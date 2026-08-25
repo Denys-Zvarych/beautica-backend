@@ -1,0 +1,43 @@
+-- Favourites category axis (mobile Phase 111 follow-up): the SALON arm of the
+-- "last booked service category" derivation.
+--
+-- Both favourite arms resolve their category the same way — for each provider on
+-- the page, take THIS client's most recent booking with that provider and read the
+-- platform category of the booked service. The MASTER arm is already served by
+-- idx_bookings_master_client_starts_at (master_id, client_id, starts_at DESC),
+-- added in V93 for the since-removed `last_service_name` LATERAL; the lookup is an
+-- exact left-prefix equality pair plus the ordering column, so it is a top-1 index
+-- seek per provider.
+--
+-- The SALON arm had no counterpart. Its only candidates were
+-- idx_bookings_salon_starts_at (salon_id, starts_at DESC) -- which forces
+-- `client_id` to a post-scan Filter, walking the salon's WHOLE timeline until this
+-- client's newest booking turns up -- and idx_bookings_client_starts_at, which has
+-- the same defect with the operands swapped. Measured on a local Postgres holding
+-- 100k bookings, with 5000 bookings from OTHER clients stacked on one salon ahead
+-- of the target client's newest: 250 rows discarded per provider per page, 1.372 ms
+-- for a 20-row page, and degrading LINEARLY with the salon's booking volume. With
+-- this index the same page plans as 20 top-1 seeks: 0 rows discarded, 0.626 ms, and
+-- the cost is a function of PAGE SIZE, not of how busy the salon is.
+--
+-- PARTIAL on both nullable operands, mirroring the query predicate exactly (§E-5):
+--   * salon_id  IS NULL for every independent-master booking (no salon involved),
+--   * client_id IS NULL for every guest/LINK booking (no account to attribute).
+-- Neither can satisfy `salon_id = :id AND client_id = :clientId`, so indexing them
+-- would be pure write amplification on the busiest table in the schema. Postgres
+-- refutes the predicate from the strict equality operators, so the planner still
+-- selects this index for the LATERAL's correlated `salon_id = s.id` term.
+--
+-- DESC on starts_at matches the query's `ORDER BY b.starts_at DESC` so the seek
+-- reads forward from the index head instead of a backward scan.
+--
+-- Deliberately NOT dropping idx_bookings_salon_starts_at: (salon_id, client_id,
+-- starts_at) cannot serve `salon_id = :id ORDER BY starts_at DESC` -- client_id
+-- sits between the equality key and the sort key -- so that index is still the
+-- only one for the salon-calendar reads. (idx_bookings_salon_id (salon_id) IS a
+-- redundant prefix of idx_bookings_salon_starts_at, but that redundancy predates
+-- this change and removing it is out of this migration's locus.)
+
+CREATE INDEX idx_bookings_salon_client_starts_at
+    ON bookings (salon_id, client_id, starts_at DESC)
+    WHERE salon_id IS NOT NULL AND client_id IS NOT NULL;

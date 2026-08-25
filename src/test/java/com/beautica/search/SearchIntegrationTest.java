@@ -1,6 +1,10 @@
 package com.beautica.search;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.search.dto.LocationFilter;
+import com.beautica.search.dto.MasterSearchRequest;
+import com.beautica.search.dto.MasterSearchResult;
+import com.beautica.search.service.SearchService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -12,6 +16,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -83,6 +89,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private CacheManager cacheManager;
 
+    @Autowired
+    private SearchService searchService;
+
     /**
      * Wires the Apache HttpClient factory before the first request in each
      * test. Kept as an explicit method (called once per test) rather than a
@@ -117,6 +126,53 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .as("only Київ masters should be returned")
                 .isEqualTo(3);
         assertThat(root.path("data").path("totalElements").asLong()).isEqualTo(3);
+    }
+
+    /**
+     * POSITIVE address-projection lock for {@code SearchService#mapMasterRow}.
+     *
+     * <p>Every other address assertion in this class and in {@code SearchServiceTest} is a
+     * NEGATIVE one (address blanked), and {@code MasterType#fromProjection} fails <b>CLOSED</b>:
+     * a drifted column index, a future enum value, or a non-{@code String} JDBC object all
+     * yield {@code null} → {@code disclosesOwnAddress} false → every address silently blanked,
+     * with no error and a fully green suite. {@code SearchServiceTest} cannot catch that — it
+     * hand-builds its {@code Object[]} rows, so it asserts the mapper against the very index
+     * layout that would have drifted.
+     *
+     * <p>This test therefore drives the REAL native query against Testcontainers Postgres and
+     * proves the trio comes back POPULATED for the one {@link com.beautica.master.entity.MasterType}
+     * the locked matrix discloses. It mirrors {@code FavoriteMigrationIT}'s positive test for the
+     * favourites surface, which is the same projection contract on a different query.
+     *
+     * <p>Calls {@code SearchService} directly rather than over HTTP on purpose: the controller
+     * applies a SECOND, caller-dependent auth gate ({@code withoutStreetAddress} for anonymous
+     * callers) that would blank the trio again and hide the very thing under test. The auth gate
+     * has its own coverage in {@code SearchControllerTest}; what is unguarded is the row mapper.
+     */
+    @Test
+    @DisplayName("searchMasters — an INDEPENDENT_MASTER's street/buildingNo/locationNote come back "
+            + "POPULATED from the real projection (guards silent blanking on index/enum drift)")
+    void should_projectOwnAddress_when_independentMasterMatchesSearch() {
+        UUID masterId = seedMaster("Київ", "4.50");
+        jdbcTemplate.update(
+                "UPDATE users SET street = ?, building_no = ?, location_note = ? "
+                        + "WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                "вул. Хрещатик", "1A", "green door", masterId);
+
+        Page<MasterSearchResult> results = searchService.searchMasters(
+                new MasterSearchRequest(new LocationFilter(cityIdByName("Київ"), null),
+                        null, null, null, null, null, null, null, null, null),
+                PageRequest.of(0, 20));
+
+        assertThat(results.getContent())
+                .as("the seeded INDEPENDENT_MASTER must be the single match")
+                .hasSize(1);
+        assertThat(results.getContent().get(0))
+                .extracting(MasterSearchResult::street, MasterSearchResult::buildingNo,
+                        MasterSearchResult::locationNote)
+                .as("an INDEPENDENT_MASTER's own address is the one the locked matrix discloses — "
+                        + "all three must survive the projection, not be silently nulled")
+                .containsExactly("вул. Хрещатик", "1A", "green door");
     }
 
     @Test

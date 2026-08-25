@@ -54,19 +54,31 @@ import java.util.UUID;
  * only when {@code priceMax != minEffectivePrice} (a genuine range). The
  * backend never collapses the two values — that is a rendering concern.</p>
  *
- * <p><b>{@code street} / {@code buildingNo} / {@code locationNote} — AUTH-GATED
+ * <p><b>{@code street} / {@code buildingNo} / {@code locationNote} — DOUBLE-GATED
  * street address:</b> the master's full street-level address
  * ({@code users.street} / {@code users.building_no} / {@code users.location_note}).
- * These are <b>privacy-sensitive</b> (an independent master's home address) and
- * are returned <b>only to an authenticated caller</b>. For an anonymous request
- * all three are {@code null}; the public {@code cityLabel}/{@code districtLabel}
- * remain visible to everyone. {@code locationNote} is a free-text arrival hint
- * ("3rd floor, ring twice") and may be {@code null} even for an authenticated
- * caller when the master recorded none. The values are always computed in SQL
- * and cached on the full object; the auth-gate (nulling for anon) happens
- * per-request <em>after</em> the cache read in the controller, so a warm cache
- * populated by an authenticated caller can never leak addresses to an anonymous
- * one (and vice-versa). See {@code SearchController} for the strip.</p>
+ * These are <b>privacy-sensitive</b> (an independent master's home address) and pass
+ * <b>two independent gates</b>:</p>
+ * <ol>
+ *   <li><b>Master-type gate</b> — the locked per-role address matrix
+ *       ({@link com.beautica.master.entity.MasterType#disclosesOwnAddress}). Only an
+ *       {@code INDEPENDENT_MASTER}'s own address is surfaced at all; for a
+ *       {@code SALON_MASTER} / {@code SALON_OWNER} the working address is the SALON's
+ *       business address and {@code users.street} is not reliably theirs, so all three are
+ *       {@code null} for every caller. Applied in {@code SearchService.mapMasterRow}, i.e.
+ *       <em>inside</em> the {@code @Cacheable} read — the rule depends only on the row, so
+ *       the cached object itself must already be masked. 2026-08 security re-audit MEDIUM:
+ *       this gate was missing, and {@code PATCH /users/me} lets a salon master write a real
+ *       home address into that column, so the leak was live.</li>
+ *   <li><b>Authentication gate</b> — even an independent master's address is returned only
+ *       to an authenticated caller. Applied per-request in {@code SearchController}
+ *       <em>after</em> the cache read (see {@code MasterSearchResult#withoutStreetAddress}),
+ *       so a warm cache populated by an authenticated caller can never leak addresses to an
+ *       anonymous one (and vice-versa).</li>
+ * </ol>
+ * <p>The public {@code cityLabel}/{@code districtLabel} remain visible to everyone.
+ * {@code locationNote} is a free-text arrival hint ("3rd floor, ring twice") and may be
+ * {@code null} even for an authenticated independent master who recorded none.</p>
  *
  * <p><b>{@code matchedServiceNames} — match preview (Phase 20.3, extended to
  * free text):</b> the capped ({@code SERVICE_NAME_CAP}), distinct list of the

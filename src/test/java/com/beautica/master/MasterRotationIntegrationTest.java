@@ -386,6 +386,121 @@ class MasterRotationIntegrationTest extends AbstractIntegrationTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
+    /**
+     * Mobile Phase 111 — a rotation changes TWO staff sets, so it must recompute TWO salon
+     * ratings. {@code MasterServiceRotateTest} already asserts both publishes against a MOCK
+     * {@code ApplicationEventPublisher}; that proves the arguments and nothing about delivery.
+     * This is the only test in the suite where a real rotation travels the whole path — HTTP →
+     * {@code MasterService} → {@code ApplicationEventPublisher} → the {@code AFTER_COMMIT}
+     * {@code SalonStaffRatingListener} → {@code recalculateSalonRating} → the {@code salons} row.
+     *
+     * <p>Both salons are pre-loaded with a rating the recalc can never produce, and each lands on
+     * a DIFFERENT correct value, so the assertions distinguish all four failure shapes: neither
+     * publish delivered (both stay 9.99), only one did (one stays 9.99), or both fired against the
+     * same salon id (the other stays 9.99).
+     *
+     * <p>Expected outcome after the master moves A → B:
+     * <ul>
+     *   <li><b>Salon A</b> → {@code 0.00 / 0}. Its only reviewed master left, and the aggregate's
+     *       {@code m.salon_id = :salonId} term now excludes them.</li>
+     *   <li><b>Salon B</b> → {@code 5.00 / 1}. Only its resident master contributes; the arriving
+     *       master's 1-star is tagged {@code r.salon_id = A} and must NOT follow them across —
+     *       reputation is earned per salon, which is the whole point of the salon-scoped formula.</li>
+     * </ul>
+     */
+    @Test
+    @DisplayName("rotating a master recomputes BOTH salons' ratings — the arriving master's old scores do not follow them")
+    void should_recalculateBothSalonRatings_when_masterRotatedBetweenSalons() {
+        // Arrange
+        UUID ownerId = insertUser("owner-rating-rotate-" + System.nanoTime() + "@beautica.test", Role.SALON_OWNER);
+        UUID salonAId = insertSalon(ownerId, "Rating Rotate Salon A");
+        UUID salonBId = insertSalon(ownerId, "Rating Rotate Salon B");
+        UUID clientId = insertUser("client-rating-rotate-" + System.nanoTime() + "@beautica.test", Role.CLIENT);
+
+        UUID moverUserId = insertUser("mover-rating-rotate-" + System.nanoTime() + "@beautica.test", Role.SALON_MASTER);
+        UUID moverId = insertMaster(moverUserId, salonAId, "SALON_MASTER");
+        insertSalonReview(salonAId, moverId, clientId, 1);
+
+        UUID residentUserId = insertUser("resident-rating-rotate-" + System.nanoTime() + "@beautica.test", Role.SALON_MASTER);
+        UUID residentId = insertMaster(residentUserId, salonBId, "SALON_MASTER");
+        insertSalonReview(salonBId, residentId, clientId, 5);
+
+        poisonSalonRating(salonAId);
+        poisonSalonRating(salonBId);
+        String ownerToken = tokenFor(ownerId, "owner@doesnotmatter.test", Role.SALON_OWNER);
+
+        // Act
+        log.debug("Act: rotating the only reviewed master out of salon A and into salon B");
+        ResponseEntity<String> rotateResponse = restTemplate.exchange(
+                String.format(ROTATE_MASTER_URL, moverId), HttpMethod.PATCH,
+                new HttpEntity<>(new RotateMasterRequest(salonBId), bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(rotateResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(readSalonAvgRating(salonAId))
+                .as("source salon lost its only contributor; 9.99 would mean the source-side "
+                        + "publish never reached the listener")
+                .isEqualByComparingTo(new java.math.BigDecimal("0.00"));
+        assertThat(readSalonReviewCount(salonAId)).isZero();
+        assertThat(readSalonAvgRating(salonBId))
+                .as("destination salon still averages only its resident's 5; 9.99 would mean the "
+                        + "destination-side publish never reached the listener")
+                .isEqualByComparingTo(new java.math.BigDecimal("5.00"));
+        assertThat(readSalonReviewCount(salonBId))
+                .as("the arriving master's review stays tagged to salon A and must not be counted here")
+                .isEqualTo(1);
+    }
+
+    /** A rating the equal-weighted aggregate can never produce — see the test above. */
+    private void poisonSalonRating(UUID salonId) {
+        jdbcTemplate.update("UPDATE salons SET avg_rating = 9.99, review_count = 999 WHERE id = ?", salonId);
+    }
+
+    private java.math.BigDecimal readSalonAvgRating(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT avg_rating FROM salons WHERE id = ?", java.math.BigDecimal.class, salonId);
+    }
+
+    private int readSalonReviewCount(UUID salonId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT review_count FROM salons WHERE id = ?", Integer.class, salonId);
+    }
+
+    /**
+     * One salon-owned service definition, its assignment, a COMPLETED booking and the review — the
+     * minimum chain {@code reviews} needs ({@code booking_id} is NOT NULL and UNIQUE, and
+     * {@code bookings.master_service_id} is NOT NULL). One definition per call is safe because
+     * each master here is reviewed exactly once; {@code resolveUnusedServiceTypeId} keeps a second
+     * definition for the same salon off V121's partial UNIQUE index.
+     */
+    private void insertSalonReview(UUID salonId, UUID masterId, UUID clientId, int rating) {
+        UUID serviceDefId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, "
+                        + "created_at, updated_at) "
+                        + "VALUES (?, 'SALON', ?, 'Rotate Rating Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, resolveUnusedServiceTypeId("SALON", salonId));
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', 500.00, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, salonId);
+        jdbcTemplate.update(
+                "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), bookingId, clientId, masterId, salonId, rating);
+    }
+
     private UUID insertUser(String email, Role role) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(

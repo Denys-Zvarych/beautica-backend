@@ -1,14 +1,12 @@
 package com.beautica.review.event;
 
-import com.beautica.review.repository.ReviewRepository;
+import com.beautica.review.service.RatingRecalculationService;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -22,7 +20,7 @@ public class ReviewEventListener {
 
     private static final Logger log = LoggerFactory.getLogger(ReviewEventListener.class);
 
-    private final ReviewRepository reviewRepository;
+    private final RatingRecalculationService ratingRecalculationService;
     private final CacheManager cacheManager;
 
     /** Public profile of one master, keyed by masterId — see MasterService#getMasterDetail. */
@@ -41,6 +39,21 @@ public class ReviewEventListener {
     // Runs after the outer transaction (review INSERT) commits.
     // REQUIRES_NEW opens a separate transaction for the rating UPDATE so that a
     // failure there does not roll back the already-committed review.
+    //
+    // That boundary lives on RatingRecalculationService, NOT on this method, and the placement is
+    // load-bearing rather than stylistic. With @Transactional(REQUIRES_NEW) here, a failing UPDATE
+    // left Hibernate's rollback-only mark on THIS transaction; the catch below swallowed the
+    // original exception and the method returned normally, whereupon TransactionInterceptor's
+    // commitTransactionAfterReturning — outside every try block in this file, because the
+    // interceptor wraps the method — threw UnexpectedRollbackException. That landed in
+    // triggerAfterCommit of the OUTER transaction, which (see the third property below) has no
+    // catch at all: an already-committed review POST returned 500 with the review persisted. With
+    // the boundary on a collaborator, the commit happens across a proxy INSIDE the try, so the
+    // existing catch contains it. See RatingRecalculationService's javadoc for the full chain.
+    //
+    // Splitting the two recalcs into two of its methods also makes the two try/catch blocks below
+    // genuinely independent: they previously shared one transaction, so a failing salon recalc
+    // marked it rollback-only and discarded the master recalc that had already succeeded.
     //
     // Eviction is registered as an afterCompletion callback on THIS (REQUIRES_NEW)
     // transaction, never executed inline. Two properties are load-bearing and the pair
@@ -71,10 +84,9 @@ public class ReviewEventListener {
     // The isSynchronizationActive() guard keeps the method callable outside a transaction
     // (unit tests invoke the bean directly), where it degrades to an immediate evict.
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void onReviewCreated(ReviewCreatedEvent event) {
         try {
-            reviewRepository.recalculateMasterRating(event.masterId());
+            ratingRecalculationService.recalculateMasterRating(event.masterId());
         } catch (Exception ex) {
             log.error("recalculateMasterRating failed for master={} — {}",
                       event.masterId(), ex.getClass().getSimpleName());
@@ -114,11 +126,11 @@ public class ReviewEventListener {
 
         // Symmetric salon branch (Phase 13.6): only runs when the reviewed booking
         // belonged to a salon-affiliated master. Same fire-and-log-don't-fail contract —
-        // a salon-recalc failure must never roll back the already-committed review, and
-        // this method already runs in its own REQUIRES_NEW transaction.
+        // a salon-recalc failure must never roll back the already-committed review, and it runs in
+        // its own REQUIRES_NEW transaction, separate from the master recalc above.
         if (event.salonId() != null) {
             try {
-                reviewRepository.recalculateSalonRating(event.salonId());
+                ratingRecalculationService.recalculateSalonRating(event.salonId());
             } catch (Exception ex) {
                 log.error("recalculateSalonRating failed for salon={} — {}",
                           event.salonId(), ex.getClass().getSimpleName());
@@ -141,6 +153,13 @@ public class ReviewEventListener {
      * committed or rolled back — falling back to running it immediately when this bean is
      * invoked outside a transaction. See {@link #onReviewCreated} for why both properties
      * (post-commit ordering AND unconditional execution) are required.
+     *
+     * <p>Since this listener no longer opens a transaction of its own, the active synchronization
+     * is the ALREADY-COMMITTED outer one whose {@code afterCommit} dispatched this event.
+     * {@code AbstractPlatformTransactionManager} collects the synchronizations for
+     * {@code triggerAfterCompletion} only after {@code triggerAfterCommit} has returned, so a
+     * callback registered here still fires — immediately, and still strictly after the recalc
+     * transaction has completed, which is the ordering the contract needs.
      */
     private void evictAfterCompletion(Runnable eviction) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {

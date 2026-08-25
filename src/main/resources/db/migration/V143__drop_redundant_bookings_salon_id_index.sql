@@ -1,0 +1,56 @@
+-- V143: drop idx_bookings_salon_id — a strict prefix of idx_bookings_salon_starts_at.
+--
+-- WHY
+-- ───
+-- V18 created BOTH of these on `bookings`:
+--     idx_bookings_salon_id          (salon_id)
+--     idx_bookings_salon_starts_at   (salon_id, starts_at DESC)   -- V19
+-- The first is a strict leading-column prefix of the second. Any predicate the prefix
+-- index can satisfy (`salon_id = ?`, `salon_id IN (...)`, `salon_id IS NOT NULL`) is
+-- satisfied by the composite with the SAME index condition and the SAME row estimate —
+-- a B-tree seeks on its leading key regardless of what follows it. It can therefore
+-- never be *required*; at most it is marginally narrower.
+--
+-- `bookings` is the busiest write table in the schema (every booking create, confirm,
+-- reschedule, cancel, decline, complete and no-show touches it) and now carries 22
+-- indexes, every one of which is maintained on each INSERT and each non-HOT UPDATE.
+-- Removing a provably-subsumed one is pure write-side saving.
+--
+-- V142 identified this redundancy but deliberately scoped the drop out of that migration,
+-- whose locus was adding idx_bookings_salon_client_starts_at (see its closing paragraph).
+-- This is that follow-up.
+--
+-- ── Checks made before dropping (this is an irreversible production change) ──────────────────
+--   * NOT unique      — V18 uses plain CREATE INDEX, so no uniqueness semantics are lost.
+--   * Backs no constraint — no PK/UNIQUE/FK/EXCLUDE references it. bookings.salon_id's FK to
+--     salons(id) is enforced by salons' PRIMARY KEY index on the referenced side; a referencing
+--     column needs no index of its own for the constraint to hold. (ON DELETE behaviour scans
+--     may lose a narrow index here, but fall back to the composite on the same leading key.)
+--   * No differing opclass, collation, INCLUDE or NULLS ordering versus the composite's
+--     leading column — both are the default uuid_ops on plain `salon_id`.
+--   * NOT partial — so, unlike the V123 case, no query family exists that the survivor's
+--     predicate could exclude. The composite is likewise full (V19 declares no WHERE), so it
+--     subsumes this index unconditionally, for every value of every other predicate.
+--   * The one measured case where the planner PREFERRED this index — V123 recorded
+--     `salon_id = ? AND status = 'CANCELLED'` choosing it — remains correct after the drop:
+--     that shape has no sort and no starts_at term, so it re-plans onto
+--     idx_bookings_salon_starts_at as an Index Cond on salon_id with a `status` Filter, the
+--     identical access pattern one column wider. A wider tuple is a per-page cost, not a plan
+--     change; there is no shape here that degrades to a Seq Scan.
+--   * Deliberately NOT touching idx_bookings_salon_starts_at or V142's
+--     idx_bookings_salon_client_starts_at. The latter is (salon_id, client_id, starts_at DESC)
+--     and cannot serve `salon_id = ? ORDER BY starts_at DESC` — client_id sits between the
+--     equality key and the sort key — so the composite stays load-bearing for salon-calendar
+--     reads and is the survivor this drop relies on.
+--   * Booking.java's @Table(indexes = {...}) block does NOT declare idx_bookings_salon_id, so
+--     no entity annotation is left lying about the schema (§E-6) and nothing would attempt to
+--     recreate it. (Empirically — Phase 26.8 audit — Hibernate 6.5's ddl-auto=validate does not
+--     check @Table(indexes=...) against the real schema either way; prod never runs
+--     ddl-auto=update, so a DROP in SQL alone is sufficient and final.)
+--
+-- No CONCURRENTLY: Flyway runs each migration inside a transaction, and DROP INDEX CONCURRENTLY
+-- cannot run in one. IF EXISTS keeps the migration replayable on a database where an operator
+-- already dropped it by hand.
+-- ────────────────────────────────────────────────────────────────────────────────────────────
+
+DROP INDEX IF EXISTS idx_bookings_salon_id;

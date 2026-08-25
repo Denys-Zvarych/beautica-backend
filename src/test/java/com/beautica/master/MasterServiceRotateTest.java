@@ -76,6 +76,12 @@ class MasterServiceRotateTest {
     // this tier — key-shape correctness is proven in CachePrefixEvictionKeyShapeTest.
     @Mock private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
+    // Mobile Phase 111: MasterService publishes a SalonStaffChangedEvent from every staff-set
+    // mutation so the salon's derived rating is recomputed. @InjectMocks must carry this or the
+    // publish call NPEs — a mock is correct here, the listener's own behaviour is unit-tested in
+    // com.beautica.review.event.SalonStaffRatingListenerTest.
+    @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
+
     @InjectMocks
     private MasterService masterService;
 
@@ -137,6 +143,13 @@ class MasterServiceRotateTest {
         // MEDIUM fix: master-by-user must be evicted on every write path that mutates this row,
         // mirroring deactivateMaster/deactivateOwnerMaster/createMasterForOwner.
         verify(masterByUserCache).evict(masterUserId);
+        // Mobile Phase 111 — a rotation changes TWO staff sets, so it must publish TWICE: the
+        // source salon loses this master's scores, the destination gains them. Verifying only
+        // one would let a half-wired rotation (the classic bug shape here) pass.
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(sourceSalonId));
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(destSalonId));
     }
 
     @Test

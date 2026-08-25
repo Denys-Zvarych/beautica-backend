@@ -27,10 +27,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * asserts the Hibernate {@link Statistics#getPrepareStatementCount()} for a page is
  * BOUNDED and INDEPENDENT of the number of favorited rows. Because the service composes
  * a JPA/native projection page (content + count) with a single batched
- * {@code DiscoveryLocationResolver.resolveLabels} call, the prepared-statement count must
- * be a small constant regardless of N favorited masters/salons. A per-row "latest booking"
- * lookup or a per-row label query would make the count scale with N — this guard fails the
- * build if that regresses.
+ * {@code DiscoveryLocationResolver.resolveLabels} call and a single batched category
+ * derivation ({@code FavoriteCategoryResolver}), the prepared-statement count must be a small
+ * constant regardless of N favorited masters/salons. A per-row "latest booking" lookup or a
+ * per-row label query would make the count scale with N — this guard fails the build if that
+ * regresses.
+ *
+ * <p>The two list guards below therefore measure at TWO different N and assert the counts match
+ * before asserting the value, so "batched" is proven rather than inferred from one magic number.
  *
  * <p>Runs the real service + resolver against the full Testcontainers context
  * ({@link AbstractIntegrationTest}) because {@code FavoriteService} is not a
@@ -54,16 +58,63 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
 
     // ── master favorites — bounded statement count, independent of N ──────────────
 
+    /**
+     * <b>Two statements per page, and — the part that actually matters — the SAME two at any N.</b>
+     *
+     * <p>Measuring one fixed N can only pin a magic number; it cannot distinguish "batched" from
+     * "happens to be 2 when N is 5". So this runs the list at two different N and asserts the
+     * counts are EQUAL to each other before asserting the value. A per-row regression fails the
+     * equality assertion with a diagnostic that names both N, rather than failing an opaque
+     * constant.
+     *
+     * <p><b>Why the exact value moved from 1 to 2.</b> The favourites screen gained a category
+     * FILTER axis ({@code categories}), derived from every distinct platform category each
+     * provider actually OFFERS (an active service in an active assignment) — reversed from an
+     * earlier design that derived it from the client's most recent booking with each provider;
+     * see {@code FavoriteCategoryResolver}'s class javadoc for the full rationale. That
+     * derivation is a SECOND statement, issued once per page against the ids the projection
+     * already returned — deliberately not a term in the list query itself. The obvious
+     * alternative, a correlated {@code LATERAL} inside the projection, is exactly what the
+     * deleted {@code lastServiceName} did: it cost 9.11 ms a page, and removing it took the page
+     * to 0.089 ms. Keeping the derivation in its own page-bounded statement preserves that.
+     *
+     * <p>The label half of the axis adds NOTHING here: it resolves off the already-{@code
+     * @Cacheable} {@code platform-category-order} list, so it issues no statement at all. If this
+     * ledger ever reads 3, a cached read has become a query.
+     *
+     * <p>Still EXACT, not a ceiling: at {@code <= 3} a 2 -> 3 regression (an added
+     * {@code JOIN FETCH}, or the category label going to the database) would pass unnoticed.
+     */
     @Test
-    @DisplayName("listMasterFavorites runs a bounded statement count independent of the number of favorited masters")
+    @DisplayName("listMasterFavorites runs the same bounded statement count at any number of favorited masters")
     void should_runBoundedStatementCount_when_listingManyMasterFavorites() {
-        UUID clientId = createClient("fav-masters-client@beautica.test");
+        long atTwo = countMasterListStatements("small", 2);
+        long atFive = countMasterListStatements("large", 5);
 
-        // N >= 3 favorited independent masters, each with a completed booking for this
-        // client so the per-row "latest booking service name" LATERAL is exercised.
-        int n = 5;
+        assertThat(atTwo)
+                .as("the statement count must not grow with the page's row count — got %s for 2 "
+                        + "favorited masters and %s for 5, which is the signature of a per-row "
+                        + "lookup rather than a batched one", atTwo, atFive)
+                .isEqualTo(atFive);
+        assertThat(atFive)
+                .as("EXACTLY two: the one content query (the count is skipped on a short page, and "
+                        + "the locality label resolve is batched away when no row carries one) plus "
+                        + "the one batched category derivation; got %s", atFive)
+                .isEqualTo(2);
+    }
+
+    /**
+     * Seeds {@code n} favorited independent masters for a fresh client — each with an active
+     * service, so the category derivation has a real offering to resolve and cannot report a
+     * flattering count by finding nothing to do — then measures one page. A COMPLETED booking is
+     * also seeded per master; it is no longer what the category derivation reads (that reversed
+     * to the offering, not the booking), but it is kept so this fixture still exercises a
+     * favourited master with real booking history too.
+     */
+    private long countMasterListStatements(String tag, int n) {
+        UUID clientId = createClient("fav-masters-" + tag + "@beautica.test");
         for (int i = 0; i < n; i++) {
-            UUID master = createIndependentMaster("fav-master-" + i + "@beautica.test");
+            UUID master = createIndependentMaster("fav-master-" + tag + "-" + i + "@beautica.test");
             UUID ms = createIndependentMasterService(master);
             createCompletedBooking(clientId, master, ms);
             favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, master);
@@ -75,27 +126,38 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                 .getContent().size();
         long statementCount = stats.getPrepareStatementCount();
 
-        assertThat(rows).isEqualTo(n);
-        assertThat(statementCount)
-                .as("listMasterFavorites must run EXACTLY the one content query (the count is "
-                        + "skipped on a short page, and the label resolve is batched away when no row "
-                        + "carries a locality); got %s for %s favorited masters. An exact bound, not a "
-                        + "ceiling: at <= 4 a 1 -> 3 regression such as an added JOIN FETCH or a "
-                        + "per-row lookup would still pass", statementCount, n)
-                .isEqualTo(1);
+        assertThat(rows)
+                .as("the measurement is only meaningful if the page actually returned %s rows", n)
+                .isEqualTo(n);
+        return statementCount;
     }
 
     // ── salon favorites — bounded statement count, independent of N ───────────────
 
+    /**
+     * Salon counterpart of the master ledger above — same two-N method, same exact bound, and
+     * the same reason the bound moved from 1 to 2. See that test's javadoc.
+     */
     @Test
-    @DisplayName("listSalonFavorites runs a bounded statement count independent of the number of favorited salons")
+    @DisplayName("listSalonFavorites runs the same bounded statement count at any number of favorited salons")
     void should_runBoundedStatementCount_when_listingManySalonFavorites() {
-        UUID clientId = createClient("fav-salons-client@beautica.test");
+        long atTwo = countSalonListStatements("small", 2);
+        long atFive = countSalonListStatements("large", 5);
 
-        // N >= 3 favorited salons.
-        int n = 5;
+        assertThat(atTwo)
+                .as("got %s statements for 2 favorited salons and %s for 5 — a count that tracks "
+                        + "the row count is a per-row lookup", atTwo, atFive)
+                .isEqualTo(atFive);
+        assertThat(atFive)
+                .as("EXACTLY two: the content query plus the one batched category derivation; "
+                        + "got %s", atFive)
+                .isEqualTo(2);
+    }
+
+    private long countSalonListStatements(String tag, int n) {
+        UUID clientId = createClient("fav-salons-" + tag + "@beautica.test");
         for (int i = 0; i < n; i++) {
-            UUID salon = createSalon("fav-salon-owner-" + i + "@beautica.test");
+            UUID salon = createSalon("fav-salon-owner-" + tag + "-" + i + "@beautica.test");
             favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salon);
         }
 
@@ -106,11 +168,7 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
         long statementCount = stats.getPrepareStatementCount();
 
         assertThat(rows).isEqualTo(n);
-        assertThat(statementCount)
-                .as("listSalonFavorites must run EXACTLY the one content query (count skipped on a "
-                        + "short page, label resolve batched away); got %s for %s favorited salons. "
-                        + "Exact, not a ceiling — see listMasterFavorites", statementCount, n)
-                .isEqualTo(1);
+        return statementCount;
     }
 
     // ── wish list (SERVICE favorites) — statement count AND entity-load shape ─────
