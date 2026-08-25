@@ -16,7 +16,11 @@ import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.service.service.PlatformCategoryLabel;
+import com.beautica.service.service.PlatformCategoryLabelResolver;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -29,6 +33,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
@@ -43,6 +48,8 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ClientPassportService {
 
+    private static final Logger log = LoggerFactory.getLogger(ClientPassportService.class);
+
     /**
      * Caffeine cache backing {@link #getPassport}. Registered in {@code CacheConfig}; evicted
      * per key by {@link com.beautica.client.event.ClientPassportCacheEvictor}.
@@ -56,6 +63,7 @@ public class ClientPassportService {
 
     private final ClientAggregationRepository aggregationRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
+    private final PlatformCategoryLabelResolver platformCategoryLabelResolver;
     private final Clock clock;
 
     /**
@@ -165,8 +173,20 @@ public class ClientPassportService {
                 pageable, SORTABLE_TIMELINE_PROPERTIES, Sort.unsorted(), null);
         Page<TimelineItemProjection> page = aggregationRepository.findTimeline(clientUserId, safePageable);
         ZoneId kyiv = TimeZones.KYIV;
+        // Resolved ONCE per request/page, never per row: platformCategoryLabelResolver is
+        // itself backed by a 60-min cached list read (see its javadoc), but building the
+        // slug->label map inside the .map(...) below would still repeat that stream/collect
+        // work once per timeline item for no benefit.
+        //
+        // Decorative, not load-bearing: categoryName() already falls back to the raw slug via
+        // getOrDefault, so a failure here degrades to that same fallback for every row instead
+        // of failing the whole timeline read. Caught narrowly at Exception (never Throwable —
+        // an OutOfMemoryError must still propagate) and logged at WARN so the degraded state
+        // (slugs showing in the UI) is diagnosable as an infra failure, not mistaken for a data
+        // problem.
+        Map<String, String> categoryLabelsBySlug = resolveCategoryLabelsBySlug();
         List<TimelineItemResponse> content = page.getContent().stream()
-                .map(p -> toTimelineResponse(p, kyiv))
+                .map(p -> toTimelineResponse(p, kyiv, categoryLabelsBySlug))
                 .toList();
         return PageResponse.of(
                 content,
@@ -174,6 +194,28 @@ public class ClientPassportService {
                 page.getSize(),
                 page.getTotalElements(),
                 page.getTotalPages());
+    }
+
+    /**
+     * Builds the slug-to-label map for one {@link #getTimeline} call, never failing the
+     * timeline read if the lookup itself fails.
+     *
+     * <p>The label lookup is decorative — the timeline payload (bookings, dates, service
+     * names, ids) does not depend on it. A cache or DB failure inside
+     * {@link PlatformCategoryLabelResolver#selectableLabels()} therefore degrades to an empty
+     * map rather than propagating: {@code categoryName} already falls back to the raw slug via
+     * {@code getOrDefault(category, category)} on a map miss, so an empty map here reproduces
+     * exactly that pre-existing, documented fallback for every row.
+     */
+    private Map<String, String> resolveCategoryLabelsBySlug() {
+        try {
+            return platformCategoryLabelResolver.selectableLabels().stream()
+                    .collect(Collectors.toMap(PlatformCategoryLabel::name, PlatformCategoryLabel::displayName));
+        } catch (Exception ex) {
+            log.warn("Category label resolution failed for timeline read — falling back to raw "
+                    + "slugs: {}", ex.getClass().getSimpleName());
+            return Map.of();
+        }
     }
 
     /**
@@ -211,14 +253,35 @@ public class ClientPassportService {
                 .toList();
     }
 
-    private TimelineItemResponse toTimelineResponse(TimelineItemProjection p, ZoneId kyiv) {
+    private TimelineItemResponse toTimelineResponse(
+            TimelineItemProjection p, ZoneId kyiv, Map<String, String> categoryLabelsBySlug) {
         return new TimelineItemResponse(
                 p.bookingId(),
                 categoryKey(p.category()),
-                p.category(),
+                categoryName(p.category(), categoryLabelsBySlug),
                 p.startsAt().atZoneSameInstant(kyiv).toLocalDate(),
                 p.masterId(),
                 p.serviceName());
+    }
+
+    /**
+     * Ukrainian display label for {@code categoryKey}'s slug, resolved against the
+     * pre-built {@code categoryLabelsBySlug} map (one {@link PlatformCategoryLabelResolver}
+     * read per request, built in {@link #getTimeline}, never per row).
+     *
+     * <p>Falls back to the raw slug — never {@code null}/blank — whenever the category is
+     * {@code null} or the lookup misses (deactivated, rejected, or renamed since the booking
+     * was made): the resolver's backing query filters {@code status = APPROVED AND active =
+     * true}, so a booking's category can silently drop out of it. The mobile client discards
+     * any timeline row where both {@code categoryKey} and {@code categoryName} are empty, so a
+     * stale-but-present slug beats a "correct" null that erases the procedure from the client's
+     * history.
+     */
+    private static String categoryName(String category, Map<String, String> categoryLabelsBySlug) {
+        if (category == null) {
+            return null;
+        }
+        return categoryLabelsBySlug.getOrDefault(category, category);
     }
 
     /**
