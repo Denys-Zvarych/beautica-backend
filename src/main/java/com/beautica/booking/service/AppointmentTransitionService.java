@@ -1040,7 +1040,26 @@ public class AppointmentTransitionService {
         User owningClient = appointment.getClient();
         if (owningClient != null) {
             acquireClientLock(owningClient.getId());
-            assertNoClientConflictExcludingBooking(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            // OVERRIDE (product decision 2026-08-22, widened 2026-08-26): req.allowClientOverlap()
+            // mirrors BookingService#doCreateBooking's / #rescheduleBooking's identical opt-in —
+            // skips ONLY this self-conflict check. assertNoSiblingOverlap above (in-visit
+            // self-double-book), the master-scoped existsOverlapExcluding below and the
+            // no_overlapping_bookings EXCLUDE constraint still run unconditionally regardless of
+            // this flag. Defaults false (primitive boolean), so an absent/omitted field
+            // reproduces today's behaviour byte-for-byte.
+            //
+            // ACTOR GATE (backend-security HIGH, cycle audit 2026-08-26): the override is the
+            // CLIENT's consent to give, not the provider's. This per-item reschedule route is
+            // reachable by SALON_OWNER/SALON_ADMIN/INDEPENDENT_MASTER as well as CLIENT (see
+            // @PreAuthorize on AppointmentController#rescheduleAppointmentItem) — so
+            // req.allowClientOverlap() must be honored ONLY when the client themselves is the
+            // actor. `initiatedByProvider` (= actorRole != Role.CLIENT, set at the top of this
+            // method) is the same discriminator already driving the ownership guard and
+            // BookingTemporalGuard/assertItemNotElapsedForClient branch above — reused here
+            // rather than threading a new parameter.
+            if (initiatedByProvider || !req.allowClientOverlap()) {
+                assertNoClientConflictExcludingBooking(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            }
             lockResult = bookingRepository.acquireAdvisoryLock(masterId);
         } else {
             // No client lock was taken (guest visit) — the master lock must fuse its own

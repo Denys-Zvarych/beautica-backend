@@ -151,7 +151,7 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
 
         OffsetDateTime futureStart = ZonedDateTime.now(KYIV).plusDays(2)
                 .withHour(10).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
-        String body = objectMapper.writeValueAsString(new RescheduleBookingRequest(futureStart));
+        String body = objectMapper.writeValueAsString(new RescheduleBookingRequest(futureStart, false));
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
                 new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);
@@ -177,7 +177,7 @@ class BookingElapsedClientGuardIT extends AbstractIntegrationTest {
 
         OffsetDateTime perfectlyValidFuture = ZonedDateTime.now(KYIV).plusDays(3)
                 .withHour(12).withMinute(0).withSecond(0).withNano(0).toOffsetDateTime();
-        String body = objectMapper.writeValueAsString(new RescheduleBookingRequest(perfectlyValidFuture));
+        String body = objectMapper.writeValueAsString(new RescheduleBookingRequest(perfectlyValidFuture, false));
         ResponseEntity<String> response = restTemplate.exchange(
                 BOOKINGS_URL + "/" + bookingId + "/reschedule", HttpMethod.PATCH,
                 new HttpEntity<>(body, bearerHeaders(clientToken)), String.class);

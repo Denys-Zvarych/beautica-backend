@@ -847,7 +847,7 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var newStartsAt = ZonedDateTime.now().plusDays(2).toOffsetDateTime();
-        var body = objectMapper.writeValueAsString(new RescheduleBookingRequest(newStartsAt));
+        var body = objectMapper.writeValueAsString(new RescheduleBookingRequest(newStartsAt, false));
         when(bookingService.rescheduleBooking(eq(clientId), eq(Role.CLIENT), eq(bookingId), any()))
                 .thenReturn(stubDetailResponse(bookingId, clientId, UUID.randomUUID(), UUID.randomUUID()));
 
@@ -879,7 +879,7 @@ class BookingControllerTest {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
         when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.rescheduleBooking(eq(ownerId), eq(Role.SALON_OWNER), eq(bookingId), any()))
                 .thenReturn(stubDetailResponse(bookingId, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID()));
@@ -903,7 +903,7 @@ class BookingControllerTest {
         var ownerId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
         when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
@@ -924,7 +924,7 @@ class BookingControllerTest {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
         when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(true);
         when(bookingService.rescheduleBooking(eq(masterId), eq(Role.INDEPENDENT_MASTER), eq(bookingId), any()))
                 .thenReturn(stubDetailResponse(bookingId, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID()));
@@ -948,7 +948,7 @@ class BookingControllerTest {
         var masterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
         when(authorizationService.canRescheduleBooking(any(), eq(bookingId))).thenReturn(false);
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
@@ -968,7 +968,7 @@ class BookingControllerTest {
         var salonMasterId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
                         .with(authenticatedAs(salonMasterId, "salonmaster@beautica.test", Role.SALON_MASTER))
@@ -990,7 +990,7 @@ class BookingControllerTest {
     void should_return401_when_noTokenOnReschedule() throws Exception {
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
 
         mockMvc.perform(patch(BOOKINGS_URL + "/" + bookingId + "/reschedule")
                         .with(csrf())
@@ -1038,7 +1038,7 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
         when(bookingService.rescheduleBooking(any(), eq(Role.CLIENT), eq(bookingId), any()))
                 .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Slot not available"));
 
@@ -1056,7 +1056,7 @@ class BookingControllerTest {
         var clientId = UUID.randomUUID();
         var bookingId = UUID.randomUUID();
         var body = objectMapper.writeValueAsString(
-                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime()));
+                new RescheduleBookingRequest(ZonedDateTime.now().plusDays(2).toOffsetDateTime(), false));
         when(bookingService.rescheduleBooking(any(), eq(Role.CLIENT), eq(bookingId), any()))
                 .thenThrow(new ForbiddenException("Access denied"));
 

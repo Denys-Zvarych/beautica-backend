@@ -1460,7 +1460,7 @@ class BookingServiceTest {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         booking.setAppointment(appointment);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
@@ -1487,7 +1487,7 @@ class BookingServiceTest {
     void should_notInteractWithAppointmentTransitionService_when_reschedulingLegacyStandaloneBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
@@ -1508,7 +1508,7 @@ class BookingServiceTest {
     void should_throw409AndNeverAcquireLocksOrSave_when_rescheduleBookingFreshnessRecheckFailsForStandaloneBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         // Overrides setUp()'s lenient "still CONFIRMED" default: a concurrent writer already moved
@@ -1587,7 +1587,7 @@ class BookingServiceTest {
         // A perfectly valid FUTURE target time — proves the client cannot escape the guard by
         // supplying a good newStartsAt: the verdict is on the SOURCE booking's persisted endsAt.
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
@@ -1671,7 +1671,7 @@ class BookingServiceTest {
     void should_reportStatusConflictNotElapsed_when_reschedulingElapsedCompletedBooking() {
         Booking booking = buildBookingEndingAt(BookingStatus.COMPLETED, clock.instant().minusSeconds(60));
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
@@ -1723,7 +1723,7 @@ class BookingServiceTest {
     void should_stillRescheduleFutureBooking_afterElapsedGuardAdded() {
         Booking booking = buildBookingEndingAt(BookingStatus.CONFIRMED, clock.instant().plusSeconds(3600));
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(6).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
@@ -1766,7 +1766,7 @@ class BookingServiceTest {
     void should_stayConfirmed_when_clientReschedulesConfirmedBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
@@ -1791,7 +1791,7 @@ class BookingServiceTest {
         UUID otherClientId = UUID.randomUUID();
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(otherClientId, bookingId, req))
@@ -1811,7 +1811,7 @@ class BookingServiceTest {
         Booking guestBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         setField(guestBooking, "client", null);
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(guestBooking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
@@ -1845,7 +1845,7 @@ class BookingServiceTest {
     private void assertRescheduleRejectsTerminalState(BookingStatus terminal) {
         Booking booking = buildBooking(bookingId, client, master, msa, terminal);
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
@@ -1862,7 +1862,7 @@ class BookingServiceTest {
     void should_throw400_when_rescheduleNewTimeBelowLeadTime() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusMinutes(14).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusMinutes(14).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
@@ -1877,7 +1877,7 @@ class BookingServiceTest {
     void should_throw400_when_rescheduleNewTimeMoreThan180DaysAhead() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         RescheduleBookingRequest req = new RescheduleBookingRequest(
-                ZonedDateTime.now(clock).plusDays(181).toOffsetDateTime());
+                ZonedDateTime.now(clock).plusDays(181).toOffsetDateTime(), false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
@@ -1891,7 +1891,7 @@ class BookingServiceTest {
     void should_throw409_when_rescheduleNewTimeOffSchedule() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         // No slot matches newStartsAt → off-schedule
         when(slotCalculationService.getAvailableSlots(eq(masterId), any(LocalDate.class), eq(masterServiceId),
@@ -1912,7 +1912,7 @@ class BookingServiceTest {
     void should_throw409_when_rescheduleOverlapsAnotherBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(true);
@@ -1933,7 +1933,7 @@ class BookingServiceTest {
     void should_throwClientBookingConflict_when_rescheduleOverlapsClientsOtherBookingWithDifferentMaster() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
 
@@ -1974,7 +1974,7 @@ class BookingServiceTest {
         setField(booking, "bufferMinutesAtBooking", 0);
         BigDecimal frozenPrice = booking.getPriceAtBooking();
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
-        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt);
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
@@ -2001,7 +2001,7 @@ class BookingServiceTest {
         stubRescheduleSlotAvailable(newStartsAt);
         when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
-        bookingService.rescheduleBooking(clientId, bookingId, new RescheduleBookingRequest(newStartsAt));
+        bookingService.rescheduleBooking(clientId, bookingId, new RescheduleBookingRequest(newStartsAt, false));
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
 
         // Provider declines (cancels) the rescheduled booking → DECLINED, via the decline path.
