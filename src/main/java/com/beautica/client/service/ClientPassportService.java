@@ -30,7 +30,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -41,8 +43,16 @@ import java.util.stream.Collectors;
 
 /**
  * Derives the read-only BEAUTI PASSPORT and BEAUTY TIMELINE for the signed-in client
- * (Phase 19.5) from their COMPLETED booking history. No preferences entity exists and
- * nothing here is user-editable.
+ * (Phase 19.5). No preferences entity exists and nothing here is user-editable.
+ *
+ * <p>{@link #getPassport} derives strictly from the client's COMPLETED booking history — every
+ * aggregate it reads ({@code findStanding}'s review count aside, {@code aggregateBudget}, {@code
+ * findTopDistricts}, {@code findTopCities}) is {@code status = COMPLETED} only. {@link
+ * #getTimeline} was widened (2026-08-26) to also include elapsed-but-unclosed {@code CONFIRMED}
+ * bookings — see {@link ClientAggregationRepository#findTimeline}'s javadoc — so the timeline can
+ * legitimately list more rows than the passport headline counts. That divergence is intentional;
+ * do not "fix" it by narrowing the timeline back to COMPLETED-only or by widening the passport
+ * aggregates to match.
  */
 @Service
 @RequiredArgsConstructor
@@ -152,6 +162,22 @@ public class ClientPassportService {
     }
 
     /**
+     * Absolute-instant "now" for {@link #getTimeline}'s elapsed-{@code CONFIRMED} leg — {@link
+     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, the SAME expression {@code
+     * BookingService#resolveNow} resolves for the Phase 28.1/29.1 partition boundary
+     * ({@code BookingSpecifications#partition} / {@link
+     * com.beautica.booking.domain.BookingClosureRule}). Reusing this exact expression — never
+     * {@code Instant.now()}/{@code OffsetDateTime.now()} (Anti-Bug §G) — is how the timeline's
+     * "has this booking elapsed?" answer is guaranteed to agree with the client's «Минулі» tab:
+     * both derive {@code now} from the same injected {@link Clock} bean via the same conversion,
+     * so they can never disagree about which side of the boundary a given {@code endsAt} falls on.
+     * {@link TimeZones#KYIV} must never appear here — this is an absolute-instant comparison.
+     */
+    private OffsetDateTime resolveNow() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+    }
+
+    /**
      * The only property {@code GET /clients/me/timeline} may be sorted by — mirrors
      * {@code BookingService.SORTABLE_BOOKING_PROPERTIES}, since this query shares the
      * {@code Booking} root and must not expose a wider sort surface than {@code GET /bookings/me}.
@@ -159,8 +185,11 @@ public class ClientPassportService {
     private static final Set<String> SORTABLE_TIMELINE_PROPERTIES = Set.of("startsAt");
 
     /**
-     * Most-recent-first page of COMPLETED procedures. The {@code categoryKey} slug and the
-     * Kyiv {@code LocalDate} are derived in-memory from the scalar projection (no N+1).
+     * Most-recent-first page of the client's CLOSED-OR-ELAPSED procedures — {@code COMPLETED}, or
+     * an unclosed {@code CONFIRMED} booking whose window has already elapsed (see {@link
+     * ClientAggregationRepository#findTimeline}'s javadoc for the exact predicate and why {@code
+     * NOT_COMPLETED} is deliberately excluded). The {@code categoryKey} slug and the Kyiv {@code
+     * LocalDate} are derived in-memory from the scalar projection (no N+1).
      */
     @Transactional(readOnly = true)
     public PageResponse<TimelineItemResponse> getTimeline(UUID clientUserId, Pageable pageable) {
@@ -171,7 +200,8 @@ public class ClientPassportService {
         // `ORDER BY b.startsAt DESC` and Spring appends the caller's sort after it.
         Pageable safePageable = SortWhitelist.apply(
                 pageable, SORTABLE_TIMELINE_PROPERTIES, Sort.unsorted(), null);
-        Page<TimelineItemProjection> page = aggregationRepository.findTimeline(clientUserId, safePageable);
+        Page<TimelineItemProjection> page =
+                aggregationRepository.findTimeline(clientUserId, resolveNow(), safePageable);
         ZoneId kyiv = TimeZones.KYIV;
         // Resolved ONCE per request/page, never per row: platformCategoryLabelResolver is
         // itself backed by a 60-min cached list read (see its javadoc), but building the

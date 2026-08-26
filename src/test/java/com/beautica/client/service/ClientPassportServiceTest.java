@@ -72,7 +72,9 @@ class ClientPassportServiceTest {
     @Mock
     private PlatformCategoryLabelResolver platformCategoryLabelResolver;
 
-    // Fixed clock — the service does not branch on time, but the constructor requires one.
+    // Fixed clock. getPassport does not branch on time, but getTimeline's elapsed-CONFIRMED leg
+    // (2026-08-26 widening) resolves "now" from this bean and forwards it to findTimeline — see
+    // should_resolveNowFromClock_when_findingTimeline below.
     private final Clock clock = Clock.fixed(Instant.parse("2026-06-18T12:00:00Z"), ZoneOffset.UTC);
 
     private ClientPassportService service;
@@ -348,7 +350,8 @@ class ClientPassportServiceTest {
                 new TimelineItemProjection(bookingId, "MANICURE", startsAt, masterId, "Classic Manicure");
         Page<TimelineItemProjection> page =
                 new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1);
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class))).thenReturn(page);
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(page);
         // Empty selectable-label set: the fallback is getOrDefault(category, category), so this
         // keeps the previous slug-passthrough assertion below intact.
         when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
@@ -369,6 +372,27 @@ class ClientPassportServiceTest {
         assertThat(result.size()).isEqualTo(20);
     }
 
+    @Test
+    @DisplayName("getTimeline — resolves \"now\" from the injected Clock bean, as an absolute-instant "
+            + "OffsetDateTime (Clock#instant() at ZoneOffset.UTC), and forwards EXACTLY that value to "
+            + "findTimeline — the same expression BookingService#resolveNow uses for the PAST/"
+            + "AWAITING_CLOSURE partition boundary, which is how the two agree on whether a given "
+            + "booking has elapsed")
+    void should_resolveNowFromClock_when_findingTimeline() {
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(), PageRequest.of(0, 20), 0));
+        when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
+
+        service().getTimeline(clientId, PageRequest.of(0, 20));
+
+        ArgumentCaptor<OffsetDateTime> nowCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(aggregationRepository).findTimeline(eq(clientId), nowCaptor.capture(), any(Pageable.class));
+        assertThat(nowCaptor.getValue())
+                .as("same OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC) expression "
+                        + "BookingService#resolveNow uses")
+                .isEqualTo(OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC));
+    }
+
     // ── timeline: category label resolution (categoryName fix regression) ──────
 
     @Test
@@ -383,7 +407,8 @@ class ClientPassportServiceTest {
         TimelineItemProjection projection =
                 new TimelineItemProjection(bookingId, "MANICURE", startsAt, masterId, "Classic Manicure");
         Page<TimelineItemProjection> page = new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1);
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class))).thenReturn(page);
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(page);
         // A POPULATED, multi-entry resolved label map — this is the label-hit branch
         // (getOrDefault actually returning the mapped value). Every other getTimeline test in this
         // class stubs an empty list and therefore never reaches it; this is the one that does.
@@ -413,7 +438,8 @@ class ClientPassportServiceTest {
         TimelineItemProjection projection =
                 new TimelineItemProjection(bookingId, "MANICURE", startsAt, masterId, "Classic Manicure");
         Page<TimelineItemProjection> page = new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1);
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class))).thenReturn(page);
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(page);
         // Non-empty map that deliberately does NOT contain "MANICURE" — proves the fallback holds
         // against a populated catalog, not merely an empty one (an empty-catalog stub would pass
         // this same assertion even if getOrDefault were broken, since the map has nothing to hit).
@@ -445,7 +471,8 @@ class ClientPassportServiceTest {
                 UUID.randomUUID(), "MANICURE", startsAt.minusDays(2), UUID.randomUUID(), "Manicure");
         Page<TimelineItemProjection> page =
                 new PageImpl<>(List.of(first, second, third), PageRequest.of(0, 20), 3);
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class))).thenReturn(page);
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(page);
         when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of(
                 new PlatformCategoryLabel("MANICURE", "Манікюр"),
                 new PlatformCategoryLabel("HAIRCUT", "Стрижка")));
@@ -473,7 +500,8 @@ class ClientPassportServiceTest {
                 UUID.randomUUID(), "BROWS", startsAt.minusDays(2), UUID.randomUUID(), "Brow Shaping");
         Page<TimelineItemProjection> page =
                 new PageImpl<>(List.of(first, second, third), PageRequest.of(0, 20), 3);
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class))).thenReturn(page);
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(page);
         when(platformCategoryLabelResolver.selectableLabels())
                 .thenThrow(new RuntimeException("cache backend unavailable"));
 
@@ -505,7 +533,8 @@ class ClientPassportServiceTest {
                 new TimelineItemProjection(bookingId, "HAIR", startsAt, masterId, "Winter Haircut");
         Page<TimelineItemProjection> page =
                 new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1);
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class))).thenReturn(page);
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
+                .thenReturn(page);
         when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
 
         PageResponse<TimelineItemResponse> result = service().getTimeline(clientId, PageRequest.of(0, 20));
@@ -522,7 +551,7 @@ class ClientPassportServiceTest {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 1, 10, 9, 0, 0, 0, ZoneOffset.UTC);
         TimelineItemProjection projection = new TimelineItemProjection(
                 UUID.randomUUID(), null, startsAt, UUID.randomUUID(), "Mystery Service");
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class)))
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(projection), PageRequest.of(0, 20), 1));
         when(platformCategoryLabelResolver.selectableLabels()).thenReturn(List.of());
 
@@ -535,7 +564,7 @@ class ClientPassportServiceTest {
     @Test
     @DisplayName("getTimeline — empty page maps to an empty PageResponse")
     void should_returnEmptyPage_when_noTimelineItems() {
-        when(aggregationRepository.findTimeline(eq(clientId), any(Pageable.class)))
+        when(aggregationRepository.findTimeline(eq(clientId), any(OffsetDateTime.class), any(Pageable.class)))
                 .thenReturn(new PageImpl<>(List.of(), PageRequest.of(0, 20), 0));
         // getTimeline builds the category-label map unconditionally, before mapping content —
         // it runs even on an empty page.

@@ -379,6 +379,32 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
         }
     }
 
+    // ── 2026-08-26: elapsed-but-unclosed CONFIRMED widening ─────────────────────
+
+    @Test
+    @DisplayName("GET timeline — an elapsed CONFIRMED booking the provider never closed out appears "
+            + "(2026-08-26 widening); an elapsed NOT_COMPLETED booking is deliberately excluded even "
+            + "though it elapsed the same way; a not-yet-elapsed CONFIRMED booking stays excluded too "
+            + "— proven over real HTTP against real Postgres, not a mocked repository")
+    void should_includeElapsedConfirmedOnly_when_gettingTimeline() throws Exception {
+        UUID clientId = createClient("timeline-elapsed-client@beautica.test");
+        UUID master = createIndependentMasterAt("timeline-elapsed-master@beautica.test", null);
+        UUID masterServiceId = createMasterService(master);
+
+        UUID elapsedConfirmed =
+                insertElapsedConfirmedBooking(clientId, master, masterServiceId, new BigDecimal("500.00"));
+        insertElapsedNotCompletedBooking(clientId, master, masterServiceId, new BigDecimal("300.00"));
+        insertUpcomingConfirmedBooking(clientId, master, masterServiceId, new BigDecimal("400.00"));
+
+        List<TimelineItemResponse> items = getTimeline(clientId);
+
+        assertThat(items)
+                .as("only the elapsed-but-unclosed CONFIRMED booking surfaces — NOT_COMPLETED and "
+                        + "not-yet-elapsed CONFIRMED are both excluded")
+                .extracting(TimelineItemResponse::bookingId)
+                .containsExactly(elapsedConfirmed);
+    }
+
     // ── HTTP plumbing ───────────────────────────────────────────────────────────
 
     private PassportResponse getPassport(UUID clientId) throws Exception {
@@ -575,6 +601,58 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
                         + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, 'COMPLETED', NOW() - interval '2 hours', "
                         + "NOW() - interval '1 hour', ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, price);
+        return bookingId;
+    }
+
+    /**
+     * A CONFIRMED booking whose window already elapsed (ends 1h ago) and was never closed out by
+     * the provider — the exact row the 2026-08-26 {@code findTimeline} widening exists to surface.
+     */
+    private UUID insertElapsedConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                                               BigDecimal price) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, price);
+        return bookingId;
+    }
+
+    /**
+     * An elapsed NOT_COMPLETED (explicit no-show) booking — locked product decision: unlike
+     * {@link #insertElapsedConfirmedBooking}, this must NEVER appear in the timeline, even though
+     * it elapsed the same way. See {@code ClientAggregationRepository#findTimeline}'s javadoc.
+     */
+    private UUID insertElapsedNotCompletedBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                                                   BigDecimal price) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'NOT_COMPLETED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, price);
+        return bookingId;
+    }
+
+    /**
+     * A CONFIRMED booking whose window has NOT elapsed yet — must stay excluded from the timeline
+     * (it is still "upcoming", not "awaiting closure").
+     */
+    private UUID insertUpcomingConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                                                BigDecimal price) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', NOW() + interval '2 hours', "
+                        + "NOW() + interval '3 hours', ?, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, price);
         return bookingId;
     }
