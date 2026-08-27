@@ -826,6 +826,134 @@ public class BookingService {
     }
 
     /**
+     * Phase 23.4 — {@code GET /bookings/salon/{salonId}}: a single-salon, paginated booking list
+     * for {@code SALON_OWNER}/{@code SALON_ADMIN}, backing the mobile salon "Розклад" tab.
+     *
+     * <p><b>Why this is a dedicated endpoint, not a {@code GET /bookings/me} widening.</b> {@code
+     * GET /bookings/me}'s {@code SALON_OWNER} arm aggregates across EVERY owned salon with no
+     * per-salon filter (see {@link #listProviderBookings}), and rejects {@code SALON_ADMIN}
+     * outright (same rejection this method's sibling {@link #getMyBookings}/{@link
+     * #getMyBookedDays}/{@link #getUnclosedCount} carry, and which stays UNTOUCHED here — this
+     * method does not relax any of those three guards). Neither shape fits a single-salon,
+     * admin-inclusive, master-filterable list, so this is a new query family rather than a branch
+     * bolted onto the existing one.
+     *
+     * <p><b>Authorization lives ENTIRELY at the controller boundary</b> —
+     * {@code @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and
+     * @authz.canManageSalon(authentication, #salonId)")}, the exact SpEL {@code
+     * SalonController}/{@code ServiceController} already use for the same owner-or-admin-of-THIS-
+     * salon check (Anti-Bug §D: a GET is a read, so one {@code can*} DB lookup at the gate is the
+     * canonical placement; a role-only controller check plus a second, separate ownership query
+     * here would be the "duplicate the same check on both layers" anti-pattern §D forbids). No
+     * {@code SalonService} injection was needed — {@code AuthorizationService#canManageSalon} was
+     * already the shared helper backing every sibling salon-management endpoint, so reusing it
+     * here adds no new bean edge and cannot create the {@code BookingService ↔ SalonService}
+     * circular dependency a naive "inject SalonService and assert ownership" approach would risk
+     * ({@code AuthorizationService} was already a {@code BookingService} constructor dependency
+     * before this phase).
+     *
+     * <p><b>Scope predicate is {@code booking.salon.id}</b> ({@link
+     * BookingSpecifications#bookingSalonIdEquals}), never {@code master.salon.id} — see that
+     * method's javadoc for why: this is "which bookings happened AT this salon" (a historical,
+     * per-booking fact), not "which of my currently-owned salons" ({@link
+     * BookingSpecifications#salonIdIn}'s multi-salon aggregate shape, keyed off the master's LIVE
+     * affiliation instead).
+     *
+     * <p><b>{@code providerCanReviewClient} authority is computed per row</b> via {@link
+     * AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)} — the same public,
+     * entity-based predicate {@link #getBooking} already uses for a single row — rather than
+     * {@link #loadProviderReviewBatch}'s page-batched {@code
+     * AuthorizationService#filterBookingIdsWithProviderAuthority}, which explicitly THROWS {@code
+     * IllegalArgumentException} for {@code SALON_ADMIN} ("add the assigned-salon arm before
+     * routing admins to this path" — this endpoint is the first caller that would need it, and
+     * extending that heavily-audited, {@code GET /bookings/me}-shared batch kernel was judged
+     * riskier than the bounded per-row cost paid here). The per-row call is gated behind the same
+     * cheap in-memory {@code isReviewCandidate} check {@link #loadProviderReviewBatch} uses as its
+     * own cost gate (client present AND {@link BookingClosureRule#isProviderReviewEligible}), so
+     * it only runs for rows that could possibly flip the flag — bounded by page size (capped
+     * globally at 100 — Anti-Bug §J), never by the salon's total booking volume.
+     *
+     * <p><b>Index coverage (Phase 23.4 audit fix, Finding 2 — corrects a stale citation).</b>
+     * {@code idx_bookings_salon_status_starts_at} was originally added by V22, but V113 rebuilt it
+     * with a narrower partial predicate — {@code WHERE status IN ('CONFIRMED','COMPLETED')} — so
+     * it covers this method's {@code ?status=} filter only for those two values; a {@code status}
+     * of {@code CANCELLED}/{@code DECLINED}/{@code NOT_COMPLETED} (or no status at all) falls back
+     * to the unfiltered {@code idx_bookings_salon_starts_at} (V19). Neither index carries {@code
+     * master_id}, so the {@code masterId} filter above is served by a dedicated composite index,
+     * {@code idx_bookings_salon_master_starts_at} (V148, status-agnostic — see that migration for
+     * why it cannot reuse V22/V113's partial predicate).
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<BookingDetailResponse> getSalonBookings(
+            UUID actorUserId, UUID salonId, UUID masterId, BookingStatus status,
+            LocalDate from, LocalDate to, Pageable pageable) {
+        if (to != null) {
+            dateMath.assertToPlusOneDayRepresentable(to);
+        }
+        if (from != null && to != null) {
+            if (from.isAfter(to)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, "'from' must not be after 'to'");
+            }
+            dateMath.assertSpanWithinMax(from, to);
+        }
+        OffsetDateTime fromTs = from == null ? null : from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to == null ? null : to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
+        Set<BookingStatus> statuses = status == null ? null : EnumSet.of(status);
+        OffsetDateTime now = resolveNow();
+        Pageable normalizedPageable = normalizeBookingSort(pageable);
+
+        Page<UUID> idPage = bookingRepository.findIdsBySalonIdFiltered(
+                salonId, masterId, statuses, fromTs, toExclusive, normalizedPageable);
+        if (idPage.isEmpty()) {
+            return PageResponse.of(List.of(), idPage.getNumber(), idPage.getSize(),
+                    idPage.getTotalElements(), idPage.getTotalPages());
+        }
+
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        // Client -> provider review-existence, batched for the whole page — same as
+        // listProviderBookings, no role dependency (unlike the provider review batch below).
+        Set<UUID> reviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(idPage.getContent()));
+
+        // Provider -> client review-existence batch, restricted to rows that could possibly
+        // qualify (see this method's javadoc for why authority itself is NOT batched here).
+        List<UUID> reviewCandidateIds = hydrated.stream()
+                .filter(b -> b.getClient() != null && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
+                .map(Booking::getId)
+                .toList();
+        Set<UUID> alreadyReviewedByProvider = reviewCandidateIds.isEmpty()
+                ? Set.of()
+                : Set.copyOf(clientReviewRepository.findReviewedBookingIds(reviewCandidateIds));
+
+        DiscoveryLabels labels = resolveBookingLabels(hydrated);
+
+        Map<UUID, Booking> byId = hydrated.stream().collect(Collectors.toMap(Booking::getId, Function.identity()));
+        List<BookingDetailResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
+                .map(b -> {
+                    UUID cityId = discoveryCityId(b);
+                    UUID districtId = discoveryDistrictId(b);
+                    boolean canReview = canReview(
+                            b.getStatus(), b.getEndsAt(), now, reviewed.contains(b.getId()), b.getClient() != null);
+                    boolean isReviewCandidate = b.getClient() != null
+                            && BookingClosureRule.isProviderReviewEligible(b.getStatus());
+                    boolean hasProviderAuthority = isReviewCandidate
+                            && authz.hasProviderAuthorityOverBooking(actorUserId, b);
+                    boolean providerCanReviewClient = providerCanReviewClient(
+                            hasProviderAuthority, b.getStatus(), b.getClient() != null,
+                            () -> alreadyReviewedByProvider.contains(b.getId()));
+                    return BookingDetailResponse.from(
+                            b, canReview, providerCanReviewClient,
+                            labels.cityLabel(cityId), labels.districtLabel(districtId), now);
+                })
+                .toList();
+
+        return PageResponse.of(ordered, idPage.getNumber(), idPage.getSize(),
+                idPage.getTotalElements(), idPage.getTotalPages());
+    }
+
+    /**
      * Property names {@code GET /bookings/me}'s {@code sort} query parameter may reference
      * (Phase 26.3, narrowed by Phase 26.8). {@code priceAtBooking} was removed from this set —
      * its only caller anywhere in the product was the provider "Мої записи" sort sheet, which

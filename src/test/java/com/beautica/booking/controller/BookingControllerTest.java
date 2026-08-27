@@ -1243,6 +1243,31 @@ class BookingControllerTest {
         org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
     }
 
+    // ── GET /salon/{salonId} (Phase 23.4 audit fix, Finding 4) ───────────────────
+
+    @Test
+    @DisplayName("GET /salon/{salonId} — page=999999 still clamps to 1000 (Anti-Bug §J deep-OFFSET "
+            + "guard, shared with /me via BookingController#clampGiantOffset) — mirrors "
+            + "should_clampPageNumberTo1000_when_pageExceeds1000 for the Phase 23.4 route")
+    void should_clampPageNumberTo1000_when_salonBookingsPageExceeds1000() throws Exception {
+        var salonId = UUID.randomUUID();
+        var ownerId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 1000, 20, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("page", "999999")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        org.mockito.Mockito.verify(bookingService)
+                .getSalonBookings(any(), eq(salonId), any(), any(), any(), any(), pageableCaptor.capture());
+        org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
+    }
+
     // ── GET /me/unclosed-count (Phase 29.4 — provider work-queue badge) ──────────
 
     @Test

@@ -144,6 +144,34 @@ public interface BookingRepositoryCustom {
             Collection<UUID> serviceIds, Pageable pageable);
 
     /**
+     * Phase 23.4 — {@code GET /bookings/salon/{salonId}}: single-salon booking list for
+     * SALON_OWNER/SALON_ADMIN, backing the mobile salon "Розклад" tab. Scoped by {@link
+     * BookingSpecifications#bookingSalonIdEquals} (the booking's OWN salon snapshot — see that
+     * method's javadoc for why this is deliberately NOT {@link #findIdsBySalonIdsFiltered}'s
+     * master-join {@code salonIdIn} shape), never an arbitrary UUID (Anti-Bug §E-4) — the caller
+     * must already have asserted management access over {@code salonId} (the controller's
+     * {@code @authz.canManageSalon} gate).
+     *
+     * <p>{@code masterId} is an ADDITIONAL optional predicate (matches {@code b.master.id}, via
+     * {@link BookingSpecifications#masterIdEquals}), composed alongside the hard {@code salonId}
+     * scope rather than replacing it — {@code null} means "every master in the salon", the same
+     * optional-predicate contract {@code statuses}/{@code from}/{@code toExclusive} carry (see
+     * {@link #findIdsByMasterIdFiltered}'s javadoc for that contract in full). {@code statuses}
+     * here is a single optional {@link BookingStatus} wrapped by the caller into a one-element
+     * {@link java.util.Set} (or {@code null}) — {@code GET /bookings/salon/{salonId}} takes one
+     * {@code status} query param, unlike {@code GET /bookings/me}'s repeatable list, so this
+     * method accepts the same {@code Collection<BookingStatus>} shape as every other query here
+     * for implementation reuse without widening the wire contract.
+     *
+     * <p>Same Phase 26.3 pre-validated-{@code Sort} contract as {@link #findIdsByMasterIdFiltered}
+     * — the {@code Pageable} passed here MUST already be normalized by {@code
+     * BookingService#normalizeBookingSort} before this method is invoked.
+     */
+    Page<UUID> findIdsBySalonIdFiltered(
+            UUID salonId, UUID masterId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable);
+
+    /**
      * Phase 29.4 — a bare {@code COUNT(*)} over an arbitrary {@link Specification}, backing
      * {@code GET /bookings/me/unclosed-count}. Deliberately generic (unlike every other method on
      * this interface, which is a named, purpose-specific query) because the caller

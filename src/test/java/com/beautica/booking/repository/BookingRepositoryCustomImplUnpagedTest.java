@@ -72,6 +72,18 @@ class BookingRepositoryCustomImplUnpagedTest {
     }
 
     @Test
+    @DisplayName("findIdsBySalonIdFiltered rejects an unpaged Pageable instead of scanning unbounded")
+    void should_throwIllegalArgument_when_salonSingleFilteredPathIsCalledUnpaged() {
+        UUID salonId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> repository.findIdsBySalonIdFiltered(
+                salonId, null, null, null, null, UNPAGED_WITH_SORT))
+                .as("the Phase 23.4 single-salon path shares findIdPage, so it shares the refusal")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(BookingRepositoryCustomImpl.UNPAGED_REJECTED_MESSAGE);
+    }
+
+    @Test
     @DisplayName("a bare Pageable.unpaged() (no Sort at all) is refused by the same guard")
     void should_throwIllegalArgument_when_unpagedCarriesNoSort() {
         UUID masterId = UUID.randomUUID();
