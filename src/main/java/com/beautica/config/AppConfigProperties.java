@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Configuration;
         VerificationPolicyConfig.class,
         PasswordResetPolicyConfig.class,
         PasswordResetOtpPolicyConfig.class,
+        RefreshTokenPolicyConfig.class,
         InternalApiKeyProperties.class,
         PublicBaseUrlProperties.class,
         SupportProperties.class,

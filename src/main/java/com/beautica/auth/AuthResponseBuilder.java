@@ -12,6 +12,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.UUID;
 
 /**
  * Single-responsibility component that turns a fully-persisted {@link User}
@@ -33,7 +34,9 @@ public class AuthResponseBuilder {
     private final Clock clock;
 
     /**
-     * Builds a complete {@link AuthResponse} for {@code user}.
+     * Builds a complete {@link AuthResponse} for {@code user}, starting a brand-new refresh
+     * token family. Used wherever a session begins fresh: login, registration/verification,
+     * invite acceptance.
      *
      * <p>Guards against inactive accounts so callers (AuthService, InviteService)
      * are both protected consistently regardless of which code path created the user.
@@ -43,6 +46,24 @@ public class AuthResponseBuilder {
      * @throws BusinessException (401) if the account is not active
      */
     public AuthResponse buildAuthResponse(User user) {
+        return buildAuthResponse(user, null);
+    }
+
+    /**
+     * Builds a complete {@link AuthResponse} for {@code user}, with the new refresh token
+     * either starting a new family ({@code familyId == null}) or continuing an existing one.
+     *
+     * <p>Used by {@code AuthService#refresh} so the replacement token inherits the
+     * predecessor's {@code familyId} — that inheritance is what makes reuse detection able to
+     * trace and revoke a whole compromised rotation chain, not just the single replayed token.
+     *
+     * @param user a fully-persisted {@link User} with a non-null {@code id}
+     * @param familyId the family the new refresh token continues, or {@code null} to start a
+     *                 new family
+     * @return a signed access token, a fresh refresh token, and identity fields
+     * @throws BusinessException (401) if the account is not active
+     */
+    public AuthResponse buildAuthResponse(User user, UUID familyId) {
         if (!user.isActive()) {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
         }
@@ -53,8 +74,10 @@ public class AuthResponseBuilder {
         String rawRefreshToken = jwtTokenProvider.generateRefreshToken(user.getId());
 
         Instant expiresAt = clock.instant().plusMillis(jwtConfig.refreshTokenExpiration());
-        var refreshToken = new RefreshToken(
-                tokenGenerator.hash(rawRefreshToken), user.getId(), expiresAt);
+        String hashedToken = tokenGenerator.hash(rawRefreshToken);
+        var refreshToken = familyId == null
+                ? RefreshToken.startNewFamily(hashedToken, user.getId(), expiresAt)
+                : RefreshToken.rotate(hashedToken, user.getId(), expiresAt, familyId);
         refreshTokenRepository.save(refreshToken);
 
         return AuthResponse.of(

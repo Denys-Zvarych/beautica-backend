@@ -10,6 +10,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -45,6 +46,12 @@ class AuthControllerIT extends AbstractIntegrationTest {
 
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private TokenGenerator tokenGenerator;
 
     @Autowired
     private TransactionTemplate transactionTemplate;
@@ -367,10 +374,15 @@ class AuthControllerIT extends AbstractIntegrationTest {
         String originalRefreshToken = loginBody.data().refreshToken();
 
         log.debug("Act: first refresh — rotates the token for email={}", email);
-        restTemplate.postForEntity(
+        ResponseEntity<String> firstRefreshResp = restTemplate.postForEntity(
                 "/api/v1/auth/refresh",
                 new RefreshRequest(originalRefreshToken),
                 String.class);
+        var firstRefreshBody = objectMapper.readValue(
+                firstRefreshResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        // The legitimate holder's new, still-live token — captured so we can prove below that
+        // reuse detection revokes the WHOLE family, not just the specific token replayed.
+        String rotatedRefreshToken = firstRefreshBody.data().refreshToken();
 
         log.debug("Act: replay the original (now-rotated) refresh token for email={}", email);
         ResponseEntity<String> replayResp = restTemplate.postForEntity(
@@ -385,5 +397,77 @@ class AuthControllerIT extends AbstractIntegrationTest {
         assertThat(body.success())
                 .as("success flag must be false for revoked token replay")
                 .isFalse();
+
+        // The real regression test: the replay above must have revoked EVERY token in the
+        // family, including rotatedRefreshToken — a token the legitimate holder never misused.
+        // If AuthService#refresh's family-wide revoke UPDATE was rolled back (the CRITICAL bug:
+        // throwing a BusinessException after the UPDATE marks the @Transactional refresh()
+        // method rollback-only, silently discarding the UPDATE before commit), this next
+        // refresh would still return 401 — findByToken would just fail differently — so the
+        // HTTP status alone cannot distinguish "family revoked" from "rejected for another
+        // reason". The DB assertion below is the part that actually proves the fix.
+        log.debug("Act: attempt refresh with the legitimately-rotated token for email={}", email);
+        ResponseEntity<String> secondRefreshResp = restTemplate.postForEntity(
+                "/api/v1/auth/refresh",
+                new RefreshRequest(rotatedRefreshToken),
+                String.class);
+
+        assertThat(secondRefreshResp.getStatusCode())
+                .as("the rotated (but never misused) token must also be rejected once the family is compromised")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        String hashedRotatedToken = tokenGenerator.hash(rotatedRefreshToken);
+        var rotatedTokenRow = refreshTokenRepository.findByToken(hashedRotatedToken).orElseThrow(
+                () -> new AssertionError("rotated refresh token row must still exist in the DB"));
+        assertThat(rotatedTokenRow.isRevoked())
+                .as("rotated token's DB row must be is_revoked=true — proves the family-wide "
+                        + "revoke UPDATE actually committed, not merely that the HTTP call failed")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("should mint DISTINCT refresh-token families for two different users who log in")
+    void should_mintDistinctFamilyIds_when_twoDifferentUsersLogIn() throws Exception {
+        // Regression net for the family-minting gap: reuse detection revokes an entire family
+        // on replay, so if two unrelated users' logins ever shared a family, one attacker
+        // replaying their own rotated-out token would revoke a STRANGER's live sessions too —
+        // a self-service denial-of-service. AuthResponseBuilderTest proves the minting
+        // mechanism in isolation; this test proves the real end-to-end path (HTTP → AuthService
+        // .login → AuthResponseBuilder → DB) never coalesces families across users, matching
+        // this class's existing DB-assertion style rather than trusting the HTTP status alone.
+        var emailA = "family.usera@beautica.com";
+        var emailB = "family.userb@beautica.com";
+        var password = "Familydistinct1";
+        log.debug("Arrange: register+verify two independent users email={} email={}", emailA, emailB);
+
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(emailA, password, SelfRegistrationRole.CLIENT, "Test", "UserA", "+380501234567", null),
+                String.class);
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(emailB, password, SelfRegistrationRole.CLIENT, "Test", "UserB", "+380509876543", null),
+                String.class);
+        verifyEmailInDb(emailA);
+        verifyEmailInDb(emailB);
+
+        log.debug("Act: log in as both users");
+        ResponseEntity<String> loginRespA = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(emailA, password), String.class);
+        ResponseEntity<String> loginRespB = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(emailB, password), String.class);
+
+        var bodyA = objectMapper.readValue(loginRespA.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        var bodyB = objectMapper.readValue(loginRespB.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+
+        var tokenRowA = refreshTokenRepository
+                .findByToken(tokenGenerator.hash(bodyA.data().refreshToken()))
+                .orElseThrow(() -> new AssertionError("user A's refresh token row must exist in the DB"));
+        var tokenRowB = refreshTokenRepository
+                .findByToken(tokenGenerator.hash(bodyB.data().refreshToken()))
+                .orElseThrow(() -> new AssertionError("user B's refresh token row must exist in the DB"));
+
+        assertThat(tokenRowB.getFamilyId())
+                .as("two different users' logins must never share a family_id — a shared family "
+                        + "would let user A's replay revoke user B's unrelated sessions")
+                .isNotEqualTo(tokenRowA.getFamilyId());
     }
 }

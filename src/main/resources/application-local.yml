@@ -38,8 +38,8 @@ spring:
 app:
   jwt:
     secret: ${JWT_SECRET}
-    access-token-expiration: 3600000
-    refresh-token-expiration: 604800000
+    access-token-expiration: 3600000      # 1 hour in ms
+    refresh-token-expiration: 2592000000  # 30 days in ms
   cloudflare-r2:
     access-key-id: local
     secret-access-key: local
@@ -65,6 +65,8 @@ app:
     stale-code-retention: 24h
     resend-cooldown: 10s   # Short cooldown for local dev — avoid waiting 60 s between resend attempts
   password-reset:
+    cleanup-retention: 7d
+  refresh-token:
     cleanup-retention: 7d
   password-reset-otp:
     otp-ttl: 15m
