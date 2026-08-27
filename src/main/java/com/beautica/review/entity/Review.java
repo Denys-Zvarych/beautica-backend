@@ -40,6 +40,13 @@ import java.util.UUID;
                 // idx_reviews_salon_created and idx_reviews_independent_master are partial indexes
                 // (WHERE salon_id IS NOT NULL / IS NULL) — defined in V40/V41, not expressible in JPA @Index.
                 // idx_reviews_salon_rating_desc/asc (V104) are likewise partial (WHERE salon_id IS NOT NULL).
+                // idx_reviews_salon_master_rating (V141) — (salon_id, master_id, rating)
+                // WHERE salon_id IS NOT NULL. Also partial, so also not mirror-able here. It backs the
+                // nested per-master aggregate mobile Phase 111 introduced
+                // (ReviewRepository#recalculateSalonRating and #countBySalonIdGroupByRating): it supplies
+                // the GROUP BY master_id order and makes the scan index-only, removing the Sort node and
+                // all heap fetches. Documented here so ddl-auto=validate drift on this table stays
+                // explained rather than looking like an unmirrored index.
         }
 )
 @Getter

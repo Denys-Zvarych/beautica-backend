@@ -790,7 +790,7 @@ public class AppointmentTransitionService {
                 .toList();
 
         OffsetDateTime newFirstStart = req.newStartsAt();
-        BookingStartsAtValidator.validate(newFirstStart, clock);
+        BookingStartsAtValidator.validate(newFirstStart, clock, initiatedByProvider);
 
         Master master = confirmedItems.get(0).getMaster();
         UUID masterId = master.getId();
@@ -799,7 +799,7 @@ public class AppointmentTransitionService {
         // Same working-hours / effective-day validation the create path relies on, run over the
         // WHOLE multi-service block (BE-2's N-service overload). Run BEFORE any lock, mirroring
         // BookingService#assertStartsOnAvailableSlot's placement.
-        assertVisitStartsOnAvailableSlot(masterId, masterServiceIds, newFirstStart);
+        assertVisitStartsOnAvailableSlot(masterId, masterServiceIds, newFirstStart, initiatedByProvider);
 
         // Timing-only re-layout — preserves every item's frozen duration/buffer/price. Re-planned
         // over the CONFIRMED items only (declined items are excluded from the moving block).
@@ -1001,7 +1001,7 @@ public class AppointmentTransitionService {
         }
 
         OffsetDateTime newStartsAt = req.newStartsAt();
-        BookingStartsAtValidator.validate(newStartsAt, clock);
+        BookingStartsAtValidator.validate(newStartsAt, clock, initiatedByProvider);
 
         Master master = target.getMaster();
         UUID masterId = master.getId();
@@ -1010,7 +1010,8 @@ public class AppointmentTransitionService {
         // the SINGLE-service getAvailableSlots overload, since only ONE item moves (never the
         // multi-service overload rescheduleAppointment uses for the whole block). Run BEFORE any
         // lock, keeping the lock window tight (backend-perf).
-        assertItemStartsOnAvailableSlot(masterId, target.getMasterService().getId(), newStartsAt);
+        assertItemStartsOnAvailableSlot(
+                masterId, target.getMasterService().getId(), newStartsAt, initiatedByProvider);
 
         // Duration + buffer are frozen at the original booking; mirror the create-path end-time
         // formula. NEVER VisitPlanner — no re-layout, no cascade (L2).
@@ -1039,7 +1040,26 @@ public class AppointmentTransitionService {
         User owningClient = appointment.getClient();
         if (owningClient != null) {
             acquireClientLock(owningClient.getId());
-            assertNoClientConflictExcludingBooking(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            // OVERRIDE (product decision 2026-08-22, widened 2026-08-26): req.allowClientOverlap()
+            // mirrors BookingService#doCreateBooking's / #rescheduleBooking's identical opt-in —
+            // skips ONLY this self-conflict check. assertNoSiblingOverlap above (in-visit
+            // self-double-book), the master-scoped existsOverlapExcluding below and the
+            // no_overlapping_bookings EXCLUDE constraint still run unconditionally regardless of
+            // this flag. Defaults false (primitive boolean), so an absent/omitted field
+            // reproduces today's behaviour byte-for-byte.
+            //
+            // ACTOR GATE (backend-security HIGH, cycle audit 2026-08-26): the override is the
+            // CLIENT's consent to give, not the provider's. This per-item reschedule route is
+            // reachable by SALON_OWNER/SALON_ADMIN/INDEPENDENT_MASTER as well as CLIENT (see
+            // @PreAuthorize on AppointmentController#rescheduleAppointmentItem) — so
+            // req.allowClientOverlap() must be honored ONLY when the client themselves is the
+            // actor. `initiatedByProvider` (= actorRole != Role.CLIENT, set at the top of this
+            // method) is the same discriminator already driving the ownership guard and
+            // BookingTemporalGuard/assertItemNotElapsedForClient branch above — reused here
+            // rather than threading a new parameter.
+            if (initiatedByProvider || !req.allowClientOverlap()) {
+                assertNoClientConflictExcludingBooking(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            }
             lockResult = bookingRepository.acquireAdvisoryLock(masterId);
         } else {
             // No client lock was taken (guest visit) — the master lock must fuse its own
@@ -1513,12 +1533,13 @@ public class AppointmentTransitionService {
      * {@code startsAt.toLocalDate()} above got wrong for a just-after-midnight start sent in a non-Kyiv
      * offset.
      */
-    private void assertVisitStartsOnAvailableSlot(UUID masterId, List<UUID> masterServiceIds, OffsetDateTime startsAt) {
+    private void assertVisitStartsOnAvailableSlot(
+            UUID masterId, List<UUID> masterServiceIds, OffsetDateTime startsAt, boolean initiatedByProvider) {
         // preloaded = null (Perf MEDIUM, 2026-08-11): this is a RESCHEDULE, so nothing has resolved the
         // assignments here — replanFromNewStart works purely off each item's frozen duration/buffer
         // snapshot and never touches master_services. The gate loads them itself, exactly as before.
         BookingSlotAvailabilityGuard.assertVisitStartsOnAvailableSlot(
-                slotCalculationService, masterId, masterServiceIds, null, startsAt);
+                slotCalculationService, masterId, masterServiceIds, null, startsAt, initiatedByProvider);
     }
 
     /**
@@ -1535,11 +1556,12 @@ public class AppointmentTransitionService {
      * rather than a shared bean (avoids a circular dependency — {@code BookingService} already
      * depends on THIS class for the per-item client-cancel header-lock seam).
      */
-    private void assertItemStartsOnAvailableSlot(UUID masterId, UUID masterServiceId, OffsetDateTime startsAt) {
+    private void assertItemStartsOnAvailableSlot(
+            UUID masterId, UUID masterServiceId, OffsetDateTime startsAt, boolean initiatedByProvider) {
         // preloaded = null — same reasoning as #assertVisitStartsOnAvailableSlot above: a per-item
         // reschedule resolves no assignment, so there is none to hand through.
         BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
-                slotCalculationService, masterId, masterServiceId, null, startsAt);
+                slotCalculationService, masterId, masterServiceId, null, startsAt, initiatedByProvider);
     }
 
     /**

@@ -20,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
@@ -62,6 +63,17 @@ class AuthorizationServiceTest {
 
     @Mock
     private BookingRepository bookingRepository;
+
+    /**
+     * A REAL instance, not a mock (perf MEDIUM, 2026-08-18): in production this is a
+     * {@code @RequestScope} bean that memoises {@code users.salon_id} for one request. Spying the
+     * real thing keeps every {@code verify(userRepository).findSalonIdById(...)} assertion in this
+     * class meaningful — the memo is transparent on a first read and only suppresses a SECOND,
+     * identical read of the same actor within one instance's lifetime (here: one test method, since
+     * JUnit 5 builds a fresh test instance per test).
+     */
+    @Spy
+    private ActorSalonAssignmentMemo actorSalonAssignmentMemo = new ActorSalonAssignmentMemo();
 
     @InjectMocks
     private AuthorizationService authorizationService;

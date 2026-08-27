@@ -124,9 +124,13 @@ public class SearchController {
             return tooShortQueryResponse(pageable.getPageNumber(), pageable.getPageSize());
         }
         Page<MasterSearchResult> result = searchService.searchMasters(request, pageable);
-        // AUTH-GATE street address per-request, AFTER the cache read (the cached
-        // value always holds the full object). Anonymous callers get street /
-        // buildingNo nulled out — privacy for masters' home addresses (§I).
+        // AUTH-GATE street address per-request, AFTER the cache read. Anonymous callers get
+        // street / buildingNo / locationNote nulled out — privacy for masters' home
+        // addresses (§I). This is the CALLER-dependent half only; the caller-INDEPENDENT
+        // per-role address matrix (MasterType.disclosesOwnAddress — a SALON_MASTER's /
+        // SALON_OWNER's own address is never surfaced to anyone) is applied inside
+        // SearchService.mapMasterRow, so the cached object is already masked by type and this
+        // strip cannot be the only thing standing between a salon master and disclosure.
         List<MasterSearchResult> content = isAuthenticated()
                 ? result.getContent()
                 : result.getContent().stream().map(MasterSearchResult::withoutStreetAddress).toList();

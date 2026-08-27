@@ -286,6 +286,26 @@ public class BookingService {
      * because the mobile card could not trust a flag that was a constant. Do not re-derive this
      * conjunction at either call site.
      *
+     * <p><b>The {@code hasClient} conjunct is load-bearing on the DETAIL path only, and is
+     * deliberately retained as defence-in-depth on the listing path</b> (QA GAP 3, 2026-08-20 —
+     * documented, not "fixed"). {@link #loadProviderReviewBatch} already drops every
+     * {@code b.getClient() == null} row from its candidate set at {@code loadProviderReviewBatch}'s
+     * first statement, so such a row can never enter {@code withAuthority} and arrives here with
+     * {@code hasProviderAuthority == false} — the conjunction is already {@code false} one term
+     * earlier and this term is unreachable for it. {@link #computeProviderCanReviewClient} has no
+     * such pre-filter: it derives authority from the actor's relationship to the MASTER/SALON, which
+     * a guest or STAFF walk-in booking satisfies exactly as well as an account-bound one, so on
+     * {@code GET /bookings/&#123;id&#125;} this term is the ONLY thing standing between a COMPLETED
+     * walk-in and a {@code true} the {@code POST /client-reviews} write endpoint would then reject
+     * (there is no {@code users} row to attach a {@code ClientReview} to).
+     *
+     * <p>The practical consequence, and the reason this is written down: a regression that deletes
+     * this single conjunct is INVISIBLE to every listing test, because the batch pre-filter makes
+     * the removal a no-op there. It was measured — mutation M6 of the Phase 22.5 read-path pass
+     * dropped this term and killed no test in {@code StaffBookingReadPathIT}'s listing suite.
+     * {@code StaffBookingReadPathIT.BookingDetail} exists to close that hole and is the suite that
+     * fails when this term goes; keep a detail-path assertion on the flag alive.
+     *
      * <p>{@code clientReviewExists} is a {@link BooleanSupplier}, not a {@code boolean}, so the
      * detail path keeps paying its {@code client_reviews} probe ONLY when the cheap in-memory
      * conjuncts have not already decided the answer — the short-circuit that keeps
@@ -475,7 +495,11 @@ public class BookingService {
                 p.masterReviewCount(),
                 // Phase B2 — the booking's own salon snapshot (b.salon.id), NOT p.salonName()'s
                 // source (m.salon). Nullable for an independent master's booking.
-                p.salonId());
+                p.salonId(),
+                // Derived from the SAME p.categoryName() scalar — the projection's sd.category
+                // select — via the shared helper so this path and the entity path can never
+                // disagree (BookingDetailContractIT's reflective parity loop). No second query.
+                BookingDetailResponse.categoryKeyOrNull(p.categoryName()));
     }
 
     /**
@@ -1147,6 +1171,12 @@ public class BookingService {
      */
     private ProviderReviewBatch loadProviderReviewBatch(
             Role role, UUID actorUserId, List<Booking> page) {
+        // This b.getClient() != null pre-filter is what makes providerCanReviewClient's own
+        // hasClient conjunct unreachable on THIS path — a guest/STAFF row never reaches
+        // withAuthority, so it is already false by the authority term. That redundancy is retained
+        // on purpose; see providerCanReviewClient's javadoc for why (the detail path has no such
+        // pre-filter, so the conjunct is load-bearing there) and for the mutation that proved a
+        // listing test can never detect its removal.
         List<Booking> candidates = page.stream()
                 .filter(b -> b.getClient() != null
                         && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
@@ -1747,7 +1777,9 @@ public class BookingService {
      * @param actorUserId the authenticated actor (from the security principal, never the body)
      * @param actorRole   the actor's role, resolved by the controller from the JWT
      * @param bookingId   the booking to move
-     * @param req         the new start time
+     * @param req         the new start time; {@link RescheduleBookingRequest#allowClientOverlap()}
+     *                    opts out of the self-conflict check below, mirroring
+     *                    {@link CreateBookingRequest#allowClientOverlap()}
      * @return the updated booking
      * @throws ForbiddenException              if the actor is not the owning client / an
      *                                          authorized provider (403)
@@ -1774,7 +1806,7 @@ public class BookingService {
                 : resolveBookingForClientReschedule(actorUserId, bookingId);
 
         OffsetDateTime newStartsAt = req.newStartsAt();
-        validateStartsAt(newStartsAt);
+        validateStartsAt(newStartsAt, initiatedByProvider);
 
         UUID masterId = booking.getMaster().getId();
         UUID masterServiceId = booking.getMasterService().getId();
@@ -1789,7 +1821,7 @@ public class BookingService {
         // No preloaded assignment here (Perf MEDIUM, 2026-08-11): the reschedule path holds only
         // booking.getMasterService(), an uninitialised LAZY proxy whose graph the availability read needs —
         // dereferencing it would cost the very query passing it is meant to save. null ⇒ plain reload.
-        assertStartsOnAvailableSlot(masterId, masterServiceId, null, newStartsAt);
+        assertStartsOnAvailableSlot(masterId, masterServiceId, null, newStartsAt, initiatedByProvider);
 
         // Duration + buffer are frozen at the original booking; mirror the create-path
         // end-time formula (duration + buffer) rather than recomputing from master_services.
@@ -1837,7 +1869,27 @@ public class BookingService {
             // Client-conflict check (excluding this booking's own row) runs BEFORE the
             // master-busy check — and before the master lock is even acquired — same precedence
             // and rationale as create; see doCreateBooking.
-            assertNoClientConflictExcluding(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            //
+            // OVERRIDE (product decision 2026-08-22, widened 2026-08-26): req.allowClientOverlap()
+            // mirrors doCreateBooking's identical opt-in — skips ONLY this self-conflict check.
+            // The master-scoped existsOverlapExcluding check below and the
+            // no_overlapping_bookings EXCLUDE constraint still run unconditionally regardless of
+            // this flag, because they protect a DIFFERENT client's claim on this master's slot,
+            // which is never the requesting client's to waive. Defaults false (primitive
+            // boolean), so an absent/omitted field reproduces today's behaviour byte-for-byte.
+            //
+            // ACTOR GATE (backend-security HIGH, cycle audit 2026-08-26): the override is the
+            // CLIENT's consent to give, not the provider's. Unlike doCreateBooking (CLIENT-only
+            // endpoint), this reschedule route is also reachable by SALON_OWNER/SALON_ADMIN/
+            // INDEPENDENT_MASTER (see @PreAuthorize on BookingController#rescheduleBooking) — so
+            // req.allowClientOverlap() must be honored ONLY when the client themselves is the
+            // actor. `initiatedByProvider` (= actorRole != Role.CLIENT, set at the top of this
+            // method) is the same discriminator already driving resolveBookingForProviderReschedule
+            // vs resolveBookingForClientReschedule and validateStartsAt above — reused here rather
+            // than threading a new parameter.
+            if (initiatedByProvider || !req.allowClientOverlap()) {
+                assertNoClientConflictExcluding(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            }
             // acquireClientLock already fused the transaction-scoped lock_timeout — reuse the
             // plain (untimed-fuse) master lock, same as every other call site that took the
             // client lock first.
@@ -2001,7 +2053,8 @@ public class BookingService {
                 .orElseThrow(() -> new NotFoundException("Master service not found"));
 
         OffsetDateTime startsAt = request.startsAt().toOffsetDateTime();
-        validateStartsAt(startsAt);
+        // false: the authenticated CLIENT/APP create path keeps the 15-minute floor, untouched.
+        validateStartsAt(startsAt, false);
 
         BigDecimal effectivePrice = msa.getPriceOverride() != null
                 ? msa.getPriceOverride()
@@ -2039,7 +2092,17 @@ public class BookingService {
         // product decision — AND the shared per-master lock (contended by every other client
         // racing for the same popular master) is never touched for a conflict that is entirely
         // about this client's own calendar (backend-perf).
-        assertNoClientConflict(clientId, startsAt, endsAt);
+        //
+        // OVERRIDE (product decision 2026-08-22): request.allowClientOverlap() is an explicit,
+        // client-supplied opt-in to double-book THEMSELVES — "it's only the client's responsibility".
+        // Skips ONLY this self-conflict check. It changes nothing below: the per-master advisory
+        // lock, existsOverlap and the no_overlapping_bookings EXCLUDE constraint still run
+        // unconditionally, because they protect a DIFFERENT client's claim on this master's slot,
+        // which is never the requesting client's to waive. Defaults false (primitive boolean), so an
+        // absent/omitted field reproduces today's behaviour byte-for-byte.
+        if (!request.allowClientOverlap()) {
+            assertNoClientConflict(clientId, startsAt, endsAt);
+        }
 
         // SCHEDULE-FIT GATE (2026-08-11 HIGH). validateStartsAt above enforces only the lead-time floor
         // and the 180-day horizon; assertNoClientConflict enforces only the CLIENT's own calendar; the
@@ -2065,7 +2128,7 @@ public class BookingService {
         //
         // `msa` is handed through so the gate does not re-issue the findByMasterIdAndIdWithGraph this
         // method already ran at :1823 (Perf MEDIUM, 2026-08-11) — same persistence context, same instance.
-        assertStartsOnAvailableSlot(master.getId(), msa.getId(), msa, startsAt);
+        assertStartsOnAvailableSlot(master.getId(), msa.getId(), msa, startsAt, false);
 
         Integer lockResult = bookingRepository.acquireAdvisoryLock(master.getId());
         if (lockResult == null) {
@@ -2167,15 +2230,19 @@ public class BookingService {
      * shared bean (avoids a circular dependency with {@code AppointmentTransitionService}).
      */
     private void assertStartsOnAvailableSlot(
-            UUID masterId, UUID masterServiceId, MasterServiceAssignment preloaded, OffsetDateTime startsAt) {
+            UUID masterId, UUID masterServiceId, MasterServiceAssignment preloaded, OffsetDateTime startsAt,
+            boolean initiatedByProvider) {
         BookingSlotAvailabilityGuard.assertStartsOnAvailableSlot(
-                slotCalculationService, masterId, masterServiceId, preloaded, startsAt);
+                slotCalculationService, masterId, masterServiceId, preloaded, startsAt, initiatedByProvider);
     }
 
-    private void validateStartsAt(OffsetDateTime startsAt) {
+    private void validateStartsAt(OffsetDateTime startsAt, boolean initiatedByProvider) {
         // Shared with GuestBookingService (DRY) so the authenticated and guest paths
         // enforce the identical lead-time floor + max-window cap.
-        BookingStartsAtValidator.validate(startsAt, clock);
+        //
+        // initiatedByProvider == true selects the STAFF floor (minimum lead 0) that walk-in CREATE
+        // already uses — gated on the ACTOR, never on booking.getSource(). CREATE callers pass false.
+        BookingStartsAtValidator.validate(startsAt, clock, initiatedByProvider);
     }
 
     /**

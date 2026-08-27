@@ -14,8 +14,13 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Resolves and chains the N services of a single-visit booking into contiguous, per-item priced/duration
@@ -61,18 +66,25 @@ class VisitPlanner {
      * <p>Duplicates are allowed verbatim (locked decision): the block sums repeats, staying consistent
      * with BE-2 availability. An unknown, foreign OR inactive {@code masterServiceId} answers 404
      * uniformly — the master-scoped finder contract BE-2 uses.
+     *
+     * <p><b>ONE resolution round-trip, not N</b> (perf LOW, 2026-08-22): the assignments are
+     * batch-loaded by {@link #resolveAssignments} before the chaining loop, which then reads them
+     * from the map in {@code serviceIds}' own order. See that method for how order, duplicates and
+     * the uniform 404 are each preserved bit-for-bit.
      */
     List<PlannedItem> planChainedItems(Master master, List<UUID> serviceIds, OffsetDateTime firstStart) {
         assertServiceIds(serviceIds);
 
+        Map<UUID, MasterServiceAssignment> assignments = resolveAssignments(master, serviceIds);
+
         List<PlannedItem> items = new ArrayList<>(serviceIds.size());
         OffsetDateTime cursor = firstStart;
         long totalMinutes = 0;
+        // Iterates serviceIds, NOT the map: list ORDER drives chain sequencing, and a repeated id
+        // legitimately produces its own chain item on each occurrence (locked decision) — both of
+        // which a walk over the de-duplicated map would silently destroy.
         for (UUID masterServiceId : serviceIds) {
-            MasterServiceAssignment msa = masterServiceRepository
-                    .findByMasterIdAndIdWithGraph(master.getId(), masterServiceId)
-                    .filter(MasterServiceAssignment::isActive)
-                    .orElseThrow(() -> new NotFoundException("Master service not found"));
+            MasterServiceAssignment msa = assignments.get(masterServiceId);
 
             int duration = msa.getDurationOverrideMinutes() != null
                     ? msa.getDurationOverrideMinutes()
@@ -95,6 +107,55 @@ class VisitPlanner {
         }
         assertContiguous(items);
         return items;
+    }
+
+    /**
+     * Batch-resolves every DISTINCT {@code serviceId} to its active, master-scoped assignment in ONE
+     * round-trip, keyed by assignment id (perf LOW, 2026-08-22).
+     *
+     * <p>Replaces the per-iteration {@code findByMasterIdAndIdWithGraph} this class ran inside its
+     * chaining loop: that cost N sequential single-row SELECTs (N bounded at
+     * {@link SlotCalculationService#MAX_SERVICES_PER_VISIT}) and, because duplicate ids are legal
+     * input, issued ten byte-identical statements for the same service booked ten times.
+     *
+     * <h4>The three behaviours this MUST NOT change, and how each is held</h4>
+     * <ul>
+     *   <li><b>Order</b> — none is expected of the returned map. The caller keeps walking
+     *       {@code serviceIds} itself and looks each position up here, so list order still drives
+     *       chain sequencing and {@link #assignmentsOf}'s parallel-index contract still holds.</li>
+     *   <li><b>Duplicates</b> — de-duplicated for the QUERY only. The same assignment instance is
+     *       returned for every occurrence, and each occurrence still produces its own
+     *       {@code PlannedItem} with its own window, exactly as N separate lookups did.</li>
+     *   <li><b>Uniform 404</b> — the {@code isActive} filter is applied to the batch result with the
+     *       identical semantics, and a size shortfall raises the SAME
+     *       {@code NotFoundException("Master service not found")}. It deliberately does not name the
+     *       offending id: unknown, foreign (another master's) and inactive must stay
+     *       indistinguishable, or the message becomes an enumeration oracle over other providers'
+     *       catalogues. The shortfall check therefore never reports WHICH id was missing.</li>
+     * </ul>
+     *
+     * <p>The 404 also still precedes the &Sigma;-duration cap, because this runs before the loop that
+     * accumulates {@code totalMinutes} — a request that is both over-cap and names an unknown
+     * service answers 404, as it did before.
+     */
+    private Map<UUID, MasterServiceAssignment> resolveAssignments(Master master, List<UUID> serviceIds) {
+        Set<UUID> distinctIds = new LinkedHashSet<>(serviceIds);
+        // A null element can never resolve to an assignment; the per-id finder answered 404 for it,
+        // so short-circuit rather than let Set.copyOf/IN-list turn it into a 500.
+        if (distinctIds.remove(null)) {
+            throw new NotFoundException("Master service not found");
+        }
+
+        Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
+                .findByMasterIdAndIdInWithGraph(master.getId(), distinctIds)
+                .stream()
+                .filter(MasterServiceAssignment::isActive)
+                .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
+
+        if (byId.size() != distinctIds.size()) {
+            throw new NotFoundException("Master service not found");
+        }
+        return byId;
     }
 
     /**

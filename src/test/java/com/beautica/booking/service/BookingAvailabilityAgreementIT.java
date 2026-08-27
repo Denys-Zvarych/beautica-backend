@@ -796,7 +796,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         // 2) A REAL booking on service A, through BookingService's own transaction, so the
         //    afterCommit eviction hook fires exactly as it does in production.
         bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null));
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false));
 
         // 3) The outcome the user asked for — immediately, with no sleep and no TTL expiry.
         assertThat(slotStarts(m.masterId(), day, svcB))
@@ -821,7 +821,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
                         List.of(LocalTime.of(11, 0), LocalTime.of(15, 0))));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svc, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svc, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         // Isolation, so this case fails for exactly ONE reason. The create above ran the schedule-fit
         // gate, which populated this master's `available-slots` key with the PRE-booking list; clearing
         // here means the warm read below is unambiguously fresh and case 12 pins the no-show eviction
@@ -923,7 +923,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         // Isolation (case 12's reasoning verbatim): the create above already swept this master's
         // keys, so clearing here makes the warm read below unambiguously fresh and this case pin
         // the CANCEL eviction alone, never the create-path eviction case 11 owns.
@@ -963,7 +963,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(12, 0), LocalTime.of(15, 0));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         clearSlotCache();
 
         assertThat(slotStarts(m.masterId(), day, svcB))
@@ -998,7 +998,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         seedExplicitTimesDay(m, day, LocalTime.of(11, 0), LocalTime.of(13, 0), LocalTime.of(15, 0));
 
         UUID bookingId = bookingService.createBooking(client, null, new CreateBookingRequest(
-                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null)).id();
+                m.masterId(), svcA, day.atTime(11, 0).atZone(TimeZones.KYIV), null, null, false)).id();
         clearSlotCache();
 
         // 1) Warm service B's entry with the pre-move picture: 11:00 taken, 13:00 and 15:00 free.
@@ -1014,7 +1014,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         //    occupied 13:00 — a per-key eviction that forgot either side fails exactly one half of
         //    the single assertion below.
         bookingService.rescheduleBooking(client, bookingId, new RescheduleBookingRequest(
-                day.atTime(13, 0).atZone(TimeZones.KYIV).toOffsetDateTime()));
+                day.atTime(13, 0).atZone(TimeZones.KYIV).toOffsetDateTime(), false));
 
         assertThat(slotStarts(m.masterId(), day, svcB))
                 .as("ONE post-move read shows both halves at once: 11:00 came back (old side "
@@ -1107,6 +1107,190 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
      * Read-only: it never mutates the cache, so it cannot influence the behavioural assertions it sits
      * beside.
      */
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 19 — the STAFF existence check answers exactly what the STAFF slot list would
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>Perf-refactor equivalence pin (perf LOW, 2026-08-18).</b> The staff create path's
+     * schedule-fit gate used to materialise a whole day of {@code AvailableSlotResponse} objects and
+     * scan them for {@code startsAt}; it now asks {@link SlotCalculationService#isStaffSlotAvailable},
+     * which applies the same comparison inside the per-interval walk and short-circuits. The staff
+     * slot list is uncached, so that list was rebuilt on every single create purely to answer a
+     * boolean.
+     *
+     * <p>The refactor is only safe if the two agree on EVERY probe, not just on the happy one, so
+     * this drives both against the genuine resolver + calculator + booking subtraction and asserts
+     * the boolean equals list membership for: an offered start, an off-grid start, a start below the
+     * staff floor, and a start outside the working interval. Both the INTERVAL day shape and the
+     * {@code EXPLICIT_TIMES} day shape are covered, because {@code dayFreeRangesContainStart} mirrors
+     * {@code computeDayFreeRanges}'s branch on exactly that switch.
+     *
+     * <p>It doubles as the staff-floor pin: at 17:20 the 17:30 start IS offered to staff (floor 0)
+     * while the client list is empty (floor 17:35), which is the whole reason a separate staff entry
+     * point exists.
+     */
+    @Test
+    @DisplayName("case 19 — isStaffSlotAvailable ⇔ getStaffAvailableSlots membership on both day "
+            + "shapes, and the 17:30 start staff may book is one the client list does not offer")
+    void should_agreeWithTheStaffSlotList_when_answeringTheStaffExistenceCheck() {
+        Master m = seedIndependentMaster();
+        UUID svc = addService(m, 30, 0);
+        seedInterval(m.masterId(), TODAY, null, TODAY.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(18, 0));
+
+        // The staff floor is "now" (17:20), not "now + 15" — so the 17:30 grid start survives.
+        assertThat(staffSlotStarts(m.masterId(), TODAY, svc))
+                .as("staff floor 0 keeps the last grid start of the day")
+                .containsExactly(LocalTime.of(17, 30));
+        assertThat(slotStarts(m.masterId(), TODAY, svc))
+                .as("the CLIENT list at the same moment is empty — 17:30 is below the 17:35 cutoff")
+                .isEmpty();
+
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(17, 30));  // offered
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(17, 45));  // off the 30-min grid
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(17, 0));   // below the staff floor
+        assertStaffAgreement(m.masterId(), TODAY, svc, LocalTime.of(18, 30));  // outside the interval
+
+        // EXPLICIT_TIMES day — the other arm of the isExplicitTimes switch both methods branch on.
+        LocalDate declaredDay = TODAY.plusDays(9);
+        seedExplicitTimesDay(m, declaredDay, LocalTime.of(13, 0), LocalTime.of(15, 0));
+
+        assertThat(staffSlotStarts(m.masterId(), declaredDay, svc))
+                .containsExactly(LocalTime.of(13, 0), LocalTime.of(15, 0));
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(13, 0));  // declared
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(15, 0));  // declared
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(14, 0));  // never declared
+        assertStaffAgreement(m.masterId(), declaredDay, svc, LocalTime.of(13, 30)); // grid, undeclared
+    }
+
+    /** The STAFF (zero-lead) slot-list start wall-clocks for a single date. */
+    private List<LocalTime> staffSlotStarts(UUID masterId, LocalDate date, UUID masterServiceId) {
+        return slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceId, null)
+                .stream()
+                .map(s -> s.startsAt().toLocalTime())
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * The invariant the perf refactor must preserve: the boolean the create-path gate now asks equals
+     * the membership test it used to run over the materialised list — for this exact start, on this
+     * exact date, through the same real pipeline.
+     */
+    private void assertStaffAgreement(UUID masterId, LocalDate date, UUID masterServiceId,
+                                      LocalTime start) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+
+        boolean inList = slotCalculationService
+                .getStaffAvailableSlots(masterId, date, masterServiceId, null).stream()
+                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
+        boolean existenceCheck = slotCalculationService
+                .isStaffSlotAvailable(masterId, date, masterServiceId, null, startsAt);
+
+        assertThat(existenceCheck)
+                .as("isStaffSlotAvailable must equal list membership at %s on %s", start, date)
+                .isEqualTo(inList);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Case 20 — the STAFF chained-visit existence check answers exactly what the STAFF chained
+    // slot list would (Phase 22.10 — the whole-chain counterpart of case 19)
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>Chained boolean-vs-list equivalence pin.</b> {@link SlotCalculationService#isStaffVisitSlotAvailable}
+     * must agree, position for position, with a scan of {@link SlotCalculationService#getStaffAvailableSlots(
+     * UUID, LocalDate, List, List)} for the SAME ordered {@code masterServiceIds}, exactly as case 19 pins the
+     * single-service pair. Two services (30-min + 45-min, no buffer) chain to a 75-minute Σ-duration block on a
+     * 09:00–18:00 interval day.
+     *
+     * <p><b>Also proves the whole-chain semantics are real, not just that the two staff methods agree with
+     * each other (D2.1).</b> On a narrow 13:00–14:00 interval, 13:30 fits {@code svcA} (30 min) ALONE with
+     * 30 minutes to spare — a per-item check on the first service would wrongly accept it — but the CHAIN'S
+     * 75 minutes overruns the 60-minute interval, so both the chained boolean and the chained list must
+     * refuse 13:30. The mechanism guard below asserts the per-item single-service check genuinely WOULD
+     * accept it, so the refusal is provably coming from the whole-chain oracle, not from the fixture
+     * happening to reject everything.
+     */
+    @Test
+    @DisplayName("case 20 — isStaffVisitSlotAvailable ⇔ getStaffAvailableSlots(list) membership on the "
+            + "chained Σ-duration block, including a start that fits the FIRST service but not the whole chain")
+    void should_agreeWithTheStaffChainedSlotList_when_answeringTheVisitExistenceCheck() {
+        // A day far enough out that the 17:20 frozen "now" cutoff never enters into it — this case
+        // isolates the WINDOW-FIT rule (D2.1), not the lead-time floor (that is case 19's job).
+        LocalDate wideDay = TODAY.plusDays(30);
+
+        Master m = seedIndependentMaster();
+        UUID svcA = addService(m, 30, 0);
+        UUID svcB = addService(m, 45, 0);
+        List<UUID> chain = List.of(svcA, svcB);
+        seedInterval(m.masterId(), wideDay, wideDay, wideDay.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(18, 0));
+
+        assertThat(staffVisitSlotStarts(m.masterId(), wideDay, chain))
+                .as("the last 75-min-block start of the day is 16:30 (16:30+75=17:45); the next grid "
+                        + "position, 17:00, would end 18:15 > 18:00 and is refused")
+                .contains(LocalTime.of(16, 30));
+
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(16, 30));  // offered
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(17, 0));   // grid, chain overruns
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(16, 45));  // off the 30-min grid
+        assertStaffVisitAgreement(m.masterId(), wideDay, chain, LocalTime.of(8, 30));   // outside the interval
+
+        // The D2.1 case: 13:30 fits svcA (30 min) alone with room to spare, but the CHAIN'S 75 minutes
+        // does not fit a 13:00–14:00 interval. A per-item check on svcA would wrongly accept it.
+        LocalDate narrowDay = TODAY.plusDays(11);
+        seedInterval(m.masterId(), narrowDay, narrowDay, narrowDay.getDayOfWeek().getValue(),
+                LocalTime.of(13, 0), LocalTime.of(14, 0));
+        assertThat(staffVisitSlotStarts(m.masterId(), narrowDay, chain))
+                .as("no 75-min chain start fits a 60-min interval")
+                .isEmpty();
+        assertThat(slotCalculationService.isStaffSlotAvailable(m.masterId(), narrowDay, svcA, null,
+                narrowDay.atTime(13, 30).atZone(TimeZones.KYIV).toOffsetDateTime()))
+                .as("mechanism guard — the per-item single-service check WOULD wrongly accept 13:30 "
+                        + "(svcA alone fits); this is exactly why the guard must never fall back to it")
+                .isTrue();
+        assertStaffVisitAgreement(m.masterId(), narrowDay, chain, LocalTime.of(13, 30));
+
+        // EXPLICIT_TIMES day — the other arm of the isExplicitTimes switch both methods branch on.
+        LocalDate declaredDay = TODAY.plusDays(12);
+        seedExplicitTimesDay(m, declaredDay, LocalTime.of(13, 0), LocalTime.of(15, 0), LocalTime.of(16, 30));
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(13, 0));  // declared, fits
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(15, 0));  // declared, fits
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(16, 30)); // declared, fits (ends 17:45, same day)
+        assertStaffVisitAgreement(m.masterId(), declaredDay, chain, LocalTime.of(14, 0));  // never declared
+    }
+
+    /** The STAFF (zero-lead) chained-visit slot-list start wall-clocks for a single date. */
+    private List<LocalTime> staffVisitSlotStarts(UUID masterId, LocalDate date, List<UUID> masterServiceIds) {
+        return slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceIds, null)
+                .stream()
+                .map(s -> s.startsAt().toLocalTime())
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * The invariant Phase 22.10 must preserve: the boolean the STAFF create-path chain gate asks equals
+     * the membership test over the materialised STAFF chained slot list — for this exact start, on this
+     * exact date, through the same real pipeline.
+     */
+    private void assertStaffVisitAgreement(UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+                                           LocalTime start) {
+        OffsetDateTime startsAt = date.atTime(start).atZone(TimeZones.KYIV).toOffsetDateTime();
+
+        boolean inList = slotCalculationService
+                .getStaffAvailableSlots(masterId, date, masterServiceIds, null).stream()
+                .anyMatch(slot -> slot.startsAt().toOffsetDateTime().isEqual(startsAt));
+        boolean existenceCheck = slotCalculationService
+                .isStaffVisitSlotAvailable(masterId, date, masterServiceIds, null, startsAt);
+
+        assertThat(existenceCheck)
+                .as("isStaffVisitSlotAvailable must equal list membership at %s on %s", start, date)
+                .isEqualTo(inList);
+    }
+
     private long cachedSlotEntryCount(UUID masterId) {
         var caffeine = (com.github.benmanes.caffeine.cache.Cache<?, ?>) slotCache().getNativeCache();
         return caffeine.asMap().keySet().stream()

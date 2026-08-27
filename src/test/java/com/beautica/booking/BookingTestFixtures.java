@@ -116,13 +116,30 @@ public class BookingTestFixtures {
      * it is a false pass. Every other caller keeps the old constant through the delegate above.
      */
     public UUID createIndependentMasterService(UUID masterId, String serviceName) {
+        return createIndependentMasterService(masterId, serviceName, 60);
+    }
+
+    /**
+     * Same as {@link #createIndependentMasterService(UUID, String)} but with a caller-chosen
+     * {@code base_duration_minutes}.
+     *
+     * <p>Added for {@code ProviderNearNowRescheduleIT}, whose whole fixture design turns on the
+     * service being SHORT: a near-now target must leave room for the booked block to end before the
+     * working interval's 23:59 close, and the 60-minute default makes that impossible for any target
+     * after 22:59 — i.e. it would make the suite fail for an hour of every day. The DB constraint is
+     * {@code base_duration_minutes > 0} (V80), so any positive value is legal here; Bean Validation's
+     * {@code @Min(5)} guards the API surface, not this direct insert. Every other caller keeps the
+     * 60-minute default through the delegate above.
+     */
+    public UUID createIndependentMasterService(UUID masterId, String serviceName, int durationMinutes) {
         UUID userId = jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
                         + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, serviceName, resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId));
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, ?, ?, ?, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, userId, serviceName,
+                resolveUnusedServiceTypeId("INDEPENDENT_MASTER", userId), durationMinutes);
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "

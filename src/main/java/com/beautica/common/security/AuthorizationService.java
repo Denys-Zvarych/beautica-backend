@@ -1,6 +1,7 @@
 package com.beautica.common.security;
 
 import com.beautica.auth.Role;
+import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingCompletionAccess;
 import com.beautica.booking.repository.BookingRepository;
@@ -35,6 +36,14 @@ public class AuthorizationService {
     private final UserRepository userRepository;
     private final ServiceRepository serviceRepository;
     private final BookingRepository bookingRepository;
+    /**
+     * Request-lifetime memo of {@code users.salon_id} for the calling actor — shared with
+     * {@code StaffBookingScopeResolver} so a {@code SALON_ADMIN} staff-booking request issues that
+     * projection once, not once per consumer (perf MEDIUM, 2026-08-18). See
+     * {@link ActorSalonAssignmentMemo} for why this value is safe to memo and the target
+     * {@code Master} is not.
+     */
+    private final ActorSalonAssignmentMemo actorSalonAssignmentMemo;
 
     /**
      * Returns true when actorId has management access to the given salon.
@@ -238,6 +247,140 @@ public class AuthorizationService {
         if (!allowed) {
             throw new ForbiddenException("Access denied");
         }
+    }
+
+    /**
+     * SpEL {@code @PreAuthorize} predicate for {@code POST /masters/&#123;masterId&#125;/bookings} —
+     * the staff walk-in create (Phase 22.4, amendment A3). ONE predicate replaces the pair the
+     * original phase body proposed, because amendment A2 removed {@code &#123;salonId&#125;} from the
+     * route and with it the salonId/masterId mismatch state {@link #masterBelongsToSalon} was added
+     * to police. That method stays — other call sites use it — it is simply not part of this
+     * expression.
+     *
+     * <p><b>Splits on the TARGET's {@code masterType}, not on the caller's role</b>, and that is
+     * load-bearing:
+     * <ul>
+     *   <li>{@code INDEPENDENT_MASTER} target &rarr; self-booking ONLY
+     *       ({@code target.user.id == callerId}). No salon scoping — they have none. A
+     *       {@code SALON_OWNER} who also holds an independent profile cannot reach an independent
+     *       master through the salon branch.</li>
+     *   <li>any salon-bound target ({@code SALON_MASTER}- or {@code SALON_OWNER}-type) &rarr; the
+     *       caller must manage THAT master's salon, which {@link #hasManagementAccess} answers for
+     *       the owner (by ownership) and the assigned admin (by {@code users.salon_id}) alike —
+     *       admin parity, product-confirmed 2026-07-08.</li>
+     * </ul>
+     *
+     * <p><b>Unknown, inactive, or closed-salon master &rarr; {@code false}, i.e. 403 and never
+     * 404</b>, deliberately: probing {@code masterId} values must not distinguish "no such master"
+     * from "not yours". This is also why the predicate applies {@link MasterBookability} rather than
+     * a bare {@code isActive()} — it is the single canonical bookability rule
+     * ({@code active master AND (no salon OR salon open)}), so this gate cannot drift from the 404
+     * {@code StaffBookingService} raises for the same condition. Ordering matters: method security
+     * runs FIRST, so for a caller with no authority that service-layer 404 is unreachable over HTTP
+     * and every negative answer is a uniform 403.
+     *
+     * <p>Role fast path mirrors {@link #canCompleteBooking}: {@code SALON_MASTER} (read-only
+     * calendar) and {@code CLIENT} can never create a staff booking, so they are rejected with no DB
+     * round-trip — including a {@code SALON_MASTER} naming their OWN master profile.
+     *
+     * <h2>Accepted costs and residuals — audited 2026-08-18, do not "optimise" these away</h2>
+     * Three separate findings landed on this method and all three were accepted <em>with reasons</em>.
+     * They are recorded here because each has a cheap-looking fix that is wrong.
+     *
+     * <p><b>1. The target {@code Master} is read here AND again in
+     * {@code StaffBookingService#createStaffBooking} (LOW, security + perf). Intentional. Do not
+     * deduplicate.</b>
+     * <ul>
+     *   <li><b>Passing it down would not save a query.</b> {@code open-in-view: false} and
+     *       {@code StaffBookingController} is not {@code @Transactional}, so the instance this method
+     *       loads is <b>detached</b> before the service opens its persistence context. Handing it on
+     *       as a {@code preloaded} argument would force a {@code merge()} inside the transaction,
+     *       which reissues the identical {@code SELECT} — net zero queries saved, plus a merge. This
+     *       is NOT the {@code VisitPlanner}/{@code preloaded} pattern
+     *       ({@code StaffBookingService#createStaffBooking}'s {@code item} hand-off): that pattern
+     *       passes entities <em>within one transaction</em>, where they stay managed.</li>
+     *   <li><b>The service's re-read is a TOCTOU narrowing, not waste.</b> It re-evaluates
+     *       {@link MasterBookability} and {@code master.getSalon()} against committed state
+     *       <em>inside</em> the inserting transaction. Reusing this method's snapshot would widen the
+     *       race to span the whole authorization step, so a master deactivated (or a salon closed) in
+     *       between would still get a booking written.</li>
+     *   <li><b>Moving this gate into the service is likewise forbidden</b>: it would forfeit the
+     *       before-handler ordering that makes 22.2's indistinct 404 unreachable over HTTP, which is
+     *       Phase 22.4's core security property (see the paragraph above).</li>
+     * </ul>
+     * A multi-salon owner pays a third read, in
+     * {@code StaffBookingScopeResolver#ownedSalonId} — a different, owner-scoped projection, kept
+     * for the same reason.
+     *
+     * <p><b>2. Residual latency oracle (LOW, security). Accepted; do not restructure.</b> An unknown
+     * {@code masterId} costs ONE query (the {@code Optional} misses and short-circuits to
+     * {@code orElse(false)}); an existing-but-foreign salon-bound master costs TWO (the load, then
+     * {@link #hasManagementAccess}). "Does not exist" and "exists, but not yours" therefore differ by
+     * one round trip — the very distinction the uniform 403 exists to erase, leaking through timing
+     * rather than through the response. It is accepted because {@code masterId} is a <b>v4 UUID</b>:
+     * there is no sequence to enumerate, and an existence oracle on a 122-bit unguessable identifier
+     * yields nothing an attacker can act on. A constant-work rewrite (always running both queries, or
+     * padding the miss) buys no real confidentiality and makes the predicate materially harder to
+     * read. Re-open this only if {@code masterId} ever becomes guessable — a slug, a sequence, or
+     * anything enumerable from a public listing.
+     *
+     * <p><b>3. Entity hydration to read five scalars (LOW, perf). Accepted; keep the shared
+     * predicate.</b> {@code findByIdWithUserAndSalon} materialises managed {@code Master} +
+     * {@code User} + {@code Salon} (the {@code User} row including {@code passwordHash}) so that five
+     * fields can be read — {@code master.isActive()} and {@code master.getSalon().isActive()} (both
+     * inside {@link MasterBookability#isBookable}), {@code master.getMasterType()},
+     * {@code salon.getId()} and {@code user.getId()} — after which the persistence context is
+     * discarded. A DTO projection
+     * would cut that, but only by forking {@link MasterBookability} into a second JPQL mirror of the
+     * canonical {@code active master AND (no salon OR salon open)} predicate, which could then drift
+     * from the version the service's 404 applies — trading a measurable-but-small cost for a
+     * silent-divergence class of bug this phase deliberately closed. Note the {@code user} fetch is
+     * genuinely load-bearing, not surplus: the {@code INDEPENDENT_MASTER} arm below reads
+     * {@code target.getUser().getId()}.
+     */
+    public boolean canBookForMaster(Authentication auth, UUID masterId) {
+        boolean cannotBook = auth.getAuthorities().stream().anyMatch(a ->
+                a.getAuthority().equals("ROLE_SALON_MASTER")
+                        || a.getAuthority().equals("ROLE_CLIENT"));
+        if (cannotBook) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        return masterRepository.findByIdWithUserAndSalon(masterId)
+                .filter(MasterBookability::isBookable)
+                .map(target -> {
+                    if (target.getMasterType() == MasterType.INDEPENDENT_MASTER) {
+                        return target.getUser() != null
+                                && target.getUser().getId().equals(actorId);
+                    }
+                    Salon salon = target.getSalon();
+                    // For a SALON_OWNER this resolves to salonRepository.existsByIdAndOwnerId, which
+                    // StaffBookingScopeResolver#ownedSalonId then STRICTLY SUBSUMES a moment later:
+                    // its findIdsByOwnerIdAndIsActiveTrue returns the owner's active salon ids, and
+                    // `salonId ∈ ownedActiveIds` implies `existsByIdAndOwnerId`.
+                    //
+                    // THAT SUBSUMPTION HAS A PRECONDITION, and it is the isBookable filter three
+                    // lines above — not anything either query says on its own.
+                    // findIdsByOwnerIdAndIsActiveTrue carries `s.isActive = true`
+                    // (SalonRepository:70); existsByIdAndOwnerId carries no activity predicate at
+                    // all. Compared in isolation the containment runs the OTHER way: an owner's
+                    // DEACTIVATED salon satisfies existsByIdAndOwnerId but is missing from
+                    // ownedActiveIds, so the resolver's set would be a strict SUBSET and swapping
+                    // it in here would silently flip this owner's verdict from allow to deny on
+                    // their closed salons. It is a superset only because
+                    // MasterBookability#isBookable (MasterBookability:106) has already rejected
+                    // every master whose salon is inactive BEFORE this lambda runs, so
+                    // salon.isActive() is known true at this point and the two sets coincide on
+                    // every reachable input. Move or weaken that filter and this comment is wrong.
+                    //
+                    // Collapsing the two
+                    // (perf LOW, 2026-08-18) would mean running the resolver BEFORE this gate and
+                    // deciding authorization from its result — which is exactly the ordering this
+                    // phase forbids: method security must run first so an unknown master is a uniform
+                    // 403 and never reaches a handler that can distinguish it. The redundant existence
+                    // check is the price of the no-oracle ordering, and it is the cheaper half.
+                    return salon != null && hasManagementAccess(salon.getId(), actorId, actorRole);
+                })
+                .orElse(false);
     }
 
     /**
@@ -966,7 +1109,14 @@ public class AuthorizationService {
             // Fix MEDIUM-7 PERF: the previous findById loaded the full User entity
             // (including passwordHash) just to read salonId. findSalonIdById uses a
             // SELECT projection that fetches only the salonId column — one column vs all.
-            return userRepository.findSalonIdById(actorId)
+            //
+            // Routed through the request-scoped memo (perf MEDIUM, 2026-08-18): on the staff
+            // walk-in create this exact projection is ALSO needed by
+            // StaffBookingScopeResolver#administeredSalonId in the handler, so the gate and the
+            // resolver would otherwise issue it twice per request for the same actor. The loader is
+            // passed rather than owned by the memo so this call site keeps naming the repository.
+            return actorSalonAssignmentMemo
+                    .salonIdOf(actorId, () -> userRepository.findSalonIdById(actorId))
                     .map(salonId::equals)
                     .orElse(false);
         }

@@ -11,6 +11,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.sql.Date;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Collection;
 import java.util.List;
@@ -423,6 +424,57 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<Booking> findAllByIdsWithGraph(@Param("ids") List<UUID> ids);
 
+    /**
+     * How many DISTINCT {@code STAFF} walk-in VISITS have been created for one recipient phone since
+     * {@code since} — the per-recipient SMS-spend cap enforced by
+     * {@code StaffBookingService#assertWalkInSmsBudgetForPhone} (SEC MEDIUM, 2026-08-18; widened to
+     * count visits rather than rows, Phase 22.13).
+     *
+     * <p><b>The unit is the VISIT, not the row.</b> {@code registerWalkInConfirmationSms} fires
+     * exactly once per visit regardless of its service count (Phase 22.13), so a query that counted
+     * {@code bookings} rows would let a single N-service walk-in burn N units of a budget that exists
+     * to cap MESSAGES: a 5-service visit would exhaust {@code MAX_WALK_INS_PER_PHONE_PER_WINDOW} by
+     * itself and 429 the very next legitimate walk-in for that phone for the rest of the window.
+     *
+     * <p>{@code coalesce(b.appointment_id, b.id)} is load-bearing. Pre-22.12 STAFF rows have
+     * {@code appointment_id = NULL} and each one IS its own visit — collapsing every NULL row into
+     * one {@code DISTINCT} bucket via a bare {@code appointment_id} would silently hand a prober an
+     * unlimited budget, since a NULL {@code appointment_id} means "no header", not "the same header".
+     * Falling back to the row's own {@code id} keeps every legacy row counted individually while every
+     * post-22.12 visit's N chained rows collapse to the one header they share.
+     *
+     * <p>Counted in the DB rather than in an in-memory bucket so the limit survives a restart and
+     * holds across instances; {@code bookings} already records the exact fact being limited.
+     *
+     * <p><b>Every status counts, deliberately.</b> The cost being bounded is the CONFIRMATION SMS,
+     * which is dispatched at create time and cannot be recalled — so a create/cancel loop must not
+     * refund budget. Filtering to {@code CONFIRMED} would make cancelling the way to reset the cap,
+     * i.e. would hand the attacker the lever this query exists to remove.
+     *
+     * <p>{@code BookingSource.STAFF} scopes it to the walk-in path only: a guest (LINK) booking's
+     * phone is OTP-verified and already throttled by {@code PhoneOtpService}, and an APP booking has
+     * no {@code guestPhone} at all.
+     *
+     * <p>Native, not JPQL: {@code coalesce} over an FK id and a PK id is awkward to express in JPQL,
+     * and the predicate already mirrors {@code idx_bookings_staff_walkin_phone} (V138:
+     * {@code (guest_phone, created_at) WHERE booking_source = 'STAFF'}) expressed in SQL — served by
+     * that index for the range, then a per-row heap fetch of {@code appointment_id}. Not index-only,
+     * and deliberately not widened to make it so: the matched set is bounded by the cap this very
+     * query enforces, so the extra heap fetch is cheap by construction.
+     *
+     * <p>The row-counting predecessor of this query has been DELETED, not left beside this one — two
+     * counters with different denominators is precisely how a future edit re-introduces the
+     * row-vs-visit bug.
+     */
+    @Query(value = """
+            SELECT count(DISTINCT coalesce(b.appointment_id, b.id))
+              FROM bookings b
+             WHERE b.guest_phone = :phone
+               AND b.booking_source = 'STAFF'
+               AND b.created_at > :since
+            """, nativeQuery = true)
+    long countStaffWalkInVisitsForPhoneSince(@Param("phone") String phone, @Param("since") Instant since);
+
     // ── Client booking-detail projection (Phase 19.3; sentinel removed Phase 26.7.1) ──
     /**
      * Hydrates a bounded set of booking ids into the enriched
@@ -486,6 +538,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * guarantee row order), mirroring the provider path's
      * {@code findIdsByMasterIdFiltered}/{@code findIdsBySalonIdsFiltered} +
      * {@code findAllByIdsWithGraph} two-query pattern exactly.
+     *
+     * <p><b>{@code JOIN b.client} is an INNER join here on purpose, and that is not the bug it is on
+     * {@link #findByIdWithFullGraph}.</b> This query serves the CLIENT listing only, whose ID page
+     * is {@code b.client.id = :clientId} — so every id it is ever handed already has a client. A
+     * null-client row ({@code booking_source} {@code 'LINK'} guest or {@code 'STAFF'} walk-in, V89 /
+     * V137 {@code chk_bookings_guest_fields}: {@code client_id IS NULL}) can therefore never reach
+     * this method's {@code :ids}, and the inner join is a structural assertion of that rather than a
+     * silent filter. Recorded because "inner JOIN b.client" reads like the CRITICAL track-24.7
+     * finding on the provider-side graph queries: it is not, and a future auditor should not chase a
+     * missing walk-in here (QA GAP 4, 2026-08-20). If this projection is ever reused by a provider
+     * or mixed-scope listing, the join must become {@code LEFT JOIN} in the same change.
      *
      * <p><b>Discovery locality is district-primary via the salon link</b> — the salon's
      * city/district/address wins when the master is salon-employed, else the master's own
@@ -1230,6 +1293,58 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT 1 FROM (SELECT pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 0))) sub
             """, nativeQuery = true)
     Integer acquireAdvisoryLock(@Param("masterId") UUID masterId);
+
+    /**
+     * Per-RECIPIENT-PHONE advisory lock serialising the walk-in SMS-budget check-then-insert
+     * ({@code StaffBookingService#assertWalkInSmsBudgetForPhone}) — security MEDIUM, 2026-08-22.
+     *
+     * <p><b>Why it exists.</b> {@link #countStaffWalkInVisitsForPhoneSince} followed by the insert
+     * is a read-then-write on a value no row locks: at READ COMMITTED, C concurrent creates naming
+     * the SAME number all observe the identical pre-burst count, all pass, and all insert — so the
+     * {@code MAX_WALK_INS_PER_PHONE_PER_WINDOW} ceiling degrades to roughly {@code cap + C}
+     * Beautica-branded messages at a number that never consented. Taking this lock first makes the
+     * count-and-insert atomic per phone: the second caller blocks until the first commits and then
+     * counts the row the first created.
+     *
+     * <p><b>Salt {@code 3} — a dedicated keyspace, disjoint from every other lock.</b> Salt
+     * {@code 0} is the per-master booking lock ({@link #acquireAdvisoryLock}), salt {@code 1} the
+     * per-client lock ({@link #acquireClientAdvisoryLockWithTimeout}) and salt {@code 2} the bulk
+     * service-setup lock — see the allocation table on
+     * {@code MasterServiceRepository#acquireBulkSetupLockWithTimeout}, and grep
+     * {@code hashtextextended} in {@code src/main} before claiming a new salt. This lock originally
+     * (wrongly) claimed salt {@code 1}, sharing the client-UUID keyspace. That never produced a
+     * wrong verdict — the lock key is not a data key, {@link #countStaffWalkInVisitsForPhoneSince}
+     * filters on real columns — but {@code hashtextextended} is non-cryptographic and computable
+     * offline, so a staff actor holding a client UUID from their own booking payloads could grind
+     * an E.164 preimage and intermittently 409 that client's creates. A disjoint salt removes the
+     * grind target outright (security LOW, 2026-08-22).
+     *
+     * <p><b>Lock ordering is phone → master on every path that takes both</b>, mirroring the
+     * client(salt 1) → master(salt 0) order {@code BookingService} uses: no path acquires the
+     * master lock before this one, so no acquisition cycle exists across the two orderings and no
+     * deadlock is introduced. The one caller must therefore keep taking this lock BEFORE
+     * {@code BookingSlotLockGuard.lockMasterAndAssertFree} — see
+     * {@code StaffBookingService#assertWalkInSmsBudgetForPhone}'s call-site comment.
+     *
+     * <p><b>The 3s {@code lock_timeout} is fused here, not inherited</b> (security MEDIUM,
+     * 2026-08-22). The staff create path takes no client lock, so this is the transaction's FIRST
+     * advisory lock and nothing has set {@code lock_timeout} yet — Postgres defaults it to
+     * {@code 0} (wait forever). The ceiling applied later by {@link #acquireAdvisoryLockWithTimeout}
+     * is useless to a caller still blocked here. This lock is taken BEFORE the count by design, so
+     * over-cap requests contend too: the cap bounds successful INSERTs, never lock acquisitions, and
+     * a provider flooding one number serialises unbounded requests that each park one of only 10
+     * Hikari connections ({@code BookingRateLimitFilter} concedes no per-actor bucket bounds an
+     * attacker holding several staff accounts). Hence the fused, transaction-scoped ceiling, exactly
+     * as on every other first-in-transaction advisory lock in this codebase. A wait beyond 3s aborts
+     * with {@code 55P03 lock_not_available} → {@code CannotAcquireLockException} → a clean 409.
+     */
+    @Query(value = """
+            SELECT 1 FROM (
+                SELECT set_config('lock_timeout', '3s', true),
+                       pg_advisory_xact_lock(hashtextextended(CAST(:phone AS text), 3))
+            ) sub
+            """, nativeQuery = true)
+    Integer acquireWalkInPhoneLock(@Param("phone") String phone);
 
     /**
      * Fused, single-round-trip form of the per-master advisory lock for callers that take

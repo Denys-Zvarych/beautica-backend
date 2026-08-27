@@ -27,6 +27,10 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -38,6 +42,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -1555,6 +1560,72 @@ class SlotCalculationServiceTest {
         verify(timeSlotCalculator).calculateAvailableSlots(
                 any(), any(), any(), durationCaptor.capture(), any(), any(), any());
         assertThat(durationCaptor.getValue()).isEqualTo(Duration.ofMinutes(90));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Staff slot-list exposure — the zero-lead list must never reach a client-facing route
+    // ════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>Source-tree scan, deliberately</b> (security LOW, 2026-08-18).
+     * {@code getStaffAvailableSlots} generates slots at a {@code Duration.ZERO} lead-time floor
+     * instead of the client's 15 minutes, and it is a {@code public} method on an injectable
+     * {@code @Service} — public because {@code @Transactional} is proxy-based and package-private
+     * would silently disable it, so visibility cannot express the constraint. A
+     * {@code @RestController} that {@code @Autowired}s {@code SlotCalculationService} and returns
+     * this list would offer self-service clients slots inside the window they are then 400'd for
+     * booking — the "API offers what it will not accept" defect {@code BookingWindow} exists to
+     * prevent.
+     *
+     * <p>No runtime assertion can catch that, so this asserts the only thing that can be asserted:
+     * no controller in the tree names either staff-floor entry point. When Phase 22.4/22.5 adds a
+     * genuinely staff-only slot endpoint, this test is the place to record the exemption — with the
+     * role gate that justifies it — rather than a line to delete quietly.
+     */
+    @Test
+    @DisplayName("no @RestController references the zero-lead staff slot entry points")
+    void should_haveNoControllerCaller_when_scanningForGetStaffAvailableSlots() throws IOException {
+        Path sourceRoot = Path.of("src/main/java/com/beautica");
+        assertThat(sourceRoot).as("scan root must exist, or this test proves nothing").exists();
+
+        List<Path> controllers;
+        try (Stream<Path> files = Files.walk(sourceRoot)) {
+            controllers = files
+                    .filter(f -> f.getFileName().toString().endsWith(".java"))
+                    .filter(f -> CONTROLLER_ANNOTATION.matcher(read(f)).find())
+                    .toList();
+        }
+        // Falsify-the-gate guard: a scan that matched nothing would pass vacuously forever.
+        assertThat(controllers).as("the scan must actually find the project's controllers").isNotEmpty();
+
+        List<String> offenders = controllers.stream()
+                .filter(f -> read(f).contains("getStaffAvailableSlots")
+                        || read(f).contains("isStaffSlotAvailable")
+                        || read(f).contains("isStaffVisitSlotAvailable"))
+                .map(Path::toString)
+                .sorted()
+                .toList();
+
+        assertThat(offenders)
+                .as("the STAFF slot floor is 0 minutes; exposing it on a client-reachable route "
+                        + "offers slots the create path rejects")
+                .isEmpty();
+    }
+
+    /**
+     * A {@code @RestController} / {@code @Controller} annotation on a TYPE declaration — anchored to
+     * the start of a line, so a Javadoc or comment that merely names the annotation (as
+     * {@code SlotCalculationService}'s own contract note does) is not mistaken for one.
+     */
+    private static final java.util.regex.Pattern CONTROLLER_ANNOTATION =
+            java.util.regex.Pattern.compile("^@(Rest)?Controller\\b", java.util.regex.Pattern.MULTILINE);
+
+    private static String read(Path file) {
+        try {
+            return Files.readString(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** Active assignment with a caller-chosen id, so multiple chained ids can be stubbed distinctly. */

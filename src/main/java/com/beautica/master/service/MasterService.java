@@ -19,6 +19,8 @@ import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.dto.WorkingHoursResponse;
+import com.beautica.master.event.SalonStaffChangedEvent;
+import org.springframework.context.ApplicationEventPublisher;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
@@ -75,6 +77,13 @@ public class MasterService {
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Mobile Phase 111: a salon's rating is now the equal-weighted mean of its ACTIVE masters'
+    // salon-scoped ratings (ReviewRepository#recalculateSalonRating), so it is a function of the
+    // staff set and must be recomputed whenever this class changes that set — with no review
+    // involved. Published as a SalonStaffChangedEvent rather than called directly so this feature
+    // never reaches into ReviewRepository; com.beautica.review.event.SalonStaffRatingListener
+    // owns the recalculation AFTER_COMMIT (it filters on the committed salon_id/is_active).
+    private final ApplicationEventPublisher eventPublisher;
     // Phase 29.2 fallout: BookingResponse.from now needs an absolute-instant "now" to compute the
     // derived awaitingClosure flag (see that record's javadoc). This cached endpoint is the one
     // pre-existing BookingResponse.from caller outside the booking feature — its "now" is
@@ -127,6 +136,10 @@ public class MasterService {
         Master saved = masterRepository.save(master);
         // Phase 13.1: allocate the public booking slug on creation.
         bookingSlugService.getOrCreateSlug(saved.getId());
+        // Mobile Phase 111 — a master JOINED this salon's staff set. Provably a no-op for the
+        // average today (a brand-new master row carries no reviews), fired anyway per
+        // publishSalonStaffChanged's javadoc.
+        publishSalonStaffChanged(salonId);
         return saved;
     }
 
@@ -232,6 +245,21 @@ public class MasterService {
                 // bookability caches. salon is the already-loaded caller entity (never a lazy
                 // proxy); capture its id synchronously inside the tx (Anti-Bug §E / §F rule 2).
                 evictBookabilityCachesAfterCommit(reactivatedMasterId, salon.getId());
+
+                // Mobile Phase 111 — reactivation puts this owner-as-master BACK into the salon's
+                // contributing set. Unlike the create branches this genuinely moves the number:
+                // the master's prior reviews at this salon start counting again. Inside the
+                // !isActive() branch only — the idempotent "already active" return changes no
+                // staff set and must not fire.
+                publishSalonStaffChanged(salon.getId());
+
+                // Audit trail — the INVERSE of deactivateOwnerMaster's line, same shape and
+                // fields as rotateMasterSalon's. Logged for the same reason: this is the half of
+                // the pair that puts a suppressed 1-star back, so an audit that recorded only the
+                // deactivation would show a one-way move that never came back. Inside the
+                // !isActive() branch, so the idempotent no-op return emits nothing.
+                log.info("Master reactivation: master {} (salon {}) reactivated by actor {}",
+                        reactivatedMasterId, salon.getId(), owner.getId());
             }
             return m; // idempotent
         }
@@ -247,6 +275,8 @@ public class MasterService {
         Master saved = masterRepository.save(master);
         // Phase 13.1: allocate the public booking slug on creation.
         bookingSlugService.getOrCreateSlug(saved.getId());
+        // Mobile Phase 111 — the owner joined their own salon's staff set as a master.
+        publishSalonStaffChanged(salon.getId());
         return saved;
     }
 
@@ -436,6 +466,18 @@ public class MasterService {
                 }
             });
         }
+
+        // Mobile Phase 111 — the owner LEFT their salon's contributing set: their reviews at this
+        // salon must stop counting toward its rating. salonId is the caller-supplied id already
+        // matched against the loaded master above, so it is this master's actual salon.
+        publishSalonStaffChanged(salonId);
+
+        // Audit trail — same shape and fields as the rotation log in rotateMasterSalon. See
+        // deactivateMaster for why a staff deactivation is an auditable event: it moves the
+        // salon's public rating, and this path is the one an OWNER can drive against their own
+        // salon (the 1-star-review scenario), so it is the more sensitive of the two.
+        log.info("Owner-master deactivation: master {} (salon {}) deactivated by actor {}",
+                deactivatedOwnerMasterId, salonId, actorUserId);
     }
 
     @Transactional
@@ -478,6 +520,21 @@ public class MasterService {
                 }
             });
         }
+
+        // Mobile Phase 111 — the master LEFT this salon's contributing set. Captured from the
+        // JOIN FETCH-ed salon while the transaction is open; null for an INDEPENDENT_MASTER,
+        // which publishSalonStaffChanged treats as a no-op.
+        final UUID leftSalonId = master.getSalon() != null ? master.getSalon().getId() : null;
+        publishSalonStaffChanged(leftSalonId);
+
+        // Audit trail — same shape and fields as the rotation log in rotateMasterSalon (UUIDs
+        // only, no PII). Deactivation is not merely a calendar change since mobile Phase 111: the
+        // salon's PUBLIC avg_rating, review_count and star histogram are all computed over its
+        // CURRENTLY-ACTIVE masters, so removing a master moves the number a client sees, within
+        // one commit and reversibly. A privileged mutation with a visible public effect and no
+        // record of who made it is exactly what an audit line exists for.
+        log.info("Master deactivation: master {} (salon {}) deactivated by actor {}",
+                masterId, leftSalonId, actorId);
     }
 
     /**
@@ -615,6 +672,13 @@ public class MasterService {
         // UUIDs only, no PII.
         log.info("Salon rotation: master {} moved from salon {} to {} by actor {}",
                 masterId, currentSalonId, destinationSalonId, actorId);
+
+        // Mobile Phase 111 — a rotation changes TWO staff sets, so it publishes TWICE. The source
+        // salon loses a contributor (its rating must drop this master's scores) and the
+        // destination gains one. currentSalonId is non-null (guarded above) and
+        // destinationSalonId is a resolved, active salon.
+        publishSalonStaffChanged(currentSalonId);
+        publishSalonStaffChanged(destinationSalonId);
 
         return MasterSummaryResponse.from(master);
     }
@@ -825,5 +889,24 @@ public class MasterService {
                 .map(b -> BookingResponse.from(b, now))
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
+    }
+
+    /**
+     * Publishes a {@link SalonStaffChangedEvent} so the salon's rating is recomputed after this
+     * transaction commits (mobile Phase 111). No-op for a {@code null} salon — an
+     * {@code INDEPENDENT_MASTER} belongs to none, and the event forbids a null id.
+     *
+     * <p>Fired unconditionally from every staff-set mutation, including ones that provably cannot
+     * move the number today (a freshly created master row has no reviews anywhere). The recalc is
+     * an idempotent single UPDATE on a path that runs at most once per invite/deactivation, so
+     * the uniform "any staff change publishes" invariant is worth more than saving that write —
+     * it removes the need for each call site to re-derive whether it is a no-op, which is exactly
+     * the kind of reasoning that silently rots.
+     */
+    private void publishSalonStaffChanged(UUID salonId) {
+        if (salonId == null) {
+            return;
+        }
+        eventPublisher.publishEvent(new SalonStaffChangedEvent(salonId));
     }
 }

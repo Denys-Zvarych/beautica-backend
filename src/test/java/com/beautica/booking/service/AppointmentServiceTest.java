@@ -165,6 +165,7 @@ class AppointmentServiceTest {
                 List.of(MASTER_SERVICE_ID),
                 ZonedDateTime.parse("2026-08-10T10:00:00Z"),
                 null,
-                null);
+                null,
+                false);
     }
 }

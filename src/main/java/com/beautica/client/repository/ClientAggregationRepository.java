@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -19,11 +20,22 @@ import java.util.UUID;
  * rather than widening the booking repository. Spring Data permits several
  * repositories over the same {@link Booking} aggregate.
  *
- * <p><b>Every booking-derived query is scoped
- * {@code client_id = :clientId AND status = COMPLETED}</b> and the callers must pass the
- * authenticated client's own user id — that predicate is the ownership boundary
+ * <p><b>Every booking-derived query is scoped {@code client_id = :clientId}</b> and the callers
+ * must pass the authenticated client's own user id — that predicate is the ownership boundary
  * (Anti-Bug §E-4). All ranking/aggregation is done IN SQL (GROUP BY + ORDER BY count DESC,
  * bounded by {@code Pageable}); none of these methods pulls the full booking set into memory.
+ *
+ * <p><b>{@code status = COMPLETED} is no longer universal (2026-08-26).</b> Every aggregate in
+ * this interface EXCEPT {@link #findTimeline} still scopes strictly to {@code status = COMPLETED}
+ * — {@link #findTopDistricts}, {@link #findTopCities}, and {@link #aggregateBudget} all count only
+ * closed, provider-confirmed visits, matching the passport headline ({@code considered}, spend
+ * band, top districts/cities). {@link #findTimeline} alone was widened, by explicit product
+ * decision, to also surface elapsed-but-unclosed {@code CONFIRMED} bookings — see its own javadoc
+ * for the predicate and the reasoning. This is a DELIBERATE, KNOWN divergence: the timeline can now
+ * list more rows than the passport headline counts (e.g. "15 entries" in the timeline vs. "12
+ * visits" in the passport) whenever a provider has unclosed visits in the client's history. Widening
+ * the other aggregates to match is a product call, not something to "fix" opportunistically —
+ * see the class javadoc note on {@link #findTimeline} before touching any sibling query.
  *
  * <p><b>One query here is NOT booking-rooted:</b> {@link #findStanding} reads the passport's
  * identity strip from {@code User} (+ a correlated {@code Review} count). It lives here rather
@@ -179,8 +191,45 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
     BudgetAggregate aggregateBudget(@Param("clientId") UUID clientId);
 
     /**
-     * Paginated, most-recent-first timeline of COMPLETED bookings. Scalar projection, so
-     * Hibernate applies a correct SQL LIMIT/OFFSET for {@code pageable} (no HHH90003004).
+     * Paginated, most-recent-first timeline of the client's CLOSED-OR-ELAPSED bookings. Scalar
+     * projection, so Hibernate applies a correct SQL LIMIT/OFFSET for {@code pageable} (no
+     * HHH90003004).
+     *
+     * <p><b>Widened beyond {@code status = COMPLETED} (2026-08-26, this session's locked product
+     * decision).</b> A master who never marks a finished visit {@code COMPLETED} used to make it
+     * invisible in the client's beauty history forever — no {@code @Scheduled} job ever closes an
+     * elapsed {@code CONFIRMED} booking (see {@link com.beautica.booking.domain.BookingClosureRule}'s
+     * header javadoc). The predicate is now:
+     *
+     * <pre>
+     * status = COMPLETED
+     * OR (status = CONFIRMED AND endsAt &lt; :now)
+     * </pre>
+     *
+     * <p>This is exactly the {@code PAST} partition's own shape (see {@link
+     * com.beautica.booking.enums.BookingPartition}'s class javadoc and {@link
+     * com.beautica.booking.repository.BookingSpecifications#partition}) MINUS the {@code
+     * NOT_COMPLETED} disjunct — deliberately, by explicit product decision, NOT reused wholesale.
+     * {@code NOT_COMPLETED} is an explicit provider no-show marking: the service never happened, so
+     * it has no place in a beauty history. Do not "fix" this to match {@code PAST} exactly by
+     * adding {@code NOT_COMPLETED} back in.
+     *
+     * <p>A JPQL {@code @Query} cannot invoke {@link
+     * com.beautica.booking.domain.BookingClosureRule#isAwaitingClosure} (a Criteria/in-memory API,
+     * not a JPQL-callable one), so the elapsed-{@code CONFIRMED} leg is re-expressed here as JPQL
+     * rather than delegated by method call — but the {@code :now} VALUE is not re-derived: the
+     * caller ({@code ClientPassportService#getTimeline}) resolves it exactly the way {@code
+     * BookingService} does for the {@code PAST}/{@code AWAITING_CLOSURE} partition boundary —
+     * {@code OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC)}, the same injected {@link
+     * java.time.Clock} bean, never {@code Instant.now()}/{@code OffsetDateTime.now()} (Anti-Bug §G)
+     * — so this predicate and {@code BookingSpecifications#partition}'s {@code PAST} arm can never
+     * disagree about whether a given booking has elapsed. {@link
+     * com.beautica.common.TimeZones#KYIV} must never appear here — this is an absolute-instant
+     * comparison, not a calendar-day one.
+     *
+     * <p><b>Both the content query and {@code countQuery} carry the identical predicate</b> — they
+     * are separate strings in this annotation and a mismatch here silently breaks pagination
+     * totals (the exact trap this javadoc calls out so a future edit does not reintroduce it).
      */
     @Query(value = """
             SELECT new com.beautica.client.repository.TimelineItemProjection(
@@ -195,13 +244,16 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
             WHERE b.client.id = :clientId
-              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+              AND ( b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+                    OR (b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED AND b.endsAt < :now) )
             ORDER BY b.startsAt DESC
             """,
             countQuery = """
             SELECT COUNT(b) FROM Booking b
             WHERE b.client.id = :clientId
-              AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+              AND ( b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
+                    OR (b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED AND b.endsAt < :now) )
             """)
-    Page<TimelineItemProjection> findTimeline(@Param("clientId") UUID clientId, Pageable pageable);
+    Page<TimelineItemProjection> findTimeline(
+            @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now, Pageable pageable);
 }

@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,6 +39,43 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     Optional<MasterServiceAssignment> findByMasterIdAndIdWithGraph(
             @Param("masterId") UUID masterId,
             @Param("id") UUID id);
+
+    /**
+     * BATCH form of {@link #findByMasterIdAndIdWithGraph} — same master scoping, same fetch graph,
+     * one round-trip for the whole set (perf LOW, 2026-08-22).
+     *
+     * <p>Exists for {@code VisitPlanner#planChainedItems}, which resolved one assignment per
+     * {@code masterServiceIds} entry inside its chaining loop: N sequential single-row SELECTs, and
+     * because duplicate ids are a locked-legal input, the same service booked ten times issued ten
+     * byte-identical statements. The planner now passes the DISTINCT id set here and resolves each
+     * chain position from the returned map.
+     *
+     * <p><b>Not a non-graph variant beside a graph one</b> (§E-1): this carries the identical
+     * {@code LEFT JOIN FETCH ms.serviceDefinition} / {@code JOIN FETCH ms.master m} /
+     * {@code LEFT JOIN FETCH m.salon} graph, for the identical reasons documented on the single-row
+     * method — {@code m.salon} MUST stay {@code LEFT} or every {@code INDEPENDENT_MASTER} drops out.
+     * The single-row form is kept because ~6 other call sites resolve exactly one assignment and
+     * would otherwise pay a collection round-trip for it.
+     *
+     * <p><b>Bounded by construction</b> (§E-3): the only caller applies
+     * {@code SlotCalculationService#MAX_SERVICES_PER_VISIT} before calling, so {@code ids} is never
+     * unbounded. All fetches are to-one — columns, not rows — so there is no cartesian risk.
+     *
+     * <p>Returns only the rows that exist and belong to {@code masterId}; it does NOT filter on
+     * {@code isActive} (mirroring the single-row method, whose callers apply their own
+     * {@code .filter(MasterServiceAssignment::isActive)}), and it says nothing about which ids were
+     * missing — the caller is responsible for turning any shortfall into its own uniform 404.
+     */
+    @Query("""
+            SELECT ms FROM MasterServiceAssignment ms
+            LEFT JOIN FETCH ms.serviceDefinition
+            JOIN FETCH ms.master m
+            LEFT JOIN FETCH m.salon
+            WHERE m.id = :masterId AND ms.id IN :ids
+            """)
+    List<MasterServiceAssignment> findByMasterIdAndIdInWithGraph(
+            @Param("masterId") UUID masterId,
+            @Param("ids") Collection<UUID> ids);
 
     /**
      * Loads one assignment by its own id with {@code serviceDefinition} and {@code master}
@@ -232,6 +270,8 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      *   <li>{@code 1} — booking per-CLIENT conflict lock
      *       ({@code BookingRepository#acquireClientAdvisoryLockWithTimeout})</li>
      *   <li>{@code 2} — this bulk service-setup lock</li>
+     *   <li>{@code 3} — staff walk-in per-RECIPIENT-PHONE SMS-budget lock
+     *       ({@code BookingRepository#acquireWalkInPhoneLock})</li>
      * </ul>
      *
      * <p>Salt {@code 2} replaced an earlier salt {@code 0} (bulk-additive re-audit). Keyed on the
@@ -390,4 +430,117 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     boolean existsBookableAssignmentForSalonService(
             @Param("salonId") UUID salonId,
             @Param("serviceDefId") UUID serviceDefId);
+
+    /**
+     * Distinct platform category codes ({@code service_definitions.category}) of the ACTIVE
+     * services each of {@code masterIds} performs via an ACTIVE {@link MasterServiceAssignment} —
+     * backs the favourites screen's category FILTER axis (the OFFERING half; see
+     * {@code com.beautica.favorite.service.FavoriteCategoryResolver}'s class javadoc for the
+     * product decision this replaced).
+     *
+     * <p>One row per {@code (master, distinct category)} pair, projected as SCALARS — the two
+     * path expressions {@code msa.master.id} and {@code sd.category} resolve to the FK/column
+     * values directly and hydrate neither {@link MasterServiceAssignment} nor
+     * {@link com.beautica.service.entity.ServiceDefinition} into the persistence context (§I).
+     * {@code sd.category IS NOT NULL} drops uncategorised services rather than emitting a chip
+     * identity the caller cannot label.
+     *
+     * <p>Bounded by the caller's own {@code IN (:masterIds)} list, mirroring every other batched
+     * page-scoped lookup in this codebase (§E-3) — never a per-master query. {@code master_id} is
+     * covered by {@code idx_master_services_master_active_created (master_id, is_active,
+     * created_at) WHERE is_active}; the join to {@code service_definitions} resolves through its
+     * primary key.
+     *
+     * <p><b>No new index or migration.</b> This arm has no owner-scoped predicate to push onto
+     * {@code service_definitions} (a master's active services can be independently- or
+     * salon-owned, so no single {@code owner_id} narrows them the way the salon arm's does) — the
+     * planner hashes the {@code is_active AND category IS NOT NULL} subset of the WHOLE table
+     * (measured 10,876-row local {@code service_definitions}, ~10,838 passing rows) against the
+     * page's filtered {@code master_services} rows. Measured warm-cache on a 20-master page: 2.6–
+     * 3.0 ms, all buffer HITS, no disk reads — flat and small in absolute terms, and a single
+     * statement regardless of page size, so it does not regress §E-3.
+     *
+     * <p>This Hash Join is planner-optimal under the current cost model, not globally optimal:
+     * forcing {@code enable_hashjoin=off} makes the planner fall back to a Nested Loop through the
+     * existing {@code service_definitions_pkey} — no new index — measured at 0.688 ms vs. the
+     * Hash Join's 3.116 ms, ~4.5x faster. The planner declines that plan on its own because
+     * {@code random_page_cost=4} overpenalises the ~129 random-order primary-key probes against
+     * what is, at this table size, a fully cached sequential scan. Shipping the Hash Join anyway
+     * is still the right call: both plans are sub-3 ms with all buffer HITS, and forcing a plan
+     * shape via a query hint or a session-level cost-model override to chase a ~2.4 ms difference
+     * is a worse trade than accepting the planner's own choice — it trades a real, ongoing
+     * maintenance liability (a hint that silently stops applying, or a cost override that leaks
+     * into unrelated queries) for a saving that is invisible next to network and serialization
+     * cost.
+     *
+     * <p>The choice is self-correcting rather than stuck: the two plans' cost curves cross at
+     * ~18,100 rows in {@code service_definitions} ({@code HashJoin_cost(N) ~= 398.05 +
+     * 0.03388*N} vs. the Nested Loop's flat {@code ~1011.56}), at which point Postgres switches
+     * to the Nested Loop on its own — no code or schema change required. The current table is
+     * 10,876 rows, ~1.67x headroom below that crossover, and degradation between here and there
+     * is linear in table size, not a cliff; this was cross-checked by forcing
+     * {@code work_mem='64kB'}, which made the planner swap which side of the join it hashes
+     * rather than spill to disk. <b>Caveat:</b> the crossover and the cost-model constants above
+     * are derived from local Postgres defaults ({@code random_page_cost=4}, {@code work_mem=4MB});
+     * production runs on Railway/Neon and that config has not been verified there, so re-derive
+     * before treating 18,100 rows as a production trigger.
+     */
+    @Query("""
+            SELECT DISTINCT msa.master.id, sd.category
+            FROM MasterServiceAssignment msa
+            JOIN msa.serviceDefinition sd
+            WHERE msa.master.id IN :masterIds
+              AND msa.isActive = true
+              AND sd.isActive = true
+              AND sd.category IS NOT NULL
+            """)
+    List<Object[]> findDistinctOfferedCategoriesByMasterIds(@Param("masterIds") Collection<UUID> masterIds);
+
+    /**
+     * Salon counterpart of {@link #findDistinctOfferedCategoriesByMasterIds}, mirroring the exact
+     * "salon offering = master-performed only" predicate {@link #findBookableAssignmentsBySalon}
+     * already applies for a single salon — extended here to a page of salon ids and projected as
+     * scalars only, so the favourites filter and the public catalogue can never disagree about
+     * what a salon "offers".
+     *
+     * <p>One row per {@code (salon, distinct category)} pair contributed by at least one currently
+     * ACTIVE master of that salon performing an ACTIVE, salon-owned, categorised service.
+     * {@code sd.ownerId = m.salon.id} closes the same cross-salon leak
+     * {@link #findBookableAssignmentsBySalon} closes (an assignment pointing at a definition owned
+     * by a DIFFERENT salon than the performing master's own must not contribute a chip).
+     *
+     * <p>{@code m.salon.id IN (:salonIds) AND m.isActive = true} is covered by
+     * {@code idx_masters_salon_active (salon_id, is_active) WHERE is_active}; the owner-type/id/
+     * active predicate on {@code service_definitions} is covered by
+     * {@code idx_service_def_owner_type_active (owner_type, owner_id, is_active)}. No new index
+     * or migration was needed for either arm — measured against real local data (masters
+     * 2,345 / master_services 14,302 / service_definitions 10,876 / salons 300):
+     * {@code EXPLAIN (ANALYZE, BUFFERS)} on a 20-salon page warm-cache at ~2.98 ms without the
+     * redundant {@code sd.ownerId IN :salonIds} term below, all buffer HITS, no reads.
+     *
+     * <p><b>{@code sd.ownerId IN :salonIds} is REDUNDANT with {@code sd.ownerId = m.salon.id} and
+     * deliberately kept anyway.</b> Without it, the planner cannot push the salon-id filter onto
+     * {@code service_definitions} before the join — it hashes every ACTIVE salon-owned
+     * categorised service on the WHOLE platform (measured 3,600 rows) and then joins that against
+     * the 20-salon-scoped master rows. Adding the same salon ids as a direct predicate on
+     * {@code sd} lets {@code idx_service_def_owner_type_active} filter to just the page's own
+     * salons (measured 240 rows) before the join, which measured ~2.1-2.2 ms warm-cache for the
+     * same 20-salon page and result set — roughly 30% faster from a query-shape change alone, no
+     * schema change. This is the same page-bounded existing index, used more precisely.
+     */
+    @Query("""
+            SELECT DISTINCT m.salon.id, sd.category
+            FROM MasterServiceAssignment msa
+            JOIN msa.master m
+            JOIN msa.serviceDefinition sd
+            WHERE m.salon.id IN :salonIds
+              AND m.isActive = true
+              AND msa.isActive = true
+              AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+              AND sd.ownerId = m.salon.id
+              AND sd.ownerId IN :salonIds
+              AND sd.isActive = true
+              AND sd.category IS NOT NULL
+            """)
+    List<Object[]> findDistinctOfferedCategoriesBySalonIds(@Param("salonIds") Collection<UUID> salonIds);
 }

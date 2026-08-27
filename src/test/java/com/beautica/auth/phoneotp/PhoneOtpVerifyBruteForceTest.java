@@ -1,7 +1,7 @@
 package com.beautica.auth.phoneotp;
 
 import com.beautica.common.exception.BusinessException;
-import com.beautica.notification.sms.SmsService;
+import com.beautica.notification.sms.OtpSmsSender;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -67,14 +67,14 @@ class PhoneOtpVerifyBruteForceTest {
     @Mock private PhoneOtpRepository phoneOtpRepository;
     @Mock private PhoneOtpAttemptRecorder attemptRecorder;
     @Mock private GuestTokenProvider guestTokenProvider;
-    @Mock private SmsService smsService;
+    @Mock private OtpSmsSender otpSmsSender;
 
     private PhoneOtpService service;
 
     @BeforeEach
     void setUp() {
         service = new PhoneOtpService(phoneOtpRepository, attemptRecorder, guestTokenProvider,
-                smsService, Clock.fixed(FIXED_NOW, ZoneOffset.UTC));
+                otpSmsSender, Clock.fixed(FIXED_NOW, ZoneOffset.UTC));
     }
 
     private static String sha256Hex(String value) throws Exception {

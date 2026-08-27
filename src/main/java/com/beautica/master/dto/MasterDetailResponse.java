@@ -80,19 +80,28 @@ public record MasterDetailResponse(
      * Returns a copy of {@code full} with PII masked for unauthenticated callers.
      * {@code phoneNumber} is always masked, regardless of master type.
      * <p>
-     * Address fields (street, buildingNo, locationNote, cityId, oblastId, districtId) are masked
-     * for {@link MasterType#SALON_MASTER} / {@link MasterType#SALON_OWNER} — a salon master's
+     * Address fields (city, street, buildingNo, locationNote, cityId, oblastId, districtId) are
+     * masked for {@link MasterType#SALON_MASTER} / {@link MasterType#SALON_OWNER} — a salon master's
      * precise address is the salon's business address and is not surfaced on this public-by-id
      * path. For {@link MasterType#INDEPENDENT_MASTER}, the full address is returned unmasked,
      * matching what the master sees on their own {@code /masters/me} profile — an independent
      * master's home/work address IS the discoverable location clients need to find them.
+     * <p>
+     * The predicate itself lives in {@link MasterType#disclosesOwnAddress(MasterType)} — it is
+     * the locked matrix's single definition, shared with {@code GET /favorites/masters}
+     * ({@code FavoriteService#mapMasterRow}). Do not re-inline the {@code == INDEPENDENT_MASTER}
+     * comparison here: a second copy is exactly how the favourites surface drifted off the rule.
      */
     public static MasterDetailResponse fromPublic(MasterDetailResponse full) {
-        boolean isIndependent = full.masterType() == MasterType.INDEPENDENT_MASTER;
+        boolean isIndependent = MasterType.disclosesOwnAddress(full.masterType());
         return new MasterDetailResponse(
                 full.masterId(), full.firstName(), full.lastName(),
                 null,             // phoneNumber — masked for public access, all master types
-                full.city(),
+                // `city` is a DENORMALISED MIRROR of cities.name_uk, written beside cityId by
+                // UserService (the same fact in human-readable form) — masking the id while
+                // passing the name through would suppress nothing. Gated on the SAME
+                // `isIndependent` predicate, not a fourth expression of the rule.
+                isIndependent ? full.city() : null,
                 isIndependent ? full.street() : null,
                 isIndependent ? full.buildingNo() : null,
                 isIndependent ? full.locationNote() : null,

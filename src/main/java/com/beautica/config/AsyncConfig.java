@@ -266,6 +266,81 @@ public class AsyncConfig implements AsyncConfigurer {
     }
 
     /**
+     * Pool for REQUEST-PATH outbound SMS — today the walk-in confirmation
+     * ({@code BookingSmsDispatcher}, backend-perf MEDIUM 2026-08-18).
+     *
+     * <p><b>Why it is not {@link #smsReminderExecutor()}</b>, even though both send SMS (Anti-Bug
+     * §H-4 asks for consolidation of pools doing the same work). The two differ in the only property
+     * that decides a pool's configuration — <b>who submits, and what a rejection costs</b>:
+     * <ul>
+     *   <li>The reminder pool is fed by {@code sms-reminder-dispatch-0}, a thread holding no DB
+     *       connection, no HTTP request and no scheduler slot, and a dropped reminder is
+     *       unrecoverable ({@code reminderSent} is already committed). Hence
+     *       {@link CallerBlocksPolicy}: park the submitter, never lose the task.</li>
+     *   <li>This pool is fed from an {@code afterCommit} callback on the SERVLET thread, which still
+     *       holds its pooled Hikari connection. Parking that thread is precisely the cost this pool
+     *       exists to remove — {@link #smsReminderDispatchExecutor()}'s measurements are the reason
+     *       — and a dropped walk-in confirmation is the mildest failure available (the booking is
+     *       committed; the client made it in person). Hence {@code AbortPolicy} plus a structured
+     *       drop log in the dispatcher.</li>
+     * </ul>
+     * Merging them would force one policy onto both and re-introduce one of the two defects. Two
+     * pools, disjoint submitters, opposite rejection semantics — documented so the next consolidation
+     * pass does not undo it.
+     *
+     * <p><b>Sizing.</b> {@code corePoolSize == maxPoolSize == 4} for the reason spelled out on
+     * {@link #smsReminderExecutor()}: a {@link ThreadPoolExecutor} only grows past its core size once
+     * the QUEUE is full, so a core smaller than max would deliver the core's concurrency and nothing
+     * more. Four workers at a ~100 ms provider RTT clear ~40 sends/s, orders of magnitude above the
+     * walk-in create rate that the tighter {@code staffBookingSmsBuckets} budget now caps.
+     * {@code allowCoreThreadTimeOut} lets all four die back after 60 s idle. The 200-slot queue IS
+     * the bulkhead against a Turbosms outage: at the 5 s read cap the pool drains ~0.8 sends/s, so a
+     * sustained outage fills the queue and subsequent sends are dropped-and-logged in bounded time
+     * instead of each paying a full timeout on a request thread.
+     *
+     * <p>No {@link DelegatingSecurityContextTaskExecutor} wrapper: the task takes a phone and a
+     * fully-rendered body, nothing principal-derived.
+     *
+     * <p>{@code @Profile("!test")}: the test profile registers a synchronous stand-in under the SAME
+     * bean name — see {@link #syncSmsReminderDispatchExecutor()} for the general rationale, and note
+     * that the wire-level suites ({@code WalkInBookingSmsIT} / {@code WalkInBookingSmsEnabledIT})
+     * assert on recorded HTTP immediately after the create returns, so an async pool there would make
+     * every one of those assertions a race.
+     */
+    @Bean(name = "smsSendExecutor")
+    @Profile("!test")
+    public TaskExecutor smsSendExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(4);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("sms-send-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        // Drain on shutdown: a queued confirmation still has a real client waiting for it, and the
+        // grace is short because the queue is small and the sends are independent.
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(20);
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * Test-profile counterpart of {@link #smsSendExecutor()} — inline execution, so a wire-level
+     * integration test observes the Turbosms call deterministically the moment the create returns
+     * (Anti-Bug §M — no {@code Thread.sleep}, no timing-dependent assertions). Same bean name and
+     * mutually exclusive profile as the production bean, so the {@code @Qualifier} in
+     * {@code BookingSmsDispatcher} resolves in every profile and can never fall back to Spring's
+     * unbounded default executor.
+     */
+    @Bean(name = "smsSendExecutor")
+    @Profile("test")
+    public TaskExecutor syncSmsSendExecutor() {
+        return new SyncTaskExecutor();
+    }
+
+    /**
      * Test-profile counterparts of {@link #smsReminderDispatchExecutor()} and
      * {@link #smsReminderExecutor()}: both stages of the guest-reminder hand-off run INLINE on the calling
      * thread, so an integration test that calls {@code BookingReminderJob#sendReminders()} observes the

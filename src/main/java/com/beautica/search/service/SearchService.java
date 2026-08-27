@@ -5,6 +5,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.location.DiscoveryLocationKey;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.master.entity.MasterType;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.repository.SalonSearchProjection;
 import com.beautica.salon.repository.SalonSearchSql;
@@ -189,6 +190,17 @@ public class SearchService {
 
     /** Projection index of the {@code COUNT(*) OVER()} total-count column (PERF-M1). */
     private static final int TOTAL_COUNT_IDX = 15;
+
+    /**
+     * Projection index of {@code masters.master_type} (2026-08 security re-audit MEDIUM).
+     *
+     * <p>Projected ONLY to drive the locked per-role address matrix in {@link #mapMasterRow}
+     * ({@link MasterType#disclosesOwnAddress}); it never reaches {@link MasterSearchResult},
+     * which is served from a {@code permitAll} endpoint and carries no internal type/role
+     * values (§I). Appended LAST so every pre-existing index — including
+     * {@link #TOTAL_COUNT_IDX} — is untouched.
+     */
+    private static final int MASTER_TYPE_IDX = 16;
 
     // ── salon dynamic-projection layout (Phase 20.2 per-service filter path) ──
     /** Salon projection index of the discovery {@code city_id}. */
@@ -1103,8 +1115,8 @@ public class SearchService {
      * its SOURCE moves from {@code t.price_max} to {@code sn.price_max}. The
      * auth-gated address trio {@code street} (11) / {@code building_no} (12) /
      * {@code location_note} (13) is followed by
-     * {@link #MATCHED_SERVICE_NAMES_IDX matched_names} (14) and finally
-     * {@link #TOTAL_COUNT_IDX} (15).
+     * {@link #MATCHED_SERVICE_NAMES_IDX matched_names} (14),
+     * {@link #TOTAL_COUNT_IDX} (15) and {@link #MASTER_TYPE_IDX} (16).
      */
     private static String wrapWithServiceNamesLateral(
             String innerSql, SearchSort sort, boolean hasCategoryFilter,
@@ -1137,7 +1149,9 @@ public class SearchService {
                 .append("t.discovery_city_id, t.discovery_district_id, ")
                 .append(minPriceExpr).append(", sn.price_max, sn.service_names, ")
                 .append("t.street, t.building_no, t.location_note, ")
-                .append(matchedNamesExpr).append(" AS matched_names, t.total_count ")
+                .append(matchedNamesExpr).append(" AS matched_names, t.total_count, ")
+                // Address-matrix driver only (MASTER_TYPE_IDX) — never projected onto the DTO.
+                .append("t.master_type ")
                 .append("FROM (").append(innerSql).append(") t ")
                 .append("LEFT JOIN LATERAL (")
                 .append("SELECT ")
@@ -1275,6 +1289,9 @@ public class SearchService {
                 // masters' home addresses.
                 .append("u.street AS street, u.building_no AS building_no, ")
                 .append("u.location_note AS location_note, ")
+                // Drives the per-role address matrix one level up (see MASTER_TYPE_IDX).
+                // Plain column off the already-joined `masters m` — no extra join, no fan-out.
+                .append("m.master_type AS master_type, ")
                 // PERF-M1: window function replaces the second COUNT(*) query.
                 // Postgres applies LIMIT after window functions, so this reports
                 // the full filtered count in every paged row of the Top-N.
@@ -2508,21 +2525,42 @@ public class SearchService {
      * Maps a raw native-query row to {@link MasterSearchResult}, stamping the
      * resolved locality labels from the batched M2-seam result.
      *
-     * <p>16-column projection (indices 0–15, Phase 20.3):
+     * <p>17-column projection (indices 0–16):
      * {@code [master_id, first_name, last_name, avg_rating, review_count,
      * avatar_url, discovery_city_id, discovery_district_id,
      * min_effective_price, price_max, service_names, street, building_no,
-     * location_note, matched_names, total_count]}.
+     * location_note, matched_names, total_count, master_type]}.
      * The internal city/district UUIDs (6, 7) are consumed here for label
      * resolution and are NOT placed on the public DTO (§I).
      * {@code total_count} (15) is read by the caller before this method is
-     * invoked and is not mapped to the DTO.
+     * invoked and is not mapped to the DTO; {@code master_type} (16) is consumed
+     * here and likewise never reaches the wire.
      *
-     * <p>{@code street} (11) / {@code building_no} (12) / {@code location_note}
-     * (13) are mapped through as-is here; the per-request auth-gate (nulling them
-     * for anonymous callers) is applied in the controller AFTER the
-     * {@code @Cacheable} read so the cache never leaks addresses across the
-     * anon/authenticated boundary.
+     * <h4>Address suppression (§I — the locked per-role address matrix)</h4>
+     * {@code street} (11) / {@code building_no} (12) / {@code location_note} (13) are the
+     * master's OWN address off {@code users}. They are returned ONLY for a master type that
+     * passes {@link MasterType#disclosesOwnAddress} — the SAME predicate
+     * {@link com.beautica.master.dto.MasterDetailResponse#fromPublic} and
+     * {@code FavoriteService#mapMasterRow} apply, called rather than re-derived so the three
+     * surfaces cannot drift. 2026-08 security re-audit MEDIUM: this endpoint previously gated
+     * the trio on AUTHENTICATION ALONE, so any logged-in caller could page results and harvest
+     * {@code users.street} for every {@code SALON_MASTER} / {@code SALON_OWNER} — and
+     * {@code PATCH /users/me} lets a salon master populate that column with their real home
+     * address, so it was a live disclosure, not a latent one.
+     *
+     * <p><b>Suppression happens HERE, inside the {@code @Cacheable} read, not in the
+     * controller</b> — deliberately, and the two gates are independent:
+     * <ul>
+     *   <li><b>type gate (this method)</b> — caller-independent, a property of the ROW, so it
+     *       is safe to bake into the cached object and must be, or a cache entry would hold an
+     *       address no caller may ever see;</li>
+     *   <li><b>auth gate ({@code SearchController})</b> — caller-dependent, therefore applied
+     *       per-request AFTER the cache read, so a warm cache populated by an authenticated
+     *       caller cannot leak to an anonymous one.</li>
+     * </ul>
+     *
+     * <p>A {@code NULL} or unrecognised {@code master_type} fails CLOSED (address suppressed)
+     * — see {@link MasterType#fromProjection}.
      */
     private static MasterSearchResult mapMasterRow(Object[] row, DiscoveryLabels labels) {
         UUID masterId = (UUID) row[0];
@@ -2555,9 +2593,10 @@ public class SearchService {
         BigDecimal minEffectivePrice = (BigDecimal) row[8];
         BigDecimal priceMax = (BigDecimal) row[9];
         List<String> serviceNames = toServiceNames(row[SERVICE_NAMES_IDX]);
-        String street = (String) row[11];
-        String buildingNo = (String) row[12];
-        String locationNote = (String) row[13];
+        boolean disclosesAddress = MasterType.disclosesOwnAddress(MasterType.fromProjection(row[MASTER_TYPE_IDX]));
+        String street = disclosesAddress ? (String) row[11] : null;
+        String buildingNo = disclosesAddress ? (String) row[12] : null;
+        String locationNote = disclosesAddress ? (String) row[13] : null;
         List<String> matchedServiceNames = toMatchedServiceNames(row[MATCHED_SERVICE_NAMES_IDX]);
 
         return new MasterSearchResult(

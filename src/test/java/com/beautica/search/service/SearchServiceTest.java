@@ -146,10 +146,24 @@ class SearchServiceTest {
         // Phase 20.3 widened the wrapped master projection to 16 columns (indices
         // 0–15): matched_names landed at index 14 (empty here — no service filter)
         // and total_count (COUNT(*) OVER()) moved to index 15 (TOTAL_COUNT_IDX).
+        // The 2026-08 security re-audit appended masters.master_type at index 16
+        // (MASTER_TYPE_IDX) to drive the per-role address matrix. Short rows — the
+        // pre-existing fixtures, authored before the column existed — are defaulted
+        // to INDEPENDENT_MASTER, the type whose own address IS published, so every
+        // pre-existing assertion keeps exercising the disclosing branch.
+        //
+        // The default keys off the AUTHORED length, never off a null value: a row
+        // that supplies all 17 columns is taken verbatim, so an explicit null
+        // master_type stays null and the fail-CLOSED branch is actually reachable
+        // from a test (a `extended[16] == null` check would silently rewrite it and
+        // make should_suppressStreetAddress_when_masterTypeIsUnrecognised untestable).
         List<Object[]> rowsWithCount = rows.stream()
                 .map(row -> {
-                    Object[] extended = java.util.Arrays.copyOf(row, 16);
+                    Object[] extended = java.util.Arrays.copyOf(row, 17);
                     extended[15] = total;   // TOTAL_COUNT_IDX in SearchService
+                    if (row.length <= 16) {
+                        extended[16] = "INDEPENDENT_MASTER";   // MASTER_TYPE_IDX
+                    }
                     return extended;
                 })
                 .toList();
@@ -313,6 +327,128 @@ class SearchServiceTest {
         assertThat(mapped.reviewCount()).isEqualTo(42);
         // Exactly one batched resolve for the whole page — never per-row (§E).
         verify(discoveryLocationResolver, times(1)).resolveLabels(any(), any());
+    }
+
+    // ── per-role address matrix (2026-08 security re-audit MEDIUM) ───────────
+    //
+    // /search/masters gated street/building_no/location_note on AUTHENTICATION ALONE, never on
+    // master type, so any logged-in caller could page results and harvest users.street for every
+    // SALON_MASTER / SALON_OWNER. Unlike the favourites case this was LIVE, not latent:
+    // PATCH /users/me lets a salon master write their real home address into that column.
+    //
+    // The masking is asserted HERE, on the service mapper, deliberately — it must sit INSIDE the
+    // @Cacheable read (the rule depends only on the row, so a cached entry must already be
+    // masked), unlike the caller-dependent anonymous strip pinned in SearchControllerTest.
+
+    private static final String SEARCH_STREET = "вул. Хрещатик";
+    private static final String SEARCH_BUILDING_NO = "12Б";
+    private static final String SEARCH_LOCATION_NOTE = "код 4321";
+
+    /**
+     * Builds the full 17-column master projection row with the address trio populated and the
+     * given {@code masters.master_type} raw value at MASTER_TYPE_IDX (16); {@code total_count}
+     * (15) is stamped by {@link #stubNativeQueries}.
+     */
+    private static Object[] masterRowWithAddress(String rawMasterType) {
+        Object[] row = new Object[17];
+        row[0] = UUID.randomUUID();
+        row[1] = "Test";
+        row[2] = "Master";
+        row[3] = new BigDecimal("4.50");
+        row[4] = 12;
+        row[6] = CITY_ID;
+        row[7] = DISTRICT_ID;
+        row[8] = new BigDecimal("250.00");
+        row[11] = SEARCH_STREET;
+        row[12] = SEARCH_BUILDING_NO;
+        row[13] = SEARCH_LOCATION_NOTE;
+        row[16] = rawMasterType;
+        return row;
+    }
+
+    @Test
+    @DisplayName("nulls street/buildingNo/locationNote for a SALON_MASTER / SALON_OWNER in the results")
+    void should_nullStreetAddress_when_salonMasterInSearchResults() {
+        stubNativeQueries(List.of(
+                masterRowWithAddress("SALON_MASTER"),
+                masterRowWithAddress("SALON_OWNER")), 2L);
+        when(discoveryLocationResolver.resolveLabels(any(), any()))
+                .thenReturn(new DiscoveryLabels(
+                        Map.of(CITY_ID, "Київ"), Map.of(DISTRICT_ID, "Печерський")));
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getContent())
+                .as("a salon-affiliated master's users.street is their own home address (or, for "
+                        + "a multi-salon owner, the WRONG salon's) — the locked matrix suppresses "
+                        + "it for every caller, exactly as MasterDetailResponse.fromPublic does")
+                .allSatisfy(r -> assertThat(r)
+                        .extracting(MasterSearchResult::street,
+                                MasterSearchResult::buildingNo,
+                                MasterSearchResult::locationNote)
+                        .containsOnlyNulls());
+        assertThat(result.getContent())
+                .as("only the address triple is masked — the public locality labels stay, or the "
+                        + "result card loses the 'where can I find them' line the matrix permits")
+                .allSatisfy(r -> {
+                    assertThat(r.cityLabel()).isEqualTo("Київ");
+                    assertThat(r.districtLabel()).isEqualTo("Печерський");
+                });
+    }
+
+    @Test
+    @DisplayName("keeps the street address for an INDEPENDENT_MASTER — the matrix masks by type, not blanket")
+    void should_keepStreetAddress_when_independentMasterInSearchResults() {
+        // The control case. A fix that blanked the trio unconditionally would pass the test above
+        // while deleting the one address discovery legitimately publishes.
+        stubNativeQueries(List.<Object[]>of(masterRowWithAddress("INDEPENDENT_MASTER")), 1L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getContent().get(0))
+                .extracting(MasterSearchResult::street,
+                        MasterSearchResult::buildingNo,
+                        MasterSearchResult::locationNote)
+                .containsExactly(SEARCH_STREET, SEARCH_BUILDING_NO, SEARCH_LOCATION_NOTE);
+    }
+
+    @Test
+    @DisplayName("suppresses the address and does not throw when master_type is null or unknown")
+    void should_suppressStreetAddress_when_masterTypeIsUnrecognised() {
+        // Fail CLOSED: a NULL column, or a constant a mid-rolling-deploy instance does not know,
+        // must mask rather than default to disclosure — and must not throw IllegalArgumentException
+        // out of a permitAll read endpoint as a 500.
+        stubNativeQueries(List.of(
+                masterRowWithAddress(null),
+                masterRowWithAddress("FUTURE_MASTER_TYPE")), 2L);
+
+        Page<MasterSearchResult> result = service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(result.getContent())
+                .as("unknown master type fails CLOSED — a missing street line is recoverable, "
+                        + "a leaked one is not")
+                .hasSize(2)
+                .allSatisfy(r -> assertThat(r)
+                        .extracting(MasterSearchResult::street,
+                                MasterSearchResult::buildingNo,
+                                MasterSearchResult::locationNote)
+                        .containsOnlyNulls());
+    }
+
+    @Test
+    @DisplayName("projects masters.master_type so the address matrix has an input to gate on")
+    void should_projectMasterType_when_buildingMasterSearchSql() {
+        // Guards the plumbing the three tests above depend on: without the column the mapper reads
+        // null at MASTER_TYPE_IDX, fails closed, and EVERY master silently loses their address —
+        // green masking tests, broken feature.
+        stubNativeQueries(List.<Object[]>of(masterRowWithAddress("INDEPENDENT_MASTER")), 1L);
+
+        service.searchMasters(emptyRequest(), PageRequest.of(0, 20));
+
+        assertThat(sqlCaptor.getAllValues())
+                .allSatisfy(sql -> assertThat(sql)
+                        .contains("m.master_type AS master_type")
+                        .contains("t.master_type"));
     }
 
     // ── zero-review rating normalisation (Phase 240 audit, Finding 3) ─────────

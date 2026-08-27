@@ -12,6 +12,7 @@ import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.exception.VerificationErrorResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -76,6 +77,12 @@ class EmailVerificationIT extends AbstractIntegrationTest {
 
     @Autowired
     private AuthService authService;
+
+    @Autowired
+    private RefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private TokenGenerator tokenGenerator;
 
 
     // ── Helper: register and capture raw OTP ─────────────────────────────────
@@ -773,5 +780,42 @@ class EmailVerificationIT extends AbstractIntegrationTest {
         assertThat(unknownBody.success()).isEqualTo(realBody.success());
         assertThat(unknownBody.message()).isEqualTo(realBody.message());
         assertThat(unknownBody.data().message()).isEqualTo(realBody.data().message());
+    }
+
+    // ── Test 15 (QA) — verifyEmail() is a distinct fresh-mint entry point ─────
+
+    @Test
+    @DisplayName("should mint DISTINCT refresh-token families for two different users who verify their email")
+    void should_mintDistinctFamilyIds_when_twoDifferentUsersVerifyEmail() throws Exception {
+        // AuthService#verifyEmail routes through the exact same one-arg
+        // AuthResponseBuilder#buildAuthResponse(User) overload as login() (AuthService.java:359),
+        // but it is a SEPARATE call site the reuse-detection gap explicitly named — pin it here
+        // rather than relying only on the login()-side proof in AuthControllerIT, and observe it
+        // through the real DB the way the rest of this feature's regression nets do.
+        var emailA = "family.verifya@beautica.test";
+        var emailB = "family.verifyb@beautica.test";
+        log.debug("Arrange: register+capture OTP for two independent users email={} email={}", emailA, emailB);
+        String codeA = registerAndCaptureCode(emailA);
+        String codeB = registerAndCaptureCode(emailB);
+
+        log.debug("Act: verify-email for both users");
+        ResponseEntity<String> verifyRespA = restTemplate.postForEntity(
+                "/api/v1/auth/verify-email", new VerifyEmailRequest(emailA, codeA), String.class);
+        ResponseEntity<String> verifyRespB = restTemplate.postForEntity(
+                "/api/v1/auth/verify-email", new VerifyEmailRequest(emailB, codeB), String.class);
+
+        var bodyA = objectMapper.readValue(verifyRespA.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        var bodyB = objectMapper.readValue(verifyRespB.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+
+        var tokenRowA = refreshTokenRepository
+                .findByToken(tokenGenerator.hash(bodyA.data().refreshToken()))
+                .orElseThrow(() -> new AssertionError("user A's refresh token row must exist in the DB"));
+        var tokenRowB = refreshTokenRepository
+                .findByToken(tokenGenerator.hash(bodyB.data().refreshToken()))
+                .orElseThrow(() -> new AssertionError("user B's refresh token row must exist in the DB"));
+
+        assertThat(tokenRowB.getFamilyId())
+                .as("two different users verifying their email must never share a family_id")
+                .isNotEqualTo(tokenRowA.getFamilyId());
     }
 }

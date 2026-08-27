@@ -1,0 +1,45 @@
+-- V145: partial index restoring index-order output for ClientAggregationRepository#findTimeline
+-- after it was widened from `status = COMPLETED` to the two-status OR predicate below.
+--
+-- WHY
+-- ───
+-- findTimeline's WHERE clause is now:
+--     b.client.id = :clientId
+--     AND ( b.status = COMPLETED OR (b.status = CONFIRMED AND b.endsAt < :now) )
+--     ORDER BY b.startsAt DESC
+--
+-- Before the widening, the query planned as a single covering Index Cond on
+-- idx_bookings_client_status_starts_at (client_id, status, starts_at) (V18) — Index Scan
+-- Backward gave `ORDER BY starts_at DESC` for free, and countQuery was a zero-heap-fetch
+-- Index Only Scan.
+--
+-- After the widening, no single existing index encodes both OR-legs AND preserves starts_at
+-- order, so Postgres plans a BitmapOr of the client-scoped indexes into a Bitmap Heap Scan,
+-- then an explicit Sort node before LIMIT is applied — losing early-termination-on-LIMIT.
+-- countQuery loses its Index Only Scan too (Recheck Cond needs a heap fetch). Bounded by
+-- per-client cardinality so it is sub-ms today, but this cost scales with the client's full
+-- booking history on EVERY page (OFFSET re-sorts the full matching set each time), and this is
+-- the home-hub landing screen query.
+--
+-- `b.endsAt < :now` cannot be folded into a partial-index predicate — `now()`/a bind parameter
+-- is not IMMUTABLE, so Postgres rejects it in a partial index's WHERE clause. Narrowing to the
+-- two qualifying statuses (COMPLETED, CONFIRMED) is still enough to restore index-order output:
+-- every row this query can ever return has status IN ('COMPLETED','CONFIRMED'), so the index
+-- covers 100% of the query's candidate rows while excluding every other status's bookings from
+-- the client's index entries (PENDING never existed, but CANCELLED/DECLINED/NOT_COMPLETED do).
+--
+-- Column order (client_id, starts_at DESC, id): client_id is the sole equality predicate;
+-- starts_at DESC matches ORDER BY b.startsAt DESC directly, avoiding both the Sort node and a
+-- backward scan; trailing id gives a stable tiebreaker for rows sharing an identical starts_at,
+-- matching the id-tiebreaker convention already used by idx_bookings_client_starts_at (V117) and
+-- idx_bookings_master_starts_at (V117) elsewhere in this table.
+--
+-- Locking: plain CREATE INDEX, matching every prior index migration on this table (V112, V142,
+-- V143, V144) — none of them use CONCURRENTLY, and Flyway wraps each migration in a transaction
+-- by default, inside which CREATE INDEX CONCURRENTLY cannot run at all. Introducing CONCURRENTLY
+-- here alone would be a deployment-behaviour change (a non-transactional migration, replayable
+-- differently on failure) with no established convention in this codebase to justify it as a
+-- one-off; it is out of this migration's locus.
+CREATE INDEX idx_bookings_client_timeline_starts_at
+    ON bookings (client_id, starts_at DESC, id)
+    WHERE status IN ('COMPLETED', 'CONFIRMED');

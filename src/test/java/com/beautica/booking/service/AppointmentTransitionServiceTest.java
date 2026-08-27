@@ -917,12 +917,32 @@ class AppointmentTransitionServiceTest {
         setIdViaReflection(itemClient, clientId); // User has no @Builder — id needs reflection
     }
 
-    /** Stubs the single-service schedule-fit oracle so {@code newStartsAt} resolves to an on-schedule slot. */
+    /**
+     * Stubs the CLIENT single-service schedule-fit oracle (15-minute lead floor) so {@code newStartsAt}
+     * resolves to an on-schedule slot.
+     *
+     * <p>Deliberately NOT the staff oracle: a provider-initiated reschedule now runs at the STAFF floor
+     * and therefore asks {@code isStaffSlotAvailable} instead — see {@link #stubStaffItemSlotAvailable}.
+     * Under {@code MockitoExtension}'s default STRICT_STUBS, stubbing both here would fail every test
+     * with {@code UnnecessaryStubbingException}, so the two actor paths get one stub each.
+     */
     private void stubItemSlotAvailable(OffsetDateTime newStartsAt) {
         AvailableSlotResponse slot = new AvailableSlotResponse(
                 newStartsAt.atZoneSameInstant(KYIV), newStartsAt.plusMinutes(60).atZoneSameInstant(KYIV));
         when(slotCalculationService.getAvailableSlots(eq(masterId), any(), eq(masterServiceId), isNull()))
                 .thenReturn(List.of(slot));
+    }
+
+    /**
+     * PROVIDER counterpart of {@link #stubItemSlotAvailable} — the STAFF (minimum-lead-0) oracle a
+     * provider-initiated per-item reschedule routes to, mirroring the walk-in CREATE path. Boolean, not
+     * a materialised slot list, because {@code BookingSlotAvailabilityGuard} asks
+     * {@code isStaffSlotAvailable} on this branch.
+     */
+    private void stubStaffItemSlotAvailable(OffsetDateTime newStartsAt) {
+        when(slotCalculationService.isStaffSlotAvailable(
+                eq(masterId), any(), eq(masterServiceId), isNull(), eq(newStartsAt)))
+                .thenReturn(true);
     }
 
     @Test
@@ -938,7 +958,7 @@ class AppointmentTransitionServiceTest {
         Booking target = confirmedItem(targetId, siblingStart.plusHours(2), siblingStart.plusHours(3));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
         AppointmentDetailResponse enriched = org.mockito.Mockito.mock(AppointmentDetailResponse.class);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
@@ -984,11 +1004,12 @@ class AppointmentTransitionServiceTest {
         Booking target = confirmedItem(targetId, start, start.plusHours(1));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
-        stubItemSlotAvailable(newStartsAt);
+        // Provider-initiated ⇒ the STAFF (minimum-lead-0) oracle, matching walk-in CREATE.
+        stubStaffItemSlotAvailable(newStartsAt);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // F1 freshness re-check (cycle-6 audit 2026-08-03): target is still CONFIRMED post-lock.
         when(bookingRepository.existsConfirmedById(targetId)).thenReturn(true);
@@ -1021,7 +1042,7 @@ class AppointmentTransitionServiceTest {
         Booking target = confirmedItem(targetId, targetStart, targetStart.plusHours(1));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         // Requested new window lands EXACTLY on the sibling's window — a strict overlap.
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(siblingStart);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(siblingStart, false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1053,7 +1074,7 @@ class AppointmentTransitionServiceTest {
         Booking target = confirmedItem(targetId, siblingStart.plusHours(5), siblingStart.plusHours(6));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         // New window starts EXACTLY where the sibling ends — legal back-to-back touch.
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(siblingEnd);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(siblingEnd, false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1088,7 +1109,7 @@ class AppointmentTransitionServiceTest {
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         // New window lands INSIDE the declined sibling's released window — allowed, it is terminal.
         OffsetDateTime newStartsAt = siblingStart.plusHours(1);
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1121,7 +1142,7 @@ class AppointmentTransitionServiceTest {
         Booking target = confirmedItem(targetId, start, start.plusHours(1));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1159,7 +1180,7 @@ class AppointmentTransitionServiceTest {
         Booking target = confirmedItem(targetId, start, start.plusHours(1));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt);
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1197,7 +1218,7 @@ class AppointmentTransitionServiceTest {
         OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
         Booking item = confirmedItem(realChild, start, start.plusHours(1));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1));
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1), false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1220,7 +1241,7 @@ class AppointmentTransitionServiceTest {
         doThrow(new ForbiddenException("Access denied"))
                 .when(authz).enforceCanManageAppointment(actorId, appointmentId);
         AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(
-                OffsetDateTime.parse("2026-08-10T09:00:00Z"));
+                OffsetDateTime.parse("2026-08-10T09:00:00Z"), false);
 
         assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
                 actorId, Role.SALON_OWNER, appointmentId, targetId, req))
@@ -1239,7 +1260,7 @@ class AppointmentTransitionServiceTest {
         UUID targetId = UUID.randomUUID();
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(foreignClientId));
         AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(
-                OffsetDateTime.parse("2026-08-10T09:00:00Z"));
+                OffsetDateTime.parse("2026-08-10T09:00:00Z"), false);
 
         assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
                 clientId, Role.CLIENT, appointmentId, targetId, req))
@@ -1274,7 +1295,7 @@ class AppointmentTransitionServiceTest {
                 .bufferMinutesAtBooking(0)
                 .build();
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1));
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1), false);
 
         // The VISIT-level guard passes — clientId genuinely owns appointmentId.
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1301,7 +1322,7 @@ class AppointmentTransitionServiceTest {
         OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
         Booking target = terminalItem(targetId, BookingStatus.DECLINED, start, start.plusHours(1));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
-        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1));
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(start.plusDays(1), false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
@@ -1329,7 +1350,7 @@ class AppointmentTransitionServiceTest {
                 OffsetDateTime.parse("2026-08-10T09:00:00Z"), OffsetDateTime.parse("2026-08-10T10:00:00Z"));
         Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
         AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(
-                OffsetDateTime.parse("2026-08-11T09:00:00Z"));
+                OffsetDateTime.parse("2026-08-11T09:00:00Z"), false);
 
         when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));

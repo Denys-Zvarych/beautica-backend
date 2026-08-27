@@ -24,7 +24,9 @@ import org.springframework.context.annotation.Import;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -191,5 +193,94 @@ class SlotCalculationServiceCacheTest {
         // FIRST element and did not clear the whole cache.
         verify(masterServiceRepository, times(1))
                 .findByMasterIdAndIdWithGraph(otherMasterId, serviceId);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Phase 22.2 — the STAFF entry points must stay UNCACHED
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>The staff slot list must never become {@code @Cacheable}</b> (Phase 22.2, QA 2026-08-18).
+     *
+     * <p>{@code getStaffAvailableSlots} runs the identical pipeline as
+     * {@link SlotCalculationService#getAvailableSlots(UUID, LocalDate, UUID)} at a DIFFERENT
+     * lead-time floor ({@link java.time.Duration#ZERO} instead of {@code BookingWindow.minLead()}),
+     * and the {@code available-slots} key — {@code {masterId, date, masterServiceId}} — carries no
+     * floor term. Annotating this method would therefore make the two answers share one entry, and
+     * every correctness assertion in the codebase would stay green: no existing test calls a staff
+     * entry point twice, and none calls one before a client one.
+     *
+     * <p>Two consecutive calls must both reach the repository. Mutation-verified: adding
+     * {@code @Cacheable(value = SLOTS_CACHE, key = "{#masterId, #date, #masterServiceId}")} to
+     * {@code getStaffAvailableSlots} turns this RED (1 invocation instead of 2).
+     */
+    @Test
+    @DisplayName("getStaffAvailableSlots — recomputes on every call; the zero-lead list is never cached")
+    void should_recomputeOnEveryCall_when_getStaffAvailableSlotsIsCalledTwice() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        stubCacheableSlots(masterId, masterServiceId, date);
+
+        slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceId, null);
+        slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceId, null);
+
+        verify(masterServiceRepository, times(2))
+                .findByMasterIdAndIdWithGraph(masterId, masterServiceId);
+    }
+
+    /**
+     * The same contract for the boolean twin the create path actually calls
+     * ({@code BookingSlotAvailabilityGuard#assertStaffStartsOnAvailableSlot} asks
+     * {@code isStaffSlotAvailable}, not the list). A cached existence verdict is strictly worse than
+     * a cached list: it would answer "free" for a slot a competing booking consumed seconds earlier,
+     * inside the whole 60-second TTL, for every subsequent walk-in on that key.
+     *
+     * <p>Mutation-verified: adding {@code @Cacheable(value = SLOTS_CACHE, ...)} to
+     * {@code isStaffSlotAvailable} turns this RED.
+     */
+    @Test
+    @DisplayName("isStaffSlotAvailable — recomputes on every call; the staff existence check is never cached")
+    void should_recomputeOnEveryCall_when_isStaffSlotAvailableIsCalledTwice() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        OffsetDateTime startsAt = date.atTime(12, 0).atOffset(ZoneOffset.UTC);
+        stubCacheableSlots(masterId, masterServiceId, date);
+
+        slotCalculationService.isStaffSlotAvailable(masterId, date, masterServiceId, null, startsAt);
+        slotCalculationService.isStaffSlotAvailable(masterId, date, masterServiceId, null, startsAt);
+
+        verify(masterServiceRepository, times(2))
+                .findByMasterIdAndIdWithGraph(masterId, masterServiceId);
+    }
+
+    /**
+     * <b>THE harm the previous two tests exist to prevent, asserted directly.</b>
+     *
+     * <p>A staff read populating the {@code available-slots} entry would poison the CLIENT-facing
+     * {@code GET /masters/{id}/slots} answer for the rest of the TTL: self-service clients would be
+     * offered slots inside the 15-minute lead-time floor they are then 400'd for booking — the exact
+     * "the API offers what it will not accept" defect {@code BookingWindow} exists to prevent.
+     *
+     * <p>Three reads, ONE staff then TWO client: the repository must be reached twice — once for the
+     * uncached staff read and once for the client MISS the staff read must not have filled. The
+     * second client read is the control that proves the client entry really is cacheable, so the
+     * count cannot be satisfied by caching being broken outright.
+     */
+    @Test
+    @DisplayName("a staff read never populates the client-facing available-slots entry")
+    void should_leaveTheClientSlotEntryUnpopulated_when_aStaffReadRunsFirst() {
+        UUID masterId = UUID.randomUUID();
+        UUID masterServiceId = UUID.randomUUID();
+        LocalDate date = LocalDate.now(clock).plusDays(7);
+        stubCacheableSlots(masterId, masterServiceId, date);
+
+        slotCalculationService.getStaffAvailableSlots(masterId, date, masterServiceId, null);
+        slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+        slotCalculationService.getAvailableSlots(masterId, date, masterServiceId);
+
+        verify(masterServiceRepository, times(2))
+                .findByMasterIdAndIdWithGraph(masterId, masterServiceId);
     }
 }

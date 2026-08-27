@@ -22,14 +22,17 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.task.SyncTaskExecutor;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -72,10 +75,25 @@ class GuestBookingServiceTest {
     void setUp() {
         service = new GuestBookingService(
                 guestTokenProvider, masterRepository, masterServiceRepository, bookingRepository,
-                appointmentRepository, slotCalculationService, outboxService, smsService,
+                appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC));
+    }
+
+    /**
+     * The REAL {@link BookingSmsDispatcher} over the mocked {@link SmsService} seam, driven by a
+     * {@link SyncTaskExecutor} — the same shape {@code StaffBookingServiceTest} uses, and the same
+     * shape the {@code test} profile wires in production code ({@code AsyncConfig#syncSmsSendExecutor}).
+     *
+     * <p>A mocked dispatcher would have been less work and strictly worse: every {@code
+     * verify(smsService)} row below would then assert only that a hand-off was requested, and a
+     * dispatcher that silently stopped sending would keep them all green. Running the real one inline
+     * keeps those rows meaning "the message was sent", exactly as before the hand-off was introduced,
+     * while still proving the service holds no {@code SmsService} of its own.
+     */
+    private BookingSmsDispatcher smsDispatcher() {
+        return new BookingSmsDispatcher(smsService, new SyncTaskExecutor());
     }
 
     @Test
@@ -83,14 +101,18 @@ class GuestBookingServiceTest {
     void should_createConfirmedGuestBooking_when_slotIsFree() {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         stubHappyPath(startsAt);
-        ArgumentCaptor<Booking> savedCaptor = ArgumentCaptor.forClass(Booking.class);
-        when(bookingRepository.saveAndFlush(savedCaptor.capture())).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
 
         GuestBookingResponse response = service.createGuestBooking(
                 "Bearer guest.jwt.token", SLUG,
                 new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
 
-        Booking saved = savedCaptor.getValue();
+        // Phase 22.12: BookingSlotLockGuard#saveOrConflict(repo, Booking) now delegates to the
+        // list overload (saveAll + flush) so the constraint-violation → 409 mapping cannot drift
+        // between the single-service and visit create paths — see that class's Javadoc.
+        ArgumentCaptor<List<Booking>> savedCaptor = ArgumentCaptor.forClass(List.class);
+        verify(bookingRepository).saveAll(savedCaptor.capture());
+        Booking saved = savedCaptor.getValue().get(0);
         assertThat(saved.getStatus()).isEqualTo(BookingStatus.CONFIRMED);
         assertThat(saved.getBookingSource()).isEqualTo(BookingSource.LINK);
         assertThat(saved.getGuestName()).isEqualTo("Олена");
@@ -114,6 +136,35 @@ class GuestBookingServiceTest {
         verify(bookingRepository).acquireAdvisoryLockWithTimeout(masterId);
     }
 
+    /**
+     * <b>The availability evict must run BEFORE the SMS, not after</b> (perf MEDIUM, 2026-08-18).
+     *
+     * <p>Both side-effects share ONE after-commit runnable, and the send was its first statement.
+     * A Turbosms brown-out therefore delayed a correctness-critical eviction by up to the full
+     * 3 s connect + 5 s read budget, and for that whole time parallel readers could repopulate — and
+     * then keep serving for the 60 s cache TTL — a slot this very booking had just consumed. That is
+     * precisely the double-book window {@code BookingAfterCommit} exists to close, reopened from the
+     * inside by an unrelated network call. The evict is in-memory and cannot block; the send can.
+     *
+     * <p>Ordering, not mere presence, is the property — so this is an {@link InOrder} assertion.
+     * Every other row in this suite verifies both collaborators independently and would stay green
+     * with the statements swapped back, which is how the defect survived to be found by review.
+     */
+    @Test
+    @DisplayName("should evict the availability caches BEFORE the confirmation SMS is attempted")
+    void should_evictAvailabilityCachesBeforeSendingTheConfirmation_when_bookingCreated() {
+        OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
+        stubHappyPath(startsAt);
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        service.createGuestBooking("Bearer guest.jwt.token", SLUG,
+                new GuestBookingRequest(serviceId, startsAt, "Олена", "Коваль"));
+
+        InOrder inOrder = org.mockito.Mockito.inOrder(slotCalculationService, smsService);
+        inOrder.verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
+        inOrder.verify(smsService).send(eq(GUEST_PHONE), anyString());
+    }
+
     @Test
     @DisplayName("should throw 409 when the requested slot is already taken")
     void should_throw409_when_slotTaken() {
@@ -134,7 +185,7 @@ class GuestBookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.CONFLICT);
 
-        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(bookingRepository, never()).saveAll(any());
         verifyNoInteractions(smsService);
         // Lock timeout must still be set even when the slot turns out to be taken — it is
         // fused into the same statement as the lock acquisition attempt, which is the first
@@ -198,7 +249,7 @@ class GuestBookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
 
-        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(bookingRepository, never()).saveAll(any());
         verifyNoInteractions(smsService);
     }
 
@@ -222,7 +273,7 @@ class GuestBookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting("status").isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
 
-        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(bookingRepository, never()).saveAll(any());
         verifyNoInteractions(smsService);
     }
 
@@ -262,12 +313,16 @@ class GuestBookingServiceTest {
         UUID thirdServiceId = UUID.randomUUID();
         when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
-                .thenReturn(Optional.of(masterService()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, secondServiceId))
-                .thenReturn(Optional.of(masterService(secondServiceId, "Педикюр")));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, thirdServiceId))
-                .thenReturn(Optional.of(masterService(thirdServiceId, "Брови")));
+        // The visit path resolves the whole chain through VisitPlanner, which batch-loads the
+        // DISTINCT id set in ONE round-trip (perf LOW, 2026-08-22) rather than one SELECT per id.
+        // Stubbing the exact set — not any() — is what keeps this stub falsifying a planner that
+        // silently narrowed or widened the id set it asks for.
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(
+                masterId, Set.of(serviceId, secondServiceId, thirdServiceId)))
+                .thenReturn(List.of(
+                        masterService(),
+                        masterService(secondServiceId, "Педикюр"),
+                        masterService(thirdServiceId, "Брови")));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -298,8 +353,10 @@ class GuestBookingServiceTest {
         OffsetDateTime startsAt = OffsetDateTime.parse("2026-06-10T12:00:00+03:00");
         when(guestTokenProvider.validate(anyString())).thenReturn(GUEST_PHONE);
         when(masterRepository.findByBookingSlugWithUser(SLUG)).thenReturn(Optional.of(master()));
-        when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
-                .thenReturn(Optional.of(masterService()));
+        // Single-element masterServiceIds still goes through the planner's BATCH finder — N = 1 is
+        // not special-cased there either.
+        when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId)))
+                .thenReturn(List.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -379,7 +436,7 @@ class GuestBookingServiceTest {
                 .thenReturn(Optional.of(masterService(serviceId, "Манікюр {cancelUrl} {date}")));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
         when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
-        when(bookingRepository.saveAndFlush(any(Booking.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
         stubSlotAvailable(startsAt);
 
         GuestBookingResponse response = service.createGuestBooking(

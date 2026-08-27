@@ -1,0 +1,41 @@
+-- V144: drop idx_bookings_master_client_starts_at and idx_bookings_salon_client_starts_at —
+-- both consumer-free after the favourites category axis was reversed.
+--
+-- WHY
+-- ───
+-- The favourites category axis used to be "the category of the last service THIS CLIENT
+-- BOOKED with this provider" — derived per-provider by a LATERAL correlating on
+-- (master_id, client_id) or (salon_id, client_id) plus an ORDER BY starts_at DESC LIMIT 1.
+-- V93 built idx_bookings_master_client_starts_at (master_id, client_id, starts_at DESC) for
+-- the master arm of that LATERAL; V142 built idx_bookings_salon_client_starts_at
+-- (salon_id, client_id, starts_at DESC), PARTIAL on both operands NOT NULL, for the salon arm.
+--
+-- The axis was reversed to "every category the provider OFFERS" — a property of the
+-- provider's active services, not of this client's booking history. That removed the only
+-- two queries that ever combined (master_id, client_id) or (salon_id, client_id) in one
+-- predicate: BookingRepository#findLastBookedCategoryBySalonIds and its master-side sibling
+-- were deleted, along with LastBookedCategoryLookup and their five test files. The category
+-- axis is now served by OfferedCategoryLookup, which reads master/salon service offerings —
+-- it never queries `bookings` at all.
+--
+-- ── Checks made before dropping (this is an irreversible production change) ──────────────────
+--   * Every remaining `bookings` query was enumerated: BookingRepository, AppointmentRepository,
+--     ClientAggregationRepository, ClosureReminderRepository, DashboardService, and
+--     BookingSpecifications. BookingSpecifications.masterIdEquals / clientIdEquals / salonIdIn
+--     are mutually exclusive role-scope predicates — never composed with each other — so no
+--     surviving query filters on (master_id, client_id) or (salon_id, client_id) together.
+--   * EXPLAIN on the live query shapes that touch master_id or salon_id shows the planner
+--     choosing idx_bookings_master_slot_overlap and idx_bookings_salon_starts_at instead —
+--     neither of the composites dropped here is selected for any surviving access pattern.
+--   * NOT unique, backs no constraint, no differing opclass/collation/INCLUDE — plain
+--     CREATE INDEX statements from V93/V142 with no constraint semantics to lose.
+--   * `bookings` is the busiest write table in the schema; removing two provably-unused
+--     composites (one of them 3-column) is pure write-side saving.
+--
+-- No CONCURRENTLY: Flyway runs each migration inside a transaction, and DROP INDEX
+-- CONCURRENTLY cannot run in one. IF EXISTS keeps this replayable on a database where an
+-- operator already dropped either index by hand.
+-- ────────────────────────────────────────────────────────────────────────────────────────────
+
+DROP INDEX IF EXISTS idx_bookings_master_client_starts_at;
+DROP INDEX IF EXISTS idx_bookings_salon_client_starts_at;

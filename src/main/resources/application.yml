@@ -191,7 +191,7 @@ app:
   jwt:
     secret: ${JWT_SECRET}
     access-token-expiration: 3600000      # 1 hour in ms
-    refresh-token-expiration: 604800000   # 7 days in ms
+    refresh-token-expiration: 2592000000  # 30 days in ms
   cloudflare-r2:
     # Master kill-switch. When false (default), S3Config does NOT register an S3Client bean and
     # R2StorageService (Phase 7.4) will run in stub-safe mode. Set R2_ENABLED=true only when all
@@ -219,6 +219,26 @@ app:
     # A cancel request inside this window returns 422.
     cancel-window-hours: ${BOOKING_CANCEL_WINDOW_HOURS:2}
     sms:
+      # Phase 22.7 — THE single "are we spending SMS money" switch. Read by SmsConfig, which uses
+      # it to choose the SmsService bean itself (NoOpSmsService when false, TurbosmsService when
+      # true), so it gates EVERY outbound booking SMS at once: walk-in confirmation, guest
+      # confirmation, 24h reminder, cancellation, provider decline. No call site branches on it.
+      #
+      # NOT gated by this flag: the guest phone-OTP (POST /api/v1/book/otp/send). An OTP is an auth
+      # credential, not booking spend, so PhoneOtpService injects OtpSmsSender — an unconditional
+      # bean in SmsConfig — and keeps delivering with this flag off. See OtpSmsSender's javadoc.
+      #
+      # Declared literally rather than left to the Java default so the state is discoverable from
+      # config. @ConditionalOnProperty compares the value with equalsIgnoreCase, so `true`/`false`
+      # are understood in ANY case (`TRUE` DOES start billing). It does NOT use Spring's relaxed
+      # boolean binder, so `on`/`yes`/`1` match neither branch and leave the context with no
+      # SmsService at all — the app then fails to start.
+      #
+      # MUST stay false in every committed profile (including local). Flip at release with
+      # APP_BOOKING_SMS_ENABLED=true on Railway; needs TURBOSMS_TOKEN set, or the first send
+      # throws a clean SmsDeliveryException. Sibling vendor gates: FIREBASE_ENABLED,
+      # app.cloudflare-r2.enabled.
+      enabled: ${APP_BOOKING_SMS_ENABLED:false}
       # Ukrainian SMS copy with {placeholder} tokens substituted at send time
       # (GuestBookingService / BookingReminderJob). Multiline via YAML block scalar.
       # Rendered text (a guest's appointment details) is never logged.
@@ -250,6 +270,18 @@ app:
       # {comment} is the provider's decline note, truncated to ~120 chars before substitution.
       # Double-quoted (not a block scalar) so the leading "\n\n" separator is unambiguous.
       decline-reason: "\n\nПричина: {comment}"
+      # Phase 22.7 — the walk-in confirmation (POST /api/v1/masters/{masterId}/bookings) is the ONE
+      # template with no key here, deliberately (QA MEDIUM, 2026-08-18). Its text lives in exactly
+      # one place: BookingSmsProperties.Sms#walkInConfirmation. A yml copy identical to that default
+      # used to sit here, which made the Java literal dead code — two sources of truth for one
+      # user-visible string, and mutating the Java one changed nothing in any profile.
+      #
+      # Do NOT re-add `walk-in-confirmation:` merely to make the copy visible from config; that
+      # silently kills the Java default again. Add it only to genuinely OVERRIDE the text, and note
+      # in the same commit that BookingSmsProperties' default is then no longer the live value.
+      # Constraint that travels with the copy wherever it lives: it must carry NO {cancelUrl} — a
+      # STAFF booking has cancel_token = NULL by the V137 CHECK, so there is no link to build and
+      # the placeholder would render literally in a real client's message.
   admin-email: ${ADMIN_EMAIL:admin@beautica.app}
   support:
     # Fixed destination inbox for the Help / Contact-us feature
@@ -301,6 +333,13 @@ app:
     # Reset tickets expired longer than this are hard-deleted by the daily sweep
     # (PasswordResetTokenCleanupJob) — keeps password_reset_tickets from growing
     # unbounded. A few days of buffer past the 10 min ticket TTL for support/forensic lookup.
+    cleanup-retention: 7d
+  refresh-token:
+    # Refresh tokens expired longer than this are hard-deleted by the daily sweep
+    # (RefreshTokenCleanupJob) — keeps refresh_tokens from growing unbounded, since rotation
+    # only revokes (never deletes) predecessors and most sessions never hit explicit logout.
+    # A week of buffer past the 30-day token TTL for incident / forensic lookup (reuse-detection
+    # family revocations included) before the row is reclaimed.
     cleanup-retention: 7d
   password-reset-otp:
     # 6-digit OTP lifetime for the password-reset request/verify step (mirrors

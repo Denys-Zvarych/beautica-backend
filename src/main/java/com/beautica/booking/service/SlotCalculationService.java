@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -242,14 +243,254 @@ public class SlotCalculationService {
     }
 
     /**
-     * Shared slot-list core for both the single-service and multi-service entry points. Identical to the
-     * pre-BE-2 single-service body except that the block length is the SUM of the ordered assignments'
-     * effective durations ({@link #validatedTotalDuration}) rather than one service's.
+     * <b>STAFF create-path slot list (Phase 22.2)</b> — the same single-service list as
+     * {@link #getAvailableSlots(UUID, LocalDate, UUID, MasterServiceAssignment)} with ONE difference:
+     * the lead-time floor is {@link Duration#ZERO} instead of {@link BookingWindow#minLead()}, so a
+     * slot starting at or after "now" is offered rather than one starting at or after "now + 15 min".
+     *
+     * <p><b>Why it must exist.</b> The staff create path proves schedule-fit exactly the way every
+     * other create path does — by requiring {@code startsAt} to MATCH a slot this service generates
+     * ({@link BookingSlotAvailabilityGuard}). The STAFF lead-time rule is "now is allowed, the past
+     * is not" ({@code BookingStartsAtValidator#validateStaff}), so with the 15-minute floor still
+     * baked into the generator a walk-in happening now would pass the lead-time check and then be
+     * rejected by the schedule-fit check for a reason that has nothing to do with the schedule.
+     * The two floors move together or the path contradicts itself — the exact class of bug
+     * {@link BookingWindow} was created to prevent.
+     *
+     * <p><b>Deliberately NOT {@code @Cacheable}.</b> A different floor is a different answer, and the
+     * {@code available-slots} key ({@code masterId, date, masterServiceId}) does not mention the
+     * floor. Sharing that key would let one staff read populate the entry every client-facing
+     * {@code GET /masters/{id}/slots} is served from, offering self-service clients slots inside the
+     * 15-minute window they are then rejected for booking. Staff creates are rare (a human typing a
+     * form) so the uncached read costs nothing worth the risk. Same reasoning as the multi-service
+     * overloads above, for a different reason.
+     *
+     * <p>{@code preloaded} carries the caller's already-JOIN-FETCHed assignment exactly as the cached
+     * overload does; the same "managed instance loaded in THIS transaction" contract applies, and
+     * since this method caches nothing, a bad one could only corrupt its own response.
+     *
+     * <h2>CONTRACT — <b>never wire this into a client-facing controller</b> (security LOW, 2026-08-18)</h2>
+     * This is a {@code public} method on an injectable {@code @Service} (it must be public for the
+     * {@code @Transactional} proxy to apply — package-private would silently disable it), so nothing
+     * in the type system stops a future {@code @RestController} from {@code @Autowired}-ing
+     * {@code SlotCalculationService} and returning this list. Doing so would offer <b>self-service
+     * clients slots inside the 15-minute lead-time window they are then 400'd for booking</b> — the
+     * exact "the API offers what it will not accept" defect {@link BookingWindow} exists to prevent.
+     *
+     * <p>Permitted callers: the STAFF create path's schedule-fit gate
+     * ({@link #isStaffSlotAvailable}, which is what {@link BookingSlotAvailabilityGuard} actually
+     * uses), the equivalence assertions that prove the two agree, and — when Phase 22.4/22.5 ships
+     * one — a staff-only endpoint behind
+     * {@code hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')} plus
+     * {@code @authz.canBookForMaster}. Never {@code permitAll}, never a CLIENT-reachable route.
+     * {@code SlotCalculationServiceTest#should_haveNoControllerCaller_when_scanningForGetStaffAvailableSlots}
+     * enforces the negative half of that by scanning the source tree.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> getStaffAvailableSlots(
+            UUID masterId, LocalDate date, UUID masterServiceId, MasterServiceAssignment preloaded) {
+        return computeAvailableSlots(masterId, date, List.of(masterServiceId),
+                preloaded != null ? List.of(preloaded) : null, Duration.ZERO);
+    }
+
+    /**
+     * <b>STAFF chained-visit slot list (Phase 22.10)</b> — the N-service twin of
+     * {@link #getStaffAvailableSlots(UUID, LocalDate, UUID, MasterServiceAssignment)}, sized to the Σ of
+     * the ordered assignments' effective durations exactly as {@link #getAvailableSlots(UUID, LocalDate,
+     * List, List)} is for the client floor. Delegates to the SAME {@link #computeAvailableSlots(UUID,
+     * LocalDate, List, List, Duration)} core at {@link Duration#ZERO}, so it can never disagree with the
+     * single-service staff list about anything but list size.
+     *
+     * <p><b>Not the create-path gate.</b> The create path's schedule-fit check is
+     * {@link #isStaffVisitSlotAvailable}, which answers the same question as a boolean without
+     * materialising this list — see that method's Javadoc for why. This method's only current caller is
+     * {@code BookingAvailabilityAgreementIT} case 20 (the equivalence pin the single-service list is
+     * exempted for in the same way — see the CONTRACT note below), and, like the single-service overload
+     * it mirrors, it is deliberately shaped to also serve a future staff-only chained-slots endpoint.
+     *
+     * <h2>CONTRACT — <b>never wire this into a client-facing controller</b> (security LOW, 2026-08-18)</h2>
+     * Same reasoning and same enforcement as {@link #getStaffAvailableSlots(UUID, LocalDate, UUID,
+     * MasterServiceAssignment)}: a {@code Duration.ZERO} floor offered on a client-reachable route would
+     * let self-service clients see slots inside the 15-minute window they are then 409'd for booking.
+     * {@code SlotCalculationServiceTest#should_haveNoControllerCaller_when_scanningForGetStaffAvailableSlots}
+     * also scans for this method's name.
+     */
+    @Transactional(readOnly = true)
+    public List<AvailableSlotResponse> getStaffAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded) {
+        assertServiceIds(masterServiceIds);
+        return computeAvailableSlots(masterId, date, masterServiceIds, preloaded, Duration.ZERO);
+    }
+
+    /**
+     * <b>STAFF schedule-fit EXISTENCE check (perf LOW, 2026-08-18)</b> — "is {@code startsAt} one of
+     * the slots {@link #getStaffAvailableSlots} would offer for this master + service on this date?",
+     * answered without materialising that list.
+     *
+     * <p><b>Identical verdict, by construction.</b> It runs the same prologue
+     * ({@link #resolveDayAvailability}: date-range guards, assignment resolution and its 404s,
+     * {@link MasterBookability} gate, summed duration, effective-day resolution, occupancy load) and
+     * the same {@link TimeSlotCalculator} walk at the same {@link Duration#ZERO} floor; the only
+     * difference is that the start-instant comparison happens INSIDE the per-interval loop
+     * ({@link #dayFreeRangesContainStart}) instead of over a fully-built list, so it returns as soon
+     * as a work interval contains the start and never allocates an {@link AvailableSlotResponse} at
+     * all. The comparison is on the {@link java.time.Instant}, exactly as
+     * {@code BookingSlotAvailabilityGuard}'s {@link OffsetDateTime#isEqual} membership test was — the
+     * caller's offset/zone representation is irrelevant to both.
+     *
+     * <p><b>The exit is BETWEEN intervals, never within one.</b> Each interval is still handed to
+     * {@link TimeSlotCalculator#calculateAvailableSlots}, which walks that interval's whole grid and
+     * materialises every accepted {@code TimeRange} before this method scans it — so what is saved is
+     * the {@link AvailableSlotResponse} mapping plus the intervals after the matching one, not the
+     * per-interval candidate walk. A genuine within-interval exit would need a target-start variant of
+     * {@code TimeSlotCalculator}'s walk, and leaving that class untouched is the deliberate
+     * correctness-first trade: it is the single grid oracle the CLIENT paths are proved against, and
+     * forking its walk to shave allocations on the staff create path would put the two at risk of
+     * disagreeing about which starts exist.
+     *
+     * <p><b>Why it is worth having.</b> The client create path amortises its whole-day slot list
+     * through the {@code available-slots} cache, so building it once serves many requests. The staff
+     * list is deliberately uncached (a different lead-time floor under the same key would poison the
+     * client-facing entry — see {@link #getStaffAvailableSlots}), so the staff create path paid for a
+     * whole day's {@code AvailableSlotResponse} objects plus two {@code ZonedDateTime}s each, on
+     * every single create, purely to answer a boolean, with zero reuse. ({@link #SLOT_STEP} is 30
+     * minutes and a day's work intervals are disjoint, so a Kyiv day holds at most 48 grid positions
+     * in total; a realistic 9-12h working day yields 17-24.)
+     *
+     * <p>{@code preloaded} follows the same "managed instance loaded in THIS transaction" contract as
+     * every other {@code preloaded} overload. This method caches nothing.
+     *
+     * @return {@code true} iff a generated staff slot starts at exactly {@code startsAt}
+     */
+    @Transactional(readOnly = true)
+    public boolean isStaffSlotAvailable(
+            UUID masterId, LocalDate date, UUID masterServiceId, MasterServiceAssignment preloaded,
+            OffsetDateTime startsAt) {
+        return containsStaffStart(masterId, date, List.of(masterServiceId),
+                preloaded != null ? List.of(preloaded) : null, startsAt);
+    }
+
+    /**
+     * <b>STAFF chained-visit schedule-fit EXISTENCE check (Phase 22.10)</b> — the whole-chain twin of
+     * {@link #isStaffSlotAvailable}, asking whether {@code startsAt} matches a slot of the ordered
+     * {@code masterServiceIds}' chained block (Σ of their effective durations), evaluated at the STAFF
+     * lead-time floor, without materialising {@link #getStaffAvailableSlots(UUID, LocalDate, List,
+     * List)}'s list.
+     *
+     * <p><b>Whole-chain, never N per-item checks — this is load-bearing, not a style preference.</b>
+     * {@code VisitPlanner} chains item <i>i</i> to begin where item <i>i-1</i> ends, so items 2..N sit at
+     * arbitrary, generally off-grid offsets by construction. Asking this method (or
+     * {@link #isStaffSlotAvailable}) about item 2's own start would return {@code false} for a
+     * perfectly legal visit. The correct — and only — question is whether the visit's FIRST start
+     * matches a slot of the chain's whole block, exactly as {@link #getAvailableSlots(UUID, LocalDate,
+     * List, List)} already asks at the client floor. Pinning the first start pins the whole block
+     * because the items are contiguous by construction at create time. A per-item check would also
+     * wrongly ACCEPT a chain whose first service fits alone but whose Σ duration overruns the master's
+     * working window — the exact case {@code BookingSlotAvailabilityGuardTest} and
+     * {@code BookingAvailabilityAgreementIT} case 20 pin RED against.
+     *
+     * <p><b>Shares the identical boolean core as {@link #isStaffSlotAvailable}</b>
+     * ({@link #containsStaffStart}) — the single-service method wraps its one id/assignment in a
+     * singleton list and calls the same private core this method calls directly, mirroring exactly how
+     * {@link #getAvailableSlots(UUID, LocalDate, UUID, MasterServiceAssignment)} and
+     * {@link #getAvailableSlots(UUID, LocalDate, List, List)} both delegate to the shared
+     * {@link #computeAvailableSlots(UUID, LocalDate, List, List, Duration)} core. So the two staff
+     * existence checks can never disagree on anything but list size, exactly as the materialising pair
+     * cannot — pinned by {@code BookingAvailabilityAgreementIT} case 20 (chained counterpart of case 19).
+     *
+     * @param preloaded the PARALLEL assignment list {@code VisitPlanner#planChainedItems} already
+     *                  resolved (same size, same order as {@code masterServiceIds}) — same "managed
+     *                  instance loaded in THIS transaction" contract as every other {@code preloaded}
+     *                  parameter in this class
+     * @return {@code true} iff a generated staff slot for the whole chain starts at exactly
+     *         {@code startsAt}
+     */
+    @Transactional(readOnly = true)
+    public boolean isStaffVisitSlotAvailable(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt) {
+        assertServiceIds(masterServiceIds);
+        return containsStaffStart(masterId, date, masterServiceIds, preloaded, startsAt);
+    }
+
+    /**
+     * Shared boolean core behind both STAFF existence checks — {@link #isStaffSlotAvailable} (single
+     * service, wraps its id/assignment in a singleton list) and {@link #isStaffVisitSlotAvailable}
+     * (whole chain, calls this directly). Mirrors exactly how {@link #computeAvailableSlots(UUID,
+     * LocalDate, List, List, Duration)} is the one materialising core both list-arity entry points of
+     * {@link #getAvailableSlots(UUID, LocalDate, List, List)} delegate to.
+     */
+    private boolean containsStaffStart(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, OffsetDateTime startsAt) {
+        return resolveDayAvailability(masterId, date, masterServiceIds, preloaded)
+                .map(day -> dayFreeRangesContainStart(
+                        date, day.effective(), day.totalDuration(), day.occupied(),
+                        // STAFF floor: minimum lead 0, so the cutoff IS the request's single `now`.
+                        day.now(), startsAt.toInstant()))
+                .orElse(false);
+    }
+
+    /**
+     * Shared slot-list core for both the single-service and multi-service entry points, at the
+     * standard {@link BookingWindow#minLead()} lead-time floor — every read path and every create
+     * path except STAFF.
      *
      * <p>{@code preloaded} is the caller's already-resolved assignment list ({@code null} on every read
      * path) — see {@link #resolveAssignments}.
      */
     private List<AvailableSlotResponse> computeAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded) {
+        return computeAvailableSlots(masterId, date, masterServiceIds, preloaded, BookingWindow.minLead());
+    }
+
+    /**
+     * Shared slot-list core. Identical to the pre-BE-2 single-service body except that the block
+     * length is the SUM of the ordered assignments' effective durations
+     * ({@link #validatedTotalDuration}) rather than one service's.
+     *
+     * <p>{@code minLead} is the lead-time floor applied to every generated candidate:
+     * {@link BookingWindow#minLead()} for every caller except the STAFF create path, which passes
+     * {@link Duration#ZERO} (see {@link #getStaffAvailableSlots}). It is the ONLY parameter that can
+     * change the verdict between those two entry points — the effective-day resolution, the master
+     * bookability gate, the duration arithmetic and the occupancy subtraction are all shared
+     * verbatim, so the staff list can never disagree with the client list about anything other than
+     * the floor.
+     */
+    private List<AvailableSlotResponse> computeAvailableSlots(
+            UUID masterId, LocalDate date, List<UUID> masterServiceIds,
+            List<MasterServiceAssignment> preloaded, Duration minLead) {
+        return resolveDayAvailability(masterId, date, masterServiceIds, preloaded)
+                .map(day -> computeDayFreeRanges(
+                        date, day.effective(), day.totalDuration(), day.occupied(),
+                        day.now().plus(minLead))
+                        .stream()
+                        .map(r -> new AvailableSlotResponse(
+                                r.start().atZone(TimeZones.KYIV),
+                                r.end().atZone(TimeZones.KYIV)))
+                        .toList())
+                .orElseGet(List::of);
+    }
+
+    /**
+     * Everything a day's slot answer needs before the {@link TimeSlotCalculator} walk itself: the
+     * request's single {@code now}, the summed effective duration, the resolved effective day and
+     * that day's CONFIRMED occupancy.
+     *
+     * <p><b>Extracted, not rewritten (perf LOW, 2026-08-18).</b> This is the former prologue of
+     * {@link #computeAvailableSlots}, moved verbatim so that the materialising slot list
+     * ({@link #computeAvailableSlots}) and the STAFF existence check
+     * ({@link #isStaffSlotAvailable}) share ONE implementation of every guard, every 404 and every
+     * load. The two therefore cannot drift on WHICH requests are valid, only on what they do with the
+     * free ranges afterwards.
+     *
+     * @return empty when the day yields no slots for a non-error reason — an unbookable master or a
+     *         day with no work intervals. Genuine input errors still throw from here exactly as they
+     *         did before (past/too-far date → 400; unknown, foreign or inactive assignment → 404).
+     */
+    private Optional<DayAvailability> resolveDayAvailability(
             UUID masterId, LocalDate date, List<UUID> masterServiceIds,
             List<MasterServiceAssignment> preloaded) {
         // Step 1: date range validation — cheapest guard, no DB.
@@ -293,7 +534,7 @@ public class SlotCalculationService {
         //
         // Free: findByMasterIdAndIdWithGraph LEFT JOIN FETCHes salon.
         if (!MasterBookability.isBookable(assignments.get(0).getMaster())) {
-            return List.of();
+            return Optional.empty();
         }
 
         // Steps 3+4: summed effective duration (override beats base, plus each service's own buffer) with
@@ -318,7 +559,7 @@ public class SlotCalculationService {
         List<WorkIntervalDto> intervals = effective.intervals();
         boolean explicitTimes = isExplicitTimes(effective);
         if (!explicitTimes && (intervals == null || intervals.isEmpty())) {
-            return List.of();
+            return Optional.empty();
         }
 
         // Step 6: compute the booking-query window in OffsetDateTime.
@@ -363,17 +604,27 @@ public class SlotCalculationService {
                 .map(b -> new TimeRange(b.startsAt().toInstant(), b.endsAt().toInstant()))
                 .toList();
 
-        // Step 8: generate candidate slots per resolved interval and union the results (shared with
-        // the free-slot bookability gate — see computeDayFreeRanges). Calling TimeSlotCalculator once
-        // per interval is the multi-interval generalization of the legacy single-window call — gaps
-        // between intervals (lunch breaks) naturally yield no slots. The cutoff is derived from the SAME
-        // `now` the range guard above used (Perf LOW-2), not re-read per interval.
-        return computeDayFreeRanges(date, effective, totalDuration, occupied, BookingWindow.bookableCutoff(now))
-                .stream()
-                .map(r -> new AvailableSlotResponse(
-                        r.start().atZone(TimeZones.KYIV),
-                        r.end().atZone(TimeZones.KYIV)))
-                .toList();
+        // Step 8 belongs to the CALLER: it generates candidate slots per resolved interval and unions
+        // the results (shared with the free-slot bookability gate — see computeDayFreeRanges). Calling
+        // TimeSlotCalculator once per interval is the multi-interval generalization of the legacy
+        // single-window call — gaps between intervals (lunch breaks) naturally yield no slots. The
+        // cutoff is derived from the SAME `now` the range guard above used (Perf LOW-2), never re-read
+        // per interval — which is why `now` is carried out of here rather than re-sampled downstream.
+        //
+        // The caller's `minLead` is BookingWindow.minLead() for every path but the STAFF create path,
+        // which uses Duration.ZERO — so `now.plus(minLead)` is byte-for-byte
+        // BookingWindow.bookableCutoff(now) on every pre-22.2 path. See #getStaffAvailableSlots.
+        return Optional.of(new DayAvailability(effective, totalDuration, occupied, now));
+    }
+
+    /**
+     * The resolved, pre-walk state of ONE master-day-service(s) availability request — see
+     * {@link #resolveDayAvailability}. {@code now} is the request's single clock read (Perf LOW-2),
+     * carried so the caller derives its cutoff from the same instant the range guards used.
+     */
+    private record DayAvailability(
+            EffectiveDayResponse effective, Duration totalDuration, List<TimeRange> occupied,
+            Instant now) {
     }
 
     // ── Availability-aware calendar day-gating (booking-contract fix) ────────────────────────
@@ -822,6 +1073,56 @@ public class SlotCalculationService {
                     cutoff));
         }
         return result;
+    }
+
+    /**
+     * <b>Membership counterpart of {@link #computeDayFreeRanges}</b> (perf LOW, 2026-08-18): true iff
+     * one of the free ranges that method would return starts at exactly {@code startsAt}.
+     *
+     * <p>Deliberately a mirror of that method line for line — the same {@link #isExplicitTimes} shape
+     * switch, the same {@link TimeSlotCalculator} calls with the same arguments, the same per-interval
+     * iteration order — differing only in that the test is applied per interval and returns at the
+     * first matching INTERVAL, instead of accumulating every range for the caller to scan. It is
+     * {@link #isDayBookable}'s loop shape with an equality predicate in place of "any" — and, like
+     * that method, it inherits {@link TimeSlotCalculator}'s allocation behaviour unchanged: each
+     * interval's candidate list is still built in full before being scanned, so the exit is between
+     * intervals, not within one. That is deliberate; see {@link #isStaffSlotAvailable}.
+     *
+     * <p><b>No availability semantics live here.</b> Which candidates exist, and at which grid
+     * positions, is entirely {@link TimeSlotCalculator}'s (untouched) answer; this only asks whether
+     * {@code startsAt} is among them. So the verdict is identical to the list-membership test
+     * {@code BookingSlotAvailabilityGuard} previously ran over {@link #getStaffAvailableSlots} —
+     * pinned by {@code BookingAvailabilityAgreementIT} case 19.
+     *
+     * @param startsAt the requested start as an {@link Instant}; {@link TimeRange#start()} is an
+     *                 instant too, so the caller's offset/zone representation cannot affect the match
+     *                 — the same property {@link OffsetDateTime#isEqual} gave the list comparison
+     */
+    private boolean dayFreeRangesContainStart(
+            LocalDate date, EffectiveDayResponse day, Duration totalDuration,
+            List<TimeRange> occupied, Instant cutoff, Instant startsAt) {
+        if (isExplicitTimes(day)) {
+            return startsOneOf(timeSlotCalculator.calculateDeclaredSlots(
+                    date, day.times(), totalDuration, occupied, cutoff), startsAt);
+        }
+        for (WorkIntervalDto interval : day.intervals()) {
+            if (startsOneOf(timeSlotCalculator.calculateAvailableSlots(
+                    date, interval.startTime(), interval.endTime(), totalDuration, SLOT_STEP, occupied,
+                    cutoff), startsAt)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True iff any range in {@code ranges} begins at exactly {@code startsAt}. */
+    private static boolean startsOneOf(List<TimeRange> ranges, Instant startsAt) {
+        for (TimeRange range : ranges) {
+            if (range.start().equals(startsAt)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

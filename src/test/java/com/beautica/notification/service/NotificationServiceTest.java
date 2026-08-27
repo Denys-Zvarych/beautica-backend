@@ -1,6 +1,7 @@
 package com.beautica.notification.service;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.master.entity.Master;
@@ -32,6 +33,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -530,6 +532,51 @@ class NotificationServiceTest {
         assertThat(Character.isHighSurrogate(noteSegment.charAt(noteSegment.length() - 2)))
                 .as("no unpaired high surrogate immediately before the ellipsis")
                 .isFalse();
+    }
+
+    /**
+     * Phase 22.1 (security MEDIUM): the guest-SMS branch must key on {@code BookingSource.LINK},
+     * not on {@code client == null}.
+     *
+     * <p>A LINK guest owns their phone — the number is proven by the OTP they answered before the
+     * booking existed. A STAFF walk-in's phone is <em>typed in by a salon employee</em> about a
+     * third party and is verified by nothing. Both shapes have a null client, so a
+     * {@code client == null} guard treats them identically and turns every staff-entered digit
+     * string into an SMS destination the platform will send to on a provider's say-so: a typo
+     * texts a stranger, and a deliberately-entered number makes the platform an on-demand SMS
+     * relay addressed to anyone, with no consent step anywhere in the flow.
+     *
+     * <p>This is the narrowest possible statement of the fix — a STAFF decline sends nothing at
+     * all — and it is deliberately asserted with {@code verifyNoInteractions} rather than
+     * {@code never().send(...)}, so a future "just a short courtesy SMS" addition cannot slip
+     * past by using a different {@code SmsService} method.
+     */
+    @Test
+    @DisplayName("a declined STAFF walk-in booking sends NO SMS — the phone was typed by staff, "
+            + "not proven by the recipient (unlike a LINK guest's OTP-verified number)")
+    void should_notSendDeclineSms_when_staffWalkInBookingDeclined() {
+        Booking booking = buildStaffWalkInBookingMockForDecline("Майстер захворів");
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verifyNoInteractions(smsService);
+        verify(emailService, never()).sendBookingDeclinedEmail(anyString(), any());
+        verify(pushService, never()).sendToUser(any(), anyString(), anyString(), any());
+    }
+
+    /**
+     * The positive half of the pair: the LINK path this gate must NOT break. Together these two
+     * pin the gate as "SMS iff LINK" — either one alone is satisfied by a gate that is simply
+     * always-off or always-on.
+     */
+    @Test
+    @DisplayName("a declined LINK guest booking still sends its SMS once the source gate is in place")
+    void should_stillSendDeclineSms_when_linkGuestBookingDeclined() {
+        Booking booking = buildGuestBookingMockForDecline("Майстер захворів");
+
+        service.notifyBookingStatusChanged(BookingVisit.single(booking));
+
+        verify(smsService).send(eq("+380501234567"), anyString());
     }
 
     @Test
@@ -1064,6 +1111,10 @@ class NotificationServiceTest {
         // lenient: only read on the (untested-here) blank-guestPhone warning branch.
         lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
         when(booking.getClient()).thenReturn(null);
+        // lenient: read only once the guest-SMS branch is gated on the SOURCE rather than on a
+        // null client (Phase 22.1 security MEDIUM). Stubbed unconditionally so every existing
+        // LINK case keeps describing a genuine LINK booking rather than "some null-client row".
+        lenient().when(booking.getBookingSource()).thenReturn(BookingSource.LINK);
         when(booking.getStatus()).thenReturn(BookingStatus.DECLINED);
         when(booking.getGuestPhone()).thenReturn("+380501234567");
         when(booking.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
@@ -1078,6 +1129,41 @@ class NotificationServiceTest {
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
         lenient().when(sd.getName()).thenReturn(serviceName);
+        MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
+        lenient().when(msa.getServiceDefinition()).thenReturn(sd);
+        lenient().when(booking.getMasterService()).thenReturn(msa);
+
+        return booking;
+    }
+
+    /**
+     * A DECLINED STAFF walk-in: identical to {@link #buildGuestBookingMockForDecline(String)} in
+     * every respect the notification path can see — null client, guest identity, a phone — except
+     * that {@code bookingSource} is {@code STAFF}. That single-field difference is the point: it is
+     * the only thing distinguishing a number the recipient proved by OTP from one a salon employee
+     * typed about a third party, so it must be the thing the SMS gate reads.
+     */
+    private Booking buildStaffWalkInBookingMockForDecline(String providerComment) {
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getBookingSource()).thenReturn(BookingSource.STAFF);
+        lenient().when(booking.getStatus()).thenReturn(BookingStatus.DECLINED);
+        lenient().when(booking.getGuestPhone()).thenReturn("+380501234567");
+        lenient().when(booking.getGuestName()).thenReturn("Олена");
+        lenient().when(booking.getGuestSurname()).thenReturn("Коваль");
+        lenient().when(booking.getStartsAt()).thenReturn(OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        lenient().when(booking.getProviderComment()).thenReturn(providerComment);
+
+        User masterUser = mock(User.class);
+        lenient().when(masterUser.getFirstName()).thenReturn("Тест");
+        lenient().when(masterUser.getLastName()).thenReturn("Майстер");
+        Master master = mock(Master.class);
+        lenient().when(master.getUser()).thenReturn(masterUser);
+        lenient().when(booking.getMaster()).thenReturn(master);
+
+        ServiceDefinition sd = mock(ServiceDefinition.class);
+        lenient().when(sd.getName()).thenReturn("Тест послуга");
         MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
         lenient().when(msa.getServiceDefinition()).thenReturn(sd);
         lenient().when(booking.getMasterService()).thenReturn(msa);

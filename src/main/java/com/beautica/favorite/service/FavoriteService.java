@@ -2,7 +2,6 @@ package com.beautica.favorite.service;
 
 import org.springframework.data.domain.Sort;
 import com.beautica.common.web.SortWhitelist;
-import com.beautica.auth.Role;
 import com.beautica.booking.domain.MasterBookability;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
@@ -13,9 +12,11 @@ import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.Favorite;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
+import com.beautica.favorite.service.FavoriteCategoryResolver.FavoriteCategories;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -54,9 +55,10 @@ import java.util.UUID;
  * javadoc. {@link #removeFavorite} is a delete-if-exists (→ controller {@code 204}).
  *
  * <h3>Target validation (application layer, not DB CHECK)</h3>
- * A {@code MASTER} target must be an {@code INDEPENDENT_MASTER}-owned master
- * ({@code 404} if no such master; {@code 400} when the master is salon-employed,
- * i.e. role {@code SALON_MASTER}). A {@code SALON} target must exist ({@code 404}).
+ * A {@code MASTER} target must be an existing, BOOKABLE master — active, and (when employed) in
+ * an active salon ({@code 404} unknown; {@code 400} otherwise) — <b>any</b> {@code MasterType}:
+ * independent, salon-employed, or salon-owner-as-master. A {@code SALON} target must exist and be
+ * active ({@code 404}).
  * A {@code SERVICE} target must be an active {@code master_services} row whose service
  * definition is also active ({@code 404} unknown; {@code 400} inactive) — with
  * <b>no role check</b>: a salon-employed master's service IS wish-listable, deliberately
@@ -68,6 +70,19 @@ import java.util.UUID;
  * ({@link DiscoveryLocationResolver}) — a fixed two queries per page, never per row
  * — exactly as {@code com.beautica.search.service.SearchService} does. The raw FK
  * ids never reach the response DTO.
+ *
+ * <h3>Category axis (batched, one statement per page)</h3>
+ * Both list reads also stamp the approved design's category filter axis ({@code categories})
+ * via {@link FavoriteCategoryResolver}, derived from every distinct platform category the
+ * provider actually OFFERS (an active service the provider — or, for a salon, an active
+ * master of the salon — performs), not from this client's booking history. Like the
+ * locality labels it is resolved once for the whole page from the ids the projection already
+ * returned — one extra statement, never a per-row subquery. The list projection queries
+ * themselves are unchanged; reintroducing this as a {@code LATERAL} inside them is what the
+ * deleted {@code lastServiceName} did, at 9.11 ms a page. An empty list (never {@code null})
+ * is common and expected for a provider with no active categorisable service — see
+ * {@link FavoriteMasterResponse}'s javadoc for the full rationale of this axis, including why
+ * it is no longer scoped to the favouriting client.
  */
 @Service
 @RequiredArgsConstructor
@@ -80,14 +95,14 @@ public class FavoriteService {
     private final ServiceRepository serviceRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final FavoritePersistenceService favoritePersistenceService;
+    private final FavoriteCategoryResolver favoriteCategoryResolver;
 
     /**
      * Favorites the target for {@code clientUserId} (the authenticated principal).
      * Idempotent: a duplicate returns the existing favorite unchanged.
      *
      * @throws NotFoundException when the target master/salon does not exist
-     * @throws BusinessException ({@code 400}) when the master target is a
-     *                           salon-employed {@code SALON_MASTER}
+     * @throws BusinessException ({@code 400}) when the target exists but is inactive
      */
     @Transactional
     public FavoriteResponse addFavorite(UUID clientUserId, FavoriteTargetType targetType, UUID targetId) {
@@ -109,13 +124,12 @@ public class FavoriteService {
     }
 
     /**
-     * One bounded page of this client's favorited independent masters, newest favorite
-     * first, each with resolved locality labels and this client's latest booking service
-     * name with that master ({@code null} when never booked).
+     * One bounded page of this client's favorited masters — <b>any</b> {@code MasterType}
+     * (mobile Phase 111) — newest favorite first, each with resolved locality labels, aggregate
+     * rating and the master's own street address.
      *
-     * <p>The {@code Pageable} bounds the LATERAL "latest booking" subquery to at most
-     * {@code pageSize} evaluations per request (§E-3, §J). Locality labels are still
-     * batch-resolved exactly once for the whole page (§E no N+1).
+     * <p>Bounded by {@code Pageable} (§E-3, §J). Locality labels are batch-resolved exactly once
+     * for the whole page (§E no N+1).
      */
     @Transactional(readOnly = true)
     public Page<FavoriteMasterResponse> listMasterFavorites(UUID clientUserId, Pageable pageable) {
@@ -125,8 +139,9 @@ public class FavoriteService {
             // No label resolution for an empty page (no N+1); preserve page metadata.
             return rows.map(row -> (FavoriteMasterResponse) null);
         }
-        DiscoveryLabels labels = resolveLabels(rows.getContent(), 4, 5);
-        return rows.map(row -> mapMasterRow(row, labels));
+        DiscoveryLabels labels = resolveMasterLabels(rows.getContent());
+        FavoriteCategories categories = resolveMasterCategories(rows.getContent());
+        return rows.map(row -> mapMasterRow(row, labels, categories));
     }
 
     /**
@@ -143,15 +158,15 @@ public class FavoriteService {
             return rows.map(row -> (FavoriteSalonResponse) null);
         }
         DiscoveryLabels labels = resolveLabels(rows.getContent(), 3, 4);
-        return rows.map(row -> mapSalonRow(row, labels));
+        FavoriteCategories categories = resolveSalonCategories(rows.getContent());
+        return rows.map(row -> mapSalonRow(row, labels, categories));
     }
 
     /**
      * Legacy unbounded single-page variant of
      * {@link #listMasterFavorites(UUID, Pageable)}, retained for existing unit tests;
      * the controller uses the paginated overload. Returns this client's favorited
-     * masters, newest favorite first, with resolved locality labels and latest booking
-     * service name.
+     * masters, newest favorite first, with resolved locality labels.
      */
     @Transactional(readOnly = true)
     public List<FavoriteMasterResponse> listMasterFavorites(UUID clientUserId) {
@@ -160,10 +175,11 @@ public class FavoriteService {
             return List.of();
         }
 
-        DiscoveryLabels labels = resolveLabels(rows, 4, 5);
+        DiscoveryLabels labels = resolveMasterLabels(rows);
+        FavoriteCategories categories = resolveMasterCategories(rows);
         List<FavoriteMasterResponse> results = new ArrayList<>(rows.size());
         for (Object[] row : rows) {
-            results.add(mapMasterRow(row, labels));
+            results.add(mapMasterRow(row, labels, categories));
         }
         return results;
     }
@@ -181,9 +197,10 @@ public class FavoriteService {
         }
 
         DiscoveryLabels labels = resolveLabels(rows, 3, 4);
+        FavoriteCategories categories = resolveSalonCategories(rows);
         List<FavoriteSalonResponse> results = new ArrayList<>(rows.size());
         for (Object[] row : rows) {
-            results.add(mapSalonRow(row, labels));
+            results.add(mapSalonRow(row, labels, categories));
         }
         return results;
     }
@@ -228,25 +245,46 @@ public class FavoriteService {
     }
 
     /**
-     * Validates a {@code MASTER} target: the master must exist, be independent, and be ACTIVE.
+     * Validates a {@code MASTER} target: the master must exist and be ACTIVE. <b>No role or
+     * {@code masterType} predicate</b> — every provider a client can book is favoritable.
      *
-     * <p>The active check was added by the 2026-08 security audit alongside the read query's
-     * {@code m.is_active = true} predicate — favoriting a deactivated master would write a row
-     * the list then hides, which is merely useless; but leaving the write open also lets a
-     * client heart a provider who can never be booked. It costs no extra query: the master is
-     * already loaded here. Same rule, same 400, as the SERVICE arm.
+     * <p><b>The role predicate was REMOVED (mobile Phase 111, locked user decision).</b> It
+     * previously required {@code users.role == INDEPENDENT_MASTER}, which rejected two of the
+     * three {@link com.beautica.master.entity.MasterType} values: a salon-employed
+     * {@code SALON_MASTER}, and — because the check read the owning <i>user's role</i> rather
+     * than {@code masterType} — a salon owner working as a master ({@code MasterType.SALON_OWNER},
+     * whose user role is {@code SALON_OWNER}). Dropping the single predicate admits all three at
+     * once. The rule is now "a client may heart any provider they can book", which also removes
+     * the long-standing asymmetry with {@link #validateServiceTarget} (a {@code SALON_MASTER}'s
+     * service was already wish-listable while the master themself was not).
+     *
+     * <p>The ACTIVE check is unchanged, including its {@code 400}: it was added by the 2026-08
+     * security audit alongside the read query's {@code m.is_active = true} predicate —
+     * favoriting a deactivated master would write a row the list then hides, and leaving the
+     * write open lets a client heart a provider who can never be booked. It costs no extra
+     * query: the master is already loaded here. Same rule, same 400, as the SERVICE arm.
+     *
+     * <p><b>The salon term is enforced here too</b> (2026-08 re-audit LOW). The read query
+     * ({@code FavoriteRepository#findFavoriteMasterRows}) carries
+     * {@code (m.salon_id IS NULL OR sal.is_active = true)}, and once the role predicate above was
+     * removed that term became genuinely load-bearing on this arm. Checking only
+     * {@code master.isActive()} at write time therefore left write-time and read-time disagreeing:
+     * a client could {@code POST} a master of a DEACTIVATED salon, receive {@code 200}, and store a
+     * row the list can never render — a soft "is this account still active" oracle for a salon
+     * withdrawn from public view. The rule is not hand-rolled: {@link MasterBookability#isBookable}
+     * is the single canonical definition of {@code is_active AND (salon IS NULL OR salon.is_active)}
+     * — the same primitive {@link #validateServiceTarget} calls — so this site cannot drift from the
+     * booking paths, and {@code salon == null} (an {@code INDEPENDENT_MASTER}) still passes. It
+     * costs no extra query: {@code findByIdWithUserAndSalon} already {@code LEFT JOIN FETCH}es the
+     * salon.
+     *
+     * <p>Both halves collapse to the SAME {@code 400}: an unprivileged client must not be able to
+     * tell "this master deactivated" from "their salon closed".
      */
     private void validateMasterTarget(UUID masterId) {
         Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
-        Role role = master.getUser().getRole();
-        if (role != Role.INDEPENDENT_MASTER) {
-            // A salon-employed master (SALON_MASTER) is never a favoritable target —
-            // clients favorite the salon, not its staff. Reject before any row is written.
-            throw new BusinessException(HttpStatus.BAD_REQUEST,
-                    "Only independent masters can be favorited");
-        }
-        if (!master.isActive()) {
+        if (!MasterBookability.isBookable(master)) {
             throw new BusinessException(HttpStatus.BAD_REQUEST,
                     "Only an active master can be favorited");
         }
@@ -271,12 +309,12 @@ public class FavoriteService {
      * Validates a {@code SERVICE} target — {@code targetId} is a {@code master_services.id}
      * (a master+service pair), never a {@code service_definitions.id}.
      *
-     * <p><b>No role check, deliberately.</b> Unlike {@link #validateMasterTarget}, a
-     * salon-employed {@code SALON_MASTER}'s service IS wish-listable. A wish-list entry is a
-     * rebook shortcut, not an endorsement of a person; applying the MASTER identity rule here
-     * would make most of the catalogue un-wish-listable. Locked user decision, 2026-08-07 —
-     * see {@link FavoriteTargetType}'s javadoc for the full asymmetry note. Do not "fix" this
-     * into consistency with the MASTER arm.
+     * <p><b>No role check, deliberately.</b> A salon-employed {@code SALON_MASTER}'s service IS
+     * wish-listable. A wish-list entry is a rebook shortcut, not an endorsement of a person.
+     * Locked user decision, 2026-08-07 — see {@link FavoriteTargetType}'s javadoc. This was
+     * historically ASYMMETRIC with {@link #validateMasterTarget}, which rejected the same master
+     * as a MASTER target; mobile Phase 111 removed that role predicate, so the two arms now
+     * agree. Do not reintroduce a role check on either.
      *
      * <p>All THREE {@code isActive} flags are checked because they are independent:
      * {@code ServiceCatalogService.deactivateServiceDefinition} soft-deletes the definition
@@ -399,6 +437,80 @@ public class FavoriteService {
 
     // ── label resolution (M2 seam, batched — §E no N+1) ───────────────────────
 
+    /**
+     * Batch-resolves the labels for a favorited-MASTERS page from the <em>effective</em>
+     * discovery locality of each row — the value {@link #mapMasterRow} will actually emit,
+     * not the raw projection columns.
+     *
+     * <p>It cannot delegate to {@link #resolveLabels(List, int, int)} with fixed indices: the
+     * masters projection carries BOTH the master's own locality (4, 5) and the employing
+     * salon's (11, 12), and which one is public depends on {@code master_type}. Resolving the
+     * wrong column would either miss a label (blank card) or resolve one that is then
+     * discarded. Still exactly one batched call for the whole page (§E no N+1).
+     */
+    private DiscoveryLabels resolveMasterLabels(List<Object[]> rows) {
+        Set<UUID> cityIds = new LinkedHashSet<>();
+        Set<UUID> districtIds = new LinkedHashSet<>();
+        for (Object[] row : rows) {
+            UUID cityId = discoveryCityIdOf(row);
+            if (cityId != null) {
+                cityIds.add(cityId);
+            }
+            UUID districtId = discoveryDistrictIdOf(row);
+            if (districtId != null) {
+                districtIds.add(districtId);
+            }
+        }
+        return discoveryLocationResolver.resolveLabels(cityIds, districtIds);
+    }
+
+    /**
+     * Batch-resolves the CATEGORY axis for a favorited-MASTERS page — the chip set the approved
+     * design's filter selects on, derived from every distinct platform category each master
+     * actually OFFERS (an active service in an active assignment), not from any client's booking
+     * history.
+     *
+     * <p>One statement for the whole page (§E no N+1), issued AFTER the page rows are in hand and
+     * keyed on the ids they carry. It is deliberately not a term in
+     * {@code FavoriteRepository#findFavoriteMasterRows}: that query carried a per-row
+     * {@code LATERAL} for the old {@code lastServiceName} and cost 9.11 ms a page until it was
+     * deleted, taking the page to 0.089 ms. Keeping the derivation in a separate, page-bounded
+     * statement preserves that: the list projection is byte-for-byte unchanged.
+     *
+     * <p>Index 0 is the master id — the same column the DTO publishes as {@code masterId}, so
+     * the lookup key and the row identity cannot drift apart.
+     *
+     * <p>No {@code clientId} is passed: unlike the booking-history axis this replaced, "what a
+     * master offers" is not a fact about the asking client — it is the same answer for anyone.
+     */
+    private FavoriteCategories resolveMasterCategories(List<Object[]> rows) {
+        return favoriteCategoryResolver.resolveForMasters(providerIdsOf(rows));
+    }
+
+    /**
+     * Salon counterpart of {@link #resolveMasterCategories(List)} — index 0 of the salons
+     * projection is the salon id. Scoped to the LOCKED "salon offering = master-performed only"
+     * domain rule, not to any client's bookings.
+     */
+    private FavoriteCategories resolveSalonCategories(List<Object[]> rows) {
+        return favoriteCategoryResolver.resolveForSalons(providerIdsOf(rows));
+    }
+
+    /**
+     * The page's provider ids — index 0 on BOTH projections (master id / salon id).
+     *
+     * <p>A {@link LinkedHashSet} for the same reason the label batching uses one: it
+     * de-duplicates before the ids reach an {@code IN (…)} list while keeping page order
+     * stable, so the generated SQL stays stable across requests and the plan cache with it.
+     */
+    private static Set<UUID> providerIdsOf(List<Object[]> rows) {
+        Set<UUID> providerIds = new LinkedHashSet<>();
+        for (Object[] row : rows) {
+            providerIds.add((UUID) row[0]);
+        }
+        return providerIds;
+    }
+
     private DiscoveryLabels resolveLabels(List<Object[]> rows, int cityIdIdx, int districtIdIdx) {
         Set<UUID> cityIds = new LinkedHashSet<>();
         Set<UUID> districtIds = new LinkedHashSet<>();
@@ -418,21 +530,64 @@ public class FavoriteService {
     /**
      * Maps a favorited-master projection row to its response DTO.
      *
-     * <p>Column layout (indices 0–7):
-     * {@code [master_id, first_name, last_name, avatar_url, discovery_city_id,
-     * discovery_district_id, avg_rating, last_service_name]}. The internal city/
-     * district FK ids (4, 5) are consumed for label resolution only and never placed
-     * on the DTO (§I).
+     * <p>Column layout (indices 0–17):
+     * {@code [master_id, first_name, last_name, avatar_url, own_city_id, own_district_id,
+     * avg_rating, own_street, own_building_no, own_location_note, master_type, salon_city_id,
+     * salon_district_id, salon_id, salon_name, salon_street, salon_building_no,
+     * salon_location_note]}. The internal city/district FK ids (4, 5, 11, 12) are consumed for
+     * label resolution only and never placed on the DTO (§I); index 10 is likewise consumed here
+     * and never surfaced.
+     *
+     * <h4>One predicate picks the whole "where do I find this provider" block</h4>
+     * {@link MasterType#disclosesOwnAddress} — the SAME predicate
+     * {@link com.beautica.master.dto.MasterDetailResponse#fromPublic} applies to the public master
+     * profile, called rather than re-derived so the surfaces cannot drift — selects the SOURCE of
+     * the locality pair AND of the street triple in one decision, so a card can never mix the two
+     * entities:
+     * <ul>
+     *   <li><b>true ({@code INDEPENDENT_MASTER})</b> → own locality (4, 5) + own address (7–9);
+     *       {@code salonId}/{@code salonName} are {@code null} — an independent master has no
+     *       employing salon, and that {@code null} is what the client keys its affiliation line
+     *       off.</li>
+     *   <li><b>false ({@code SALON_MASTER} / {@code SALON_OWNER})</b> → the employing salon's
+     *       locality (11, 12), identity (13, 14) and address (15–17) — <b>or nothing</b>. There is
+     *       deliberately NO fall-through to the master's own row for any of them: {@code salons}
+     *       columns are all nullable, and borrowing {@code users.street} is exactly the leak below.
+     *       </li>
+     * </ul>
+     *
+     * <h4>Why the employee's OWN address is never emitted (unchanged)</h4>
+     * A salon-employed master has no personal address to disclose, and {@code users.street} is not
+     * reliably even their workplace: a multi-salon owner's {@code users} row carries the MOST
+     * RECENTLY CREATED salon's address, so a master working in salon A was being handed salon B's
+     * street. An earlier revision returned indices 7–9 for every master type and delegated the
+     * suppression to the mobile client; a client-side suppression is not a server-side control.
+     * What changed since is only the FALLBACK — the card now publishes the salon's street (public
+     * business data, already unmasked on {@link #mapSalonRow} and on the public salon profile)
+     * rather than nothing, because a card showing only city + district cannot tell a client where
+     * to go.
+     *
+     * <p>An unparseable or {@code NULL} {@code master_type} fails CLOSED — it takes the salon
+     * branch, so the master's own address can never leak through it. For such a row the salon
+     * columns are whatever the {@code LEFT JOIN} produced ({@code null} throughout when the master
+     * has no salon), never the {@code users} ones. See {@link MasterType#fromProjection}.
      */
-    private static FavoriteMasterResponse mapMasterRow(Object[] row, DiscoveryLabels labels) {
+    private static FavoriteMasterResponse mapMasterRow(Object[] row, DiscoveryLabels labels,
+                                                       FavoriteCategories categories) {
         UUID masterId = (UUID) row[0];
         String firstName = (String) row[1];
         String lastName = (String) row[2];
         String avatarUrl = (String) row[3];
-        UUID cityId = (UUID) row[4];
-        UUID districtId = (UUID) row[5];
         Double avgRating = row[6] == null ? null : ((BigDecimal) row[6]).doubleValue();
-        String lastServiceName = (String) row[7];
+
+        boolean disclosesOwn = disclosesOwnLocation(row);
+        UUID cityId = discoveryCityIdOf(row);
+        UUID districtId = discoveryDistrictIdOf(row);
+        UUID salonId = disclosesOwn ? null : (UUID) row[13];
+        String salonName = disclosesOwn ? null : (String) row[14];
+        String street = (String) (disclosesOwn ? row[7] : row[15]);
+        String buildingNo = (String) (disclosesOwn ? row[8] : row[16]);
+        String locationNote = (String) (disclosesOwn ? row[9] : row[17]);
 
         return new FavoriteMasterResponse(
                 masterId,
@@ -442,26 +597,68 @@ public class FavoriteService {
                 labels.cityLabel(cityId),
                 labels.districtLabel(districtId),
                 avgRating,
-                lastServiceName
+                salonId,
+                salonName,
+                street,
+                buildingNo,
+                locationNote,
+                // The category axis is keyed on the MASTER, not on the employing salon: the
+                // chips answer "what does this PERSON do". A salon-affiliated master therefore
+                // keeps their own offered categories even though their address block resolves
+                // through the salon — the two field groups answer different questions and the
+                // disclosesOwnAddress predicate above governs only the address one.
+                categories.categories(masterId)
         );
+    }
+
+    /**
+     * The locked per-role address matrix, evaluated once per projection row. Both the street
+     * triple and the discovery locality branch on this single value so they cannot diverge.
+     *
+     * <p>Parsing lives on {@link MasterType#fromProjection} — shared with
+     * {@code SearchService#mapMasterRow}, the other native-projection surface — and fails CLOSED
+     * on a {@code NULL} or unrecognised column.
+     */
+    private static boolean disclosesOwnLocation(Object[] row) {
+        return MasterType.disclosesOwnAddress(MasterType.fromProjection(row[10]));
+    }
+
+    /**
+     * The city id this row may publish: the employing salon's (11) for a salon-affiliated
+     * master — {@code null} when that salon has no recorded locality — else the master's own (4).
+     */
+    private static UUID discoveryCityIdOf(Object[] row) {
+        return (UUID) (disclosesOwnLocation(row) ? row[4] : row[11]);
+    }
+
+    /** District counterpart of {@link #discoveryCityIdOf} (own 5 / salon 12). */
+    private static UUID discoveryDistrictIdOf(Object[] row) {
+        return (UUID) (disclosesOwnLocation(row) ? row[5] : row[12]);
     }
 
     /**
      * Maps a favorited-salon projection row to its response DTO.
      *
-     * <p>Column layout (indices 0–5):
-     * {@code [salon_id, name, avatar_url, city_id, district_id, avg_rating]}. The
-     * internal city/district FK ids (3, 4) are consumed for label resolution only.
-     * {@code avg_rating} is the {@code AVG(reviews.rating)} aggregate (a Postgres
-     * {@code numeric}), {@code null} when the salon has no reviews.
+     * <p>Column layout (indices 0–8):
+     * {@code [salon_id, name, avatar_url, city_id, district_id, avg_rating, street,
+     * building_no, location_note]}. The internal city/district FK ids (3, 4) are consumed for
+     * label resolution only. {@code avg_rating} is the persisted {@code salons.avg_rating}
+     * column (a Postgres {@code numeric}), already {@code NULL}-ed by the query when the salon
+     * has no reviews — see {@code FavoriteRepository#findFavoriteSalonRows}. The
+     * {@code (Number)} cast rather than {@code (BigDecimal)} is deliberate: it survives a
+     * driver returning either.
      */
-    private static FavoriteSalonResponse mapSalonRow(Object[] row, DiscoveryLabels labels) {
+    private static FavoriteSalonResponse mapSalonRow(Object[] row, DiscoveryLabels labels,
+                                                     FavoriteCategories categories) {
         UUID salonId = (UUID) row[0];
         String name = (String) row[1];
         String avatarUrl = (String) row[2];
         UUID cityId = (UUID) row[3];
         UUID districtId = (UUID) row[4];
         Double avgRating = row[5] == null ? null : ((Number) row[5]).doubleValue();
+        String street = (String) row[6];
+        String buildingNo = (String) row[7];
+        String locationNote = (String) row[8];
 
         return new FavoriteSalonResponse(
                 salonId,
@@ -469,7 +666,11 @@ public class FavoriteService {
                 avatarUrl,
                 labels.cityLabel(cityId),
                 labels.districtLabel(districtId),
-                avgRating
+                avgRating,
+                street,
+                buildingNo,
+                locationNote,
+                categories.categories(salonId)
         );
     }
 }
