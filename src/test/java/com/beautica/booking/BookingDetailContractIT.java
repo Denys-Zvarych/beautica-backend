@@ -132,6 +132,18 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         assertThat(single.get("salonName").asText())
                 .isEqualTo("Contract Bare Salon");
 
+        // categoryKey non-vacuity. The reflective loop above already compares this field, but the
+        // fixture's raw category is deliberately NOT already in slug form, so this also proves the
+        // normalisation itself — not just field presence — agrees on both mapper paths.
+        assertThat(single.get("categoryKey").asText())
+                .as("entity path (GET /bookings/{id}) must serve the normalized slug of raw "
+                        + "category '%s'", RAW_CATEGORY)
+                .isEqualTo(EXPECTED_CATEGORY_KEY);
+        assertThat(listItem.get("categoryKey").asText())
+                .as("CLIENT projection path (GET /bookings/me) must serve the same normalized slug — "
+                        + "a mapper that hardcoded categoryKey on only one path would diverge here")
+                .isEqualTo(EXPECTED_CATEGORY_KEY);
+
         // clientAvatarUrl non-vacuity. The reflective loop above ALREADY compares this field —
         // it enumerates getRecordComponents(), so the component was picked up the moment it was
         // added to the DTO, with no new hand-written assertion needed. But "both sides agree"
@@ -182,6 +194,49 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         assertThat(listItem.get("salonId").asText())
                 .as("CLIENT projection path (GET /bookings/me) must serve the same salon_id")
                 .isEqualTo(fx.salonId().toString());
+    }
+
+    /**
+     * backend-qa LOW (booking-category-key audit): the test above proves {@code categoryKey}'s
+     * normalization transform, but its fixture ({@link #RAW_CATEGORY}, {@code "Nail Care & Spa"})
+     * bypasses the service-layer validation that keeps real {@code service_definitions.category}
+     * values slug-shaped — it is not input the system can actually produce. This test closes that
+     * gap with the other half: a booking whose category is a genuine, currently-active
+     * {@code platform_categories.name} slug ({@link #REALISTIC_CATEGORY}), proving {@code
+     * categoryKey} is correct for input the system really produces, on both mapper paths, not just
+     * for the messy transform-exercising case.
+     *
+     * <p>Deliberately additive, not a replacement for the messy-fixture test above — losing that
+     * one would leave the normalization transform itself untested.
+     */
+    @Test
+    @DisplayName("categoryKey — a real platform_categories taxonomy slug passes through unchanged "
+            + "on BOTH mapper paths (closes backend-qa LOW: the messy-fixture test alone proves the "
+            + "transform but not correctness for input the system actually produces)")
+    void should_serveRealTaxonomySlugUnchangedAsCategoryKey_when_categoryIsAGenuinePlatformCategoryName()
+            throws Exception {
+        Fixture fx = seedSalonBookingWithDivergentAddresses(REALISTIC_CATEGORY);
+        UUID bookingId = insertConfirmedBooking(fx);
+        String clientToken = tokenFor(fx.clientEmail());
+
+        JsonNode single = getBookingDetail(bookingId, clientToken);
+        JsonNode listItem = findInMyBookings(bookingId, clientToken);
+
+        assertThat(listItem)
+                .as("booking %s must appear on the client's own GET /bookings/me page", bookingId)
+                .isNotNull();
+        assertThat(single.get("categoryKey").asText())
+                .as("entity path (GET /bookings/{id}) — a real slug must round-trip unchanged, "
+                        + "not just a messy value get normalized")
+                .isEqualTo(REALISTIC_CATEGORY);
+        assertThat(listItem.get("categoryKey").asText())
+                .as("CLIENT projection path (GET /bookings/me) must serve the same real slug — a "
+                        + "mapper that hardcoded categoryKey on only one path would diverge here")
+                .isEqualTo(REALISTIC_CATEGORY);
+        assertThat(single.get("categoryName").asText())
+                .as("categoryName is documented as the raw slug (see its @Schema) — for this "
+                        + "already-slug-shaped input it must equal categoryKey")
+                .isEqualTo(REALISTIC_CATEGORY);
     }
 
     /**
@@ -483,6 +538,40 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
     private static final int MASTER_REVIEW_COUNT = 12;
 
     /**
+     * The raw {@code service_definitions.category} value seeded for this fixture's service,
+     * deliberately NOT already in slug form (mixed case, a space, an ampersand). {@code
+     * categoryKey} is expected to normalize it via {@code BookingDetailResponse.categoryKeyOrNull}
+     * on BOTH mapper paths. Before this field existed, the reflective loop below compared
+     * categoryKey vacuously (null == null, since no prior fixture in this file set a category at
+     * all) — the same trap this suite's history is full of. Seeding a real, normalization-needing
+     * value is what makes the comparison, and the mutation "categoryKey hardcoded on only one
+     * path" it exists to catch, mean something.
+     *
+     * <p><b>Deliberately kept alongside {@link #REALISTIC_CATEGORY} below, not replaced by it</b>
+     * (backend-qa LOW finding, booking-category-key audit): this value is not input the system can
+     * actually produce — {@code ServiceDefinition.category} is validated against
+     * {@code platform_categories.name} at write time, which is always an upper-snake slug, never
+     * free text with spaces/ampersands. Losing this messy fixture would leave the normalization
+     * transform itself untested; {@link #REALISTIC_CATEGORY} alone would only prove the identity
+     * case (slug in, same slug out).
+     */
+    private static final String RAW_CATEGORY = "Nail Care & Spa";
+    private static final String EXPECTED_CATEGORY_KEY = "NAIL_CARE_SPA";
+
+    /**
+     * A genuine {@code platform_categories.name} taxonomy slug — real input the system actually
+     * produces, unlike {@link #RAW_CATEGORY} above. Sourced from
+     * {@code V74__seed_taxonomy_platform_categories.sql} lines 59-64 (the {@code MANICURE ->
+     * NAIL_SERVICE} rename) and re-asserted at line 140 — still active/APPROVED as of
+     * {@code V81__reconcile_taxonomy_to_final_20.sql} (which only folded {@code SHAVING} into
+     * {@code BEARD_CARE}; {@code NAIL_SERVICE} is untouched). Used by
+     * {@link #should_serveRealTaxonomySlugUnchangedAsCategoryKey_when_categoryIsAGenuinePlatformCategoryName}
+     * below to close the backend-qa LOW: {@code categoryKey} must be correct for input the system
+     * really produces, not only for the messy fixture above that exercises the transform.
+     */
+    private static final String REALISTIC_CATEGORY = "NAIL_SERVICE";
+
+    /**
      * Keys that must never appear in a denied booking read. {@code guestName}/{@code guestSurname}
      * are not {@link BookingDetailResponse} components today — they fold into
      * {@code clientFirstName}/{@code clientLastName} for guest (LINK) bookings — and are listed
@@ -533,6 +622,10 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
     }
 
     private Fixture seedSalonBookingWithDivergentAddresses() {
+        return seedSalonBookingWithDivergentAddresses(RAW_CATEGORY);
+    }
+
+    private Fixture seedSalonBookingWithDivergentAddresses(String category) {
         String ownerEmail = "contract-owner-" + System.nanoTime() + "@beautica.test";
         UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
 
@@ -573,9 +666,10 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, base_price, buffer_minutes_after, is_active, created_at, updated_at) "
-                        + "VALUES (?, 'SALON', ?, 'Haircut', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, salonId, resolveServiceTypeId());
+                        + "category, base_duration_minutes, base_price, buffer_minutes_after, is_active, "
+                        + "created_at, updated_at) "
+                        + "VALUES (?, 'SALON', ?, 'Haircut', ?, ?, 60, 500.00, 0, true, NOW(), NOW())",
+                serviceDefId, salonId, resolveServiceTypeId(), category);
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "

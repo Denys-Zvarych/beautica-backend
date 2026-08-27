@@ -4,7 +4,9 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.client.dto.PassportResponse;
+import com.beautica.client.dto.TimelineItemResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.PageResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -56,6 +58,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ClientPassportContractIT extends AbstractIntegrationTest {
 
     private static final String PASSPORT_URL = "/api/v1/clients/me/passport";
+    private static final String TIMELINE_URL = "/api/v1/clients/me/timeline";
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     @Autowired
@@ -302,6 +305,106 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
         assertThat(passport.bookingsConsidered()).isEqualTo(3);
     }
 
+    // ── categoryName fix (backend-security F1) — Ukrainian display_name over real HTTP ───
+    //
+    // NOTE: earlier drafts of these tests hardcoded the legacy slug 'MANICURE'. V74 renamed it to
+    // 'NAIL_SERVICE' (display_name 'Нігтьовий сервіс') as part of the 21-category reconciliation,
+    // so 'MANICURE' no longer exists as of the V64->V74->V81 trail and that literal would have
+    // failed with EmptyResultDataAccessException on the SELECT below — caught by actually running
+    // this suite rather than trusting the migration history from memory. Both tests below resolve
+    // a real APPROVED+active category at runtime instead of hardcoding any slug, so they stay
+    // correct across a future taxonomy reconciliation too.
+
+    private record SeededCategory(String name, String displayName) {
+    }
+
+    /** One real, currently APPROVED+active platform category, read at runtime — never hardcoded. */
+    private SeededCategory anySeededApprovedActiveCategory() {
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT name, display_name FROM platform_categories "
+                        + "WHERE status = 'APPROVED' AND active = TRUE ORDER BY name LIMIT 1");
+        return new SeededCategory((String) row.get("name"), (String) row.get("display_name"));
+    }
+
+    @Test
+    @DisplayName("GET timeline — categoryName resolves the real platform_categories.display_name "
+            + "(Ukrainian) for a seeded APPROVED+active category, while categoryKey stays the raw "
+            + "slug — this is the exact HTTP-visible contract the categoryName fix restores; a "
+            + "mocked resolver in the unit tests cannot prove a real seeded row round-trips correctly")
+    void should_resolveUkrainianCategoryName_when_categoryIsApprovedAndActive() throws Exception {
+        SeededCategory category = anySeededApprovedActiveCategory();
+        UUID clientId = createClient("timeline-category-hit-client@beautica.test");
+        UUID master = createIndependentMasterAt("timeline-category-hit-master@beautica.test", null);
+        UUID masterServiceId = createMasterService(master);
+        setServiceCategory(masterServiceId, category.name());
+        insertCompletedBooking(clientId, master, masterServiceId, new BigDecimal("500.00"));
+
+        List<TimelineItemResponse> items = getTimeline(clientId);
+
+        assertThat(items).hasSize(1);
+        assertThat(items.get(0).categoryKey()).as("machine key stays the raw uppercase slug")
+                .isEqualTo(category.name());
+        assertThat(items.get(0).categoryName())
+                .as("Ukrainian display_name over the wire, never the raw English slug — the exact "
+                        + "defect this fix closes")
+                .isEqualTo(category.displayName());
+    }
+
+    @Test
+    @DisplayName("GET timeline — a category deactivated after the booking was made falls back to the "
+            + "raw slug over HTTP, never null or blank, so the historical procedure is not silently "
+            + "dropped from the client's timeline")
+    void should_fallBackToRawSlugOverHttp_when_categoryDeactivatedSinceBooking() throws Exception {
+        SeededCategory category = anySeededApprovedActiveCategory();
+        UUID clientId = createClient("timeline-deactivated-client@beautica.test");
+        UUID master = createIndependentMasterAt("timeline-deactivated-master@beautica.test", null);
+        UUID masterServiceId = createMasterService(master);
+        setServiceCategory(masterServiceId, category.name());
+        insertCompletedBooking(clientId, master, masterServiceId, new BigDecimal("500.00"));
+
+        // platform_categories is reference data shared by every IT in this JVM (cleanDb() never
+        // restores it) — flip it back in a finally so no later test inherits a deactivated category.
+        jdbcTemplate.update("UPDATE platform_categories SET active = false WHERE name = ?", category.name());
+        try {
+            List<TimelineItemResponse> items = getTimeline(clientId);
+
+            assertThat(items).hasSize(1);
+            assertThat(items.get(0).categoryKey()).isEqualTo(category.name());
+            assertThat(items.get(0).categoryName())
+                    .as("fallback to the raw slug over HTTP — never null, never blank")
+                    .isEqualTo(category.name())
+                    .isNotBlank();
+        } finally {
+            jdbcTemplate.update("UPDATE platform_categories SET active = true WHERE name = ?", category.name());
+        }
+    }
+
+    // ── 2026-08-26: elapsed-but-unclosed CONFIRMED widening ─────────────────────
+
+    @Test
+    @DisplayName("GET timeline — an elapsed CONFIRMED booking the provider never closed out appears "
+            + "(2026-08-26 widening); an elapsed NOT_COMPLETED booking is deliberately excluded even "
+            + "though it elapsed the same way; a not-yet-elapsed CONFIRMED booking stays excluded too "
+            + "— proven over real HTTP against real Postgres, not a mocked repository")
+    void should_includeElapsedConfirmedOnly_when_gettingTimeline() throws Exception {
+        UUID clientId = createClient("timeline-elapsed-client@beautica.test");
+        UUID master = createIndependentMasterAt("timeline-elapsed-master@beautica.test", null);
+        UUID masterServiceId = createMasterService(master);
+
+        UUID elapsedConfirmed =
+                insertElapsedConfirmedBooking(clientId, master, masterServiceId, new BigDecimal("500.00"));
+        insertElapsedNotCompletedBooking(clientId, master, masterServiceId, new BigDecimal("300.00"));
+        insertUpcomingConfirmedBooking(clientId, master, masterServiceId, new BigDecimal("400.00"));
+
+        List<TimelineItemResponse> items = getTimeline(clientId);
+
+        assertThat(items)
+                .as("only the elapsed-but-unclosed CONFIRMED booking surfaces — NOT_COMPLETED and "
+                        + "not-yet-elapsed CONFIRMED are both excluded")
+                .extracting(TimelineItemResponse::bookingId)
+                .containsExactly(elapsedConfirmed);
+    }
+
     // ── HTTP plumbing ───────────────────────────────────────────────────────────
 
     private PassportResponse getPassport(UUID clientId) throws Exception {
@@ -324,6 +427,24 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
     private PassportResponse parsePassport(String body) throws Exception {
         return objectMapper
                 .readValue(body, new TypeReference<ApiResponse<PassportResponse>>() {})
+                .data();
+    }
+
+    private List<TimelineItemResponse> getTimeline(UUID clientId) throws Exception {
+        String email = jdbcTemplate.queryForObject(
+                "SELECT email FROM users WHERE id = ?", String.class, clientId);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(loginAndGetToken(email));
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                TIMELINE_URL, HttpMethod.GET, new HttpEntity<>(headers), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        return objectMapper
+                .readValue(response.getBody(),
+                        new TypeReference<ApiResponse<PageResponse<TimelineItemResponse>>>() {})
+                .data()
                 .data();
     }
 
@@ -442,6 +563,19 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
         return insertServiceDefinitionAndAssignment(masterId, "SALON", salonId);
     }
 
+    /**
+     * Sets {@code service_definitions.category} for the service definition behind a
+     * {@code master_services} row. {@code insertServiceDefinitionAndAssignment} never populates
+     * this column (it is nullable, unrelated to {@code service_type_id}), so tests that need a
+     * specific platform-category slug on the timeline projection set it explicitly here.
+     */
+    private void setServiceCategory(UUID masterServiceId, String categorySlug) {
+        jdbcTemplate.update(
+                "UPDATE service_definitions SET category = ? WHERE id = "
+                        + "(SELECT service_def_id FROM master_services WHERE id = ?)",
+                categorySlug, masterServiceId);
+    }
+
     private UUID insertServiceDefinitionAndAssignment(UUID masterId, String ownerType, UUID ownerId) {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -467,6 +601,58 @@ class ClientPassportContractIT extends AbstractIntegrationTest {
                         + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, 'COMPLETED', NOW() - interval '2 hours', "
                         + "NOW() - interval '1 hour', ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, price);
+        return bookingId;
+    }
+
+    /**
+     * A CONFIRMED booking whose window already elapsed (ends 1h ago) and was never closed out by
+     * the provider — the exact row the 2026-08-26 {@code findTimeline} widening exists to surface.
+     */
+    private UUID insertElapsedConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                                               BigDecimal price) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, price);
+        return bookingId;
+    }
+
+    /**
+     * An elapsed NOT_COMPLETED (explicit no-show) booking — locked product decision: unlike
+     * {@link #insertElapsedConfirmedBooking}, this must NEVER appear in the timeline, even though
+     * it elapsed the same way. See {@code ClientAggregationRepository#findTimeline}'s javadoc.
+     */
+    private UUID insertElapsedNotCompletedBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                                                   BigDecimal price) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'NOT_COMPLETED', NOW() - interval '2 hours', "
+                        + "NOW() - interval '1 hour', ?, 60, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, masterId, masterServiceId, price);
+        return bookingId;
+    }
+
+    /**
+     * A CONFIRMED booking whose window has NOT elapsed yet — must stay excluded from the timeline
+     * (it is still "upcoming", not "awaiting closure").
+     */
+    private UUID insertUpcomingConfirmedBooking(UUID clientId, UUID masterId, UUID masterServiceId,
+                                                BigDecimal price) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, status, "
+                        + "starts_at, ends_at, price_at_booking, duration_minutes_at_booking, "
+                        + "buffer_minutes_at_booking, booking_source, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, 'CONFIRMED', NOW() + interval '2 hours', "
+                        + "NOW() + interval '3 hours', ?, 60, 0, 'APP', NOW(), NOW())",
                 bookingId, clientId, masterId, masterServiceId, price);
         return bookingId;
     }

@@ -495,7 +495,11 @@ public class BookingService {
                 p.masterReviewCount(),
                 // Phase B2 — the booking's own salon snapshot (b.salon.id), NOT p.salonName()'s
                 // source (m.salon). Nullable for an independent master's booking.
-                p.salonId());
+                p.salonId(),
+                // Derived from the SAME p.categoryName() scalar — the projection's sd.category
+                // select — via the shared helper so this path and the entity path can never
+                // disagree (BookingDetailContractIT's reflective parity loop). No second query.
+                BookingDetailResponse.categoryKeyOrNull(p.categoryName()));
     }
 
     /**
@@ -1773,7 +1777,9 @@ public class BookingService {
      * @param actorUserId the authenticated actor (from the security principal, never the body)
      * @param actorRole   the actor's role, resolved by the controller from the JWT
      * @param bookingId   the booking to move
-     * @param req         the new start time
+     * @param req         the new start time; {@link RescheduleBookingRequest#allowClientOverlap()}
+     *                    opts out of the self-conflict check below, mirroring
+     *                    {@link CreateBookingRequest#allowClientOverlap()}
      * @return the updated booking
      * @throws ForbiddenException              if the actor is not the owning client / an
      *                                          authorized provider (403)
@@ -1863,7 +1869,27 @@ public class BookingService {
             // Client-conflict check (excluding this booking's own row) runs BEFORE the
             // master-busy check — and before the master lock is even acquired — same precedence
             // and rationale as create; see doCreateBooking.
-            assertNoClientConflictExcluding(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            //
+            // OVERRIDE (product decision 2026-08-22, widened 2026-08-26): req.allowClientOverlap()
+            // mirrors doCreateBooking's identical opt-in — skips ONLY this self-conflict check.
+            // The master-scoped existsOverlapExcluding check below and the
+            // no_overlapping_bookings EXCLUDE constraint still run unconditionally regardless of
+            // this flag, because they protect a DIFFERENT client's claim on this master's slot,
+            // which is never the requesting client's to waive. Defaults false (primitive
+            // boolean), so an absent/omitted field reproduces today's behaviour byte-for-byte.
+            //
+            // ACTOR GATE (backend-security HIGH, cycle audit 2026-08-26): the override is the
+            // CLIENT's consent to give, not the provider's. Unlike doCreateBooking (CLIENT-only
+            // endpoint), this reschedule route is also reachable by SALON_OWNER/SALON_ADMIN/
+            // INDEPENDENT_MASTER (see @PreAuthorize on BookingController#rescheduleBooking) — so
+            // req.allowClientOverlap() must be honored ONLY when the client themselves is the
+            // actor. `initiatedByProvider` (= actorRole != Role.CLIENT, set at the top of this
+            // method) is the same discriminator already driving resolveBookingForProviderReschedule
+            // vs resolveBookingForClientReschedule and validateStartsAt above — reused here rather
+            // than threading a new parameter.
+            if (initiatedByProvider || !req.allowClientOverlap()) {
+                assertNoClientConflictExcluding(owningClient.getId(), newStartsAt, newEndsAt, bookingId);
+            }
             // acquireClientLock already fused the transaction-scoped lock_timeout — reuse the
             // plain (untimed-fuse) master lock, same as every other call site that took the
             // client lock first.

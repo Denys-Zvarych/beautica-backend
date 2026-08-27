@@ -16,7 +16,11 @@ import com.beautica.common.TimeZones;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
+import com.beautica.service.service.PlatformCategoryLabel;
+import com.beautica.service.service.PlatformCategoryLabelResolver;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
@@ -26,9 +30,12 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
@@ -36,12 +43,22 @@ import java.util.stream.Collectors;
 
 /**
  * Derives the read-only BEAUTI PASSPORT and BEAUTY TIMELINE for the signed-in client
- * (Phase 19.5) from their COMPLETED booking history. No preferences entity exists and
- * nothing here is user-editable.
+ * (Phase 19.5). No preferences entity exists and nothing here is user-editable.
+ *
+ * <p>{@link #getPassport} derives strictly from the client's COMPLETED booking history — every
+ * aggregate it reads ({@code findStanding}'s review count aside, {@code aggregateBudget}, {@code
+ * findTopDistricts}, {@code findTopCities}) is {@code status = COMPLETED} only. {@link
+ * #getTimeline} was widened (2026-08-26) to also include elapsed-but-unclosed {@code CONFIRMED}
+ * bookings — see {@link ClientAggregationRepository#findTimeline}'s javadoc — so the timeline can
+ * legitimately list more rows than the passport headline counts. That divergence is intentional;
+ * do not "fix" it by narrowing the timeline back to COMPLETED-only or by widening the passport
+ * aggregates to match.
  */
 @Service
 @RequiredArgsConstructor
 public class ClientPassportService {
+
+    private static final Logger log = LoggerFactory.getLogger(ClientPassportService.class);
 
     /**
      * Caffeine cache backing {@link #getPassport}. Registered in {@code CacheConfig}; evicted
@@ -56,6 +73,7 @@ public class ClientPassportService {
 
     private final ClientAggregationRepository aggregationRepository;
     private final DiscoveryLocationResolver discoveryLocationResolver;
+    private final PlatformCategoryLabelResolver platformCategoryLabelResolver;
     private final Clock clock;
 
     /**
@@ -144,6 +162,22 @@ public class ClientPassportService {
     }
 
     /**
+     * Absolute-instant "now" for {@link #getTimeline}'s elapsed-{@code CONFIRMED} leg — {@link
+     * Clock#instant()} as a fixed-offset {@link OffsetDateTime}, the SAME expression {@code
+     * BookingService#resolveNow} resolves for the Phase 28.1/29.1 partition boundary
+     * ({@code BookingSpecifications#partition} / {@link
+     * com.beautica.booking.domain.BookingClosureRule}). Reusing this exact expression — never
+     * {@code Instant.now()}/{@code OffsetDateTime.now()} (Anti-Bug §G) — is how the timeline's
+     * "has this booking elapsed?" answer is guaranteed to agree with the client's «Минулі» tab:
+     * both derive {@code now} from the same injected {@link Clock} bean via the same conversion,
+     * so they can never disagree about which side of the boundary a given {@code endsAt} falls on.
+     * {@link TimeZones#KYIV} must never appear here — this is an absolute-instant comparison.
+     */
+    private OffsetDateTime resolveNow() {
+        return OffsetDateTime.ofInstant(clock.instant(), ZoneOffset.UTC);
+    }
+
+    /**
      * The only property {@code GET /clients/me/timeline} may be sorted by — mirrors
      * {@code BookingService.SORTABLE_BOOKING_PROPERTIES}, since this query shares the
      * {@code Booking} root and must not expose a wider sort surface than {@code GET /bookings/me}.
@@ -151,8 +185,11 @@ public class ClientPassportService {
     private static final Set<String> SORTABLE_TIMELINE_PROPERTIES = Set.of("startsAt");
 
     /**
-     * Most-recent-first page of COMPLETED procedures. The {@code categoryKey} slug and the
-     * Kyiv {@code LocalDate} are derived in-memory from the scalar projection (no N+1).
+     * Most-recent-first page of the client's CLOSED-OR-ELAPSED procedures — {@code COMPLETED}, or
+     * an unclosed {@code CONFIRMED} booking whose window has already elapsed (see {@link
+     * ClientAggregationRepository#findTimeline}'s javadoc for the exact predicate and why {@code
+     * NOT_COMPLETED} is deliberately excluded). The {@code categoryKey} slug and the Kyiv {@code
+     * LocalDate} are derived in-memory from the scalar projection (no N+1).
      */
     @Transactional(readOnly = true)
     public PageResponse<TimelineItemResponse> getTimeline(UUID clientUserId, Pageable pageable) {
@@ -163,10 +200,23 @@ public class ClientPassportService {
         // `ORDER BY b.startsAt DESC` and Spring appends the caller's sort after it.
         Pageable safePageable = SortWhitelist.apply(
                 pageable, SORTABLE_TIMELINE_PROPERTIES, Sort.unsorted(), null);
-        Page<TimelineItemProjection> page = aggregationRepository.findTimeline(clientUserId, safePageable);
+        Page<TimelineItemProjection> page =
+                aggregationRepository.findTimeline(clientUserId, resolveNow(), safePageable);
         ZoneId kyiv = TimeZones.KYIV;
+        // Resolved ONCE per request/page, never per row: platformCategoryLabelResolver is
+        // itself backed by a 60-min cached list read (see its javadoc), but building the
+        // slug->label map inside the .map(...) below would still repeat that stream/collect
+        // work once per timeline item for no benefit.
+        //
+        // Decorative, not load-bearing: categoryName() already falls back to the raw slug via
+        // getOrDefault, so a failure here degrades to that same fallback for every row instead
+        // of failing the whole timeline read. Caught narrowly at Exception (never Throwable —
+        // an OutOfMemoryError must still propagate) and logged at WARN so the degraded state
+        // (slugs showing in the UI) is diagnosable as an infra failure, not mistaken for a data
+        // problem.
+        Map<String, String> categoryLabelsBySlug = resolveCategoryLabelsBySlug();
         List<TimelineItemResponse> content = page.getContent().stream()
-                .map(p -> toTimelineResponse(p, kyiv))
+                .map(p -> toTimelineResponse(p, kyiv, categoryLabelsBySlug))
                 .toList();
         return PageResponse.of(
                 content,
@@ -174,6 +224,28 @@ public class ClientPassportService {
                 page.getSize(),
                 page.getTotalElements(),
                 page.getTotalPages());
+    }
+
+    /**
+     * Builds the slug-to-label map for one {@link #getTimeline} call, never failing the
+     * timeline read if the lookup itself fails.
+     *
+     * <p>The label lookup is decorative — the timeline payload (bookings, dates, service
+     * names, ids) does not depend on it. A cache or DB failure inside
+     * {@link PlatformCategoryLabelResolver#selectableLabels()} therefore degrades to an empty
+     * map rather than propagating: {@code categoryName} already falls back to the raw slug via
+     * {@code getOrDefault(category, category)} on a map miss, so an empty map here reproduces
+     * exactly that pre-existing, documented fallback for every row.
+     */
+    private Map<String, String> resolveCategoryLabelsBySlug() {
+        try {
+            return platformCategoryLabelResolver.selectableLabels().stream()
+                    .collect(Collectors.toMap(PlatformCategoryLabel::name, PlatformCategoryLabel::displayName));
+        } catch (Exception ex) {
+            log.warn("Category label resolution failed for timeline read — falling back to raw "
+                    + "slugs: {}", ex.getClass().getSimpleName());
+            return Map.of();
+        }
     }
 
     /**
@@ -211,14 +283,35 @@ public class ClientPassportService {
                 .toList();
     }
 
-    private TimelineItemResponse toTimelineResponse(TimelineItemProjection p, ZoneId kyiv) {
+    private TimelineItemResponse toTimelineResponse(
+            TimelineItemProjection p, ZoneId kyiv, Map<String, String> categoryLabelsBySlug) {
         return new TimelineItemResponse(
                 p.bookingId(),
                 categoryKey(p.category()),
-                p.category(),
+                categoryName(p.category(), categoryLabelsBySlug),
                 p.startsAt().atZoneSameInstant(kyiv).toLocalDate(),
                 p.masterId(),
                 p.serviceName());
+    }
+
+    /**
+     * Ukrainian display label for {@code categoryKey}'s slug, resolved against the
+     * pre-built {@code categoryLabelsBySlug} map (one {@link PlatformCategoryLabelResolver}
+     * read per request, built in {@link #getTimeline}, never per row).
+     *
+     * <p>Falls back to the raw slug — never {@code null}/blank — whenever the category is
+     * {@code null} or the lookup misses (deactivated, rejected, or renamed since the booking
+     * was made): the resolver's backing query filters {@code status = APPROVED AND active =
+     * true}, so a booking's category can silently drop out of it. The mobile client discards
+     * any timeline row where both {@code categoryKey} and {@code categoryName} are empty, so a
+     * stale-but-present slug beats a "correct" null that erases the procedure from the client's
+     * history.
+     */
+    private static String categoryName(String category, Map<String, String> categoryLabelsBySlug) {
+        if (category == null) {
+            return null;
+        }
+        return categoryLabelsBySlug.getOrDefault(category, category);
     }
 
     /**

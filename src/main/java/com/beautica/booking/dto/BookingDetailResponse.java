@@ -321,6 +321,16 @@ public record BookingDetailResponse(
                         + "master have moved since — and an independent-master booking surfaces "
                         + "the master's own note. Nullable — most providers never set one.")
         String locationNote,
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "The RAW category slug (e.g. \"NAIL_SERVICE\"), sourced directly from "
+                        + "service_definitions.category — NOT a human-readable display name, despite "
+                        + "the field name. The Ukrainian display text lives in "
+                        + "platform_categories.display_name, which no booking read path joins. Kept "
+                        + "for backward compatibility with existing consumers; do not rename or "
+                        + "repoint it to the display name without a coordinated client migration — "
+                        + "that would silently change every current consumer's rendered value. New "
+                        + "code that needs a stable machine key for icon/category resolution should "
+                        + "prefer categoryKey below.")
         String categoryName,
         boolean canReview,
         @Schema(description = "TRUE only for the CURRENT authenticated viewer, and only on "
@@ -426,7 +436,26 @@ public record BookingDetailResponse(
                         + "always identifies the premises whose address is displayed alongside it. "
                         + "(Before 242 the address block came from the master's LIVE salon and the "
                         + "two could disagree after a rotation — that divergence is gone.)")
-        UUID salonId
+        UUID salonId,
+        // Appended LAST, after the UUID salonId, for the same compile-time-slip-detection reason
+        // as every field above it — mobile category-icon wiring, this session. Sourced from the
+        // SAME sd.category value as categoryName above (never a second lookup), so the two can
+        // never disagree; see categoryKeyOrNull's javadoc for the exact derivation, which mirrors
+        // ClientAggregationRepository#findTimeline's categoryKey/categoryName pair (Beauty
+        // Timeline) — same field names, same slug normalisation — EXCEPT that findTimeline's
+        // sentinel-on-null ("UNKNOWN", so an uncategorised timeline row still renders a tile) is
+        // deliberately NOT reused here: a booking card must render NO icon for an uncategorised
+        // service, and a non-null placeholder would paint the wrong one. Null, never a fallback
+        // string.
+        @Schema(types = {"string", "null"}, nullable = true,
+                description = "Stable machine key for the client-side category-icon resolver — the "
+                        + "uppercase slug of the service's category (e.g. \"NAIL_SERVICE\"), or null "
+                        + "when the service has no category. Mirrors "
+                        + "ClientAggregationRepository#findTimeline's categoryKey/categoryName pair "
+                        + "(Beauty Timeline). Prefer this over categoryName for icon resolution — "
+                        + "categoryName is for display only. Never a fallback/placeholder value: a "
+                        + "null here must render no icon, not a guessed one.")
+        String categoryKey
 ) {
 
     /**
@@ -463,6 +492,35 @@ public record BookingDetailResponse(
      */
     public static BigDecimal masterAvgRatingOrNull(int reviewCount, BigDecimal storedAvgRating) {
         return reviewCount == 0 ? null : storedAvgRating;
+    }
+
+    /**
+     * The single {@code categoryKey} derivation, shared verbatim by BOTH mapper paths ({@link #from}
+     * below and {@code BookingService#toDetailResponse}'s CLIENT projection path) — for the same
+     * divergence-prevention reason as {@link #masterAvgRatingOrNull}, and covered automatically by
+     * {@code BookingDetailContractIT}'s reflective parity loop the moment this component exists.
+     *
+     * <p>Mirrors {@code ClientAggregationRepository#findTimeline}'s {@code categoryKey} slug
+     * normalisation (uppercase, non-alphanumeric runs collapsed to {@code _}, trimmed) — the exact
+     * transform {@code ClientPassportService#categoryKey} applies for the Beauty Timeline — so a
+     * service's category resolves to the SAME machine key on the timeline and on a booking card.
+     * The one deliberate difference: {@code findTimeline} returns the sentinel {@code "UNKNOWN"} for
+     * a null/blank category (so an uncategorised row still renders a timeline tile); this method
+     * returns {@code null} instead, because a booking card must render NO icon for an uncategorised
+     * service — a non-null placeholder here would paint the wrong glyph, not a generic one.
+     *
+     * @param category the raw {@code service_definitions.category} slug (nullable) — the SAME value
+     *                  passed as {@code categoryName} at both call sites, never a second read
+     * @return the normalised uppercase slug, or {@code null} when {@code category} is null/blank
+     */
+    public static String categoryKeyOrNull(String category) {
+        if (category == null || category.isBlank()) {
+            return null;
+        }
+        return category.trim()
+                .toUpperCase(java.util.Locale.ROOT)
+                .replaceAll("[^A-Z0-9]+", "_")
+                .replaceAll("^_+|_+$", "");
     }
 
     /**
@@ -577,7 +635,11 @@ public record BookingDetailResponse(
                 // same booking snapshot, so this is now simply the id of the `salon` local. Kept as
                 // its own expression rather than folded into `salon` only because the null-guard
                 // reads clearer here; the two can no longer disagree.
-                salon != null ? salon.getId() : null
+                salon != null ? salon.getId() : null,
+                // Derived from the SAME serviceDefinition.getCategory() read as categoryName above
+                // — no second lazy-graph walk, no widening of this factory's documented hydration
+                // contract. See categoryKeyOrNull's javadoc.
+                categoryKeyOrNull(booking.getMasterService().getServiceDefinition().getCategory())
         );
     }
 }

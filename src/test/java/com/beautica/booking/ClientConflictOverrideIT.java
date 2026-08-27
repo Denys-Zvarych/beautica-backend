@@ -3,12 +3,16 @@ package com.beautica.booking;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.booking.dto.AppointmentItemRescheduleRequest;
 import com.beautica.booking.dto.CreateBookingRequest;
+import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -26,22 +30,73 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
- * Full-HTTP-stack coverage for the client-supplied {@code allowClientOverlap} opt-in on
- * {@code POST /bookings} (product decision 2026-08-22) — see {@link CreateBookingRequest#allowClientOverlap()}.
+ * Full-HTTP-stack coverage for the client-supplied {@code allowClientOverlap} opt-in — originally
+ * {@code POST /bookings} (product decision 2026-08-22, see
+ * {@link CreateBookingRequest#allowClientOverlap()}), widened 2026-08-26 to both reschedule paths:
+ * {@code PATCH /bookings/{id}/reschedule} ({@link RescheduleBookingRequest#allowClientOverlap()})
+ * and {@code PATCH /appointments/{appointmentId}/services/{bookingId}/reschedule}
+ * ({@link AppointmentItemRescheduleRequest#allowClientOverlap()}).
  *
- * <p>Only {@code BookingService#assertNoClientConflict} (the CLIENT's own-calendar guard) becomes
- * skippable. The per-master {@code existsOverlap} pre-check and the {@code no_overlapping_bookings}
- * GIST EXCLUDE constraint — which protect a DIFFERENT client's claim on a master's slot — are never
- * affected by this flag, for any client. {@link
+ * <p>Only the CLIENT's own-calendar guard becomes skippable on every path
+ * ({@code BookingService#assertNoClientConflict(Excluding)}, {@code AppointmentTransitionService
+ * #assertNoClientConflictExcludingBooking}). The per-master {@code existsOverlap(Excluding)}
+ * pre-check and the {@code no_overlapping_bookings} GIST EXCLUDE constraint — which protect a
+ * DIFFERENT client's claim on a master's slot — are never affected by this flag, for any client, on
+ * any path. {@link
  * #should_stillRejectDoubleBooking_when_twoDifferentClientsTargetTheSameMasterSlotEvenWithAllowClientOverlap}
- * is the load-bearing proof of that boundary: if it could be made to pass while also bypassing
- * {@code existsOverlap}, the change would be unsafe.
+ * is the load-bearing proof of that boundary for CREATE.
+ *
+ * <p><b>The two RESCHEDULE-path positive tests</b> (client-initiated, target master slot genuinely
+ * free, only the client's own calendar overlaps) moved to
+ * {@code com.beautica.booking.service.RescheduleMasterOverlapGuardConcurrencyIT} (backend-qa LOW /
+ * backend-perf, cycle audit 2026-08-26) — that class already carries a superset {@code @SpyBean}
+ * combination ({@code BookingRepository} + {@code BookingService} + {@code AppointmentTransitionService})
+ * for its own negative race tests, so co-locating the positive half there avoids bootstrapping a
+ * SECOND, narrower Spring context (this class's old {@code BookingRepository}-only spy) purely to
+ * host two tests. This class therefore no longer spies {@code BookingRepository} — nothing left here
+ * needs it (verified: neither the CREATE-path tests above nor the provider-gate tests below call
+ * {@code verify(bookingRepository)} anywhere).
+ *
+ * <p><b>The two provider-gate negative tests below</b>
+ * ({@link #should_return409_when_providerReschedulesWithAllowClientOverlapTrue_andClientHasNotConsented},
+ * {@link #should_return409_when_providerReschedulesItemWithAllowClientOverlapTrue_andClientHasNotConsented})
+ * close backend-security HIGH (cycle audit 2026-08-26): {@code req.allowClientOverlap()} is the
+ * CLIENT's own consent to waive their own-calendar conflict, but both reschedule routes are also
+ * reachable by SALON_OWNER/SALON_ADMIN/INDEPENDENT_MASTER (unlike {@code POST /bookings}, which is
+ * CLIENT-only). Without an actor gate, a provider already authorized to reschedule a client's booking
+ * could set {@code allowClientOverlap=true} and silently double-book that client's calendar on the
+ * client's behalf. {@code BookingService#rescheduleBooking} / {@code AppointmentTransitionService
+ * #rescheduleAppointmentItem} now gate the skip on {@code initiatedByProvider} (the existing
+ * {@code actorRole != Role.CLIENT} discriminator each method already computes to pick its
+ * resolver/validator) — {@code initiatedByProvider || !req.allowClientOverlap()} — so the guard runs
+ * unconditionally whenever a provider is the actor, regardless of the flag.
+ *
+ * <p><b>The RESCHEDULE-path negative ("master busy") race tests live in a SEPARATE class</b> —
+ * {@code com.beautica.booking.service.RescheduleMasterOverlapGuardConcurrencyIT} — not here, and not
+ * for style reasons. {@code BookingService#assertStartsOnAvailableSlot} /
+ * {@code AppointmentTransitionService#assertItemStartsOnAvailableSlot} run BEFORE the per-master
+ * advisory lock and BEFORE {@code existsOverlapExcluding}, and the slot list they consult already has
+ * the master's CONFIRMED bookings subtracted (see {@code BookingService#rescheduleBooking}'s own "the
+ * slot list already has the master's CONFIRMED bookings subtracted" javadoc). A conflicting booking
+ * that is ALREADY committed before the reschedule request starts is therefore rejected at THAT
+ * earlier guard, with the SAME generic "Slot not available" 409 — {@code existsOverlapExcluding} is
+ * never even reached, so a naive pre-seeded-conflict test in THIS class cannot exercise, and cannot
+ * mutation-prove, the line these tests exist to guard. Reaching it requires racing the occupying
+ * booking to commit strictly AFTER the reschedule's own (unlocked) slot read but strictly BEFORE its
+ * (locked) {@code existsOverlapExcluding} call — which in turn requires pausing the reschedule thread
+ * at a PACKAGE-PRIVATE seam ({@code BookingService#isStillConfirmed} /
+ * {@code AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule}), exactly the same
+ * constraint that already put {@code BookingCancelRescheduleConcurrencyIT} and
+ * {@code AppointmentCrossPathTransitionConcurrencyIT} in {@code com.beautica.booking.service} rather
+ * than here (see {@link BookingTestFixtures}'s own "public (cycle-2 audit finding 5)" javadoc
+ * paragraph for the identical rationale).
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("POST /bookings — allowClientOverlap opt-in (product decision 2026-08-22)")
+@DisplayName("POST /bookings + PATCH .../reschedule — allowClientOverlap opt-in (product decision 2026-08-22, widened 2026-08-26)")
 class ClientConflictOverrideIT extends AbstractIntegrationTest {
 
     private static final String BOOKINGS_URL = "/api/v1/bookings";
+    private static final String APPOINTMENTS_URL = "/api/v1/appointments";
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -228,5 +283,157 @@ class ClientConflictOverrideIT extends AbstractIntegrationTest {
         assertThat(confirmedForMaster)
                 .as("the master must still hold exactly ONE CONFIRMED booking for this slot")
                 .isEqualTo(1L);
+    }
+
+    // ── PROVIDER GATE — PATCH /bookings/{id}/reschedule (BookingService#rescheduleBooking) ─────────
+
+    @Test
+    @DisplayName("RESCHEDULE — 409 CLIENT_BOOKING_CONFLICT when the PROVIDER (not the client) sends "
+            + "allowClientOverlap=true; the target master's slot is genuinely free, but the override "
+            + "is the CLIENT's consent to give, never the provider's")
+    void should_return409_when_providerReschedulesWithAllowClientOverlapTrue_andClientHasNotConsented()
+            throws Exception {
+        String clientEmail = "cco-provgate-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        UUID masterAId = fixtures.createIndependentMaster(
+                "cco-provgate-masterA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = fixtures.createIndependentMasterService(masterAId);
+        fixtures.addWorkingHoursForEveryDay(masterAId);
+
+        String masterBEmail = "cco-provgate-masterb-" + System.nanoTime() + "@beautica.test";
+        UUID masterBId = fixtures.createIndependentMaster(masterBEmail);
+        String masterBToken = fixtures.tokenFor(masterBEmail);
+        UUID masterBServiceId = fixtures.createIndependentMasterService(masterBId);
+        fixtures.addWorkingHoursForEveryDay(masterBId);
+
+        ZonedDateTime slotT1 = ZonedDateTime.now(TimeZones.KYIV).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        ZonedDateTime slotT2 = slotT1.plusHours(4); // master B's ORIGINAL slot — clear of T1
+
+        var bookingOnA = new CreateBookingRequest(masterAId, masterAServiceId, slotT1, null, null, false);
+        ResponseEntity<String> respA = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(bookingOnA, fixtures.bearerHeaders(clientToken)), String.class);
+        assertThat(respA.getStatusCode())
+                .as("setup: client's booking on master A must succeed — body: %s", respA.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+
+        var bookingOnB = new CreateBookingRequest(masterBId, masterBServiceId, slotT2, null, null, false);
+        ResponseEntity<String> respB = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(bookingOnB, fixtures.bearerHeaders(clientToken)), String.class);
+        assertThat(respB.getStatusCode())
+                .as("setup: client's booking on master B must succeed — body: %s", respB.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        UUID bookingBId = UUID.fromString(objectMapper.readTree(respB.getBody()).path("data").path("id").asText());
+
+        // Master B — the PROVIDER authorized to reschedule the booking they perform — moves it onto
+        // T1 and sets allowClientOverlap=true on the client's behalf. Master B's OWN calendar is
+        // genuinely free at T1 (no master-busy conflict), so a 200 here would prove the provider
+        // silently waived the CLIENT's own-calendar conflict (master A's booking, also at T1)
+        // without the client ever consenting.
+        var rescheduleRequest = new RescheduleBookingRequest(slotT1.toOffsetDateTime(), true);
+        ResponseEntity<String> rescheduleResponse = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingBId + "/reschedule", HttpMethod.PATCH,
+                new HttpEntity<>(rescheduleRequest, fixtures.bearerHeaders(masterBToken)), String.class);
+
+        assertThat(rescheduleResponse.getStatusCode())
+                .as("a PROVIDER may not waive the CLIENT's own-calendar overlap on the client's "
+                        + "behalf, even with allowClientOverlap=true — body: %s",
+                        rescheduleResponse.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        JsonNode body = objectMapper.readTree(rescheduleResponse.getBody());
+        assertThat(body.path("data").path("code").asText())
+                .as("must be the client-conflict code — proves the guard actually ran rather than "
+                        + "failing for an unrelated reason")
+                .isEqualTo("CLIENT_BOOKING_CONFLICT");
+
+        OffsetDateTime persistedStartsAt = jdbcTemplate.queryForObject(
+                "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, bookingBId);
+        assertThat(persistedStartsAt.toInstant())
+                .as("the rejected provider reschedule must leave the booking at its ORIGINAL time")
+                .isEqualTo(slotT2.toOffsetDateTime().toInstant());
+    }
+
+    // ── PROVIDER GATE — PATCH .../services/{bookingId}/reschedule (AppointmentTransitionService) ──
+
+    @Test
+    @DisplayName("RESCHEDULE ITEM — 409 CLIENT_BOOKING_CONFLICT when the PROVIDER (not the client) "
+            + "sends allowClientOverlap=true on a per-item reschedule; the item's target master slot "
+            + "is genuinely free, but the override is the CLIENT's consent to give")
+    void should_return409_when_providerReschedulesItemWithAllowClientOverlapTrue_andClientHasNotConsented()
+            throws Exception {
+        String clientEmail = "cco-provgate-item-client-" + System.nanoTime() + "@beautica.test";
+        fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+
+        UUID masterAId = fixtures.createIndependentMaster(
+                "cco-provgate-item-masterA-" + System.nanoTime() + "@beautica.test");
+        UUID masterAServiceId = fixtures.createIndependentMasterService(masterAId);
+        fixtures.addWorkingHoursForEveryDay(masterAId);
+
+        String masterBEmail = "cco-provgate-item-masterb-" + System.nanoTime() + "@beautica.test";
+        UUID masterBId = fixtures.createIndependentMaster(masterBEmail);
+        String masterBToken = fixtures.tokenFor(masterBEmail);
+        UUID masterBServiceId = fixtures.createIndependentMasterService(masterBId);
+        fixtures.addWorkingHoursForEveryDay(masterBId);
+
+        ZonedDateTime slotT1 = ZonedDateTime.now(TimeZones.KYIV).plusDays(2)
+                .withHour(10).withMinute(0).withSecond(0).withNano(0);
+        ZonedDateTime slotT2 = slotT1.plusHours(4);
+
+        var bookingOnA = new CreateBookingRequest(masterAId, masterAServiceId, slotT1, null, null, false);
+        ResponseEntity<String> respA = restTemplate.exchange(
+                BOOKINGS_URL, HttpMethod.POST,
+                new HttpEntity<>(bookingOnA, fixtures.bearerHeaders(clientToken)), String.class);
+        assertThat(respA.getStatusCode())
+                .as("setup: client's booking on master A must succeed — body: %s", respA.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+
+        // Client's own single-service visit on master B, at a clear time.
+        String visitBody = objectMapper.writeValueAsString(Map.of(
+                "masterId", masterBId.toString(),
+                "masterServiceIds", List.of(masterBServiceId.toString()),
+                "startsAt", slotT2.toOffsetDateTime().toString()));
+        ResponseEntity<String> visitResponse = restTemplate.exchange(
+                APPOINTMENTS_URL, HttpMethod.POST,
+                new HttpEntity<>(visitBody, fixtures.bearerHeaders(clientToken)), String.class);
+        assertThat(visitResponse.getStatusCode())
+                .as("setup: client's visit on master B must succeed — body: %s", visitResponse.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+        JsonNode visitData = objectMapper.readTree(visitResponse.getBody()).path("data");
+        UUID appointmentId = UUID.fromString(visitData.path("id").asText());
+        UUID itemBookingId = UUID.fromString(visitData.path("items").get(0).path("bookingId").asText());
+
+        // Master B — the PROVIDER of this item — moves it onto T1 with allowClientOverlap=true.
+        // Master B's own calendar is genuinely free at T1, so a 200 here would prove the provider
+        // silently waived the client's own-calendar conflict (master A's booking, also at T1) on the
+        // client's behalf.
+        var rescheduleItemRequest = new AppointmentItemRescheduleRequest(slotT1.toOffsetDateTime(), true);
+        ResponseEntity<String> rescheduleResponse = restTemplate.exchange(
+                APPOINTMENTS_URL + "/" + appointmentId + "/services/" + itemBookingId + "/reschedule",
+                HttpMethod.PATCH, new HttpEntity<>(rescheduleItemRequest, fixtures.bearerHeaders(masterBToken)),
+                String.class);
+
+        assertThat(rescheduleResponse.getStatusCode())
+                .as("a PROVIDER may not waive the CLIENT's own-calendar overlap on a per-item "
+                        + "reschedule either, even with allowClientOverlap=true — body: %s",
+                        rescheduleResponse.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        JsonNode body = objectMapper.readTree(rescheduleResponse.getBody());
+        assertThat(body.path("data").path("code").asText())
+                .as("must be the client-conflict code — proves the guard actually ran rather than "
+                        + "failing for an unrelated reason")
+                .isEqualTo("CLIENT_BOOKING_CONFLICT");
+
+        OffsetDateTime persistedStartsAt = jdbcTemplate.queryForObject(
+                "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, itemBookingId);
+        assertThat(persistedStartsAt.toInstant())
+                .as("the rejected provider reschedule must leave the item at its ORIGINAL time")
+                .isEqualTo(slotT2.toOffsetDateTime().toInstant());
     }
 }

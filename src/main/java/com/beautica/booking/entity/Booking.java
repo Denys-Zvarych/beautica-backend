@@ -124,6 +124,14 @@ import java.util.UUID;
                 // always have a null client_id (V89 chk_bookings_guest_fields) and can never match
                 // this query's client_id equality — indexing them would be pure write amplification.
                 @Index(name = "idx_bookings_client_slot_overlap", columnList = "client_id, starts_at, ends_at"),
+                // partial index (V145): ClientAggregationRepository#findTimeline — WHERE client_id = ?
+                // AND (status = COMPLETED OR (status = CONFIRMED AND ends_at < :now)) ORDER BY
+                // starts_at DESC. JPA cannot encode the WHERE status IN (...) predicate nor the
+                // ends_at < :now leg (not IMMUTABLE, so it can never live in a partial index) — the
+                // predicate lives in V145 only. Narrowing to the two qualifying statuses is still
+                // enough to restore index-order output for the ORDER BY, since every row the query
+                // can return has one of these two statuses.
+                @Index(name = "idx_bookings_client_timeline_starts_at", columnList = "client_id, starts_at, id"),
                 // partial index (V125): "fetch all rows of this multi-service visit" lookup.
                 // JPA cannot encode WHERE appointment_id IS NOT NULL — the predicate lives in V125
                 // only; this annotation mirrors the column for reader accuracy, not enforcement.

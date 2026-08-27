@@ -46,7 +46,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * (salon wins outright when present, even with a null district — never falls through to the
  * master's own personal district; §Anti-Bug-fix-19.3-class), budget AVG/MIN/MAX/COUNT, and
  * most-recent-first timeline ordering with the category key/name and serviceName populated.
- * ASCII-only seed data throughout.
+ * {@code findTimeline} is COMPLETED-or-elapsed-CONFIRMED only (2026-08-26 widening) — the other
+ * three aggregates ({@code findTopDistricts}, {@code findTopCities}, {@code aggregateBudget})
+ * stay COMPLETED-only; see {@link ClientAggregationRepository}'s class javadoc for that
+ * deliberate divergence. ASCII-only seed data throughout.
  */
 @DisplayName("ClientAggregationRepository — @DataJpaTest")
 class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
@@ -61,6 +64,16 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
     private EntityManagerFactory emf;
 
     private static final Pageable TOP_3 = PageRequest.of(0, 3);
+
+    /**
+     * Fixed "now" for {@code findTimeline}'s elapsed-{@code CONFIRMED} leg. All {@link #slot()}
+     * bookings (base 2026-05-01, advancing 2h per call) and every explicit {@code older}/{@code
+     * newer} literal in the {@code findTimeline} tests below sit in May 2026 — strictly before
+     * this constant — so any CONFIRMED booking built from them elapses relative to it; a booking
+     * that must stay NOT elapsed for a test uses an explicit startsAt after this constant instead.
+     */
+    private static final OffsetDateTime TIMELINE_NOW =
+            OffsetDateTime.of(2026, 6, 1, 0, 0, 0, 0, ZoneOffset.UTC);
 
     private User client;
     private User otherClient;
@@ -548,8 +561,8 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
     // ── findTimeline ─────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("findTimeline — most-recent-first; COMPLETED only; category, serviceName, masterId populated; "
-            + "cross-client isolation")
+    @DisplayName("findTimeline — most-recent-first; COMPLETED only; NOT-yet-elapsed CONFIRMED excluded; "
+            + "category, serviceName, masterId populated; cross-client isolation")
     void should_returnTimelineDesc_when_completedBookingsExist() {
         Master master = persistIndependentMaster(seededDistrictIds.get(0));
         MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
@@ -557,15 +570,19 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
 
         OffsetDateTime older = OffsetDateTime.of(2026, 5, 1, 9, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime newer = OffsetDateTime.of(2026, 5, 10, 9, 0, 0, 0, ZoneOffset.UTC);
+        // Strictly after TIMELINE_NOW, so this CONFIRMED booking has NOT elapsed — it must stay
+        // excluded even under the widened predicate (still "upcoming", not "awaiting closure").
+        OffsetDateTime notYetElapsed = OffsetDateTime.of(2026, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
         Booking olderBooking = persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", older);
         Booking newerBooking = persistBooking(client, master, pedicure, BookingStatus.COMPLETED, "450", newer);
-        // Excluded: not COMPLETED, and another client's COMPLETED booking.
-        persistBooking(client, master, manicure, BookingStatus.CONFIRMED, "300", slot());
+        // Excluded: CONFIRMED but not yet elapsed, and another client's COMPLETED booking.
+        persistBooking(client, master, manicure, BookingStatus.CONFIRMED, "300", notYetElapsed);
         persistBooking(otherClient, master, manicure, BookingStatus.COMPLETED, "300", slot());
         em.flush();
         em.clear();
 
-        Page<TimelineItemProjection> page = repository.findTimeline(client.getId(), PageRequest.of(0, 20));
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
 
         assertThat(page.getTotalElements()).as("only this client's COMPLETED bookings").isEqualTo(2L);
         List<TimelineItemProjection> items = page.getContent();
@@ -582,7 +599,100 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("findTimeline — empty page when the client has no COMPLETED bookings")
+    @DisplayName("findTimeline — elapsed CONFIRMED booking (ends_at < now) is included, unclosed or not "
+            + "(2026-08-26 widening) — the master never marking it COMPLETED must not hide it forever")
+    void should_includeElapsedConfirmedBooking_when_findingTimeline() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
+
+        OffsetDateTime elapsedStart = OffsetDateTime.of(2026, 5, 20, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking elapsedConfirmed =
+                persistBooking(client, master, manicure, BookingStatus.CONFIRMED, "300", elapsedStart);
+        em.flush();
+        em.clear();
+
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isEqualTo(1L);
+        assertThat(page.getContent())
+                .extracting(TimelineItemProjection::bookingId)
+                .containsExactly(elapsedConfirmed.getId());
+    }
+
+    @Test
+    @DisplayName("findTimeline — NOT_COMPLETED is excluded even when elapsed (locked product decision: "
+            + "a no-show is not a beauty-history entry, unlike the PAST partition which DOES include it)")
+    void should_excludeNotCompletedBooking_when_findingTimeline() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
+
+        OffsetDateTime elapsedStart = OffsetDateTime.of(2026, 5, 20, 9, 0, 0, 0, ZoneOffset.UTC);
+        persistBooking(client, master, manicure, BookingStatus.NOT_COMPLETED, "300", elapsedStart);
+        em.flush();
+        em.clear();
+
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isZero();
+        assertThat(page.getContent()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("findTimeline — ends_at == now is NOT included (half-open, strict <, matches "
+            + "BookingClosureRule/BookingSpecifications#partition's boundary exactly)")
+    void should_excludeConfirmedBooking_when_endsAtEqualsNow() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
+
+        // startsAt + 1h (persistBooking's fixed duration) == TIMELINE_NOW exactly.
+        OffsetDateTime startsAtBoundary = TIMELINE_NOW.minusHours(1);
+        persistBooking(client, master, manicure, BookingStatus.CONFIRMED, "300", startsAtBoundary);
+        em.flush();
+        em.clear();
+
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements()).isZero();
+        assertThat(page.getContent()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("findTimeline — cross-client isolation on the elapsed-CONFIRMED leg (security LOW "
+            + "regression test): otherClient's elapsed CONFIRMED booking never leaks into client's "
+            + "timeline. This pins operator precedence — `client.id = :clientId AND (status = COMPLETED "
+            + "OR (status = CONFIRMED AND endsAt < :now))` — against the mis-parenthesised "
+            + "`client.id = :clientId AND status = COMPLETED OR (status = CONFIRMED AND endsAt < :now)`, "
+            + "which drops the clientId scope from the elapsed-CONFIRMED disjunct entirely and would leak "
+            + "EVERY client's elapsed-CONFIRMED bookings into EVERY other client's timeline. Mutation-proven "
+            + "(see QA audit): moving the parens turns this test red.")
+    void should_excludeOtherClientsElapsedConfirmed_when_gettingTimeline() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment service = persistService(master, "Classic Manicure", "MANICURE", "300");
+
+        OffsetDateTime elapsedStart = OffsetDateTime.of(2026, 5, 20, 9, 0, 0, 0, ZoneOffset.UTC);
+        // otherClient's elapsed CONFIRMED booking — the newly-widened state a mis-parenthesised
+        // predicate leaks first, since it is the disjunct without an explicit status = COMPLETED guard.
+        persistBooking(otherClient, master, service, BookingStatus.CONFIRMED, "300", elapsedStart);
+        // Control: `client` (the requesting principal) has NOTHING — the assertion below must see an
+        // unconditionally empty page, not merely "fewer rows than otherClient".
+        em.flush();
+        em.clear();
+
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
+
+        assertThat(page.getTotalElements())
+                .as("otherClient's elapsed CONFIRMED booking must not appear in client's timeline — "
+                        + "an unscoped OR disjunct would leak it regardless of the :clientId parameter")
+                .isZero();
+        assertThat(page.getContent()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("findTimeline — empty page when the client has no COMPLETED/elapsed-CONFIRMED bookings")
     void should_returnEmptyTimeline_when_noCompletedBookings() {
         Master master = persistIndependentMaster(seededDistrictIds.get(0));
         MasterServiceAssignment service = persistService(master, "Manicure", "MANICURE", "300");
@@ -590,10 +700,89 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         em.flush();
         em.clear();
 
-        Page<TimelineItemProjection> page = repository.findTimeline(client.getId(), PageRequest.of(0, 20));
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
 
         assertThat(page.getTotalElements()).isZero();
         assertThat(page.getContent()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("findTimeline — countQuery agrees with the content query across a MIXED "
+            + "COMPLETED + elapsed-CONFIRMED set: paging with a page size smaller than the total row "
+            + "count exercises totalPages/hasNext/the last partial page — if the content and countQuery "
+            + "predicate strings in the @Query annotation ever drifted apart (e.g. one widened and the "
+            + "other wasn't), the total here would disagree with what the content query can actually "
+            + "return and this test would catch it; a single page-size-20 test (as the other findTimeline "
+            + "tests use) cannot, because both queries would still report the same single-page shape")
+    void should_agreeCountAndContent_when_pagingMixedCompletedAndElapsedConfirmed() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
+        MasterServiceAssignment pedicure = persistService(master, "Spa Pedicure", "PEDICURE", "450");
+
+        // 3 COMPLETED + 2 elapsed CONFIRMED = 5 rows, all strictly before TIMELINE_NOW.
+        OffsetDateTime base = OffsetDateTime.of(2026, 5, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", base);
+        persistBooking(client, master, pedicure, BookingStatus.CONFIRMED, "450", base.plusDays(1));
+        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", base.plusDays(2));
+        persistBooking(client, master, pedicure, BookingStatus.CONFIRMED, "450", base.plusDays(3));
+        persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", base.plusDays(4));
+        em.flush();
+        em.clear();
+
+        Page<TimelineItemProjection> page0 =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 2));
+
+        assertThat(page0.getTotalElements())
+                .as("countQuery must count all 5 COMPLETED+elapsed-CONFIRMED rows, matching the "
+                        + "content predicate exactly")
+                .isEqualTo(5L);
+        assertThat(page0.getTotalPages()).as("5 rows at page size 2 -> 3 pages").isEqualTo(3);
+        assertThat(page0.getContent()).hasSize(2);
+        assertThat(page0.hasNext()).isTrue();
+
+        Page<TimelineItemProjection> lastPage =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(2, 2));
+
+        assertThat(lastPage.getContent())
+                .as("the last (partial) page holds exactly the 5th row — a countQuery/content "
+                        + "predicate mismatch would make this page empty (over-counted) or overflow "
+                        + "(under-counted)")
+                .hasSize(1);
+        assertThat(lastPage.hasNext()).isFalse();
+    }
+
+    @Test
+    @DisplayName("findTimeline — most-recent-first ORDER BY holds across INTERLEAVED COMPLETED and "
+            + "elapsed-CONFIRMED rows, not just within one status — the widening merges two statuses "
+            + "into one ordered list and this pins that the merge is a single predicate, not a "
+            + "status-grouped shape")
+    void should_orderDescInterleaved_when_completedAndElapsedConfirmedMixed() {
+        Master master = persistIndependentMaster(seededDistrictIds.get(0));
+        MasterServiceAssignment manicure = persistService(master, "Classic Manicure", "MANICURE", "300");
+        MasterServiceAssignment pedicure = persistService(master, "Spa Pedicure", "PEDICURE", "450");
+
+        OffsetDateTime t1 = OffsetDateTime.of(2026, 5, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime t2 = t1.plusDays(1);
+        OffsetDateTime t3 = t1.plusDays(2);
+        OffsetDateTime t4 = t1.plusDays(3);
+        // Oldest to newest, status alternating: CONFIRMED(elapsed), COMPLETED, CONFIRMED(elapsed),
+        // COMPLETED — so a correct DESC order must interleave statuses, not group them.
+        Booking b1 = persistBooking(client, master, pedicure, BookingStatus.CONFIRMED, "450", t1);
+        Booking b2 = persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", t2);
+        Booking b3 = persistBooking(client, master, pedicure, BookingStatus.CONFIRMED, "450", t3);
+        Booking b4 = persistBooking(client, master, manicure, BookingStatus.COMPLETED, "300", t4);
+        em.flush();
+        em.clear();
+
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
+
+        assertThat(page.getContent())
+                .as("DESC by startsAt regardless of status — b4 (COMPLETED, newest) then b3 "
+                        + "(CONFIRMED-elapsed), b2 (COMPLETED), b1 (CONFIRMED-elapsed, oldest)")
+                .extracting(TimelineItemProjection::bookingId)
+                .containsExactly(b4.getId(), b3.getId(), b2.getId(), b1.getId());
     }
 
     // ── findTimeline — no N+1 (bounded statement count) ──────────────────────────
@@ -621,7 +810,8 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         statistics.setStatisticsEnabled(true);
         statistics.clear();
 
-        Page<TimelineItemProjection> page = repository.findTimeline(client.getId(), PageRequest.of(0, 20));
+        Page<TimelineItemProjection> page =
+                repository.findTimeline(client.getId(), TIMELINE_NOW, PageRequest.of(0, 20));
         long statementCount = statistics.getPrepareStatementCount();
 
         assertThat(page.getContent()).hasSize(n);

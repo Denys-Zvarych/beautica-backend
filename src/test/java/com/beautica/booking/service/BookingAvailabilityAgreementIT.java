@@ -1014,7 +1014,7 @@ class BookingAvailabilityAgreementIT extends AbstractIntegrationTest {
         //    occupied 13:00 — a per-key eviction that forgot either side fails exactly one half of
         //    the single assertion below.
         bookingService.rescheduleBooking(client, bookingId, new RescheduleBookingRequest(
-                day.atTime(13, 0).atZone(TimeZones.KYIV).toOffsetDateTime()));
+                day.atTime(13, 0).atZone(TimeZones.KYIV).toOffsetDateTime(), false));
 
         assertThat(slotStarts(m.masterId(), day, svcB))
                 .as("ONE post-move read shows both halves at once: 11:00 came back (old side "
