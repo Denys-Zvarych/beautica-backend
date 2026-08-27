@@ -22,11 +22,14 @@ import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -62,6 +65,24 @@ public class AuthService {
     private final VerificationPolicyConfig verificationPolicyConfig;
     private final JwtTokenProvider jwtTokenProvider;
     private final AccessTokenDenylist accessTokenDenylist;
+
+    /**
+     * Self-proxy reference so {@link #revokeFamilyIndependently(UUID)} runs through the Spring
+     * AOP proxy and its {@code REQUIRES_NEW} propagation is honoured — a direct
+     * {@code this.revokeFamilyIndependently(...)} call bypasses the proxy and would run inside
+     * {@link #refresh(RefreshRequest)}'s own transaction, which is exactly the bug this method
+     * exists to avoid (see {@link #refresh(RefreshRequest)} for the full rationale).
+     *
+     * <p>This is a deliberate, documented exception to the project's no-field-injection rule —
+     * mirrors {@code NotificationOutboxDrainWorker#self}. Self-proxy injection cannot be
+     * expressed as a constructor parameter (circular dependency at construction time), so
+     * {@code @Lazy @Autowired} field injection is the only viable pattern without a full class
+     * split. Field injection here (rather than splitting into a second bean) also keeps
+     * {@code AuthServiceTest}'s existing {@code new AuthService(...)} constructor calls intact.
+     */
+    @Autowired
+    @Lazy
+    private AuthService self;
 
     public AuthService(
             UserRepository userRepository,
@@ -254,6 +275,27 @@ public class AuthService {
                 .orElseThrow(() -> new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found"));
 
         if (storedToken.isRevoked()) {
+            // Reuse detection: an already-revoked refresh token being presented again means
+            // this rotation chain has been compromised — either the token was stolen and both
+            // the legitimate holder and an attacker have rotated from it, or it is a straight
+            // replay after the legitimate holder already rotated. Either way, a single-token
+            // revoke is not enough: the attacker may be holding a later, still-valid token from
+            // the same chain. Revoke every token in the family so the whole chain is dead.
+            //
+            // Must commit independently of this method's own transaction: refresh() is
+            // @Transactional with default rollback rules, and the very next line throws a
+            // BusinessException (a RuntimeException) to return the 401. That marks THIS
+            // transaction rollback-only, so if the revoke ran inside it, Spring's
+            // TransactionInterceptor would roll the bulk UPDATE back before commit — the
+            // caller still gets a 401, but every sibling token in the family silently
+            // survives (including one an attacker may have already rotated to), making the
+            // whole feature a no-op. Deliberately NOT `noRollbackFor = BusinessException.class`
+            // on refresh(): that would also spare rollback for any OTHER BusinessException
+            // thrown later in this method (expired token, inactive/unverified user), which
+            // is a correctness hazard unrelated to reuse detection. A dedicated REQUIRES_NEW
+            // method scopes the no-rollback behaviour to exactly this one statement. Called
+            // via `self` — see the field javadoc for why the proxy indirection is required.
+            self.revokeFamilyIndependently(storedToken.getFamilyId());
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token has been revoked");
         }
 
@@ -275,7 +317,23 @@ public class AuthService {
             throw new BusinessException(HttpStatus.UNAUTHORIZED, "Refresh token not found");
         }
 
-        return buildAuthResponse(user);
+        // The replacement token inherits this chain's familyId — see
+        // AuthResponseBuilder#buildAuthResponse(User, UUID) — so reuse detection above can
+        // trace and revoke the whole chain, not just whichever single token gets replayed.
+        return authResponseBuilder.buildAuthResponse(user, storedToken.getFamilyId());
+    }
+
+    /**
+     * Revokes every non-revoked token in {@code familyId} in its own transaction, committed
+     * independently of the caller. See the reuse-detection comment inside
+     * {@link #refresh(RefreshRequest)} for why this cannot simply run inside that method's
+     * transaction. Must be called through the {@code self} proxy, never as {@code this.}, or
+     * the {@code REQUIRES_NEW} propagation below is silently skipped (self-invocation bypasses
+     * the Spring AOP proxy).
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void revokeFamilyIndependently(UUID familyId) {
+        refreshTokenRepository.revokeAllByFamilyId(familyId);
     }
 
     /**

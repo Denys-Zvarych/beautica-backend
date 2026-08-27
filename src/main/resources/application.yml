@@ -191,7 +191,7 @@ app:
   jwt:
     secret: ${JWT_SECRET}
     access-token-expiration: 3600000      # 1 hour in ms
-    refresh-token-expiration: 604800000   # 7 days in ms
+    refresh-token-expiration: 2592000000  # 30 days in ms
   cloudflare-r2:
     # Master kill-switch. When false (default), S3Config does NOT register an S3Client bean and
     # R2StorageService (Phase 7.4) will run in stub-safe mode. Set R2_ENABLED=true only when all
@@ -333,6 +333,13 @@ app:
     # Reset tickets expired longer than this are hard-deleted by the daily sweep
     # (PasswordResetTokenCleanupJob) — keeps password_reset_tickets from growing
     # unbounded. A few days of buffer past the 10 min ticket TTL for support/forensic lookup.
+    cleanup-retention: 7d
+  refresh-token:
+    # Refresh tokens expired longer than this are hard-deleted by the daily sweep
+    # (RefreshTokenCleanupJob) — keeps refresh_tokens from growing unbounded, since rotation
+    # only revokes (never deletes) predecessors and most sessions never hit explicit logout.
+    # A week of buffer past the 30-day token TTL for incident / forensic lookup (reuse-detection
+    # family revocations included) before the row is reclaimed.
     cleanup-retention: 7d
   password-reset-otp:
     # 6-digit OTP lifetime for the password-reset request/verify step (mirrors

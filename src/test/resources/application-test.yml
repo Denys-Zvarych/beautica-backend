@@ -99,6 +99,8 @@ app:
     resend-cooldown: 60s   # Integration tests use the production default; unit tests pass Duration directly
   password-reset:
     cleanup-retention: 7d
+  refresh-token:
+    cleanup-retention: 7d
   password-reset-otp:
     otp-ttl: 15m
     max-attempts-per-code: 5

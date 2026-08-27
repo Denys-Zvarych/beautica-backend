@@ -67,6 +67,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
     private RefreshTokenRepository refreshTokenRepository;
 
     @Autowired
+    private TokenGenerator tokenGenerator;
+
+    @Autowired
     private InviteTokenRepository inviteTokenRepository;
 
     @Autowired
@@ -537,6 +540,63 @@ class InviteControllerIT extends AbstractIntegrationTest {
         assertThat(persistedUser).isPresent();
         assertThat(persistedUser.get().getRole()).isEqualTo(Role.SALON_MASTER);
         assertThat(persistedUser.get().getSalonId()).isEqualTo(salonId);
+    }
+
+    @Test
+    @DisplayName("should mint DISTINCT refresh-token families for two different invites accepted")
+    void should_mintDistinctFamilyIds_when_twoDifferentInvitesAccepted() throws Exception {
+        // InviteService#acceptInvite routes through the exact same one-arg
+        // AuthResponseBuilder#buildAuthResponse(User) overload as login()/verifyEmail()
+        // (InviteService.java:290) — pin it here as its own call site, per the reuse-detection
+        // gap: a shared family across two accepted invites would let one invitee's replay
+        // revoke the other invitee's unrelated sessions.
+        String masterEmailA = uniqueEmail("familyinvite-a");
+        String masterEmailB = uniqueEmail("familyinvite-b");
+        createdEmails.add(masterEmailA);
+        createdEmails.add(masterEmailB);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: two valid invite tokens for email={} email={}", masterEmailA, masterEmailB);
+
+        String salonOwnerEmail = uniqueEmail("salon-owner-family");
+        createdEmails.add(salonOwnerEmail);
+        jdbcTemplate.update(
+                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, email_verified, created_at, updated_at) " +
+                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
+                salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
+                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
+                salonId, salonOwnerEmail);
+        createdSalonIds.add(salonId);
+
+        String rawTokenA = UUID.randomUUID().toString();
+        String rawTokenB = UUID.randomUUID().toString();
+        saveValidInviteToken(masterEmailA, salonId, rawTokenA);
+        saveValidInviteToken(masterEmailB, salonId, rawTokenB);
+
+        log.debug("Act: accept both invites");
+        ResponseEntity<String> respA = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept",
+                new InviteAcceptRequest(rawTokenA, "Password12345", "Jane", "Doe", "+380501234567"),
+                String.class);
+        ResponseEntity<String> respB = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept",
+                new InviteAcceptRequest(rawTokenB, "Password12345", "John", "Roe", "+380509876543"),
+                String.class);
+
+        var bodyA = objectMapper.readValue(respA.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        var bodyB = objectMapper.readValue(respB.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+
+        var tokenRowA = refreshTokenRepository
+                .findByToken(tokenGenerator.hash(bodyA.data().refreshToken()))
+                .orElseThrow(() -> new AssertionError("invitee A's refresh token row must exist in the DB"));
+        var tokenRowB = refreshTokenRepository
+                .findByToken(tokenGenerator.hash(bodyB.data().refreshToken()))
+                .orElseThrow(() -> new AssertionError("invitee B's refresh token row must exist in the DB"));
+
+        assertThat(tokenRowB.getFamilyId())
+                .as("two different accepted invites must never share a family_id")
+                .isNotEqualTo(tokenRowA.getFamilyId());
     }
 
     @Test

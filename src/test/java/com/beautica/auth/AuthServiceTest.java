@@ -54,6 +54,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -152,6 +153,12 @@ class AuthServiceTest {
                 jwtTokenProvider,
                 accessTokenDenylist
         );
+        // AuthService#revokeFamilyIndependently is called through the `self` proxy field so its
+        // REQUIRES_NEW propagation is honoured in production (Spring AOP self-invocation bypass
+        // fix — mirrors NotificationOutboxDrainWorkerTest's `self` wiring). Field injection never
+        // runs here since the test constructs AuthService directly, so it must be wired manually
+        // or every self.xxx(...) call NPEs.
+        ReflectionTestUtils.setField(authService, "self", authService);
     }
 
     @AfterEach
@@ -338,7 +345,7 @@ class AuthServiceTest {
         var userId = UUID.randomUUID();
         var rawToken = "raw-refresh-token";
         var hashedToken = "hashed-refresh-token";
-        var storedToken = new RefreshToken(hashedToken, userId, Instant.now().plusSeconds(3600));
+        var storedToken = RefreshToken.startNewFamily(hashedToken, userId, Instant.now().plusSeconds(3600));
         var user = buildUser(userId, "ref@example.com",
                 passwordEncoder.encode("pass"), Role.CLIENT);
         // A user who holds a refresh token must have completed email verification first.
@@ -351,7 +358,7 @@ class AuthServiceTest {
         when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
         when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(authResponseBuilder.buildAuthResponse(any(User.class))).thenReturn(stubResponse);
+        when(authResponseBuilder.buildAuthResponse(any(User.class), any(UUID.class))).thenReturn(stubResponse);
 
         log.debug("Act: refresh token rotation with valid non-expired token for userId={}", userId);
         var response = authService.refresh(new RefreshRequest(rawToken));
@@ -364,12 +371,67 @@ class AuthServiceTest {
     }
 
     @Test
+    @DisplayName("refresh — rotated token inherits the predecessor's familyId")
+    void should_inheritPredecessorFamilyId_when_refreshRotates() {
+        var userId = UUID.randomUUID();
+        var rawToken = "raw-refresh-token";
+        var hashedToken = "hashed-refresh-token";
+        var storedToken = RefreshToken.startNewFamily(hashedToken, userId, Instant.now().plusSeconds(3600));
+        var user = buildUser(userId, "family@example.com",
+                passwordEncoder.encode("pass"), Role.CLIENT);
+        ReflectionTestUtils.setField(user, "emailVerified", true);
+        log.debug("Arrange: storedToken familyId={} for userId={}", storedToken.getFamilyId(), userId);
+
+        var stubResponse = AuthResponse.of("new-access-tok", "new-refresh-tok",
+                userId, "family@example.com", Role.CLIENT);
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
+        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(authResponseBuilder.buildAuthResponse(any(User.class), any(UUID.class))).thenReturn(stubResponse);
+
+        log.debug("Act: refresh rotation for userId={}", userId);
+        authService.refresh(new RefreshRequest(rawToken));
+
+        ArgumentCaptor<UUID> familyIdCaptor = ArgumentCaptor.forClass(UUID.class);
+        verify(authResponseBuilder).buildAuthResponse(eq(user), familyIdCaptor.capture());
+        assertThat(familyIdCaptor.getValue())
+                .as("the rotated-in replacement must continue the SAME family as the token it replaced")
+                .isEqualTo(storedToken.getFamilyId());
+    }
+
+    @Test
+    @DisplayName("refresh — a normal (non-revoked) refresh does NOT revoke the family")
+    void should_notRevokeFamily_when_refreshTokenIsValid() {
+        var userId = UUID.randomUUID();
+        var rawToken = "raw-refresh-token";
+        var hashedToken = "hashed-refresh-token";
+        var storedToken = RefreshToken.startNewFamily(hashedToken, userId, Instant.now().plusSeconds(3600));
+        var user = buildUser(userId, "novalid@example.com",
+                passwordEncoder.encode("pass"), Role.CLIENT);
+        ReflectionTestUtils.setField(user, "emailVerified", true);
+
+        var stubResponse = AuthResponse.of("new-access-tok", "new-refresh-tok",
+                userId, "novalid@example.com", Role.CLIENT);
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
+        when(refreshTokenRepository.save(any(RefreshToken.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(authResponseBuilder.buildAuthResponse(any(User.class), any(UUID.class))).thenReturn(stubResponse);
+
+        log.debug("Act: refresh with a still-valid, never-revoked token for userId={}", userId);
+        authService.refresh(new RefreshRequest(rawToken));
+
+        verify(refreshTokenRepository, never()).revokeAllByFamilyId(any(UUID.class));
+    }
+
+    @Test
     @DisplayName("refresh throws BusinessException when token has been revoked")
     void should_throwBusinessException_when_refreshTokenIsRevoked() {
         var userId = UUID.randomUUID();
         var rawToken = "raw-revoked-token";
         var hashedToken = "hashed-revoked-token";
-        var storedToken = new RefreshToken(hashedToken, userId, Instant.now().plusSeconds(3600));
+        var storedToken = RefreshToken.startNewFamily(hashedToken, userId, Instant.now().plusSeconds(3600));
         storedToken.revoke();
         log.debug("Arrange: stored token for userId={} is revoked", userId);
 
@@ -383,13 +445,46 @@ class AuthServiceTest {
     }
 
     @Test
+    @DisplayName("refresh — replaying an already-revoked token revokes the WHOLE family, not just that token")
+    void should_revokeWholeFamily_when_revokedRefreshTokenIsReplayed() {
+        var userId = UUID.randomUUID();
+        var rawToken = "raw-revoked-token";
+        var hashedToken = "hashed-revoked-token";
+        var storedToken = RefreshToken.startNewFamily(hashedToken, userId, Instant.now().plusSeconds(3600));
+        storedToken.revoke();
+        UUID familyId = storedToken.getFamilyId();
+        log.debug("Arrange: replayed token for userId={} belongs to familyId={}", userId, familyId);
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(storedToken));
+
+        log.debug("Act: replay a revoked token — expects family-wide revocation before the 401");
+        assertThatThrownBy(() -> authService.refresh(new RefreshRequest(rawToken)))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("revoked");
+
+        // The whole family must be revoked at the repository level — a single-token
+        // in-memory revoke() call is NOT sufficient, since any sibling token from the same
+        // family already loaded elsewhere would stay live.
+        //
+        // NOTE: this verify() proves the CALL happened, not that it survives the enclosing
+        // transaction's rollback — a unit test mocks the repository, so there is no real
+        // transaction here to commit or roll back. The commit-survival proof lives in
+        // AuthControllerIT.should_return401_when_oldRefreshTokenReplayedAfterRotation, which
+        // hits a real DB end-to-end and is the load-bearing assertion for persistence. This
+        // unit test only pins the service-level wiring (self./this. call correctness — the
+        // exact bug this gap hid earlier in this chain).
+        verify(refreshTokenRepository).revokeAllByFamilyId(familyId);
+    }
+
+    @Test
     @DisplayName("refresh throws BusinessException when refresh token is expired")
     void should_throwBusinessException_when_refreshTokenIsExpired() {
         var userId = UUID.randomUUID();
         var rawToken = "raw-expired";
         var hashedToken = "hashed-expired";
         // expiresAt is 1 second before FIXED_NOW — expired relative to the mocked clock
-        var storedToken = new RefreshToken(hashedToken, userId, FIXED_NOW.minusSeconds(1));
+        var storedToken = RefreshToken.startNewFamily(hashedToken, userId, FIXED_NOW.minusSeconds(1));
         log.debug("Arrange: stored token for userId={} has expired expiresAt", userId);
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
@@ -1018,7 +1113,7 @@ class AuthServiceTest {
 
         String rawToken = "raw-refresh-token-unverified";
         String hashedToken = "hashed-token-unverified";
-        RefreshToken refreshToken = new RefreshToken(hashedToken, userId, FIXED_NOW.plusSeconds(3600));
+        RefreshToken refreshToken = RefreshToken.startNewFamily(hashedToken, userId, FIXED_NOW.plusSeconds(3600));
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(refreshTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(refreshToken));
