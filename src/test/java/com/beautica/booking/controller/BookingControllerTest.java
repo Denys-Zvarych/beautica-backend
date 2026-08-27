@@ -145,7 +145,11 @@ class BookingControllerTest {
                 new BigDecimal("4.75"), 12,
                 // salonId (Phase B2 additive) — this stub's master is INDEPENDENT_MASTER (see
                 // masterType above), so null is the consistent value.
-                null
+                null,
+                // categoryKey (additive, mobile category-icon wiring) — mirrors categoryName
+                // above ("MANICURE"): categoryKeyOrNull is a no-op normalisation for an
+                // already-uppercase slug with no separators to collapse.
+                "MANICURE"
         );
     }
 

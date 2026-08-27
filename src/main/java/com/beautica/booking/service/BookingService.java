@@ -495,7 +495,11 @@ public class BookingService {
                 p.masterReviewCount(),
                 // Phase B2 — the booking's own salon snapshot (b.salon.id), NOT p.salonName()'s
                 // source (m.salon). Nullable for an independent master's booking.
-                p.salonId());
+                p.salonId(),
+                // Derived from the SAME p.categoryName() scalar — the projection's sd.category
+                // select — via the shared helper so this path and the entity path can never
+                // disagree (BookingDetailContractIT's reflective parity loop). No second query.
+                BookingDetailResponse.categoryKeyOrNull(p.categoryName()));
     }
 
     /**

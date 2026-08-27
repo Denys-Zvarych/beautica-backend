@@ -2534,6 +2534,65 @@ class BookingServiceTest {
         assertThat(booking.id()).isEqualTo(bookingId);
     }
 
+    // ── categoryKey — mobile category-icon resolver slug, CLIENT projection path ───────────────
+    //    toDetailResponse derives categoryKey from p.categoryName() via the SAME shared
+    //    BookingDetailResponse.categoryKeyOrNull helper the entity path uses (see
+    //    BookingDetailResponseTest), so the two mappers cannot disagree. QA-authored — self-
+    //    reported gap: every clientProjectionRow* fixture above hardcodes categoryName to the
+    //    already-slug-form "MANICURE", which proves the field is passed through but proves
+    //    nothing about the normalisation actually running.
+
+    private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithCategory(
+            String categoryName) {
+        return new com.beautica.booking.repository.ClientBookingDetailProjection(
+                bookingId, clientId, masterId, masterServiceId, "Manicure",
+                BookingStatus.CONFIRMED,
+                OffsetDateTime.now(clock).plusHours(2),
+                OffsetDateTime.now(clock).plusHours(3),
+                new BigDecimal("500.00"), 60,
+                Instant.now(clock),
+                "Client", "User", "Master", "Person",
+                null,
+                null, null, null,
+                "https://cdn.test/avatar.png", Role.INDEPENDENT_MASTER, null,
+                null, null, "Khreschatyk", "10",
+                null,
+                categoryName, false,
+                null,
+                null,
+                null,
+                new BigDecimal("4.20"), 3,
+                // Phase B2 salonId — irrelevant to the categoryKey normalisation.
+                null);
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) normalizes a raw projected category into categoryKey — "
+            + "trim + uppercase + collapse non-alphanumeric runs to '_', the SAME transform the "
+            + "entity path applies, via the shared helper")
+    void should_normalizeCategoryKey_when_clientProjectionRowHasRawCategory() {
+        var booking = firstClientRowFor(clientProjectionRowWithCategory("  Nail Care & Spa!!  "));
+
+        assertThat(booking.categoryKey())
+                .as("actual=%s", booking.categoryKey())
+                .isEqualTo("NAIL_CARE_SPA");
+        assertThat(booking.categoryName())
+                .as("categoryName stays the raw projected value — only categoryKey is normalized")
+                .isEqualTo("  Nail Care & Spa!!  ");
+    }
+
+    @Test
+    @DisplayName("getMyBookings (CLIENT) leaves categoryKey NULL — never findTimeline's \"UNKNOWN\" "
+            + "sentinel and never an empty string — when the projected category is null")
+    void should_returnNullCategoryKey_when_clientProjectionRowHasNoCategory() {
+        var booking = firstClientRowFor(clientProjectionRowWithCategory(null));
+
+        assertThat(booking.categoryKey())
+                .as("a booking card must render NO icon for an uncategorised service — a non-null "
+                        + "placeholder here would paint the wrong glyph, not a generic one")
+                .isNull();
+    }
+
     private com.beautica.booking.repository.ClientBookingDetailProjection clientProjectionRowWithId(
             UUID id, String serviceName) {
         return new com.beautica.booking.repository.ClientBookingDetailProjection(

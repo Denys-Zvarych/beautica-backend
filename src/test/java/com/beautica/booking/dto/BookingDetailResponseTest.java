@@ -616,4 +616,62 @@ class BookingDetailResponseTest {
                 .isNotEqualTo("B: 5-й поверх, код 9999")
                 .isNotEqualTo("Master's own note — must NOT surface");
     }
+
+    // ── categoryKey — mobile category-icon resolver slug (this session) ──────────────────────
+    //    Derived via the shared BookingDetailResponse.categoryKeyOrNull helper from the SAME
+    //    serviceDefinition.getCategory() value as categoryName — never a second lookup. Unlike
+    //    ClientAggregationRepository#findTimeline's "UNKNOWN" sentinel, a booking card must
+    //    render NO icon for an uncategorised service, so the no-category case is null here, not
+    //    a placeholder string. QA-authored (self-reported gap: every prior fixture left
+    //    serviceDefinition.getCategory() unstubbed, so every test incidentally walked the null
+    //    branch without asserting anything about it — a regression that always returned
+    //    "UNKNOWN" or always returned null would have passed the whole suite).
+
+    @Test
+    @DisplayName("categoryKey is the uppercased category slug, read off the SAME service-definition "
+            + "category as categoryName, when the service has one")
+    void should_mapCategoryKey_when_serviceHasCategory() {
+        var serviceDef = booking.getMasterService().getServiceDefinition();
+        when(serviceDef.getCategory()).thenReturn("Manicure");
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.categoryKey()).isEqualTo("MANICURE");
+        assertThat(response.categoryName())
+                .as("categoryKey and categoryName must read the SAME underlying value — never a "
+                        + "second lookup")
+                .isEqualTo("Manicure");
+    }
+
+    @Test
+    @DisplayName("categoryKey trims, uppercases and collapses spaces/punctuation on a raw category — "
+            + "a value already in slug form would prove nothing about the normalisation actually running")
+    void should_normalizeCategoryKey_when_rawCategoryNeedsNormalizing() {
+        var serviceDef = booking.getMasterService().getServiceDefinition();
+        when(serviceDef.getCategory()).thenReturn("  Nail Care & Spa!!  ");
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.categoryKey())
+                .as("trim + uppercase + collapse non-alphanumeric runs to '_' + strip leading/"
+                        + "trailing underscores, actual=%s", response.categoryKey())
+                .isEqualTo("NAIL_CARE_SPA");
+    }
+
+    @Test
+    @DisplayName("categoryKey is NULL — never findTimeline's \"UNKNOWN\" sentinel and never an empty "
+            + "string — when the service has no category; stubbed deliberately so the test states "
+            + "its intent rather than relying on an unstubbed mock's incidental default")
+    void should_returnNullCategoryKey_when_serviceHasNoCategory() {
+        var serviceDef = booking.getMasterService().getServiceDefinition();
+        when(serviceDef.getCategory()).thenReturn(null);
+
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+
+        assertThat(response.categoryKey())
+                .as("a booking card must render NO icon for an uncategorised service — a non-null "
+                        + "placeholder (e.g. \"UNKNOWN\" or \"\") here would paint the wrong glyph, "
+                        + "not a generic one")
+                .isNull();
+    }
 }
