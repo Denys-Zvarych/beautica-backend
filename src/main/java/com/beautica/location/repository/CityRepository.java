@@ -75,6 +75,26 @@ public interface CityRepository extends JpaRepository<City, UUID> {
     List<Object[]> findNameUkByIdIn(@Param("ids") Collection<UUID> ids);
 
     /**
+     * Batch-resolves city → parent-oblast-id pairs for a set of city ids in a
+     * single {@code IN (...)} query.
+     *
+     * <p>Sibling of {@link #findNameUkByIdIn(Collection)}: used by
+     * {@code SalonService#getOwnerSalons} to stamp {@code oblastId} onto a whole
+     * page of an owner's salons at once. The single-key {@link #findOblastIdById(UUID)}
+     * (or {@link #findByIdWithOblast(UUID)}) would N+1 across the list (§E) — this
+     * fuses the resolution into one round-trip regardless of how many distinct
+     * cities the owner's salons reference. The 2-element scalar projection
+     * {@code [id, oblast.id]} avoids hydrating the {@link City} entity (and its
+     * LAZY {@code oblast}) just to read one FK column.
+     *
+     * @param ids distinct, non-null city ids to resolve
+     * @return rows of {@code [UUID cityId, UUID oblastId]}; empty when {@code ids}
+     *         is empty
+     */
+    @Query("SELECT c.id, c.oblast.id FROM City c WHERE c.id IN :ids")
+    List<Object[]> findOblastIdsByIdIn(@Param("ids") Collection<UUID> ids);
+
+    /**
      * Resolves the parent oblast id of a single city by the city's id.
      *
      * <p>Single-key sibling of {@link CityDistrictRepository#findNameUkById(UUID)}:

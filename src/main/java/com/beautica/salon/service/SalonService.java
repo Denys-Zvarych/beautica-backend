@@ -12,6 +12,9 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
@@ -36,8 +39,12 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -50,6 +57,7 @@ public class SalonService {
     private final MasterRepository masterRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
+    private final CityRepository cityRepository;
     private final CacheManager cacheManager;
     private final AuthorizationService authorizationService;
 
@@ -118,7 +126,30 @@ public class SalonService {
             masterService.createMasterForOwner(owner, savedSalon);
         }
 
-        return SalonResponse.from(savedSalon);
+        return SalonResponse.from(savedSalon, resolveOblastId(savedSalon.getCityId()));
+    }
+
+    /**
+     * Resolves the parent oblast id of a single city by its id, for the {@code oblastId}
+     * surfaced on {@link SalonResponse}. Mirrors
+     * {@code MasterService#resolveOblastId(UUID)} — same graph-fetch mechanism
+     * ({@link CityRepository#findByIdWithOblast(UUID)}), reused rather than reinvented
+     * (§E / REUSE-FIRST). Single-row by PK — the create/update paths touch exactly one
+     * salon, so this is not the §E "per-row in a collection" concern; {@link #getOwnerSalons}
+     * uses the batch {@link CityRepository#findOblastIdsByIdIn(java.util.Collection)} instead.
+     *
+     * @param cityId the salon's {@code cityId}, possibly {@code null}
+     * @return the resolved oblast id, or {@code null} when {@code cityId} is {@code null}
+     *         or does not resolve to a known city
+     */
+    private UUID resolveOblastId(UUID cityId) {
+        if (cityId == null) {
+            return null;
+        }
+        return cityRepository.findByIdWithOblast(cityId)
+                .map(City::getOblast)
+                .map(Oblast::getId)
+                .orElse(null);
     }
 
     // Eviction helpers are registered as post-commit callbacks rather than via @CacheEvict.
@@ -224,7 +255,7 @@ public class SalonService {
         // Hibernate dirty-checking flushes the setter mutations on commit. The explicit save()
         // was a redundant no-op write (PERF-LOW); save() returned the same managed instance, so
         // mapping the in-memory `salon` is equivalent. The findById load is retained (existence).
-        SalonResponse result = SalonResponse.from(salon);
+        SalonResponse result = SalonResponse.from(salon, resolveOblastId(salon.getCityId()));
 
         // Evict after commit so a concurrent reader cannot repopulate stale data within the
         // commit window. Replaces the @CacheEvict annotations that fired pre-commit (PERF-MEDIUM-2).
@@ -290,10 +321,43 @@ public class SalonService {
     @Transactional(readOnly = true)
     @Cacheable(value = "ownerSalons", key = "#ownerId")
     public List<SalonResponse> getOwnerSalons(UUID ownerId) {
-        return salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)
-                .stream()
-                .map(SalonResponse::from)
+        List<Salon> salons = salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId);
+
+        // Batch-resolve oblastId for the whole page in ONE query rather than one
+        // findByIdWithOblast per salon (§E — never a per-element repository call in a loop).
+        Set<UUID> cityIds = salons.stream()
+                .map(Salon::getCityId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        Map<UUID, UUID> oblastIdByCityId = resolveOblastIdsByCityIds(cityIds);
+
+        return salons.stream()
+                .map(salon -> SalonResponse.from(salon, oblastIdByCityId.get(salon.getCityId())))
                 .toList();
+    }
+
+    /**
+     * Batch sibling of {@link #resolveOblastId(UUID)} — resolves every distinct city id in
+     * one {@code IN (...)} query via {@link CityRepository#findOblastIdsByIdIn(java.util.Collection)}
+     * instead of one {@code findByIdWithOblast} per salon, so {@link #getOwnerSalons} issues
+     * exactly one oblast-resolution query regardless of how many salons the owner has.
+     *
+     * @param cityIds distinct, non-null city ids appearing across the owner's salons
+     * @return a {@code cityId -> oblastId} map; empty when {@code cityIds} is empty
+     */
+    private Map<UUID, UUID> resolveOblastIdsByCityIds(Set<UUID> cityIds) {
+        // A plain HashMap throughout — including the empty-input short-circuit — is deliberate:
+        // Map.of() rejects a null get() key with an NPE (Objects.requireNonNull on lookup), and
+        // salon.getCityId() is null for any salon with no locality set, so the caller's
+        // oblastIdByCityId.get(salon.getCityId()) must tolerate a null key.
+        Map<UUID, UUID> result = new HashMap<>();
+        if (cityIds.isEmpty()) {
+            return result;
+        }
+        for (Object[] row : cityRepository.findOblastIdsByIdIn(cityIds)) {
+            result.put((UUID) row[0], (UUID) row[1]);
+        }
+        return result;
     }
 
     @Transactional

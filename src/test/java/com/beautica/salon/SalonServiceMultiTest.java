@@ -3,6 +3,7 @@ package com.beautica.salon;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -26,11 +27,14 @@ import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -58,6 +62,12 @@ class SalonServiceMultiTest {
 
     @Mock
     private CacheManager cacheManager;
+
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value (mirrors MasterServiceTest).
+    @Mock
+    private CityRepository cityRepository;
 
     @InjectMocks
     private SalonService salonService;
@@ -125,6 +135,110 @@ class SalonServiceMultiTest {
 
         assertThat(responses).isEmpty();
         verify(salonRepository).findAllByOwnerIdAndIsActiveTrue(ownerId);
+    }
+
+    // -------------------------------------------------------------------------
+    // getOwnerSalons — batch oblastId resolution (§E — exactly ONE findOblastIdsByIdIn
+    // call regardless of salon count; this is the whole point of the batch method over
+    // the per-salon resolveOblastId used by createSalon/updateSalon).
+    //
+    // Fixture uses TWO DIFFERENT city/oblast pairs deliberately (Anti-Bug §"fixture values
+    // can defang the assertion"): if resolveOblastIdsByCityIds ever built its map backwards,
+    // dropped a key, or returned one shared oblastId for every city, a single-city fixture
+    // would still pass by coincidence. Two distinct pairs prove the per-salon lookup, not
+    // just "a value came back".
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("getOwnerSalons — resolves each salon's OWN oblastId in exactly one batch query")
+    void should_resolveDistinctOblastIdsPerSalon_when_ownerHasSalonsInDifferentCities() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.test", Role.SALON_OWNER);
+
+        UUID cityA = UUID.randomUUID();
+        UUID oblastA = UUID.randomUUID();
+        UUID cityB = UUID.randomUUID();
+        UUID oblastB = UUID.randomUUID();
+
+        Salon salonA = Salon.builder().owner(owner).name("Salon A").isActive(true).cityId(cityA).build();
+        ReflectionTestUtils.setField(salonA, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(salonA, "createdAt", Instant.now());
+        Salon salonB = Salon.builder().owner(owner).name("Salon B").isActive(true).cityId(cityB).build();
+        ReflectionTestUtils.setField(salonB, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(salonB, "createdAt", Instant.now());
+
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId))
+                .thenReturn(List.of(salonA, salonB));
+        // Row order deliberately reversed vs. salon list order — a map-based lookup must not
+        // depend on the repository returning rows in salon-list order.
+        when(cityRepository.findOblastIdsByIdIn(Set.of(cityA, cityB)))
+                .thenReturn(List.of(
+                        new Object[] {cityB, oblastB},
+                        new Object[] {cityA, oblastA}));
+
+        List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
+
+        assertThat(responses)
+                .as("each salon must carry its OWN oblastId, not a swapped/shared one")
+                .extracting(SalonResponse::cityId, SalonResponse::oblastId)
+                .containsExactlyInAnyOrder(tuple(cityA, oblastA), tuple(cityB, oblastB));
+        // Gap 2 (verifier/perf-flagged): the batch method is the entire point of
+        // resolveOblastIdsByCityIds — a regression back to a per-salon N+1 call must fail this.
+        // any() (not the exact combined set) is deliberate: an N+1 regression calls the method
+        // once PER SALON with a smaller, DIFFERENT argument each time (e.g. Set.of(cityA) then
+        // Set.of(cityB)) — an exact-args verify would not even see those extra calls, since
+        // Mockito counts invocations per distinct argument match, not total calls to the method.
+        verify(cityRepository, times(1)).findOblastIdsByIdIn(any());
+        // The one call that does happen must carry the full combined city-id set.
+        verify(cityRepository).findOblastIdsByIdIn(Set.of(cityA, cityB));
+    }
+
+    @Test
+    @DisplayName("getOwnerSalons — leaves oblastId null for a salon with no cityId, without breaking siblings")
+    void should_returnNullOblastId_when_oneSalonHasNoCityIdInBatch() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.test", Role.SALON_OWNER);
+
+        UUID cityA = UUID.randomUUID();
+        UUID oblastA = UUID.randomUUID();
+
+        Salon salonWithCity = Salon.builder().owner(owner).name("Salon A").isActive(true).cityId(cityA).build();
+        ReflectionTestUtils.setField(salonWithCity, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(salonWithCity, "createdAt", Instant.now());
+        Salon salonNoCity = buildSalon(UUID.randomUUID(), owner, "Salon No City");
+
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId))
+                .thenReturn(List.of(salonWithCity, salonNoCity));
+        // Only the non-null cityId may appear in the batch query's input set.
+        when(cityRepository.findOblastIdsByIdIn(Set.of(cityA)))
+                .thenReturn(List.<Object[]>of(new Object[] {cityA, oblastA}));
+
+        List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
+
+        assertThat(responses)
+                .extracting(SalonResponse::name, SalonResponse::oblastId)
+                .containsExactlyInAnyOrder(
+                        tuple("Salon A", oblastA),
+                        tuple("Salon No City", null));
+    }
+
+    @Test
+    @DisplayName("getOwnerSalons — never calls the batch resolver when no salon has a cityId")
+    void should_notCallCityRepository_when_noSalonHasCityId() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.test", Role.SALON_OWNER);
+        Salon salon1 = buildSalon(UUID.randomUUID(), owner, "Salon Alpha");
+        Salon salon2 = buildSalon(UUID.randomUUID(), owner, "Salon Beta");
+
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId))
+                .thenReturn(List.of(salon1, salon2));
+
+        List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
+
+        assertThat(responses).extracting(SalonResponse::oblastId).containsOnlyNulls();
+        // CRITICAL guard-branch assertion (Q6): the empty-cityIds short-circuit must never
+        // reach the DB — verifies resolveOblastIdsByCityIds' cityIds.isEmpty() branch.
+        verify(cityRepository, never()).findOblastIdsByIdIn(any());
     }
 
     // -------------------------------------------------------------------------

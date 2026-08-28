@@ -59,6 +59,12 @@ class SalonServiceAdminTest {
     @Mock
     private com.beautica.location.LocalityWriteValidator localityWriteValidator;
 
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value (mirrors MasterServiceTest).
+    @Mock
+    private com.beautica.location.repository.CityRepository cityRepository;
+
     @InjectMocks
     private SalonService salonService;
 

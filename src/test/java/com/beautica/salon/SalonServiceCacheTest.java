@@ -5,6 +5,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.CacheConfig;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -94,6 +95,11 @@ class SalonServiceCacheTest {
     // Phase 21.3: SalonService now constructor-depends on AuthorizationService (rotateAdmin).
     // This slice does not exercise that path, so a mock satisfies the wiring.
     @MockBean AuthorizationService authorizationService;
+    // oblastId surfacing on SalonResponse: SalonService now constructor-depends on
+    // CityRepository (resolveOblastId). This slice's Salon mocks return a null cityId by
+    // default, so resolveOblastId short-circuits and this mock is only needed to satisfy
+    // Spring's bean graph, not for its stubbed behaviour.
+    @MockBean CityRepository cityRepository;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;

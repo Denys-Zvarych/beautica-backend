@@ -4,6 +4,7 @@ import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
@@ -68,6 +69,12 @@ class SalonServicePrimaryTest {
 
     @Mock
     private CacheManager cacheManager;
+
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value (mirrors MasterServiceTest).
+    @Mock
+    private CityRepository cityRepository;
 
     @InjectMocks
     private SalonService salonService;

@@ -17,6 +17,13 @@ import java.util.UUID;
  * wrote. The legacy free-text {@code city} / {@code region} / {@code address}
  * are retained on the wire (now always whatever was last persisted before
  * Phase 10.6 — no longer written) for backward-compatible clients.
+ *
+ * <p>{@code oblastId} (added alongside the {@code SalonAddressEditScreen} work) lets the
+ * mobile salon address-edit screen pre-select the oblast tier of the oblast→city→district
+ * cascade directly, instead of scanning every oblast's city list — mirroring
+ * {@code UserProfileResponse#oblastId} and {@code MasterDetailResponse#oblastId}. It is
+ * derived from {@code cityId} at read time (never stored), so callers must pass the
+ * resolved value in; see {@link #from(Salon, UUID)}.
  */
 public record SalonResponse(
         UUID id,
@@ -27,6 +34,7 @@ public record SalonResponse(
         String region,
         String address,
         UUID cityId,
+        UUID oblastId,
         UUID districtId,
         String street,
         String buildingNo,
@@ -40,7 +48,13 @@ public record SalonResponse(
         boolean isPrimary,
         Instant createdAt
 ) {
-    public static SalonResponse from(Salon salon) {
+    /**
+     * @param salon    the salon entity
+     * @param oblastId the PK of the Oblast that owns {@code salon.getCityId()}, resolved by
+     *                 the caller (see {@code SalonService#resolveOblastId}); {@code null}
+     *                 when the salon has no city set
+     */
+    public static SalonResponse from(Salon salon, UUID oblastId) {
         return new SalonResponse(
                 salon.getId(),
                 salon.getOwner() != null ? salon.getOwner().getId() : null,
@@ -50,6 +64,7 @@ public record SalonResponse(
                 salon.getRegion(),
                 salon.getAddress(),
                 salon.getCityId(),
+                oblastId,
                 salon.getDistrictId(),
                 salon.getStreet(),
                 salon.getBuildingNo(),

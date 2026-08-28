@@ -11,6 +11,8 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -46,6 +48,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -76,6 +79,12 @@ class SalonServiceTest {
     // CacheManager: post-commit eviction uses TransactionSynchronizationManager,
     // which is inactive under MockitoExtension — tested via integration test.
     private CacheManager cacheManager;
+
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value (mirrors MasterServiceTest).
+    @Mock
+    private com.beautica.location.repository.CityRepository cityRepository;
 
     @InjectMocks
     private SalonService salonService;
@@ -139,6 +148,123 @@ class SalonServiceTest {
         verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
         // first-salon path (existsByOwnerId=false) must trigger master auto-creation
         verify(masterService).createMasterForOwner(owner, savedSalon);
+    }
+
+    // ── createSalon / updateSalon — resolveOblastId (mirrors MasterServiceTest) ────────
+    // The oblastId surfaced on SalonResponse is DERIVED from savedSalon.getCityId() at read
+    // time (never stored) — see SalonResponse#from(Salon, UUID) and
+    // SalonService#resolveOblastId(UUID). Neither direction was previously value-asserted:
+    // every prior test in this package either left cityId null or never read
+    // response.oblastId(), so a broken resolveOblastId (e.g. always null, or wired to the
+    // wrong repository method) passed every existing test.
+
+    @Test
+    @DisplayName("createSalon — resolves oblastId from the saved salon's cityId")
+    void should_resolveOblastId_when_createSalonWithCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Geo Salon", null, null, null, null, null, null,
+                cityId, null, null, null, null);
+        var savedSalon = Salon.builder()
+                .owner(owner)
+                .name("Geo Salon")
+                .isActive(true)
+                .cityId(cityId)
+                .build();
+        ReflectionTestUtils.setField(savedSalon, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(savedSalon, "createdAt", Instant.now());
+
+        Oblast oblast = mock(Oblast.class);
+        when(oblast.getId()).thenReturn(oblastId);
+        City city = mock(City.class);
+        when(city.getOblast()).thenReturn(oblast);
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(city));
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.cityId()).isEqualTo(cityId);
+        assertThat(response.oblastId())
+                .as("oblastId must resolve to the real parent oblast of the salon's cityId")
+                .isEqualTo(oblastId);
+        verify(cityRepository).findByIdWithOblast(cityId);
+    }
+
+    @Test
+    @DisplayName("createSalon — leaves oblastId null when the saved salon has no cityId")
+    void should_returnNullOblastId_when_createSalonWithoutCityId() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("No Geo Salon", null, null, null, null, null, null,
+                null, null, null, null, null);
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "No Geo Salon");
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.oblastId()).isNull();
+        // CRITICAL guard-branch assertion (Q6): the cityId-null fast path must never hit the DB.
+        verify(cityRepository, never()).findByIdWithOblast(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — resolves oblastId from the patched salon's cityId")
+    void should_resolveOblastId_when_updateSalonSetsCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+
+        var request = new UpdateSalonRequest("Old Name", null, null, null, null,
+                cityId, null, null, null, null, null, null);
+
+        Oblast oblast = mock(Oblast.class);
+        when(oblast.getId()).thenReturn(oblastId);
+        City city = mock(City.class);
+        when(city.getOblast()).thenReturn(oblast);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(city));
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.oblastId())
+                .as("oblastId must resolve to the real parent oblast of the patched cityId")
+                .isEqualTo(oblastId);
+        verify(cityRepository).findByIdWithOblast(cityId);
+    }
+
+    @Test
+    @DisplayName("updateSalon — leaves oblastId null when the patched cityId does not resolve to a known city")
+    void should_returnNullOblastId_when_updateSalonCityIdUnresolvable() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+
+        var request = new UpdateSalonRequest("Old Name", null, null, null, null,
+                cityId, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.oblastId())
+                .as("an orphaned/unresolvable cityId must degrade to null oblastId, never throw")
+                .isNull();
+        verify(cityRepository).findByIdWithOblast(cityId);
     }
 
     // ── createSalon — Phase 20.x instagram widened validation + normalisation ──
