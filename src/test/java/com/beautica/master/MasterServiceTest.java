@@ -9,9 +9,6 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
-import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
@@ -70,10 +67,11 @@ class MasterServiceTest {
     @Mock private WorkingHoursRepository workingHoursRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private CacheManager cacheManager;
-    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
-    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
-    // getCityId() returns a non-null value.
-    @Mock private CityRepository cityRepository;
+    // Phase 240 perf MEDIUM fix: resolveOblastId now delegates to the shared cached resolver
+    // (LocationQueryService#resolveCityOblastId) instead of calling CityRepository directly —
+    // must be declared so @InjectMocks can satisfy the constructor parameter (mirrors
+    // SalonServiceTest). MasterService no longer depends on CityRepository at all.
+    @Mock private com.beautica.location.service.LocationQueryService locationQueryService;
     // Phase 13.1: declared so @InjectMocks satisfies the BookingSlugService constructor
     // parameter. The creation paths call getOrCreateSlug(...) after save — a no-op stub
     // (default mock) is sufficient; its return value is ignored by MasterService.
@@ -321,8 +319,8 @@ class MasterServiceTest {
         assertThat(response.workingHours().get(0).dayOfWeek()).isEqualTo(1);
         // HIGH-2: cityId must be null when user.getCityId() returns null (fast-path)
         assertThat(response.cityId()).isNull();
-        // CRITICAL: cityRepository must never be called when cityId is null
-        verifyNoInteractions(cityRepository);
+        // CRITICAL: locationQueryService must never be called when cityId is null
+        verifyNoInteractions(locationQueryService);
     }
 
     // ── resolveOblastId paths ─────────────────────────────────────────────────
@@ -333,12 +331,6 @@ class MasterServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID cityUuid = UUID.randomUUID();
         UUID oblastUuid = UUID.randomUUID();
-
-        Oblast oblast = mock(Oblast.class);
-        when(oblast.getId()).thenReturn(oblastUuid);
-
-        City city = mock(City.class);
-        when(city.getOblast()).thenReturn(oblast);
 
         User user = mock(User.class);
         when(user.getFirstName()).thenReturn("Anna");
@@ -354,13 +346,13 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
-        when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.of(city));
+        when(locationQueryService.resolveCityOblastId(cityUuid)).thenReturn(oblastUuid);
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
 
         assertThat(response.cityId()).isEqualTo(cityUuid);
         assertThat(response.oblastId()).isEqualTo(oblastUuid);
-        verify(cityRepository).findByIdWithOblast(cityUuid);
+        verify(locationQueryService).resolveCityOblastId(cityUuid);
     }
 
     @Test
@@ -386,7 +378,7 @@ class MasterServiceTest {
 
         assertThat(response.cityId()).isNull();
         assertThat(response.oblastId()).isNull();
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     @Test
@@ -409,12 +401,129 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
-        when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.empty());
+        when(locationQueryService.resolveCityOblastId(cityUuid)).thenReturn(null);
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
 
         assertThat(response.oblastId()).isNull();
-        verify(cityRepository).findByIdWithOblast(cityUuid);
+        verify(locationQueryService).resolveCityOblastId(cityUuid);
+    }
+
+    // ── getMasterDetail — embedded salon's oblastId (follow-up to PublicSalonResponse#oblastId) ──
+    // The salon-affiliated master's embedded PublicSalonResponse must resolve oblastId from the
+    // SALON's cityId, not the master's own user.getCityId() — a fixture where the two cities (and
+    // therefore the two oblasts) DIFFER is required, or a bug that swaps/collapses the two
+    // resolutions would still pass (fixture-defang guard, per project memory).
+
+    @Test
+    @DisplayName("should_resolveSalonOblastId_independently_when_masterHasSalonInDifferentCity")
+    void should_resolveSalonOblastId_independently_when_masterHasSalonInDifferentCity() {
+        UUID masterId = UUID.randomUUID();
+        UUID userCityUuid = UUID.randomUUID();
+        UUID userOblastUuid = UUID.randomUUID();
+        UUID salonCityUuid = UUID.randomUUID();
+        UUID salonOblastUuid = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(userCityUuid);
+        when(user.getDistrictId()).thenReturn(null);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(salonCityUuid);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(locationQueryService.resolveCityOblastId(userCityUuid)).thenReturn(userOblastUuid);
+        when(locationQueryService.resolveCityOblastId(salonCityUuid)).thenReturn(salonOblastUuid);
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.oblastId())
+                .as("the master's own oblastId must come from the master's user cityId")
+                .isEqualTo(userOblastUuid);
+        assertThat(response.salon().oblastId())
+                .as("the embedded salon's oblastId must come from the SALON's cityId, not the master's")
+                .isEqualTo(salonOblastUuid);
+        assertThat(response.salon().oblastId()).isNotEqualTo(response.oblastId());
+        // Finding 3 (Phase 240 perf LOW) short-circuit only kicks in when the two cities are
+        // EQUAL — different cities here, so both must still independently reach the resolver.
+        verify(locationQueryService).resolveCityOblastId(userCityUuid);
+        verify(locationQueryService).resolveCityOblastId(salonCityUuid);
+    }
+
+    @Test
+    @DisplayName("should_resolveSalonOblastIdOnce_when_masterAndSalonShareTheSameCity")
+    void should_resolveSalonOblastIdOnce_when_masterAndSalonShareTheSameCity() {
+        // Phase 240 perf LOW (Finding 3): the common case — a salon-affiliated master whose own
+        // city IS the salon's city — must reuse the already-resolved oblastId instead of running
+        // a second resolveCityOblastId call for the SAME cityId.
+        UUID masterId = UUID.randomUUID();
+        UUID sharedCityUuid = UUID.randomUUID();
+        UUID sharedOblastUuid = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(sharedCityUuid);
+        when(user.getDistrictId()).thenReturn(null);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(sharedCityUuid);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(locationQueryService.resolveCityOblastId(sharedCityUuid)).thenReturn(sharedOblastUuid);
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.oblastId()).isEqualTo(sharedOblastUuid);
+        assertThat(response.salon().oblastId())
+                .as("same-city short-circuit must still populate the salon's oblastId")
+                .isEqualTo(sharedOblastUuid);
+        // The short-circuit means only ONE resolver call total, not one per resolveOblastId site.
+        verify(locationQueryService, org.mockito.Mockito.times(1)).resolveCityOblastId(sharedCityUuid);
+    }
+
+    @Test
+    @DisplayName("should_leaveSalonOblastIdNull_when_masterHasNoSalon")
+    void should_leaveSalonOblastIdNull_when_masterHasNoSalon() {
+        UUID masterId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.salon()).isNull();
+        // No salon at all — resolveOblastId must never be invoked with a salon cityId.
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     // ── deactivateMaster — cache eviction ─────────────────────────────────────

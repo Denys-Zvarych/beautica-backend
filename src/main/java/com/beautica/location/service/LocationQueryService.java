@@ -3,6 +3,8 @@ package com.beautica.location.service;
 import com.beautica.location.dto.CityDistrictResponse;
 import com.beautica.location.dto.CityResponse;
 import com.beautica.location.dto.OblastResponse;
+import com.beautica.location.entity.City;
+import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.repository.OblastRepository;
@@ -29,7 +31,7 @@ import java.util.UUID;
  * matching eviction is required), and the locality repositories expose no
  * mutation methods.
  *
- * <p>All three reads are {@code @Cacheable(sync = true)}: these back the
+ * <p>All four reads are {@code @Cacheable(sync = true)}: these back the
  * unauthenticated cascading-picker endpoint, so on a cold start (or once the
  * 24-hour TTL lapses) a popular key — e.g. the single {@code listOblasts}
  * entry, or Kyiv's districts — would otherwise let every concurrent request
@@ -37,6 +39,12 @@ import java.util.UUID;
  * per-key stampede to a single loader (§F.7 — the matching gap to the
  * {@code search:*} caches, which already use {@code sync = true}). It changes
  * no result, only loader concurrency.
+ *
+ * <p><strong>{@link #resolveCityOblastId(UUID)}</strong> (Phase 240 perf follow-up) is the
+ * SHARED {@code cityId → oblastId} resolver for {@code SalonService} and {@code MasterService}
+ * (REUSE-FIRST — one cached implementation, not two private per-service copies). Same static
+ * KATOTTH reference data as the three reads above, so it follows the identical no-eviction, 24h
+ * TTL contract.
  *
  * <p><strong>No N+1 (§E):</strong> {@code listCitiesByOblast} computes
  * {@code hasDistricts} from a single set-based query
@@ -56,6 +64,7 @@ public class LocationQueryService {
     static final String CACHE_OBLASTS = "locationOblasts";
     static final String CACHE_CITIES_BY_OBLAST = "locationCitiesByOblast";
     static final String CACHE_DISTRICTS_BY_CITY = "locationDistrictsByCity";
+    static final String CACHE_CITY_OBLAST_ID = "cityOblastId";
 
     private final OblastRepository oblastRepository;
     private final CityRepository cityRepository;
@@ -105,5 +114,31 @@ public class LocationQueryService {
         return cityDistrictRepository.findByCityIdOrderByNameUkAsc(cityId).stream()
                 .map(district -> CityDistrictResponse.from(district, cityId))
                 .toList();
+    }
+
+    /**
+     * Resolves the parent oblast id of a single city by its id. SHARED cached resolver for
+     * {@code SalonService#resolveOblastId} and {@code MasterService#resolveOblastId} — both
+     * previously ran an uncached {@code findByIdWithOblast} JOIN on every call (Phase 240 perf
+     * MEDIUM finding), even though this is the exact same class of static reference data
+     * ({@code ~23} oblasts / {@code ~356} cities, Flyway-seed-only, never mutated at runtime) the
+     * three reads above already cache with a 24h TTL and no eviction path.
+     *
+     * <p>Callers MUST guard {@code cityId == null} themselves before invoking this method — the
+     * underlying Caffeine cache cannot hold a {@code null} key, so a null-cityId call must never
+     * reach the {@code @Cacheable} proxy in the first place (mirrors the pre-existing guard both
+     * callers already had in front of their own {@code findByIdWithOblast} call).
+     *
+     * @param cityId a non-null city id
+     * @return the PK of the parent {@link Oblast}, or {@code null} when {@code cityId} does not
+     *         resolve to a known city
+     */
+    @Cacheable(value = CACHE_CITY_OBLAST_ID, key = "#cityId", sync = true)
+    @Transactional(readOnly = true)
+    public UUID resolveCityOblastId(UUID cityId) {
+        return cityRepository.findByIdWithOblast(cityId)
+                .map(City::getOblast)
+                .map(Oblast::getId)
+                .orElse(null);
     }
 }

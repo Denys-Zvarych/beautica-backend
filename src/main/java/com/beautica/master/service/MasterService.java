@@ -12,9 +12,7 @@ import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
@@ -55,6 +53,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
@@ -72,7 +71,7 @@ public class MasterService {
     private final BookingRepository bookingRepository;
     private final CacheManager cacheManager;
     private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
-    private final CityRepository cityRepository;
+    private final LocationQueryService locationQueryService;
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
@@ -321,8 +320,10 @@ public class MasterService {
                 .orElseThrow(() -> new NotFoundException("Master not found"));
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
-        UUID oblastId = resolveOblastId(master.getUser().getCityId());
-        return MasterDetailResponse.from(master, hours, oblastId);
+        UUID masterCityId = master.getUser().getCityId();
+        UUID oblastId = resolveOblastId(masterCityId);
+        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
+        return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
     }
 
     /**
@@ -337,8 +338,10 @@ public class MasterService {
     @Transactional(readOnly = true)
     public MasterDetailResponse getMasterDetail(Master master) {
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
-        UUID oblastId = resolveOblastId(master.getUser().getCityId());
-        return MasterDetailResponse.from(master, hours, oblastId);
+        UUID masterCityId = master.getUser().getCityId();
+        UUID oblastId = resolveOblastId(masterCityId);
+        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
+        return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
     }
 
     // Fix 3 + Fix 7: use shared authorizationService, batch-load all days, saveAll
@@ -684,11 +687,14 @@ public class MasterService {
     }
 
     /**
-     * Resolves the {@code oblastId} for the given city in a single JOIN FETCH round-trip.
+     * Resolves the {@code oblastId} for the given city. Delegates to the SHARED cached resolver
+     * {@link LocationQueryService#resolveCityOblastId(UUID)} (Phase 240 perf MEDIUM finding)
+     * rather than querying {@code CityRepository} directly — {@code SalonService#resolveOblastId}
+     * delegates to the exact same shared resolver (REUSE-FIRST: one cached implementation, not two
+     * private per-service copies).
      *
-     * <p>Uses {@link CityRepository#findByIdWithOblast} so the {@code LAZY} oblast
-     * association is initialised within the active transaction — no secondary SELECT
-     * and no LazyInitializationException (Anti-Bug §E).
+     * <p>The {@code cityId == null} guard MUST stay here, in front of the call: the shared
+     * resolver's {@code @Cacheable} proxy cannot accept a {@code null} Caffeine key.
      *
      * @param cityId raw city FK from {@code users.city_id}; {@code null} when the user
      *               has no location set
@@ -699,10 +705,40 @@ public class MasterService {
         if (cityId == null) {
             return null;
         }
-        return cityRepository.findByIdWithOblast(cityId)
-                .map(City::getOblast)
-                .map(Oblast::getId)
-                .orElse(null);
+        return locationQueryService.resolveCityOblastId(cityId);
+    }
+
+    /**
+     * Resolves the affiliated salon's {@code oblastId} for {@link #getMasterDetail(UUID)},
+     * {@link #getMasterDetail(Master)}, and {@link #getMyMasterDetail(UUID)} (Phase 240 perf LOW
+     * finding — free rider on {@link #resolveOblastId(UUID)}'s Finding 2 fix; builds nothing
+     * bespoke of its own).
+     *
+     * <p>Short-circuits the common case — a salon-affiliated master whose own city IS the salon's
+     * city — by reusing the already-resolved {@code masterOblastId} instead of running a second
+     * {@link #resolveOblastId(UUID)} round-trip (still cached post-Finding-2, but every avoided
+     * call is one fewer cache lookup on this per-request path). A different salon city (the
+     * uncommon case — e.g. an admin editing before the master's profile address is synced) still
+     * resolves independently, so the two oblastIds never collapse into one when the cities differ.
+     *
+     * <p>The {@code master.getSalon() == null} guard is preserved exactly: no salon means no
+     * salon {@code oblastId} to resolve, full stop — {@link #resolveOblastId(UUID)} is never
+     * invoked with a salon cityId in that case.
+     *
+     * @param master        the master entity (salon association must be initialised)
+     * @param masterCityId  {@code master.getUser().getCityId()}, already extracted by the caller
+     * @param masterOblastId the already-resolved {@code oblastId} for {@code masterCityId}
+     * @return the affiliated salon's {@code oblastId}, or {@code null} when the master has no
+     *         affiliated salon or the salon has no city set
+     */
+    private UUID resolveSalonOblastId(Master master, UUID masterCityId, UUID masterOblastId) {
+        if (master.getSalon() == null) {
+            return null;
+        }
+        UUID salonCityId = master.getSalon().getCityId();
+        return Objects.equals(salonCityId, masterCityId)
+                ? masterOblastId
+                : resolveOblastId(salonCityId);
     }
 
     // Eviction is registered as a post-commit callback rather than via @CacheEvict.
@@ -839,8 +875,10 @@ public class MasterService {
         Master master = masterRepository.findActiveByUserIdWithUserAndSalon(userId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
-        UUID oblastId = resolveOblastId(master.getUser().getCityId());
-        return MasterDetailResponse.from(master, hours, oblastId);
+        UUID masterCityId = master.getUser().getCityId();
+        UUID oblastId = resolveOblastId(masterCityId);
+        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
+        return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
     }
 
     @Cacheable(value = "master-by-user", key = "#userId", sync = true)

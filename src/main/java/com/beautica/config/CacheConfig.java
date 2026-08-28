@@ -146,6 +146,8 @@ public class CacheConfig {
      *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
      *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
      *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
+     *   cityOblastId            — shared cityId -> oblastId resolver (SalonService/MasterService) —
+     *                             24 h TTL, max 400 entries; no eviction path (static reference data)
      *   localityTaxonomyFacts  — fused city-exists/has-districts/district-child resolution
      *                            per (cityId,districtId) write-validation pair — 24 h TTL, max 600 entries
      *
@@ -468,6 +470,17 @@ public class CacheConfig {
         manager.registerCustomCache("locationDistrictsByCity",
                 Caffeine.newBuilder()
                         .maximumSize(200)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
+                        .build());
+        // Phase 240 perf MEDIUM — shared cityId -> oblastId resolver
+        // (LocationQueryService#resolveCityOblastId) backing SalonService/MasterService's
+        // per-request oblastId resolution. Same static-reference-data rationale as the
+        // locationOblasts/* caches above: ~356 cities is the realistic ceiling, so 400 entries
+        // comfortably covers every distinct city ever resolved, with the same 24h TTL / no
+        // @CacheEvict contract (data is Flyway-seed-only, never mutated at runtime).
+        manager.registerCustomCache("cityOblastId",
+                Caffeine.newBuilder()
+                        .maximumSize(400)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
         // Phase 10.6 — fused write-path taxonomy resolution per (cityId, districtId)

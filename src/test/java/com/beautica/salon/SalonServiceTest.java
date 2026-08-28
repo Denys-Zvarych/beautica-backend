@@ -11,8 +11,6 @@ import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -48,7 +46,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -81,10 +78,18 @@ class SalonServiceTest {
     private CacheManager cacheManager;
 
     // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
-    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
-    // getCityId() returns a non-null value (mirrors MasterServiceTest).
+    // parameter — without it the field receives null (used by the batch
+    // resolveOblastIdsByCityIds sibling for getOwnerSalons; the single-row resolveOblastId path
+    // no longer touches this mock — see locationQueryService below).
     @Mock
     private com.beautica.location.repository.CityRepository cityRepository;
+
+    // Phase 240 perf MEDIUM fix: resolveOblastId now delegates to the shared cached resolver
+    // (LocationQueryService#resolveCityOblastId) instead of calling CityRepository directly —
+    // must be declared so @InjectMocks can satisfy the constructor parameter (mirrors
+    // MasterServiceTest).
+    @Mock
+    private com.beautica.location.service.LocationQueryService locationQueryService;
 
     @InjectMocks
     private SalonService salonService;
@@ -176,15 +181,10 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(savedSalon, "id", UUID.randomUUID());
         ReflectionTestUtils.setField(savedSalon, "createdAt", Instant.now());
 
-        Oblast oblast = mock(Oblast.class);
-        when(oblast.getId()).thenReturn(oblastId);
-        City city = mock(City.class);
-        when(city.getOblast()).thenReturn(oblast);
-
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(city));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
 
@@ -192,7 +192,7 @@ class SalonServiceTest {
         assertThat(response.oblastId())
                 .as("oblastId must resolve to the real parent oblast of the salon's cityId")
                 .isEqualTo(oblastId);
-        verify(cityRepository).findByIdWithOblast(cityId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
     }
 
     @Test
@@ -212,7 +212,7 @@ class SalonServiceTest {
 
         assertThat(response.oblastId()).isNull();
         // CRITICAL guard-branch assertion (Q6): the cityId-null fast path must never hit the DB.
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     @Test
@@ -228,20 +228,15 @@ class SalonServiceTest {
         var request = new UpdateSalonRequest("Old Name", null, null, null, null,
                 cityId, null, null, null, null, null, null);
 
-        Oblast oblast = mock(Oblast.class);
-        when(oblast.getId()).thenReturn(oblastId);
-        City city = mock(City.class);
-        when(city.getOblast()).thenReturn(oblast);
-
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(city));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
 
         assertThat(response.oblastId())
                 .as("oblastId must resolve to the real parent oblast of the patched cityId")
                 .isEqualTo(oblastId);
-        verify(cityRepository).findByIdWithOblast(cityId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
     }
 
     @Test
@@ -257,14 +252,14 @@ class SalonServiceTest {
                 cityId, null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(null);
 
         SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
 
         assertThat(response.oblastId())
                 .as("an orphaned/unresolvable cityId must degrade to null oblastId, never throw")
                 .isNull();
-        verify(cityRepository).findByIdWithOblast(cityId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
     }
 
     // ── createSalon — Phase 20.x instagram widened validation + normalisation ──
@@ -369,6 +364,56 @@ class SalonServiceTest {
         assertThatThrownBy(() -> salonService.getSalonEntity(salonId))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Salon not found");
+    }
+
+    // ── getPublicSalon — oblastId resolution on the permitAll GET /salons/{salonId} path ──
+    // Follow-up to the createSalon/updateSalon coverage above: PublicSalonResponse#oblastId is
+    // stranded unless THIS resolution path (the one endpoint the mobile owner/admin management
+    // screen actually loads through) is independently value-pinned in both directions.
+
+    @Test
+    @DisplayName("getPublicSalon — resolves oblastId from the salon's cityId")
+    void should_resolveOblastId_when_getPublicSalonWithCityId() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User owner = buildUser(UUID.randomUUID(), "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Geo Salon")
+                .isActive(true)
+                .cityId(cityId)
+                .build();
+        ReflectionTestUtils.setField(salon, "id", salonId);
+        ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
+
+        when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
+
+        var response = salonService.getPublicSalon(salonId);
+
+        assertThat(response.cityId()).isEqualTo(cityId);
+        assertThat(response.oblastId())
+                .as("oblastId must resolve to the real parent oblast of the salon's cityId")
+                .isEqualTo(oblastId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
+    }
+
+    @Test
+    @DisplayName("getPublicSalon — leaves oblastId null when the salon has no cityId")
+    void should_returnNullOblastId_when_getPublicSalonWithoutCityId() {
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(UUID.randomUUID(), "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "No Geo Salon");
+
+        when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
+
+        var response = salonService.getPublicSalon(salonId);
+
+        assertThat(response.oblastId()).isNull();
+        // CRITICAL guard-branch assertion (Q6, mirrored): the cityId-null fast path must never
+        // hit the DB.
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     @Test

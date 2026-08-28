@@ -45,12 +45,20 @@ public record MasterDetailResponse(
     /**
      * Builds a fully-populated response including locality cascade IDs.
      *
-     * @param master    the master entity (user + salon associations must be initialised)
-     * @param hours     the master's active working-hours rows
-     * @param oblastId  the PK of the Oblast that owns {@code master.getUser().getCityId()};
-     *                  {@code null} when the user has no city set
+     * @param master        the master entity (user + salon associations must be initialised)
+     * @param hours         the master's active working-hours rows
+     * @param oblastId      the PK of the Oblast that owns {@code master.getUser().getCityId()};
+     *                      {@code null} when the user has no city set
+     * @param salonOblastId the PK of the Oblast that owns {@code master.getSalon().getCityId()},
+     *                      resolved by the caller (see {@code MasterService#resolveOblastId});
+     *                      {@code null} when the master has no affiliated salon or the salon has
+     *                      no city set. Deliberately a SEPARATE resolution from {@code oblastId}
+     *                      above — the master's own locality and the salon's business locality
+     *                      are different cities in general (e.g. an admin editing before the
+     *                      master's profile address is synced).
      */
-    public static MasterDetailResponse from(Master master, List<WorkingHours> hours, UUID oblastId) {
+    public static MasterDetailResponse from(
+            Master master, List<WorkingHours> hours, UUID oblastId, UUID salonOblastId) {
         return new MasterDetailResponse(
                 master.getId(),
                 master.getUser().getFirstName(),
@@ -68,7 +76,8 @@ public record MasterDetailResponse(
                         master.getReviewCount(), master.getAvgRating()),
                 master.getReviewCount(),
                 master.getMasterType(),
-                master.getSalon() != null ? PublicSalonResponse.from(master.getSalon()) : null,
+                master.getSalon() != null
+                        ? PublicSalonResponse.from(master.getSalon(), salonOblastId) : null,
                 hours.stream().map(WorkingHoursResponse::from).toList(),
                 master.getUser().getCityId(),
                 oblastId,

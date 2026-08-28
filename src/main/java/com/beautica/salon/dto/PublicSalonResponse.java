@@ -24,6 +24,16 @@ import java.util.UUID;
  * salon-affiliated master's precise address because that address is the salon's own business
  * address duplicated onto the master. A salon's business address IS the thing salon
  * discovery exists to surface — masking it here would defeat the endpoint's purpose.
+ *
+ * <p>{@code oblastId} was added as a follow-up to the {@code SalonResponse#oblastId} rollout:
+ * {@code GET /salons/{salonId}} (unauthenticated, {@code permitAll}) is the ONLY load path the
+ * mobile owner/admin salon-management screen actually uses, so leaving {@code oblastId} off this
+ * DTO stranded the field the address-edit cascade needs. Not a disclosure concern (§I) — this
+ * DTO already exposes {@code cityId}/{@code districtId} unmasked, and oblast is simply the
+ * public, static parent tier of an already-public city in the government-territory taxonomy; see
+ * {@code backend-security} audit note on commit {@code f00b6f1}. Like {@code SalonResponse}, it
+ * is derived from {@code cityId} at read time (never stored) — callers pass the resolved value
+ * in; see {@link #from(Salon, UUID)}.
  */
 public record PublicSalonResponse(
         UUID id,
@@ -33,6 +43,7 @@ public record PublicSalonResponse(
         String region,
         String address,
         UUID cityId,
+        UUID oblastId,
         UUID districtId,
         String street,
         String buildingNo,
@@ -43,7 +54,13 @@ public record PublicSalonResponse(
         BigDecimal avgRating,
         int reviewCount
 ) {
-    public static PublicSalonResponse from(Salon salon) {
+    /**
+     * @param salon    the salon entity
+     * @param oblastId the PK of the Oblast that owns {@code salon.getCityId()}, resolved by
+     *                 the caller (see {@code SalonService#resolveOblastId}); {@code null}
+     *                 when the salon has no city set
+     */
+    public static PublicSalonResponse from(Salon salon, UUID oblastId) {
         return new PublicSalonResponse(
                 salon.getId(),
                 salon.getName(),
@@ -52,6 +69,7 @@ public record PublicSalonResponse(
                 salon.getRegion(),
                 salon.getAddress(),
                 salon.getCityId(),
+                oblastId,
                 salon.getDistrictId(),
                 salon.getStreet(),
                 salon.getBuildingNo(),

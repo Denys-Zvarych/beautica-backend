@@ -62,7 +62,7 @@ public class SalonController {
 
     @GetMapping("/{salonId}")
     public ApiResponse<PublicSalonResponse> getSalon(@PathVariable UUID salonId) {
-        return ApiResponse.ok(PublicSalonResponse.from(salonService.getSalonEntity(salonId)));
+        return ApiResponse.ok(salonService.getPublicSalon(salonId));
     }
 
     @PatchMapping("/{salonId}")

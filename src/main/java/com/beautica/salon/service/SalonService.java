@@ -12,13 +12,13 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.location.LocalityWriteValidator;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -58,6 +58,7 @@ public class SalonService {
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
     private final CityRepository cityRepository;
+    private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
     private final AuthorizationService authorizationService;
 
@@ -131,12 +132,17 @@ public class SalonService {
 
     /**
      * Resolves the parent oblast id of a single city by its id, for the {@code oblastId}
-     * surfaced on {@link SalonResponse}. Mirrors
-     * {@code MasterService#resolveOblastId(UUID)} — same graph-fetch mechanism
-     * ({@link CityRepository#findByIdWithOblast(UUID)}), reused rather than reinvented
-     * (§E / REUSE-FIRST). Single-row by PK — the create/update paths touch exactly one
-     * salon, so this is not the §E "per-row in a collection" concern; {@link #getOwnerSalons}
-     * uses the batch {@link CityRepository#findOblastIdsByIdIn(java.util.Collection)} instead.
+     * surfaced on {@link SalonResponse}. Delegates to the SHARED cached resolver
+     * {@link LocationQueryService#resolveCityOblastId(UUID)} (Phase 240 perf MEDIUM finding)
+     * rather than querying {@link CityRepository} directly — that method mirrors
+     * {@code MasterService#resolveOblastId(UUID)}, which delegates to the exact same shared
+     * resolver (REUSE-FIRST: one cached implementation, not two private per-service copies).
+     * Single-row by PK — the create/update paths touch exactly one salon, so this is not the §E
+     * "per-row in a collection" concern; {@link #getOwnerSalons} uses the batch
+     * {@link CityRepository#findOblastIdsByIdIn(java.util.Collection)} instead.
+     *
+     * <p>The {@code cityId == null} guard MUST stay here, in front of the call: the shared
+     * resolver's {@code @Cacheable} proxy cannot accept a {@code null} Caffeine key.
      *
      * @param cityId the salon's {@code cityId}, possibly {@code null}
      * @return the resolved oblast id, or {@code null} when {@code cityId} is {@code null}
@@ -146,10 +152,7 @@ public class SalonService {
         if (cityId == null) {
             return null;
         }
-        return cityRepository.findByIdWithOblast(cityId)
-                .map(City::getOblast)
-                .map(Oblast::getId)
-                .orElse(null);
+        return locationQueryService.resolveCityOblastId(cityId);
     }
 
     // Eviction helpers are registered as post-commit callbacks rather than via @CacheEvict.
@@ -266,21 +269,65 @@ public class SalonService {
     }
 
     /**
-     * {@code sync = true} (Phase 240 audit, item A) mirrors
-     * {@link com.beautica.master.service.MasterService#getMasterDetail(UUID)}. Required because
-     * {@code ReviewEventListener#onReviewCreated} now evicts this entry by key on every review of
-     * a salon-affiliated master, so the cache misses on a real WRITE path and not only on TTL
-     * expiry — without collapsing, N concurrent readers of a popular salon each run the
-     * {@code findByIdAndIsActiveTrueWithOwner} graph query (Anti-Bug §F-7).
+     * Plain (uncached) entity fetch — the graph query behind {@link #getPublicSalon(UUID)} and
+     * a reusable load point for any future internal caller that needs the raw {@link Salon}
+     * entity with its owner association initialised.
      *
-     * <p>Compatible: this {@code @Cacheable} names ONE cache and carries no {@code unless} /
-     * {@code condition}, both of which {@code sync = true} forbids.
+     * <p><b>Deliberately NOT {@code @Cacheable} (Phase 240 CRITICAL fix).</b> It previously
+     * carried {@code @Cacheable(value = "salon-detail", ...)}, but its only production caller was
+     * {@link #getPublicSalon(UUID)} calling it as a plain in-class {@code this.getSalonEntity(...)}
+     * — a Spring self-invocation. {@code CacheConfig} wires proxy-based {@code @EnableCaching}
+     * (no AspectJ mode, see {@code CacheConfig:54}), so a self-invoked call never crosses the
+     * CGLIB proxy and the cache annotation was silently inert on the one path that mattered:
+     * {@code GET /salons/{salonId}} ran {@code findByIdAndIsActiveTrueWithOwner} on EVERY request,
+     * and the {@code sync = true} thundering-herd guard never engaged. It stayed green because
+     * {@code SalonServiceCacheTest}/{@code ReviewCacheEvictionIT} called this method directly
+     * through the injected (proxied) bean reference — exactly the one call shape that still
+     * worked, and exactly the shape production traffic never takes.
+     *
+     * <p>Fix: the {@code @Cacheable} boundary moved to {@link #getPublicSalon(UUID)} itself (see
+     * its Javadoc) rather than (a) pushing DTO assembly into {@code SalonController} — every
+     * controller in this codebase stays a thin HTTP-only shim with zero {@code Response.from(...)}
+     * calls, and moving it here would be the first exception — or (c) self-injecting a {@code @Lazy}
+     * proxy of this same bean — no self-injection precedent exists anywhere in this codebase, and
+     * it was unnecessary once caching could just live on the method that is actually called
+     * externally. Eviction is untouched: {@link #evictSalonDetailCacheAfterCommit(UUID)},
+     * {@code ReviewEventListener}, and {@code SalonStaffRatingListener} all evict the
+     * {@code "salon-detail"} cache by name + {@code salonId} key, agnostic of whether the cached
+     * value is a {@link Salon} entity or a {@link PublicSalonResponse} DTO.
      */
     @Transactional(readOnly = true)
-    @Cacheable(value = "salon-detail", key = "#salonId", sync = true)
     public Salon getSalonEntity(UUID salonId) {
         return salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found: " + salonId));
+    }
+
+    /**
+     * Builds the unauthenticated public view of a salon for {@code GET /salons/{salonId}} — the
+     * highest-traffic {@code permitAll} endpoint in this set.
+     *
+     * <p>DTO assembly is kept in the service (not the controller) precisely because it needs a
+     * second collaborator call ({@link #resolveOblastId}) beyond the entity fetch — mirrors
+     * {@link #createSalon}/{@link #updateSalon}, which likewise resolve {@code oblastId} before
+     * handing back the response. Single-row: this endpoint returns exactly one salon, so the
+     * per-row {@link #resolveOblastId(UUID)} is correct here — {@link #getOwnerSalons} is the
+     * only caller that needs the batch {@link #resolveOblastIdsByCityIds(Set)} sibling.
+     *
+     * <p>{@code @Cacheable} lives HERE, not on {@link #getSalonEntity(UUID)} (Phase 240 CRITICAL
+     * fix — see that method's Javadoc for the self-invocation bug this replaces). This is the
+     * method the controller actually calls through the Spring proxy, so caching the whole DTO here
+     * — rather than the entity one level down — needs no self-injection and introduces no new
+     * pattern: it is just an ordinary {@code @Cacheable} on the method an external caller invokes.
+     * {@code sync = true} (unchanged from the prior placement) collapses the thundering herd on a
+     * popular salon when {@code ReviewEventListener#onReviewCreated} evicts this entry by key
+     * (Anti-Bug §F-7); {@code unless}/{@code condition} are absent, which {@code sync = true}
+     * requires.
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = "salon-detail", key = "#salonId", sync = true)
+    public PublicSalonResponse getPublicSalon(UUID salonId) {
+        Salon salon = getSalonEntity(salonId);
+        return PublicSalonResponse.from(salon, resolveOblastId(salon.getCityId()));
     }
 
     @Transactional

@@ -5,7 +5,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -68,7 +68,9 @@ class MasterServiceRotateTest {
     @Mock private WorkingHoursRepository workingHoursRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private CacheManager cacheManager;
-    @Mock private CityRepository cityRepository;
+    // Phase 240 perf MEDIUM fix: MasterService no longer depends on CityRepository — resolveOblastId
+    // now delegates to the shared cached resolver (LocationQueryService#resolveCityOblastId).
+    @Mock private LocationQueryService locationQueryService;
     @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
     @Mock private AuthorizationService authorizationService;
     // Prefix-eviction fix: rotation's afterCommit master-calendar eviction delegates to the shared

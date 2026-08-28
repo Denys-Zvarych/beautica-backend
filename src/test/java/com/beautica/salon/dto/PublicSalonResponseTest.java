@@ -22,7 +22,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
 
         assertThat(response.avgRating())
                 .as("avgRating must be null, not a fabricated value, when reviewCount is 0")
@@ -40,7 +40,7 @@ class PublicSalonResponseTest {
                 .reviewCount(12)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
 
         assertThat(response.avgRating()).isEqualByComparingTo("4.75");
         assertThat(response.reviewCount()).isEqualTo(12);
@@ -56,7 +56,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
 
         assertThat(response.coverImageUrl()).isEqualTo("https://cdn.example.com/cover.jpg");
     }
@@ -70,10 +70,48 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
 
         assertThat(response.getClass().getRecordComponents())
                 .as("PublicSalonResponse must never grow an ownerId/owner-identifying field")
                 .noneMatch(c -> c.getName().toLowerCase().contains("owner"));
+    }
+
+    // ── oblastId passthrough — resolution itself is tested in SalonServiceTest ────────
+    // (getPublicSalon), mirroring SalonResponseTest/SalonServiceTest for SalonResponse#oblastId.
+    // `from` never resolves oblastId itself; it only carries whatever the caller resolved.
+
+    @Test
+    @DisplayName("carries the caller-resolved oblastId through unchanged")
+    void should_mapOblastId_when_present() {
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        Salon salon = Salon.builder()
+                .id(UUID.randomUUID())
+                .name("Beauty Bar")
+                .cityId(cityId)
+                .reviewCount(0)
+                .build();
+
+        PublicSalonResponse response = PublicSalonResponse.from(salon, oblastId);
+
+        assertThat(response.cityId()).isEqualTo(cityId);
+        assertThat(response.oblastId())
+                .as("from() is a pure passthrough — resolution is the caller's job")
+                .isEqualTo(oblastId);
+    }
+
+    @Test
+    @DisplayName("leaves oblastId null when the caller resolved null (e.g. salon has no cityId)")
+    void should_returnNullOblastId_when_callerResolvesNull() {
+        Salon salon = Salon.builder()
+                .id(UUID.randomUUID())
+                .name("Beauty Bar")
+                .reviewCount(0)
+                .build();
+
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+
+        assertThat(response.oblastId()).isNull();
     }
 }

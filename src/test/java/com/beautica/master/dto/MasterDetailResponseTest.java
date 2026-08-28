@@ -2,6 +2,8 @@ package com.beautica.master.dto;
 
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.salon.dto.PublicSalonResponse;
+import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -167,11 +169,57 @@ class MasterDetailResponseTest {
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(user);
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null);
 
         assertThat(response.professionalTitle())
                 .as("MasterDetailResponse.from reads professionalTitle off the linked User")
                 .isEqualTo("Візажист");
+    }
+
+    // ── salonOblastId — separate resolution from the master's own oblastId ────────────
+    // The embedded PublicSalonResponse#oblastId is derived from the SALON's cityId, not the
+    // master's own user.getCityId(); a fixture where the two differ proves the two `resolveOblastId`
+    // calls in MasterService are not accidentally collapsed into one (fixture-defang guard).
+
+    @Test
+    @DisplayName("from passes salonOblastId through to the embedded PublicSalonResponse, distinct from the master's own oblastId")
+    void should_passSalonOblastIdThroughToEmbeddedSalon_when_masterHasSalon() {
+        UUID masterOblastId = UUID.randomUUID();
+        UUID salonOblastId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(UUID.randomUUID());
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getSalon()).thenReturn(salon);
+
+        MasterDetailResponse response =
+                MasterDetailResponse.from(master, List.of(), masterOblastId, salonOblastId);
+
+        assertThat(response.oblastId())
+                .as("the master's own oblastId must come from the `oblastId` parameter")
+                .isEqualTo(masterOblastId);
+        assertThat(response.salon())
+                .isNotNull()
+                .extracting(PublicSalonResponse::oblastId)
+                .as("the embedded salon's oblastId must come from the SEPARATE salonOblastId parameter, "
+                        + "not be swapped with or defaulted to the master's own oblastId")
+                .isEqualTo(salonOblastId);
+        assertThat(response.salon().oblastId())
+                .as("must not equal the master's own oblastId (fixtures use distinct values)")
+                .isNotEqualTo(masterOblastId);
+    }
+
+    @Test
+    @DisplayName("from leaves salon null (and never dereferences salonOblastId) when the master has no salon")
+    void should_leaveSalonNull_when_masterHasNoSalon() {
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getSalon()).thenReturn(null);
+
+        MasterDetailResponse response =
+                MasterDetailResponse.from(master, List.of(), UUID.randomUUID(), UUID.randomUUID());
+
+        assertThat(response.salon()).isNull();
     }
 
     // ── Zero-review rating normalisation (Phase 240 audit, Finding 3) ─────────────────
@@ -190,7 +238,7 @@ class MasterDetailResponseTest {
         // count, not off a null/zero check on the rating itself.
         when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null);
 
         assertThat(response.avgRating())
                 .as("an unreviewed master must not be served a fabricated 0.00 rating")
@@ -208,7 +256,7 @@ class MasterDetailResponseTest {
         when(master.getReviewCount()).thenReturn(1);
         when(master.getAvgRating()).thenReturn(new BigDecimal("1.00"));
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null);
 
         assertThat(response.avgRating())
                 .as("suppression triggers on count == 0 only — a real low rating must survive")

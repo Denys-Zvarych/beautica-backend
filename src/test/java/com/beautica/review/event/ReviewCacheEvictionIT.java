@@ -5,7 +5,7 @@ import com.beautica.master.service.MasterService;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.service.ReviewService;
 import com.beautica.review.support.AbstractRatingVisibilityIT;
-import com.beautica.salon.entity.Salon;
+import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.service.SalonService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -153,7 +153,7 @@ class ReviewCacheEvictionIT extends AbstractRatingVisibilityIT {
     // ── salon master — adds the salon-detail branch ────────────────────────────
 
     @Test
-    @DisplayName("salon master — salon-detail is evicted too and the salon entity re-reads at the recalculated 4.00")
+    @DisplayName("salon master — salon-detail is evicted too and the public salon profile re-reads at the recalculated 4.00")
     void should_returnRecalculatedSalonAverage_when_salonAffiliatedMasterIsReviewed() {
         String suffix = "-smc-" + System.nanoTime();
         UUID ownerId = seedProviderUser("own" + suffix + "@beautica.test", "SALON_OWNER", null);
@@ -167,15 +167,19 @@ class ReviewCacheEvictionIT extends AbstractRatingVisibilityIT {
         // ── 1. Prime all three caches ──
         masterService.getMasterDetail(masterId);
         masterService.getMyMasterDetail(masterUserId);
-        Salon salonBefore = salonService.getSalonEntity(salonId);
+        // Phase 240 CRITICAL fix: salon-detail is now keyed on getPublicSalon's PublicSalonResponse
+        // DTO, not the raw Salon entity — getSalonEntity is deliberately uncached (self-invocation
+        // fix, see SalonService#getSalonEntity's Javadoc) and getPublicSalon is the method the
+        // Spring proxy actually caches, so priming MUST go through it, exactly like SalonController.
+        PublicSalonResponse salonBefore = salonService.getPublicSalon(salonId);
 
-        assertThat(salonBefore.getReviewCount())
+        assertThat(salonBefore.reviewCount())
                 .as("priming read must capture the salon's zero-review state, actual=%s",
-                        salonBefore.getReviewCount())
+                        salonBefore.reviewCount())
                 .isZero();
         assertThat(cacheEntry(SALON_DETAIL_CACHE, salonId))
-                .as("salon-detail must hold the primed Salon entity under the salonId key — "
-                    + "otherwise the eviction assertion would be vacuous")
+                .as("salon-detail must hold the primed PublicSalonResponse DTO under the salonId "
+                    + "key — otherwise the eviction assertion would be vacuous")
                 .isNotNull();
 
         // ── 2. Review the salon-affiliated master ──
@@ -197,19 +201,19 @@ class ReviewCacheEvictionIT extends AbstractRatingVisibilityIT {
 
         // ── 4. Fresh values on re-read ──
         MasterDetailResponse masterAfter = masterService.getMasterDetail(masterId);
-        Salon salonAfter = salonService.getSalonEntity(salonId);
+        PublicSalonResponse salonAfter = salonService.getPublicSalon(salonId);
 
         assertThat(masterAfter.avgRating())
                 .as("the master's public profile must show 4.00 immediately, actual=%s",
                         masterAfter.avgRating())
                 .isEqualByComparingTo("4.00");
-        assertThat(salonAfter.getAvgRating())
+        assertThat(salonAfter.avgRating())
                 .as("the salon profile must show 4.00 immediately, actual=%s — a stale 0.00 here "
                     + "means the salon-branch afterCompletion eviction never fired",
-                        salonAfter.getAvgRating())
+                        salonAfter.avgRating())
                 .isEqualByComparingTo("4.00");
-        assertThat(salonAfter.getReviewCount())
-                .as("the salon's reviewCount must be 1, actual=%s", salonAfter.getReviewCount())
+        assertThat(salonAfter.reviewCount())
+                .as("the salon's reviewCount must be 1, actual=%s", salonAfter.reviewCount())
                 .isEqualTo(1);
     }
 

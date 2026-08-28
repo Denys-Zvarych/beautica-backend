@@ -8,6 +8,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.salon.controller.SalonController;
 import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
@@ -245,7 +246,9 @@ class SalonControllerTest {
     void should_return200_when_publicGetSalon() throws Exception {
         var salonId = UUID.randomUUID();
         var salon = buildSalonEntity(salonId, "Public Salon");
-        when(salonService.getSalonEntity(salonId)).thenReturn(salon);
+        // Controller now calls SalonService#getPublicSalon directly — DTO assembly (including
+        // the oblastId resolution) moved into the service so it isn't duplicated per-controller.
+        when(salonService.getPublicSalon(salonId)).thenReturn(PublicSalonResponse.from(salon, null));
 
         log.debug("Act: GET {}/{} without credentials — public endpoint", SALONS_URL, salonId);
         mockMvc.perform(get(SALONS_URL + "/" + salonId)
@@ -259,7 +262,7 @@ class SalonControllerTest {
     @DisplayName("GET /api/v1/salons/{id} — 404 when salon does not exist")
     void should_return404_when_salonNotFound() throws Exception {
         var unknownId = UUID.randomUUID();
-        when(salonService.getSalonEntity(unknownId))
+        when(salonService.getPublicSalon(unknownId))
                 .thenThrow(new com.beautica.common.exception.NotFoundException("Salon not found"));
 
         log.debug("Act: GET {}/{} for a salon that does not exist", SALONS_URL, unknownId);
@@ -924,9 +927,10 @@ class SalonControllerTest {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**
-     * Builds a minimal {@link com.beautica.salon.entity.Salon} entity stub for tests that call
-     * {@link SalonService#getSalonEntity} — the controller maps this to
-     * {@link com.beautica.salon.dto.PublicSalonResponse} via its static factory method.
+     * Builds a minimal {@link com.beautica.salon.entity.Salon} entity stub, passed to
+     * {@link com.beautica.salon.dto.PublicSalonResponse#from} when stubbing
+     * {@link SalonService#getPublicSalon} — the controller returns that service's result
+     * directly (DTO assembly, including the {@code oblastId} resolution, lives in the service).
      */
     private com.beautica.salon.entity.Salon buildSalonEntity(UUID salonId, String name) {
         return com.beautica.salon.entity.Salon.builder()

@@ -2,7 +2,7 @@ package com.beautica.master;
 
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.config.CacheConfig;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -106,7 +106,7 @@ class OwnerMasterCacheTest {
     @MockBean WorkingHoursRepository workingHoursRepository;
     @MockBean ScheduleExceptionRepository scheduleExceptionRepository;
     @MockBean BookingRepository bookingRepository;
-    @MockBean CityRepository cityRepository;
+    @MockBean LocationQueryService locationQueryService;
     // Phase 13.1: MasterService now constructor-depends on BookingSlugService.
     @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
     // Phase 21.3: MasterService now constructor-depends on AuthorizationService (rotateMasterToSalon).

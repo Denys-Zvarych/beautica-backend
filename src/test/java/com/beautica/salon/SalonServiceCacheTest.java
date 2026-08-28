@@ -96,10 +96,12 @@ class SalonServiceCacheTest {
     // This slice does not exercise that path, so a mock satisfies the wiring.
     @MockBean AuthorizationService authorizationService;
     // oblastId surfacing on SalonResponse: SalonService now constructor-depends on
-    // CityRepository (resolveOblastId). This slice's Salon mocks return a null cityId by
-    // default, so resolveOblastId short-circuits and this mock is only needed to satisfy
-    // Spring's bean graph, not for its stubbed behaviour.
+    // CityRepository (batch resolveOblastIdsByCityIds, used only by getOwnerSalons) and
+    // LocationQueryService (single-row resolveOblastId — Phase 240 perf MEDIUM fix). This
+    // slice's Salon mocks return a null cityId by default, so resolveOblastId short-circuits
+    // and neither mock is exercised beyond satisfying Spring's bean graph.
     @MockBean CityRepository cityRepository;
+    @MockBean com.beautica.location.service.LocationQueryService locationQueryService;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
@@ -151,21 +153,39 @@ class SalonServiceCacheTest {
 
     // ── salon-detail cache tests ───────────────────────────────────────────────
 
+    /**
+     * Phase 240 CRITICAL fix — mandatory proof for the Finding 1 self-invocation bug.
+     *
+     * <p>Before the fix, {@code @Cacheable} sat on {@code getSalonEntity}, and
+     * {@code getPublicSalon} called it as a plain in-class {@code this.getSalonEntity(...)}. That
+     * self-invocation never crosses the CGLIB proxy under this codebase's proxy-based
+     * {@code @EnableCaching} (no AspectJ mode), so the cache never fired on the ONLY path real
+     * traffic takes — {@code GET /salons/{salonId}} via {@link SalonService#getPublicSalon}.
+     *
+     * <p>This test calls {@code salonService.getPublicSalon(salonId)} — through the REAL Spring
+     * proxy this {@code @SpringBootTest(classes = ...)} context builds, exactly like
+     * {@code SalonController} does — never {@code getSalonEntity} directly (that call shape is
+     * exactly what let the bug hide behind a passing test suite before this fix: see
+     * {@code SalonService#getSalonEntity}'s Javadoc). Confirmed RED against the pre-fix code
+     * (see the PR description / commit history for the reverted-fix run) — before the fix, each
+     * call re-executed {@code findByIdAndIsActiveTrueWithOwner}, so the repository was hit TWICE
+     * and this assertion failed with "Wanted 1 time but was 2 times."
+     */
     @Test
-    @DisplayName("second call to getSalonEntity returns cached result without hitting repository")
-    void should_notHitRepository_when_getSalonEntityCalledTwice() {
+    @DisplayName("Phase 240 CRITICAL — second call to getPublicSalon (through the real proxy) is served from cache, not a self-invoked getSalonEntity")
+    void should_notHitRepository_when_getPublicSalonCalledTwiceThroughTheProxy() {
         UUID salonId = UUID.randomUUID();
         Salon salon = Mockito.mock(Salon.class);
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
 
-        salonService.getSalonEntity(salonId);
-        salonService.getSalonEntity(salonId);
+        salonService.getPublicSalon(salonId);
+        salonService.getPublicSalon(salonId);
 
         verify(salonRepository, times(1)).findByIdAndIsActiveTrueWithOwner(salonId);
     }
 
     @Test
-    @DisplayName("updateSalon evicts salon-detail so the next getSalonEntity re-queries the repository")
+    @DisplayName("updateSalon evicts salon-detail so the next getPublicSalon re-queries the repository")
     void should_evictSalonDetailCache_when_updateSalonCalled() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -175,8 +195,8 @@ class SalonServiceCacheTest {
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
-        // Populate salon-detail cache
-        salonService.getSalonEntity(salonId);
+        // Populate salon-detail cache — through the real proxy, mirroring SalonController.
+        salonService.getPublicSalon(salonId);
 
         // Evict via updateSalon
         UpdateSalonRequest updateRequest = new UpdateSalonRequest(
@@ -185,7 +205,7 @@ class SalonServiceCacheTest {
         salonService.updateSalon(actorId, salonId, updateRequest);
 
         // Cache was evicted — repository must be queried again
-        salonService.getSalonEntity(salonId);
+        salonService.getPublicSalon(salonId);
 
         verify(salonRepository, times(2)).findByIdAndIsActiveTrueWithOwner(salonId);
     }
@@ -218,7 +238,7 @@ class SalonServiceCacheTest {
     }
 
     @Test
-    @DisplayName("deactivateSalon evicts salon-detail so the next getSalonEntity re-queries the repository")
+    @DisplayName("deactivateSalon evicts salon-detail so the next getPublicSalon re-queries the repository")
     void should_evictSalonDetailCache_when_deactivateSalonCalled() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -231,14 +251,14 @@ class SalonServiceCacheTest {
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
-        // Populate salon-detail cache
-        salonService.getSalonEntity(salonId);
+        // Populate salon-detail cache — through the real proxy, mirroring SalonController.
+        salonService.getPublicSalon(salonId);
 
         // Evict cache via deactivateSalon
         salonService.deactivateSalon(ownerId, salonId);
 
         // Cache was evicted — repository must be queried again
-        salonService.getSalonEntity(salonId);
+        salonService.getPublicSalon(salonId);
 
         verify(salonRepository, times(2)).findByIdAndIsActiveTrueWithOwner(salonId);
     }

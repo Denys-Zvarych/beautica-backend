@@ -61,9 +61,14 @@ class SalonServiceAdminTest {
 
     // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
     // parameter — without it the field receives null and resolveOblastId throws NPE whenever
-    // getCityId() returns a non-null value (mirrors MasterServiceTest).
+    // getCityId() returns a non-null value (mirrors MasterServiceTest). CityRepository backs
+    // ONLY the batch resolveOblastIdsByCityIds sibling now (getOwnerSalons) — the single-row
+    // resolveOblastId delegates to the shared LocationQueryService below (Phase 240 perf fix).
     @Mock
     private com.beautica.location.repository.CityRepository cityRepository;
+
+    @Mock
+    private com.beautica.location.service.LocationQueryService locationQueryService;
 
     @InjectMocks
     private SalonService salonService;
