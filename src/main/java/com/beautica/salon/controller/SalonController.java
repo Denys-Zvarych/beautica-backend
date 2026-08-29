@@ -18,7 +18,6 @@ import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
 import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Pageable;
@@ -41,7 +40,6 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1/salons")
 @RequiredArgsConstructor
-@Tag(name = "salon")
 public class SalonController {
 
     private final SalonService salonService;
