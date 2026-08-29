@@ -84,6 +84,14 @@ class SalonServiceCacheTest {
                         throws TransactionException {}
             };
         }
+
+        // Phase 23.1: SalonService now constructor-depends on Clock (§G — no bare
+        // Instant.now()/LocalDate.now()). This slice does not exercise the pending-invites
+        // paths that read it, so a plain system clock satisfies the wiring only.
+        @Bean
+        java.time.Clock clock() {
+            return java.time.Clock.systemUTC();
+        }
     }
 
     @MockBean SalonRepository salonRepository;
@@ -102,6 +110,10 @@ class SalonServiceCacheTest {
     // and neither mock is exercised beyond satisfying Spring's bean graph.
     @MockBean CityRepository cityRepository;
     @MockBean com.beautica.location.service.LocationQueryService locationQueryService;
+    // Phase 23.1: SalonService now constructor-depends on InviteTokenRepository
+    // (listPendingInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
+    // not exercise those paths, so a mock/fixed-clock bean satisfies the wiring only.
+    @MockBean com.beautica.user.InviteTokenRepository inviteTokenRepository;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;

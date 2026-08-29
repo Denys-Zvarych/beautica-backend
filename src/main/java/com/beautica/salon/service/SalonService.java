@@ -18,6 +18,7 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.PendingInviteResponse;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
@@ -25,6 +26,8 @@ import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.search.service.SearchCacheNames;
+import com.beautica.user.InviteToken;
+import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -39,10 +42,12 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.time.Clock;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -54,6 +59,7 @@ public class SalonService {
     private final SalonRepository salonRepository;
     private final UserRepository userRepository;
     private final InviteService inviteService;
+    private final InviteTokenRepository inviteTokenRepository;
     private final MasterRepository masterRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
@@ -61,6 +67,7 @@ public class SalonService {
     private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
     private final AuthorizationService authorizationService;
+    private final Clock clock;
 
     @Transactional
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
@@ -558,6 +565,93 @@ public class SalonService {
                 userId, salonId, destinationSalonId, actorId);
 
         return SalonAdminResponse.from(admin);
+    }
+
+    /**
+     * Lists pending (not-yet-accepted, unexpired) invites for a salon (Phase 23.1
+     * {@code GET /salons/{salonId}/invites/pending}). Salon-scoping — the caller must be the
+     * SALON_OWNER of {@code salonId} or a SALON_ADMIN assigned to it — is already enforced by
+     * {@code @PreAuthorize("... and @authz.canManageSalon(authentication, #salonId)")} on the
+     * controller (mirrors {@link #updateSalon}/{@link #inviteMaster}); a denied caller never
+     * reaches this method, and {@code AuthorizationDeniedException} is logged at WARN by
+     * {@code GlobalExceptionHandler#handleAuthorizationDenied} (method + path + authorities +
+     * non-PII subject — no redundant WARN needed here).
+     *
+     * <p>Never exposes the token value or its hash — {@link PendingInviteResponse} carries only
+     * the recipient email, role, and timestamps (Anti-Bug §I). "Pending" excludes both
+     * already-used and expired tokens, via {@link InviteTokenRepository
+     * #findBySalonIdAndIsUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc}.
+     */
+    @Transactional(readOnly = true)
+    public List<PendingInviteResponse> listPendingInvites(UUID salonId) {
+        return inviteTokenRepository
+                .findBySalonIdAndIsUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(salonId, clock.instant())
+                .stream()
+                .map(PendingInviteResponse::from)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Cancels (revokes) a pending invite (Phase 23.1 {@code DELETE
+     * /salons/{salonId}/invites/{inviteId}}). Salon-scoping is enforced by {@code @PreAuthorize}
+     * on the controller exactly as in {@link #listPendingInvites} — a caller without management
+     * access to {@code salonId} never reaches this method.
+     *
+     * <p>Marks the token {@code used = true} rather than deleting the row (per the phase doc —
+     * avoids FK-cascade surprises and leaves an audit trail of a cancelled, never-accepted
+     * invite) — mirrors {@link #removeAdmin}/{@link #rotateAdmin}, which likewise mutate a
+     * managed entity loaded in this transaction and rely on Hibernate dirty-checking to flush on
+     * commit rather than an explicit {@code save()}.
+     *
+     * <p>Defense-in-depth cross-salon check: re-verifies {@code token.getSalonId().equals
+     * (salonId)} even though the controller's {@code @PreAuthorize} already scopes the salon —
+     * a caller with management access to salon A must never cancel a token that happens to
+     * belong to salon B just because it knows the token's id. A token belonging to a different
+     * salon, already used, or simply missing all collapse to the same {@link NotFoundException}
+     * (404) — distinguishing "belongs to another salon" from "does not exist" via a different
+     * status would let an authorized caller probe arbitrary invite ids and learn which ones exist
+     * at OTHER salons (IDOR oracle — same rationale as {@code AuthorizationService
+     * #salonsShareOwner}'s collapsed denial reasons).
+     *
+     * <p>QA audit Phase 23.1 (Security MEDIUM): the token is loaded via {@link #lockInviteForCancel}
+     * — a {@code PESSIMISTIC_WRITE} row lock, the SAME lock {@code InviteService#acceptInvite}
+     * takes via {@code findByTokenForUpdate} — rather than a plain {@code findById}. A cancel racing
+     * an accept now serialises against it: whichever side's lock is granted first wins, and the
+     * loser's grant always returns the freshly-committed row, so this method's {@code isUsed()}
+     * check below can never act on a stale, pre-accept snapshot. See
+     * {@code PendingInviteCancelAcceptRaceIT}.
+     *
+     * @throws NotFoundException if {@code inviteId} does not resolve to a pending (unused) invite
+     *                            for {@code salonId}
+     */
+    @Transactional
+    public void cancelInvite(UUID actorId, UUID salonId, UUID inviteId) {
+        InviteToken token = lockInviteForCancel(inviteId)
+                .orElseThrow(() -> new NotFoundException("Invite not found: " + inviteId));
+
+        if (token.isUsed() || !salonId.equals(token.getSalonId())) {
+            throw new NotFoundException("Invite not found: " + inviteId);
+        }
+
+        token.markUsed();
+
+        // Audit trail (mirrors rotateAdmin/removeAdmin's INFO line) — UUIDs only, never the
+        // recipient email or any token material (Anti-Bug §I).
+        log.info("Invite {} for salon {} cancelled by actor {}", inviteId, salonId, actorId);
+    }
+
+    /**
+     * Seam for {@link #cancelInvite} — isolated into its own method (public, not {@code private})
+     * so a concurrency test can {@code @SpyBean} + spy on it and pause the calling thread here,
+     * immediately after the row lock is acquired but before the transaction commits (mirrors the
+     * lock-seam pattern {@code AppointmentTransitionService} uses, e.g.
+     * {@code lockAppointmentHeaderBeforeClientItemCancel}). Delegates to {@link
+     * InviteTokenRepository#findByIdForUpdate}, which takes a {@code PESSIMISTIC_WRITE} row lock —
+     * see that method's Javadoc for why this replaced a plain {@code findById} (Phase 23.1 QA audit
+     * Security MEDIUM).
+     */
+    public Optional<InviteToken> lockInviteForCancel(UUID inviteId) {
+        return inviteTokenRepository.findByIdForUpdate(inviteId);
     }
 
     /**

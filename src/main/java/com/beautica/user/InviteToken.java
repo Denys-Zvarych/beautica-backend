@@ -32,6 +32,15 @@ import java.util.UUID;
  *       cannot be expressed via {@code @Index columnList}, and Hibernate
  *       {@code ddl-auto=validate} does not verify indexes — hence documented here instead of
  *       annotated.</li>
+ *   <li>{@code idx_invite_tokens_salon_pending} — partial index on
+ *       {@code (salon_id, expires_at) WHERE is_used = false} (V149). Serves the pending-invites
+ *       listing {@code findBySalonIdAndIsUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc} behind
+ *       {@code GET /api/v1/salons/{salonId}/invites/pending}. {@code expires_at} is deliberately
+ *       the second column rather than {@code created_at}: there is no cleanup job for
+ *       {@code invite_tokens}, so expired-but-unused rows accumulate indefinitely, and putting
+ *       {@code expires_at} second lets Postgres apply {@code expires_at > ?} as an index
+ *       condition and skip that dead tail, leaving only a cheap sort over the small live-pending
+ *       set for the {@code ORDER BY created_at DESC}.</li>
  * </ul>
  */
 @Entity

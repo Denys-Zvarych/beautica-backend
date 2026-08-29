@@ -9,6 +9,7 @@ import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.InviteRequest;
+import com.beautica.salon.dto.PendingInviteResponse;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.RotateAdminRequest;
 import com.beautica.salon.dto.SalonAdminResponse;
@@ -175,5 +176,28 @@ public class SalonController {
         SalonAdminResponse response =
                 salonService.rotateAdmin(actorId, salonId, userId, request.destinationSalonId());
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    // Phase 23.1 — SALON_OWNER/SALON_ADMIN manage their salon's outbound invites. canManageSalon
+    // enforces the same salon-scoping as updateSalon/inviteMaster above (owner-of-this-salon or
+    // admin-assigned-to-this-salon); a caller without access is denied before either method runs.
+    @GetMapping("/{salonId}/invites/pending")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<PendingInviteResponse>> listPendingInvites(
+            @PathVariable UUID salonId
+    ) {
+        return ApiResponse.ok(salonService.listPendingInvites(salonId));
+    }
+
+    @DeleteMapping("/{salonId}/invites/{inviteId}")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ResponseEntity<Void> cancelInvite(
+            @PathVariable UUID salonId,
+            @PathVariable UUID inviteId,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        salonService.cancelInvite(actorId, salonId, inviteId);
+        return ResponseEntity.noContent().build();
     }
 }
