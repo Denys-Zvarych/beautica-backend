@@ -182,6 +182,30 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     List<UUID> findMasterIdsByServiceDefinitionId(@Param("serviceDefId") UUID serviceDefId);
 
     /**
+     * Batch {@code COUNT(...) GROUP BY master} of each given master's currently ACTIVE
+     * {@code master_services} rows — backs {@code SalonService#getSalonStaff} (Phase 21.5 staff
+     * roster), where every master on a salon's roster needs its own {@code serviceCount}.
+     *
+     * <p>One query for the whole salon rather than one {@code COUNT} per master — mirrors the
+     * batch shape of {@link #findDistinctOfferedCategoriesByMasterIds} — so a salon with many
+     * masters does not turn the roster read into an N+1 (Anti-Bug §E-3). A master with zero
+     * active services simply has no row in the result; the caller defaults it to 0.
+     *
+     * <p>Deliberately NOT filtered on {@code sd.isActive} (unlike
+     * {@link #findByMasterIdAndIsActiveTrueWithGraph}): this count is a management-facing "how
+     * many services is this master set up with" figure, not the public bookable-service list, so
+     * it is not required to hide a service whose {@code ServiceDefinition} was soft-deleted out
+     * from under an otherwise-active assignment.
+     */
+    @Query("""
+            SELECT ms.master.id AS masterId, COUNT(ms) AS serviceCount
+            FROM MasterServiceAssignment ms
+            WHERE ms.master.id IN :masterIds AND ms.isActive = true
+            GROUP BY ms.master.id
+            """)
+    List<MasterServiceCountProjection> countActiveByMasterIdIn(@Param("masterIds") Collection<UUID> masterIds);
+
+    /**
      * Returns true if the given master has at least one assignment whose linked service
      * definition is <em>also</em> active — i.e. at least one service visible in the
      * master's menu and the public browse.

@@ -98,6 +98,10 @@ class SalonServiceCacheTest {
     @MockBean UserRepository userRepository;
     @MockBean InviteService inviteService;
     @MockBean MasterRepository masterRepository;
+    // Phase 21.5: SalonService now constructor-depends on MasterServiceRepository
+    // (getSalonStaff's batch service-count query). This slice does not exercise that path,
+    // so a mock satisfies the wiring only.
+    @MockBean com.beautica.service.repository.MasterServiceRepository masterServiceRepository;
     @MockBean LocalityWriteValidator localityWriteValidator;
     @MockBean MasterService masterService;
     // Phase 21.3: SalonService now constructor-depends on AuthorizationService (rotateAdmin).

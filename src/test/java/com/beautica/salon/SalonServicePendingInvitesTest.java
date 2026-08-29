@@ -12,6 +12,7 @@ import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.PendingInviteResponse;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.SalonService;
+import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.UserRepository;
@@ -70,6 +71,9 @@ class SalonServicePendingInvitesTest {
     private MasterRepository masterRepository;
 
     @Mock
+    private MasterServiceRepository masterServiceRepository;
+
+    @Mock
     private LocalityWriteValidator localityWriteValidator;
 
     @Mock
@@ -94,8 +98,8 @@ class SalonServicePendingInvitesTest {
         Clock fixedClock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         salonService = new SalonService(
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
-                localityWriteValidator, masterService, cityRepository, locationQueryService, cacheManager,
-                authorizationService, fixedClock);
+                masterServiceRepository, localityWriteValidator, masterService, cityRepository,
+                locationQueryService, cacheManager, authorizationService, fixedClock);
     }
 
     @Test

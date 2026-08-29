@@ -15,6 +15,7 @@ import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterSummaryResponse;
+import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -22,10 +23,13 @@ import com.beautica.salon.dto.PendingInviteResponse;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
+import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.search.service.SearchCacheNames;
+import com.beautica.service.repository.MasterServiceCountProjection;
+import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.UserRepository;
@@ -43,6 +47,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,6 +66,7 @@ public class SalonService {
     private final InviteService inviteService;
     private final InviteTokenRepository inviteTokenRepository;
     private final MasterRepository masterRepository;
+    private final MasterServiceRepository masterServiceRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
     private final CityRepository cityRepository;
@@ -370,6 +376,56 @@ public class SalonService {
                 pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
         return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
                 .map(MasterSummaryResponse::from);
+    }
+
+    /**
+     * Management-scoped staff roster for {@code GET /{salonId}/staff} (Phase 21.5) — masters
+     * (any type bound to the salon) AND {@code SALON_ADMIN}s in one read, so the mobile Персонал
+     * tab and staff-detail screen never need two round trips or two response shapes.
+     *
+     * <p>REUSE, not a parallel read path: masters are sourced via the SAME
+     * {@link MasterRepository#findBySalonIdAndIsActiveTrueWithUser} query
+     * {@link #getMastersBySalon} already uses (called with {@link Pageable#unpaged()} — a salon's
+     * staff roster is bounded by the salon's actual headcount, never the unbounded-collection
+     * concern §E-3 guards against; this is the same reasoning that already lets
+     * {@link #listPendingInvites} return an unbounded {@code List} for one salon). Admins are
+     * sourced via {@link UserRepository#findBySalonIdAndRole}. {@code serviceCount} per master
+     * comes from {@link MasterServiceRepository#countActiveByMasterIdIn} — one batch
+     * {@code GROUP BY} query for the whole roster, never a per-master count (Anti-Bug §E-3).
+     */
+    @Transactional(readOnly = true)
+    public List<SalonStaffMemberResponse> getSalonStaff(UUID salonId) {
+        List<Master> masters = masterRepository
+                .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
+                .getContent();
+
+        Map<UUID, Long> serviceCountByMasterId = resolveServiceCounts(masters);
+
+        List<SalonStaffMemberResponse> staff = masters.stream()
+                .map(master -> SalonStaffMemberResponse.fromMaster(
+                        master, serviceCountByMasterId.getOrDefault(master.getId(), 0L)))
+                .collect(Collectors.toCollection(ArrayList::new));
+
+        userRepository.findBySalonIdAndRole(salonId, Role.SALON_ADMIN).stream()
+                .map(SalonStaffMemberResponse::fromAdmin)
+                .forEach(staff::add);
+
+        return staff;
+    }
+
+    /**
+     * Batch-resolves {@link #getSalonStaff}'s per-master {@code serviceCount} in ONE query
+     * (Anti-Bug §E-3) — never a per-master {@code COUNT} call inside the mapping loop above.
+     */
+    private Map<UUID, Long> resolveServiceCounts(List<Master> masters) {
+        if (masters.isEmpty()) {
+            return Map.of();
+        }
+        List<UUID> masterIds = masters.stream().map(Master::getId).toList();
+        return masterServiceRepository.countActiveByMasterIdIn(masterIds).stream()
+                .collect(Collectors.toMap(
+                        MasterServiceCountProjection::getMasterId,
+                        MasterServiceCountProjection::getServiceCount));
     }
 
     @Transactional(readOnly = true)

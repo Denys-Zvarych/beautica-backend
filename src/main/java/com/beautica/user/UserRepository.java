@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -44,6 +45,24 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      * caller cannot use this predicate to probe non-admin users assigned to a salon.
      */
     boolean existsByIdAndSalonIdAndRole(UUID id, UUID salonId, Role role);
+
+    /**
+     * Backs {@link com.beautica.salon.service.SalonService#getSalonStaff} — the
+     * {@code SALON_ADMIN} half of the management-scoped staff roster (Phase 21.5). Masters are
+     * sourced separately via {@code MasterRepository.findBySalonIdAndIsActiveTrueWithUser}
+     * (there is no {@code Master} row for an admin), so this finder is scoped by role so a
+     * de-activated or CLIENT-role user sharing the same {@code salon_id} column value (which
+     * cannot actually occur for CLIENT, but mirrors the role-scoping discipline of
+     * {@link #existsByIdAndSalonIdAndRole}) never leaks into the roster.
+     *
+     * <p>Unlike {@code MasterRepository.findBySalonIdAndIsActiveTrueWithUser}, this query has no
+     * {@code isActive} filter. That is not an oversight: nothing in this codebase ever sets
+     * {@code User.isActive = false} today (only {@code Salon} and {@code Master} are
+     * soft-deactivated), so the asymmetry is harmless as written. If a future user-suspension
+     * feature starts setting {@code User.isActive = false}, this query must gain the same filter
+     * or deactivated admins will keep appearing in salon rosters.
+     */
+    List<User> findBySalonIdAndRole(UUID salonId, Role role);
 
     /**
      * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids

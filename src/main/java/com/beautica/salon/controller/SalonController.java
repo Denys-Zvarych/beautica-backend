@@ -14,8 +14,11 @@ import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.RotateAdminRequest;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
+import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Pageable;
@@ -38,6 +41,7 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1/salons")
 @RequiredArgsConstructor
+@Tag(name = "salon")
 public class SalonController {
 
     private final SalonService salonService;
@@ -104,6 +108,28 @@ public class SalonController {
                 page.getTotalElements(),
                 page.getTotalPages()
         ));
+    }
+
+    /**
+     * Management-scoped staff roster (Phase 21.5) — masters AND admins in one read, backing the
+     * mobile Персонал tab and the staff-member detail screen for BOTH a {@code SALON_MASTER} and
+     * a {@code SALON_ADMIN}. Unlike {@link #getMastersBySalon} (public, master-only,
+     * PII-masked) this endpoint returns unmasked {@code phoneNumber}/{@code instagram} and
+     * includes admins — so it is management-gated, not {@code permitAll}.
+     *
+     * <p>{@code @authz.canManageSalon} is the IDENTICAL expression already gating
+     * {@link #updateSalon}/{@link #inviteMaster}/{@link #listPendingInvites} — reused verbatim,
+     * not re-derived, so a future role change to salon management cannot diverge between sibling
+     * endpoints.
+     */
+    @Operation(summary = "List salon staff (masters and admins)",
+            description = "Management-scoped roster combining the salon's masters (any type) "
+                    + "and SALON_ADMINs, with unmasked contact details. Requires management "
+                    + "access to the salon (owner or assigned admin).")
+    @GetMapping("/{salonId}/staff")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<SalonStaffMemberResponse>> getSalonStaff(@PathVariable UUID salonId) {
+        return ApiResponse.ok(salonService.getSalonStaff(salonId));
     }
 
     /**
