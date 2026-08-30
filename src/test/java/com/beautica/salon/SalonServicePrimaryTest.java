@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.ForbiddenException;
@@ -173,6 +174,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(UUID.randomUUID());
 
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .owner(owner)
                 .name("Test")
                 .isActive(true)

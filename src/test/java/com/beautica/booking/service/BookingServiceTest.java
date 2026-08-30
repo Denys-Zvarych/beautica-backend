@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
@@ -535,6 +536,7 @@ class BookingServiceTest {
         // state deactivateSalon leaves behind (it does not cascade).
         Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
         salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .isActive(false)
                 .build());
@@ -560,6 +562,7 @@ class BookingServiceTest {
     void should_createBooking_when_masterSalonIsActive() {
         Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
         salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .isActive(true)
                 .build());

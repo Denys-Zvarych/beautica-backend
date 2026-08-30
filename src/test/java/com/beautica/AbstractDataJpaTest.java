@@ -1,13 +1,17 @@
 package com.beautica;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.validation.beanvalidation.MethodValidationPostProcessor;
 import org.testcontainers.containers.PostgreSQLContainer;
+
+import java.util.UUID;
 
 /**
  * Base class for {@code @DataJpaTest} slice tests that need a real PostgreSQL container.
@@ -54,10 +58,33 @@ public abstract class AbstractDataJpaTest {
         POSTGRES.start();
     }
 
+    // @DataJpaTest autoconfigures a JdbcTemplate bean when spring-jdbc is on the classpath —
+    // used only to resolve a real cities.id row for salon fixtures (see #testCityId()).
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
     @DynamicPropertySource
     static void registerDatasource(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+    }
+
+    /**
+     * Resolves a real, persisted {@code cities.id} row for {@code @DataJpaTest} fixtures that
+     * {@code em.persist()} a {@link com.beautica.salon.entity.Salon}.
+     *
+     * <p>{@code salons.city_id} carries {@code fk_salons_city_id} (V54) to {@code cities(id)} and,
+     * as of V150, is {@code NOT NULL} — a literal {@code UUID.randomUUID()} fails the FK check on
+     * flush, so every fixture that persists a salon must resolve a seeded row instead of inventing
+     * one. Vinnytsia is used everywhere for consistency with
+     * {@link com.beautica.service.ServiceTestFixtures#createSalon} and
+     * {@link com.beautica.AbstractIntegrationTest#testCityId()} (the {@code @SpringBootTest}-side
+     * sibling of this method — the two slice families cannot share a base class, see this class's
+     * own javadoc on cross-slice sharing).
+     */
+    protected UUID testCityId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
     }
 }

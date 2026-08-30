@@ -24,6 +24,16 @@ import java.util.UUID;
  * {@code locationNote} (and {@code districtId}, per the rule above) remains
  * optional.
  *
+ * <p><strong>{@code locationNote} PATCH semantics:</strong> {@code null} means
+ * "not included in this update — leave the stored value unchanged" (the same
+ * contract as {@code cityId} above); the empty string ({@code ""}) is the
+ * explicit signal to <em>clear</em> a previously-saved note. This matches the
+ * mobile client exactly: {@code salon_management_profile_notifier.dart}'s
+ * {@code saveAddress()} omits the field (sends {@code null}) when the note is
+ * untouched and sends {@code ""} when the user blanks it. Do not "fix" this by
+ * treating blank/absent the same way — that would remove the only way to clear
+ * a note. See {@code SalonService#updateSalon}.
+ *
  * <p>The legacy free-text {@code city} / {@code region} / {@code address}
  * fields are retained on the wire for backward-compatible clients but are
  * <em>no longer the source of truth</em> — the service stops persisting them

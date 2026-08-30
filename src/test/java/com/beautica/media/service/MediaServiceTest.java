@@ -1,5 +1,6 @@
 package com.beautica.media.service;
 
+import com.beautica.TestConstants;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -345,7 +346,8 @@ class MediaServiceTest {
     void should_uploadPortfolioForSalon_when_salonOwnerUploads() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Salon.builder().id(salonId).isActive(true).build();
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build();
         when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
                 .thenReturn(Optional.of(salon));
         when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));
@@ -504,7 +506,8 @@ class MediaServiceTest {
     void should_evictPortfolioCache_when_uploadPortfolioPhotoSucceeds() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Salon.builder().id(salonId).isActive(true).build();
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build();
         when(salonRepo.findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc(any(UUID.class)))
                 .thenReturn(Optional.of(salon));
         when(userRepo.getReferenceById(actorId)).thenReturn(newUser(actorId));

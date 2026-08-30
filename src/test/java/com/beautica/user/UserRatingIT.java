@@ -99,8 +99,8 @@ class UserRatingIT extends AbstractIntegrationTest {
         UUID ownerId = createUser(ownerEmail, "SALON_OWNER");
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
         String masterEmail = "rating-reviewed-master-" + System.nanoTime() + "@beautica.test";
         UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);
         UUID masterId = UUID.randomUUID();
@@ -268,8 +268,8 @@ class UserRatingIT extends AbstractIntegrationTest {
         UUID ownerId = createUser("rating-provider-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
         UUID masterUserId = createUser(
                 "rating-provider-master-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId);
         UUID masterId = UUID.randomUUID();

@@ -1172,8 +1172,8 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
 
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + ownerId, testCityId());
 
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + System.nanoTime() + "@beautica.test";

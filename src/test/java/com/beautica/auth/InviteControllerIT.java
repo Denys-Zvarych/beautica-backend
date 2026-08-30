@@ -513,9 +513,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
                 salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
-                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
-                salonId, salonOwnerEmail);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) " +
+                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now(), ?)",
+                salonId, salonOwnerEmail, testCityId());
         createdSalonIds.add(salonId);
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
@@ -564,9 +564,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
                 salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
-                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
-                salonId, salonOwnerEmail);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) " +
+                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now(), ?)",
+                salonId, salonOwnerEmail, testCityId());
         createdSalonIds.add(salonId);
 
         String rawTokenA = UUID.randomUUID().toString();
@@ -907,9 +907,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
 
     private String promoteToSalonOwnerWithSalon(String email, String existingToken, UUID salonId) throws Exception {
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now())",
-                salonId, email
-        );
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now(), ?)",
+                salonId, email, testCityId());
         createdSalonIds.add(salonId);
         transactionTemplate.executeWithoutResult(status ->
                 userRepository.findByEmail(email).ifPresent(user -> {

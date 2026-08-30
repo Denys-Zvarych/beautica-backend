@@ -264,6 +264,7 @@ class SalonRepositoryPrimaryTest extends AbstractDataJpaTest {
 
     private Salon persistSalon(User owner, String name, boolean isActive, boolean isPrimary) {
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name(name)
                 .isActive(isActive)

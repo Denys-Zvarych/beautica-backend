@@ -1,5 +1,6 @@
 package com.beautica.salon.dto;
 
+import com.beautica.TestConstants;
 import com.beautica.salon.entity.Salon;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -16,6 +17,7 @@ class PublicSalonResponseTest {
     @DisplayName("returns null avgRating when reviewCount is 0, even if a value is persisted")
     void should_returnNullAvgRating_when_reviewCountIsZero() {
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .name("Beauty Bar")
                 .avgRating(new BigDecimal("4.50")) // stale/leftover value — must still be nulled
@@ -34,6 +36,7 @@ class PublicSalonResponseTest {
     @DisplayName("returns the persisted avgRating when reviewCount is greater than 0")
     void should_returnPersistedAvgRating_when_reviewCountIsPositive() {
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .name("Beauty Bar")
                 .avgRating(new BigDecimal("4.75"))
@@ -50,6 +53,7 @@ class PublicSalonResponseTest {
     @DisplayName("maps coverImageUrl through unchanged")
     void should_mapCoverImageUrl_when_present() {
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .name("Beauty Bar")
                 .coverImageUrl("https://cdn.example.com/cover.jpg")
@@ -65,6 +69,7 @@ class PublicSalonResponseTest {
     @DisplayName("does not expose the salon owner or any other internal id (public DTO, §I)")
     void should_notExposeOwnerId_onPublicDto() {
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .name("Beauty Bar")
                 .reviewCount(0)
@@ -102,9 +107,10 @@ class PublicSalonResponseTest {
     }
 
     @Test
-    @DisplayName("leaves oblastId null when the caller resolved null (e.g. salon has no cityId)")
+    @DisplayName("leaves oblastId null when the caller passes null (from() never re-derives it from the salon)")
     void should_returnNullOblastId_when_callerResolvesNull() {
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .name("Beauty Bar")
                 .reviewCount(0)

@@ -630,8 +630,8 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
     private UUID createSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, is_active) VALUES (?, ?, ?, 'Kyiv', true)",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, city, is_active, city_id) VALUES (?, ?, ?, 'Kyiv', true, ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 

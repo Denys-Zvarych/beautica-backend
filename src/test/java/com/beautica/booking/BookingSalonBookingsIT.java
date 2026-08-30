@@ -445,13 +445,17 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * {@code master.getSalon()} proxy resolutions, each of which must hit the SAME identity-map
      * entry to stay free.
      *
-     * <p>4 = the ID page ({@code findIdsBySalonIdFiltered}) + the graph hydrate ({@code
+     * <p>5 = the ID page ({@code findIdsBySalonIdFiltered}) + the graph hydrate ({@code
      * findAllByIdsWithGraph}, which fetch-joins {@code b.salon}) + the client-&gt;provider review
      * batch ({@code reviewRepository.findReviewedBookingIds}, always run) + the
      * provider-&gt;client review batch ({@code clientReviewRepository.findReviewedBookingIds}, run
-     * because every seeded row is review-eligible). Notably NOT 5: the per-row {@code
-     * hasProviderAuthorityOverBooking} call costs ZERO extra statements for THIS actor (the salon
-     * OWNER) specifically because {@code AuthorizationService:716}'s in-memory
+     * because every seeded row is review-eligible) + the discovery-label city batch
+     * ({@code TaxonomyDiscoveryLocationResolver#resolveCityLabels}, run because {@code
+     * resolveBookingLabels}' {@code cityIds} set is non-empty — every seeded master shares one
+     * salon, so this is ONE query for the whole page, not one per row; the sibling district batch
+     * stays skipped since no fixture in this test sets a {@code districtId}). Notably NOT 6: the
+     * per-row {@code hasProviderAuthorityOverBooking} call costs ZERO extra statements for THIS
+     * actor (the salon OWNER) specifically because {@code AuthorizationService:716}'s in-memory
      * {@code salon.getOwner().getId().equals(actorId)} short-circuits before {@code
      * hasManagementAccess} — but reaching that free comparison at all still requires {@code
      * salon.getOwner()} (a non-identifier property read on the {@code Salon} the {@code
@@ -467,8 +471,17 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * {@code Salon} entity and must issue its own {@code SELECT} to read {@code salon.getOwner()}.
      * Confirmed RED, then the fetch join was restored and the gate re-confirmed GREEN at 4. This is
      * exactly the regression backend-perf's MEDIUM finding describes as currently uncaught.
+     *
+     * <p><b>Baseline moved 4 -&gt; 5 (V150, "a salon must always have a city").</b> Every salon
+     * test fixture now sets a real, non-null {@code cityId} (previously this fixture left it
+     * {@code NULL}, so {@code resolveBookingLabels}' {@code cityIds} set was empty and the city
+     * batch above was skipped entirely). This is the fixture becoming more representative of
+     * production — post-V150 every real salon has a city, so this query is now ALWAYS exercised
+     * in production too — not a new N+1: the mutation above still adds its own independent +1 on
+     * top of this new baseline (identity-map miss vs. city-label resolution are unrelated code
+     * paths), so the gate's discriminating power against that specific regression is unaffected.
      */
-    private static final long SALON_OWNER_COMPLETED_PAGE_STATEMENTS = 4L;
+    private static final long SALON_OWNER_COMPLETED_PAGE_STATEMENTS = 5L;
 
     @Test
     @DisplayName("SALON_OWNER scope, COMPLETED (review-eligible) page — the per-row "

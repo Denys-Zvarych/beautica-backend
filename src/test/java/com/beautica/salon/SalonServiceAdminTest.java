@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteResponse;
@@ -151,6 +152,7 @@ class SalonServiceAdminTest {
 
     private Salon buildSalon(UUID id, User owner, String name) {
         var salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .owner(owner)
                 .name(name)
                 .isActive(true)

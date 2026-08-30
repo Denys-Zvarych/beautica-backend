@@ -348,8 +348,8 @@ class ReviewLoopIT extends AbstractIntegrationTest {
         UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
         UUID masterUserId = createUser("loop-salonmaster-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(

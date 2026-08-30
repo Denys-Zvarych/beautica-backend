@@ -102,9 +102,9 @@ class SortOracleHttpIT extends AbstractIntegrationTest {
         UUID ownerId = createUser("owner-" + UUID.randomUUID() + "@test.com", "SALON_OWNER", null);
         salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, is_primary, created_at, updated_at) "
-                        + "VALUES (?, ?, 'Sort Oracle Salon', true, true, NOW(), NOW())",
-                salonId, ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, is_primary, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, 'Sort Oracle Salon', true, true, NOW(), NOW(), ?)",
+                salonId, ownerId, testCityId());
 
         String masterEmail = "master-" + UUID.randomUUID() + "@test.com";
         UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);

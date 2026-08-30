@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
@@ -210,7 +211,7 @@ class SalonServiceMultiTest {
         Salon salonWithCity = Salon.builder().owner(owner).name("Salon A").isActive(true).cityId(cityA).build();
         ReflectionTestUtils.setField(salonWithCity, "id", UUID.randomUUID());
         ReflectionTestUtils.setField(salonWithCity, "createdAt", Instant.now());
-        Salon salonNoCity = buildSalon(UUID.randomUUID(), owner, "Salon No City");
+        Salon salonNoCity = buildSalonNoCity(UUID.randomUUID(), owner, "Salon No City");
 
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId))
                 .thenReturn(List.of(salonWithCity, salonNoCity));
@@ -232,8 +233,8 @@ class SalonServiceMultiTest {
     void should_notCallCityRepository_when_noSalonHasCityId() {
         UUID ownerId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.test", Role.SALON_OWNER);
-        Salon salon1 = buildSalon(UUID.randomUUID(), owner, "Salon Alpha");
-        Salon salon2 = buildSalon(UUID.randomUUID(), owner, "Salon Beta");
+        Salon salon1 = buildSalonNoCity(UUID.randomUUID(), owner, "Salon Alpha");
+        Salon salon2 = buildSalonNoCity(UUID.randomUUID(), owner, "Salon Beta");
 
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId))
                 .thenReturn(List.of(salon1, salon2));
@@ -282,6 +283,26 @@ class SalonServiceMultiTest {
     }
 
     private Salon buildSalon(UUID id, User owner, String name) {
+        var salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .owner(owner)
+                .name(name)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(salon, "id", id);
+        ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
+        return salon;
+    }
+
+    /**
+     * Same as {@link #buildSalon(UUID, User, String)} but WITHOUT a cityId — a real salon can
+     * never reach this state going forward (DB-level {@code NOT NULL} as of V150, plus the
+     * unconditional {@code LocalityWriteValidator} guard on every write path), but the defensive
+     * null-handling in {@code SalonService#resolveOblastId}/{@code #resolveOblastIdsByCityIds}
+     * stays in place for legacy rows and is exactly what these tests exist to cover — do NOT
+     * "fix" them onto {@link #buildSalon} by giving this salon a real cityId.
+     */
+    private Salon buildSalonNoCity(UUID id, User owner, String name) {
         var salon = Salon.builder()
                 .owner(owner)
                 .name(name)

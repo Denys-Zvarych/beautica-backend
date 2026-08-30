@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("SalonRepository — data access layer")
 class SalonRepositoryTest extends AbstractDataJpaTest {
@@ -49,16 +50,19 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(otherOwner);
 
         Salon activeSalon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Active Salon")
                 .isActive(true)
                 .build();
         Salon inactiveSalon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Inactive Salon")
                 .isActive(false)
                 .build();
         Salon otherSalon = Salon.builder()
+                .cityId(testCityId())
                 .owner(otherOwner)
                 .name("Other Owner Salon")
                 .isActive(true)
@@ -99,6 +103,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("My Salon")
                 .isActive(true)
@@ -128,6 +133,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Real Owner Salon")
                 .isActive(true)
@@ -159,6 +165,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Olena Beauty")
                 .isActive(true)
@@ -203,6 +210,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(ownerB);
 
         Salon salonA = Salon.builder()
+                .cityId(testCityId())
                 .owner(ownerA)
                 .name("Salon A")
                 .isActive(true)
@@ -234,6 +242,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Active Detail Salon")
                 .isActive(true)
@@ -272,6 +281,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Inactive Detail Salon")
                 .isActive(false)
@@ -297,5 +307,59 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         assertThat(result)
                 .as("findByIdAndIsActiveTrueWithOwner must return empty when no salon matches the given UUID")
                 .isEmpty();
+    }
+
+    // ── V150/V151 "a salon must always have a city" — behavioural enforcement ──────
+
+    @Test
+    @DisplayName("persisting a Salon with a null cityId is rejected — proves the V150/V151 DB "
+            + "constraint (and Salon.cityId nullable=false) actually block the write, not just "
+            + "information_schema metadata")
+    void should_rejectPersist_when_salonCityIdIsNull() {
+        // Arrange — a real, otherwise-valid owner + salon, but with cityId deliberately null.
+        // Bypasses LocalityWriteValidator entirely (that guard lives in SalonService, one layer
+        // above the repository) so this test isolates the DB-level invariant on its own: even if
+        // every application-layer guard were removed or buggy, the column itself must refuse
+        // the write.
+        User owner = new User(
+                "owner-null-city-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Nadiya",
+                "Bondar",
+                "+380503334455"
+        );
+        em.persist(owner);
+        em.flush();
+
+        Salon cityless = Salon.builder()
+                .owner(owner)
+                .name("Cityless Salon")
+                .isActive(true)
+                .build(); // cityId deliberately left null
+
+        // Act + Assert — saveAndFlush forces the INSERT to execute now rather than deferring to
+        // end-of-test rollback, so a thrown exception here proves the write itself is rejected —
+        // confirmed (see this test's real run) to be a genuine DB-level rejection: Postgres
+        // returns SQLState 23502 ("null value in column city_id ... violates not-null
+        // constraint"), which Spring Data's repository exception translation surfaces as
+        // DataIntegrityViolationException. isInstanceOfAny also tolerates Hibernate's own
+        // not-null property check short-circuiting locally (PropertyValueException) or a bare
+        // PersistenceException wrapper, so this test stays green regardless of which layer
+        // happens to intercept the write, as long as one of them does.
+        //
+        // No follow-up SELECT after this: a failed INSERT leaves the DataJpaTest transaction
+        // aborted (Postgres refuses further statements on that connection until rollback,
+        // SQLState 25P02), and @DataJpaTest rolls the whole transaction back at test end anyway
+        // — the row can never be committed regardless, so re-querying it here would only trip
+        // the aborted-transaction state, not add proof.
+        assertThatThrownBy(() -> salonRepository.saveAndFlush(cityless))
+                .as("a Salon with cityId=null must never be persisted — V150/V151 must reject it "
+                        + "at the DB, and/or Hibernate must refuse the write locally for the "
+                        + "nullable=false mapping")
+                .isInstanceOfAny(
+                        jakarta.persistence.PersistenceException.class,
+                        org.springframework.dao.DataIntegrityViolationException.class,
+                        org.hibernate.PropertyValueException.class);
     }
 }

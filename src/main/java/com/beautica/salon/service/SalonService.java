@@ -247,7 +247,31 @@ public class SalonService {
         // district mandatory iff the city has urban districts; district a child
         // of the city). The legacy free-text city/region/address are NO LONGER
         // written (kept nullable per Phase 10.3, no longer the source of truth).
-        localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+        //
+        // PATCH semantics: a null cityId means "locality not included in this update", NOT
+        // "clear my city". Validating/writing the FK pair unconditionally against the raw
+        // (possibly-omitted) request reproduced the reported bug: a PATCH that only touches
+        // name/description/phone/etc. and omits cityId (the mobile client does not always
+        // resend it) got a 400 BusinessException ("City is required") even though the salon
+        // already has a valid city — V150/V151 guarantee every existing salon row does. Unlike
+        // CLIENT (optional locality), a salon's city is mandatory, so there is always a valid
+        // existing value to fall back to; only (re)validate and (re)write cityId/districtId when
+        // the caller actually supplies a cityId. Mirrors the CLIENT/INDEPENDENT_MASTER fix in
+        // UserService#writeLocalityFields (commit 9ed0559).
+        // Same-shape PATCH-drop bug as locationNote below, but at the FK-pair level:
+        // districtId without cityId can never be validated (the taxonomy lookup needs
+        // both) nor safely written (writing districtId alone could orphan it against the
+        // salon's EXISTING city). Silently dropping it would return a 200 while the
+        // caller believes their district change applied — fail loud instead.
+        if (request.cityId() == null && request.districtId() != null) {
+            throw new BusinessException(
+                    "Changing districtId requires supplying cityId in the same request");
+        }
+        if (request.cityId() != null) {
+            localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+            salon.setCityId(request.cityId());
+            salon.setDistrictId(request.districtId());
+        }
 
         if (request.name() != null) {
             salon.setName(request.name());
@@ -255,11 +279,19 @@ public class SalonService {
         if (request.description() != null) {
             salon.setDescription(request.description());
         }
-        salon.setCityId(request.cityId());
-        salon.setDistrictId(request.districtId());
+        // street/buildingNo are @NotBlank on UpdateSalonRequest, so they can never be
+        // absent from a validated request — the locationNote bug below is unreachable here,
+        // no null-guard needed.
         salon.setStreet(request.street());
         salon.setBuildingNo(request.buildingNo());
-        salon.setLocationNote(request.locationNote());
+        // locationNote is OPTIONAL on the DTO: null means "not included in this PATCH,
+        // leave unchanged" (mirrors the cityId contract above), while "" is the explicit
+        // clear signal — see UpdateSalonRequest#locationNote javadoc. An unconditional
+        // write here previously destroyed a saved note on any PATCH that omitted it
+        // (e.g. a name-only edit, or an address edit that only touched street/building).
+        if (request.locationNote() != null) {
+            salon.setLocationNote(request.locationNote());
+        }
         if (request.phone() != null) {
             salon.setPhone(request.phone());
         }

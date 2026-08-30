@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
@@ -934,6 +935,7 @@ class SalonControllerTest {
      */
     private com.beautica.salon.entity.Salon buildSalonEntity(UUID salonId, String name) {
         return com.beautica.salon.entity.Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(salonId)
                 .name(name)
                 .build();

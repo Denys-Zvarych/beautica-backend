@@ -1,5 +1,6 @@
 package com.beautica.booking.entity;
 
+import com.beautica.TestConstants;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.exception.BusinessException;
@@ -133,7 +134,8 @@ class AppointmentStaffFactoryTest {
     @Test
     @DisplayName("should carry the salon onto the header when the master is salon-bound")
     void should_carryTheSalon_when_masterBelongsToASalon() {
-        Salon salon = Salon.builder().id(UUID.randomUUID()).isActive(true).build();
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(UUID.randomUUID()).isActive(true).build();
 
         Appointment appointment = Appointment.staffAppointment(
                 salon, "Олена", "Коваль", "+380501234567", STAFF_ID);

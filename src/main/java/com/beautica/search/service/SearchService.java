@@ -253,9 +253,8 @@ public class SearchService {
      *
      * <p><b>Anti-Bug audit LOW-1 (2026-07):</b> {@code COALESCE}, not
      * {@code CASE WHEN sal.id IS NOT NULL THEN … ELSE … END}, is intentional and
-     * safe here — <em>not</em> because a salon is guaranteed to have a
-     * {@code city_id} (legacy pre-Phase-10.3 rows can be city-less;
-     * {@code Salon.cityId} carries no {@code NOT NULL}), but because
+     * safe here — <em>not</em> because a salon can have a null {@code city_id}
+     * ({@code salons.city_id} is {@code NOT NULL} as of V150), but because
      * {@code appendWhereClause} below pins {@code u.role = 'INDEPENDENT_MASTER'}
      * unconditionally (Phase 19.7 decision 7). Every row this query can ever
      * return belongs to an {@code INDEPENDENT_MASTER}, whose {@code masters.salon_id}

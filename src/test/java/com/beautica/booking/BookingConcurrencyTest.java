@@ -94,6 +94,17 @@ class BookingConcurrencyTest {
     @Autowired
     private BookingRepository bookingRepository;
 
+    /**
+     * Resolves a real {@code cities.id} row for the salon fixture below — this class does not
+     * extend {@code AbstractIntegrationTest} (it runs its own standalone {@code PostgreSQLContainer}),
+     * so {@code AbstractIntegrationTest#testCityId()} is duplicated here rather than inherited.
+     * {@code salons.city_id} is {@code NOT NULL} as of V150 and carries an FK to {@code cities(id)}.
+     */
+    private UUID testCityId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+    }
+
     @MockBean
     private NotificationOutboxService notificationOutboxService;
 
@@ -217,8 +228,8 @@ class BookingConcurrencyTest {
 
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Concurrency-Salon-" + ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Concurrency-Salon-" + ownerId, testCityId());
 
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + System.nanoTime() + "@beautica.test";

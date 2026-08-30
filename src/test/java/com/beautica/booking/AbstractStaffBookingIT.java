@@ -202,8 +202,8 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
         SeededUser owner = insertUser("SALON_OWNER", null);
 
         UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                + "VALUES (?, ?, ?, true, NOW(), NOW())", salonId, owner.id(), "Salon-" + salonId);
+        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, owner.id(), "Salon-" + salonId, testCityId());
 
         UUID masterId = UUID.randomUUID();
         String slug = "m-" + masterId;

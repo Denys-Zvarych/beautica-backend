@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import static org.mockito.Mockito.verifyNoInteractions;
 import com.beautica.common.exception.BusinessException;
 import org.springframework.http.HttpStatus;
@@ -202,7 +203,7 @@ class SalonServiceTest {
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         var request = new CreateSalonRequest("No Geo Salon", null, null, null, null, null, null,
                 null, null, null, null, null);
-        var savedSalon = buildSalon(UUID.randomUUID(), owner, "No Geo Salon");
+        var savedSalon = buildSalonNoCity(UUID.randomUUID(), owner, "No Geo Salon");
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
@@ -404,7 +405,7 @@ class SalonServiceTest {
     void should_returnNullOblastId_when_getPublicSalonWithoutCityId() {
         UUID salonId = UUID.randomUUID();
         User owner = buildUser(UUID.randomUUID(), "owner@beautica.com", Role.SALON_OWNER);
-        Salon salon = buildSalon(salonId, owner, "No Geo Salon");
+        Salon salon = buildSalonNoCity(salonId, owner, "No Geo Salon");
 
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
 
@@ -532,27 +533,155 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("updateSalon — propagates BusinessException from LocalityWriteValidator and does not save")
-    void should_rejectUpdateSalon_when_localityValidationFails() {
+    @DisplayName("updateSalon — propagates BusinessException from LocalityWriteValidator when a supplied cityId is rejected, and does not save")
+    void should_rejectUpdateSalon_when_suppliedCityIdFailsLocalityValidation() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
+        UUID unknownCityId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Old Name");
 
-        // City omitted — validator (the real one) would reject; here the mock is
-        // configured to throw to assert the service propagates and aborts the save.
+        // cityId IS supplied (not omitted) but the (mocked) validator rejects it — e.g. the
+        // taxonomy id does not exist. This is distinct from the omitted-cityId PATCH case
+        // (see should_notValidateOrTouchLocality_when_updateSalonOmitsCityId below): here the
+        // caller explicitly asked for a locality change, so validation must still run and its
+        // rejection must still propagate and abort the save.
         var request = new UpdateSalonRequest("New Name", null, null, null, null,
-                null, null, null, null, null, null, null);
+                unknownCityId, null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("Selected city does not exist"))
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
         assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
                 .isInstanceOf(com.beautica.common.exception.BusinessException.class)
-                .hasMessageContaining("City is required");
+                .hasMessageContaining("Selected city does not exist");
 
         verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — description-only PATCH with cityId omitted skips locality validation and leaves the salon's existing city/district untouched")
+    void should_notValidateOrTouchLocality_when_updateSalonOmitsCityId() {
+        // Regression test for the actual user-reported bug: a PATCH that only changes
+        // description (mobile's notifier does not resend cityId) used to throw
+        // BusinessException("City is required") because validateProviderLocality ran
+        // unconditionally against the raw (null) request.cityId(). A salon's city is
+        // guaranteed non-null (V150/V151), so an omitted cityId in a PATCH must mean
+        // "keep the existing locality", not "reject the request".
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID existingDistrictId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setCityId(existingCityId);
+        salon.setDistrictId(existingDistrictId);
+        salon.setDescription("Old description");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl.
+        var request = new UpdateSalonRequest(null, "New description", null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.description()).isEqualTo("New description");
+        assertThat(response.cityId())
+                .as("existing cityId must survive a description-only PATCH unchanged")
+                .isEqualTo(existingCityId);
+        assertThat(response.districtId())
+                .as("existing districtId must survive a description-only PATCH unchanged")
+                .isEqualTo(existingDistrictId);
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — a name-only PATCH that omits locationNote must not wipe the previously saved note")
+    void should_notWipeLocationNote_when_updateSalonOmitsIt() {
+        // Regression for the sibling bug to should_notValidateOrTouchLocality_when_updateSalonOmitsCityId
+        // above: locationNote is OPTIONAL on UpdateSalonRequest (unlike street/buildingNo, which
+        // are @NotBlank and therefore always present), so an unconditional
+        // salon.setLocationNote(request.locationNote()) silently wiped a saved note on ANY PATCH
+        // that didn't resend it — e.g. this name-only edit. A null locationNote in the patch must
+        // mean "not included in this update", matching the cityId PATCH contract.
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setLocationNote("Ring the back doorbell");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl.
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getLocationNote())
+                .as("a null locationNote in the patch must leave the stored note untouched (PATCH semantics)")
+                .isEqualTo("Ring the back doorbell");
+    }
+
+    @Test
+    @DisplayName("updateSalon — an explicit empty-string locationNote clears the previously saved note")
+    void should_clearLocationNote_when_updateSalonSendsEmptyString() {
+        // Pins the other half of the locationNote contract: null means "leave unchanged" (see
+        // should_notWipeLocationNote_when_updateSalonOmitsIt above), but the mobile client's
+        // clear-the-note action sends "" explicitly (salon_management_profile_notifier.dart's
+        // saveAddress() diff-then-omit formula), so "" must still reach the entity and must NOT
+        // be treated the same as null.
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setLocationNote("Ring the back doorbell");
+
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                null, null, null, null, "", null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getLocationNote())
+                .as("an explicit empty string must clear the note, distinct from a null (unchanged) patch")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("updateSalon — rejects a districtId supplied without cityId instead of silently dropping it")
+    void should_rejectUpdate_when_districtIdSuppliedWithoutCityId() {
+        // Regression for the LOW finding sibling to the cityId-omitted fix above: the locality
+        // write is gated on cityId != null, so a PATCH supplying districtId but NOT cityId used to
+        // be a silent no-op — the district was neither validated, nor written, nor rejected, and
+        // the caller got a 200 believing their change applied. Fail loud with a clean 400 instead.
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID orphanDistrictId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setCityId(existingCityId);
+
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                null, orphanDistrictId, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("cityId");
+
+        verify(salonRepository, never()).save(any());
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+        assertThat(salon.getDistrictId())
+                .as("the salon's district must remain unset — the rejected districtId must not be written")
+                .isNull();
     }
 
     @Test
@@ -831,6 +960,26 @@ class SalonServiceTest {
     }
 
     private Salon buildSalon(UUID id, User owner, String name) {
+        var salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .owner(owner)
+                .name(name)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(salon, "id", id);
+        ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
+        return salon;
+    }
+
+    /**
+     * Same as {@link #buildSalon(UUID, User, String)} but WITHOUT a cityId — a real salon can
+     * never reach this state going forward (DB-level {@code NOT NULL} as of V150, plus the
+     * unconditional {@code LocalityWriteValidator} guard on every write path), but the defensive
+     * null-handling in {@code SalonService#resolveOblastId} stays in place for legacy rows and is
+     * exactly what these tests exist to cover — do NOT "fix" them onto {@link #buildSalon} by
+     * giving this salon a real cityId.
+     */
+    private Salon buildSalonNoCity(UUID id, User owner, String name) {
         var salon = Salon.builder()
                 .owner(owner)
                 .name(name)

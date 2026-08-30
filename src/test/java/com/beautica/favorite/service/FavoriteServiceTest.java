@@ -1,5 +1,6 @@
 package com.beautica.favorite.service;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.booking.domain.MasterBookability;
 import com.beautica.common.exception.BusinessException;
@@ -368,7 +369,8 @@ class FavoriteServiceTest {
             // returned 200 and stored a row findFavoriteMasterRows filters out for ever — a soft
             // "is this account still active" oracle for a salon withdrawn from public view.
             Master master = masterOwnedBy(Role.SALON_MASTER, true);
-            master.setSalon(Salon.builder().id(UUID.randomUUID()).isActive(false).build());
+            master.setSalon(Salon.builder()
+                    .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(UUID.randomUUID()).isActive(false).build());
             // Pin the verdict to the CANONICAL rule rather than a look-alike inline predicate:
             // validateMasterTarget delegates to MasterBookability, exactly as validateServiceTarget
             // does. Re-inline the check and let the two drift, and this precondition fails.
@@ -394,7 +396,8 @@ class FavoriteServiceTest {
                 + "every salon-employed master")
         void should_persist_when_masterSalonIsActive() {
             Master master = masterOwnedBy(Role.SALON_MASTER, true);
-            master.setSalon(Salon.builder().id(UUID.randomUUID()).isActive(true).build());
+            master.setSalon(Salon.builder()
+                    .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(UUID.randomUUID()).isActive(true).build());
             when(masterRepository.findByIdWithUserAndSalon(targetId)).thenReturn(Optional.of(master));
             when(favoriteRepository.findByClientIdAndTargetTypeAndTargetId(
                     clientId, FavoriteTargetType.MASTER, targetId)).thenReturn(Optional.empty());
@@ -616,7 +619,8 @@ class FavoriteServiceTest {
             // false — the exact state that let a closed salon's services keep a live «Записатись».
             MasterServiceAssignment assignment = assignmentOwnedBy(
                     Role.SALON_MASTER, true, true, true,
-                    Salon.builder().id(UUID.randomUUID()).isActive(false).build());
+                    Salon.builder()
+                            .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(UUID.randomUUID()).isActive(false).build());
             // The rejection must be the CANONICAL rule's verdict, not a look-alike hand-rolled
             // predicate: validateServiceTarget delegates to MasterBookability, so pin the two
             // together here. If someone re-inlines the check and the two drift, this fails.
@@ -642,7 +646,8 @@ class FavoriteServiceTest {
         void should_persist_when_masterSalonIsActive() {
             MasterServiceAssignment assignment = assignmentOwnedBy(
                     Role.SALON_MASTER, true, true, true,
-                    Salon.builder().id(UUID.randomUUID()).isActive(true).build());
+                    Salon.builder()
+                            .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(UUID.randomUUID()).isActive(true).build());
             // The other half of the MasterBookability pin (see should_reject_when_masterSalonIsInactive):
             // without this, a helper that always answered false would leave that test green while
             // silently locking every salon-employed master out of the wish list.

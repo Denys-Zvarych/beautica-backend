@@ -1,5 +1,6 @@
 package com.beautica.master;
 
+import com.beautica.TestConstants;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -98,8 +99,10 @@ class MasterServiceRotateTest {
 
         User user = mock(User.class);
         when(user.getId()).thenReturn(masterUserId);
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
-        Salon destSalon = Salon.builder().id(destSalonId).isActive(true).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
+        Salon destSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(destSalonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -211,7 +214,8 @@ class MasterServiceRotateTest {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Salon.builder().id(salonId).isActive(true).build();
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -234,7 +238,8 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID sourceSalonId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -262,7 +267,8 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID sourceSalonId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -285,8 +291,10 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID sourceSalonId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
-        Salon inactiveDest = Salon.builder().id(destSalonId).isActive(false).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
+        Salon inactiveDest = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(destSalonId).isActive(false).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)

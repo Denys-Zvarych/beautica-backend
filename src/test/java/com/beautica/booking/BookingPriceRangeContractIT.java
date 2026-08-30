@@ -2175,9 +2175,9 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     private UUID addSalonUnderOwner(UUID ownerId) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
         UUID masterUserId = fixtures.createUser(
                 "bprc-owner-salon-master-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId);
         jdbcTemplate.update(
@@ -2462,9 +2462,9 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     private UUID insertBareSalonUnderOwner(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, name, testCityId());
         stampSalonLocality(salonId);
         return salonId;
     }

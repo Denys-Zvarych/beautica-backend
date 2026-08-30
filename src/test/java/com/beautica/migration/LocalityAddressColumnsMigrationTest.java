@@ -79,6 +79,27 @@ class LocalityAddressColumnsMigrationTest extends AbstractIntegrationTest {
                 .isEqualTo(expectedMaxLength);
     }
 
+    /**
+     * Same shape as {@link #assertNullableColumn}, for the one column V150 promoted to NOT NULL
+     * after this class's V54 was applied — see {@code should_addNotNullUuidCityId_when_v150Applied_salons}.
+     */
+    private void assertNotNullColumn(
+            String table, String column, String expectedType, Integer expectedMaxLength) {
+        Map<String, Object> meta = columnMeta(table, column);
+
+        assertThat(meta.get("data_type"))
+                .as("%s.%s type", table, column)
+                .isEqualTo(expectedType);
+        assertThat(meta.get("is_nullable"))
+                .as("%s.%s must be NOT NULL — V150 does NOT clean up any pre-existing null-city "
+                        + "row; it fail-loudly RAISE EXCEPTIONs and refuses to apply if one "
+                        + "exists (\"a salon must always have a city\")", table, column)
+                .isEqualTo("NO");
+        assertThat(meta.get("character_maximum_length"))
+                .as("%s.%s max length", table, column)
+                .isEqualTo(expectedMaxLength);
+    }
+
     // ---------------------------------------------------------------------
     // New locality columns — type + NULLABLE on BOTH users and salons
     // ---------------------------------------------------------------------
@@ -118,9 +139,16 @@ class LocalityAddressColumnsMigrationTest extends AbstractIntegrationTest {
         }
 
         @Test
-        @DisplayName("salons.city_id is a nullable uuid")
-        void should_addNullableUuidCityId_when_v54Applied_salons() {
-            assertNullableColumn("salons", "city_id", "uuid", null);
+        @DisplayName("salons.city_id is a NOT NULL uuid (promoted by V150, was nullable under V54)")
+        void should_addNotNullUuidCityId_when_v150Applied_salons() {
+            // V54 added this column NULLABLE (see this class's own javadoc / V54's migration
+            // comment); V150 later promoted it to NOT NULL. V150 does NO cleanup of its own — it
+            // fail-loudly RAISE EXCEPTIONs and refuses to apply if any salons.city_id IS NULL row
+            // exists; the write-path guard (LocalityWriteValidator, shipped in Phase 10.6) is what
+            // already keeps every row clean by the time V150 runs on a real database. This test
+            // class name still says "V54" but exercises the schema as currently migrated, so it
+            // must track the column's CURRENT constraint, not V54's original one.
+            assertNotNullColumn("salons", "city_id", "uuid", null);
         }
 
         @Test
