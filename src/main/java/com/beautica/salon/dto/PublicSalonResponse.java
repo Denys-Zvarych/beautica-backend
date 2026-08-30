@@ -2,6 +2,8 @@ package com.beautica.salon.dto;
 
 import com.beautica.salon.entity.Salon;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 import java.math.BigDecimal;
 import java.util.UUID;
 
@@ -42,8 +44,22 @@ public record PublicSalonResponse(
         String city,
         String region,
         String address,
+        @Schema(
+                format = "uuid",
+                requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Taxonomy city. Every salon has one — salons.city_id is DB-level "
+                        + "NOT NULL (V150/V151) and application-enforced from Phase 10.6 "
+                        + "(LocalityWriteValidator). Never null on the wire.")
         UUID cityId,
+        @Schema(
+                format = "uuid",
+                requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Parent oblast of cityId, resolved at read time (see #from). "
+                        + "cities.oblast_id is itself DB-level NOT NULL with a FK to oblasts, "
+                        + "and cityId is guaranteed non-null and FK-valid, so resolution always "
+                        + "succeeds. Never null on the wire.")
         UUID oblastId,
+        // Optional — a city without urban districts legitimately has none (§ locked decision).
         UUID districtId,
         String street,
         String buildingNo,
@@ -57,8 +73,10 @@ public record PublicSalonResponse(
     /**
      * @param salon    the salon entity
      * @param oblastId the PK of the Oblast that owns {@code salon.getCityId()}, resolved by
-     *                 the caller (see {@code SalonService#resolveOblastId}); {@code null}
-     *                 when the salon has no city set
+     *                 the caller (see {@code SalonService#resolveOblastId}). Never {@code null}
+     *                 for a persisted salon — {@code cityId} is DB-level NOT NULL (V150/V151)
+     *                 and FK-valid, and {@code cities.oblast_id} is itself NOT NULL with a FK
+     *                 to {@code oblasts}, so the resolution always succeeds.
      */
     public static PublicSalonResponse from(Salon salon, UUID oblastId) {
         return new PublicSalonResponse(
