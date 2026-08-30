@@ -2,6 +2,7 @@ package com.beautica.salon.dto;
 
 import com.beautica.location.LocalityWriteInput;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
@@ -25,10 +26,16 @@ import java.util.UUID;
  * fields are retained nullable for forward-compat with geocoder Part B.
  * They are kept on the wire but are not the source of truth.
  *
- * <p>{@code cityId}/{@code districtId} carry no Bean Validation annotation by
- * design: the UUID type rejects malformed values at deserialisation (generic
- * 400 via {@code GlobalExceptionHandler}), and referential-integrity is
- * owned by {@code LocalityWriteValidator}, not a syntactic constraint.
+ * <p>{@code cityId} is {@code @NotNull} — a salon must always have a city
+ * (mirrors the DB-level {@code NOT NULL} on {@code salons.city_id} and
+ * {@code Salon.cityId}'s {@code nullable = false}), which also makes
+ * SpringDoc emit {@code cityId} in the generated schema's {@code required}
+ * array so the contract, not just the runtime check, forbids a cityless
+ * salon. {@code districtId} carries no Bean Validation annotation by design:
+ * a city without urban districts legitimately has none, the UUID type
+ * rejects malformed values at deserialisation (generic 400 via
+ * {@code GlobalExceptionHandler}), and referential-integrity is owned by
+ * {@code LocalityWriteValidator}, not a syntactic constraint.
  * {@code @Size} caps mirror {@code @Column(length = …)} so oversized payloads
  * yield a clean 400 rather than a {@code DataIntegrityViolationException}
  * 500 (§A).
@@ -67,6 +74,7 @@ public record CreateSalonRequest(
         // Control-char @Pattern alongside @Size (§A): @Size caps length only —
         // an embedded NUL/newline would reach the DB and yield a 500 instead
         // of a clean 400.
+        @NotNull(message = "City is required")
         UUID cityId,
         UUID districtId,
         @NotBlank(message = "Street is required")
@@ -84,8 +92,13 @@ public record CreateSalonRequest(
 
     /**
      * Projects the taxonomy FK pair into the locality validator's input shape.
-     * Returns an input with {@code null} cityId when none was provided — the
-     * service guards the validator call behind a {@code cityId != null} check.
+     * {@code cityId} is {@code @NotNull} so it cannot be null by the time this
+     * runs on the create path — {@link com.beautica.salon.service.SalonService
+     * #createSalon} calls {@code LocalityWriteValidator#validateProviderLocality}
+     * unconditionally (no {@code cityId != null} guard). The validator's own
+     * null-cityId branch stays live as defence-in-depth here and remains the
+     * live path for {@code updateSalon} and the master locality-write path,
+     * where {@code cityId} is legitimately optional.
      */
     public LocalityWriteInput toLocalityInput() {
         return LocalityWriteInput.of(cityId, districtId);
