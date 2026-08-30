@@ -66,6 +66,64 @@ class PublicSalonResponseTest {
     }
 
     @Test
+    @DisplayName("maps phone through unchanged (public business contact, deliberate — see DTO javadoc)")
+    void should_mapPhone_when_present() {
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .id(UUID.randomUUID())
+                .name("Beauty Bar")
+                .phone("+380671234567")
+                .reviewCount(0)
+                .build();
+
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+
+        assertThat(response.phone())
+                .as("the salon phone is the client-facing contact rendered next to instagramUrl; "
+                        + "dropping it left the mobile «Контакти» block blank until an unrelated PATCH")
+                .isEqualTo("+380671234567");
+    }
+
+    @Test
+    @DisplayName("leaves phone null when the salon has none")
+    void should_returnNullPhone_when_salonHasNone() {
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .id(UUID.randomUUID())
+                .name("Beauty Bar")
+                .reviewCount(0)
+                .build();
+
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+
+        assertThat(response.phone()).isNull();
+    }
+
+    @Test
+    @DisplayName("serves an empty-string phone verbatim — never normalised to null (locked wire contract)")
+    void should_servePhoneVerbatim_when_salonPhoneIsEmptyString() {
+        // A salon whose owner cleared the phone stores "" (UpdateSalonRequest treats null as
+        // "omitted from this PATCH" and "" as the explicit clear signal — see SalonServiceTest
+        // #should_clearPhone_when_updateSalonSendsEmptyString). from() is a pure passthrough: the
+        // wire may carry null OR "" for "no phone", and the mobile client is defensive about both.
+        // Locked product decision — do NOT add blank-to-null normalisation here; it would silently
+        // change the wire shape (and SalonResponse's existing behaviour) for a cosmetic gain.
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .id(UUID.randomUUID())
+                .name("Beauty Bar")
+                .phone("")
+                .reviewCount(0)
+                .build();
+
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+
+        assertThat(response.phone())
+                .as("a persisted empty-string phone must be served as \"\", not tidied into null")
+                .isEmpty();
+    }
+
+    @Test
     @DisplayName("does not expose the salon owner or any other internal id (public DTO, §I)")
     void should_notExposeOwnerId_onPublicDto() {
         Salon salon = Salon.builder()

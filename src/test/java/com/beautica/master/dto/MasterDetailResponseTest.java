@@ -32,13 +32,28 @@ class MasterDetailResponseTest {
 
     private static final String PROFESSIONAL_TITLE = "Майстер манікюру";
 
+    /**
+     * The master's OWN contact number — a natural person's PII, masked unconditionally by
+     * {@code fromPublic}. Deliberately a different value from {@link #SALON_BUSINESS_PHONE} so a
+     * swap between the two halves of the masking asymmetry cannot pass silently.
+     */
+    private static final String MASTER_PERSONAL_PHONE = "+380671234567";
+
+    /** The salon's published business contact — NOT masked; see the asymmetry test below. */
+    private static final String SALON_BUSINESS_PHONE = "+380442223344";
+
     private static MasterDetailResponse fullDetailFor(MasterType masterType, UUID cityUuid, UUID oblastUuid,
             UUID districtUuid) {
+        return fullDetailFor(masterType, cityUuid, oblastUuid, districtUuid, null);
+    }
+
+    private static MasterDetailResponse fullDetailFor(MasterType masterType, UUID cityUuid, UUID oblastUuid,
+            UUID districtUuid, PublicSalonResponse salon) {
         return new MasterDetailResponse(
-                UUID.randomUUID(), "Oksana", "Kovalenko", "+380671234567", "Київ",
+                UUID.randomUUID(), "Oksana", "Kovalenko", MASTER_PERSONAL_PHONE, "Київ",
                 "вул. Хрещатик", "1A", "green door",
                 "Nail artist", "@oksana.nails", PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
-                new BigDecimal("4.75"), 12, masterType, null, List.of(),
+                new BigDecimal("4.75"), 12, masterType, salon, List.of(),
                 cityUuid, oblastUuid, districtUuid);
     }
 
@@ -131,6 +146,44 @@ class MasterDetailResponseTest {
         assertThat(publicView.masterType()).isEqualTo(full.masterType());
         assertThat(publicView.salon()).isEqualTo(full.salon());
         assertThat(publicView.workingHours()).isEqualTo(full.workingHours());
+    }
+
+    // ── phone masking asymmetry: personal number masked, salon business number public ──────
+    //
+    // Two deliberate halves of ONE rule, asserted together on purpose. MasterDetailResponse:108
+    // nulls `phoneNumber` (the master's own contact — a natural person's PII) for every
+    // MasterType, while :122 passes `full.salon()` through whole, so the embedded
+    // PublicSalonResponse keeps the salon's phone — the business contact GET /masters/{masterId}
+    // exists to publish, the direct analogue of the instagramUrl already on that DTO.
+    //
+    // Split across two tests either half could drift green: a "consistency" refactor that also
+    // masked the salon phone would re-break the mobile «Контакти» block (the bug this branch
+    // fixes by adding `phone` to PublicSalonResponse), and one that stopped masking phoneNumber
+    // would leak a real person's number on a permitAll path. It is the PAIRING that must hold.
+
+    @Test
+    @DisplayName("fromPublic masks the master's own phoneNumber while the embedded salon keeps its business phone")
+    void should_maskMasterPhone_butKeepSalonPhone_when_fromPublic() {
+        Salon salon = mock(Salon.class);
+        when(salon.getPhone()).thenReturn(SALON_BUSINESS_PHONE);
+        MasterDetailResponse full = fullDetailFor(MasterType.SALON_MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                PublicSalonResponse.from(salon, UUID.randomUUID()));
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.phoneNumber())
+                .as("the master's personal number is PII and must be masked on the public path for "
+                        + "every master type — it must never be confused with the salon's number")
+                .isNull();
+        assertThat(publicView.salon())
+                .as("fromPublic must not drop the embedded salon while masking the master")
+                .isNotNull();
+        assertThat(publicView.salon().phone())
+                .as("the salon's phone is a published business contact, not personal PII — it must "
+                        + "survive fromPublic() unmasked, or the app's «Контакти» block goes blank "
+                        + "again on the master profile")
+                .isEqualTo(SALON_BUSINESS_PHONE);
     }
 
     // ── professionalTitle (V110) — public-facing headline, never masked ────────

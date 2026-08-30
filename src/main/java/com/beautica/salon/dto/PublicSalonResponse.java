@@ -36,6 +36,14 @@ import java.util.UUID;
  * {@code backend-security} audit note on commit {@code f00b6f1}. Like {@code SalonResponse}, it
  * is derived from {@code cityId} at read time (never stored) — callers pass the resolved value
  * in; see {@link #from(Salon, UUID)}.
+ *
+ * <p>{@code phone} was added for the same reason as {@code oblastId}: this endpoint is the ONLY
+ * load path the mobile owner/admin salon-profile screen uses, so omitting the phone left the
+ * «Контакти» block blank on a freshly registered salon until the owner happened to PATCH the
+ * contacts form (which returns {@link SalonResponse}, where {@code phone} has always been
+ * present). Exposing it is deliberate, not a §I regression — the salon phone is a business
+ * contact published to clients, the direct analogue of the {@code instagramUrl} already on this
+ * DTO, and carries no natural-person identity. Do not "harden" this by stripping it again.
  */
 public record PublicSalonResponse(
         UUID id,
@@ -64,6 +72,13 @@ public record PublicSalonResponse(
         String street,
         String buildingNo,
         String locationNote,
+        @Schema(
+                description = "Salon's public business contact number. Intentionally exposed on "
+                        + "this permitAll path: it is the contact clients are meant to call, the "
+                        + "same value already returned by GET /salons/mine and rendered in the "
+                        + "app's «Контакти» block alongside instagramUrl. Not personal data of a "
+                        + "natural person, so §I does not apply. Optional — a salon may have none.")
+        String phone,
         String instagramUrl,
         String avatarUrl,
         String coverImageUrl,
@@ -92,6 +107,7 @@ public record PublicSalonResponse(
                 salon.getStreet(),
                 salon.getBuildingNo(),
                 salon.getLocationNote(),
+                salon.getPhone(),
                 salon.getInstagramUrl(),
                 salon.getAvatarUrl(),
                 salon.getCoverImageUrl(),

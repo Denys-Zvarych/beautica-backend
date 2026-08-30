@@ -616,6 +616,29 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo("Kyiv");
     }
 
+    @Test
+    @DisplayName("public salon profile exposes the phone persisted on the salon row, with no PATCH first")
+    void should_exposePhone_when_salonIsFetchedPubliclyWithoutAnyUpdate() throws Exception {
+        String ownerEmail = "owner-phone-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = createSalonOwner(ownerEmail);
+        UUID salonId = createSalon(ownerId, "Phone Salon " + System.nanoTime());
+        jdbcTemplate.update("UPDATE salons SET phone = ? WHERE id = ?", "+380671234567", salonId);
+
+        ResponseEntity<String> publicResp =
+                restTemplate.getForEntity(SALONS_URL + "/" + salonId, String.class);
+
+        assertThat(publicResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var wrapper = objectMapper.readValue(publicResp.getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {});
+        assertThat(wrapper.data().phone())
+                .as("GET /salons/{id} is the ONLY load path the mobile owner/admin salon-profile "
+                        + "screen uses — PublicSalonResponse dropped `phone` entirely, so the "
+                        + "«Контакти» block stayed blank on a freshly registered salon until an "
+                        + "unrelated contacts PATCH (which returns SalonResponse) happened to "
+                        + "populate it client-side. No PATCH is issued here on purpose")
+                .isEqualTo("+380671234567");
+    }
+
     // ── fixtures — salon side ─────────────────────────────────────────────────────
 
     private UUID createSalonOwner(String email) {

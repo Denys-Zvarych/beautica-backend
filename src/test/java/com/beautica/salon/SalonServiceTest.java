@@ -654,6 +654,62 @@ class SalonServiceTest {
     }
 
     @Test
+    @DisplayName("updateSalon — a name-only PATCH that omits phone must not wipe the previously saved phone")
+    void should_notWipePhone_when_updateSalonOmitsIt() {
+        // Same contract as should_notWipeLocationNote_when_updateSalonOmitsIt above, pinned for
+        // `phone` because PublicSalonResponse now serves it on the public GET — the mobile
+        // «Контакти» block reads it there, so a PATCH that silently nulled it would blank the
+        // block for every unauthenticated visitor. phone is OPTIONAL on UpdateSalonRequest, so a
+        // null means "not included in this PATCH", never "clear it".
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setPhone("+380509998877");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl.
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getPhone())
+                .as("a null phone in the patch must leave the stored phone untouched (PATCH semantics)")
+                .isEqualTo("+380509998877");
+    }
+
+    @Test
+    @DisplayName("updateSalon — an explicit empty-string phone clears the previously saved phone verbatim")
+    void should_clearPhone_when_updateSalonSendsEmptyString() {
+        // Pins the other half of the phone contract, mirroring
+        // should_clearLocationNote_when_updateSalonSendsEmptyString above: "" is the mobile
+        // client's explicit clear signal and must reach the entity, distinct from null. It is
+        // stored and served VERBATIM as "" — locked product decision, do NOT normalise blank to
+        // null here or in PublicSalonResponse (see PublicSalonResponseTest
+        // #should_servePhoneVerbatim_when_salonPhoneIsEmptyString); the client treats null and ""
+        // alike as "no phone".
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setPhone("+380509998877");
+
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                null, null, null, null, null, "", null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getPhone())
+                .as("an explicit empty string must clear the phone, distinct from a null (unchanged) patch")
+                .isEmpty();
+    }
+
+    @Test
     @DisplayName("updateSalon — rejects a districtId supplied without cityId instead of silently dropping it")
     void should_rejectUpdate_when_districtIdSuppliedWithoutCityId() {
         // Regression for the LOW finding sibling to the cityId-omitted fix above: the locality
