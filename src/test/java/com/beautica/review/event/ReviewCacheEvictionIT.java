@@ -94,7 +94,7 @@ class ReviewCacheEvictionIT extends AbstractRatingVisibilityIT {
 
         // ── 1. Prime both caches; the stored DTOs must carry the pre-review state ──
         MasterDetailResponse publicBefore = masterService.getMasterDetail(masterId);
-        MasterDetailResponse selfBefore = masterService.getMyMasterDetail(masterUserId);
+        MasterDetailResponse selfBefore = masterService.findMyMasterDetail(masterUserId).orElseThrow();
 
         assertThat(publicBefore.reviewCount())
                 .as("priming read must capture the zero-review state; a non-zero count here would "
@@ -131,7 +131,7 @@ class ReviewCacheEvictionIT extends AbstractRatingVisibilityIT {
         // ── 4. …and the re-read must surface the RECALCULATED average, not a
         //        stale value repopulated by an eviction that fired too early. ──
         MasterDetailResponse publicAfter = masterService.getMasterDetail(masterId);
-        MasterDetailResponse selfAfter = masterService.getMyMasterDetail(masterUserId);
+        MasterDetailResponse selfAfter = masterService.findMyMasterDetail(masterUserId).orElseThrow();
 
         assertThat(publicAfter.avgRating())
                 .as("GET /masters/{id} must return 5.00 immediately after the review commits, "
@@ -166,7 +166,7 @@ class ReviewCacheEvictionIT extends AbstractRatingVisibilityIT {
 
         // ── 1. Prime all three caches ──
         masterService.getMasterDetail(masterId);
-        masterService.getMyMasterDetail(masterUserId);
+        masterService.findMyMasterDetail(masterUserId);
         // Phase 240 CRITICAL fix: salon-detail is now keyed on getPublicSalon's PublicSalonResponse
         // DTO, not the raw Salon entity — getSalonEntity is deliberately uncached (self-invocation
         // fix, see SalonService#getSalonEntity's Javadoc) and getPublicSalon is the method the

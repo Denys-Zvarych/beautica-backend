@@ -95,6 +95,13 @@ class MasterServiceTest {
     // publish call NPEs — a mock is correct here, the listener's own behaviour is unit-tested in
     // com.beautica.review.event.SalonStaffRatingListenerTest.
     @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
+    // Audit-fix cycle 2: every create/reactivate/deactivate path now also evicts the
+    // user-profile cache through the shared evictor (a `masters` write stales GET /users/me
+    // via hasMasterProfile). @InjectMocks must have one to wire or those paths NPE. Left as a
+    // bare mock here on purpose — the eviction itself is proved against the REAL evictor and
+    // the REAL CacheConfig in OwnerMasterCacheTest and UserCacheEvictionIT, where a cache
+    // actually exists to observe; verifying a mock call here would only restate the source.
+    @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
     // Phase 29.2 fallout: getMasterCalendar now resolves an absolute-instant "now" for
     // BookingResponse.awaitingClosure. A real fixed-value Clock (not a bare @Mock, which would
     // return null from #instant() and NPE) — the exact instant is irrelevant to every test in
@@ -1011,17 +1018,28 @@ class MasterServiceTest {
                 .isInstanceOf(NotFoundException.class);
     }
 
+    /**
+     * Audit-fix cycle 2 — the assertion flipped from "throws" to "returns empty" because
+     * {@code findMyMasterDetail} must be able to NEGATIVELY CACHE this outcome, and
+     * {@code @Cacheable} never stores an exception. The user-visible contract is unchanged and is
+     * pinned one layer up: {@code MasterControllerTest
+     * #should_return404_when_salonOwnerHasNoActiveOwnerMasterRow} feeds this same empty Optional
+     * through the controller and asserts 404 (not 403). What is asserted HERE is that a
+     * deactivated master still resolves to "absent" at the DB-filter level — a master holding a
+     * valid JWT must not reach their profile after deactivation.
+     */
     @Test
-    @DisplayName("should_throwNotFound_when_getMyMasterDetail_andMasterIsDeactivated")
-    void should_throwNotFound_when_getMyMasterDetail_andMasterIsDeactivated() {
+    @DisplayName("should_returnEmpty_when_findMyMasterDetail_andMasterIsDeactivated")
+    void should_returnEmpty_when_findMyMasterDetail_andMasterIsDeactivated() {
         UUID userId = UUID.randomUUID();
 
         // DB-level isActive=true filter: deactivated master returns empty Optional,
         // preventing a master with a valid JWT from accessing GET /masters/me.
         when(masterRepository.findActiveByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> masterService.getMyMasterDetail(userId))
-                .isInstanceOf(NotFoundException.class);
+        assertThat(masterService.findMyMasterDetail(userId))
+                .as("a deactivated master must resolve to absent; the controller turns this into 404")
+                .isEmpty();
     }
 
     // ── createMasterForOwner (entity overload) ────────────────────────────────

@@ -45,12 +45,19 @@ import static org.mockito.Mockito.when;
  * emitted-SQL shape it used to stand in for is pinned for real, against Postgres, by
  * {@code SalonSiblingProjectionShapeIT}.
  *
- * <p>Only the two collaborators these assertions actually exercise are mocked. Seven further
+ * <p>Only the two collaborators these assertions actually exercise are stubbed. Seven further
  * {@code @Mock} fields ({@code userRepository}, {@code inviteService}, {@code masterRepository},
  * {@code localityWriteValidator}, {@code masterService}, {@code cacheManager},
  * {@code authorizationService}) were never stubbed and never verified — Mockito's constructor
  * injection simply passes {@code null} for the arguments they used to fill, which
  * {@code getSiblingSalons} never touches.
+ *
+ * <p>{@code userProfileCacheEvictor} is the deliberate exception: it is declared but neither
+ * stubbed nor verified. {@code getSiblingSalons} does not reach it today, but leaving it
+ * undeclared arms a trap — {@code @InjectMocks} substitutes {@code null} for an undeclared
+ * collaborator <em>silently</em>, so the omission survives {@code compileTestJava} and only
+ * surfaces as a runtime NPE the first time an unrelated change routes this class through a
+ * write path. Declaring it costs nothing and disarms that.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("SalonService.getSiblingSalons — unit")
@@ -66,6 +73,14 @@ class SalonServiceSiblingSalonsTest {
      */
     @Mock
     private CityRepository cityRepository;
+
+    // Audit-fix cycle 2: SalonService evicts the affected user's cached profile after commit
+    // (createSalon, removeAdmin, rotateAdmin all mutate a `users` row). @InjectMocks passes null
+    // for an UNDECLARED collaborator silently, so compileTestJava stays green and the omission
+    // only surfaces as an NPE at runtime — this field must exist even when no test here reaches
+    // an evict call.
+    @Mock
+    private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
     @InjectMocks
     private SalonService salonService;

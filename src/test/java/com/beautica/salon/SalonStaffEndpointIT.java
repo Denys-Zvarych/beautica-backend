@@ -6,6 +6,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.salon.dto.SalonStaffMemberResponse;
+import com.beautica.user.UserProfileResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -50,6 +51,10 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
 
     private static final String STAFF_URL = "/api/v1/salons/%s/staff";
     private static final String MASTER_DETAIL_URL = "/api/v1/masters/%s";
+    /** Phase 265 — the owner-as-master toggle pair (SalonMasterController:53 / :73). */
+    private static final String OWNER_MASTER_URL = "/api/v1/salons/%s/master";
+    /** Phase 265 — the authenticated self-read that carries the derived {@code hasMasterProfile}. */
+    private static final String USERS_ME_URL = "/api/v1/users/me";
     private static final String TEST_PASSWORD = SalonItFixtures.TEST_PASSWORD;
 
     @Autowired
@@ -422,6 +427,143 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
         assertThat(masterOneEntry.serviceCount())
                 .as("the master with 1 active service assignment must show serviceCount=1")
                 .isEqualTo(1L);
+    }
+
+    // ── Phase 265 — the owner-as-master toggle round trip ──────────────────────
+    //
+    // Phase 265 test case 4. Every other assertion on `hasMasterProfile` in this repo stops short
+    // of the real toggle: UserServiceTest stubs the finder (a Mockito stub cannot toggle
+    // anything), MasterRepositoryOwnerMasterFlagTest persists the row by hand via TestEntityManager
+    // (it never calls the endpoint that writes it), and OwnerMasterCacheTest asserts eviction. None
+    // of them proves the derived flag on GET /users/me tracks what POST/DELETE
+    // /api/v1/salons/{salonId}/master actually DO to the database. This test drives both real
+    // endpoints over real HTTP and reads the flag back over real HTTP in between.
+    //
+    // It lives in SalonStaffEndpointIT rather than a new class because the toggle endpoints are
+    // SalonMasterController's, it needs exactly this class's owner+salon fixtures, and a new
+    // @SpringBootTest class would fork nothing but cost a context lookup (§M-3 / Q3).
+
+    @Test
+    @DisplayName("Phase 265 — hasMasterProfile flips true then false across POST then DELETE "
+            + "/salons/{salonId}/master, read back over GET /users/me")
+    void should_flipTrueThenFalse_when_postThenDeleteSalonMasterIsCalled() throws Exception {
+        // Arrange — a SALON_OWNER whose salon is inserted by JDBC, so SalonService.createSalon's
+        // auto-createMasterForOwner never ran and the toggle starts genuinely OFF. That gives the
+        // assertion sequence three distinct observations (false → true → false) instead of two,
+        // so a derivation hard-wired to either constant fails somewhere in it.
+        UUID ownerId = fixtures.insertUser(
+                "owner-toggle-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Owner Master Toggle Salon");
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
+
+        assertThat(readHasMasterProfile(ownerToken))
+                .as("precondition: this owner has no master row yet, so the derived flag must "
+                        + "start OFF — otherwise the flip below proves nothing")
+                .isFalse();
+
+        // Act 1 — opt in through the real endpoint the mobile toggle calls.
+        log.debug("Act: POST {} to opt the owner IN as a master, then re-read GET /users/me",
+                String.format(OWNER_MASTER_URL, salonId));
+        ResponseEntity<String> enableResponse = restTemplate.exchange(
+                String.format(OWNER_MASTER_URL, salonId), HttpMethod.POST,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert 1
+        assertThat(enableResponse.getStatusCode())
+                .as("POST /salons/{salonId}/master must return 200 for the salon's own owner, "
+                        + "body=%s", enableResponse.getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat(readHasMasterProfile(ownerToken))
+                .as("an active SALON_OWNER-type master row now exists — GET /users/me must derive "
+                        + "hasMasterProfile=true on the very next read. This read goes THROUGH the "
+                        + "live `user-profile` Caffeine cache, which the precondition read above "
+                        + "already populated with false: a POST that writes the masters row but "
+                        + "fails to evict leaves that false entry standing for the full 5-minute "
+                        + "TTL and fails here. This is the cross-aggregate staleness assertion, "
+                        + "not merely a derivation assertion.")
+                .isTrue();
+
+        // Act 2 — opt back out. DELETE DEACTIVATES the row, it does not remove it.
+        log.debug("Act: DELETE {} to opt the owner back OUT, then re-read GET /users/me",
+                String.format(OWNER_MASTER_URL, salonId));
+        ResponseEntity<String> disableResponse = restTemplate.exchange(
+                String.format(OWNER_MASTER_URL, salonId), HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert 2
+        assertThat(disableResponse.getStatusCode())
+                .as("DELETE /salons/{salonId}/master must return 204, body=%s",
+                        disableResponse.getBody())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject(
+                        "SELECT is_active FROM masters WHERE user_id = ? AND master_type = 'SALON_OWNER'",
+                        Boolean.class, ownerId))
+                .as("the toggle-off is a soft delete: the row must still be there, deactivated. "
+                        + "If it were hard-deleted the final assertion below would pass for the "
+                        + "WRONG reason and stop guarding the isActive predicate.")
+                .isFalse();
+        assertThat(readHasMasterProfile(ownerToken))
+                .as("the row survives deactivation, so a derivation that checks mere row existence "
+                        + "would still read true here — hasMasterProfile must track is_active")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("Phase 265 — a second POST /salons/{salonId}/master reactivates the soft-deleted "
+            + "row and hasMasterProfile returns to true")
+    void should_returnToTrue_when_ownerReEnablesTheMasterProfileAfterDelete() throws Exception {
+        // Arrange — drive the owner through a full OFF cycle first, so the second POST lands on
+        // createMasterForOwner's REACTIVATION branch (MasterService.java:180) rather than its
+        // create branch. That branch is the one a mobile user hits every time they flip the
+        // switch back on, and it is a different code path with its own cache evictions.
+        UUID ownerId = fixtures.insertUser(
+                "owner-retoggle-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Owner Master Retoggle Salon");
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
+        String url = String.format(OWNER_MASTER_URL, salonId);
+
+        restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
+        restTemplate.exchange(url, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(readHasMasterProfile(ownerToken))
+                .as("precondition: the owner is opted OUT before the reactivating POST")
+                .isFalse();
+
+        // Act
+        log.debug("Act: POST {} a SECOND time — reactivation branch, not creation", url);
+        ResponseEntity<String> response = restTemplate.exchange(
+                url, HttpMethod.POST,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("re-enabling is idempotent and must return 200, body=%s", response.getBody())
+                .isEqualTo(HttpStatus.OK);
+        assertThat(readHasMasterProfile(ownerToken))
+                .as("the reactivation branch flips is_active back to true, so the derived flag "
+                        + "must follow it back up — a one-way flag would strand the user with a "
+                        + "toggle that never turns back on")
+                .isTrue();
+    }
+
+    /** {@code GET /api/v1/users/me} as {@code token}, returning only the derived Phase 265 flag. */
+    private boolean readHasMasterProfile(String token) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                USERS_ME_URL, HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(token)),
+                String.class);
+        assertThat(response.getStatusCode())
+                .as("GET %s must return 200 for an authenticated owner — a non-200 here means the "
+                        + "flag was never read and the surrounding assertion is meaningless; body=%s",
+                        USERS_ME_URL, response.getBody())
+                .isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        return body.data().hasMasterProfile();
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 package com.beautica.master.controller;
 
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.service.ScheduleOverrideConflictService;
@@ -68,11 +69,49 @@ public class MasterController {
     private final ScheduleOverrideConflictService scheduleOverrideConflictService;
     private final UserService userService;
 
+    /**
+     * The authenticated provider's own master profile.
+     *
+     * <p><b>Phase 265 — {@code SALON_OWNER} added to the role gate.</b> An owner who has opted in
+     * as a master (the «Я також працюю як майстер» toggle, backed by
+     * {@code POST/DELETE /api/v1/salons/{salonId}/master}) owns a {@code Master} row with
+     * {@code masterType = SALON_OWNER}, and
+     * {@link MasterService#getMyMasterDetail(UUID)} already resolves it through
+     * {@code masterRepository.findActiveByUserIdWithUserAndSalon(userId)} — a finder with NO
+     * {@code masterType} predicate. The annotation was therefore the <em>only</em> thing standing
+     * between an owner and their own profile; nothing below this line needed to change.
+     *
+     * <p>Consequently an owner who never opted in, or who toggled the profile OFF (the row is
+     * deactivated, never hard-deleted), gets <b>404</b> — not 403. The role gate no longer
+     * distinguishes those cases, and must not: 403 would say "owners may not have master
+     * profiles", which is false.
+     *
+     * <p><b>Where the 404 comes from (audit-fix cycle 2).</b> It used to be thrown by the service's
+     * active-row lookup. The service now returns {@code Optional} so the empty result can be
+     * NEGATIVELY CACHED — {@code @Cacheable} never stores an exception, so while it threw, an
+     * opted-out owner paid an uncached DB round-trip on every hit — and this method raises the
+     * identical {@code NotFoundException} on an empty Optional. The status codes are unchanged in
+     * both directions: 404 for an opted-out owner, 403 for a {@code CLIENT} or {@code SALON_ADMIN}
+     * denied by the {@code @PreAuthorize} above (which runs first and never reaches the service).
+     * {@code MasterControllerTest} pins 404-not-403 explicitly.
+     *
+     * <p>Unwrapping here rather than in the service is deliberate and is not business logic: the
+     * alternative — a throwing {@code getMyMasterDetail} delegating to the cached
+     * {@code findMyMasterDetail} on the same bean — would be a self-invocation and would bypass the
+     * cache proxy entirely (Anti-Bug §F-3), which is the exact defect this change exists to fix.
+     *
+     * <p>Scope note: only this read is widened. {@code PATCH /me/profile} and
+     * {@code GET /me/calendar} keep their {@code SALON_MASTER}/{@code INDEPENDENT_MASTER} gates.
+     *
+     * @see com.beautica.user.UserProfileResponse#hasMasterProfile() the render gate the client
+     *     reads first, so it does not fire a speculative call that 404s
+     */
     @GetMapping("/me")
-    @PreAuthorize("hasAnyRole('SALON_MASTER', 'INDEPENDENT_MASTER')")
+    @PreAuthorize("hasAnyRole('SALON_MASTER', 'INDEPENDENT_MASTER', 'SALON_OWNER')")
     public ApiResponse<MasterDetailResponse> getMyProfile(Authentication authentication) {
         UUID userId = AuthenticationUtils.userId(authentication);
-        return ApiResponse.ok(masterService.getMyMasterDetail(userId));
+        return ApiResponse.ok(masterService.findMyMasterDetail(userId)
+                .orElseThrow(() -> new NotFoundException("Master not found")));
     }
 
     /**

@@ -91,6 +91,13 @@ class SalonServicePendingInvitesTest {
     @Mock
     private AuthorizationService authorizationService;
 
+    // Audit-fix cycle 2: SalonService now evicts the user-profile cache on the three paths
+    // that write a `users` row (createSalon locality sync, removeAdmin, rotateAdmin). None is
+    // exercised by this class, so a real evictor over a NoOpCacheManager is enough.
+    private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor =
+            new com.beautica.common.cache.UserProfileCacheEvictor(
+                    new org.springframework.cache.support.NoOpCacheManager());
+
     private SalonService salonService;
 
     @BeforeEach
@@ -99,7 +106,8 @@ class SalonServicePendingInvitesTest {
         salonService = new SalonService(
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
                 masterServiceRepository, localityWriteValidator, masterService, cityRepository,
-                locationQueryService, cacheManager, authorizationService, fixedClock);
+                locationQueryService, cacheManager, authorizationService, fixedClock,
+                userProfileCacheEvictor);
     }
 
     @Test

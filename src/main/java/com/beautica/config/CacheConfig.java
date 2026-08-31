@@ -1,6 +1,7 @@
 package com.beautica.config;
 
 import com.beautica.client.service.ClientPassportService;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.search.service.SearchCacheNames;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -118,7 +119,22 @@ public class CacheConfig {
      *                         max 2000; evicted by master prefix on every schedule AND booking write
      *   master-by-user      — stable userId→Master entity mapping; TTL-only eviction — 10 min TTL, max 500 entries
      *   master-detail         — masterId→MasterDetailResponse DTO for public GET /masters/{masterId} — 5 min TTL, max 1000 entries
-     *   master-detail-by-user — userId→MasterDetailResponse DTO for GET /masters/me — 10 min TTL, max 500 entries
+     *   master-detail-by-user — userId→Optional&lt;MasterDetailResponse&gt; for GET /masters/me — 10 min
+     *                         TTL, max 1000 entries (raised from 500 by the Phase 265 audit:
+     *                         widening the endpoint to SALON_OWNER admits every owner into this
+     *                         population, and SalonService#createSalon auto-creates the owner-master
+     *                         row, so owners are eligible by default; 1000 matches sibling
+     *                         master-detail). NEGATIVE-CACHING: the value type is Optional, so
+     *                         Spring stores NullValue for "this user has no active master row" and
+     *                         the miss is memoised too — which is why eviction is BIDIRECTIONAL,
+     *                         firing on create/reactivate as well as deactivate. See the invariant
+     *                         block on MasterService#deactivateOwnerMaster.
+     *   user-profile        — userId→UserProfileResponse DTO for GET /users/me — 5 min TTL, max
+     *                         2000 entries. CROSS-AGGREGATE: hasMasterProfile is derived from a
+     *                         `masters` row this cache's owning service does not write, so
+     *                         MasterService and SalonService are also writers. Eviction is
+     *                         centralised in common/cache/UserProfileCacheEvictor, whose javadoc
+     *                         carries the complete writer set.
      *   service-type-search — trigram search results per (q, categoryId) — 5 min TTL, max 1000 entries
      *   salon-detail        — single salon entity by ID — 5 min TTL, max 1000 entries
      *   search:masters:browse / search:salons:browse — location-only discovery pages, first 5
@@ -320,10 +336,58 @@ public class CacheConfig {
                         .maximumSize(1000)
                         .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
+        // NEGATIVE CACHING (audit-fix cycle 2, MEDIUM). MasterService#findMyMasterDetail returns
+        // Optional<MasterDetailResponse>; Spring's cache abstraction unwraps that to null and — with
+        // CaffeineCacheManager's default allowNullValues=true, which this class deliberately does NOT
+        // override — stores NullValue.INSTANCE. So an opted-out SALON_OWNER's 404 costs ONE query per
+        // TTL window instead of one per request, and a caller that ignores the GET /users/me
+        // hasMasterProfile render gate can no longer turn /masters/me into an uncached DB read.
+        //
+        // The price is that "no row" is now a CACHED FACT, so the eviction contract became
+        // BIDIRECTIONAL: before, only deactivation could stale this cache (a miss was never stored);
+        // now creation and reactivation stale it too, and every such path must evict. The complete,
+        // named path list — and why it is exhaustive — lives in the invariant block inside
+        // MasterService#deactivateOwnerMaster. Do not add a fourth create path without reading it.
+        //
+        // Phase 265 audit (finding 6): 500 → 1000. GET /masters/me was widened to SALON_OWNER,
+        // and SalonService#createSalon auto-creates the owner-master row on first-salon
+        // registration, so every owner is eligible for a key here by default — the previous 500
+        // no longer left headroom over the provider population it serves. 1000 aligns it with
+        // the sibling master-detail cache below/above, which serves a strictly LARGER (public,
+        // all-masters) population at the same size; the old asymmetry was backwards. Cost is
+        // ~2-3 MB of the 512 MB Railway container.
         manager.registerCustomCache("master-detail-by-user",
                 Caffeine.newBuilder()
-                        .maximumSize(500)
+                        .maximumSize(1000)
                         .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
+        // GET /api/v1/users/me (audit-fix cycle 2, LOW). The hottest authenticated read in the app —
+        // every client, every launch — and until now the only one with no cache at all: three queries
+        // per hit (the users row, the district label when a district is set, the city→oblast scalar)
+        // plus, for a SALON_OWNER, the hasMasterProfile EXISTS.
+        //
+        // CROSS-AGGREGATE COUPLING — the actual hazard, stated explicitly per the audit. Every other
+        // per-user cache in this file is invalidated by the service that owns the row it caches.
+        // This one is not. UserProfileResponse.hasMasterProfile is derived (UserService
+        // #resolveHasMasterProfile) from an ACTIVE `masters` row of type SALON_OWNER — a different
+        // table, owned by a different service, in a different feature package. A write in
+        // MasterService therefore stales a cache in the `user` package with nothing in the type
+        // system, the call graph, or this file's neighbours to say so. That is why the eviction is
+        // NOT an inline block here or in UserService but a named component,
+        // common/cache/UserProfileCacheEvictor: its javadoc enumerates the complete writer set
+        // (UserService, MasterService × 5 lifecycle paths, SalonService × 3,
+        // EmailVerificationProcessor) together with the paths that are provably NOT writers and the
+        // field-by-field evidence for each. A new writer of `masters.is_active`, `users.salon_id` or
+        // `users.email_verified` must be added there.
+        //
+        // 5 min TTL — deliberately SHORTER than master-detail-by-user's 10, because this DTO has
+        // strictly more writers than that one does and the TTL is the backstop for a writer someone
+        // forgets to wire up. 2000 entries: this population is every authenticated user, not just
+        // providers, so it is the largest per-user cache here.
+        manager.registerCustomCache(UserProfileCacheEvictor.USER_PROFILE_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(2000)
+                        .expireAfterWrite(5, TimeUnit.MINUTES)
                         .build());
         manager.registerCustomCache("service-type-search",
                 Caffeine.newBuilder()
@@ -531,6 +595,13 @@ public class CacheConfig {
                         .expireAfterWrite(60, TimeUnit.MINUTES)
                         .build());
         assertCustomRegistration(manager, ClientPassportService.CLIENT_PASSPORT_CACHE);
+        // Same treatment for user-profile: it is written by four services across three feature
+        // packages via UserProfileCacheEvictor, which resolves the cache through
+        // cacheManager.getCache(...) and NULL-CHECKS the result. That null-check is correct
+        // defensive style but it means a dropped registration would make every eviction a silent
+        // no-op rather than a loud failure — while @Cacheable on the read side failed loudly. Fail
+        // at context refresh instead.
+        assertCustomRegistration(manager, UserProfileCacheEvictor.USER_PROFILE_CACHE);
         return manager;
     }
 

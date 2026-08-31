@@ -54,7 +54,7 @@ class UserVerificationEntityTest {
         var user = new User("e@example.com", "hash", Role.CLIENT, "A", "B", "123");
         user.setEmailVerified(true);
 
-        var response = UserProfileResponse.from(user);
+        var response = UserProfileResponse.from(user, null, null, false);
 
         assertThat(response.emailVerified()).isTrue();
     }
@@ -68,7 +68,7 @@ class UserVerificationEntityTest {
         user.setVerificationCodeHash("a".repeat(64));
         user.setVerificationCodeExpiresAt(Instant.now());
 
-        var json = new ObjectMapper().writeValueAsString(UserProfileResponse.from(user));
+        var json = new ObjectMapper().writeValueAsString(UserProfileResponse.from(user, null, null, false));
 
         assertThat(json).doesNotContain("verificationCodeHash");
         assertThat(json).doesNotContain("verificationCodeExpiresAt");

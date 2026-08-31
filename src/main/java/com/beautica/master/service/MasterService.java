@@ -54,6 +54,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
@@ -76,6 +77,13 @@ public class MasterService {
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Audit-fix cycle 2 (LOW — GET /users/me caching). Every method in this class that
+    // creates, reactivates or deactivates a `masters` row also flips
+    // UserProfileResponse.hasMasterProfile, which is derived from that row — so a `masters`
+    // write stales a `users`-package cache. Routed through the shared evictor rather than an
+    // inline cacheManager.getCache("user-profile") so the cross-aggregate writer set stays
+    // enumerable from one file; see UserProfileCacheEvictor's javadoc.
+    private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
     // Mobile Phase 111: a salon's rating is now the equal-weighted mean of its ACTIVE masters'
     // salon-scoped ratings (ReviewRepository#recalculateSalonRating), so it is a function of the
     // staff set and must be recomputed whenever this class changes that set — with no review
@@ -112,6 +120,14 @@ public class MasterService {
         // Phase 13.1: allocate the public booking slug on creation (one extra UPDATE
         // per registration — acceptable). getOrCreateSlug sets it on the managed entity.
         bookingSlugService.getOrCreateSlug(saved.getId());
+        // Audit-fix cycle 2 — CREATE is now an eviction trigger for master-detail-by-user, which
+        // memoises the negative answer since findMyMasterDetail returns Optional. `userId` here is
+        // a row AuthService persisted moments ago in this same transaction, so no entry can
+        // actually exist under it and this is provably a no-op TODAY. It is fired anyway, for the
+        // same reason publishSalonStaffChanged is: the alternative is a comment asserting
+        // "unreachable" that every future caller of this method must re-derive and that silently
+        // becomes false the first time an existing user is converted into an independent master.
+        evictUserKeyedMasterCachesAfterCommit(user.getId());
         return saved;
     }
 
@@ -139,6 +155,12 @@ public class MasterService {
         // average today (a brand-new master row carries no reviews), fired anyway per
         // publishSalonStaffChanged's javadoc.
         publishSalonStaffChanged(salonId);
+        // Audit-fix cycle 2 — same reasoning as createMasterForIndependentUser: InviteService
+        // mints this user row in the same transaction (acceptInvite rejects an email that already
+        // exists), so no cached entry is reachable today. Fired unconditionally so the invariant
+        // in deactivateOwnerMaster can say "every create path evicts" without a per-path exemption
+        // list that has to be re-verified on every future edit.
+        evictUserKeyedMasterCachesAfterCommit(user.getId());
         return saved;
     }
 
@@ -225,6 +247,20 @@ public class MasterService {
                     });
                 }
 
+                // Audit-fix cycle 2, THE load-bearing one. master-detail-by-user now memoises the
+                // NEGATIVE answer (findMyMasterDetail returns Optional), so the window this
+                // reactivation reopens is real and user-visible: the owner toggled
+                // «Я також працюю як майстер» OFF, deactivateOwnerMaster evicted, some read then
+                // re-cached Optional.empty(), and now they toggle it back ON. Without this evict
+                // GET /masters/me answers 404 for their own just-reactivated profile for the rest
+                // of the 10-minute TTL, while GET /users/me's hasMasterProfile already reads true —
+                // the exact same two-values-in-one-screen split the deactivate side was fixed for,
+                // pointing the other way. Cycle 1 documented this branch as needing no counterpart
+                // evict; that was correct ONLY while a miss could not be cached, and negative
+                // caching retired the premise. It also covers user-profile, since is_active
+                // flipping true is precisely what hasMasterProfile reads.
+                evictUserKeyedMasterCachesAfterCommit(ownerUserId);
+
                 // Evict the public master-detail cache so the re-enabled master's updated
                 // is_active state is reflected immediately on GET /api/v1/masters/{masterId}.
                 if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -276,6 +312,14 @@ public class MasterService {
         bookingSlugService.getOrCreateSlug(saved.getId());
         // Mobile Phase 111 — the owner joined their own salon's staff set as a master.
         publishSalonStaffChanged(salon.getId());
+        // Audit-fix cycle 2 — unlike the other two create paths this one is NOT provably a no-op.
+        // It is reached from POST /api/v1/salons/{salonId}/master by an EXISTING, long-lived owner
+        // account (the Phase 12.4 re-enable endpoint routes here whenever the row was hard-absent
+        // rather than merely deactivated), so that owner's userId can already hold a cached
+        // Optional.empty() from any earlier GET /masters/me. Missing this evict would answer 404
+        // for a master profile that demonstrably exists. It also flips hasMasterProfile from false
+        // to true, staling user-profile.
+        evictUserKeyedMasterCachesAfterCommit(owner.getId());
         return saved;
     }
 
@@ -426,6 +470,13 @@ public class MasterService {
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
         evictMasterCalendarAfterCommit(master.getId());
 
+        // Audit-fix cycle 2 — is_active going FALSE flips UserProfileResponse.hasMasterProfile to
+        // false, and GET /users/me is cached as of this cycle. The master-detail-by-user half of
+        // the pair is evicted in the afterCommit block below (kept there, beside its invariant
+        // block); this line adds the user-profile half. Both are idempotent per-key evicts, so the
+        // partial overlap with that block is harmless.
+        userProfileCacheEvictor.evictAfterCommit(actorUserId);
+
         // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
         // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
         // salon is JOIN-FETCHed by findByUserIdWithSalon and non-null (filtered above); capture
@@ -452,6 +503,77 @@ public class MasterService {
                     Cache detail = cacheManager.getCache("master-detail");
                     if (detail != null) {
                         detail.evict(deactivatedOwnerMasterId);
+                    }
+                    // Phase 265 — evict the userId-keyed twin behind GET /masters/me (10-min TTL).
+                    // That endpoint is now reachable by SALON_OWNER, so an owner toggling
+                    // «Я також працюю як майстер» OFF would otherwise keep being served their own
+                    // cached master profile for the rest of the TTL, while GET /users/me's
+                    // hasMasterProfile already reads false — the two would disagree inside the same
+                    // screen. Mirrors the eviction rotateMasterToSalon performs (Anti-Bug §F-1).
+                    //
+                    // ════════════════════════════════════════════════════════════════════════════
+                    // INVARIANT — master-detail-by-user (audit-fix cycle 2; SUPERSEDES the
+                    // deactivate-only invariant written here in cycle 1).
+                    // ════════════════════════════════════════════════════════════════════════════
+                    // THE RULE, in full:
+                    //
+                    //   EVERY path that CREATES, REACTIVATES or DEACTIVATES a `masters` row must
+                    //   evict `master-detail-by-user` — and `user-profile` — for that row's user,
+                    //   after commit.
+                    //
+                    // WHY IT IS BIDIRECTIONAL NOW. Cycle 1 asserted the reactivation branch of
+                    // createMasterForOwner needed no counterpart evict, resting on premise (i):
+                    // "no value is EVER cached for a user with no active master row, because
+                    // getMyMasterDetail throws NotFoundException and @Cacheable never stores an
+                    // exception". That premise was true when written and is now FALSE by design:
+                    // findMyMasterDetail returns Optional<MasterDetailResponse>, Spring unwraps the
+                    // empty case to null, and Caffeine stores NullValue.INSTANCE. The MISS is
+                    // memoised. So "no row" is a cached fact that a create or reactivate makes
+                    // stale, exactly as a deactivate makes a cached row stale — and the
+                    // create-side bug is the nastier one: a 404 on a profile that provably exists,
+                    // with nothing logged and no error to explain it, until the TTL expires.
+                    //
+                    // THE PATHS THIS RULE DEPENDS ON — all seven, each named, each evicting.
+                    // Found by grepping src/main for `masterRepository.save`, `Master.builder()`
+                    // and every `setActive(` on a Master; that grep returns nothing else, and
+                    // `masters` has no @Modifying bulk UPDATE anywhere in the codebase.
+                    //
+                    //   CREATE
+                    //   1. createMasterForIndependentUser — AuthService registration. Evicts via
+                    //      evictUserKeyedMasterCachesAfterCommit. No-op today (the user row is
+                    //      minted in the same tx), fired anyway.
+                    //   2. createMasterFromInvite — InviteService.acceptInvite. Same: evicts,
+                    //      no-op today, fired anyway.
+                    //   3. createMasterForOwner(User, Salon), create branch — SalonService
+                    //      .createSalon on first salon, AND the Phase 12.4 re-enable endpoint
+                    //      POST /salons/{salonId}/master when no row exists at all. NOT a no-op:
+                    //      an existing owner reaches it with a warm cache. Evicts.
+                    //      (The UUID overload createMasterForOwner(UUID, UUID) delegates here and
+                    //      needs no evict of its own.)
+                    //
+                    //   REACTIVATE
+                    //   4. createMasterForOwner(User, Salon), !isActive() branch — the toggle back
+                    //      ON. The single most likely key to hold a cached Optional.empty(), since
+                    //      the matching toggle-OFF evicted this very key moments earlier and any
+                    //      read in between re-cached the miss. Evicts.
+                    //
+                    //   DEACTIVATE
+                    //   5. deactivateOwnerMaster — this method; DELETE /salons/{salonId}/master.
+                    //   6. deactivateMaster — DELETE /masters/{masterId}. Reachable for an
+                    //      owner-master row: AuthorizationService#canManageMaster authorizes
+                    //      MasterType.SALON_OWNER rows. Cycle 1 added its mirrored evict.
+                    //
+                    //   MUTATE (not a lifecycle change, but it rewrites the cached DTO's `salon`)
+                    //   7. rotateMasterToSalon — evicts both caches in its own afterCommit block.
+                    //
+                    // IF YOU ADD AN EIGHTH PATH: call evictUserKeyedMasterCachesAfterCommit and
+                    // add it to this list. There is no compile-time or startup check that will
+                    // catch you; the failure mode is a silent, self-healing-in-10-minutes 404 that
+                    // no test outside OwnerMasterCacheTest will reproduce.
+                    // ════════════════════════════════════════════════════════════════════════════
+                    Cache detailByUser = cacheManager.getCache("master-detail-by-user");
+                    if (detailByUser != null) {
+                        detailByUser.evict(masterUserId);
                     }
                 }
             });
@@ -506,6 +628,11 @@ public class MasterService {
         // findByIdWithUserAndSalon, so getUser() is initialized). A stale master-by-user entry
         // would allow the deactivated master to pass the isActive guard for up to the cache TTL.
         final UUID masterUserId = master.getUser().getId();
+        // Audit-fix cycle 2 — the user-profile (GET /users/me) half of the pair; the
+        // master-detail-by-user half stays in the afterCommit block below. Reached for an
+        // owner-master row too (canManageMaster authorizes MasterType.SALON_OWNER), which is
+        // precisely the row hasMasterProfile is derived from.
+        userProfileCacheEvictor.evictAfterCommit(masterUserId);
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
@@ -519,6 +646,22 @@ public class MasterService {
                     Cache detail = cacheManager.getCache("master-detail");
                     if (detail != null) {
                         detail.evict(masterId);
+                    }
+                    // Audit fix (finding 3) — mirror of the eviction deactivateOwnerMaster
+                    // performs on the userId-keyed twin behind GET /masters/me (10-min TTL).
+                    // This is the SECOND reachable deactivation path for an owner-master row:
+                    // AuthorizationService#canManageMaster authorizes MasterType.SALON_OWNER
+                    // rows, so DELETE /masters/{masterId} deactivates the same row the
+                    // «Я також працюю як майстер» toggle owns. Without this evict the owner
+                    // kept being served their own cached master profile for the rest of the TTL
+                    // while GET /users/me's hasMasterProfile (derived on read, never cached)
+                    // already read false — and the no-counterpart invariant documented in
+                    // deactivateOwnerMaster held on only one of the two paths (§F rule 1).
+                    // Also correct for SALON_MASTER/INDEPENDENT_MASTER rows, whose /masters/me
+                    // entry must likewise disappear the moment they are deactivated.
+                    Cache detailByUser = cacheManager.getCache("master-detail-by-user");
+                    if (detailByUser != null) {
+                        detailByUser.evict(masterUserId);
                     }
                 }
             });
@@ -741,6 +884,50 @@ public class MasterService {
                 : resolveOblastId(salonCityId);
     }
 
+    /**
+     * Evicts the two user-keyed caches that every {@code masters}-row lifecycle change invalidates,
+     * after the current transaction commits. Called from EVERY create, reactivate and deactivate
+     * path in this class — see the invariant block in {@link #deactivateOwnerMaster} for the
+     * enumerated list and why it is exhaustive.
+     *
+     * <ul>
+     *   <li>{@code master-detail-by-user} — {@code GET /masters/me}. Since audit-fix cycle 2 this
+     *       cache memoises the NEGATIVE answer too ({@link #findMyMasterDetail} returns
+     *       {@code Optional}), so a create or reactivate that does not evict leaves the user
+     *       served a cached 404 for their own freshly-created profile.</li>
+     *   <li>{@code user-profile} — {@code GET /users/me}. {@code UserProfileResponse
+     *       .hasMasterProfile} is derived from exactly this row, in a different aggregate; the
+     *       coupling is documented at the cache registration and in
+     *       {@code UserProfileCacheEvictor}.</li>
+     * </ul>
+     *
+     * <p>Both are per-key evicts, never {@code clear()} (Anti-Bug §F-6), and both run
+     * {@code afterCommit} so no parallel reader can repopulate them with the pre-write state
+     * (§F-2). Safe to call in addition to an existing eviction block for the same key — a second
+     * evict of an already-empty key is a no-op, and registering two synchronizations is
+     * order-independent.
+     *
+     * @param userId the master row's owning user; the key shape both caches use
+     */
+    private void evictUserKeyedMasterCachesAfterCommit(UUID userId) {
+        if (userId == null) {
+            return;
+        }
+        userProfileCacheEvictor.evictAfterCommit(userId);
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache detailByUser = cacheManager.getCache("master-detail-by-user");
+                if (detailByUser != null) {
+                    detailByUser.evict(userId);
+                }
+            }
+        });
+    }
+
     // Eviction is registered as a post-commit callback rather than via @CacheEvict.
     // @CacheEvict fires before the transaction commits, allowing a concurrent reader
     // to repopulate the cache with stale data within the commit window.
@@ -868,17 +1055,65 @@ public class MasterService {
      * <p>Callers in {@link com.beautica.master.controller.MasterController#getMyProfile}
      * must use this method. {@link #getMasterByUserId} is retained for other callers
      * (e.g. calendar endpoint) that only need the {@link Master} entity.
+     *
+     * <p><b>Why this returns {@code Optional} instead of throwing (audit-fix cycle 2, MEDIUM —
+     * negative caching).</b> {@code @Cacheable} never stores an exception, so while this method
+     * threw {@code NotFoundException} for "no active master row" that answer was recomputed on
+     * every single request: an opted-out {@code SALON_OWNER} polling {@code GET /masters/me} paid
+     * an uncached DB round-trip per hit, with the cache present but structurally unable to help.
+     * Returning {@code Optional} lets Spring's cache abstraction unwrap the empty case to
+     * {@code null} and store {@code NullValue.INSTANCE} (CaffeineCacheManager's default
+     * {@code allowNullValues = true}, which {@code CacheConfig} deliberately leaves alone), so the
+     * miss is memoised like any hit. {@code MasterController#getMyProfile} translates the empty
+     * Optional into the same {@code NotFoundException} it always raised — the HTTP contract is
+     * byte-identical, 404 for an opted-out owner and 403 for a {@code CLIENT}, and
+     * {@code MasterControllerTest} pins both.
+     *
+     * <p>The {@code find*} name is not cosmetic. The signature change from
+     * {@code MasterDetailResponse} to {@code Optional<MasterDetailResponse>} is a silent one for a
+     * caller that only ever used the value — the compiler catches it, but a future reader would not
+     * see why. Renaming forces every call site through review and matches this codebase's
+     * convention that {@code find*} may be empty and {@code get*} throws.
+     *
+     * <p><b>Consequence for eviction — read this before adding a write path.</b> Because "no row"
+     * is now a cached fact, this cache's invalidation contract is BIDIRECTIONAL. Deactivation
+     * staling a positive entry was always true; creation and reactivation now stale a NEGATIVE
+     * entry just as badly, and a missed evict there is the worse bug of the two — an owner who
+     * enables «Я також працюю як майстер» would keep getting 404 on their own brand-new profile
+     * for the rest of the 10-minute TTL, with no error anywhere to explain it. The complete,
+     * named path list is the invariant block in {@link #deactivateOwnerMaster}.
+     *
+     * <p><b>Phase 265 — owners resolve here too, with no logic change.</b>
+     * {@code findActiveByUserIdWithUserAndSalon} filters on {@code user.id} and
+     * {@code isActive} only — it carries NO {@code masterType} predicate — so a
+     * {@code SALON_OWNER} who has opted in as a master (an active row with
+     * {@code masterType = SALON_OWNER}) is served by exactly the same lookup as a
+     * {@code SALON_MASTER} or {@code INDEPENDENT_MASTER}. Widening the controller's
+     * {@code @PreAuthorize} was the whole of that change.
+     *
+     * <p>The {@link java.util.Optional} return cannot raise {@code NonUniqueResultException}:
+     * {@code masters.user_id} is {@code unique = true} ({@link Master} line ~56), and V56 adds a
+     * partial unique index {@code idx_masters_user_owner_type WHERE master_type = 'SALON_OWNER'}
+     * on top (mirrored on {@link Master}'s {@code @Table(indexes = ...)}, which cannot express the
+     * partial {@code WHERE}). At most one owner-master row per user exists by construction.
+     *
+     * <p><b>This is NOT multi-salon owner-master support.</b> An owner has exactly one master row,
+     * pinned to one salon by {@code createMasterForOwner}'s "already exists in a different salon"
+     * {@code ConflictException}. Backend phases 271–281 (the {@code master_salons} join table and
+     * everything built on it) are BLOCKED on a reversed shared-schedule premise — do not pull any
+     * of that work in through this method.
      */
     @Cacheable(value = "master-detail-by-user", key = "#userId", sync = true)
     @Transactional(readOnly = true)
-    public MasterDetailResponse getMyMasterDetail(UUID userId) {
-        Master master = masterRepository.findActiveByUserIdWithUserAndSalon(userId)
-                .orElseThrow(() -> new NotFoundException("Master not found"));
-        var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
-        UUID masterCityId = master.getUser().getCityId();
-        UUID oblastId = resolveOblastId(masterCityId);
-        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
-        return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
+    public Optional<MasterDetailResponse> findMyMasterDetail(UUID userId) {
+        return masterRepository.findActiveByUserIdWithUserAndSalon(userId)
+                .map(master -> {
+                    var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
+                    UUID masterCityId = master.getUser().getCityId();
+                    UUID oblastId = resolveOblastId(masterCityId);
+                    UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
+                    return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
+                });
     }
 
     @Cacheable(value = "master-by-user", key = "#userId", sync = true)

@@ -97,6 +97,28 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue(
             UUID userId, UUID salonId, MasterType masterType);
 
+    /**
+     * Returns {@code true} iff the given user has an <em>active</em> master row of the given type,
+     * in ANY salon. Backs {@code UserService.getProfile}'s derived
+     * {@code UserProfileResponse.hasMasterProfile} (Phase 265) — the owner-as-master toggle state,
+     * which is the presence of this row, never a stored column.
+     *
+     * <p><b>Why this is not a duplicate of
+     * {@link #existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue}.</b> That method answers
+     * "…in THIS salon", and every one of its callers has a {@code salonId} in hand from the path
+     * ({@code /salons/{salonId}/master}). {@code GET /users/me} has no path salon and must not
+     * invent one: {@code users.salon_id} is the owner's primary salon and would make the flag read
+     * {@code false} for an owner whose master row sits in a different salon of theirs. Passing a
+     * fabricated salon into the salon-scoped variant is exactly the bug this narrower predicate
+     * avoids, so the two coexist deliberately (§E-1) with disjoint call sites.
+     *
+     * <p>The {@code isActive} term is load-bearing, not defensive: the DELETE toggle endpoint
+     * <em>deactivates</em> the row rather than hard-deleting it, so a plain
+     * {@code existsByUserIdAndMasterType} would report every owner who has ever opted in as still
+     * opted in, forever.
+     */
+    boolean existsByUserIdAndMasterTypeAndIsActiveTrue(UUID userId, MasterType masterType);
+
     boolean existsByIdAndSalonId(UUID id, UUID salonId);
 
     /**

@@ -1,6 +1,7 @@
 package com.beautica.auth;
 
 import com.beautica.auth.dto.VerifyEmailRequest;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.VerificationException;
 import com.beautica.config.VerificationPolicyConfig;
 import com.beautica.user.User;
@@ -46,16 +47,25 @@ public class EmailVerificationProcessor {
     private final TokenGenerator tokenGenerator;
     private final Clock clock;
     private final VerificationPolicyConfig verificationPolicy;
+    // Audit-fix cycle 2 (LOW — GET /users/me caching). The success path below flips
+    // users.email_verified, which UserProfileResponse.emailVerified surfaces and the mobile app
+    // gates on. Registered here rather than in AuthService.verifyEmail because the write commits
+    // with THIS bean's @Transactional proxy: an evict in the (non-transactional) caller happens to
+    // be post-commit today, but would silently become pre-commit the moment anyone annotates
+    // verifyEmail — and a pre-commit evict is the §F-2 defect.
+    private final UserProfileCacheEvictor userProfileCacheEvictor;
 
     public EmailVerificationProcessor(
             UserRepository userRepository,
             TokenGenerator tokenGenerator,
             Clock clock,
-            VerificationPolicyConfig verificationPolicy) {
+            VerificationPolicyConfig verificationPolicy,
+            UserProfileCacheEvictor userProfileCacheEvictor) {
         this.userRepository = userRepository;
         this.tokenGenerator = tokenGenerator;
         this.clock = clock;
         this.verificationPolicy = verificationPolicy;
+        this.userProfileCacheEvictor = userProfileCacheEvictor;
     }
 
     /**
@@ -146,6 +156,13 @@ public class EmailVerificationProcessor {
         user.setVerificationAttempts((short) 0);
         user.setVerificationFailedTotal((short) 0);
         user.setVerificationLockedUntil(null);
+        // Audit-fix cycle 2 — evict the caller's cached GET /users/me after commit. Only
+        // email_verified out of the six fields written here is on UserProfileResponse; the other
+        // five are OTP bookkeeping and are deliberately not (they are secrets). A stale entry here
+        // is user-visible: the app polls /users/me straight after verifying and would keep seeing
+        // emailVerified=false for the 5-minute TTL, i.e. an account that verified successfully
+        // still being told to verify.
+        userProfileCacheEvictor.evictAfterCommit(user.getId());
         // Single flush at commit — collapses the former success-path double save().
         return user.getId();
     }

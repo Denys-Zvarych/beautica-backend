@@ -76,6 +76,11 @@ public class SalonService {
     private final CacheManager cacheManager;
     private final AuthorizationService authorizationService;
     private final Clock clock;
+    // Audit-fix cycle 2 (LOW — GET /users/me caching). Three methods in this class mutate a
+    // `users` row this service does not own: createSalon syncs the owner's locality columns and
+    // (on first salon) creates the owner-master row that hasMasterProfile is derived from;
+    // removeAdmin and rotateAdmin rewrite users.salon_id. All three stale the user-profile cache.
+    private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
     /**
      * Ceiling on how many ACTIVE salons one {@code SALON_OWNER} may hold (Perf LOW-3).
@@ -189,6 +194,18 @@ public class SalonService {
         if (isFirstSalon) {
             masterService.createMasterForOwner(owner, savedSalon);
         }
+
+        // Audit-fix cycle 2 — this method writes the owner's own `users` row twice over, and
+        // GET /users/me is cached as of this cycle:
+        //   1. the locality sync above (cityId/districtId/street/buildingNo/locationNote — five
+        //      fields carried verbatim by UserProfileResponse), and
+        //   2. on first salon, createMasterForOwner, which flips hasMasterProfile to true.
+        // Unconditional rather than mirroring the `request.cityId() != null` / `isFirstSalon`
+        // guards: an evict that fires when nothing changed costs one recompute of a 5-minute key,
+        // whereas re-deriving those two guards on every future edit of this method is how the
+        // eviction goes missing. (createMasterForOwner also evicts on its own path — both are
+        // idempotent per-key evicts.)
+        userProfileCacheEvictor.evictAfterCommit(ownerIdOf(savedSalon));
 
         return SalonResponse.from(savedSalon, resolveOblastId(savedSalon.getCityId()));
     }
@@ -748,6 +765,10 @@ public class SalonService {
         // Hibernate dirty-checking flushes the salonId mutation on commit (mirrors
         // deactivateSalon/updateSalon — no redundant explicit save()).
         admin.setSalonId(null);
+        // Audit-fix cycle 2 — users.salon_id is surfaced as UserProfileResponse.salonId, so the
+        // removed admin's cached GET /users/me would keep naming the salon they no longer belong
+        // to for the full 5-minute TTL. Keyed on the ADMIN's id, never the actor's.
+        userProfileCacheEvictor.evictAfterCommit(userId);
     }
 
     /**
@@ -824,6 +845,9 @@ public class SalonService {
         // Hibernate dirty-checking flushes the salonId mutation on commit (mirrors removeAdmin —
         // no redundant explicit save()).
         admin.setSalonId(destinationSalonId);
+        // Audit-fix cycle 2 — same field, same reasoning as removeAdmin: the rotated admin's
+        // cached GET /users/me would keep reporting the SOURCE salon. Keyed on the admin.
+        userProfileCacheEvictor.evictAfterCommit(userId);
 
         // Audit trail (LOW-fix): no dedicated audit-log subsystem exists in this codebase yet —
         // a structured INFO log line is the established minimal pattern for sensitive mutations

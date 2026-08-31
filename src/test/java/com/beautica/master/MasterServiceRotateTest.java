@@ -85,6 +85,11 @@ class MasterServiceRotateTest {
     // com.beautica.review.event.SalonStaffRatingListenerTest.
     @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
 
+    // Audit-fix cycle 2: MasterService evicts the affected user's cached profile after commit
+    // (deactivateOwnerMaster, deactivateMaster). @InjectMocks passes null for an UNDECLARED
+    // collaborator silently — declared so no path here NPEs on a null evictor.
+    @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
     @InjectMocks
     private MasterService masterService;
 

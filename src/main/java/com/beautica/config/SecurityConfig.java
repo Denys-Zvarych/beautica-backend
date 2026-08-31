@@ -101,6 +101,18 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/actuator/health").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
+                    // Audit fix (finding 5) — MUST stay ABOVE the "{masterId}" matcher below.
+                    // A PathPattern "{var}" matches ANY single segment, so
+                    // "/api/v1/masters/{masterId}" pattern-matches the literal
+                    // "/api/v1/masters/me" as well. Spring Security takes the FIRST matching
+                    // rule, so without this line the authenticated self-read GET /masters/me is
+                    // permitAll at the filter-chain level and its @PreAuthorize is the SOLE gate
+                    // — the endpoint Phase 265 just widened to SALON_OWNER. MVC still routes
+                    // "me" to getMyProfile (a literal @GetMapping beats "/{masterId}"), so the
+                    // mismatch is invisible until method security is loosened or fails open.
+                    // Defense in depth (§K): the chain now rejects anonymous callers BEFORE the
+                    // DispatcherServlet, instead of relying on the annotation alone.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/me").authenticated();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll();
                     // Phase 8.10 — master review summary. Needs its own matcher: the

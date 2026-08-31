@@ -1,0 +1,35 @@
+-- V152 — drop the redundant plain btree index on masters(user_id).
+--
+-- WHY IT IS REDUNDANT.
+-- masters.user_id carries a UNIQUE constraint (Master entity: @JoinColumn(name = "user_id",
+-- nullable = false, unique = true)). Postgres implements a UNIQUE constraint with its own unique
+-- btree index on exactly that column, so idx_masters_user_id — created by
+-- V4__Patch_salons_add_masters.sql line 22 as a second, non-unique btree on the same single column
+-- in the same order — can serve no query the constraint's index cannot serve at least as well.
+-- Every finder in MasterRepository that filters on user_id (findActiveByUserIdWithUserAndSalon,
+-- findByUserIdWithSalon, existsByUserIdAndMasterTypeAndIsActiveTrue, …) is an equality lookup on a
+-- unique column: the planner takes the constraint index.
+--
+-- WHAT IT COSTS TO KEEP. A duplicate index is not free: every INSERT, every UPDATE that moves the
+-- row, and every VACUUM maintains it, and it occupies buffer cache that the constraint index would
+-- otherwise hold. This is a write-amplification and memory finding, not a query-plan one — dropping
+-- it cannot change any plan, because no plan can prefer it over the unique index.
+--
+-- WHY PLAIN DROP AND NOT DROP INDEX CONCURRENTLY.
+-- DROP INDEX takes an ACCESS EXCLUSIVE lock on masters, but the work under that lock is a catalog
+-- update plus unlinking the index relation — metadata only, sub-millisecond at this table's size
+-- (one row per provider). CONCURRENTLY would avoid the brief lock but cannot run inside a
+-- transaction, so it would need a Flyway `executeInTransaction=false` sidecar and would forfeit the
+-- automatic rollback every other migration in this project gets — real complexity bought for no
+-- real availability gain.
+--
+-- IF EXISTS: the index is created unconditionally by V4, so it is present on every environment that
+-- has migrated. The guard is for a database restored from a dump taken after a manual drop, and
+-- keeps a replay of the migration history idempotent.
+--
+-- ddl-auto=validate DRIFT: none. Master's @Table(indexes = {...}) declares idx_masters_salon_active,
+-- idx_masters_salon_owner_active and idx_masters_user_owner_type — it has never listed
+-- idx_masters_user_id, so removing the DB object brings the two into agreement rather than out of
+-- it. V4 itself is NOT edited: it is shipped, and rewriting an applied migration changes its
+-- checksum and crash-loops Flyway everywhere it has already run. Fix-forward only.
+DROP INDEX IF EXISTS idx_masters_user_id;
