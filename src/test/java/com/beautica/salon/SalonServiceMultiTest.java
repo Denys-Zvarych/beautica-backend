@@ -2,6 +2,7 @@ package com.beautica.salon;
 
 import com.beautica.TestConstants;
 import com.beautica.auth.Role;
+import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
@@ -31,7 +32,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
+import org.springframework.http.HttpStatus;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
@@ -90,7 +94,7 @@ class SalonServiceMultiTest {
         var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         SalonResponse response = salonService.createSalon(ownerId, request);
@@ -259,7 +263,7 @@ class SalonServiceMultiTest {
         var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "My Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
         salonService.createSalon(ownerId, request);
@@ -270,6 +274,59 @@ class SalonServiceMultiTest {
                 .isNull();
         // userRepository.save must never be called just to update the owner's salonId
         verify(userRepository, never()).save(any(User.class));
+    }
+
+    // -------------------------------------------------------------------------
+    // createSalon — per-owner active-salon cap (Perf LOW-3)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("createSalon — rejects with 409 once the owner holds the maximum active salons")
+    void should_rejectWith409_when_ownerIsAtTheActiveSalonCap() {
+        // Arrange — nothing bounded an owner's portfolio before, and three unbounded reads hang off
+        // it: GET /salons/mine, GET /{salonId}/sibling-salons, and each ownerSalons cache entry.
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "capped-owner@beautica.test", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("One Too Many", null, "Kyiv", null, null, null, null, null, null, null, null, null);
+
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId))
+                .thenReturn((long) SalonService.MAX_ACTIVE_SALONS_PER_OWNER);
+
+        // Act / Assert
+        assertThatThrownBy(() -> salonService.createSalon(ownerId, request))
+                .isInstanceOf(BusinessException.class)
+                .as("a well-formed request that conflicts with the owner's current state is a 409")
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        // Assert — the cap runs BEFORE any validation or write, so nothing is persisted and the
+        // locality validator is never even consulted.
+        verify(salonRepository, never()).save(any(Salon.class));
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+    }
+
+    @Test
+    @DisplayName("createSalon — allows the salon that lands exactly ON the cap")
+    void should_createSalon_when_ownerIsOneBelowTheActiveSalonCap() {
+        // Arrange — an off-by-one in the guard would reject the last legitimate salon. Deactivated
+        // salons do not count, so this is also what lets a chain that closed a branch open another.
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "almost-capped@beautica.test", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Final Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
+        var savedSalon = buildSalon(UUID.randomUUID(), owner, "Final Salon");
+
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.countByOwnerIdAndIsActiveTrue(ownerId))
+                .thenReturn((long) SalonService.MAX_ACTIVE_SALONS_PER_OWNER - 1);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        // Act
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        // Assert
+        assertThat(response.name()).isEqualTo("Final Salon");
+        verify(salonRepository).save(any(Salon.class));
     }
 
     // -------------------------------------------------------------------------

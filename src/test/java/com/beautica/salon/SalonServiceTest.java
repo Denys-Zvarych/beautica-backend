@@ -103,7 +103,7 @@ class SalonServiceTest {
         var request = new CreateSalonRequest("Second Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -134,7 +134,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Geo Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
         when(userRepository.save(owner)).thenReturn(owner);
@@ -182,7 +182,7 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(savedSalon, "id", UUID.randomUUID());
         ReflectionTestUtils.setField(savedSalon, "createdAt", Instant.now());
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
         when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
@@ -205,7 +205,7 @@ class SalonServiceTest {
                 null, null, null, null, null);
         var savedSalon = buildSalonNoCity(UUID.randomUUID(), owner, "No Geo Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -283,7 +283,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Handle Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -307,7 +307,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "URL Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -346,7 +346,7 @@ class SalonServiceTest {
         User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
         var request = new CreateSalonRequest("My Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.createSalon(userId, request))
                 .isInstanceOf(ForbiddenException.class)
@@ -753,7 +753,7 @@ class SalonServiceTest {
                 cityId, null, null, null, null
         );
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
@@ -780,7 +780,7 @@ class SalonServiceTest {
                 null, null, null, null, null
         );
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
@@ -810,7 +810,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Valid Geo Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 

@@ -94,7 +94,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -116,7 +116,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -138,7 +138,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Any Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -156,7 +156,7 @@ class SalonServicePrimaryTest {
         User client = buildUser(userId, Role.CLIENT);
         var request = new CreateSalonRequest("Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.createSalon(userId, request))
                 .isInstanceOf(ForbiddenException.class)
@@ -194,7 +194,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Primary Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
@@ -216,7 +216,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
@@ -240,7 +240,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
@@ -270,7 +270,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 

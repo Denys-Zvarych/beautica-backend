@@ -15,6 +15,7 @@ import com.beautica.salon.dto.RotateAdminRequest;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.SalonStaffMemberResponse;
+import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -128,6 +129,46 @@ public class SalonController {
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<List<SalonStaffMemberResponse>> getSalonStaff(@PathVariable UUID salonId) {
         return ApiResponse.ok(salonService.getSalonStaff(salonId));
+    }
+
+    /**
+     * Sibling salons (Phase 21.3b) — every ACTIVE salon sharing {@code salonId}'s owner,
+     * <b>excluding {@code salonId} itself</b>. This is the destination candidate set for
+     * {@link #rotateAdmin} ({@code PATCH /{salonId}/admins/{userId}/salon}), which already enforces
+     * the same-owner rule server-side; this read only lets the mobile rotate-admin picker
+     * (mobile Phase 21.6) show the correct choices instead of guessing.
+     *
+     * <p><b>Self is excluded by design:</b> the picker chooses a <em>destination</em>, and
+     * rotating an admin into the salon they already occupy is a no-op that {@code rotateAdmin}
+     * rejects with 400. Offering it would render a guaranteed-to-fail option.
+     *
+     * <p>Why {@code GET /mine} cannot serve this: it is {@code hasRole('SALON_OWNER')} only, so the
+     * {@code SALON_ADMIN} who may legitimately perform the rotation gets 403 — and even for an
+     * owner it returns the CALLER's portfolio, not the portfolio of {@code salonId}'s owner.
+     *
+     * <p>{@code @authz.canManageSalon} is the IDENTICAL expression already gating
+     * {@link #getSalonStaff}/{@link #updateSalon}/{@link #listPendingInvites} — reused verbatim,
+     * not re-derived, so a future role change to salon management cannot diverge between sibling
+     * endpoints. It also places the caller inside exactly the trust boundary {@link #rotateAdmin}
+     * operates in, so this leaks nothing that mutation does not already expose — an argument that
+     * depends on self-rotation remaining legal for a {@code SALON_ADMIN}; see
+     * {@link SalonService#getSiblingSalons} for that coupling.
+     *
+     * <p><b>Returns {@link SiblingSalonOption}, not {@code SalonResponse}.</b> A picker needs the
+     * id it will submit plus enough text to tell two salons apart. The full {@code SalonResponse}
+     * additionally handed an assigned {@code SALON_ADMIN} the owner's UUID and every sibling's
+     * {@code description}, {@code phone}, {@code instagramUrl}, {@code avatarUrl}, legacy
+     * city/region/address, {@code isPrimary} and {@code createdAt} — for salons they hold no
+     * assignment to. See that record's Javadoc.
+     */
+    @Operation(summary = "List sibling salons of the same owner",
+            description = "Active salons sharing this salon's owner, excluding this salon itself, "
+                    + "as id + name + short address. Backs the rotate-admin destination picker. "
+                    + "Requires management access to the salon (owner or assigned admin).")
+    @GetMapping("/{salonId}/sibling-salons")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<SiblingSalonOption>> getSiblingSalons(@PathVariable UUID salonId) {
+        return ApiResponse.ok(salonService.getSiblingSalons(salonId));
     }
 
     /**

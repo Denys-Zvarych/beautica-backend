@@ -151,6 +151,79 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
                 .isFalse();
     }
 
+    /**
+     * Phase 283 behaviour-identity pin, input 3 of 4 — {@code salonId} resolving to no row.
+     *
+     * <p>{@code existsByIdAndOwnerId} was rewritten from a derived query (which emitted a pointless
+     * {@code left join users} to read back {@code users.id}, already present as {@code
+     * salons.owner_id}) to an explicit native {@code SELECT EXISTS (SELECT 1 ...)}. Since the old
+     * form's join was an OUTER join, the case that could most plausibly have differed is one with
+     * no {@code salons} row at all — pinned here alongside the owner / non-owner cases above and
+     * the inactive case below, which together cover every input class this predicate sees.
+     */
+    @Test
+    @DisplayName("existsByIdAndOwnerId — returns false when the salon id resolves to no row")
+    void should_returnFalse_when_salonIdDoesNotExist() {
+        User owner = new User(
+                "owner-missing-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Olena",
+                "Kovalenko",
+                "+380502222222"
+        );
+        em.persist(owner);
+        em.flush();
+        em.clear();
+
+        boolean result = salonRepository.existsByIdAndOwnerId(UUID.randomUUID(), owner.getId());
+
+        assertThat(result)
+                .as("existsByIdAndOwnerId must return false for a salon id with no row")
+                .isFalse();
+    }
+
+    /**
+     * Phase 283 behaviour-identity pin, input 4 of 4 — a DEACTIVATED salon still answers
+     * {@code true} for its owner.
+     *
+     * <p>This predicate carries no {@code is_active} filter and must not acquire one: see
+     * {@code SalonRepository#findIdsByIdInAndOwnerId}'s Javadoc for why adding one would make the
+     * booking listing's {@code providerCanReviewClient} flag disagree with both
+     * {@code GET /bookings/&#123;id&#125;} and the {@code POST /client-reviews} write gate. The
+     * native-query rewrite must preserve that exactly.
+     */
+    @Test
+    @DisplayName("existsByIdAndOwnerId — returns true for a DEACTIVATED salon owned by the given owner (no is_active predicate)")
+    void should_returnTrue_when_salonIsInactiveButOwnedByOwner() {
+        User owner = new User(
+                "owner-inactive-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Olena",
+                "Kovalenko",
+                "+380503333333"
+        );
+        em.persist(owner);
+
+        Salon inactiveSalon = Salon.builder()
+                .cityId(testCityId())
+                .owner(owner)
+                .name("Closed Branch")
+                .isActive(false)
+                .build();
+        em.persist(inactiveSalon);
+        em.flush();
+        em.clear();
+
+        boolean result = salonRepository.existsByIdAndOwnerId(inactiveSalon.getId(), owner.getId());
+
+        assertThat(result)
+                .as("existsByIdAndOwnerId carries no is_active predicate — a deactivated salon "
+                        + "must still resolve for its owner")
+                .isTrue();
+    }
+
     @Test
     @DisplayName("findByIdAndOwnerId — returns populated Optional when correct owner fetches their salon")
     void should_returnSalon_when_correctOwnerFetchesSalon() {

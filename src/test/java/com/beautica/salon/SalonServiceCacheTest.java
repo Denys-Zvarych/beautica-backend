@@ -131,6 +131,28 @@ class SalonServiceCacheTest {
         cacheManager.getCache("search:salons:browse").clear();
     }
 
+    /**
+     * A mock {@link Salon} whose {@code owner} resolves to {@code ownerId}.
+     *
+     * <p>Every {@code ownerSalons} eviction now keys on {@code SalonService#ownerIdOf(salon)}
+     * (Phase 283) rather than on the actor parameter, so a bare {@code Mockito.mock(Salon.class)}
+     * — which answers {@code null} for {@code getOwner()} — no longer models any row this service
+     * can load: {@code salons.owner_id} is {@code NOT NULL REFERENCES users(id)} (V3). Extracted
+     * the moment a second test needed the same three stub lines (§M-3).
+     */
+    private static Salon salonOwnedBy(UUID ownerId) {
+        Salon salon = Mockito.mock(Salon.class);
+        User owner = Mockito.mock(User.class);
+        when(owner.getId()).thenReturn(ownerId);
+        when(salon.getOwner()).thenReturn(owner);
+        return salon;
+    }
+
+    private static UpdateSalonRequest renameTo(String name) {
+        return new UpdateSalonRequest(name, null, null, null, null,
+                null, null, null, null, null, null, null);
+    }
+
     @Test
     @DisplayName("second call to getOwnerSalons returns cached result without hitting repository")
     void should_notHitRepository_when_getOwnerSalonsCalledTwice() {
@@ -150,7 +172,7 @@ class SalonServiceCacheTest {
         UUID salonId = UUID.randomUUID();
 
         User owner = new User("owner@example.com", "hash", Role.SALON_OWNER, "Test", "Owner", "+380501234567");
-        var salon = Mockito.mock(com.beautica.salon.entity.Salon.class);
+        Salon salon = salonOwnedBy(ownerId);
 
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
@@ -205,7 +227,7 @@ class SalonServiceCacheTest {
     void should_evictSalonDetailCache_when_updateSalonCalled() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Mockito.mock(Salon.class);
+        Salon salon = salonOwnedBy(UUID.randomUUID());
 
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
@@ -215,10 +237,7 @@ class SalonServiceCacheTest {
         salonService.getPublicSalon(salonId);
 
         // Evict via updateSalon
-        UpdateSalonRequest updateRequest = new UpdateSalonRequest(
-                "Updated Name", null, null, null, null,
-                null, null, null, null, null, null, null);
-        salonService.updateSalon(actorId, salonId, updateRequest);
+        salonService.updateSalon(actorId, salonId, renameTo("Updated Name"));
 
         // Cache was evicted — repository must be queried again
         salonService.getPublicSalon(salonId);
@@ -227,30 +246,68 @@ class SalonServiceCacheTest {
     }
 
     @Test
-    @DisplayName("updateSalon evicts ownerSalons so the next getOwnerSalons re-queries the repository")
+    @DisplayName("updateSalon by the OWNER evicts ownerSalons so the next getOwnerSalons re-queries the repository")
     void should_evictOwnerSalonsCache_when_updateSalonCalled() {
-        // updateSalon's @Caching evicts ownerSalons under key=#actorId — the actor IS the owner
-        UUID actorId = UUID.randomUUID();
+        // The owner-is-the-actor case. Key derivation is still ownerIdOf(salon), not #actorId —
+        // the two merely coincide here; should_...adminUpdatesSalon covers the case where they do not.
+        UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Mockito.mock(Salon.class);
+        Salon salon = salonOwnedBy(ownerId);
 
-        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(actorId)).thenReturn(List.of());
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate ownerSalons cache for this owner
-        salonService.getOwnerSalons(actorId);
+        salonService.getOwnerSalons(ownerId);
 
-        // Evict via updateSalon — second @CacheEvict in @Caching group targets ownerSalons
-        UpdateSalonRequest updateRequest = new UpdateSalonRequest(
-                "Updated Name", null, null, null, null,
-                null, null, null, null, null, null, null);
-        salonService.updateSalon(actorId, salonId, updateRequest);
+        salonService.updateSalon(ownerId, salonId, renameTo("Updated Name"));
 
         // Cache was evicted — repository must be queried again
-        salonService.getOwnerSalons(actorId);
+        salonService.getOwnerSalons(ownerId);
 
-        verify(salonRepository, times(2)).findAllByOwnerIdAndIsActiveTrue(actorId);
+        verify(salonRepository, times(2)).findAllByOwnerIdAndIsActiveTrue(ownerId);
+    }
+
+    /**
+     * Phase 283 regression pin — the defect this whole fix exists for.
+     *
+     * <p>{@code getOwnerSalons} is {@code @Cacheable(value = "ownerSalons", key = "#ownerId")},
+     * but {@code updateSalon} used to evict under its {@code actorId} parameter, on the assumption
+     * (stated verbatim in this file's previous revision: <i>"the actor IS the owner"</i>) that only
+     * the owner ever reaches it. That assumption is false: {@code updateSalon}'s gate is
+     * {@code @PreAuthorize("... @authz.canManageSalon(...)")}, which also admits the
+     * {@code SALON_ADMIN} assigned to the salon — see
+     * {@code SalonServiceAdminTest#should_allowSalonAdminToUpdateSalonDetails}. An admin PATCH
+     * therefore evicted a key nobody reads, and {@code GET /salons/mine} kept serving the owner the
+     * pre-edit salon name for the full 5-minute {@code ownerSalons} TTL.
+     *
+     * <p>The actor id here is deliberately a THIRD, unrelated UUID, so the test can only pass if
+     * the eviction key is derived from the salon row's owner and not from the caller.
+     * Confirmed RED against the pre-fix line ({@code evictOwnerSalonsCacheAfterCommit(actorId)}):
+     * the owner's entry survived, the second read was served from cache and the assertion failed
+     * with "Wanted 2 times but was 1 time."
+     */
+    @Test
+    @DisplayName("Phase 283 — a SALON_ADMIN's updateSalon evicts ownerSalons under the OWNER's key, not the actor's")
+    void should_evictOwnerSalonsCacheUnderOwnerKey_when_adminUpdatesSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID adminActorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(ownerId);
+
+        when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        // Populate the OWNER's ownerSalons entry — this is what GET /salons/mine reads.
+        salonService.getOwnerSalons(ownerId);
+
+        // The admin — not the owner — renames the salon.
+        salonService.updateSalon(adminActorId, salonId, renameTo("Renamed By Admin"));
+
+        salonService.getOwnerSalons(ownerId);
+
+        verify(salonRepository, times(2)).findAllByOwnerIdAndIsActiveTrue(ownerId);
     }
 
     @Test
@@ -260,7 +317,7 @@ class SalonServiceCacheTest {
         UUID salonId = UUID.randomUUID();
 
         User owner = new User("owner2@example.com", "hash", Role.SALON_OWNER, "Test", "Owner", "+380501234568");
-        Salon salon = Mockito.mock(Salon.class);
+        Salon salon = salonOwnedBy(ownerId);
 
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
@@ -287,7 +344,7 @@ class SalonServiceCacheTest {
 
         // Arrange — wire mocks so deactivateSalon completes without errors
         User owner = new User("owner3@example.com", "hash", Role.SALON_OWNER, "Test", "Owner", "+380501234569");
-        Salon salon = Mockito.mock(Salon.class);
+        Salon salon = salonOwnedBy(ownerId);
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));

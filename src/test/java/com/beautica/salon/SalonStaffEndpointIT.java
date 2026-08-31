@@ -2,8 +2,6 @@ package com.beautica.salon;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.Role;
-import com.beautica.auth.dto.AuthResponse;
-import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.master.dto.MasterDetailResponse;
@@ -23,7 +21,6 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -53,7 +50,7 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
 
     private static final String STAFF_URL = "/api/v1/salons/%s/staff";
     private static final String MASTER_DETAIL_URL = "/api/v1/masters/%s";
-    private static final String TEST_PASSWORD = "Str0ngP@ss1!";
+    private static final String TEST_PASSWORD = SalonItFixtures.TEST_PASSWORD;
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -64,18 +61,22 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    private SalonItFixtures fixtures;
+
     @BeforeEach
     void configureHttpClient() {
         restTemplate.getRestTemplate().setRequestFactory(
                 new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        fixtures = new SalonItFixtures(
+                restTemplate, jdbcTemplate, objectMapper, passwordEncoder, this::testCityId);
     }
 
     @Test
     @DisplayName("200 with both a master and an admin entry when SALON_OWNER requests their own salon's roster")
     void should_return200WithBothRoles_when_ownerRequestsStaff() throws Exception {
         // Arrange
-        UUID ownerId = insertUser("owner-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Staff Roster Salon");
+        UUID ownerId = fixtures.insertUser("owner-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Staff Roster Salon");
         UUID masterUserId = insertStaffUser(
                 "master-staff-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId,
                 "+380501112233", "master_insta", "Master bio", "Майстер манікюру", "https://cdn.test/master.png");
@@ -85,14 +86,14 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
                 "+380502223344", "admin_insta", "Admin bio", "Адміністратор", "https://cdn.test/admin.png");
         insertActiveMasterService(salonId, masterId);
         insertActiveMasterService(salonId, masterId);
-        String ownerToken = loginAndGetToken(emailOf(ownerId));
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
 
         // Act
         log.debug("Act: GET {} as SALON_OWNER — must return both the master and the admin",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
         // Assert
@@ -137,19 +138,19 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("200 when the salon's OWN SALON_ADMIN requests the roster")
     void should_return200_when_ownAdminRequestsStaff() throws Exception {
         // Arrange
-        UUID ownerId = insertUser("owner-adminview-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Admin View Salon");
+        UUID ownerId = fixtures.insertUser("owner-adminview-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Admin View Salon");
         UUID adminUserId = insertStaffUser(
                 "admin-view-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN", salonId,
                 "+380503334455", null, null, null, null);
-        String adminToken = loginAndGetToken(emailOf(adminUserId));
+        String adminToken = fixtures.loginAndGetToken(fixtures.emailOf(adminUserId));
 
         // Act
         log.debug("Act: GET {} as the salon's own SALON_ADMIN — must succeed",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(adminToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(adminToken)),
                 String.class);
 
         // Assert
@@ -166,18 +167,18 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("403 when a foreign SALON_OWNER requests another salon's roster")
     void should_return403_when_foreignOwnerRequestsStaff() throws Exception {
         // Arrange
-        UUID ownerAId = insertUser("owner-a-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonAId = insertSalon(ownerAId, "Salon A Staff");
-        UUID ownerBId = insertUser("owner-b-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        insertSalon(ownerBId, "Salon B Staff");
-        String ownerBToken = loginAndGetToken(emailOf(ownerBId));
+        UUID ownerAId = fixtures.insertUser("owner-a-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonAId = fixtures.insertSalon(ownerAId, "Salon A Staff");
+        UUID ownerBId = fixtures.insertUser("owner-b-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        fixtures.insertSalon(ownerBId, "Salon B Staff");
+        String ownerBToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerBId));
 
         // Act
         log.debug("Act: GET {} as a foreign SALON_OWNER — must be denied",
                 String.format(STAFF_URL, salonAId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonAId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerBToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerBToken)),
                 String.class);
 
         // Assert
@@ -190,21 +191,21 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("403 when a foreign SALON_ADMIN requests another salon's roster")
     void should_return403_when_foreignAdminRequestsStaff() throws Exception {
         // Arrange
-        UUID ownerAId = insertUser("owner-a-admstaff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonAId = insertSalon(ownerAId, "Salon A Admin Staff");
-        UUID ownerBId = insertUser("owner-b-admstaff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonBId = insertSalon(ownerBId, "Salon B Admin Staff");
+        UUID ownerAId = fixtures.insertUser("owner-a-admstaff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonAId = fixtures.insertSalon(ownerAId, "Salon A Admin Staff");
+        UUID ownerBId = fixtures.insertUser("owner-b-admstaff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonBId = fixtures.insertSalon(ownerBId, "Salon B Admin Staff");
         UUID adminBId = insertStaffUser(
                 "admin-b-staff-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN", salonBId,
                 null, null, null, null, null);
-        String adminBToken = loginAndGetToken(emailOf(adminBId));
+        String adminBToken = fixtures.loginAndGetToken(fixtures.emailOf(adminBId));
 
         // Act
         log.debug("Act: GET {} as a SALON_ADMIN of a different salon — must be denied",
                 String.format(STAFF_URL, salonAId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonAId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(adminBToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(adminBToken)),
                 String.class);
 
         // Assert
@@ -217,17 +218,17 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("403 when a CLIENT requests a salon's roster")
     void should_return403_when_clientRequestsStaff() throws Exception {
         // Arrange
-        UUID ownerId = insertUser("owner-client-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Client Denied Salon");
-        UUID clientId = insertUser("client-staff-" + System.nanoTime() + "@beautica.test", "CLIENT");
-        String clientToken = loginAndGetToken(emailOf(clientId));
+        UUID ownerId = fixtures.insertUser("owner-client-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Client Denied Salon");
+        UUID clientId = fixtures.insertUser("client-staff-" + System.nanoTime() + "@beautica.test", "CLIENT");
+        String clientToken = fixtures.loginAndGetToken(fixtures.emailOf(clientId));
 
         // Act
         log.debug("Act: GET {} as CLIENT — role guard must deny with 403",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(clientToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(clientToken)),
                 String.class);
 
         // Assert
@@ -240,18 +241,18 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("REGRESSION PIN: GET /masters/{id} still masks phoneNumber for the same master the new roster exposes unmasked")
     void should_stillMaskPhoneNumber_when_publicMasterDetailRequestedForSameMaster() throws Exception {
         // Arrange
-        UUID ownerId = insertUser("owner-regression-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Regression Pin Salon");
+        UUID ownerId = fixtures.insertUser("owner-regression-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Regression Pin Salon");
         UUID masterUserId = insertStaffUser(
                 "master-regression-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId,
                 "+380509998877", "regression_insta", "bio", "title", null);
         UUID masterId = insertMaster(masterUserId, salonId, "SALON_MASTER");
-        String ownerToken = loginAndGetToken(emailOf(ownerId));
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
 
         // Act — the new management-gated roster
         ResponseEntity<String> staffResponse = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
         var staffBody = objectMapper.readValue(
                 staffResponse.getBody(), new TypeReference<ApiResponse<List<SalonStaffMemberResponse>>>() {});
@@ -281,16 +282,16 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("200 with empty list when a salon has no masters and no admins")
     void should_returnEmptyList_when_salonHasNoStaff() throws Exception {
         // Arrange
-        UUID ownerId = insertUser("owner-empty-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Empty Staff Salon");
-        String ownerToken = loginAndGetToken(emailOf(ownerId));
+        UUID ownerId = fixtures.insertUser("owner-empty-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Empty Staff Salon");
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
 
         // Act
         log.debug("Act: GET {} for a salon with zero masters and zero admins",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
         // Assert
@@ -308,8 +309,8 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("a deactivated master is excluded from the roster while the still-active master remains")
     void should_excludeInactiveMaster_when_masterHasBeenDeactivated() throws Exception {
         // Arrange
-        UUID ownerId = insertUser("owner-inactive-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Inactive Master Salon");
+        UUID ownerId = fixtures.insertUser("owner-inactive-staff-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Inactive Master Salon");
         UUID activeMasterUserId = insertStaffUser(
                 "master-active-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId,
                 "+380504445566", null, null, null, null);
@@ -318,14 +319,14 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
                 "master-inactive-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId,
                 "+380505556677", null, null, null, null);
         insertMaster(inactiveMasterUserId, salonId, "SALON_MASTER", false);
-        String ownerToken = loginAndGetToken(emailOf(ownerId));
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
 
         // Act
         log.debug("Act: GET {} — salon has one active and one deactivated master",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
         // Assert
@@ -343,22 +344,22 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     @DisplayName("all SALON_ADMINs are returned when a salon has more than one (multi-admin, Phase 21.1)")
     void should_returnAllAdmins_when_salonHasMultipleAdmins() throws Exception {
         // Arrange — V108 dropped uq_users_salon_admin, so a salon can now carry >1 admin.
-        UUID ownerId = insertUser("owner-multiadmin-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Multi Admin Salon");
+        UUID ownerId = fixtures.insertUser("owner-multiadmin-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Multi Admin Salon");
         UUID adminOneId = insertStaffUser(
                 "admin-one-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN", salonId,
                 "+380506667788", null, null, null, null);
         UUID adminTwoId = insertStaffUser(
                 "admin-two-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN", salonId,
                 "+380507778899", null, null, null, null);
-        String ownerToken = loginAndGetToken(emailOf(ownerId));
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
 
         // Act
         log.debug("Act: GET {} — salon has two SALON_ADMINs, neither a master",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
         // Assert
@@ -379,8 +380,8 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     void should_attributeServiceCountPerMaster_when_countsDiffer() throws Exception {
         // Arrange — two masters with DISCRIMINATING counts (3 vs 1): a batch GROUP BY that
         // misattributes rows across masters, or collapses to a single shared value, must fail this.
-        UUID ownerId = insertUser("owner-countattr-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
-        UUID salonId = insertSalon(ownerId, "Count Attribution Salon");
+        UUID ownerId = fixtures.insertUser("owner-countattr-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Count Attribution Salon");
         UUID masterThreeUserId = insertStaffUser(
                 "master-three-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId,
                 "+380508889900", null, null, null, null);
@@ -395,14 +396,14 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
         UUID masterOneId = insertMaster(masterOneUserId, salonId, "SALON_MASTER");
         insertActiveMasterService(salonId, masterOneId);
 
-        String ownerToken = loginAndGetToken(emailOf(ownerId));
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
 
         // Act
         log.debug("Act: GET {} — one master has 3 active services, the other has 1",
                 String.format(STAFF_URL, salonId));
         ResponseEntity<String> response = restTemplate.exchange(
                 String.format(STAFF_URL, salonId), HttpMethod.GET,
-                new HttpEntity<>(bearerHeaders(ownerToken)),
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
                 String.class);
 
         // Assert
@@ -424,15 +425,6 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
-
-    private UUID insertUser(String email, String role) {
-        String hash = passwordEncoder.encode(TEST_PASSWORD);
-        UUID id = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) VALUES (?, ?, ?, ?, true, true)",
-                id, email, hash, role);
-        return id;
-    }
 
     private UUID insertStaffUser(String email, String role, UUID salonId, String phoneNumber,
             String instagram, String bio, String professionalTitle, String avatarUrl) {
@@ -474,30 +466,4 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
                 UUID.randomUUID(), masterId, serviceDefId);
     }
 
-    private UUID insertSalon(UUID ownerId, String name) {
-        UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
-                salonId, ownerId, name, testCityId());
-        return salonId;
-    }
-
-    private String emailOf(UUID userId) {
-        return jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, userId);
-    }
-
-    private String loginAndGetToken(String email) throws Exception {
-        ResponseEntity<String> resp = restTemplate.postForEntity(
-                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
-        return body.data().accessToken();
-    }
-
-    private HttpHeaders bearerHeaders(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setBearerAuth(token);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        return headers;
-    }
 }
