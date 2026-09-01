@@ -22,6 +22,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -506,17 +508,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         log.debug("Arrange: insert valid invite token for email={}", masterEmail);
 
         String rawToken = UUID.randomUUID().toString();
-        String salonOwnerEmail = uniqueEmail("salon-owner");
-        createdEmails.add(salonOwnerEmail);
-        jdbcTemplate.update(
-                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, email_verified, created_at, updated_at) " +
-                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
-                salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) " +
-                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now(), ?)",
-                salonId, salonOwnerEmail, testCityId());
-        createdSalonIds.add(salonId);
+        createSalonWithOwner(salonId, "salon-owner");
         saveValidInviteToken(masterEmail, salonId, rawToken);
 
         var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
@@ -540,6 +532,60 @@ class InviteControllerIT extends AbstractIntegrationTest {
         assertThat(persistedUser).isPresent();
         assertThat(persistedUser.get().getRole()).isEqualTo(Role.SALON_MASTER);
         assertThat(persistedUser.get().getSalonId()).isEqualTo(salonId);
+        // REGRESSION (locked-out-forever bug): User.createFromInvite must persist
+        // email_verified=true. Before the fix, every invited user was created with the
+        // default false and permanently 403'd at login with EmailNotVerifiedException —
+        // this pins the write itself, not just the eventual login outcome below.
+        assertThat(persistedUser.get().isEmailVerified())
+                .as("invited SALON_MASTER %s must be persisted with email_verified=true", masterEmail)
+                .isTrue();
+    }
+
+    @ParameterizedTest(name = "role={0}")
+    @EnumSource(value = Role.class, names = {"SALON_ADMIN", "SALON_MASTER"})
+    @DisplayName("REGRESSION: a user who just accepted their invite can log in immediately with the password they set — no OTP required (bug: createFromInvite left email_verified=false, so login threw EmailNotVerifiedException for every SALON_ADMIN and SALON_MASTER invitee)")
+    void should_allowLogin_afterAcceptingInvite_withoutOtp(Role invitedRole) throws Exception {
+        String inviteeEmail = uniqueEmail("invite-login-" + invitedRole.name().toLowerCase());
+        createdEmails.add(inviteeEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: valid {} invite token for email={} salonId={}", invitedRole, inviteeEmail, salonId);
+
+        createSalonWithOwner(salonId, "owner-invite-login-" + invitedRole.name().toLowerCase());
+
+        String rawToken = UUID.randomUUID().toString();
+        if (invitedRole == Role.SALON_ADMIN) {
+            saveValidAdminInviteToken(inviteeEmail, salonId, rawToken);
+        } else {
+            saveValidInviteToken(inviteeEmail, salonId, rawToken);
+        }
+        String password = "Password12345";
+        var acceptRequest = new InviteAcceptRequest(rawToken, password, "Jane", "Doe", "+380501234567");
+
+        log.debug("Act: POST /auth/invite/accept for role={} email={}", invitedRole, inviteeEmail);
+        ResponseEntity<String> acceptResponse = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept", acceptRequest, String.class);
+        assertThat(acceptResponse.getStatusCode())
+                .as("accepting a valid %s invite must return 201", invitedRole)
+                .isEqualTo(HttpStatus.CREATED);
+
+        log.debug("Act: POST /auth/login for just-accepted invitee email={} with the password just set — must NOT require OTP verification", inviteeEmail);
+        ResponseEntity<String> loginResponse = restTemplate.postForEntity(
+                "/api/v1/auth/login",
+                new LoginRequest(inviteeEmail, password),
+                String.class);
+
+        assertThat(loginResponse.getStatusCode())
+                .as("REGRESSION: a %s who just accepted their invite must be able to log in immediately (bug shipped a 403 EmailNotVerifiedException here for every invitee)", invitedRole)
+                .isEqualTo(HttpStatus.OK);
+
+        var loginBody = objectMapper.readValue(
+                loginResponse.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        assertThat(loginBody.success()).isTrue();
+        assertThat(loginBody.data().accessToken())
+                .as("login immediately after invite acceptance must return a usable access token")
+                .isNotBlank();
+        assertThat(loginBody.data().role()).isEqualTo(invitedRole);
+        assertThat(loginBody.data().email()).isEqualTo(inviteeEmail);
     }
 
     @Test
@@ -557,17 +603,7 @@ class InviteControllerIT extends AbstractIntegrationTest {
         UUID salonId = UUID.randomUUID();
         log.debug("Arrange: two valid invite tokens for email={} email={}", masterEmailA, masterEmailB);
 
-        String salonOwnerEmail = uniqueEmail("salon-owner-family");
-        createdEmails.add(salonOwnerEmail);
-        jdbcTemplate.update(
-                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, email_verified, created_at, updated_at) " +
-                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
-                salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
-        jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) " +
-                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now(), ?)",
-                salonId, salonOwnerEmail, testCityId());
-        createdSalonIds.add(salonId);
+        createSalonWithOwner(salonId, "salon-owner-family");
 
         String rawTokenA = UUID.randomUUID().toString();
         String rawTokenB = UUID.randomUUID().toString();
@@ -949,6 +985,27 @@ class InviteControllerIT extends AbstractIntegrationTest {
         var body = objectMapper.readValue(
                 loginResp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
         return body.data().accessToken();
+    }
+
+    /**
+     * Persists an active SALON_OWNER + salon row via raw JDBC (no HTTP round trip) so an
+     * accept-invite test has a real, FK-satisfying salon to attach the invite token to.
+     * Registers both rows for teardown in {@link #cleanUp()}. Mirrors the inline setup
+     * duplicated across the accept-invite tests above (kept there to avoid touching
+     * passing tests during this pass — see QA finding Q4).
+     */
+    private void createSalonWithOwner(UUID salonId, String ownerEmailPrefix) {
+        String salonOwnerEmail = uniqueEmail(ownerEmailPrefix);
+        createdEmails.add(salonOwnerEmail);
+        jdbcTemplate.update(
+                "INSERT INTO users (email, password_hash, role, first_name, last_name, is_active, email_verified, created_at, updated_at) " +
+                "VALUES (?, ?, 'SALON_OWNER', 'Owner', 'Test', true, true, now(), now())",
+                salonOwnerEmail, TestConstants.HASHED_TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) " +
+                "VALUES (?, (SELECT id FROM users WHERE email = ?), 'Test Salon', true, now(), now(), ?)",
+                salonId, salonOwnerEmail, testCityId());
+        createdSalonIds.add(salonId);
     }
 
     private InviteToken saveValidInviteToken(String email, UUID salonId, String rawToken) {

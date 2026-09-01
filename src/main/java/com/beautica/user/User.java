@@ -254,6 +254,38 @@ public class User extends AuditableEntity {
         this.salonId = salonId;
     }
 
+    /**
+     * Creates a user accepted through a salon invite (SALON_ADMIN or SALON_MASTER).
+     * <p>
+     * The invite token was single-use and emailed to this exact address by
+     * {@code InviteService}; presenting it back at accept-time <em>is</em> the proof
+     * of mailbox ownership for this account — the invite token was the email
+     * verification. Deferring to the normal OTP-verification flow afterward is both
+     * redundant and, as originally shipped, unsatisfiable (nothing on the invite path
+     * ever issues a verification code), which locked every invited user out of login.
+     * <p>
+     * The salonId-taking constructor above stays public — it also backs fixtures that
+     * represent an already-onboarded salon staff member (e.g. an existing SALON_ADMIN
+     * used as the caller of {@code sendInvite}), which is a different scenario from
+     * "just accepted an invite" and must not be forced verified by construction. This
+     * factory is the one InviteService#acceptInvite must call, so the verified-by-token
+     * intent stays documented and centralized rather than a call-site
+     * {@code setEmailVerified(true)} that a future edit could silently drop.
+     */
+    public static User createFromInvite(
+            String email,
+            String passwordHash,
+            Role role,
+            String firstName,
+            String lastName,
+            String phoneNumber,
+            UUID salonId
+    ) {
+        User user = new User(email, passwordHash, role, firstName, lastName, phoneNumber, salonId);
+        user.emailVerified = true;
+        return user;
+    }
+
     public UUID getId() {
         return id;
     }

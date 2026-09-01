@@ -260,7 +260,10 @@ public class InviteService {
         token.markUsed();
         inviteTokenRepository.save(token);
 
-        var user = new User(
+        // Accepting the invite IS the email verification: the token was single-use and
+        // emailed to token.getEmail(); User.createFromInvite marks the account verified
+        // structurally so this path can never regress to the locked-out-forever bug.
+        var user = User.createFromInvite(
                 token.getEmail(),
                 passwordEncoder.encode(request.password()),
                 token.getRole(),
