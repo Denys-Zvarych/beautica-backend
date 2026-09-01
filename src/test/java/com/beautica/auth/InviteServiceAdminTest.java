@@ -104,7 +104,7 @@ class InviteServiceAdminTest {
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("admin@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("admin@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-admin-tok");
 
@@ -130,7 +130,7 @@ class InviteServiceAdminTest {
         when(userRepository.existsByEmail("second-admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("second-admin@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("second-admin@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-second-admin-tok");
 
@@ -158,7 +158,7 @@ class InviteServiceAdminTest {
         when(userRepository.existsByEmail("another-admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("another-admin@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("another-admin@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-another-admin-tok");
 
@@ -304,7 +304,7 @@ class InviteServiceAdminTest {
         when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
         // SALON_ADMIN branch calls findById, NOT findByIdAndOwnerId
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-master-tok");
 

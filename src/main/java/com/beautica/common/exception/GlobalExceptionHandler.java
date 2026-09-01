@@ -25,12 +25,15 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.LinkedHashMap;
@@ -553,6 +556,90 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.PAYLOAD_TOO_LARGE)
                 .body(ApiResponse.error("Upload exceeds the maximum allowed size"));
+    }
+
+    /**
+     * Wrong HTTP verb on an existing path — e.g. {@code GET /api/v1/book/{slug}/booking}, which
+     * only maps {@code POST}.
+     *
+     * <h3>Why this handler is load-bearing and not cosmetic</h3>
+     * Spring resolves handler exceptions through an ordered chain:
+     * {@code ExceptionHandlerExceptionResolver} (order 0, i.e. THIS advice) runs BEFORE
+     * {@code DefaultHandlerExceptionResolver} (order 2), which is the component that would
+     * otherwise turn {@link HttpRequestMethodNotSupportedException} into a proper 405. With no
+     * handler here, {@link #handleGeneric}'s {@code @ExceptionHandler(Exception.class)} matched
+     * first and SHADOWED the framework's mapping: every wrong-verb request returned HTTP 500 and
+     * wrote {@code log.error("Unhandled exception", ex)} with a full stack trace.
+     *
+     * <p>That was reachable without credentials. {@code /api/v1/book/**} is {@code permitAll} for
+     * the guest-booking flow, so an anonymous caller looping {@code GET /api/v1/book/x/booking}
+     * produced an unbounded stream of ERROR-level stack traces — log-volume exhaustion on a
+     * metered host, and noise that buries real incidents. A wrong verb is client error, so it
+     * belongs at DEBUG.
+     *
+     * <p>The {@code Allow} header is required by RFC 9110 §15.5.6 on every 405 and is exactly what
+     * {@code DefaultHandlerExceptionResolver} would have emitted; it discloses nothing an
+     * {@code OPTIONS} request would not.
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethodNotSupported(
+            HttpRequestMethodNotSupportedException ex) {
+        log.debug("Method not allowed: {}", ex.getMethod());
+        var response = ResponseEntity.status(HttpStatus.METHOD_NOT_ALLOWED);
+        var supported = ex.getSupportedHttpMethods();
+        if (supported != null && !supported.isEmpty()) {
+            response.allow(supported.toArray(new org.springframework.http.HttpMethod[0]));
+        }
+        return response.body(ApiResponse.error("Request method not supported"));
+    }
+
+    /**
+     * The caller's {@code Accept} header matches nothing this endpoint can produce. Shadowed into
+     * a 500 by {@link #handleGeneric} for exactly the same resolver-ordering reason as
+     * {@link #handleMethodNotSupported} — and reachable from the same unauthenticated surface,
+     * since {@code Accept} is caller-controlled on every request including {@code permitAll} ones.
+     * 406 is the correct status; the response carries no body, so it discloses nothing about what
+     * the endpoint does produce.
+     *
+     * <p><strong>The empty body is the fix, not an oversight.</strong> Returning an
+     * {@link ApiResponse} envelope here is self-defeating by definition: the exception fired
+     * BECAUSE the caller's {@code Accept} header excludes JSON, so Jackson cannot write the
+     * envelope either. {@code AbstractMessageConverterMethodProcessor} re-runs content negotiation
+     * on the handler's own return value, fails again, and re-throws — at which point
+     * {@code ExceptionHandlerExceptionResolver} logs a FULL STACK TRACE at WARN under
+     * {@code org.springframework}, which {@code application.yml} leaves WARN-enabled in prod. That
+     * simply moves the anonymous log-flooding vector from {@code com.beautica} ERROR to Spring
+     * WARN; the caller loops {@code Accept: image/jpeg} and mints stack traces either way. With a
+     * {@code null} body the processor returns early without negotiating, which is exactly what
+     * Spring's own {@code ResponseEntityExceptionHandler} does for this exception.
+     */
+    @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMediaTypeNotAcceptable(
+            HttpMediaTypeNotAcceptableException ex) {
+        log.debug("Not acceptable — {}", ex.getClass().getSimpleName());
+        return ResponseEntity.status(HttpStatus.NOT_ACCEPTABLE).build();
+    }
+
+    /**
+     * Defensive companion to {@link #handleNoResourceFound}. {@link NoHandlerFoundException}
+     * CANNOT fire in the current configuration — Spring only throws it when
+     * {@code spring.mvc.throw-exception-if-no-handler-found} is on AND
+     * {@code spring.web.resources.add-mappings} is off, and this repository sets neither (the
+     * default resource mapping catches every unmatched path and raises
+     * {@link NoResourceFoundException} instead).
+     *
+     * <p>It exists anyway because the day someone disables {@code add-mappings} — a normal thing
+     * to do on an API-only service — the unmatched-path branch would silently move onto
+     * {@link #handleGeneric} and start returning HTTP 500 with a stack trace for every 404-shaped
+     * request, i.e. the exact defect {@link #handleMethodNotSupported} documents, re-opened by a
+     * one-line property change. Three lines now cost less than that regression.
+     */
+    @ExceptionHandler(NoHandlerFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNoHandlerFound(NoHandlerFoundException ex) {
+        log.debug("No handler for {} {}", ex.getHttpMethod(), ex.getRequestURL());
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error("Resource not found"));
     }
 
     @ExceptionHandler(Exception.class)

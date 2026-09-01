@@ -188,22 +188,28 @@ public class InviteService {
         // with the already-registered early return above, a *second* identical call had a not-
         // yet-registered email hit the 409 while a registered email still returned 200, so the
         // 200-vs-409 split deterministically revealed registration status. An expired prior
-        // token is recycled (deleted) before a fresh one is issued.
+        // token is retired (marked SUPERSEDED, not deleted) before a fresh one is issued.
         //
         // SECURITY/CORRECTNESS (cross-salon silent-drop): the lookup is salon-scoped via
         // salonId. An email-global lookup let salon A's pending invite short-circuit salon B's
         // dispatch — B's owner saw a false success while no invite for B was ever created. Each
         // salon now decides idempotency independently against its own pending invite.
         Optional<InviteToken> existingInvite =
-                inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse(email, request.salonId());
-        if (existingInvite.isPresent() && existingInvite.get().getExpiresAt().isAfter(clock.instant())) {
+                inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(
+                        email, request.salonId());
+        // Negation of the SAME canonical predicate the recycle filter uses (InviteToken#isExpired):
+        // "still live" here and "recyclable" in InvitePersistenceService must partition the
+        // timeline with no gap and no overlap. Two open-coded comparisons could leave a token
+        // that is neither — short-circuiting as idempotent while the row is never retired.
+        if (existingInvite.isPresent() && !existingInvite.get().isExpiredAt(clock.instant())) {
             log.debug("Invite idempotent: active invite already exists for this salon (salonId={})", request.salonId());
             return new InviteResponse(email, expiresAt);
         }
-        // An expired-but-unused token still carries is_used = false, so it occupies the
-        // ux_invite_tokens_active slot for (lower(email), salon_id); it is recycled (deleted)
-        // atomically inside persistInviteAndEnqueue, in the same transaction as the new INSERT,
-        // so the delete and insert never deadlock across transaction boundaries.
+        // An expired-but-unused token still carries is_used = false; it occupies the
+        // ux_invite_tokens_active slot for (lower(email), salon_id) until revoked_at is set. It is
+        // retired (marked SUPERSEDED — kept as history, never deleted) atomically inside
+        // persistInviteAndEnqueue, in the same transaction as the new INSERT, so the update and
+        // insert never deadlock across transaction boundaries.
 
         String rawToken = tokenGenerator.generateToken();
         String hashedToken = tokenGenerator.hash(rawToken);
@@ -233,7 +239,19 @@ public class InviteService {
         InviteToken token = inviteTokenRepository.findByToken(tokenGenerator.hash(rawToken))
                 .orElseThrow(() -> new BusinessException("Invalid or expired invite token"));
 
-        if (token.isUsed() || token.getExpiresAt().isBefore(clock.instant())) {
+        // InviteToken.isExpiredAt is THE canonical expiry predicate — shared with acceptInvite,
+        // InvitePersistenceService's recycle filter, SalonService#cancelInvite and the history
+        // status ladder, so no two of them can drift at the boundary instant. See its Javadoc.
+        if (token.isUsed() || token.isExpiredAt(clock.instant())) {
+            throw new BusinessException("Invalid or expired invite token");
+        }
+
+        // Defence in depth. A CANCELLED token already trips isUsed() above, but a SUPERSEDED one
+        // does NOT — it keeps is_used = false, and a clock skew or an unexpired token retired by
+        // some future path would otherwise slip past both checks. Any revoked token is dead,
+        // whatever retired it. Same generic message as every other failure here: distinguishing
+        // "revoked" from "never existed" would turn this endpoint into an invite-id oracle.
+        if (token.getRevokedAt() != null) {
             throw new BusinessException("Invalid or expired invite token");
         }
 
@@ -249,7 +267,15 @@ public class InviteService {
             throw new BusinessException("Invite token has already been used");
         }
 
-        if (token.getExpiresAt().isBefore(clock.instant())) {
+        // Defence in depth — see previewInvite. A CANCELLED token is caught by isUsed() above; a
+        // SUPERSEDED one keeps is_used = false, so this is the check that stops an account being
+        // provisioned from an invite that was retired rather than accepted.
+        if (token.getRevokedAt() != null) {
+            throw new BusinessException("Invite token has already been used");
+        }
+
+        // Same canonical predicate as previewInvite / the history ladder (InviteToken#isExpired).
+        if (token.isExpiredAt(clock.instant())) {
             throw new BusinessException("Invite token has expired");
         }
 

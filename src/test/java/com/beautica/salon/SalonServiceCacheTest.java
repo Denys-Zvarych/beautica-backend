@@ -115,9 +115,16 @@ class SalonServiceCacheTest {
     @MockBean CityRepository cityRepository;
     @MockBean com.beautica.location.service.LocationQueryService locationQueryService;
     // Phase 23.1: SalonService now constructor-depends on InviteTokenRepository
-    // (listPendingInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
+    // (listSalonInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
     // not exercise those paths, so a mock/fixed-clock bean satisfies the wiring only.
     @MockBean com.beautica.user.InviteTokenRepository inviteTokenRepository;
+    // SalonService constructor-depends on UserProfileCacheEvictor: createSalon (owner locality
+    // sync + auto-created owner-master row), removeAdmin and rotateAdmin all write a `users` row
+    // and must stale the user-profile cache. This slice asserts the ownerSalons/salon-detail
+    // caches only, so a mock satisfies the bean graph without changing any assertion below.
+    // WITHOUT this bean the whole context fails to load with "No qualifying bean of type
+    // UserProfileCacheEvictor ... constructor parameter 13", taking all 8 tests red.
+    @MockBean com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;

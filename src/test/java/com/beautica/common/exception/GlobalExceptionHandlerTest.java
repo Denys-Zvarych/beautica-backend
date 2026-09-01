@@ -31,6 +31,8 @@ import org.springframework.core.MethodParameter;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DeadlockLoserDataAccessException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -46,13 +48,17 @@ import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.NoHandlerFoundException;
 
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -1222,6 +1228,104 @@ class GlobalExceptionHandlerTest {
         assertThat(anyLouderLevel)
                 .as("a bounded lock-wait timeout must never be logged at WARN/ERROR")
                 .isFalse();
+    }
+
+    // ── 405 / 406 / 404 — the resolver-shadowing family ───────────────────────
+
+    /**
+     * Anti-Bug §N: every handler in this advice is unit-tested. The ORDERING half — that Spring
+     * reaches this method at all rather than {@code handleGeneric} — cannot be asserted here and
+     * is pinned by {@code GlobalExceptionHandlerResolverOrderTest}; the two are a pair.
+     */
+    @Test
+    @DisplayName("handleMethodNotSupported returns 405 with an Allow header and no leaked detail")
+    void should_return405WithAllowHeader_when_methodNotSupported() {
+        var ex = new HttpRequestMethodNotSupportedException("GET", Set.of("POST"));
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMethodNotSupported(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getHeaders().get(HttpHeaders.ALLOW))
+                .as("RFC 9110 §15.5.6 requires Allow on every 405 — this is what "
+                        + "DefaultHandlerExceptionResolver used to emit before the catch-all "
+                        + "shadowed it")
+                .containsExactly("POST");
+    }
+
+    @Test
+    @DisplayName("handleMethodNotSupported logs at DEBUG with no throwable attached")
+    void should_logAtDebugWithoutStackTrace_when_methodNotSupported() {
+        handler.handleMethodNotSupported(new HttpRequestMethodNotSupportedException("GET", Set.of("POST")));
+
+        assertThat(listAppender.list)
+                .as("this is client error on an unauthenticated-reachable surface; an ERROR-level "
+                        + "stack trace per request is a log-volume amplifier")
+                .allMatch(e -> e.getLevel() == Level.DEBUG && e.getThrowableProxy() == null);
+    }
+
+    /**
+     * A 405 with no {@code supportedMethods} is possible (Spring's own constructor allows it), and
+     * an unguarded {@code toArray} on a null set would turn the handler ITSELF into the 500 it
+     * exists to prevent.
+     */
+    @Test
+    @DisplayName("handleMethodNotSupported still returns 405 when no supported methods are known")
+    void should_return405WithoutAllowHeader_when_supportedMethodsAreUnknown() {
+        var ex = new HttpRequestMethodNotSupportedException("GET");
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMethodNotSupported(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(response.getHeaders().get(HttpHeaders.ALLOW)).isNull();
+    }
+
+    /**
+     * The body MUST be null. An {@link ApiResponse} envelope cannot be written to a caller whose
+     * {@code Accept} header is what raised the exception, so
+     * {@code AbstractMessageConverterMethodProcessor} re-throws and
+     * {@code ExceptionHandlerExceptionResolver} logs a full stack trace at WARN — moving the
+     * anonymous log-flooding vector from {@code com.beautica} ERROR to {@code org.springframework}
+     * WARN rather than closing it. A null body short-circuits negotiation entirely, which is what
+     * Spring's own {@code ResponseEntityExceptionHandler} does. The wire-level proof lives in
+     * {@code GlobalExceptionHandlerResolverOrderTest}; this asserts the contract at the source.
+     */
+    @Test
+    @DisplayName("handleMediaTypeNotAcceptable returns 406 with an unwritable-by-design empty body")
+    void should_return406_when_acceptHeaderUnsatisfiable() {
+        var ex = new HttpMediaTypeNotAcceptableException(List.of(org.springframework.http.MediaType.APPLICATION_JSON));
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMediaTypeNotAcceptable(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_ACCEPTABLE);
+        assertThat(response.getBody())
+                .as("a non-null body cannot be serialised to a client that refuses JSON and costs "
+                        + "a WARN-level stack trace per request")
+                .isNull();
+        assertThat(listAppender.list).allMatch(e -> e.getLevel() == Level.DEBUG);
+    }
+
+    /**
+     * {@link NoHandlerFoundException} cannot fire in the current configuration — it is handled
+     * defensively so that flipping {@code spring.web.resources.add-mappings} to false (a normal
+     * thing to do on an API-only service) cannot silently reopen a 500-with-stack-trace path for
+     * every unmatched URL. The handler is therefore unreachable-by-configuration, not dead: this
+     * test is what keeps it correct until the day it becomes reachable.
+     */
+    @Test
+    @DisplayName("handleNoHandlerFound returns 404 at DEBUG and echoes no request detail to the client")
+    void should_return404_when_noHandlerFound() {
+        var ex = new NoHandlerFoundException(HttpMethod.GET.name(), "/api/v1/nope", HttpHeaders.EMPTY);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleNoHandlerFound(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().message())
+                .as("the requested URL must not be reflected back into the response body")
+                .doesNotContain("/api/v1/nope");
+        assertThat(listAppender.list).allMatch(e -> e.getLevel() == Level.DEBUG);
     }
 
     /**

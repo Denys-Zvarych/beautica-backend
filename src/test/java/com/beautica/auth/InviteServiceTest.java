@@ -114,7 +114,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
                 .thenReturn(Optional.empty());
 
         log.debug("Act: sendInvite with tokenGenerator returning raw='{}' hashed='{}'", rawToken, hashedToken);
@@ -149,7 +149,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
                 .thenReturn(Optional.empty());
 
         log.debug("Act: sendInvite for email={} salonId={} on happy path", request.email(), salonId);
@@ -215,7 +215,7 @@ class InviteServiceTest {
         // Brand-new target → token issued.
         var newRequest = new InviteRequest("brandnew@example.com", salonId, null);
         when(userRepository.existsByEmail("brandnew@example.com")).thenReturn(false);
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("brandnew@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("brandnew@example.com", salonId))
                 .thenReturn(Optional.empty());
         var newResponse = inviteService.sendInvite(newRequest, callerId);
 
@@ -324,7 +324,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("pending@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("pending@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("pending@example.com", salonId))
                 .thenReturn(Optional.of(existing));
 
         log.debug("Act: sendInvite for email={} with an active invite — must be idempotent success", request.email());
@@ -357,7 +357,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("expired@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("expired@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("expired@example.com", salonId))
                 .thenReturn(Optional.of(expired));
 
         log.debug("Act: sendInvite for email={} — expired invite exists; recycle + insert delegated to persistence service", request.email());
@@ -576,7 +576,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("admin@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("admin@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-admin-token");
 
@@ -626,7 +626,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("admin2@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("admin2@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("admin2@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-second-admin-token");
 
@@ -765,7 +765,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salon));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
                 .thenReturn(Optional.empty());
         when(tokenGenerator.generateToken()).thenReturn("raw-tok");
 
@@ -792,7 +792,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId)).thenReturn(Optional.empty());
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
 
         inviteService.sendInvite(request, callerId);
 
@@ -927,7 +927,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId)).thenReturn(Optional.empty());
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> httpService.sendInvite(request, callerId))
                 .isInstanceOf(IllegalStateException.class)
@@ -962,7 +962,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId)).thenReturn(Optional.empty());
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
 
         httpsService.sendInvite(request, callerId);
 
@@ -1000,7 +1000,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId)).thenReturn(Optional.empty());
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> spoofService.sendInvite(request, callerId))
                 .isInstanceOf(IllegalStateException.class)
@@ -1036,7 +1036,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId)).thenReturn(Optional.empty());
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> spoofService.sendInvite(request, callerId))
                 .isInstanceOf(IllegalStateException.class)
@@ -1074,7 +1074,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId)).thenReturn(Optional.empty());
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId)).thenReturn(Optional.empty());
 
         localhostService.sendInvite(request, callerId);
 
@@ -1106,7 +1106,7 @@ class InviteServiceTest {
         when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
         // SALON_ADMIN branch: salonRepository.findById is called (not findByIdAndOwnerId)
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("newmaster@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("newmaster@example.com", salonId))
                 .thenReturn(Optional.empty());
 
         var response = inviteService.sendInvite(request, callerId);
@@ -1172,7 +1172,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("racer@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("racer@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("racer@example.com", salonId))
                 .thenReturn(Optional.empty());
         doThrow(new org.springframework.dao.DataIntegrityViolationException("ux_invite_tokens_active"))
                 .when(invitePersistenceService)
@@ -1209,7 +1209,7 @@ class InviteServiceTest {
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
         // Scoped to THIS salon → empty; the other salon's active invite is invisible here.
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("shared@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("shared@example.com", salonId))
                 .thenReturn(Optional.empty());
 
         log.debug("Act: sendInvite for this salon — a token must be created despite the other salon's invite");
@@ -1235,7 +1235,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("master@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId))
                 .thenReturn(Optional.of(existing));
 
         log.debug("Act: sendInvite with mixed-case/whitespace email — must normalize before the salon-scoped pre-check");
@@ -1244,7 +1244,7 @@ class InviteServiceTest {
         // The scoped pre-check MUST run on the canonical value so the existing active invite is FOUND.
         // Without normalization the raw-case lookup misses it, then the INSERT silently collides on the
         // case-insensitive lower(email) guard — dropping the invite (no token, no e-mail).
-        verify(inviteTokenRepository).findByEmailAndSalonIdAndIsUsedFalse("master@example.com", salonId);
+        verify(inviteTokenRepository).findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("master@example.com", salonId);
         // Registration probe also runs on the canonical value (agrees with AuthService write path).
         verify(userRepository).existsByEmail("master@example.com");
         assertThat(response.invitedEmail())
@@ -1270,7 +1270,7 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("newmaster@example.com")).thenReturn(false);
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse("newmaster@example.com", salonId))
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("newmaster@example.com", salonId))
                 .thenReturn(Optional.empty());
 
         log.debug("Act: sendInvite for a brand-new mixed-case email — delegate must receive the canonical value");

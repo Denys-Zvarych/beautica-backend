@@ -19,9 +19,10 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
-import com.beautica.salon.dto.PendingInviteResponse;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonAdminResponse;
+import com.beautica.salon.dto.SalonInviteHistoryResponse;
+import com.beautica.salon.dto.SalonInviteResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.SiblingSalonOption;
@@ -31,6 +32,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.service.repository.MasterServiceCountProjection;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.user.InviteHistoryRow;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.User;
@@ -41,6 +43,7 @@ import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -49,6 +52,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -81,6 +85,23 @@ public class SalonService {
     // (on first salon) creates the owner-master row that hasMasterProfile is derived from;
     // removeAdmin and rotateAdmin rewrite users.salon_id. All three stale the user-profile cache.
     private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    /**
+     * Hard ceiling on rows returned by {@link #listSalonInvites}.
+     *
+     * <p>The invite-history endpoint is deliberately NOT paginated — a salon's realistic invite
+     * count is single- to low-double-digit, so a page cursor would be ceremony the client has to
+     * carry for no benefit. But {@code invite_tokens} has no cleanup job, so the underlying table
+     * only grows; returning it unbounded would be exactly the unbounded-collection-at-a-public-
+     * service-boundary defect Anti-Bug §E3 forbids. This cap is the bound.
+     *
+     * <p>Trade-off, stated plainly: invite number {@value #MAX_INVITE_HISTORY}+ is dropped from
+     * the response. It is NOT dropped silently — {@code SalonInviteHistoryResponse.truncated} is
+     * set whenever that happens, so the client can tell an incomplete audit trail from a complete
+     * one. Acceptable at current scale; the fix, if a salon ever approaches the cap, is real
+     * pagination, not a bigger number.
+     */
+    private static final int MAX_INVITE_HISTORY = 200;
 
     /**
      * Ceiling on how many ACTIVE salons one {@code SALON_OWNER} may hold (Perf LOW-3).
@@ -513,7 +534,7 @@ public class SalonService {
      * {@link #getMastersBySalon} already uses (called with {@link Pageable#unpaged()} — a salon's
      * staff roster is bounded by the salon's actual headcount, never the unbounded-collection
      * concern §E-3 guards against; this is the same reasoning that already lets
-     * {@link #listPendingInvites} return an unbounded {@code List} for one salon). Admins are
+     * {@link #listSalonInvites} returns a capped {@code List} for one salon). Admins are
      * sourced via {@link UserRepository#findBySalonIdAndRole}. {@code serviceCount} per master
      * comes from {@link MasterServiceRepository#countActiveByMasterIdIn} — one batch
      * {@code GROUP BY} query for the whole roster, never a per-master count (Anti-Bug §E-3).
@@ -859,40 +880,83 @@ public class SalonService {
     }
 
     /**
-     * Lists pending (not-yet-accepted, unexpired) invites for a salon (Phase 23.1
-     * {@code GET /salons/{salonId}/invites/pending}). Salon-scoping — the caller must be the
-     * SALON_OWNER of {@code salonId} or a SALON_ADMIN assigned to it — is already enforced by
+     * Lists the salon's FULL invite history — pending, accepted, expired and cancelled alike —
+     * newest-first ({@code GET /salons/{salonId}/invites}). Replaces the earlier pending-only
+     * listing: an owner needs to see that an invite was accepted or that they cancelled it, not
+     * just what is still outstanding.
+     *
+     * <p>Salon-scoping — the caller must be the SALON_OWNER of {@code salonId} or a SALON_ADMIN
+     * assigned to it — is already enforced by
      * {@code @PreAuthorize("... and @authz.canManageSalon(authentication, #salonId)")} on the
      * controller (mirrors {@link #updateSalon}/{@link #inviteMaster}); a denied caller never
      * reaches this method, and {@code AuthorizationDeniedException} is logged at WARN by
      * {@code GlobalExceptionHandler#handleAuthorizationDenied} (method + path + authorities +
      * non-PII subject — no redundant WARN needed here).
      *
-     * <p>Never exposes the token value or its hash — {@link PendingInviteResponse} carries only
-     * the recipient email, role, and timestamps (Anti-Bug §I). "Pending" excludes both
-     * already-used and expired tokens, via {@link InviteTokenRepository
-     * #findBySalonIdAndIsUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc}.
+     * <p>Never exposes the token value or its hash — {@link SalonInviteResponse} carries only the
+     * recipient email, role, derived status and timestamps (Anti-Bug §I).
+     *
+     * <p><strong>Truncation is OBSERVABLE, not silent.</strong> The listing is capped at
+     * {@link #MAX_INVITE_HISTORY} rows — the cap is what keeps this a bounded collection return
+     * (Anti-Bug §E3) rather than an unbounded {@code List} that grows forever, since
+     * {@code invite_tokens} has no cleanup job. A bare {@code List} made a truncated history
+     * indistinguishable from a complete one, which is unacceptable on an endpoint that IS the
+     * audit trail, so the response carries
+     * {@link SalonInviteHistoryResponse#truncated()}.
+     *
+     * <p>The flag is derived by asking for {@code MAX_INVITE_HISTORY + 1} rows and checking
+     * whether the extra one came back — a probe, not a second {@code COUNT(*)} round trip. The
+     * surplus row is dropped before mapping, so the caller still never sees more than the cap.
+     *
+     * <p>{@code clock.instant()} is hoisted to a local so every row in one response is classified
+     * against ONE instant. Reading the clock inside the map would let a page straddle an
+     * {@code expiresAt} boundary and return two rows whose PENDING/EXPIRED split disagrees.
      */
     @Transactional(readOnly = true)
-    public List<PendingInviteResponse> listPendingInvites(UUID salonId) {
-        return inviteTokenRepository
-                .findBySalonIdAndIsUsedFalseAndExpiresAtAfterOrderByCreatedAtDesc(salonId, clock.instant())
-                .stream()
-                .map(PendingInviteResponse::from)
-                .collect(Collectors.toList());
+    public SalonInviteHistoryResponse listSalonInvites(UUID salonId) {
+        Instant now = clock.instant();
+        List<InviteHistoryRow> rows = inviteTokenRepository
+                .findSalonInviteHistory(salonId, PageRequest.of(0, MAX_INVITE_HISTORY + 1));
+
+        List<SalonInviteResponse> invites = rows.stream()
+                .limit(MAX_INVITE_HISTORY)
+                .map(row -> SalonInviteResponse.from(row, now))
+                .toList();
+
+        return new SalonInviteHistoryResponse(invites, rows.size() > MAX_INVITE_HISTORY);
     }
 
     /**
      * Cancels (revokes) a pending invite (Phase 23.1 {@code DELETE
      * /salons/{salonId}/invites/{inviteId}}). Salon-scoping is enforced by {@code @PreAuthorize}
-     * on the controller exactly as in {@link #listPendingInvites} — a caller without management
+     * on the controller exactly as in {@link #listSalonInvites} — a caller without management
      * access to {@code salonId} never reaches this method.
      *
-     * <p>Marks the token {@code used = true} rather than deleting the row (per the phase doc —
-     * avoids FK-cascade surprises and leaves an audit trail of a cancelled, never-accepted
-     * invite) — mirrors {@link #removeAdmin}/{@link #rotateAdmin}, which likewise mutate a
-     * managed entity loaded in this transaction and rely on Hibernate dirty-checking to flush on
-     * commit rather than an explicit {@code save()}.
+     * <p>Marks the token revoked via {@link InviteToken#markCancelled(Instant)} rather than
+     * deleting the row (avoids FK-cascade surprises and leaves an audit trail of a cancelled,
+     * never-accepted invite) — mirrors {@link #removeAdmin}/{@link #rotateAdmin}, which likewise
+     * mutate a managed entity loaded in this transaction and rely on Hibernate dirty-checking to
+     * flush on commit rather than an explicit {@code save()}.
+     *
+     * <p>{@code markCancelled} keeps {@code isUsed = true} — exactly what the previous
+     * {@code markUsed()} wrote — so the {@code isUsed()} guard below, {@code acceptInvite} and
+     * {@code previewInvite} all behave identically. What it ADDS is
+     * {@code revokedReason = CANCELLED}, without which {@link #listSalonInvites} could not tell a
+     * cancelled invite from an accepted one: both paths set the same single flag. The status
+     * ladder in {@link SalonInviteResponse#from} therefore tests CANCELLED before {@code isUsed}.
+     *
+     * <p><strong>Only a PENDING invite is cancellable</strong> — the guard rejects all four
+     * non-pending shapes, which is exactly what the endpoint's OpenAPI description promises. This
+     * matters more since the row became history rather than a transient: {@code markCancelled}
+     * OVERWRITES {@code revoked_at} and {@code revoked_reason}, so without the
+     * {@code getRevokedAt() != null} rung a SUPERSEDED row — which keeps {@code is_used = false}
+     * and therefore sailed past the original {@code isUsed()}-only guard — could be rewritten
+     * SUPERSEDED &rarr; CANCELLED, retroactively falsifying the audit trail this endpoint exists
+     * to serve. The expiry rung closes the same hole for a row that simply lapsed
+     * ({@code revoked_at} null, {@code expires_at} past): cancelling a dead invite is a no-op that
+     * would nonetheless stamp it CANCELLED and hide the fact it was never acted on. Both use
+     * {@link InviteToken#isExpiredAt(Instant)} / the shared predicate rather than an open-coded
+     * comparison, so the cancel boundary can never drift from the accept and display boundaries.
      *
      * <p>Defense-in-depth cross-salon check: re-verifies {@code token.getSalonId().equals
      * (salonId)} even though the controller's {@code @PreAuthorize} already scopes the salon —
@@ -912,19 +976,24 @@ public class SalonService {
      * check below can never act on a stale, pre-accept snapshot. See
      * {@code PendingInviteCancelAcceptRaceIT}.
      *
-     * @throws NotFoundException if {@code inviteId} does not resolve to a pending (unused) invite
-     *                            for {@code salonId}
+     * @throws NotFoundException if {@code inviteId} does not resolve to a PENDING invite for
+     *                            {@code salonId} — accepted, cancelled, superseded, lapsed,
+     *                            cross-salon and missing all collapse to the same 404
      */
     @Transactional
     public void cancelInvite(UUID actorId, UUID salonId, UUID inviteId) {
+        Instant now = clock.instant();
         InviteToken token = lockInviteForCancel(inviteId)
                 .orElseThrow(() -> new NotFoundException("Invite not found: " + inviteId));
 
-        if (token.isUsed() || !salonId.equals(token.getSalonId())) {
+        if (token.isUsed()
+                || token.getRevokedAt() != null
+                || token.isExpiredAt(now)
+                || !salonId.equals(token.getSalonId())) {
             throw new NotFoundException("Invite not found: " + inviteId);
         }
 
-        token.markUsed();
+        token.markCancelled(now);
 
         // Audit trail (mirrors rotateAdmin/removeAdmin's INFO line) — UUIDs only, never the
         // recipient email or any token material (Anti-Bug §I).

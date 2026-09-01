@@ -9,10 +9,11 @@ import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.InviteRequest;
-import com.beautica.salon.dto.PendingInviteResponse;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.RotateAdminRequest;
 import com.beautica.salon.dto.SalonAdminResponse;
+import com.beautica.salon.dto.SalonInviteHistoryResponse;
+import com.beautica.salon.dto.SalonInviteResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.SiblingSalonOption;
@@ -117,7 +118,7 @@ public class SalonController {
      * includes admins — so it is management-gated, not {@code permitAll}.
      *
      * <p>{@code @authz.canManageSalon} is the IDENTICAL expression already gating
-     * {@link #updateSalon}/{@link #inviteMaster}/{@link #listPendingInvites} — reused verbatim,
+     * {@link #updateSalon}/{@link #inviteMaster}/{@link #listSalonInvites} — reused verbatim,
      * not re-derived, so a future role change to salon management cannot diverge between sibling
      * endpoints.
      */
@@ -147,7 +148,7 @@ public class SalonController {
      * owner it returns the CALLER's portfolio, not the portfolio of {@code salonId}'s owner.
      *
      * <p>{@code @authz.canManageSalon} is the IDENTICAL expression already gating
-     * {@link #getSalonStaff}/{@link #updateSalon}/{@link #listPendingInvites} — reused verbatim,
+     * {@link #getSalonStaff}/{@link #updateSalon}/{@link #listSalonInvites} — reused verbatim,
      * not re-derived, so a future role change to salon management cannot diverge between sibling
      * endpoints. It also places the caller inside exactly the trust boundary {@link #rotateAdmin}
      * operates in, so this leaks nothing that mutation does not already expose — an argument that
@@ -243,17 +244,33 @@ public class SalonController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    // Phase 23.1 — SALON_OWNER/SALON_ADMIN manage their salon's outbound invites. canManageSalon
-    // enforces the same salon-scoping as updateSalon/inviteMaster above (owner-of-this-salon or
+    // SALON_OWNER/SALON_ADMIN manage their salon's outbound invites. canManageSalon enforces the
+    // same salon-scoping as updateSalon/inviteMaster above (owner-of-this-salon or
     // admin-assigned-to-this-salon); a caller without access is denied before either method runs.
-    @GetMapping("/{salonId}/invites/pending")
+    @Operation(summary = "List the salon's invite history",
+            description = """
+                    Returns every invite the salon has ever dispatched — pending, accepted, \
+                    expired and cancelled alike — newest-first by createdAt, under \
+                    `data.invites`. `status` is derived per row at read time and is one of \
+                    PENDING, ACCEPTED, EXPIRED, CANCELLED; only a PENDING invite can be \
+                    cancelled. The token value is never exposed. Capped at the 200 most recent \
+                    invites; `data.truncated` is true when older invites exist beyond that cap \
+                    and are not included.""")
+    @GetMapping("/{salonId}/invites")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
-    public ApiResponse<List<PendingInviteResponse>> listPendingInvites(
+    public ApiResponse<SalonInviteHistoryResponse> listSalonInvites(
             @PathVariable UUID salonId
     ) {
-        return ApiResponse.ok(salonService.listPendingInvites(salonId));
+        return ApiResponse.ok(salonService.listSalonInvites(salonId));
     }
 
+    @Operation(summary = "Cancel a pending invite",
+            description = """
+                    Revokes an invite that is still PENDING. The row is kept as history, \
+                    relabelled CANCELLED. Any invite that is not PENDING — already accepted, \
+                    already cancelled, superseded by a re-invite, or simply lapsed — returns 404, \
+                    as does an invite belonging to another salon: a non-pending invite must never \
+                    have its recorded outcome rewritten.""")
     @DeleteMapping("/{salonId}/invites/{inviteId}")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<Void> cancelInvite(

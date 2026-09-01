@@ -93,6 +93,13 @@ import static org.mockito.Mockito.when;
         classes = {
                 CacheConfig.class,
                 MasterCachePrefixEvictor.class,
+                // PRE-EXISTING BREAKAGE, unrelated to this slice's subject: MasterService gained a
+                // UserProfileCacheEvictor constructor parameter and this explicit `classes` list
+                // was not updated with it, so the context failed to start and all six tests here
+                // errored out. It is a real collaborator over the real CacheManager this slice
+                // already builds, so listing it is the fix — mocking it would hide a future
+                // constructor change the same way.
+                com.beautica.common.cache.UserProfileCacheEvictor.class,
                 SlotCalculationService.class,
                 MasterService.class,
                 DashboardService.class

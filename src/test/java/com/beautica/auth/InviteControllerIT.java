@@ -105,8 +105,11 @@ class InviteControllerIT extends AbstractIntegrationTest {
                     refreshTokenRepository.deleteByUserId(user.getId());
                     userRepository.delete(user);
                 });
-                inviteTokenRepository.findByEmailAndIsUsedFalse(email)
-                        .ifPresent(inviteTokenRepository::delete);
+                // Raw DELETE, not a findBy...().ifPresent(delete): since invite rows became
+                // HISTORY, one email can legitimately own several (a SUPERSEDED row plus its
+                // replacement), so any Optional-returning finder would either miss rows or blow up
+                // with IncorrectResultSizeDataAccessException. Delete them all by email.
+                jdbcTemplate.update("DELETE FROM invite_tokens WHERE email = ?", email);
             }
         });
         createdEmails.clear();
@@ -270,9 +273,12 @@ class InviteControllerIT extends AbstractIntegrationTest {
 
         // No invite token is created and no e-mail enqueued for an already-registered target —
         // the distinguishing side effect is absent, not merely hidden.
-        assertThat(inviteTokenRepository.findByEmailAndIsUsedFalse(alreadyRegistered))
-                .as("no invite token must be persisted for an already-registered email")
-                .isEmpty();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM invite_tokens WHERE email = ?", Integer.class, alreadyRegistered))
+                .as("no invite token must be persisted for an already-registered email — counted "
+                        + "across ALL rows, not just live ones, because superseded rows are now "
+                        + "retained as history and an Optional finder would no longer be total")
+                .isZero();
     }
 
     @Test

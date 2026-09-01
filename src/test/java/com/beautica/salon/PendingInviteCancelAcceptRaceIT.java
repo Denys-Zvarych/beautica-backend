@@ -62,7 +62,7 @@ import static org.mockito.Mockito.doAnswer;
  * loser's grant (once unblocked) always returns Postgres's freshly-committed row, so a losing
  * {@code acceptInvite} correctly rejects an already-cancelled token, and a losing {@code
  * cancelInvite} would correctly 404 on an already-accepted one (not exercised by this test — see
- * {@code PendingInvitesIntegrationTest#should_return404_when_ownerCancelsPendingInvite_and...}
+ * {@code SalonInviteHistoryIntegrationTest#should_return204AndMarkUsed_when_ownerCancels...}
  * sibling coverage for the reverse ordering via plain sequential calls).
  *
  * <p><b>Test technique.</b> One-sided gate (the same pattern proven in {@code
@@ -237,9 +237,24 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
         assertThat(readIsUsed(inviteId))
                 .as("the token must be marked used exactly by the winning cancel")
                 .isTrue();
+
+        // The race must leave ONE row in ONE coherent terminal state. is_used alone no longer
+        // says which terminal state that is — the losing accept and the winning cancel would both
+        // have written it — so the row must also carry revoked_reason = CANCELLED, otherwise
+        // GET /salons/{salonId}/invites shows the owner "Accepted" for the invite they were told
+        // (204) they had revoked, and the mobile UI offers no cancel action to correct it.
+        assertThat(jdbcTemplate.queryForObject(
+                        "SELECT revoked_reason FROM invite_tokens WHERE id = ?", String.class, inviteId))
+                .as("a race the cancel won must read CANCELLED in the invite history, never ACCEPTED")
+                .isEqualTo("CANCELLED");
+        assertThat(jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM invite_tokens WHERE id = ?", Integer.class, inviteId))
+                .as("neither racer may delete the row — the history must retain exactly one entry "
+                        + "for this invite")
+                .isEqualTo(1);
     }
 
-    // ── helpers (mirrors PendingInvitesIntegrationTest) ────────────────────────
+    // ── helpers (mirrors SalonInviteHistoryIntegrationTest) ────────────────────
 
     private UUID insertUser(String email, String role) {
         String hash = passwordEncoder.encode(TEST_PASSWORD);

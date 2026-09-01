@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Phase 21.5 — integration tests for {@code GET /api/v1/salons/{salonId}/staff}.
  *
- * <p>Mirrors {@code PendingInvitesIntegrationTest}/{@code SalonAdminRemovalIntegrationTest}: real
+ * <p>Mirrors {@code SalonInviteHistoryIntegrationTest}/{@code SalonAdminRemovalIntegrationTest}: real
  * HTTP through {@link TestRestTemplate} against a Testcontainers PostgreSQL instance, fixtures
  * inserted directly via JDBC. Cleanup is handled by {@link AbstractIntegrationTest#cleanDb()}.
  *
