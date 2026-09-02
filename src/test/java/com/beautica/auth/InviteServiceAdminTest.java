@@ -3,6 +3,7 @@ package com.beautica.auth;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteRequest;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
@@ -194,11 +195,11 @@ class InviteServiceAdminTest {
     // ── sendInvite — email conflict guard ─────────────────────────────────────
 
     @Test
-    @DisplayName("sendInvite returns generic success (no delegate call) when email is already registered — enumeration hardening")
-    void should_returnGenericSuccessNoToken_when_emailAlreadyRegistered() {
-        // New contract: already-registered is no longer a distinguishing 409 (enumeration oracle).
-        // Authorization + ownership run first, then the already-registered branch returns the same
-        // generic InviteResponse without delegating any persistence.
+    @DisplayName("sendInvite (SALON_OWNER caller) throws EmailAlreadyRegisteredException when email is already registered — phase 287 reversal")
+    void should_throwEmailAlreadyRegistered_when_emailAlreadyRegistered() {
+        // Phase 287: already-registered is now an honest 409, not a distinguishing-oracle concern.
+        // Authorization + ownership still run first — ONLY THEN does the already-registered branch
+        // throw, without delegating any persistence.
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var owner = buildOwner(callerId, salonId);
@@ -209,13 +210,33 @@ class InviteServiceAdminTest {
         when(salonRepository.findByIdAndOwnerId(salonId, callerId))
                 .thenReturn(Optional.of(mock(com.beautica.salon.entity.Salon.class)));
 
-        var response = inviteService.sendInvite(request, callerId);
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(EmailAlreadyRegisteredException.class);
 
-        assertThat(response.invitedEmail())
-                .as("already-registered target must still echo the same generic invited email")
-                .isEqualTo("existing@example.com");
-        assertThat(response.expiresAt()).isAfter(Instant.now());
+        verify(invitePersistenceService, never())
+                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+    }
 
+    @Test
+    @DisplayName("sendInvite (SALON_ADMIN caller) throws the SAME EmailAlreadyRegisteredException as a SALON_OWNER caller — phase 287")
+    void should_throwEmailAlreadyRegistered_when_salonAdminCallerAndTargetAlreadyRegistered() {
+        // Phase 287 explicitly requires parity: a SALON_ADMIN caller inviting into their own salon
+        // gets the identical 409 EMAIL_ALREADY_REGISTERED a SALON_OWNER caller gets — the reversal
+        // is not SALON_OWNER-specific.
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var adminCaller = buildSalonAdmin(callerId, salonId);
+        var request = new InviteRequest("existing-admin-caller@example.com", salonId, Role.SALON_MASTER);
+
+        var salonStub = mock(com.beautica.salon.entity.Salon.class);
+        when(userRepository.existsByEmail("existing-admin-caller@example.com")).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(adminCaller));
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salonStub));
+
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(EmailAlreadyRegisteredException.class);
+
+        verify(salonRepository).findById(salonId);
         verify(invitePersistenceService, never())
                 .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
     }

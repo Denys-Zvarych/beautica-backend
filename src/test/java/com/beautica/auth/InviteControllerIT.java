@@ -237,8 +237,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_OWNER invites already-registered email → 201 generic success (no enumeration oracle)")
-    void should_return201GenericSuccess_when_invitedEmailAlreadyRegistered() throws Exception {
+    @DisplayName("SALON_OWNER invites already-registered email → 409 EMAIL_ALREADY_REGISTERED (phase 287 reversal)")
+    void should_return409_when_invitedEmailAlreadyRegistered() throws Exception {
         String ownerEmail = uniqueEmail("owner2");
         String alreadyRegistered = uniqueEmail("existing");
         createdEmails.add(ownerEmail);
@@ -249,6 +249,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
         String registrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
         String ownerAccessToken = promoteToSalonOwnerWithSalon(ownerEmail, registrationToken, salonId);
         registerAndGetToken(alreadyRegistered, Role.CLIENT);
+
+        long outboxCountBefore = notificationOutboxRepository.count();
 
         HttpHeaders headers = bearerHeaders(ownerAccessToken);
         var request = new InviteRequest(alreadyRegistered, salonId, null);
@@ -261,27 +263,69 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 String.class
         );
 
-        // Enumeration hardening: an already-registered target must return the SAME generic 201
-        // and body shape as a normal invite — never a distinguishing 409 — so an authenticated
-        // caller cannot probe registration status.
+        // Phase 287: an already-registered target now gets an honest, distinguishing 409 — the
+        // anti-enumeration argument for silence no longer holds on this authenticated, role-gated,
+        // rate-limited endpoint (see InviteService#sendInvite javadoc).
         assertThat(response.getStatusCode())
-                .as("already-registered must return the same generic 201 as a normal invite")
-                .isEqualTo(HttpStatus.CREATED);
+                .as("already-registered must return 409, not the old generic 201")
+                .isEqualTo(HttpStatus.CONFLICT);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
-        assertThat(body.success()).isTrue();
-        assertThat(body.data().invitedEmail()).isEqualTo(alreadyRegistered);
-        assertThat(body.data().expiresAt()).isAfter(Instant.now());
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code())
+                .isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
 
-        // No invite token is created and no e-mail enqueued for an already-registered target —
-        // the distinguishing side effect is absent, not merely hidden.
+        // Zero side effects on the 409 path — status alone does not prove nothing was written.
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM invite_tokens WHERE email = ?", Integer.class, alreadyRegistered))
                 .as("no invite token must be persisted for an already-registered email — counted "
                         + "across ALL rows, not just live ones, because superseded rows are now "
                         + "retained as history and an Optional finder would no longer be total")
                 .isZero();
+        assertThat(notificationOutboxRepository.count())
+                .as("no notification-outbox row must be enqueued for an already-registered target")
+                .isEqualTo(outboxCountBefore);
+    }
+
+    @Test
+    @DisplayName("Phase 287: caller who does not own the target salon still gets 403, not 409, even when the target email IS registered — authorization ordering")
+    void should_return403NotEmailAlreadyRegistered_when_callerDoesNotOwnSalon_andTargetIsRegistered() throws Exception {
+        // THE important test: the already-registered check must be thrown AFTER authorization, or
+        // an unauthorized caller could distinguish 403-vs-409 to learn a target's registration
+        // status. ownerA does not own salonB, so this must fail authorization before ever reaching
+        // the already-registered branch.
+        String ownerAEmail = uniqueEmail("owner-a-287");
+        String ownerBEmail = uniqueEmail("owner-b-287");
+        String registeredTarget = uniqueEmail("registered-target-287");
+        createdEmails.add(ownerAEmail);
+        createdEmails.add(ownerBEmail);
+        createdEmails.add(registeredTarget);
+        UUID salonAId = UUID.randomUUID();
+        UUID salonBId = UUID.randomUUID();
+        log.debug("Arrange: ownerA={} owns salonA={}; salonB={} belongs to a different owner; target={} is registered",
+                ownerAEmail, salonAId, salonBId, registeredTarget);
+
+        String ownerARegToken = registerAndGetToken(ownerAEmail, Role.CLIENT);
+        String ownerAAccessToken = promoteToSalonOwnerWithSalon(ownerAEmail, ownerARegToken, salonAId);
+        String ownerBRegToken = registerAndGetToken(ownerBEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(ownerBEmail, ownerBRegToken, salonBId);
+        registerAndGetToken(registeredTarget, Role.CLIENT);
+
+        HttpHeaders headers = bearerHeaders(ownerAAccessToken);
+        var request = new InviteRequest(registeredTarget, salonBId, null);
+
+        log.debug("Act: ownerA POSTs /auth/invite targeting salonB (not owned by ownerA) with a registered target email — must be 403, not 409");
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/auth/invite",
+                HttpMethod.POST,
+                new HttpEntity<>(request, headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode())
+                .as("an unauthorized caller must get 403, never a 409 that would leak the target's registration status")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     @Test
@@ -407,6 +451,45 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 response.getBody(), new TypeReference<ApiResponse<InviteResponse>>() {});
         assertThat(body.success()).isTrue();
         assertThat(body.data().invitedEmail()).isEqualTo(secondAdminEmail);
+    }
+
+    @Test
+    @DisplayName("Phase 287: a SALON_ADMIN caller gets the SAME 409 EMAIL_ALREADY_REGISTERED as a SALON_OWNER caller when the target is already registered")
+    void should_return409_when_salonAdminCallerAndTargetAlreadyRegistered() throws Exception {
+        String ownerEmail = uniqueEmail("owner-admin-287");
+        String adminEmail = uniqueEmail("admin-caller-287");
+        String registeredTarget = uniqueEmail("registered-via-admin-287");
+        createdEmails.add(ownerEmail);
+        createdEmails.add(adminEmail);
+        createdEmails.add(registeredTarget);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: SALON_ADMIN ({}) of salonId={} invites an already-registered target={}", adminEmail, salonId, registeredTarget);
+
+        String ownerRegistrationToken = registerAndGetToken(ownerEmail, Role.CLIENT);
+        promoteToSalonOwnerWithSalon(ownerEmail, ownerRegistrationToken, salonId);
+        registerAndGetToken(adminEmail, Role.CLIENT);
+        String adminAccessToken = promoteToSalonAdmin(adminEmail, salonId);
+        registerAndGetToken(registeredTarget, Role.CLIENT);
+
+        HttpHeaders headers = bearerHeaders(adminAccessToken);
+        var request = new com.beautica.salon.dto.InviteRequest(registeredTarget, Role.SALON_MASTER);
+
+        log.debug("Act: POST /salons/{}/invite as SALON_ADMIN caller for already-registered target={}", salonId, registeredTarget);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/invite",
+                HttpMethod.POST,
+                new HttpEntity<>(request, headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode())
+                .as("a SALON_ADMIN caller must get the same 409 a SALON_OWNER caller gets")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
     }
 
     @Test

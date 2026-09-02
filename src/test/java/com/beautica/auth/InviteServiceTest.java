@@ -168,13 +168,12 @@ class InviteServiceTest {
     }
 
     @Test
-    @DisplayName("sendInvite returns generic success (no delegate call) when target email already registered — enumeration hardening")
-    void should_returnGenericSuccessNoToken_when_emailAlreadyRegistered() {
-        // New contract: an already-registered target is NOT a distinguishing 409 (that was an
-        // enumeration oracle). All authorization/ownership checks still run first, then the
-        // already-registered branch returns the same generic InviteResponse WITHOUT creating a
-        // token or enqueuing an e-mail. The flow now reaches findById(callerId), so the caller
-        // and salon-ownership path must be stubbed.
+    @DisplayName("sendInvite throws EmailAlreadyRegisteredException (409 EMAIL_ALREADY_REGISTERED) when target email already registered — phase 287 reversal")
+    void should_throwEmailAlreadyRegistered_when_targetEmailAlreadyRegistered() {
+        // Phase 287: an already-registered target is now an honest 409, not a distinguishing-
+        // oracle concern (see InviteService#sendInvite javadoc for the reversal). Authorization/
+        // ownership checks still run first — the flow reaches findById(callerId) and
+        // findByIdAndOwnerId — and ONLY THEN does the already-registered branch throw.
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var request = new InviteRequest("taken@example.com", salonId, null);
@@ -185,57 +184,118 @@ class InviteServiceTest {
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
         when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
 
-        log.debug("Act: sendInvite for already-registered email={} — must return generic success, no token", request.email());
-        var response = inviteService.sendInvite(request, callerId);
+        log.debug("Act: sendInvite for already-registered email={} — must throw EmailAlreadyRegisteredException", request.email());
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .isInstanceOf(EmailAlreadyRegisteredException.class);
 
-        assertThat(response.invitedEmail())
-                .as("already-registered target must still echo the same generic invited email")
-                .isEqualTo("taken@example.com");
-        assertThat(response.expiresAt())
-                .as("response must carry a plausible recomputed expiry, actual=%s", response.expiresAt())
-                .isAfter(Instant.now());
-
-        // The distinguishing side effects must be ABSENT, not merely hidden.
+        // Zero side effects on the 409 path.
         verify(invitePersistenceService, never())
                 .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
-    @DisplayName("sendInvite returns a structurally identical response for a brand-new vs already-registered target (no distinguishing field)")
-    void should_returnIdenticallyShapedResponse_forNewAndRegisteredTargets() {
-        // Indistinguishability proof at the service layer: the brand-new branch (token issued)
-        // and the already-registered branch (no token) must yield the SAME response shape — same
-        // invitedEmail field and a non-null expiry — so a caller cannot tell them apart by body.
+    @DisplayName("sendInvite splits registered (409) from unregistered-with-active-invite (201) — the intended post-287 contract")
+    void should_splitRegisteredFrom_unregisteredActiveInvite() {
+        // Phase 287 REPLACES the old indistinguishability proof (brand-new vs already-registered
+        // both returning 201) with the opposite assertion: the split is now INTENDED. A registered
+        // target must throw; an unregistered target with a pre-existing active invite for the same
+        // salon must still return the idempotent 201 unchanged (see the duplicate-invite branch's
+        // own comment — that 201 was never an anti-enumeration control, it is correctness).
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var caller = buildCallerWithSalon(callerId, salonId);
-        var salonStub = mock(Salon.class);
-        when(salonStub.getName()).thenReturn("Test Salon");
         when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
-        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(salonStub));
-        when(tokenGenerator.generateToken()).thenReturn("raw-token");
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
 
-        // Brand-new target → token issued.
-        var newRequest = new InviteRequest("brandnew@example.com", salonId, null);
-        when(userRepository.existsByEmail("brandnew@example.com")).thenReturn(false);
-        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull("brandnew@example.com", salonId))
-                .thenReturn(Optional.empty());
-        var newResponse = inviteService.sendInvite(newRequest, callerId);
+        // Registered target → 409, regardless of any pending invite state.
+        var registeredRequest = new InviteRequest("registered@example.com", salonId, null);
+        when(userRepository.existsByEmail("registered@example.com")).thenReturn(true);
 
-        // Already-registered target → no token, same shape.
-        var registeredRequest = new InviteRequest("brandnew@example.com", salonId, null);
-        when(userRepository.existsByEmail("brandnew@example.com")).thenReturn(true);
-        var registeredResponse = inviteService.sendInvite(registeredRequest, callerId);
+        assertThatThrownBy(() -> inviteService.sendInvite(registeredRequest, callerId))
+                .as("registered target must throw EmailAlreadyRegisteredException")
+                .isInstanceOf(EmailAlreadyRegisteredException.class);
 
-        assertThat(registeredResponse.invitedEmail())
-                .as("both branches must echo the same invitedEmail")
-                .isEqualTo(newResponse.invitedEmail());
-        assertThat(newResponse.expiresAt())
-                .as("brand-new branch must carry a non-null expiry")
-                .isNotNull();
-        assertThat(registeredResponse.expiresAt())
-                .as("already-registered branch must carry a non-null expiry (no distinguishing null)")
-                .isNotNull();
+        // Unregistered target with an active invite already pending for this salon → idempotent 201.
+        var pendingRequest = new InviteRequest("pending-active@example.com", salonId, null);
+        var existing = buildInviteToken("pending-active@example.com", Instant.now().plusSeconds(3600));
+        when(userRepository.existsByEmail("pending-active@example.com")).thenReturn(false);
+        when(inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(
+                "pending-active@example.com", salonId)).thenReturn(Optional.of(existing));
+
+        var pendingResponse = inviteService.sendInvite(pendingRequest, callerId);
+
+        assertThat(pendingResponse.invitedEmail())
+                .as("unregistered-with-active-invite must still return the idempotent generic 201")
+                .isEqualTo("pending-active@example.com");
+        assertThat(pendingResponse.expiresAt()).isNotNull();
+        verify(invitePersistenceService, never())
+                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("sendInvite throws EmailAlreadyRegisteredException BEFORE checking for a pending active invite — the already-registered branch wins the ordering, phase 287")
+    void should_throwEmailAlreadyRegistered_beforeCheckingActiveInvite_when_bothConditionsHold() {
+        // Phase-287 report Q4: the alreadyRegistered check and the active-invite idempotency check
+        // are two independent early-return branches in the same method. Every other test exercises
+        // them one at a time (registered-with-no-invite-state-given, or unregistered-with-active-
+        // invite). This is the ONE test where BOTH conditions are simultaneously true, so it proves
+        // the actual precedence: alreadyRegistered wins, and the method never even reaches the
+        // active-invite lookup. If the two branches were swapped (active-invite checked first), this
+        // target would silently get the idempotent 201 instead of the 409 — that regression would be
+        // invisible to every other existing test, because none of them sets both conditions at once.
+        var salonId = UUID.randomUUID();
+        var callerId = UUID.randomUUID();
+        var caller = buildCallerWithSalon(callerId, salonId);
+        var request = new InviteRequest("registered-with-pending-invite@example.com", salonId, null);
+        log.debug("Arrange: email={} is BOTH already registered AND (would-be) has an active pending "
+                + "invite for salonId={} — the active-invite lookup is deliberately left unstubbed, "
+                + "since a correct implementation must never call it here", request.email(), salonId);
+
+        when(userRepository.existsByEmail("registered-with-pending-invite@example.com")).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(salonId, callerId)).thenReturn(Optional.of(mock(Salon.class)));
+
+        log.debug("Act: sendInvite where target is registered AND has an active invite — must throw 409, not return the idempotent 201");
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .as("already-registered must win over the idempotent-active-invite branch")
+                .isInstanceOf(EmailAlreadyRegisteredException.class);
+
+        // The strongest proof of ordering: the active-invite lookup is never even reached.
+        verify(inviteTokenRepository, never())
+                .findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(any(), any());
+        verify(invitePersistenceService, never())
+                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("sendInvite throws ForbiddenException (NOT EmailAlreadyRegisteredException) when caller does not own the salon, even for a registered target — authorization ordering")
+    void should_throwForbiddenNotEmailAlreadyRegistered_when_callerDoesNotOwnSalon_andTargetIsRegistered() {
+        // THE important test: the already-registered branch is placed AFTER authorization on
+        // purpose (phase 287). This pins that an unauthorized caller gets their ForbiddenException
+        // unchanged and never learns the target's registration status via a 409 vs 403 split.
+        // Mutation check: moving the `alreadyRegistered` throw up to before the authorization
+        // branches must turn this test red — see the phase-287 report for the mutation run.
+        var callerId = UUID.randomUUID();
+        var requestedSalonId = UUID.randomUUID();
+        var callerOwnedSalonId = UUID.randomUUID();
+        var request = new InviteRequest("registered-target@example.com", requestedSalonId, null);
+        var caller = buildCallerWithSalon(callerId, callerOwnedSalonId);
+        log.debug("Arrange: caller salonId={} != requested salonId={}; target email IS registered",
+                callerOwnedSalonId, requestedSalonId);
+
+        when(userRepository.existsByEmail("registered-target@example.com")).thenReturn(true);
+        when(userRepository.findById(callerId)).thenReturn(Optional.of(caller));
+        when(salonRepository.findByIdAndOwnerId(requestedSalonId, callerId)).thenReturn(Optional.empty());
+
+        log.debug("Act: sendInvite where caller does not own salonId={} and target email is registered — must throw ForbiddenException, not 409", requestedSalonId);
+        assertThatThrownBy(() -> inviteService.sendInvite(request, callerId))
+                .as("an unauthorized caller must get 403, never a 409 that would leak registration status")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("do not own");
+
+        verify(salonRepository).findByIdAndOwnerId(requestedSalonId, callerId);
+        verify(invitePersistenceService, never())
+                .persistInviteAndEnqueue(any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -312,11 +372,11 @@ class InviteServiceTest {
     @Test
     @DisplayName("sendInvite is idempotent (no delegate call) when an active unexpired invite already exists")
     void should_returnGenericSuccessNoNewToken_when_activeInviteExists() {
-        // New contract: a pre-existing active (unused, unexpired) invite is an idempotent success.
-        // The old 409 here re-opened the enumeration oracle (a second call to a pending email hit
-        // 409 while a registered email kept returning 200). It now returns the same generic
-        // InviteResponse WITHOUT delegating to persistInviteAndEnqueue — so no second token, no
-        // second e-mail, and the still-valid existing token is left untouched.
+        // A pre-existing active (unused, unexpired) invite is an idempotent success. UNCHANGED by
+        // phase 287 (this branch's 201 was always a correctness property, not an anti-enumeration
+        // control — see InviteService#sendInvite's duplicate-invite branch comment). Returns the
+        // same generic InviteResponse WITHOUT delegating to persistInviteAndEnqueue — so no second
+        // token, no second e-mail, and the still-valid existing token is left untouched.
         var salonId = UUID.randomUUID();
         var callerId = UUID.randomUUID();
         var request = new InviteRequest("pending@example.com", salonId, null);

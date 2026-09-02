@@ -104,31 +104,40 @@ public class InviteService {
     }
 
     /**
-     * Sends a salon invite for the target email, or returns a non-distinguishing generic
-     * success when an invite cannot or should not be created.
+     * Sends a salon invite for the target email.
      *
-     * <p><strong>Enumeration hardening:</strong> all three outcomes — target already
-     * registered, target already has an active pending invite, and target is brand-new —
-     * return a structurally identical {@link InviteResponse} (echoed email + a freshly
-     * computed ~{@code tokenExpirationHours} expiry) with the same success status. None of
-     * them surfaces a distinguishing 4xx, and the returned expiry is recomputed on every
-     * call in every branch, so repeated invites cannot reveal registration status (the
-     * earlier residual {@code 200-vs-409} oracle on the second call is closed). An active
-     * pending invite is treated as an idempotent success — no second token is issued and no
-     * second e-mail is dispatched. An expired prior token is recycled (deleted) before a
-     * fresh one is created.
+     * <p><strong>Phase 287 — anti-enumeration reasoning REVERSED for the already-registered
+     * branch.</strong> This method used to swallow an already-registered target into the same
+     * non-distinguishing generic 201 as a brand-new invite, on the theory that a distinguishing
+     * 4xx here would turn this endpoint into an enumeration oracle (an authenticated caller
+     * could probe arbitrary emails for registration status). That trade-off is reversed as of
+     * phase 287, on the identical precedent {@link AuthService#register}'s duplicate-email 409
+     * already established: {@code AuthService#register} is {@code permitAll} and already returns
+     * an honest 409 {@code EMAIL_ALREADY_REGISTERED} <em>to anyone on the internet</em>, rejecting
+     * the silent-200 as "an undebuggable 'we sent a code, but it never comes' footgun" — the bit
+     * this endpoint was hiding is therefore already public to anonymous callers, so silence here
+     * was paying the footgun cost to protect nothing. This endpoint's caller is, on top of that,
+     * authenticated, role-gated to {@code SALON_OWNER}/{@code SALON_ADMIN}, attributable to a
+     * named principal, and rate-limited on two dedicated Bucket4j buckets ({@code inviteBuckets}
+     * for {@code POST /api/v1/auth/invite}, {@code salonInviteBuckets} for
+     * {@code POST /api/v1/salons/{salonId}/invite}) — it leaks strictly less than
+     * {@code register} already does. See the phase-287 doc for the full ruling.
      *
-     * <p><strong>Residual timing side-channel:</strong> the already-registered and
-     * active-invite branches skip token generation, hashing, persistence and outbox
-     * encryption, so they complete measurably faster than the brand-new branch. Full timing
-     * equalization is intentionally not attempted here; the compensating control is a per-IP
-     * rate limit in {@code AuthRateLimitFilter}, applied independently on <em>both</em> HTTP
-     * paths that reach this method: {@code POST /api/v1/auth/invite} ({@code inviteBuckets},
-     * SALON_OWNER-only) and {@code POST /api/v1/salons/{salonId}/invite}
-     * ({@code salonInviteBuckets}, SALON_OWNER + SALON_ADMIN since the Phase 21.1 multi-admin
-     * relaxation). Each bucket bounds how many timing samples an attacker can collect on its
-     * respective path. Both paths also require authentication ({@code SALON_OWNER} or
-     * {@code SALON_ADMIN}), so any abuse is attributable to a known principal.
+     * <p><strong>Where the throw sits matters.</strong> {@code alreadyRegistered} is computed
+     * up front, before the caller/role/salon authorization branches below, but the
+     * {@link EmailAlreadyRegisteredException} is thrown only AFTER every authorization check has
+     * passed — at the site of what used to be the synthetic-success early return. Throwing at the
+     * computation site instead would leak registration status to a caller who is not even
+     * authorized to invite into that salon; such a caller must still receive their unchanged
+     * {@link ForbiddenException}, regardless of the target's registration status.
+     *
+     * <p>The duplicate-active-invite branch further down keeps its idempotent 201 — this reversal
+     * does not touch it; see its own comment for why.
+     *
+     * <p><strong>Scope:</strong> this reversal covers only the invite-send path. It does not
+     * license changing {@code /auth/forgot-password}, which keeps its deliberate uniform response
+     * — that endpoint is keyed by a guessable email from an anonymous caller and is genuinely
+     * enumerable.
      */
     @Transactional(readOnly = true)
     public InviteResponse sendInvite(InviteRequest request, UUID callerId) {
@@ -141,12 +150,12 @@ public class InviteService {
         // the outbox enqueue and the response all on the same canonical value.
         String email = request.email().toLowerCase(Locale.ROOT).strip();
 
-        // SECURITY (email-enumeration): do NOT surface a distinct "already registered"
-        // error here — that turns this endpoint into an enumeration oracle (an authenticated
-        // SALON_OWNER could probe arbitrary emails for registration status). Instead we run
-        // the same authorization flow regardless and, if the email is already registered,
-        // silently skip invite creation while returning the same generic response shape.
-        // The real reason is logged at debug only. Happy-path semantics are unchanged.
+        // Phase 287: computed here, BEFORE the authorization branches below, purely so the
+        // slow DB round-trip happens once regardless of outcome — the resulting boolean is NOT
+        // acted on until after every authorization check passes (see the throw at the site of
+        // the former synthetic-success early return, further down). Acting on it here would let
+        // an unauthorized caller learn a target's registration status via a ForbiddenException
+        // that never fires; see the method javadoc for the full reversal.
         boolean alreadyRegistered = userRepository.existsByEmail(email);
 
         User caller = userRepository.findById(callerId)
@@ -188,21 +197,29 @@ public class InviteService {
 
         Instant expiresAt = clock.instant().plus(tokenExpirationHours, ChronoUnit.HOURS);
 
-        // Non-distinguishing outcome: an already-registered target gets the same generic
-        // success response (same shape, plausible expiry) without an invite ever being
-        // created or an e-mail dispatched. Only this debug line records the real reason.
+        // Phase 287: honest 409, thrown HERE — after every authorization/ownership branch above
+        // has already passed — never at the `alreadyRegistered` computation site up top. Reusing
+        // the EXISTING EmailAlreadyRegisteredException/EMAIL_ALREADY_REGISTERED code (same type
+        // AuthService#register throws for the same wire code) rather than minting a second
+        // spelling of it: one code, one handler, no divergence. See the method javadoc for the
+        // full reversal and why this is safe on this endpoint specifically.
         if (alreadyRegistered) {
-            log.debug("Invite skipped: target email already registered (salonId={})", request.salonId());
-            return new InviteResponse(email, expiresAt);
+            throw new EmailAlreadyRegisteredException();
         }
 
         // A pre-existing *active* (unused, unexpired) invite for THIS salon is an idempotent
         // success — return the same generic response WITHOUT issuing a second token or e-mail.
-        // Raising a 409 here (the old behaviour) re-opened the enumeration oracle: combined
-        // with the already-registered early return above, a *second* identical call had a not-
-        // yet-registered email hit the 409 while a registered email still returned 200, so the
-        // 200-vs-409 split deterministically revealed registration status. An expired prior
-        // token is retired (marked SUPERSEDED, not deleted) before a fresh one is issued.
+        // UNCHANGED by phase 287: this branch's justification was never anti-enumeration secrecy
+        // in the first place, it is correctness — re-inviting the same person to the same salon
+        // should not mint a second token or send a second e-mail, independent of the target's
+        // registration status. The comment that used to live here argued raising a 409 would
+        // re-open a 200-vs-409 registration-status oracle when combined with the (now-removed)
+        // already-registered silent-201 above; that argument is void now that the already-
+        // registered branch throws its own honest 409 directly two paragraphs up — there is no
+        // longer a silent branch for a 409 here to be compared against. This branch keeps its 201
+        // because it is the correct idempotent response, not because silence protects anything.
+        // An expired prior token is retired (marked SUPERSEDED, not deleted) before a fresh one
+        // is issued.
         //
         // SECURITY/CORRECTNESS (cross-salon silent-drop): the lookup is salon-scoped via
         // salonId. An email-global lookup let salon A's pending invite short-circuit salon B's
