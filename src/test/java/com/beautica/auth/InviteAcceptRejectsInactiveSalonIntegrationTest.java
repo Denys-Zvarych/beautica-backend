@@ -2,7 +2,9 @@ package com.beautica.auth;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.InviteAcceptRequest;
+import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.InviteTokenException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.service.SalonService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -91,8 +93,12 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
         assertThat(response.getStatusCode())
                 .as("a redemption into a dead salon must be rejected — body: %s", response.getBody())
                 .isEqualTo(HttpStatus.CONFLICT);
-        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
+        assertThat(body.data().code())
+                .as("phase 285: phase 286's throw is re-pointed at InviteTokenException.Code.INVITE_SALON_INACTIVE")
+                .isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
 
         assertThat(countMasters(fixture.salonId()))
                 .as("no master row may ever be bound to a deactivated salon")
@@ -129,7 +135,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
     @Test
     @DisplayName("a SALON_ADMIN invite with a NULL salonId is salon-bound corrupt state — 409, "
             + "not 201")
-    void should_return409_when_inviteSalonIdIsNull() {
+    void should_return409_when_inviteSalonIdIsNull() throws Exception {
         // SALON_ADMIN is salon-bound: InviteService#sendInvite only ever mints a SALON_ADMIN
         // token after resolving a live Salon (InviteRequest.salonId() is @NotNull), so a live
         // token with this role NEVER legitimately has a null salonId. A null here can only mean
@@ -150,6 +156,9 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
                 .as("a salon-bound role with a null salonId must fail closed, not skip the "
                         + "guard — body: %s", response.getBody())
                 .isEqualTo(HttpStatus.CONFLICT);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
         assertThat(countUsers(fixture.email()))
                 .as("no account may be provisioned for a rejected redemption")
                 .isZero();
@@ -161,7 +170,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
     @Test
     @DisplayName("a SALON_MASTER invite with a NULL salonId is salon-bound corrupt state — 409, "
             + "zero masters, zero users, token left unused")
-    void should_leaveTokenUnusedAndProvisionNothing_when_salonBoundInviteHasNullSalonId() {
+    void should_leaveTokenUnusedAndProvisionNothing_when_salonBoundInviteHasNullSalonId() throws Exception {
         // Same corrupt-state shape as the SALON_ADMIN case above, but for SALON_MASTER — the
         // other salon-bound role — and additionally pins that
         // MasterService#createMasterFromInvite is never reached (which would otherwise call
@@ -179,6 +188,9 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
                         + "never a 500 from MasterService#createMasterFromInvite — body: %s",
                         response.getBody())
                 .isEqualTo(HttpStatus.CONFLICT);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
         assertThat(countUsers(fixture.email()))
                 .as("no account may be provisioned for a rejected redemption")
                 .isZero();
@@ -194,7 +206,7 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
     @DisplayName("the realistic interleave — invite minted while the salon is ACTIVE, then the "
             + "salon is deactivated through the real SalonService before redemption — still 409, "
             + "still zero side effects, still unused token")
-    void should_rejectRedemption_when_salonIsDeactivatedAfterInviteWasIssued() {
+    void should_rejectRedemption_when_salonIsDeactivatedAfterInviteWasIssued() throws Exception {
         // Unlike seedInvite(role, false) above (which seeds the salon already inactive at INSERT
         // time), this drives the actual production sequence phase 286's Javadoc calls out as the
         // scenario a phase-267 cascade cannot win: the invite is minted for a genuinely LIVE
@@ -224,6 +236,9 @@ class InviteAcceptRejectsInactiveSalonIntegrationTest extends AbstractIntegratio
                 .as("a real deactivate-then-redeem interleave must still be rejected — body: %s",
                         response.getBody())
                 .isEqualTo(HttpStatus.CONFLICT);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
         assertThat(countMasters(salonId)).isZero();
         assertThat(countUsers(email)).isZero();
         assertThat(readIsUsed(inviteId))

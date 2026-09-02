@@ -2,7 +2,9 @@ package com.beautica.salon;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.InviteAcceptRequest;
+import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.InviteTokenException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.service.SalonService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -224,8 +226,13 @@ class PendingInviteCancelAcceptRaceIT extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var acceptBody = objectMapper.readValue(
-                respAccept.get().getBody(), new com.fasterxml.jackson.core.type.TypeReference<ApiResponse<Void>>() {});
+                respAccept.get().getBody(),
+                new com.fasterxml.jackson.core.type.TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(acceptBody.success()).isFalse();
+        // The row accept observes was cancelled by the winning cancel thread — phase 285 must
+        // report INVITE_REVOKED here, not INVITE_USED (see InviteService#acceptInvite's
+        // revoked-before-used ordering).
+        assertThat(acceptBody.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
 
         Integer provisionedAccounts = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM users WHERE email = ?", Integer.class, raceEmail);

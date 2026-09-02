@@ -558,8 +558,12 @@ class SalonInviteHistoryIntegrationTest extends AbstractIntegrationTest {
                 .as("accepting a cancelled invite must be rejected, never provision an account")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
         var body = objectMapper.readValue(
-                acceptResponse.getBody(), new TypeReference<ApiResponse<Void>>() {});
+                acceptResponse.getBody(),
+                new TypeReference<ApiResponse<com.beautica.auth.dto.InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
+        assertThat(body.data().code())
+                .as("phase 285: a cancelled invite must report INVITE_REVOKED, not INVITE_USED")
+                .isEqualTo(com.beautica.common.exception.InviteTokenException.Code.INVITE_REVOKED.name());
         assertThat(jdbcTemplate.queryForObject(
                         "SELECT COUNT(*) FROM users WHERE email = (SELECT email FROM invite_tokens WHERE id = ?)",
                         Integer.class, inviteId))

@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.TestConstants;
 import com.beautica.auth.dto.InviteAcceptRequest;
+import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
@@ -11,6 +12,8 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
+import com.beautica.common.exception.InviteTokenException;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.user.InviteToken;
@@ -642,7 +645,8 @@ class InviteControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Token not found → 404")
+    @DisplayName("Token not found → 404, data.code=INVITE_NOT_FOUND (phase 285 backward-compat: "
+            + "status was 404 before this phase and MUST stay 404 — only data.code is new)")
     void should_return404_when_tokenNotFound() throws Exception {
         var request = new InviteAcceptRequest("nonexistent-token-xyz", "Password12345", "Jane", "Doe", "+380501234567");
         log.debug("Arrange: no matching token in DB");
@@ -652,12 +656,18 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/invite/accept", request, String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 404 when token does not exist")
+                .as("BACKWARD-COMPAT: status must stay 404 when token does not exist — accept and "
+                        + "preview deliberately disagree on this case, see InviteTokenException's javadoc")
                 .isEqualTo(HttpStatus.NOT_FOUND);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND.name());
     }
 
     @Test
-    @DisplayName("Expired token → 400")
+    @DisplayName("Expired token → 400, data.code=INVITE_EXPIRED")
     void should_return400_when_tokenExpired() throws Exception {
         String masterEmail = uniqueEmail("expiredmaster");
         createdEmails.add(masterEmail);
@@ -673,17 +683,17 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/invite/accept", request, String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 400 when invite token is expired")
+                .as("BACKWARD-COMPAT: status must stay 400 when invite token is expired")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).isEqualTo("Invalid request");
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED.name());
     }
 
     @Test
-    @DisplayName("Already-used token → 400")
+    @DisplayName("Already-used token → 400, data.code=INVITE_USED")
     void should_return400_when_tokenAlreadyUsed() throws Exception {
         String masterEmail = uniqueEmail("usedmaster");
         createdEmails.add(masterEmail);
@@ -699,13 +709,104 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/invite/accept", request, String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 400 when invite token was already used")
+                .as("BACKWARD-COMPAT: status must stay 400 when invite token was already used")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).isEqualTo("Invalid request");
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_USED.name());
+    }
+
+    @Test
+    @DisplayName("Cancelled/revoked token → 400, data.code=INVITE_REVOKED (distinct from INVITE_USED "
+            + "even though markCancelled also sets isUsed — phase 285)")
+    void should_return400_when_tokenWasCancelled() throws Exception {
+        String masterEmail = uniqueEmail("cancelledmaster");
+        createdEmails.add(masterEmail);
+        log.debug("Arrange: insert cancelled invite token for email={}", masterEmail);
+
+        String rawToken = UUID.randomUUID().toString();
+        saveRevokedInviteToken(masterEmail, rawToken);
+
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
+
+        log.debug("Act: POST /auth/invite/accept with a cancelled token for email={}", masterEmail);
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 for a revoked invite token")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
+    }
+
+    @Test
+    @DisplayName("Salon deactivated → 409, data.code=INVITE_SALON_INACTIVE (phase 286's throw, "
+            + "re-pointed at the typed exception by phase 285)")
+    void should_return409_when_inviteSalonIsInactive() throws Exception {
+        String masterEmail = uniqueEmail("inactivesalonmaster");
+        createdEmails.add(masterEmail);
+        UUID salonId = UUID.randomUUID();
+        log.debug("Arrange: insert a DEACTIVATED salon and a live invite token bound to it");
+
+        createSalonWithOwner(salonId, "inactivesalonowner");
+        jdbcTemplate.update("UPDATE salons SET is_active = false WHERE id = ?", salonId);
+
+        String rawToken = UUID.randomUUID().toString();
+        saveValidInviteToken(masterEmail, salonId, rawToken);
+
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
+
+        log.debug("Act: POST /auth/invite/accept against a deactivated salon for email={}", masterEmail);
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 409 when the invite's salon is inactive")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
+    }
+
+    @Test
+    @DisplayName("Email already registered → 409, data.code=EMAIL_ALREADY_REGISTERED (phase 285 reuses "
+            + "the EXISTING EmailAlreadyRegisteredException — same code AuthService#register emits)")
+    void should_return409_when_acceptInviteEmailAlreadyRegistered() throws Exception {
+        String masterEmail = uniqueEmail("collisionmaster");
+        createdEmails.add(masterEmail);
+        log.debug("Arrange: a user already exists for the invite's email, and a live invite token");
+
+        restTemplate.postForEntity(
+                "/api/v1/auth/register",
+                new RegisterRequest(masterEmail, "Str0ngP@ss1!", SelfRegistrationRole.CLIENT, "Existing", "User", "+380501234567", null),
+                String.class);
+        verifyEmailInDb(masterEmail);
+
+        String rawToken = UUID.randomUUID().toString();
+        saveValidInviteToken(masterEmail, null, rawToken);
+
+        var request = new InviteAcceptRequest(rawToken, "Password12345", "Jane", "Doe", "+380501234567");
+
+        log.debug("Act: POST /auth/invite/accept where email={} is already registered", masterEmail);
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/api/v1/auth/invite/accept", request, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("BACKWARD-COMPAT: status must stay 409 when the invite's email is already registered")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(EmailAlreadyRegisteredException.ERROR_CODE);
     }
 
     @Test
@@ -751,8 +852,9 @@ class InviteControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("GET /auth/invite/validate with unknown token → 400")
-    void should_return404_when_validateWithUnknownToken() {
+    @DisplayName("GET /auth/invite/validate with unknown token → 400, data.code=INVITE_NOT_FOUND "
+            + "(phase 285 backward-compat: status was 400 before this phase and MUST stay 400)")
+    void should_return404_when_validateWithUnknownToken() throws Exception {
         log.debug("Arrange: no token stored — using random UUID");
 
         log.debug("Act: GET /auth/invite/validate with a random UUID that has no matching token in the DB");
@@ -760,12 +862,18 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/invite/validate?token=" + UUID.randomUUID(), String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 400 when token is unknown")
+                .as("BACKWARD-COMPAT: status must stay 400 when token is unknown — note this is NOT "
+                        + "the same status as accept's 404 for the identical case, a deliberate asymmetry")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND.name());
     }
 
     @Test
-    @DisplayName("GET /auth/invite/validate with expired token → 400")
+    @DisplayName("GET /auth/invite/validate with expired token → 400, data.code=INVITE_EXPIRED")
     void should_return400_when_validateWithExpiredToken() throws Exception {
         String masterEmail = uniqueEmail("expiredvalidate");
         createdEmails.add(masterEmail);
@@ -779,17 +887,17 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 400 when invite token is expired")
+                .as("BACKWARD-COMPAT: status must stay 400 when invite token is expired")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).isEqualTo("Invalid request");
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED.name());
     }
 
     @Test
-    @DisplayName("GET /auth/invite/validate with used token → 400")
+    @DisplayName("GET /auth/invite/validate with used token → 400, data.code=INVITE_USED")
     void should_return400_when_validateWithUsedToken() throws Exception {
         String masterEmail = uniqueEmail("usedvalidate");
         createdEmails.add(masterEmail);
@@ -803,13 +911,37 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
 
         assertThat(response.getStatusCode())
-                .as("status must be 400 when invite token was already used")
+                .as("BACKWARD-COMPAT: status must stay 400 when invite token was already used")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
 
         var body = objectMapper.readValue(
-                response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
-        assertThat(body.message()).isEqualTo("Invalid request");
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_USED.name());
+    }
+
+    @Test
+    @DisplayName("GET /auth/invite/validate with cancelled token → 400, data.code=INVITE_REVOKED")
+    void should_return400_when_validateWithCancelledToken() throws Exception {
+        String masterEmail = uniqueEmail("cancelledvalidate");
+        createdEmails.add(masterEmail);
+        String rawToken = UUID.randomUUID().toString();
+        log.debug("Arrange: save cancelled invite token for email={}", masterEmail);
+
+        saveRevokedInviteToken(masterEmail, rawToken);
+
+        log.debug("Act: GET /auth/invite/validate with a cancelled token for email={}", masterEmail);
+        ResponseEntity<String> response = restTemplate.getForEntity(
+                "/api/v1/auth/invite/validate?token=" + rawToken, String.class);
+
+        assertThat(response.getStatusCode())
+                .as("status must be 400 for a revoked invite token")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
     }
 
     @Test
@@ -1056,6 +1188,25 @@ class InviteControllerIT extends AbstractIntegrationTest {
                 Instant.now().plusSeconds(3600)
         );
         token.markUsed();
+        return inviteTokenRepository.save(token);
+    }
+
+    /**
+     * Cancelled invite (phase 285's INVITE_REVOKED case). Deliberately uses
+     * {@code markCancelled}, not {@code markUsed} — {@code markCancelled} sets BOTH
+     * {@code isUsed = true} and {@code revokedAt}, which is exactly the shape that must produce
+     * {@code INVITE_REVOKED}, not {@code INVITE_USED} (see {@code InviteService#acceptInvite}'s
+     * revoked-before-used ordering).
+     */
+    private InviteToken saveRevokedInviteToken(String email, String rawToken) {
+        var token = new InviteToken(
+                sha256Hex(rawToken),
+                email,
+                null,
+                Role.SALON_MASTER,
+                Instant.now().plusSeconds(3600)
+        );
+        token.markCancelled(Instant.now());
         return inviteTokenRepository.save(token);
     }
 

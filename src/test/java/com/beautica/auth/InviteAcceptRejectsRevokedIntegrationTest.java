@@ -2,7 +2,9 @@ package com.beautica.auth;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.InviteAcceptRequest;
+import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.exception.InviteTokenException;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -93,8 +95,13 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         assertThat(response.getStatusCode())
                 .as("a retired invite must never provision an account — body: %s", response.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
-        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
+        assertThat(body.data().code())
+                .as("phase 285: a SUPERSEDED token is revoked regardless of what retired it — "
+                        + "INVITE_REVOKED, not INVITE_USED or INVITE_EXPIRED")
+                .isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
         assertThat(countUsers(fixture.email()))
                 .as("THE decisive assertion: no account may exist for a superseded invite's address")
                 .isZero();
@@ -104,8 +111,9 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
     }
 
     @Test
-    @DisplayName("GET /auth/invite/validate — 400 for a SUPERSEDED token whose expires_at is still "
-            + "in the future, so the invitee never sees a live-looking preview of a dead link")
+    @DisplayName("GET /auth/invite/validate — 400 + data.code=INVITE_REVOKED for a SUPERSEDED token "
+            + "whose expires_at is still in the future, so the invitee never sees a live-looking "
+            + "preview of a dead link")
     void should_return400_when_previewingASupersededButUnexpiredToken() throws Exception {
         Fixture fixture = seedRevokedInvite("SUPERSEDED", false);
 
@@ -116,18 +124,25 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         assertThat(response.getStatusCode())
                 .as("body: %s", response.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
-        var body = objectMapper.readValue(response.getBody(), new TypeReference<ApiResponse<Void>>() {});
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
         assertThat(body.success()).isFalse();
+        // Phase 285 REVERSES the old "must not distinguish revoked from never-existed" posture —
+        // data.code now legitimately says INVITE_REVOKED (see InviteService#previewInvite's
+        // rewritten javadoc for the ruling). What must still never leak is the DB-internal
+        // revoked_reason enum constant ("SUPERSEDED"/"CANCELLED" — distinct from the wire-level
+        // INVITE_REVOKED code) and any PII (the invitee's email).
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
         assertThat(response.getBody())
-                .as("the failure must not distinguish 'revoked' from 'never existed' — that split "
-                        + "turns this unauthenticated endpoint into an invite oracle")
+                .as("the response must never leak the internal revoked_reason enum constant or PII")
                 .doesNotContain("SUPERSEDED")
                 .doesNotContain(fixture.email());
     }
 
     @Test
-    @DisplayName("POST /auth/invite/accept — 400 and NO account for a CANCELLED token (the older "
-            + "is_used boundary must still hold now that cancellation also writes revoked_reason)")
+    @DisplayName("POST /auth/invite/accept — 400 + data.code=INVITE_REVOKED and NO account for a "
+            + "CANCELLED token (phase 285: the revoked check now runs BEFORE the used check, so "
+            + "a CANCELLED token — which sets both — reports the more specific code)")
     void should_return400AndProvisionNothing_when_acceptingACancelledToken() throws Exception {
         Fixture fixture = seedRevokedInvite("CANCELLED", true);
 
@@ -140,13 +155,17 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         assertThat(response.getStatusCode())
                 .as("body: %s", response.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.success()).isFalse();
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
         assertThat(countUsers(fixture.email()))
                 .as("no account may be provisioned from a cancelled invite")
                 .isZero();
     }
 
     @Test
-    @DisplayName("GET /auth/invite/validate — 400 for a CANCELLED token")
+    @DisplayName("GET /auth/invite/validate — 400 + data.code=INVITE_REVOKED for a CANCELLED token")
     void should_return400_when_previewingACancelledToken() throws Exception {
         Fixture fixture = seedRevokedInvite("CANCELLED", true);
 
@@ -156,6 +175,9 @@ class InviteAcceptRejectsRevokedIntegrationTest extends AbstractIntegrationTest 
         assertThat(response.getStatusCode())
                 .as("body: %s", response.getBody())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<InviteErrorResponse>>() {});
+        assertThat(body.data().code()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED.name());
     }
 
     /**

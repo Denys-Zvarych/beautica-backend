@@ -2,6 +2,7 @@ package com.beautica.common.exception;
 
 import com.beautica.auth.dto.EmailAlreadyRegisteredResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
+import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
@@ -189,6 +190,48 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         DuplicateServiceResponse.from(ex),
                         "This service already exists"));
+    }
+
+    /**
+     * Typed invite-token failure codes (phase 285) — distinguishes token-not-found / used /
+     * expired / revoked / salon-inactive via {@code data.code}, replacing the single genericised
+     * BAD_REQUEST/CONFLICT body {@link #handleBusiness} used to emit for every one of them
+     * (see {@link InviteTokenException}'s javadoc for why the codes were previously collapsed and
+     * why that is reversed as of phase 285).
+     *
+     * <p>Unlike every other typed handler in this class, the status is NOT hardcoded here — the
+     * case space genuinely spans 400/404/409 (again, see {@link InviteTokenException}), so this
+     * reads {@code ex.getStatus()} rather than fixing one status the way {@link #handleVerification}
+     * fixes 400 for every {@code VerificationException.Code}.
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured {@link InviteErrorResponse}
+     * body is emitted instead of the generic status-genericised message.
+     *
+     * <p><strong>The client-facing {@code message} is hardcoded per {@link InviteTokenException.Code}
+     * here, never {@code ex.getMessage()}.</strong> Every current {@code InviteService} throw site
+     * happens to pass a static literal, but nothing stops a future contributor from interpolating a
+     * salon name, invitee email, or token fragment into one of those messages — which would ship
+     * straight to the wire the way {@link #handleBusiness} deliberately avoids for its
+     * {@code CONFLICT}/{@code BAD_REQUEST} branches. Reading {@code ex.getMessage()} here would
+     * defeat that same discipline for this handler alone, so the mapping below is a structural
+     * guard, not a convention: the wire message cannot vary with what a throw site passes, no
+     * matter what future code does. {@code data.code} — the discriminator the mobile client
+     * actually branches on (phase 285/304) — is unaffected; these strings are human prose only.
+     */
+    @ExceptionHandler(InviteTokenException.class)
+    public ResponseEntity<ApiResponse<InviteErrorResponse>> handleInviteToken(InviteTokenException ex) {
+        log.debug("Invite token rejected: {}", ex.getCode());
+        String clientMessage = switch (ex.getCode()) {
+            case INVITE_NOT_FOUND -> "Invalid or expired invite token";
+            case INVITE_EXPIRED -> "This invite has expired";
+            case INVITE_USED -> "This invite has already been used";
+            case INVITE_REVOKED -> "This invite is no longer valid";
+            case INVITE_SALON_INACTIVE -> "This salon is no longer active";
+        };
+        return ResponseEntity
+                .status(ex.getStatus())
+                .body(new ApiResponse<>(false, new InviteErrorResponse(ex.getCode().name()), clientMessage));
     }
 
     @ExceptionHandler(BusinessException.class)

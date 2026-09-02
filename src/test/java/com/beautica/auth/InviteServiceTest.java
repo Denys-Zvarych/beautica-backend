@@ -5,8 +5,9 @@ import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.InviteTokenException;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
@@ -35,6 +36,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -420,7 +422,8 @@ class InviteServiceTest {
     }
 
     @Test
-    @DisplayName("acceptInvite throws NotFoundException when token does not exist")
+    @DisplayName("acceptInvite throws InviteTokenException(404, INVITE_NOT_FOUND) when token does not exist "
+            + "— phase 285 backward-compat: status stays 404, only the type/code are new")
     void should_throwNotFoundException_when_tokenNotFound() {
         var rawToken = "nonexistent";
         var hashedToken = "hashed-nonexistent";
@@ -430,33 +433,60 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.empty());
 
-        log.debug("Act: acceptInvite with non-existent token='{}' — must throw NotFoundException", rawToken);
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(NotFoundException.class)
-                .hasMessageContaining("not found");
+        log.debug("Act: acceptInvite with non-existent token='{}' — must throw InviteTokenException(404)", rawToken);
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown).hasMessageContaining("not found");
+        assertThat(thrown.getStatus())
+                .as("phase 285 backward-compat gate: accept's token-not-found status must stay 404")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
     }
 
     @Test
-    @DisplayName("acceptInvite throws BusinessException when token is already used")
+    @DisplayName("acceptInvite throws InviteTokenException(INVITE_USED) when token is already used")
     void should_throwBusinessException_when_tokenAlreadyUsed() {
         var rawToken = "raw-used-token";
         var hashedToken = "hashed-used-token";
         var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
         invite.markUsed();
         var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
-        log.debug("Arrange: invite token already marked used");
+        log.debug("Arrange: invite token already marked used (markUsed only — NOT markCancelled, so "
+                + "revokedAt stays null and this must report INVITE_USED, not INVITE_REVOKED)");
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: acceptInvite with a token already marked used — must throw BusinessException");
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("already been used");
+        log.debug("Act: acceptInvite with a token already marked used — must throw InviteTokenException");
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown).hasMessageContaining("already been used");
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_USED);
     }
 
     @Test
-    @DisplayName("acceptInvite throws BusinessException when token is expired")
+    @DisplayName("acceptInvite throws InviteTokenException(INVITE_REVOKED) when token was cancelled — "
+            + "the mutation-check case: a CANCELLED token sets isUsed AND revokedAt, so the revoked "
+            + "check must run BEFORE the used check to report the more specific code")
+    void should_throwInviteRevoked_when_tokenWasCancelled() {
+        var rawToken = "raw-cancelled-token";
+        var hashedToken = "hashed-cancelled-token";
+        var invite = buildInviteToken("cancelled@example.com", Instant.now().plusSeconds(3600));
+        invite.markCancelled(Instant.now());
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
+        log.debug("Arrange: invite token cancelled (markCancelled sets isUsed=true AND revokedAt)");
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
+
+        log.debug("Act: acceptInvite with a cancelled token — must throw INVITE_REVOKED, not INVITE_USED");
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED);
+    }
+
+    @Test
+    @DisplayName("acceptInvite throws InviteTokenException(INVITE_EXPIRED) when token is expired")
     void should_throwBusinessException_when_tokenExpired() {
         var rawToken = "raw-expired-token";
         var hashedToken = "hashed-expired-token";
@@ -467,14 +497,17 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: acceptInvite with an expired token — must throw BusinessException");
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("expired");
+        log.debug("Act: acceptInvite with an expired token — must throw InviteTokenException");
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown).hasMessageContaining("expired");
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED);
     }
 
     @Test
-    @DisplayName("acceptInvite throws BusinessException when email already registered")
+    @DisplayName("acceptInvite throws the EXISTING EmailAlreadyRegisteredException (EMAIL_ALREADY_REGISTERED) "
+            + "when email already registered — phase 285 chose to reuse this type rather than mint a "
+            + "second code, see InviteTokenException's class javadoc")
     void should_throwBusinessException_when_emailAlreadyRegisteredOnAccept() {
         var rawToken = "raw-collision-token";
         var hashedToken = "hashed-collision-token";
@@ -486,10 +519,11 @@ class InviteServiceTest {
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("collision@example.com")).thenReturn(true);
 
-        log.debug("Act: acceptInvite where email=collision@example.com is already registered — must throw BusinessException");
+        log.debug("Act: acceptInvite where email=collision@example.com is already registered — must throw EmailAlreadyRegisteredException");
         assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(BusinessException.class)
-                .hasMessageContaining("already registered");
+                .isInstanceOf(EmailAlreadyRegisteredException.class)
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
     }
 
     // ── Phase 286: salon-liveness guard, exercised directly at the service unit level ──────────
@@ -519,10 +553,12 @@ class InviteServiceTest {
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(inactiveSalon));
 
         log.debug("Act: acceptInvite against a deactivated salon — must throw 409, not provision anything");
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(BusinessException.class)
-                .extracting(e -> ((BusinessException) e).getStatus())
-                .isEqualTo(HttpStatus.CONFLICT);
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(thrown.getCode())
+                .as("phase 285: phase 286's throw is re-pointed at InviteTokenException.Code.INVITE_SALON_INACTIVE")
+                .isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
 
         assertThat(invite.isUsed())
                 .as("a rejected redemption must not burn the single-use token — guard must run "
@@ -555,10 +591,10 @@ class InviteServiceTest {
         when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
 
         log.debug("Act: acceptInvite where findById(salonId) is empty — must throw 409, not NPE/500");
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(BusinessException.class)
-                .extracting(e -> ((BusinessException) e).getStatus())
-                .isEqualTo(HttpStatus.CONFLICT);
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
 
         assertThat(invite.isUsed()).isFalse();
         verify(userRepository, never()).save(any(User.class));
@@ -586,10 +622,10 @@ class InviteServiceTest {
         when(userRepository.existsByEmail("null-salon@example.com")).thenReturn(false);
 
         log.debug("Act: acceptInvite with salonId == null for a salon-bound role — must fail closed");
-        assertThatThrownBy(() -> inviteService.acceptInvite(request))
-                .isInstanceOf(BusinessException.class)
-                .extracting(e -> ((BusinessException) e).getStatus())
-                .isEqualTo(HttpStatus.CONFLICT);
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.acceptInvite(request), InviteTokenException.class);
+        assertThat(thrown.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE);
 
         assertThat(invite.isUsed()).isFalse();
         verify(salonRepository, never()).findById(any());
@@ -619,7 +655,8 @@ class InviteServiceTest {
     }
 
     @Test
-    @DisplayName("previewInvite throws BusinessException when token does not exist")
+    @DisplayName("previewInvite throws InviteTokenException(400, INVITE_NOT_FOUND) when token does not "
+            + "exist — phase 285 backward-compat: status stays 400, only the type/code are new")
     void should_throwNotFound_when_previewTokenNotFound() {
         var rawToken = "unknown-raw-token";
         var hashedToken = "hashed-unknown-token";
@@ -628,32 +665,56 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.empty());
 
-        log.debug("Act: previewInvite with unknown token='{}' — must throw BusinessException", rawToken);
-        assertThatThrownBy(() -> inviteService.previewInvite(rawToken))
-                .isInstanceOf(BusinessException.class)
-                .hasMessage("Invalid or expired invite token");
+        log.debug("Act: previewInvite with unknown token='{}' — must throw InviteTokenException(400)", rawToken);
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
+        assertThat(thrown).hasMessage("Invalid or expired invite token");
+        assertThat(thrown.getStatus())
+                .as("phase 285 backward-compat gate: preview's token-not-found status must stay 400")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND);
     }
 
     @Test
-    @DisplayName("previewInvite throws BusinessException when token is already used")
+    @DisplayName("previewInvite throws InviteTokenException(INVITE_USED) when token is already used")
     void should_throw400_when_previewTokenAlreadyUsed() {
         var rawToken = "raw-used-preview-token";
         var hashedToken = "hashed-used-preview-token";
         var invite = buildInviteToken("used@example.com", Instant.now().plusSeconds(3600));
         invite.markUsed();
-        log.debug("Arrange: invite token already marked used");
+        log.debug("Arrange: invite token already marked used (markUsed only, revokedAt stays null)");
 
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: previewInvite with an already-used token for email=used@example.com — must throw BusinessException");
-        assertThatThrownBy(() -> inviteService.previewInvite(rawToken))
-                .isInstanceOf(BusinessException.class)
-                .hasMessage("Invalid or expired invite token");
+        log.debug("Act: previewInvite with an already-used token for email=used@example.com — must throw InviteTokenException");
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
+        assertThat(thrown).hasMessageContaining("already been used");
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_USED);
     }
 
     @Test
-    @DisplayName("previewInvite throws BusinessException when token is expired")
+    @DisplayName("previewInvite throws InviteTokenException(INVITE_REVOKED) when token was cancelled — "
+            + "mutation-check case: a CANCELLED token sets isUsed AND revokedAt, revoked must win")
+    void should_throwInviteRevoked_when_previewTokenWasCancelled() {
+        var rawToken = "raw-cancelled-preview-token";
+        var hashedToken = "hashed-cancelled-preview-token";
+        var invite = buildInviteToken("cancelled-preview@example.com", Instant.now().plusSeconds(3600));
+        invite.markCancelled(Instant.now());
+        log.debug("Arrange: invite token cancelled (markCancelled sets isUsed=true AND revokedAt)");
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
+
+        log.debug("Act: previewInvite with a cancelled token — must throw INVITE_REVOKED, not INVITE_USED");
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_REVOKED);
+    }
+
+    @Test
+    @DisplayName("previewInvite throws InviteTokenException(INVITE_EXPIRED) when token is expired")
     void should_throw400_when_previewTokenExpired() {
         var rawToken = "raw-expired-preview-token";
         var hashedToken = "hashed-expired-preview-token";
@@ -663,10 +724,11 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByToken(hashedToken)).thenReturn(Optional.of(invite));
 
-        log.debug("Act: previewInvite with an expired token for email=expired@example.com — must throw BusinessException");
-        assertThatThrownBy(() -> inviteService.previewInvite(rawToken))
-                .isInstanceOf(BusinessException.class)
-                .hasMessage("Invalid or expired invite token");
+        log.debug("Act: previewInvite with an expired token for email=expired@example.com — must throw InviteTokenException");
+        InviteTokenException thrown = catchThrowableOfType(
+                () -> inviteService.previewInvite(rawToken), InviteTokenException.class);
+        assertThat(thrown).hasMessageContaining("expired");
+        assertThat(thrown.getCode()).isEqualTo(InviteTokenException.Code.INVITE_EXPIRED);
     }
 
     // ── Phase 2.8 — SALON_ADMIN invite flow ──────────────────────────────────

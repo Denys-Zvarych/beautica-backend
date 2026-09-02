@@ -5,8 +5,9 @@ import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InvitePreviewResponse;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
-import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
+import com.beautica.common.exception.InviteTokenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.service.MasterService;
@@ -247,25 +248,52 @@ public class InviteService {
         return new InviteResponse(email, expiresAt);
     }
 
+    /**
+     * Previews an invite by token, without accepting it — the mobile "who invited you" landing
+     * screen calls this before the invitee sets a password.
+     *
+     * <p><strong>Phase 285 — anti-enumeration reasoning REVERSED.</strong> This method used to
+     * collapse every failure (not-found / used / expired / revoked) into one identical
+     * {@code BusinessException} message, on the theory that distinguishing "revoked" from "never
+     * existed" would turn this endpoint into an invite-id oracle. That reasoning is reversed as of
+     * phase 285, on the same precedent {@link AuthService#register}'s duplicate-email 409 already
+     * established: a uniform failure is an undebuggable "why didn't my invite work?" footgun for
+     * the invitee, and the anti-enumeration argument for silence does not actually hold on THIS
+     * endpoint — it is keyed by possession of a high-entropy single-use token, not a guessable
+     * identifier like an email, so there is no enumeration surface to close. A caller without a
+     * valid token learns only {@code INVITE_NOT_FOUND}, which they already knew by definition; a
+     * caller with a valid token learns the state of an invite that was mailed to them. See
+     * phase-285's doc for the full two-part ruling (user + architect).
+     *
+     * <p>Scope note: this reasoning covers ONLY this token-keyed pair of endpoints
+     * ({@code previewInvite} / {@link #acceptInvite}). It does not license distinguishing failures
+     * on any email-keyed endpoint — {@code /auth/forgot-password} keeps its deliberate uniform
+     * response.
+     */
     @Transactional(readOnly = true)
     public InvitePreviewResponse previewInvite(String rawToken) {
         InviteToken token = inviteTokenRepository.findByToken(tokenGenerator.hash(rawToken))
-                .orElseThrow(() -> new BusinessException("Invalid or expired invite token"));
+                .orElseThrow(() -> new InviteTokenException(
+                        InviteTokenException.Code.INVITE_NOT_FOUND, "Invalid or expired invite token"));
 
         // InviteToken.isExpiredAt is THE canonical expiry predicate — shared with acceptInvite,
         // InvitePersistenceService's recycle filter, SalonService#cancelInvite and the history
         // status ladder, so no two of them can drift at the boundary instant. See its Javadoc.
-        if (token.isUsed() || token.isExpiredAt(clock.instant())) {
-            throw new BusinessException("Invalid or expired invite token");
-        }
-
-        // Defence in depth. A CANCELLED token already trips isUsed() above, but a SUPERSEDED one
-        // does NOT — it keeps is_used = false, and a clock skew or an unexpired token retired by
-        // some future path would otherwise slip past both checks. Any revoked token is dead,
-        // whatever retired it. Same generic message as every other failure here: distinguishing
-        // "revoked" from "never existed" would turn this endpoint into an invite-id oracle.
+        //
+        // Order: revoked, then used, then expired. InviteToken#markCancelled sets BOTH revokedAt
+        // AND isUsed, so revokedAt must be checked FIRST to report the more specific
+        // INVITE_REVOKED rather than INVITE_USED; InviteToken#markSuperseded leaves isUsed =
+        // false, so a superseded token is reachable ONLY through this first check (see
+        // InviteAcceptRejectsRevokedIntegrationTest — "a revoked token is dead regardless of what
+        // retired it").
         if (token.getRevokedAt() != null) {
-            throw new BusinessException("Invalid or expired invite token");
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_REVOKED, "This invite is no longer valid");
+        }
+        if (token.isUsed()) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
+        }
+        if (token.isExpiredAt(clock.instant())) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_EXPIRED, "This invite has expired");
         }
 
         return new InvitePreviewResponse(token.getEmail(), token.getRole(), token.getExpiresAt());
@@ -273,27 +301,35 @@ public class InviteService {
 
     @Transactional
     public AuthResponse acceptInvite(InviteAcceptRequest request) {
+        // Status stays 404 here (NOT the 400 previewInvite uses for the same case) — a deliberate,
+        // pre-existing asymmetry phase 285 preserves rather than "tidies" (see InviteTokenException's
+        // javadoc and the phase doc's backward-compatibility gate).
         InviteToken token = inviteTokenRepository.findByTokenForUpdate(tokenGenerator.hash(request.token()))
-                .orElseThrow(() -> new NotFoundException("Invite token not found"));
+                .orElseThrow(() -> new InviteTokenException(
+                        InviteTokenException.Code.INVITE_NOT_FOUND, HttpStatus.NOT_FOUND, "Invite token not found"));
 
-        if (token.isUsed()) {
-            throw new BusinessException("Invite token has already been used");
+        // Same ordering rationale as previewInvite: revoked before used, so a CANCELLED token
+        // (which sets both) reports INVITE_REVOKED, not the less specific INVITE_USED. A SUPERSEDED
+        // token leaves isUsed = false and is reachable only through this first check.
+        if (token.getRevokedAt() != null) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_REVOKED, "This invite is no longer valid");
         }
 
-        // Defence in depth — see previewInvite. A CANCELLED token is caught by isUsed() above; a
-        // SUPERSEDED one keeps is_used = false, so this is the check that stops an account being
-        // provisioned from an invite that was retired rather than accepted.
-        if (token.getRevokedAt() != null) {
-            throw new BusinessException("Invite token has already been used");
+        if (token.isUsed()) {
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
         }
 
         // Same canonical predicate as previewInvite / the history ladder (InviteToken#isExpired).
         if (token.isExpiredAt(clock.instant())) {
-            throw new BusinessException("Invite token has expired");
+            throw new InviteTokenException(InviteTokenException.Code.INVITE_EXPIRED, "This invite has expired");
         }
 
+        // Phase 285: reuse the EXISTING EmailAlreadyRegisteredException/EMAIL_ALREADY_REGISTERED
+        // code (AuthService#register throws the same type for the same wire code) rather than
+        // minting a second spelling of it as an InviteTokenException.Code — one code, one handler,
+        // no divergence. See InviteTokenException's class javadoc.
         if (userRepository.existsByEmail(token.getEmail())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
+            throw new EmailAlreadyRegisteredException();
         }
 
         // Phase 286: a salon-bound invite must not be redeemable once its salon has been
@@ -324,7 +360,8 @@ public class InviteService {
                     ? null
                     : salonRepository.findById(token.getSalonId()).orElse(null);
             if (salon == null || !salon.isActive()) {
-                throw new BusinessException(HttpStatus.CONFLICT, "Salon is no longer active");
+                throw new InviteTokenException(
+                        InviteTokenException.Code.INVITE_SALON_INACTIVE, "This salon is no longer active");
             }
         }
 

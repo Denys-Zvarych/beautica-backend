@@ -814,6 +814,74 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
     }
 
+    @Test
+    @DisplayName("handleInviteToken (phase 285) — status reads ex.getStatus(), not a hardcoded value, "
+            + "and the body carries the typed InviteTokenException.Code")
+    void should_returnExStatusWithCode_when_inviteTokenExceptionThrown() {
+        // Arrange — accept's token-not-found case: 404, NOT 400, and this handler must honour that
+        // per-throw-site status rather than fixing one status the way handleVerification fixes 400.
+        var ex = new InviteTokenException(
+                InviteTokenException.Code.INVITE_NOT_FOUND, HttpStatus.NOT_FOUND, "Invite token not found");
+
+        // Act
+        ResponseEntity<ApiResponse<com.beautica.auth.dto.InviteErrorResponse>> response =
+                handler.handleInviteToken(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("handleInviteToken must read ex.getStatus(), not hardcode 400/404/409")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data().code())
+                .as("code must be the stable INVITE_NOT_FOUND constant the mobile client branches on")
+                .isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND.name());
+        // Message is now hardcoded per Code in the handler, not echoed from ex.getMessage()
+        // (structural guard against a future dynamic detail reaching the wire) — the exception
+        // was constructed above with a distinct message ("Invite token not found") specifically
+        // to prove the handler does NOT echo it.
+        assertThat(response.getBody().message()).isEqualTo("Invalid or expired invite token");
+    }
+
+    @Test
+    @DisplayName("handleInviteToken — honours a 409 CONFLICT status (INVITE_SALON_INACTIVE) exactly "
+            + "as it honours 400/404, proving the status is not hardcoded per-status either")
+    void should_return409_when_inviteTokenExceptionCarriesConflictStatus() {
+        var ex = new InviteTokenException(
+                InviteTokenException.Code.INVITE_SALON_INACTIVE, "This salon is no longer active");
+
+        ResponseEntity<ApiResponse<com.beautica.auth.dto.InviteErrorResponse>> response =
+                handler.handleInviteToken(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().data().code())
+                .isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
+    }
+
+    @Test
+    @DisplayName("handleInviteToken — emits DEBUG log marker carrying the code, no email/PII")
+    void should_emitDebugLog_when_inviteTokenExceptionThrown() {
+        var ex = new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
+        listAppender.list.clear();
+
+        handler.handleInviteToken(ex);
+
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleInviteToken must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must carry the code, not a raw message that might one day include PII")
+                .contains("INVITE_USED");
+        boolean emailShapedLogged = listAppender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.matches(".*\\S+@\\S+.*"));
+        assertThat(emailShapedLogged)
+                .as("no log event may contain an email-shaped substring — PII at any level")
+                .isFalse();
+    }
+
     /**
      * Minimal, fully-hydrated {@link Booking} fixture used to construct a
      * {@link ClientBookingConflictException} — mirrors the fixture style in
