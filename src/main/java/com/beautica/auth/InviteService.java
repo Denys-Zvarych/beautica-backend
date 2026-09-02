@@ -30,13 +30,26 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.EnumSet;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 @Slf4j
 @Service
 public class InviteService {
+
+    /**
+     * Roles that {@link #sendInvite} requires a live {@link Salon} to mint a token for — see
+     * {@code InviteRequest#isRoleAllowed} (only {@code SALON_MASTER}/{@code SALON_ADMIN} are ever
+     * assignable via invite) and {@code InviteRequest.salonId()}'s {@code @NotNull}. Every invite
+     * token ever issued today carries one of these two roles, so every live token is salon-bound.
+     * No currently-invitable role is genuinely salon-less; this set exists so a future role that
+     * IS salon-less (and therefore legitimately carries a null {@code salonId}) can be added
+     * without it here, rather than by loosening the null check in {@link #acceptInvite}.
+     */
+    private static final Set<Role> SALON_BOUND_ROLES = EnumSet.of(Role.SALON_MASTER, Role.SALON_ADMIN);
 
     private final InviteTokenRepository inviteTokenRepository;
     private final UserRepository userRepository;
@@ -281,6 +294,38 @@ public class InviteService {
 
         if (userRepository.existsByEmail(token.getEmail())) {
             throw new BusinessException(HttpStatus.CONFLICT, "Email is already registered");
+        }
+
+        // Phase 286: a salon-bound invite must not be redeemable once its salon has been
+        // soft-deactivated (SalonService.deactivateSalon). Placed AFTER the
+        // used/revoked/expired/email checks (those are cheaper and are properties of the token
+        // itself — a used token must still report "used", not "salon inactive") and BEFORE
+        // markUsed() (a rejected redemption must not burn the single-use token;
+        // findByTokenForUpdate's row lock means throwing here rolls the whole transaction back
+        // with no partial state).
+        //
+        // SECURITY (fail-closed on null salonId): InviteRequest.salonId() is @NotNull and
+        // InviteService#sendInvite only ever mints tokens for SALON_MASTER/SALON_ADMIN
+        // (InviteRequest#isRoleAllowed) — both always salon-bound at creation, so a live token
+        // for either role NEVER has a legitimately null salonId. The one way salon_id can go
+        // null on a live row is invite_tokens.salon_id's ON DELETE SET NULL FK
+        // (V5__Fix_invite_tokens_cascade.sql) firing when the referenced salons row is hard-
+        // deleted — currently unreachable (SalonService.deactivateSalon only soft-deletes,
+        // nothing hard-deletes a Salon) but must fail closed, not silently skip, in case a
+        // future admin/cleanup tool arms it: skipping would let acceptInvite proceed and
+        // MasterService#createMasterFromInvite would then call
+        // salonRepository.findById(null), which Spring Data rejects with an uncaught
+        // IllegalArgumentException (500) instead of a clean 409. SALON_BOUND_ROLES is therefore
+        // the set of roles for which sendInvite requires a resolved Salon before issuing a
+        // token; a role outside that set (none exist today — see the set's Javadoc) is
+        // genuinely salon-less and skips this guard entirely, exactly as before.
+        if (SALON_BOUND_ROLES.contains(token.getRole())) {
+            Salon salon = token.getSalonId() == null
+                    ? null
+                    : salonRepository.findById(token.getSalonId()).orElse(null);
+            if (salon == null || !salon.isActive()) {
+                throw new BusinessException(HttpStatus.CONFLICT, "Salon is no longer active");
+            }
         }
 
         token.markUsed();

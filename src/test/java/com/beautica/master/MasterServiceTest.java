@@ -208,6 +208,9 @@ class MasterServiceTest {
                 .build();
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        // Phase 286: createMasterFromInvite now rejects a deactivated salon — stub active so
+        // this happy-path test still exercises success.
+        when(salon.isActive()).thenReturn(true);
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(masterRepository.save(any(Master.class))).thenReturn(saved);
 
@@ -241,6 +244,9 @@ class MasterServiceTest {
                 .build();
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        // Phase 286: createMasterFromInvite now rejects a deactivated salon — stub active so
+        // this happy-path test still exercises success.
+        when(salon.isActive()).thenReturn(true);
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(masterRepository.save(any(Master.class))).thenReturn(saved);
 
@@ -276,6 +282,28 @@ class MasterServiceTest {
 
         assertThatThrownBy(() -> masterService.createMasterFromInvite(userId, salonId))
                 .isInstanceOf(NotFoundException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwBusinessException_when_createMasterFromInviteWithInactiveSalon")
+    void should_throwBusinessException_when_createMasterFromInviteWithInactiveSalon() {
+        // Phase 286: defence in depth for InviteService.acceptInvite's own salon-liveness
+        // guard — this method is public and @Transactional, so the invariant belongs here too,
+        // not only on that one caller's discipline.
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(salon.isActive()).thenReturn(false);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        assertThatThrownBy(() -> masterService.createMasterFromInvite(userId, salonId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Salon is not active");
 
         verify(masterRepository, never()).save(any());
     }

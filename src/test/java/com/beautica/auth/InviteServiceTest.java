@@ -24,6 +24,7 @@ import java.time.Clock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -387,6 +388,11 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("new@example.com")).thenReturn(false);
+        // Phase 286: acceptInvite now loads the salon to verify it is still active before
+        // provisioning — stub an active salon so this happy-path test still exercises success.
+        var acceptSalonStub = mock(Salon.class);
+        when(acceptSalonStub.isActive()).thenReturn(true);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", userId);
@@ -484,6 +490,110 @@ class InviteServiceTest {
         assertThatThrownBy(() -> inviteService.acceptInvite(request))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("already registered");
+    }
+
+    // ── Phase 286: salon-liveness guard, exercised directly at the service unit level ──────────
+    //
+    // The Testcontainers IT (InviteAcceptRejectsInactiveSalonIntegrationTest) proves the HTTP
+    // contract end to end but only reaches the guard through the full Spring context. These three
+    // pin the guard's own three branches (present-but-inactive, absent, null-salonId-fail-closed)
+    // at the unit level, cheaply and independently of wiring, and assert the SAME "no side effect"
+    // invariant the IT does: no user persisted and the token still reports isUsed() == false.
+
+    @Test
+    @DisplayName("acceptInvite throws 409 CONFLICT and burns nothing when the invite's salon is inactive")
+    void should_throwConflictAndLeaveTokenUnused_when_acceptInviteSalonIsInactive() {
+        var rawToken = "raw-inactive-salon-token";
+        var hashedToken = "hashed-inactive-salon-token";
+        var salonId = UUID.randomUUID();
+        var invite = buildInviteToken("inactive-salon@example.com", Instant.now().plusSeconds(3600));
+        ReflectionTestUtils.setField(invite, "salonId", salonId);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
+        log.debug("Arrange: valid unused SALON_MASTER token whose salon exists but is inactive");
+
+        var inactiveSalon = mock(Salon.class);
+        when(inactiveSalon.isActive()).thenReturn(false);
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
+        when(userRepository.existsByEmail("inactive-salon@example.com")).thenReturn(false);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(inactiveSalon));
+
+        log.debug("Act: acceptInvite against a deactivated salon — must throw 409, not provision anything");
+        assertThatThrownBy(() -> inviteService.acceptInvite(request))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(invite.isUsed())
+                .as("a rejected redemption must not burn the single-use token — guard must run "
+                        + "BEFORE markUsed()")
+                .isFalse();
+        verify(userRepository, never()).save(any(User.class));
+        verify(masterService, never()).createMasterFromInvite(any(), any());
+    }
+
+    @Test
+    @DisplayName("acceptInvite throws 409 CONFLICT when the invite's salonId no longer resolves to any salon row")
+    void should_throwConflictAndLeaveTokenUnused_when_acceptInviteSalonNotFound() {
+        // Distinct from the null-salonId case below: here salonId is non-null (the invite was
+        // legitimately salon-bound at creation) but salonRepository.findById comes back empty.
+        // Not reachable via a real DB today (invite_tokens.salon_id carries a hard FK to
+        // salons(id) with ON DELETE SET NULL, never a dangling reference — V5), but the guard's
+        // `.orElse(null)` branch exists in the code, so it must be pinned to fail exactly like
+        // the present-but-inactive case, not to fall through and provision an account.
+        var rawToken = "raw-missing-salon-token";
+        var hashedToken = "hashed-missing-salon-token";
+        var salonId = UUID.randomUUID();
+        var invite = buildInviteToken("missing-salon@example.com", Instant.now().plusSeconds(3600));
+        ReflectionTestUtils.setField(invite, "salonId", salonId);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
+        log.debug("Arrange: valid unused SALON_MASTER token whose salonId resolves to no salon row");
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
+        when(userRepository.existsByEmail("missing-salon@example.com")).thenReturn(false);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.empty());
+
+        log.debug("Act: acceptInvite where findById(salonId) is empty — must throw 409, not NPE/500");
+        assertThatThrownBy(() -> inviteService.acceptInvite(request))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(invite.isUsed()).isFalse();
+        verify(userRepository, never()).save(any(User.class));
+        verify(masterService, never()).createMasterFromInvite(any(), any());
+    }
+
+    @Test
+    @DisplayName("acceptInvite fails closed with 409 for a SALON_MASTER token whose salonId is null, "
+            + "without ever calling salonRepository")
+    void should_throwConflictAndSkipSalonLookup_when_acceptInviteSalonBoundTokenHasNullSalonId() {
+        // SALON_MASTER is salon-bound (SALON_BOUND_ROLES); a live token for it never legitimately
+        // carries a null salonId (see acceptInvite's SECURITY javadoc — only reachable via
+        // invite_tokens.salon_id's ON DELETE SET NULL FK). The ternary in the guard must treat
+        // null as "no salon" WITHOUT calling salonRepository.findById(null), which Spring Data
+        // would reject with an uncaught IllegalArgumentException (500) instead of a clean 409.
+        var rawToken = "raw-null-salon-token";
+        var hashedToken = "hashed-null-salon-token";
+        var invite = buildInviteToken("null-salon@example.com", Instant.now().plusSeconds(3600));
+        ReflectionTestUtils.setField(invite, "salonId", null);
+        var request = new InviteAcceptRequest(rawToken, "Str0ngP@ss1!", null, null, null);
+        log.debug("Arrange: valid unused SALON_MASTER token with a corrupt null salonId");
+
+        when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
+        when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
+        when(userRepository.existsByEmail("null-salon@example.com")).thenReturn(false);
+
+        log.debug("Act: acceptInvite with salonId == null for a salon-bound role — must fail closed");
+        assertThatThrownBy(() -> inviteService.acceptInvite(request))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getStatus())
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(invite.isUsed()).isFalse();
+        verify(salonRepository, never()).findById(any());
+        verify(userRepository, never()).save(any(User.class));
     }
 
     @Test
@@ -657,6 +767,11 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("admin@example.com")).thenReturn(false);
+        // Phase 286: acceptInvite now loads the salon to verify it is still active before
+        // provisioning — stub an active salon so this happy-path test still exercises success.
+        var acceptSalonStub = mock(Salon.class);
+        when(acceptSalonStub.isActive()).thenReturn(true);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", userId);
@@ -691,6 +806,11 @@ class InviteServiceTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail("newmaster@example.com")).thenReturn(false);
+        // Phase 286: acceptInvite now loads the salon to verify it is still active before
+        // provisioning — stub an active salon so this happy-path test still exercises success.
+        var acceptSalonStub = mock(Salon.class);
+        when(acceptSalonStub.isActive()).thenReturn(true);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", userId);

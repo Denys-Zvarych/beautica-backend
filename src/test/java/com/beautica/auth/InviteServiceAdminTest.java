@@ -5,6 +5,7 @@ import com.beautica.auth.dto.InviteAcceptRequest;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.service.MasterService;
+import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -441,6 +442,11 @@ class InviteServiceAdminTest {
         when(tokenGenerator.hash(rawToken)).thenReturn(hashedToken);
         when(inviteTokenRepository.findByTokenForUpdate(hashedToken)).thenReturn(Optional.of(invite));
         when(userRepository.existsByEmail(invite.getEmail())).thenReturn(false);
+        // Phase 286: acceptInvite now loads the salon to verify it is still active before
+        // provisioning — stub an active salon so this happy-path helper still exercises success.
+        var acceptSalonStub = mock(Salon.class);
+        when(acceptSalonStub.isActive()).thenReturn(true);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(acceptSalonStub));
         when(userRepository.save(any(User.class))).thenAnswer(inv -> {
             var u = (User) inv.getArgument(0);
             ReflectionTestUtils.setField(u, "id", userId);

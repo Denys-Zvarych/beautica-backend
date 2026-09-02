@@ -139,6 +139,14 @@ public class MasterService {
         var salon = salonRepository.findById(salonId)
                 .orElseThrow(() -> new NotFoundException("Salon not found"));
 
+        // Phase 286: defence in depth, redundant with InviteService.acceptInvite's own
+        // salon-liveness guard. This method is public and @Transactional, so the invariant
+        // belongs here rather than on one caller's discipline. Same exception type + message
+        // as createMasterForOwner's identical check below so the two paths cannot drift.
+        if (!salon.isActive()) {
+            throw new BusinessException("Salon is not active");
+        }
+
         var master = Master.builder()
                 .user(user)
                 .salon(salon)

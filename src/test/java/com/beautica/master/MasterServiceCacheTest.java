@@ -106,6 +106,14 @@ class MasterServiceCacheTest {
     // in SalonPublicProfileIntegrationTest).
     @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // c4d69ac: MasterService now constructor-depends on UserProfileCacheEvictor (evicts the
+    // GET /users/me cache on every create/reactivate/deactivate-master path, since
+    // hasMasterProfile is derived from the masters table). None of these tests assert on
+    // user-profile cache eviction — only master-calendar and master-by-user — so a mock
+    // satisfies the wiring, matching slotCalculationService/salonCatalogCacheEvictor above.
+    // Its own eviction behaviour belongs in a MasterService test slice that actually wires a
+    // user-profile CacheManager entry, not here.
+    @MockBean com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;
