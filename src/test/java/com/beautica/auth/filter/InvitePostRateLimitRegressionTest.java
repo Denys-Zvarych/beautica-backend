@@ -64,7 +64,7 @@ class InvitePostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postInvite() {

@@ -74,7 +74,7 @@ class RotateStaffRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest rotateAdmin(UUID salonId, UUID userId) {

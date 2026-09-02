@@ -69,6 +69,14 @@ app:
     # ServiceWriteRateLimitRegressionTest builds the filter directly against hand-built buckets
     # (bypassing this property entirely), so the override does not neuter the throttling coverage.
     service-write-capacity: 100000
+    # High so InviteControllerIT (which fires several dozen real HTTP calls against GET
+    # /auth/invite/validate and POST /auth/invite/accept from 127.0.0.1 across its test methods)
+    # is not itself rate-limited — production defaults stay the tight 30/60s and 20/15min in
+    # RateLimitConfig. InviteAcceptPostRateLimitRegressionTest / InviteValidateGetRateLimitTest
+    # build the filter directly against a hand-built low-capacity LoadingCache (bypassing this
+    # property entirely), so this override does not neuter that throttling coverage.
+    invite-validate-capacity: 100000
+    invite-accept-capacity: 100000
   jwt:
     # Unit tests that wire JwtTokenProvider directly use TestConstants.TEST_JWT_SECRET (different value);
     # integration tests loaded via this profile use the placeholder below. Keep both in sync.

@@ -76,7 +76,7 @@ class CancelPostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postCancel() {
