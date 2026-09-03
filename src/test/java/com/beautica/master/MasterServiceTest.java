@@ -51,8 +51,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -566,17 +568,21 @@ class MasterServiceTest {
     @Test
     @DisplayName("should_evictMasterDetailCache_when_deactivateMasterCalled")
     void should_evictMasterDetailCache_when_deactivateMasterCalled() {
-        UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
         User user = mock(User.class);
         when(user.getId()).thenReturn(userId);
 
+        // INDEPENDENT_MASTER + actorId == userId: self-deactivation, so the Phase 290 finding #5
+        // ownership guard (assertCanManageMaster) is satisfied with no salon fixture or
+        // salonRepository/userRepository stubbing needed — this test is about cache eviction,
+        // not authorization.
         Master master = Master.builder()
-                .masterType(MasterType.SALON_MASTER)
+                .masterType(MasterType.INDEPENDENT_MASTER)
                 .isActive(true)
                 .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
         ReflectionTestUtils.setField(master, "user", user);
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
@@ -595,7 +601,7 @@ class MasterServiceTest {
         // non-transactional unit test, then capture and replay afterCommit().
         TransactionSynchronizationManager.initSynchronization();
         try {
-            masterService.deactivateMaster(ownerId, masterId);
+            masterService.deactivateMaster(userId, masterId);
 
             // Capture all registered synchronizations and invoke afterCommit() on each.
             List<TransactionSynchronization> syncs =
@@ -641,6 +647,12 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(master, "salon", salon);
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // Phase 290 finding #5 — assertCanManageMaster's SALON_MASTER branch defers to the same
+        // owner-or-admin check the batch cascade uses; stub the owner half. The role gate
+        // (security fix, Phase 290 audit) must see actorId resolve to SALON_OWNER or this actor
+        // is rejected before existsByIdAndOwnerId is even consulted.
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_OWNER));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
@@ -721,7 +733,6 @@ class MasterServiceTest {
     @Test
     @DisplayName("deactivateMaster (INDEPENDENT_MASTER, no salon) — evicts master-service-bookable but is a no-op on the salon-catalog evictor")
     void should_notTouchSalonCatalogEvictor_when_deactivatedMasterHasNoSalon() {
-        UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
@@ -738,7 +749,10 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
-        runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
+        // Phase 290 finding #5 — assertCanManageMaster's INDEPENDENT_MASTER branch requires
+        // self-management (actorId == the master's own user id); an independent master's only
+        // legitimate deactivation caller is themselves.
+        runAndReplayAfterCommit(() -> masterService.deactivateMaster(userId, masterId));
 
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor, never()).evict(any());
@@ -960,9 +974,10 @@ class MasterServiceTest {
     @Test
     @DisplayName("should_deactivateMaster_when_masterExists")
     void should_deactivateMaster_when_authorizedActorRequests() {
-        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        // Controller-level authorization (@PreAuthorize) is not re-checked here; the Phase 290
+        // finding #5 service-layer guard IS exercised — INDEPENDENT_MASTER + actorId == userId
+        // satisfies it via self-management, with no salon fixture needed.
         // save() is no longer called — Hibernate dirty-checking flushes the mutation on commit.
-        UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
@@ -970,14 +985,14 @@ class MasterServiceTest {
         when(user.getId()).thenReturn(userId);
 
         Master master = Master.builder()
-                .masterType(MasterType.SALON_MASTER)
+                .masterType(MasterType.INDEPENDENT_MASTER)
                 .isActive(true)
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
-        masterService.deactivateMaster(ownerId, masterId);
+        masterService.deactivateMaster(userId, masterId);
 
         assertThat(master.isActive()).isFalse();
         verify(masterRepository, never()).save(any());
@@ -996,6 +1011,237 @@ class MasterServiceTest {
                 .isInstanceOf(NotFoundException.class);
 
         verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("deactivateMaster — Phase 290 finding #5: throws Forbidden when the actor neither "
+            + "owns the master's salon nor is assigned to it as SALON_ADMIN")
+    void should_throwForbidden_when_deactivateMaster_actorDoesNotOwnSalonAndIsNotAdmin() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "user", user);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // Actor holds a role that CAN manage salon staff (SALON_ADMIN) but is not assigned to
+        // THIS salon — the role gate alone must not be sufficient, the assignment must also match.
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_ADMIN));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        // The master must be left untouched — the guard runs BEFORE the mutation.
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    /**
+     * QA audit (2026-09-03) gap fix — every existing {@code assertCanManageMaster}/
+     * {@code assertCanManageSalonStaff} test exercised either the OWNER-positive branch or a
+     * doubly-negative (neither owner nor admin) actor. Nothing proved the SALON_ADMIN-positive
+     * branch of {@code canManageSalonStaff} — {@code userRepository.findSalonIdById(actorId)}
+     * resolving to the master's own salon — actually authorizes. Without this test, inverting
+     * that {@code .map(salonId::equals)} to something that always returns {@code false} would
+     * still pass the whole suite (the owner-positive tests short-circuit past the admin branch
+     * via {@code ||}, and the negative test never gives it a matching salon id to accept).
+     */
+    @Test
+    @DisplayName("deactivateMaster — Phase 290 finding #5: a SALON_ADMIN who is NOT the owner but "
+            + "IS assigned to this salon may deactivate its SALON_MASTER staff")
+    void should_deactivateMaster_when_actorIsSalonAdminNotOwner() {
+        UUID adminActorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(masterUserId);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        ReflectionTestUtils.setField(master, "user", masterUser);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // The admin's persisted role clears the gate...
+        when(userRepository.findRoleById(adminActorId)).thenReturn(Optional.of(Role.SALON_ADMIN));
+        // ...and IS assigned to this salon — the SALON_ADMIN branch of canManageSalonStaff.
+        when(userRepository.findSalonIdById(adminActorId)).thenReturn(Optional.of(salonId));
+
+        runAndReplayAfterCommit(() -> masterService.deactivateMaster(adminActorId, masterId));
+
+        assertThat(master.isActive())
+                .as("the admin-positive branch must actually authorize the mutation")
+                .isFalse();
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
+    }
+
+    /**
+     * Security fix regression test (Phase 290 audit, MEDIUM) — {@code canManageSalonStaff}
+     * previously admitted ANY actor whose {@code users.salon_id} matched the target salon,
+     * with no role check. {@code User.createFromInvite} populates {@code salon_id} for an invited
+     * {@code SALON_MASTER} (a read-only role per the domain rules) exactly as it does for
+     * {@code SALON_ADMIN}, so a master invited to THIS salon satisfied the old guard's second
+     * OR-branch. This actor's {@code findSalonIdById} is stubbed to resolve to the target salon —
+     * proving the role gate, not merely a missing assignment row, is what rejects them.
+     */
+    @Test
+    @DisplayName("deactivateMaster — Phase 290 audit MEDIUM fix: a SALON_MASTER actor assigned to "
+            + "this salon must NOT be treated as its staff manager")
+    void should_throwForbidden_when_deactivateMaster_actorIsSalonMasterAssignedToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "user", user);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_MASTER));
+        // lenient(): the fixed guard short-circuits on the role gate before ever reaching this
+        // branch, so this stub is unused on correct code — kept anyway so the mutation check
+        // (deleting the role gate) actually flips this test red instead of silently staying green,
+        // since without it the mutated code would fall through to an unstubbed (empty) default.
+        lenient().when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    // ── deactivateMasters — Phase 290 batch cascade (findings #2, #3, #5) ────────
+
+    @Test
+    @DisplayName("deactivateMasters — deactivates every master using the ALREADY-LOADED entities "
+            + "(no findByIdWithUserAndSalon call) and publishes exactly ONE SalonStaffChangedEvent "
+            + "for the whole batch")
+    void should_deactivateEveryMasterAndPublishExactlyOneEvent_when_deactivateMastersBatch() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        User userA = mock(User.class);
+        when(userA.getId()).thenReturn(UUID.randomUUID());
+        User userB = mock(User.class);
+        when(userB.getId()).thenReturn(UUID.randomUUID());
+
+        Master masterA = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+        ReflectionTestUtils.setField(masterA, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(masterA, "user", userA);
+        ReflectionTestUtils.setField(masterA, "salon", salon);
+
+        Master masterB = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+        ReflectionTestUtils.setField(masterB, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(masterB, "user", userB);
+        ReflectionTestUtils.setField(masterB, "salon", salon);
+
+        // Role gate (security fix, Phase 290 audit) — the batch guard resolves the actor's role
+        // ONCE for the whole call, not once per master; see the negative test below for the count
+        // assertion.
+        when(userRepository.findRoleById(ownerId)).thenReturn(Optional.of(Role.SALON_OWNER));
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+
+        masterService.deactivateMasters(ownerId, List.of(masterA, masterB), salonId);
+
+        assertThat(masterA.isActive()).isFalse();
+        assertThat(masterB.isActive()).isFalse();
+        // Finding #3 — the batch never re-fetches a Master it was already handed.
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
+        // Finding #2 — ONE event for N deactivations, not N.
+        verify(eventPublisher, times(1)).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
+        // Role-gate perf invariant — resolved once for the batch, never once per master.
+        verify(userRepository, times(1)).findRoleById(ownerId);
+    }
+
+    @Test
+    @DisplayName("deactivateMasters — empty list is a no-op: no authorization query, no event")
+    void should_doNothing_when_deactivateMastersCalledWithEmptyList() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        masterService.deactivateMasters(ownerId, List.of(), salonId);
+
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    @Test
+    @DisplayName("deactivateMasters — Phase 290 finding #5: throws Forbidden, before any master is "
+            + "mutated or the event is published, when the actor neither owns the salon nor is its admin")
+    void should_throwForbidden_when_deactivateMastersActorUnauthorized() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Master master = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+
+        // Actor holds a role that CAN manage salon staff (SALON_ADMIN) but is not assigned to
+        // THIS salon.
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_ADMIN));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.deactivateMasters(actorId, List.of(master), salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    /**
+     * Security fix regression test (Phase 290 audit, MEDIUM) — batch-cascade sibling of
+     * {@code should_throwForbidden_when_deactivateMaster_actorIsSalonMasterAssignedToSalon}. The
+     * cascade caller ({@code SalonService#deactivateSalon}) always requires {@code SALON_OWNER}
+     * independently, but {@code assertCanManageSalonStaff} is the defense-in-depth layer BEHIND
+     * that gate and must not itself admit a SALON_MASTER on an assignment-only match.
+     */
+    @Test
+    @DisplayName("deactivateMasters — Phase 290 audit MEDIUM fix: a SALON_MASTER actor assigned to "
+            + "this salon must NOT authorize the batch cascade")
+    void should_throwForbidden_when_deactivateMasters_actorIsSalonMasterAssignedToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Master master = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_MASTER));
+        // lenient(): unreachable once the role gate short-circuits on correct code — see the
+        // single-master sibling test for why it stays.
+        lenient().when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatThrownBy(() -> masterService.deactivateMasters(actorId, List.of(master), salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
     }
 
     // V83 removed the POST/DELETE /masters/{id}/schedule-exceptions legacy endpoints and the

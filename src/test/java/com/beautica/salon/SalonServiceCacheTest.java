@@ -8,6 +8,7 @@ import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
+import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
@@ -24,6 +25,8 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionException;
@@ -31,6 +34,7 @@ import org.springframework.transaction.annotation.EnableTransactionManagement;
 import org.springframework.transaction.support.AbstractPlatformTransactionManager;
 import org.springframework.transaction.support.DefaultTransactionStatus;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -125,6 +129,16 @@ class SalonServiceCacheTest {
     // WITHOUT this bean the whole context fails to load with "No qualifying bean of type
     // UserProfileCacheEvictor ... constructor parameter 13", taking all 8 tests red.
     @MockBean com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+    // Phase 290: SalonService now constructor-depends on the salon-deletion staff-deactivation
+    // cascade's five collaborators. WITHOUT these the whole context fails to load with
+    // "No qualifying bean of type ..." — the same failure mode userProfileCacheEvictor's own
+    // comment above documents — taking every test in this file red, not just the three that
+    // exercise deactivateSalon.
+    @MockBean com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
+    @MockBean com.beautica.user.RefreshTokenRepository refreshTokenRepository;
+    @MockBean com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
+    @MockBean com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
+    @MockBean com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
@@ -146,13 +160,36 @@ class SalonServiceCacheTest {
      * — which answers {@code null} for {@code getOwner()} — no longer models any row this service
      * can load: {@code salons.owner_id} is {@code NOT NULL REFERENCES users(id)} (V3). Extracted
      * the moment a second test needed the same three stub lines (§M-3).
+     *
+     * <p>{@code isActive()} is stubbed {@code true} (Phase 290): {@code deactivateSalon}'s new
+     * idempotency guard returns early — before touching any cache — for an already-inactive
+     * salon, and a bare {@code Mockito.mock(Salon.class)} otherwise answers the primitive
+     * {@code boolean} default ({@code false}), which would make every {@code deactivateSalon}
+     * test below a silent no-op.
      */
     private static Salon salonOwnedBy(UUID ownerId) {
         Salon salon = Mockito.mock(Salon.class);
         User owner = Mockito.mock(User.class);
         when(owner.getId()).thenReturn(ownerId);
         when(salon.getOwner()).thenReturn(owner);
+        when(salon.isActive()).thenReturn(true);
         return salon;
+    }
+
+    /**
+     * Wires the Phase 290 staff-deactivation cascade to a clean no-op for {@code salonId}: audit
+     * CLEAN, no active masters, no staff user ids. Every {@code deactivateSalon} test in this file
+     * asserts CACHE behaviour, not the cascade itself (that is
+     * {@code SalonStaffDeactivationCascadeIT}'s job) — without these stubs, the new fail-closed
+     * audit call and the masters/staff loops would NPE on Mockito's default {@code null} return
+     * for the unstubbed {@link StaffClientReferenceAuditResult} and {@link Page} types.
+     */
+    private void stubCleanEmptyStaffCascade(UUID salonId) {
+        when(staffClientReferenceAuditService.runAuditForSalon(salonId))
+                .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.now()));
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged()))
+                .thenReturn(Page.empty());
+        when(staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId)).thenReturn(List.of());
     }
 
     private static UpdateSalonRequest renameTo(String name) {
@@ -184,6 +221,7 @@ class SalonServiceCacheTest {
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId)).thenReturn(List.of());
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate cache
@@ -329,6 +367,7 @@ class SalonServiceCacheTest {
         when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Populate salon-detail cache — through the real proxy, mirroring SalonController.
@@ -355,6 +394,7 @@ class SalonServiceCacheTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub needed: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         // Seed the search:salons:browse cache with a sentinel entry so we can confirm it is cleared.

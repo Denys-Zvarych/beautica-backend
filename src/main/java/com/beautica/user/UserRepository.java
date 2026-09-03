@@ -22,6 +22,19 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     @Query("SELECT u.salonId FROM User u WHERE u.id = :userId")
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
 
+    /**
+     * Narrow projection backing {@code MasterService#canManageSalonStaff} (Phase 290 finding #5
+     * role-gate fix) — reads only the {@code role} column, never the full {@link User} entity
+     * (which carries {@code passwordHash}), mirroring {@link #findSalonIdById}'s pattern.
+     *
+     * <p>Needed because {@code users.salon_id} is populated for BOTH an invited
+     * {@code SALON_ADMIN} and an invited {@code SALON_MASTER} ({@code User.createFromInvite} sets
+     * it from the invite token regardless of role) — a salon-id match alone cannot distinguish a
+     * staff manager from a read-only master, so the caller must resolve the role first.
+     */
+    @Query("SELECT u.role FROM User u WHERE u.id = :userId")
+    Optional<Role> findRoleById(@Param("userId") UUID userId);
+
     // findCreatedAtById was removed by the 2026-08 perf audit (F2): its only caller,
     // ClientPassportService, now reads the registration instant AND the authored-review count
     // in a single statement via ClientAggregationRepository.findStanding. Do not reinstate a
@@ -55,14 +68,17 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      * cannot actually occur for CLIENT, but mirrors the role-scoping discipline of
      * {@link #existsByIdAndSalonIdAndRole}) never leaks into the roster.
      *
-     * <p>Unlike {@code MasterRepository.findBySalonIdAndIsActiveTrueWithUser}, this query has no
-     * {@code isActive} filter. That is not an oversight: nothing in this codebase ever sets
-     * {@code User.isActive = false} today (only {@code Salon} and {@code Master} are
-     * soft-deactivated), so the asymmetry is harmless as written. If a future user-suspension
-     * feature starts setting {@code User.isActive = false}, this query must gain the same filter
-     * or deactivated admins will keep appearing in salon rosters.
+     * <p><b>Renamed from {@code findBySalonIdAndRole} (Phase 290).</b> That method's own javadoc
+     * flagged this exact gap in advance: "nothing in this codebase ever sets
+     * {@code User.isActive = false} today ... if a future user-suspension feature starts setting
+     * it, this query must gain the same filter or deactivated admins will keep appearing in salon
+     * rosters." Phase 290's salon-deletion staff cascade is that feature — it sets
+     * {@code SALON_ADMIN.isActive = false} on a deleted salon's admin accounts, and
+     * {@code getSalonStaff} remains reachable afterwards (the OWNER's own management access is not
+     * gated on {@code salon.isActive}). Without this filter a deactivated admin of a deleted salon
+     * would keep appearing in that salon's own staff roster forever.
      */
-    List<User> findBySalonIdAndRole(UUID salonId, Role role);
+    List<User> findBySalonIdAndRoleAndIsActiveTrue(UUID salonId, Role role);
 
     /**
      * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids

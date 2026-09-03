@@ -124,6 +124,32 @@ public class StaffClientReferenceAuditService {
         return StaffClientReferenceAuditResult.of(violations, clock.instant());
     }
 
+    /**
+     * Resolves {@code salonId}'s staff user ids (Phase 290) — the exact same resolution
+     * {@link #runAuditForSalon(UUID)} uses internally
+     * ({@link StaffClientReferenceAuditRepository#findSalonStaffUserIds}), exposed separately so
+     * the salon-deletion staff-deactivation cascade can determine WHICH users to deactivate
+     * without re-deriving the query. Two independent calls into the same repository method within
+     * one {@code deactivateSalon} transaction (one via {@link #runAuditForSalon(UUID)}, one via
+     * this method) rather than widening {@link StaffClientReferenceAuditResult} to also carry the
+     * id list — that result type's whole contract (see its javadoc) is "clean vs. violations
+     * found", and stuffing an unrelated id list onto it for one caller's convenience would blur
+     * that.
+     *
+     * <p>{@code SALON_MASTER} via {@code masters.salon_id}, {@code SALON_ADMIN} via
+     * {@code users.salon_id} — never the salon's owner, whose role is {@code SALON_OWNER} and so
+     * never satisfies either predicate. This is what makes the owner-account exemption (Phase 290
+     * D3) structural rather than a branch the caller has to remember: the id list handed back here
+     * cannot contain the owner's own user id.
+     *
+     * <p>No {@code @Transactional} here — this is a plain read with no torn-snapshot risk on its
+     * own, and its caller ({@code SalonService.deactivateSalon}) already runs inside a wider
+     * {@code @Transactional} boundary that this call joins.
+     */
+    public List<UUID> resolveSalonStaffUserIds(UUID salonId) {
+        return auditRepository.findSalonStaffUserIds(salonId);
+    }
+
     private void appendViolations(
             List<StaffClientReferenceViolation> target,
             List<StaffClientReferenceRowProjection> rows,

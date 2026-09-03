@@ -115,6 +115,24 @@ class SalonServiceInviteHistoryTest {
             new com.beautica.common.cache.UserProfileCacheEvictor(
                     new org.springframework.cache.support.NoOpCacheManager());
 
+    // Phase 290: SalonService now constructor-depends on the salon-deletion staff-deactivation
+    // cascade's five collaborators. None of listSalonInvites/cancelInvite exercises
+    // deactivateSalon, so plain mocks satisfy the constructor without any stubbing.
+    @Mock
+    private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
+
+    @Mock
+    private com.beautica.user.RefreshTokenRepository refreshTokenRepository;
+
+    @Mock
+    private com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
+
+    @Mock
+    private com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
+
+    @Mock
+    private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
+
     private SalonService salonService;
 
     @BeforeEach
@@ -124,7 +142,8 @@ class SalonServiceInviteHistoryTest {
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
                 masterServiceRepository, localityWriteValidator, masterService, cityRepository,
                 locationQueryService, cacheManager, authorizationService, fixedClock,
-                userProfileCacheEvictor);
+                userProfileCacheEvictor, staffClientReferenceAuditService, refreshTokenRepository,
+                deviceTokenRepository, passwordResetTicketRepository, tokensValidAfterCache);
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

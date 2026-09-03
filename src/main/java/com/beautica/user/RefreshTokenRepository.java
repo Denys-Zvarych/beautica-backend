@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -16,6 +17,17 @@ public interface RefreshTokenRepository extends JpaRepository<RefreshToken, UUID
     @Modifying
     @Query("DELETE FROM RefreshToken rt WHERE rt.userId = :userId")
     void deleteByUserId(@Param("userId") UUID userId);
+
+    /**
+     * Bulk sibling of {@link #deleteByUserId} — purges every refresh token for every user in
+     * {@code userIds} in ONE statement. Added for the salon-deletion staff cascade (Phase 290
+     * perf finding #1): {@code SalonService.deactivateSalonStaff} previously called
+     * {@link #deleteByUserId} once per staff member (N single-row round trips); this collapses
+     * that to exactly one bulk {@code DELETE ... WHERE user_id IN (...)}.
+     */
+    @Modifying
+    @Query("DELETE FROM RefreshToken rt WHERE rt.userId IN :userIds")
+    void deleteByUserIdIn(@Param("userIds") Collection<UUID> userIds);
 
     /**
      * Hard-deletes every row whose {@code expires_at} is strictly before {@code cutoff}. Wired

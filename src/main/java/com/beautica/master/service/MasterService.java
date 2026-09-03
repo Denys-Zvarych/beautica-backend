@@ -613,12 +613,180 @@ public class MasterService {
                 deactivatedOwnerMasterId, salonId, actorUserId);
     }
 
+    /**
+     * Single-master deactivation — the {@code DELETE /masters/{masterId}} controller path.
+     * {@code @PreAuthorize("@authz.canManageMaster(...)")} on the controller is the PRIMARY
+     * gate; {@link #assertCanManageMaster} below is defense-in-depth (Phase 290 finding #5) for
+     * the OTHER caller of this method, {@link #deactivateMasters}, which reaches it
+     * service-to-service with no {@code Authentication} to hand a SpEL predicate.
+     */
     @Transactional
     public void deactivateMaster(UUID actorId, UUID masterId) {
-        // Ownership already enforced by @PreAuthorize("@authz.canManageMaster(...)") on
-        // the controller — no redundant DB round-trip needed here.
         var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
+        assertCanManageMaster(actorId, master);
+        deactivateMasterInternal(actorId, master, true);
+    }
+
+    /**
+     * Batch sibling of {@link #deactivateMaster(UUID, UUID)} for a caller that already holds
+     * every {@link Master} row it needs to deactivate — {@code SalonService}'s salon-deletion
+     * cascade ({@code SalonService#deactivateSalonStaff}), the only caller today. Two Phase 290
+     * perf findings, fixed together because the second is a direct consequence of the first:
+     *
+     * <ul>
+     *   <li><b>Finding #3</b> — no redundant {@code findByIdWithUserAndSalon} SELECT. The caller's
+     *       {@code findBySalonIdAndIsActiveTrueWithUser(salonId, …)} already JOIN-FETCHed
+     *       {@code user} for every row in {@code masters}; this method deactivates them in place
+     *       rather than re-fetching each one by id.</li>
+     *   <li><b>Finding #2</b> — exactly ONE {@link SalonStaffChangedEvent} for the whole batch,
+     *       not one per master. {@link #deactivateMaster(UUID, UUID)} publishes on every call, so
+     *       N single-master calls would fire N {@code AFTER_COMMIT} rating recalculations
+     *       ({@code SalonStaffRatingListener} → {@code RatingRecalculationService
+     *       #recalculateSalonRating}, {@code REQUIRES_NEW}) for the identical salon aggregate,
+     *       each also re-running the {@code reviews-by-salon} Caffeine keyset prefix scan
+     *       (finding #4) — collapsing the publish to one collapses that scan to one too.</li>
+     * </ul>
+     *
+     * <p>Every master in {@code masters} is deactivated with its own per-row cache evictions
+     * (master-detail, master-by-user, master-detail-by-user, user-profile, bookability) —
+     * finding #4's javadoc note that those are "correctly proportionate" applies here unchanged;
+     * only the salon-level rating recalculation and its two dependent evictions
+     * ({@code salon-detail}, {@code reviews-by-salon}) are collapsed.
+     *
+     * @param actorId the verified {@code SALON_OWNER} driving the cascade
+     * @param masters every currently-active master row for {@code salonId}, JOIN-FETCHed with
+     *                {@code user} (never {@code null}; an empty list is a no-op — no assertion,
+     *                no event)
+     * @param salonId the salon every entry in {@code masters} belongs to (by construction of the
+     *                caller's query)
+     */
+    @Transactional
+    public void deactivateMasters(UUID actorId, List<Master> masters, UUID salonId) {
+        if (masters.isEmpty()) {
+            return;
+        }
+        assertCanManageSalonStaff(actorId, salonId);
+        for (Master master : masters) {
+            deactivateMasterInternal(actorId, master, false);
+        }
+        publishSalonStaffChanged(salonId);
+    }
+
+    /**
+     * Defense-in-depth ownership guard for {@link #deactivateMaster(UUID, UUID)} (Phase 290
+     * finding #5), mirroring {@code AuthorizationService#canManageMaster(Authentication, UUID)}'s
+     * three branches — but answered entirely from data already on {@code master} (no repeated
+     * {@code findByIdWithUserAndSalon}) plus, for an invited {@code SALON_MASTER} row, one
+     * role-gated ownership/admin-assignment check ({@link #canManageSalonStaff}). Deliberately NOT
+     * routed through {@code AuthorizationService#hasManagementAccess(UUID, UUID)} (the 2-arg
+     * overload): that reads the actor's role off {@code SecurityContextHolder}, which is empty for
+     * a plain service-to-service call with no web request in play — see
+     * {@link #assertCanManageSalonStaff} for the same reasoning applied to the batch path.
+     *
+     * <p><b>Corrected (Phase 290 audit, security MEDIUM):</b> this javadoc previously claimed
+     * parity with {@code AuthorizationService#hasManagementAccess(UUID, UUID, Role)} while
+     * {@link #canManageSalonStaff} never actually checked the actor's role — it admitted any actor
+     * whose {@code users.salon_id} matched, which {@code User.createFromInvite} populates for an
+     * invited {@code SALON_MASTER} (read-only) exactly as it does for {@code SALON_ADMIN}. The
+     * role gate now lives in {@link #canManageSalonStaff} itself; see its javadoc.
+     *
+     * @throws ForbiddenException if {@code actorId} may not manage {@code master}
+     */
+    private void assertCanManageMaster(UUID actorId, Master master) {
+        boolean authorized = switch (master.getMasterType()) {
+            case INDEPENDENT_MASTER -> master.getUser() != null
+                    && master.getUser().getId().equals(actorId);
+            case SALON_OWNER -> master.getSalon() != null
+                    && master.getSalon().getOwner() != null
+                    && master.getSalon().getOwner().getId().equals(actorId);
+            case SALON_MASTER -> master.getSalon() != null
+                    && canManageSalonStaff(actorId, master.getSalon().getId());
+        };
+        if (!authorized) {
+            throw new ForbiddenException("Actor is not authorized to manage this master");
+        }
+    }
+
+    /**
+     * Defense-in-depth ownership guard for {@link #deactivateMasters} (Phase 290 finding #5) —
+     * checked ONCE for the whole batch, not once per master, since every entry in the caller's
+     * list is already known to belong to {@code salonId} (see that method's javadoc).
+     *
+     * <p><b>Ordering hazard, checked and cleared</b>: the cascade caller
+     * ({@code SalonService#deactivateSalon}) flips {@code salon.isActive} to {@code false} BEFORE
+     * calling {@link #deactivateMasters}. Neither branch of {@link #canManageSalonStaff} filters
+     * on {@code is_active} — {@code SalonRepository#existsByIdAndOwnerId}'s javadoc documents
+     * "No is_active predicate ... a deactivated salon still answers true for its owner", and
+     * {@code UserRepository#findSalonIdById} reads a {@code SALON_ADMIN}'s assignment, which has
+     * no relationship to the SALON's active flag at all — so the already-flipped salon still
+     * authorizes correctly.
+     *
+     * <p><b>Not routed through {@code AuthorizationService}'s SecurityContext-reading
+     * {@code hasManagementAccess(UUID, UUID)}</b>: that overload calls
+     * {@code roleFromCurrentAuthentication()}, which throws {@code ForbiddenException("Not
+     * authenticated")} when {@code SecurityContextHolder} carries no {@code Authentication} —
+     * exactly the case for {@code SalonStaffDeactivationCascadeIT}, which calls
+     * {@code SalonService.deactivateSalon} directly with no web request in play. A check that
+     * required an authenticated context would fail that legitimate direct-service caller, not
+     * just an attacker — so this guard is self-contained instead, resolving the actor's persisted
+     * {@link Role} directly and gating on it, exactly like the two branches
+     * {@code AuthorizationService#hasManagementAccess(UUID, UUID, Role)} covers (see
+     * {@link #canManageSalonStaff}).
+     *
+     * @throws ForbiddenException if {@code actorId} may not manage {@code salonId}'s staff
+     */
+    private void assertCanManageSalonStaff(UUID actorId, UUID salonId) {
+        if (!canManageSalonStaff(actorId, salonId)) {
+            throw new ForbiddenException("Actor is not authorized to manage this salon's staff");
+        }
+    }
+
+    /**
+     * Data-only mirror of {@code AuthorizationService#hasManagementAccess(UUID, UUID, Role)} for
+     * callers with no {@code Authentication} to read a role from (see the two javadocs above for
+     * why the SecurityContext-reading overloads cannot be used here). Resolves {@code actorId}'s
+     * persisted {@link Role} first and short-circuits to {@code false} for any role other than
+     * {@code SALON_OWNER} / {@code SALON_ADMIN} — the same restriction the 3-arg overload enforces
+     * — before running that role's single branch.
+     *
+     * <p><b>Security fix (Phase 290 audit, MEDIUM):</b> the previous version of this method
+     * answered {@code salonRepository.existsByIdAndOwnerId(...) ||
+     * userRepository.findSalonIdById(...).map(salonId::equals)} with NO role check at all. Because
+     * {@code User.createFromInvite} populates {@code users.salon_id} for an invited
+     * {@code SALON_MASTER} exactly as it does for {@code SALON_ADMIN} (both branches of
+     * {@code InviteService}'s invite-acceptance set it from the invite token regardless of
+     * {@code token.getRole()}), a {@code SALON_MASTER} — a read-only role — satisfied the second
+     * OR-branch and was admitted as if they could manage salon staff. Not exploitable through any
+     * current caller ({@code MasterController}'s {@code @PreAuthorize} and
+     * {@code SalonService.deactivateSalon}'s own {@code SALON_OWNER} requirement both reject a
+     * {@code SALON_MASTER} first) but this method exists precisely as the defense-in-depth layer
+     * behind those gates, so it must not itself be role-blind.
+     *
+     * <p>One extra query ({@link UserRepository#findRoleById}) per call — for
+     * {@link #assertCanManageSalonStaff}'s batch caller ({@link #deactivateMasters}) that is once
+     * per BATCH, not once per master, same as before this fix.
+     */
+    private boolean canManageSalonStaff(UUID actorId, UUID salonId) {
+        Role actorRole = userRepository.findRoleById(actorId).orElse(null);
+        if (actorRole == Role.SALON_OWNER) {
+            return salonRepository.existsByIdAndOwnerId(salonId, actorId);
+        }
+        if (actorRole == Role.SALON_ADMIN) {
+            return userRepository.findSalonIdById(actorId).map(salonId::equals).orElse(false);
+        }
+        return false;
+    }
+
+    /**
+     * The deactivation body shared by {@link #deactivateMaster(UUID, UUID)} (one master, one
+     * publish) and {@link #deactivateMasters} (N masters, one publish for the whole batch —
+     * {@code publishEvent} is {@code false} on every call inside that loop). Authorization is the
+     * CALLER's responsibility ({@link #assertCanManageMaster} / {@link #assertCanManageSalonStaff}
+     * respectively) — this method trusts {@code master} is already cleared.
+     */
+    private void deactivateMasterInternal(UUID actorId, Master master, boolean publishEvent) {
+        final UUID masterId = master.getId();
 
         master.setActive(false);
         // Hibernate dirty-checking flushes the mutation on commit; no explicit save() needed.
@@ -626,15 +794,16 @@ public class MasterService {
 
         // Deactivation flips is_active FALSE — a sole-performer's SALON service must vanish from
         // the booking master-list and the salon catalogue immediately, not after the 60s TTL.
-        // salon is JOIN-FETCHed by findByIdWithUserAndSalon and may be null (INDEPENDENT_MASTER,
-        // a no-op for the catalogue evict); capture its id synchronously inside the tx (§E / §F-2).
+        // salon may be null (INDEPENDENT_MASTER, a no-op for the catalogue evict); capture its id
+        // synchronously inside the tx (§E / §F-2).
         evictBookabilityCachesAfterCommit(
                 masterId,
                 master.getSalon() != null ? master.getSalon().getId() : null);
 
         // Capture the user UUID while the transaction is still open (user is JOIN FETCH-ed by
-        // findByIdWithUserAndSalon, so getUser() is initialized). A stale master-by-user entry
-        // would allow the deactivated master to pass the isActive guard for up to the cache TTL.
+        // both findByIdWithUserAndSalon and findBySalonIdAndIsActiveTrueWithUser, so getUser() is
+        // initialized on every caller's Master). A stale master-by-user entry would allow the
+        // deactivated master to pass the isActive guard for up to the cache TTL.
         final UUID masterUserId = master.getUser().getId();
         // Audit-fix cycle 2 — the user-profile (GET /users/me) half of the pair; the
         // master-detail-by-user half stays in the afterCommit block below. Reached for an
@@ -676,17 +845,22 @@ public class MasterService {
         }
 
         // Mobile Phase 111 — the master LEFT this salon's contributing set. Captured from the
-        // JOIN FETCH-ed salon while the transaction is open; null for an INDEPENDENT_MASTER,
-        // which publishSalonStaffChanged treats as a no-op.
+        // salon association while the transaction is open; null for an INDEPENDENT_MASTER, which
+        // publishSalonStaffChanged treats as a no-op. Suppressed entirely (publishEvent == false)
+        // for a deactivateMasters() batch entry — the caller publishes ONCE for the whole batch
+        // instead (Phase 290 finding #2).
         final UUID leftSalonId = master.getSalon() != null ? master.getSalon().getId() : null;
-        publishSalonStaffChanged(leftSalonId);
+        if (publishEvent) {
+            publishSalonStaffChanged(leftSalonId);
+        }
 
         // Audit trail — same shape and fields as the rotation log in rotateMasterSalon (UUIDs
         // only, no PII). Deactivation is not merely a calendar change since mobile Phase 111: the
         // salon's PUBLIC avg_rating, review_count and star histogram are all computed over its
         // CURRENTLY-ACTIVE masters, so removing a master moves the number a client sees, within
-        // one commit and reversibly. A privileged mutation with a visible public effect and no
-        // record of who made it is exactly what an audit line exists for.
+        // one commit and reversibly (immediately for a single deactivation; after the ONE batch
+        // publish for a deactivateMasters() cascade). A privileged mutation with a visible public
+        // effect and no record of who made it is exactly what an audit line exists for.
         log.info("Master deactivation: master {} (salon {}) deactivated by actor {}",
                 masterId, leftSalonId, actorId);
     }

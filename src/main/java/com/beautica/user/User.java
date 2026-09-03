@@ -333,6 +333,19 @@ public class User extends AuditableEntity {
         return isActive;
     }
 
+    /**
+     * Deactivates (or reactivates) this account. Introduced by the salon-deletion staff cascade
+     * (Phase 290) — {@code SalonService} flips this to {@code false} for a scrubbed salon's
+     * {@code SALON_MASTER}/{@code SALON_ADMIN} accounts, alongside {@link #setTokensValidAfter}
+     * so an already-issued access token stops working too (a boolean flip alone would leave any
+     * outstanding token usable for the rest of its TTL — see that setter's javadoc). The
+     * {@code SALON_OWNER} account is never a valid argument to this call from that cascade — see
+     * {@code SalonService}'s staff-resolution javadoc for why the owner is structurally excluded.
+     */
+    public void setActive(boolean active) {
+        this.isActive = active;
+    }
+
     public boolean isEmailVerified() {
         return emailVerified;
     }
@@ -441,11 +454,23 @@ public class User extends AuditableEntity {
     }
 
     /**
-     * Marks every access token issued before {@code tokensValidAfter} as invalid.
-     * Callers MUST supply the current instant at the moment of a password reset —
-     * this mutator is intentionally narrow: it exists solely for
-     * {@code PasswordResetService.resetPassword} and must not be called from any
-     * other write path.
+     * Marks every access token issued before {@code tokensValidAfter} as invalid. Callers MUST
+     * supply the current instant at the moment of the revoking event.
+     *
+     * <p>Two legitimate callers as of Phase 290 (previously restricted to the first alone):
+     * <ul>
+     *   <li>{@code PasswordResetService.resetPassword} — the original caller; a password reset
+     *       must invalidate any access token issued before it.</li>
+     *   <li>{@code SalonService}'s salon-deletion staff cascade — a scrubbed
+     *       {@code SALON_MASTER}/{@code SALON_ADMIN} account's outstanding access token must stop
+     *       working immediately, not merely at its natural TTL expiry. {@code isActive} alone is
+     *       not enough: {@code JwtAuthenticationFilter} has no {@code isActive} check, only the
+     *       {@code tokensValidAfter} one (via {@code TokensValidAfterCache}).</li>
+     * </ul>
+     * Both callers must also purge the user's refresh tokens
+     * ({@code RefreshTokenRepository.deleteByUserId}) and evict
+     * {@code TokensValidAfterCache} AFTER their transaction commits — never inline — for the same
+     * stale-read race reason documented on {@code TokensValidAfterCache#invalidate}.
      */
     public void setTokensValidAfter(Instant tokensValidAfter) {
         this.tokensValidAfter = tokensValidAfter;

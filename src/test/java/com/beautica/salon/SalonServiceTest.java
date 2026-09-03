@@ -17,6 +17,10 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
+import com.beautica.common.exception.SalonDeletionBlockedException;
+import com.beautica.salon.audit.StaffClientReferenceAuditResult;
+import com.beautica.salon.audit.StaffClientReferenceType;
+import com.beautica.salon.audit.StaffClientReferenceViolation;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -99,6 +103,26 @@ class SalonServiceTest {
     // an evict call.
     @Mock
     private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    // Phase 290: SalonService now constructor-depends on the salon-deletion staff-deactivation
+    // cascade's five collaborators. @InjectMocks passes null for an UNDECLARED collaborator
+    // silently, so compileTestJava stays green and the omission only surfaces as an NPE at
+    // runtime — declared even though only two tests below actually exercise deactivateSalon's
+    // new code (every other test's deactivateSalon call throws before reaching it).
+    @Mock
+    private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
+
+    @Mock
+    private com.beautica.user.RefreshTokenRepository refreshTokenRepository;
+
+    @Mock
+    private com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
+
+    @Mock
+    private com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
+
+    @Mock
+    private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
     @InjectMocks
     private SalonService salonService;
@@ -840,6 +864,7 @@ class SalonServiceTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub: `salon` is a managed entity in-tx; the isActive mutation flushes via
         // Hibernate dirty-checking on commit, so deactivateSalon no longer calls save()
         // (PERF-LOW redundant-write drop). The behavioural contract is the isActive flip below.
@@ -879,6 +904,7 @@ class SalonServiceTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         salonService.deactivateSalon(ownerId, salonId);
@@ -918,6 +944,65 @@ class SalonServiceTest {
                 .hasMessageContaining("User not found");
 
         verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
+    }
+
+    /**
+     * QA audit (2026-09-03) gap fix — {@code should_abortWithoutMutating_when_auditFindsViolation}
+     * (the Testcontainers IT) proves a violation aborts the deletion, but no test anywhere
+     * asserted the actual VALUE {@code deactivateSalon} computes for
+     * {@link SalonDeletionBlockedException#getAffectedStaffCount()}. Phase 289's own finding is
+     * that violations are CORRELATED, not independent — one bad booking row trips
+     * {@code BOOKING_CLIENT} plus any review/client-review built on that same booking, for the
+     * SAME staff member. A naive {@code violations.size()} (no {@code .distinct()} on the mapped
+     * user ids) would report 3 incidents for 1 person. This pins the collapsing behaviour
+     * directly, at the unit level, without a real DB.
+     */
+    @Test
+    @DisplayName("deactivateSalon — throws SalonDeletionBlockedException with affectedStaffCount "
+            + "collapsed to DISTINCT staff, not a per-violation-row count, and mutates nothing")
+    void should_reportDistinctStaffCount_when_auditFindsCorrelatedViolationsForSameUser() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+
+        UUID correlatedStaffId = UUID.randomUUID();
+        UUID otherStaffId = UUID.randomUUID();
+        StaffClientReferenceAuditResult violating = StaffClientReferenceAuditResult.of(
+                List.of(
+                        // Same staff member, tripped at THREE reference sites by one underlying
+                        // booking — this must collapse to ONE incident, not three.
+                        new StaffClientReferenceViolation(
+                                correlatedStaffId, Role.SALON_MASTER,
+                                StaffClientReferenceType.BOOKING_CLIENT, 1),
+                        new StaffClientReferenceViolation(
+                                correlatedStaffId, Role.SALON_MASTER,
+                                StaffClientReferenceType.REVIEW_CLIENT, 1),
+                        new StaffClientReferenceViolation(
+                                correlatedStaffId, Role.SALON_MASTER,
+                                StaffClientReferenceType.CLIENT_REVIEW_SUBJECT, 1),
+                        // A genuinely different staff member — must still count as a second.
+                        new StaffClientReferenceViolation(
+                                otherStaffId, Role.SALON_ADMIN,
+                                StaffClientReferenceType.BOOKING_CLIENT, 1)),
+                Instant.now());
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        when(staffClientReferenceAuditService.runAuditForSalon(salonId)).thenReturn(violating);
+
+        assertThatThrownBy(() -> salonService.deactivateSalon(ownerId, salonId))
+                .isInstanceOf(SalonDeletionBlockedException.class)
+                .satisfies(ex -> assertThat(((SalonDeletionBlockedException) ex).getAffectedStaffCount())
+                        .as("4 violation rows across 2 distinct staff ids must report 2, not 4")
+                        .isEqualTo(2));
+
+        // Fail-closed: the abort happens before ANY mutation — salon stays active, and the staff
+        // cascade (masters lookup, staff-id resolution) never runs.
+        assertThat(salon.isActive()).isTrue();
+        verify(masterRepository, never()).findBySalonIdAndIsActiveTrueWithUser(any(), any());
+        verify(staffClientReferenceAuditService, never()).resolveSalonStaffUserIds(any());
+        verify(salonRepository, never()).save(any());
     }
 
     @Test
@@ -1015,6 +1100,22 @@ class SalonServiceTest {
                 .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
 
         verifyNoInteractions(masterRepository);
+    }
+
+    /**
+     * Wires the Phase 290 staff-deactivation cascade to a clean no-op for {@code salonId}: audit
+     * CLEAN, no active masters, no staff user ids. The two {@code deactivateSalon} tests that
+     * reach this new code assert something else entirely (the {@code isActive} flip, the
+     * salon-repository call shape) — without these stubs the fail-closed audit call and the
+     * masters/staff loops would NPE on Mockito's default {@code null} return for the unstubbed
+     * {@link StaffClientReferenceAuditResult}/{@link Page} types.
+     */
+    private void stubCleanEmptyStaffCascade(UUID salonId) {
+        when(staffClientReferenceAuditService.runAuditForSalon(salonId))
+                .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.now()));
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged()))
+                .thenReturn(Page.empty());
+        when(staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId)).thenReturn(List.of());
     }
 
     private User buildUser(UUID id, String email, Role role) {

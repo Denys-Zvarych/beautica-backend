@@ -13,6 +13,7 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.ApiResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
@@ -987,6 +988,74 @@ class GlobalExceptionHandlerTest {
         assertThat(debugEvents.get(0).getFormattedMessage())
                 .as("DEBUG log must contain the non-PII exception class marker")
                 .contains("ClientBookingConflictException");
+    }
+
+    // ── handleSalonDeletionBlocked (Phase 290) ──────────────────────────────────
+    // QA audit (2026-09-03) gap fix — GlobalExceptionHandlerTest had zero coverage of this
+    // handler despite testing every other typed exception's DTO mapping (see the
+    // ClientBookingConflict pair immediately above, whose shape this mirrors). Without this test,
+    // a bug in SalonDeletionBlockedResponse.from(ex) — or a stray HttpStatus.BAD_REQUEST typo —
+    // could ship with the WHOLE suite green: SalonStaffDeactivationCascadeIT only asserts the
+    // exception TYPE thrown by the service (isInstanceOf(SalonDeletionBlockedException.class)),
+    // never what the handler turns it into on the wire.
+
+    @Test
+    @DisplayName("Should return 409 with SALON_DELETION_BLOCKED code and affectedStaffCount "
+            + "when SalonDeletionBlockedException is thrown")
+    void should_return409WithSalonDeletionBlockedCode_when_salonDeletionBlockedExceptionThrown() {
+        // Arrange
+        var ex = new SalonDeletionBlockedException(2);
+
+        // Act
+        ResponseEntity<ApiResponse<SalonDeletionBlockedResponse>> response =
+                handler.handleSalonDeletionBlocked(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("a blocked salon deletion must map to 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        // Reference the constant — a rename of SalonDeletionBlockedException.ERROR_CODE must fail
+        // this test, not silently break the mobile client's branch on this 409's data.code.
+        assertThat(response.getBody().data().code())
+                .as("code must be the stable SALON_DELETION_BLOCKED constant")
+                .isEqualTo(SalonDeletionBlockedException.ERROR_CODE);
+
+        assertThat(response.getBody().data().affectedStaffCount())
+                .as("the DISTINCT-staff count computed by the service must reach the wire unchanged")
+                .isEqualTo(2);
+
+        assertThat(response.getBody().message())
+                .as("the top-level message must never echo internal audit detail — code carries "
+                        + "the machine-readable signal")
+                .isEqualTo("Salon cannot be deleted — contact support");
+    }
+
+    @Test
+    @DisplayName("handleSalonDeletionBlocked — emits WARN log, not DEBUG, with affectedStaffCount")
+    void should_emitWarnLog_when_salonDeletionBlockedExceptionThrown() {
+        var ex = new SalonDeletionBlockedException(3);
+        listAppender.list.clear();
+
+        handler.handleSalonDeletionBlocked(ex);
+
+        // This 409 is deliberately logged at WARN, not DEBUG like the other typed 409s (the
+        // handler's own javadoc: "NOT expected user input ... an operational signal worth
+        // surfacing"). A regression to log.debug(...) would silently drop this from default
+        // production log levels — worth its own assertion, not just "some log line exists".
+        List<ILoggingEvent> warnEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warnEvents)
+                .as("handleSalonDeletionBlocked must emit exactly one WARN log")
+                .hasSize(1);
+        assertThat(warnEvents.get(0).getFormattedMessage())
+                .as("WARN log must carry the affected-staff count for operator triage")
+                .contains("affectedStaffCount=3");
     }
 
     // ── handleBookingElapsed (track 24.x read-only-after-elapse) ───────────────

@@ -6,6 +6,7 @@ import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
@@ -190,6 +191,32 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         DuplicateServiceResponse.from(ex),
                         "This service already exists"));
+    }
+
+    /**
+     * Distinct 409 for a salon deletion Phase 289's staff-as-client safety audit blocks (Phase
+     * 290) — the fail-closed precondition on {@code SalonService.deactivateSalon} found a
+     * violation for the salon being deleted and aborted before any mutation ran.
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured
+     * {@link SalonDeletionBlockedResponse} body — carrying the {@code SALON_DELETION_BLOCKED}
+     * code — is emitted instead of the generic conflict message. Logged at WARN, not DEBUG like
+     * the other typed 409s above: this one is NOT expected user input (a violating row can only
+     * exist via a seed/fixture script bypassing the service layer — see the phase 289 doc's
+     * {@code ## Background}), so it is an operational signal worth surfacing, not ordinary flow
+     * control.
+     */
+    @ExceptionHandler(SalonDeletionBlockedException.class)
+    public ResponseEntity<ApiResponse<SalonDeletionBlockedResponse>> handleSalonDeletionBlocked(
+            SalonDeletionBlockedException ex) {
+        log.warn("Salon deletion blocked by staff-as-client safety audit: affectedStaffCount={}",
+                ex.getAffectedStaffCount());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        SalonDeletionBlockedResponse.from(ex),
+                        "Salon cannot be deleted — contact support"));
     }
 
     /**

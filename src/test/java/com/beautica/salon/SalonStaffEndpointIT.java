@@ -380,6 +380,53 @@ class SalonStaffEndpointIT extends AbstractIntegrationTest {
                 .allSatisfy(entry -> assertThat(entry.role()).isEqualTo(Role.SALON_ADMIN));
     }
 
+    /**
+     * QA audit (2026-09-03) gap fix — Phase 290's own D6: {@code UserRepository
+     * .findBySalonIdAndRole} carried NO {@code isActive} filter before this phase (its own
+     * javadoc predicted this exact scenario — "if a future user-suspension feature starts
+     * setting it, this query must gain the same filter or deactivated admins will keep appearing
+     * in salon rosters"). Renamed to {@code findBySalonIdAndRoleAndIsActiveTrue} as part of Phase
+     * 290 — this is that fix's OWN regression pin, listed as an explicit acceptance criterion in
+     * the phase doc ("SalonService.getSalonStaff never lists a deactivated admin") but never
+     * actually proven by any test until now. {@code is_active=false} is stamped directly by SQL,
+     * mirroring the class's is_active=false convention for the master half above — nothing in
+     * this codebase drives a SALON_ADMIN to isActive=false through a service call yet outside the
+     * salon-deletion cascade itself.
+     */
+    @Test
+    @DisplayName("a deactivated SALON_ADMIN is excluded from the roster while the still-active admin remains")
+    void should_excludeInactiveAdmin_when_adminHasBeenDeactivated() throws Exception {
+        // Arrange
+        UUID ownerId = fixtures.insertUser("owner-inactive-admin-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = fixtures.insertSalon(ownerId, "Inactive Admin Salon");
+        UUID activeAdminId = insertStaffUser(
+                "admin-active-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN", salonId,
+                "+380508889900", null, null, null, null);
+        UUID inactiveAdminId = insertStaffUser(
+                "admin-inactive-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN", salonId,
+                "+380509990011", null, null, null, null);
+        jdbcTemplate.update("UPDATE users SET is_active = false WHERE id = ?", inactiveAdminId);
+        String ownerToken = fixtures.loginAndGetToken(fixtures.emailOf(ownerId));
+
+        // Act
+        log.debug("Act: GET {} — salon has one active and one deactivated SALON_ADMIN",
+                String.format(STAFF_URL, salonId));
+        ResponseEntity<String> response = restTemplate.exchange(
+                String.format(STAFF_URL, salonId), HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<List<SalonStaffMemberResponse>>>() {});
+        assertThat(body.data())
+                .as("the deactivated admin's is_active=false row must be filtered out, exactly the "
+                        + "still-active admin must remain — Phase 290 D6's own regression pin")
+                .extracting(SalonStaffMemberResponse::userId)
+                .containsExactly(activeAdminId);
+    }
+
     @Test
     @DisplayName("serviceCount is attributed to the CORRECT master when two masters have different counts")
     void should_attributeServiceCountPerMaster_when_countsDiffer() throws Exception {

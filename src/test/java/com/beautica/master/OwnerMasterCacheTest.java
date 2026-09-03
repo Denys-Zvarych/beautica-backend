@@ -267,7 +267,7 @@ class OwnerMasterCacheTest {
 
         // Act — the TransactionTemplate commits synchronously, so afterCommit() runs inline.
         transactionTemplate.execute(status -> {
-            masterService.deactivateMaster(UUID.randomUUID(), MASTER_ID);
+            masterService.deactivateMaster(ACTOR_USER_ID, MASTER_ID);
             return null;
         });
 
@@ -460,7 +460,7 @@ class OwnerMasterCacheTest {
 
         // Act
         transactionTemplate.execute(status -> {
-            masterService.deactivateMaster(UUID.randomUUID(), MASTER_ID);
+            masterService.deactivateMaster(ACTOR_USER_ID, MASTER_ID);
             return null;
         });
 
@@ -636,11 +636,16 @@ class OwnerMasterCacheTest {
      * {@code getUser().getId()} must resolve, since that is the cache key the service evicts by.
      */
     private void stubMasterForStaffDeactivation() {
-        var salon = mock(com.beautica.salon.entity.Salon.class);
-        when(salon.getId()).thenReturn(SALON_ID);
-
         var user = mock(com.beautica.user.User.class);
         when(user.getId()).thenReturn(ACTOR_USER_ID);
+
+        var salon = mock(com.beautica.salon.entity.Salon.class);
+        when(salon.getId()).thenReturn(SALON_ID);
+        // A SALON_OWNER-type master row's own user IS the salon's owner by construction — same
+        // person, same mock. Phase 290 finding #5's ownership guard (assertCanManageMaster)
+        // checks master.getSalon().getOwner(), so this must be wired for the deactivateMaster
+        // call sites below (actorId == ACTOR_USER_ID) to pass authorization realistically.
+        when(salon.getOwner()).thenReturn(user);
 
         Master master = mock(Master.class);
         when(master.getId()).thenReturn(MASTER_ID);

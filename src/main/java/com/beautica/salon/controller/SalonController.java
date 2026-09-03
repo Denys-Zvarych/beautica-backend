@@ -191,6 +191,20 @@ public class SalonController {
         return ApiResponse.ok(bookingMasterService.getBookableMasters(salonId, serviceDefId));
     }
 
+    // Swagger @ApiResponse is written fully qualified in this method only — its simple name
+    // collides with com.beautica.common.ApiResponse, imported above. springdoc scans controller
+    // signatures, not @RestControllerAdvice handlers, so without this declaration the 409's body
+    // has no schema in /api-docs and the generated mobile client has no model for the
+    // SALON_DELETION_BLOCKED payload it must branch on (Phase 290).
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409",
+            description = "Phase 289's salon-scoped staff-as-client safety audit found a violation "
+                    + "for this salon; the deletion was aborted before any mutation ran. Branch on "
+                    + "`data.code` == SALON_DELETION_BLOCKED, never on `message`. Direct the owner "
+                    + "to contact support — this is not self-service-resolvable.",
+            content = @io.swagger.v3.oas.annotations.media.Content(
+                    schema = @io.swagger.v3.oas.annotations.media.Schema(
+                            implementation = com.beautica.salon.dto.SalonDeletionBlockedResponse.class)))
     @DeleteMapping("/{salonId}")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<Void> deactivateSalon(

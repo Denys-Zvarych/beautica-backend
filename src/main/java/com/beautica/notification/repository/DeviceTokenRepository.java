@@ -61,4 +61,30 @@ public interface DeviceTokenRepository extends JpaRepository<DeviceToken, UUID> 
      * stale records.
      */
     List<DeviceToken> findAllByIsActiveFalseAndUpdatedAtBefore(Instant cutoff);
+
+    /**
+     * Bulk-purges EVERY device token row for a user, active or not — added for the salon-deletion
+     * staff cascade (Phase 290), which does not have specific token VALUES in hand (unlike
+     * {@link #deleteByUserIdAndToken}/{@link #deleteByUserIdAndTokenIn}, both driven by a value
+     * the calling device just presented on logout/deregistration). Mirrors
+     * {@code RefreshTokenRepository.deleteByUserId} exactly: a deactivated staff account must not
+     * keep receiving push notifications addressed to a userId whose salon employment just ended,
+     * for however long the device happens to hold a registered token.
+     */
+    @Transactional
+    @Modifying
+    @Query("DELETE FROM DeviceToken dt WHERE dt.user.id = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
+
+    /**
+     * Bulk sibling of {@link #deleteByUserId} — purges every device token for every user in
+     * {@code userIds} in ONE statement. Added for the salon-deletion staff cascade (Phase 290
+     * perf finding #1): {@code SalonService.deactivateSalonStaff} previously called
+     * {@link #deleteByUserId} once per staff member (N single-row round trips); this collapses
+     * that to exactly one bulk {@code DELETE ... WHERE user_id IN (...)}.
+     */
+    @Transactional
+    @Modifying
+    @Query("DELETE FROM DeviceToken dt WHERE dt.user.id IN :userIds")
+    void deleteByUserIdIn(@Param("userIds") Collection<UUID> userIds);
 }

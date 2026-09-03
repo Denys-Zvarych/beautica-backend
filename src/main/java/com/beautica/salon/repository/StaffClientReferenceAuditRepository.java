@@ -133,11 +133,25 @@ public interface StaffClientReferenceAuditRepository extends JpaRepository<User,
      * scalar subquery/IN-list position, only as a top-level query — a native query is the direct,
      * unambiguous way to express this rather than working around the grammar with two round trips
      * merged in Java.
+     *
+     * <p><b>{@code m.master_type = 'SALON_MASTER'} on the first arm is load-bearing (Phase 290
+     * fix).</b> A salon can also hold a {@code SALON_OWNER}-type {@code masters} row for its own
+     * owner ("I also work as a master", track 12.x) sharing the exact same {@code salon_id}. That
+     * row's {@code user_id} is the OWNER, whose {@code users.role} is {@code SALON_OWNER} — not
+     * staff by any definition this method's own name and javadoc promise. Without this filter the
+     * first arm returned every master row for the salon regardless of type, so an owner-as-master
+     * salon's own owner leaked into "the salon's staff" here. Phase 289's own audit correctness
+     * was unaffected (the three {@code *ForSalon} finders independently re-filter
+     * {@code u.role IN :roles}, so a leaked owner id could never produce a false violation), but
+     * Phase 290's staff-deactivation cascade calls this method DIRECTLY to decide which
+     * {@code users} rows to deactivate — an unfiltered owner id here would have deactivated the
+     * salon's own owner account, violating the locked owner-exemption rule. Caught by
+     * {@code SalonStaffDeactivationCascadeIT.should_deactivateOwnerMasterRow_butNeverTheOwnerUsersRow_when_salonDeactivated}.
      */
     @Query(value = """
             SELECT m.user_id AS user_id
             FROM masters m
-            WHERE m.salon_id = :salonId
+            WHERE m.salon_id = :salonId AND m.master_type = 'SALON_MASTER'
             UNION
             SELECT u.id AS user_id
             FROM users u

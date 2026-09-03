@@ -5,11 +5,13 @@ import java.util.Set;
 import com.beautica.common.web.SortWhitelist;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
+import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.SalonDeletionBlockedException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
@@ -18,6 +20,10 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.repository.DeviceTokenRepository;
+import com.beautica.salon.audit.AuditOutcome;
+import com.beautica.salon.audit.StaffClientReferenceAuditResult;
+import com.beautica.salon.audit.StaffClientReferenceViolation;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonAdminResponse;
@@ -35,6 +41,8 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.InviteHistoryRow;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
+import com.beautica.user.PasswordResetTicketRepository;
+import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -85,6 +93,22 @@ public class SalonService {
     // (on first salon) creates the owner-master row that hasMasterProfile is derived from;
     // removeAdmin and rotateAdmin rewrite users.salon_id. All three stale the user-profile cache.
     private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    // ── Phase 290 — salon-deletion staff-deactivation cascade ─────────────────────────────────
+    // StaffClientReferenceAuditService backs both the fail-closed precondition
+    // (runAuditForSalon) and staff-id resolution (resolveSalonStaffUserIds) that
+    // deactivateSalon's cascade uses — see that method's javadoc. The remaining four back the
+    // per-staff-user session/notification purge: RefreshTokenRepository/DeviceTokenRepository/
+    // PasswordResetTicketRepository mirror the exact precedent PasswordResetService.resetPassword
+    // already establishes for "revoke everything tied to this account", and
+    // TokensValidAfterCache is the read-through cache JwtAuthenticationFilter checks — without
+    // evicting it, a just-deactivated staff member's already-issued access token would keep
+    // working for up to the cache's TTL despite tokensValidAfter being stamped.
+    private final StaffClientReferenceAuditService staffClientReferenceAuditService;
+    private final RefreshTokenRepository refreshTokenRepository;
+    private final DeviceTokenRepository deviceTokenRepository;
+    private final PasswordResetTicketRepository passwordResetTicketRepository;
+    private final TokensValidAfterCache tokensValidAfterCache;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -535,7 +559,7 @@ public class SalonService {
      * staff roster is bounded by the salon's actual headcount, never the unbounded-collection
      * concern §E-3 guards against; this is the same reasoning that already lets
      * {@link #listSalonInvites} returns a capped {@code List} for one salon). Admins are
-     * sourced via {@link UserRepository#findBySalonIdAndRole}. {@code serviceCount} per master
+     * sourced via {@link UserRepository#findBySalonIdAndRoleAndIsActiveTrue}. {@code serviceCount} per master
      * comes from {@link MasterServiceRepository#countActiveByMasterIdIn} — one batch
      * {@code GROUP BY} query for the whole roster, never a per-master count (Anti-Bug §E-3).
      */
@@ -552,7 +576,7 @@ public class SalonService {
                         master, serviceCountByMasterId.getOrDefault(master.getId(), 0L)))
                 .collect(Collectors.toCollection(ArrayList::new));
 
-        userRepository.findBySalonIdAndRole(salonId, Role.SALON_ADMIN).stream()
+        userRepository.findBySalonIdAndRoleAndIsActiveTrue(salonId, Role.SALON_ADMIN).stream()
                 .map(SalonStaffMemberResponse::fromAdmin)
                 .forEach(staff::add);
 
@@ -714,6 +738,22 @@ public class SalonService {
         return result;
     }
 
+    /**
+     * Deactivates a salon (Phase 290 — the first destructive write in the salon-deletion
+     * cascade). Beyond the {@code salons} row itself, this now also deactivates the salon's own
+     * staff — see {@link #deactivateSalonStaff(UUID, UUID)} for the full scope. Booking
+     * cancellation, catalogue/favourites cleanup, media purge and the rest of the cascade remain
+     * separate, later phases (293-298) — see {@code docs/backend-phases/phase-290-*.md}
+     * {@code ## Out of scope}.
+     *
+     * @throws NotFoundException             if {@code ownerId} does not resolve to a user, or if
+     *                                        {@code salonId} does not resolve to a salon owned by
+     *                                        {@code ownerId}
+     * @throws ForbiddenException             if the caller is not a {@code SALON_OWNER}
+     * @throws SalonDeletionBlockedException if Phase 289's salon-scoped staff-as-client safety
+     *                                        audit finds a violation for this salon — the whole
+     *                                        deletion aborts before any mutation runs
+     */
     @Transactional
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
@@ -726,11 +766,39 @@ public class SalonService {
         var salon = salonRepository.findByIdAndOwnerId(salonId, ownerId)
                 .orElseThrow(() -> new NotFoundException("Salon not found or access denied"));
 
+        // Idempotency guard (Phase 290, pulled forward from the future Phase 298 transaction
+        // contract because double-scrubbing becomes POSSIBLE the moment this phase ships a
+        // second mutation beyond the salon flag). A second DELETE on an already-inactive salon
+        // must be a no-op: without this guard, every repeat call would re-run the staff cascade
+        // below against already-deactivated masters/users — re-purging refresh/device tokens and
+        // re-stamping tokensValidAfter for no behavioural change, plus a wasted audit query.
+        if (!salon.isActive()) {
+            return;
+        }
+
+        // Fail-closed precondition (Phase 290) — Phase 289's SALON-SCOPED audit only, never the
+        // platform-wide sweep (StaffClientReferenceAuditRepository's class javadoc: the
+        // platform-wide shape Seq Scans `bookings` and must never run on a request path). A
+        // VIOLATIONS_FOUND outcome aborts the ENTIRE deletion before any mutation below runs.
+        StaffClientReferenceAuditResult audit = staffClientReferenceAuditService.runAuditForSalon(salonId);
+        if (audit.outcome() == AuditOutcome.VIOLATIONS_FOUND) {
+            // Correlated, not independent (phase 289 finding): reviews/client_reviews FK back to
+            // the same booking, so one bad row can trip more than one reference-type check for
+            // the SAME staff member. Report distinct staff members implicated, not violation rows.
+            long affectedStaffCount = audit.violations().stream()
+                    .map(StaffClientReferenceViolation::userId)
+                    .distinct()
+                    .count();
+            throw new SalonDeletionBlockedException((int) affectedStaffCount);
+        }
+
         // `salon` was loaded via findByIdAndOwnerId in THIS @Transactional, so it is a managed
         // entity — Hibernate dirty-checking flushes the isActive mutation on commit. The explicit
         // save() was a redundant no-op write (PERF-LOW). The findByIdAndOwnerId load is retained:
         // it enforces existence + ownership scoping and cannot be dropped.
         salon.setActive(false);
+
+        deactivateSalonStaff(ownerId, salonId);
 
         // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
         // Also evicts search:salons because a deactivated salon must not appear in discovery
@@ -743,6 +811,124 @@ public class SalonService {
         evictOwnerSalonsCacheAfterCommit(ownerIdOf(salon));
         evictSalonDetailCacheAfterCommit(salonId);
         evictSearchSalonsCacheAfterCommit();
+    }
+
+    /**
+     * Deactivates {@code salonId}'s own staff — both the {@code masters} rows AND the backing
+     * {@code users} accounts — as part of {@link #deactivateSalon}'s cascade (Phase 290).
+     *
+     * <h3>Masters</h3>
+     * Reuses {@link MasterService#deactivateMasters} over EVERY currently-active master row for
+     * this salon (REUSE-FIRST — this does not reimplement that method's cache-eviction and
+     * rating-recalculation side effects). That one batch call uniformly covers two distinct rows:
+     * <ul>
+     *   <li>{@code SALON_MASTER}-type rows — the salon's actual staff.</li>
+     *   <li>The owner's OWN {@code SALON_OWNER}-type master row, if "I also work as a master"
+     *       (Phase 12.x) is enabled in THIS salon.</li>
+     * </ul>
+     * Neither row type is excluded from the batch — deactivating the owner's own row too is
+     * correct and intended (Phase 290 D3 in the phase doc). {@code masters.salon_id} is retained
+     * by {@code deactivateMasters} — it is never nulled, which is exactly what this cascade
+     * needs: nulling it would read as promotion to {@code INDEPENDENT_MASTER}, the opposite of
+     * the deletion intent.
+     *
+     * <p>Perf pass (Phase 290 findings #2/#3, see {@code MasterService#deactivateMasters}'
+     * javadoc for the mechanism): passing the already-loaded {@code salonMasters} list straight
+     * to the batch overload avoids a redundant {@code findByIdWithUserAndSalon} SELECT per master
+     * (the query below already JOIN-FETCHed {@code user}) AND collapses what was N
+     * {@code SalonStaffChangedEvent} publishes — each triggering its own
+     * {@code REQUIRES_NEW} salon-rating recalculation and {@code reviews-by-salon} cache scan —
+     * into exactly one for the whole batch.
+     *
+     * <h3>Users</h3>
+     * {@code SALON_MASTER}/{@code SALON_ADMIN} accounts ONLY, resolved via
+     * {@link StaffClientReferenceAuditService#resolveSalonStaffUserIds} — Phase 289's
+     * {@code findSalonStaffUserIds} reused, not re-derived. That resolution structurally can
+     * NEVER include the salon's owner: the owner's {@code role} is {@code SALON_OWNER}, which
+     * satisfies neither the {@code masters.salon_id}-joined {@code SALON_MASTER} predicate nor
+     * the {@code users.salon_id}-scoped {@code SALON_ADMIN} predicate. The owner-account
+     * exemption (Phase 290 D3, locked — the owner's {@code users} row is NEVER touched here) is
+     * therefore a structural property of the query, not a branch this method has to remember.
+     *
+     * <p>For each resolved staff user: {@code isActive = false}; {@code tokensValidAfter} is
+     * stamped so an already-issued access token stops working immediately rather than merely at
+     * its natural TTL expiry ({@code JwtAuthenticationFilter} has no {@code isActive} check —
+     * only the {@code tokensValidAfter} one, via {@link TokensValidAfterCache}); refresh tokens
+     * are purged; any outstanding password-reset ticket is invalidated (defence in depth — a
+     * deactivated account should not be able to complete a reset that was in flight); and device
+     * tokens are purged so the scrubbed account stops receiving push notifications addressed to a
+     * salon it no longer belongs to.
+     *
+     * <p>Perf pass (Phase 290 finding #1): the {@code isActive}/{@code tokensValidAfter} field
+     * mutations and their per-user cache-eviction registrations stay in the per-user loop — each
+     * cache key is a different person, so that fan-out is correctly proportionate to N. The
+     * session/notification purge below it is NOT per-user DML any more: {@code deleteByUserId} /
+     * {@code deleteByUserId} / {@code markAllUsedByUserId} each issued their own JDBC round trip
+     * per staff member (3N total). {@link RefreshTokenRepository#deleteByUserIdIn},
+     * {@link DeviceTokenRepository#deleteByUserIdIn} and
+     * {@link PasswordResetTicketRepository#markAllUsedByUserIdIn} replace them with exactly THREE
+     * bulk statements against the full {@code staffUserIds} list, called once after the loop.
+     */
+    private void deactivateSalonStaff(UUID ownerId, UUID salonId) {
+        // Phase 290 perf pass (findings #2/#3): the masters here are already JOIN-FETCHed with
+        // `user` by findBySalonIdAndIsActiveTrueWithUser — passed straight to the batch overload
+        // rather than re-fetched one-by-one via deactivateMaster(ownerId, master.getId()), and
+        // that overload fires exactly ONE SalonStaffChangedEvent for the whole list instead of
+        // one per master (see MasterService#deactivateMasters' javadoc for the full mechanism —
+        // it also collapses the redundant per-master reviews-by-salon cache scan, finding #4).
+        List<Master> salonMasters = masterRepository
+                .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
+                .getContent();
+        masterService.deactivateMasters(ownerId, salonMasters, salonId);
+
+        List<UUID> staffUserIds = staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId);
+        if (staffUserIds.isEmpty()) {
+            return;
+        }
+
+        // Per-user mutations and per-user cache-eviction registrations stay in the loop — each
+        // key is a different person (finding #4's "correctly proportionate" call). Only the
+        // session/notification-purge DML below is batched (finding #1): 3N single-row round
+        // trips collapsed to exactly 3 bulk statements against the full staffUserIds list.
+        Instant now = clock.instant();
+        for (User staffUser : userRepository.findAllById(staffUserIds)) {
+            // `staffUser` is a managed entity loaded within THIS @Transactional boundary, so
+            // Hibernate dirty-checking flushes both mutations on commit — no explicit save().
+            staffUser.setActive(false);
+            staffUser.setTokensValidAfter(now);
+
+            UUID staffUserId = staffUser.getId();
+            evictTokensValidAfterCacheAfterCommit(staffUserId);
+            // isActive is surfaced on UserProfileResponse (GET /users/me) — this cascade is a
+            // NEW writer of that DTO's field; see UserProfileCacheEvictor's "complete writer
+            // set" javadoc, updated alongside this change.
+            userProfileCacheEvictor.evictAfterCommit(staffUserId);
+        }
+
+        refreshTokenRepository.deleteByUserIdIn(staffUserIds);
+        deviceTokenRepository.deleteByUserIdIn(staffUserIds);
+        passwordResetTicketRepository.markAllUsedByUserIdIn(staffUserIds);
+    }
+
+    /**
+     * Evicts {@code userId}'s {@link TokensValidAfterCache} entry once the current transaction
+     * commits, never before — mirrors {@code PasswordResetService.evictTokensValidAfterCache}
+     * exactly, and for the identical reason: that cache is a read-through cache backed by the
+     * {@code users.tokens_valid_after} row this method just updated, so an eviction that fires
+     * before commit reopens the stale-read race window {@link TokensValidAfterCache#invalidate}
+     * documents.
+     */
+    private void evictTokensValidAfterCacheAfterCommit(UUID userId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            tokensValidAfterCache.invalidate(userId);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                tokensValidAfterCache.invalidate(userId);
+            }
+        });
     }
 
     /**

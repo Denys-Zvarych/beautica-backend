@@ -178,10 +178,15 @@ class MasterServiceCacheTest {
         // Real proxy again — see should_evictMasterCalendarCache_when_upsertWorkingHours.
         Object cacheKey = populateRealCalendarEntry(MASTER_ID);
 
+        // ACTOR_ID as the master's own user id: INDEPENDENT_MASTER + self-management satisfies
+        // the Phase 290 finding #5 ownership guard with no salon fixture needed — this test is
+        // about cache eviction, not authorization.
         User user = mock(User.class);
-        when(user.getId()).thenReturn(UUID.randomUUID());
+        when(user.getId()).thenReturn(ACTOR_ID);
 
         Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+        when(master.getMasterType()).thenReturn(com.beautica.master.entity.MasterType.INDEPENDENT_MASTER);
         when(master.getUser()).thenReturn(user);
         when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
         when(masterRepository.save(master)).thenReturn(master);
@@ -203,7 +208,10 @@ class MasterServiceCacheTest {
         Cache masterByUserCache = cacheManager.getCache("master-by-user");
         assertThat(masterByUserCache).isNotNull();
 
-        UUID userAId = UUID.randomUUID();
+        // userAId == ACTOR_ID: INDEPENDENT_MASTER + self-management satisfies the Phase 290
+        // finding #5 ownership guard with no salon fixture needed. The per-key eviction contract
+        // under test (only userA's entry is touched) is unaffected by which id that happens to be.
+        UUID userAId = ACTOR_ID;
         UUID userBId = UUID.randomUUID();
 
         // Prime both entries
@@ -216,6 +224,8 @@ class MasterServiceCacheTest {
         when(userA.getId()).thenReturn(userAId);
 
         Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+        when(master.getMasterType()).thenReturn(com.beautica.master.entity.MasterType.INDEPENDENT_MASTER);
         when(master.getUser()).thenReturn(userA);
         when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
 
