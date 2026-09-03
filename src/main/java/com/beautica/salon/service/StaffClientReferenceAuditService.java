@@ -1,0 +1,136 @@
+package com.beautica.salon.service;
+
+import com.beautica.auth.Role;
+import com.beautica.salon.audit.StaffClientReferenceAuditResult;
+import com.beautica.salon.audit.StaffClientReferenceType;
+import com.beautica.salon.audit.StaffClientReferenceViolation;
+import com.beautica.salon.repository.StaffClientReferenceAuditRepository;
+import com.beautica.salon.repository.StaffClientReferenceRowProjection;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Runs the salon-deletion safety audit (Phase 289) — see
+ * {@code docs/backend-phases/phase-289-staff-as-client-safety-audit.md}.
+ *
+ * <p>Read-only, and deliberately not wired into {@code SalonService.deactivateSalon} in this
+ * phase — that fail-closed guard is Phase 290's job, once the destructive scrub it protects
+ * actually exists. This service only proves the capability and is exercised directly by its own
+ * integration tests.
+ *
+ * <p>Never catches or swallows an exception from {@link StaffClientReferenceAuditRepository} — a
+ * failed query must propagate rather than silently degrade into a falsely "clean"
+ * {@link StaffClientReferenceAuditResult}. See that result type's javadoc for the full "clean vs.
+ * not run" contract.
+ *
+ * <h3>Two callers — {@link #runAudit()} vs {@link #runAuditForSalon(UUID)}</h3>
+ *
+ * {@link #runAudit()} is the platform-wide, offline/one-off sweep: run manually to discover
+ * whether a violating row already exists ANYWHERE, before Phase 290's cascade exists at all.
+ * Slow is fine — nothing waits on it, and it must never be called from a request path.
+ *
+ * <p>{@link #runAuditForSalon(UUID)} is the per-delete precondition Phase 290's
+ * {@code DELETE /salons/{salonId}} guard will call — scoped to exactly the salon being deleted,
+ * so a delete pays only for its own salon's staff, never a platform-wide scan. See
+ * {@link StaffClientReferenceAuditRepository}'s class javadoc for the full rationale and the
+ * measured {@code EXPLAIN (ANALYZE, BUFFERS)} evidence for why these cannot share one query
+ * shape.
+ */
+@Service
+@RequiredArgsConstructor
+public class StaffClientReferenceAuditService {
+
+    /** The only roles this audit is concerned with — see the phase doc's `## Background`. */
+    private static final List<Role> AUDITED_STAFF_ROLES = List.of(Role.SALON_MASTER, Role.SALON_ADMIN);
+
+    private final StaffClientReferenceAuditRepository auditRepository;
+    private final Clock clock;
+
+    /**
+     * Platform-wide, offline/one-off sweep — see class javadoc. Never call this from a request
+     * path; use {@link #runAuditForSalon(UUID)} for that.
+     *
+     * <p>{@code @Transactional(readOnly = true)} wraps all three repository calls in one
+     * transaction (same shape as {@code ClientPassportService.getPassport}/{@code getTimeline},
+     * {@code ClientPassportService.java:119,194}) — without it each call ran in its own
+     * transaction, so a write racing between call 1 and call 3 could yield a torn, internally
+     * inconsistent snapshot. A precondition that can read a torn snapshot is worse than one that
+     * has not run at all.
+     */
+    @Transactional(readOnly = true)
+    public StaffClientReferenceAuditResult runAudit() {
+        List<StaffClientReferenceViolation> violations = new ArrayList<>();
+
+        appendViolations(
+                violations,
+                auditRepository.findBookingClientViolations(AUDITED_STAFF_ROLES),
+                StaffClientReferenceType.BOOKING_CLIENT);
+        appendViolations(
+                violations,
+                auditRepository.findReviewClientViolations(AUDITED_STAFF_ROLES),
+                StaffClientReferenceType.REVIEW_CLIENT);
+        appendViolations(
+                violations,
+                auditRepository.findClientReviewSubjectViolations(AUDITED_STAFF_ROLES),
+                StaffClientReferenceType.CLIENT_REVIEW_SUBJECT);
+
+        return StaffClientReferenceAuditResult.of(violations, clock.instant());
+    }
+
+    /**
+     * Per-delete precondition — scoped to {@code salonId}'s own staff only. Phase 290's future
+     * {@code DELETE /salons/{salonId}} guard is the intended caller.
+     *
+     * <p>Resolves the salon's staff user ids ONCE ({@link
+     * StaffClientReferenceAuditRepository#findSalonStaffUserIds}) and reuses that list across all
+     * three finder queries, rather than re-deriving a per-salon join inside each one — see that
+     * repository's javadoc for the measured reason (a correlated per-row subquery cannot be
+     * pushed down onto `bookings`' client-id index; a pre-resolved {@code IN} list can). A salon
+     * with no staff at all short-circuits to an empty, clean result without issuing any of the
+     * three finder queries — an empty {@code IN} list has no violation to find, and skipping the
+     * calls avoids relying on how Hibernate happens to translate an empty collection bind.
+     *
+     * <p>Same {@code @Transactional(readOnly = true)} torn-snapshot rationale as {@link
+     * #runAudit()} — all reads (the id resolution and the three finders) share one transaction.
+     */
+    @Transactional(readOnly = true)
+    public StaffClientReferenceAuditResult runAuditForSalon(UUID salonId) {
+        List<UUID> staffUserIds = auditRepository.findSalonStaffUserIds(salonId);
+        if (staffUserIds.isEmpty()) {
+            return StaffClientReferenceAuditResult.of(List.of(), clock.instant());
+        }
+
+        List<StaffClientReferenceViolation> violations = new ArrayList<>();
+
+        appendViolations(
+                violations,
+                auditRepository.findBookingClientViolationsForSalon(AUDITED_STAFF_ROLES, staffUserIds),
+                StaffClientReferenceType.BOOKING_CLIENT);
+        appendViolations(
+                violations,
+                auditRepository.findReviewClientViolationsForSalon(AUDITED_STAFF_ROLES, staffUserIds),
+                StaffClientReferenceType.REVIEW_CLIENT);
+        appendViolations(
+                violations,
+                auditRepository.findClientReviewSubjectViolationsForSalon(AUDITED_STAFF_ROLES, staffUserIds),
+                StaffClientReferenceType.CLIENT_REVIEW_SUBJECT);
+
+        return StaffClientReferenceAuditResult.of(violations, clock.instant());
+    }
+
+    private void appendViolations(
+            List<StaffClientReferenceViolation> target,
+            List<StaffClientReferenceRowProjection> rows,
+            StaffClientReferenceType referenceType) {
+        for (StaffClientReferenceRowProjection row : rows) {
+            target.add(new StaffClientReferenceViolation(
+                    row.getUserId(), row.getRole(), referenceType, row.getRowCount()));
+        }
+    }
+}
