@@ -4,6 +4,7 @@ import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -103,4 +104,66 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID> 
             ORDER BY t.createdAt DESC, t.id DESC
             """)
     List<InviteHistoryRow> findSalonInviteHistory(@Param("salonId") UUID salonId, Pageable pageable);
+
+    /**
+     * Redacts every {@code invite_tokens.email} row this salon dispatched to any of
+     * {@code staffUserIds}, rewriting each matched row to that SAME staff member's tombstone
+     * (Phase 291 audit-fix, MEDIUM — "an irreversible PII scrub leaves the erased email
+     * recoverable by a single join"; perf audit MEDIUM follow-up — collapsed from N per-staff
+     * {@code @Modifying} updates into this ONE bulk statement for the whole cascade).
+     *
+     * <p>Called from {@code SalonService#deactivateSalonStaff} ONCE, for the entire
+     * {@code staffUserIds} list, BEFORE the per-user loop that calls {@code User#scrubPii} — see
+     * the "MUST run before scrubPii" note below for why a naive single {@code WHERE email IN
+     * (...)} cannot substitute for this join.
+     *
+     * <p>{@code email} is {@code nullable = false} (see {@link InviteToken}), so this redacts
+     * rather than nulls — the same "tombstone, don't null" choice {@code User#scrubPii} makes for
+     * {@code users.email}, for the identical reason (a {@code NOT NULL} column).
+     *
+     * <p>Scoped to {@code salonId} — the salon actually being deleted — NOT a global match on
+     * email. A staff member can have a separate, unrelated PENDING invite waiting at the same
+     * address from a DIFFERENT salon; that row belongs to that other salon's own history and must
+     * survive this cascade untouched (see {@code
+     * SalonStaffPiiScrubIT#should_preserveUnrelatedSalonsPendingInvite_when_salonDeactivated}).
+     * Deliberately status-blind — no {@code is_used}/{@code revoked_at} predicate — so PENDING,
+     * ACCEPTED, EXPIRED and SUPERSEDED rows are all redacted alike; a salon can plausibly have
+     * re-invited or re-accepted the same address more than once, and none of those rows need to
+     * be loaded as entities to be rewritten.
+     *
+     * <p><strong>Why a join, not {@code WHERE email IN (:originalEmails)}:</strong> every staff
+     * member needs a DIFFERENT tombstone, derived from their own {@code users.id} — one bulk
+     * statement can't map N distinct target values without joining back to the row that carries
+     * them. JPQL bulk updates cannot express a join, so this is a native {@code UPDATE ... FROM}.
+     *
+     * <p><strong>MUST run BEFORE {@code User#scrubPii} touches any of these users'
+     * {@code email}.</strong> The join predicate is {@code t.email = u.email} — it matches an
+     * invite row against the staff member's CURRENT address. Run this after {@code scrubPii},
+     * and {@code u.email} is already the tombstone: the join matches nothing and the redaction
+     * silently no-ops. See the call site comment in {@code SalonService#deactivateSalonStaff}.
+     *
+     * <p>Naturally idempotent even without a {@code scrubbedAt} filter: a staff member already
+     * scrubbed by an earlier run has {@code u.email} equal to their tombstone (a deterministic
+     * function of {@code u.id} alone), and any invite row already redacted to that same tombstone
+     * matches and is rewritten to the identical value — a no-op in effect.
+     *
+     * @param tombstonePrefix {@code SalonService.SCRUB_EMAIL_PREFIX} — passed as a parameter
+     *         rather than inlined into the SQL so this query and {@code User#scrubPii}'s caller
+     *         can never drift onto two different tombstone formats
+     * @param tombstoneSuffix {@code SalonService.SCRUB_EMAIL_DOMAIN}
+     * @return number of {@code invite_tokens} rows rewritten
+     */
+    @Modifying
+    @Query(value = """
+            UPDATE invite_tokens t
+            SET email = :tombstonePrefix || u.id::text || :tombstoneSuffix
+            FROM users u
+            WHERE u.id IN (:staffUserIds)
+              AND t.salon_id = :salonId
+              AND t.email = u.email
+            """, nativeQuery = true)
+    int redactEmailsBySalonIdAndStaffUserIds(@Param("salonId") UUID salonId,
+                                              @Param("staffUserIds") List<UUID> staffUserIds,
+                                              @Param("tombstonePrefix") String tombstonePrefix,
+                                              @Param("tombstoneSuffix") String tombstoneSuffix);
 }

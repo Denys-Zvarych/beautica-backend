@@ -18,7 +18,12 @@ import java.util.UUID;
  * response listing the caller's OWN invites, not a parse error echoing the valid-constant set.
  *
  * @param inviteId       id to pass back to {@code DELETE /salons/{salonId}/invites/{inviteId}}
- * @param recipientEmail address the invite was sent to
+ * @param recipientEmail address the invite was sent to — rewritten to the recipient's
+ *                       {@code deleted+<uuid>@beautica-deleted.invalid} tombstone if that user's
+ *                       account has since been PII-scrubbed by a salon deletion (Phase 291;
+ *                       see {@code InviteTokenRepository#redactEmailsBySalonIdAndStaffUserIds}).
+ *                       This is deliberate, not a bug: the whole point of the scrub is that the
+ *                       original address is no longer recoverable through this endpoint either.
  * @param role           {@link com.beautica.auth.Role} name the invite grants
  * @param status         derived {@link InviteStatus} name — see {@link #from(InviteHistoryRow, Instant)}
  * @param createdAt      when the invite was dispatched (the sort key of the history listing)

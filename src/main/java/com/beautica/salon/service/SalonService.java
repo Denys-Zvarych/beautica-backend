@@ -54,6 +54,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -109,6 +110,80 @@ public class SalonService {
     private final DeviceTokenRepository deviceTokenRepository;
     private final PasswordResetTicketRepository passwordResetTicketRepository;
     private final TokensValidAfterCache tokensValidAfterCache;
+
+    /**
+     * Tombstone email prefix (Phase 291). Combined with {@link #SCRUB_EMAIL_DOMAIN} and the
+     * user's own {@code id}, this is the ENTIRE fix for "owner deletes a salon, then cannot
+     * re-invite the master who was in it" — see {@link User#scrubPii}'s javadoc for the full
+     * mechanism.
+     */
+    private static final String SCRUB_EMAIL_PREFIX = "deleted+";
+
+    /**
+     * RFC 2606 reserves the {@code .invalid} TLD specifically for addresses that are guaranteed
+     * to never resolve — unlike {@code .example}/{@code .test}, which are for documentation, this
+     * is exactly the "known-dead address" semantics a tombstone needs. A domain ending in
+     * {@code .beautica.local} would NOT carry that guarantee (nothing stops a future internal
+     * DNS zone from resolving it); this must end in the reserved TLD itself.
+     */
+    private static final String SCRUB_EMAIL_DOMAIN = "@beautica-deleted.invalid";
+
+    /**
+     * Single shared BCrypt hash rotated onto EVERY scrubbed staff row, in every salon deletion,
+     * for the lifetime of this JVM (Phase 291 perf audit — CRITICAL). Computed exactly ONCE, here,
+     * rather than once per staff member inside {@link #deactivateSalonStaff}'s loop.
+     *
+     * <p><strong>The bug this replaces.</strong> The original code called
+     * {@code passwordEncoder.encode(UUID.randomUUID().toString())} per staff member, sequentially,
+     * on the request thread inside the {@code @Transactional} cascade backing
+     * {@code DELETE /salons/{salonId}} — measured at 56.04 ms/encode with this deployment's
+     * {@code BCryptPasswordEncoder} strength (10, see {@code SecurityConfig#passwordEncoder}):
+     * 1.12 s at N=20 staff, 2.80 s at N=50, pure CPU, holding a Hikari connection and a Tomcat
+     * worker the whole time. It did not parallelise, cache, or benefit from an index — it got
+     * strictly worse with every additional staff member on the salon being deleted.
+     *
+     * <p><strong>Per-user freshness bought no security property.</strong> Nobody can ever present
+     * the plaintext for a tombstoned account either way — the "password" rotated in was a
+     * {@code UUID.randomUUID()} value generated and immediately discarded, never stored or
+     * transmitted anywhere. A single shared hash is exactly as unauthenticatable as N distinct
+     * ones, so computing N of them bought nothing.
+     *
+     * <p><strong>This MUST stay real, valid BCrypt — never a non-BCrypt sentinel.</strong>
+     * {@link com.beautica.auth.AuthService#login} calls {@code passwordEncoder.matches()}
+     * <em>before</em> checking {@code user.isActive()} — the comparison against a scrubbed row's
+     * hash genuinely executes on every login attempt against a tombstoned address, it is not
+     * short-circuited away. A non-BCrypt sentinel (e.g. a literal {@code "SCRUBBED"} string) would
+     * return from {@code matches()} in microseconds, while a real BCrypt comparison costs ~56 ms —
+     * a timing side-channel that would let a prober distinguish "this address belongs to a
+     * scrubbed account" from "this address never existed", fingerprinting tombstoned accounts.
+     * Valid-format BCrypt preserves verify-time parity with every other login attempt in the
+     * system, closing that channel.
+     *
+     * <p><strong>Why a fresh per-JVM-boot random value, encoded once here, rather than a
+     * hardcoded source literal.</strong> Both are equally safe from a security standpoint — this
+     * hash protects nothing (there is no plaintext anyone could ever present that it would
+     * accept), so "identical across deployments" carries no exploitable weakness the way it would
+     * for a real credential. The random-per-boot form was chosen anyway: it avoids a fixed BCrypt
+     * string sitting in version control that a future reviewer has to separately re-derive "this
+     * is intentionally not a secret" for, and this repo's own convention is "secrets via env vars,
+     * never hardcoded" — a literal here would look identical to a violation of that rule on sight,
+     * even though it isn't one. The cost is paid exactly once per JVM lifetime (~56 ms at server
+     * boot), not once per scrubbed user, so the O(1)-per-deletion property this fix exists for is
+     * unaffected either way.
+     *
+     * <p>Deliberately constructed with a locally-owned {@link BCryptPasswordEncoder} rather than
+     * the shared {@link PasswordEncoder} bean this class used to inject solely for this call: a
+     * {@code static final} field initializer runs at class-load time, before Spring has built any
+     * bean graph, so the DI container has nothing to hand over yet. That was the class's ONLY use
+     * of an injected {@code PasswordEncoder} — with the per-user {@code encode()} call gone, the
+     * dependency had nothing left to do, so it was removed from the constructor entirely rather
+     * than kept unused (see the phase doc for the corresponding test-fixture cleanup). Strength is
+     * pinned to {@code 10} to match {@code SecurityConfig#passwordEncoder}; there is no
+     * compile-time link between the two, so if that strength ever changes this literal must be
+     * updated by hand.
+     */
+    private static final String SCRUBBED_PASSWORD_HASH =
+            new BCryptPasswordEncoder(10).encode(UUID.randomUUID().toString());
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -857,7 +932,9 @@ public class SalonService {
      * are purged; any outstanding password-reset ticket is invalidated (defence in depth — a
      * deactivated account should not be able to complete a reset that was in flight); and device
      * tokens are purged so the scrubbed account stops receiving push notifications addressed to a
-     * salon it no longer belongs to.
+     * salon it no longer belongs to. As of Phase 291, each resolved staff user's PII is also
+     * scrubbed via {@link User#scrubPii} — see that method's javadoc for the full column-by-column
+     * contract; this is the change that actually fixes the "cannot re-invite" bug.
      *
      * <p>Perf pass (Phase 290 finding #1): the {@code isActive}/{@code tokensValidAfter} field
      * mutations and their per-user cache-eviction registrations stay in the per-user loop — each
@@ -886,6 +963,24 @@ public class SalonService {
             return;
         }
 
+        // Perf audit MEDIUM fix: this used to be a per-staff-member call INSIDE the loop below —
+        // N round trips, one per staff member, in the same method whose own comment two lines down
+        // claims the O(1)-in-N property Phase 290 established for the session/notification purges.
+        // Collapsed to ONE bulk statement for the whole staffUserIds list via a native
+        // InviteToken-to-User join (see InviteTokenRepository#redactEmailsBySalonIdAndStaffUserIds
+        // for why a join, not a plain WHERE email IN (...), is required — every staff member needs
+        // a DIFFERENT tombstone).
+        //
+        // MUST run BEFORE the loop below calls User#scrubPii on any of these users. The join
+        // matches invite_tokens.email against users.email AS IT IS RIGHT NOW — once scrubPii has
+        // rewritten a user's email to their tombstone, the join can no longer find that user's
+        // original address and the redaction silently no-ops for them. Do NOT move this below the
+        // loop: SalonStaffPiiScrubIT#should_redactInviteTokenEmail_when_salonDeactivated and
+        // #should_preserveUnrelatedSalonsPendingInvite_when_salonDeactivated both pin the
+        // resulting end state and go red the moment this call trails scrubPii.
+        inviteTokenRepository.redactEmailsBySalonIdAndStaffUserIds(
+                salonId, staffUserIds, SCRUB_EMAIL_PREFIX, SCRUB_EMAIL_DOMAIN);
+
         // Per-user mutations and per-user cache-eviction registrations stay in the loop — each
         // key is a different person (finding #4's "correctly proportionate" call). Only the
         // session/notification-purge DML below is batched (finding #1): 3N single-row round
@@ -893,9 +988,30 @@ public class SalonService {
         Instant now = clock.instant();
         for (User staffUser : userRepository.findAllById(staffUserIds)) {
             // `staffUser` is a managed entity loaded within THIS @Transactional boundary, so
-            // Hibernate dirty-checking flushes both mutations on commit — no explicit save().
+            // Hibernate dirty-checking flushes every mutation below on commit — no explicit save().
             staffUser.setActive(false);
             staffUser.setTokensValidAfter(now);
+
+            // Phase 291 — email tombstone + PII scrub. This is the actual fix for "owner deletes
+            // a salon, then cannot re-invite the master who was in it": InviteService.sendInvite/
+            // acceptInvite both gate on the GLOBAL, salon-agnostic userRepository.existsByEmail —
+            // intentionally left unchanged (relaxing it would let acceptInvite insert a second row
+            // with the same email and hit users.email's UNIQUE constraint) — so the fix has to be
+            // data-side. Guarded on scrubbedAt == null so a hypothetical re-entry into this loop
+            // for an already-scrubbed row never re-does this work; deactivateSalon's own
+            // idempotency guard (`if (!salon.isActive()) return;`) already prevents this loop from
+            // running twice for the same salon, but this check makes per-user idempotency a
+            // property of scrubPii's own call site, not an accident of the caller two levels up.
+            if (staffUser.getScrubbedAt() == null) {
+                String tombstoneEmail = SCRUB_EMAIL_PREFIX + staffUser.getId() + SCRUB_EMAIL_DOMAIN;
+                // Perf audit CRITICAL fix: was passwordEncoder.encode(UUID.randomUUID()...) HERE,
+                // per staff member, sequentially, on the request thread — 56.04 ms/encode measured,
+                // 1.12 s at N=20, 2.80 s at N=50. Replaced with SCRUBBED_PASSWORD_HASH, a single
+                // BCrypt hash computed exactly once per JVM boot (see that constant's javadoc for
+                // the full reasoning, including why it must stay real BCrypt rather than a
+                // sentinel). This drops the per-deletion cost of this line to O(1) regardless of N.
+                staffUser.scrubPii(tombstoneEmail, SCRUBBED_PASSWORD_HASH, now);
+            }
 
             UUID staffUserId = staffUser.getId();
             evictTokensValidAfterCacheAfterCommit(staffUserId);
@@ -908,6 +1024,15 @@ public class SalonService {
         refreshTokenRepository.deleteByUserIdIn(staffUserIds);
         deviceTokenRepository.deleteByUserIdIn(staffUserIds);
         passwordResetTicketRepository.markAllUsedByUserIdIn(staffUserIds);
+
+        // Security audit LOW fix: this cascade previously logged nothing at all — rotateAdmin
+        // logs an INFO line for a far less consequential mutation (SalonService#rotateAdmin).
+        // One line per BATCH, not per staff member — ids and a count only, exactly this repo's
+        // PII-in-logs convention (mirrors PhoneMask's "never the raw value" rule for phone
+        // numbers); the tombstone email, the original email, and any other scrubbed value are
+        // NEVER logged, here or anywhere else in this method.
+        log.info("Salon deletion PII scrub: {} staff member(s) scrubbed for salon {} by actor {}",
+                staffUserIds.size(), salonId, ownerId);
     }
 
     /**

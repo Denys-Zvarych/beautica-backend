@@ -139,7 +139,6 @@ class SalonServiceCacheTest {
     @MockBean com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
     @MockBean com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
     @MockBean com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
-
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
 

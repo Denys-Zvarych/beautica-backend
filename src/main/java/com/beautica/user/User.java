@@ -208,6 +208,16 @@ public class User extends AuditableEntity {
     @Column(name = "tokens_valid_after")
     private Instant tokensValidAfter;
 
+    /**
+     * Non-null once {@link #scrubPii} has run for this row — the salon-deletion staff-scrub
+     * cascade's idempotency marker (Phase 291). NULL means "never scrubbed" (the default, and
+     * true for every user who is not a scrubbed ex-staff member). See {@link #scrubPii}'s javadoc
+     * for the full contract.
+     */
+    @JsonIgnore
+    @Column(name = "scrubbed_at")
+    private Instant scrubbedAt;
+
     protected User() {
     }
 
@@ -608,5 +618,94 @@ public class User extends AuditableEntity {
 
     public int getReviewCount() {
         return reviewCount;
+    }
+
+    @JsonIgnore
+    public Instant getScrubbedAt() {
+        return scrubbedAt;
+    }
+
+    /**
+     * Scrubs this account's PII in place — the second half of the salon-deletion
+     * staff-deactivation cascade (Phase 291), always called immediately after {@link #setActive}
+     * and {@link #setTokensValidAfter} deactivate the same row (Phase 290). Idempotent: a call
+     * against an already-scrubbed row ({@code scrubbedAt != null}) is a no-op, so this method's
+     * own contract does not depend on the caller re-checking {@link #getScrubbedAt()} first —
+     * though {@code SalonService}'s cascade still does check it before generating a fresh
+     * tombstone/password, since both are real work (a BCrypt encode) that would otherwise be
+     * discarded on every call into this no-op branch.
+     *
+     * <p>{@code tombstoneEmail} MUST be a per-user-unique, non-routable address — see
+     * {@code SalonService}'s call site for the {@code deleted+<uuid>@beautica-deleted.invalid}
+     * format, which is built from {@link #getId()} itself: uniqueness is therefore inherited from
+     * this row's own primary-key uniqueness, not re-derived. This is the ENTIRE fix for the bug
+     * this phase closes: {@code userRepository.existsByEmail(originalEmail)} — read verbatim,
+     * UNCHANGED, by both {@code InviteService.sendInvite} and {@code #acceptInvite} — naturally
+     * returns {@code false} once the original address is gone from this row, so a re-invite to
+     * that same address no longer collides. Neither invite method needed to change.
+     *
+     * <p>{@code rotatedPasswordHash} MUST already be BCrypt-encoded (mirrors
+     * {@link #setPasswordHash}'s contract) — callers must never pass a plaintext value.
+     *
+     * <h3>What is retained, and why</h3>
+     * <ul>
+     *   <li>{@link #firstName}/{@link #lastName} — LOCKED product decision: a surviving client's
+     *       past booking detail and public review card render the master's name; blanking it
+     *       would corrupt a record belonging to someone whose own account is untouched.</li>
+     *   <li>{@link #avatarR2Key} — deliberately NOT nulled here. Phase 297 (not yet implemented)
+     *       needs this exact pointer to find and delete the R2 blob; nulling it first would
+     *       orphan the blob with no handle left to clean it up. {@link #avatarUrl} (the
+     *       public-facing URL) IS cleared below — the two are independent columns for exactly
+     *       this reason.</li>
+     *   <li>{@code role}, {@code salonId} — non-PII structural/historical data; nulling
+     *       {@code salonId} would misread as the same "promotion to INDEPENDENT_MASTER" signal
+     *       Phase 290 D2 already ruled out for {@code masters.salon_id}.</li>
+     *   <li>{@code avgRating}/{@code reviewCount} (this user's rating AS a client, via
+     *       {@code client_reviews}) — untouched, but not by omission: Phase 289's fail-closed
+     *       audit already blocks this entire cascade from running at all if this user is
+     *       referenced as a client anywhere, so any user who reaches this method structurally has
+     *       zero {@code client_reviews} rows — these fields are already {@code null}/{@code 0}.</li>
+     *   <li>{@code emailVerified}, {@code isActive}, {@code tokensValidAfter},
+     *       {@code createdAt}/{@code updatedAt} — not PII; {@code isActive}/
+     *       {@code tokensValidAfter} are the OTHER half of the cascade, set by the caller just
+     *       before this call, not by this method.</li>
+     * </ul>
+     */
+    public void scrubPii(String tombstoneEmail, String rotatedPasswordHash, Instant scrubbedAt) {
+        if (this.scrubbedAt != null) {
+            return;
+        }
+
+        this.email = tombstoneEmail;
+        this.passwordHash = rotatedPasswordHash;
+
+        this.phoneNumber = null;
+        this.city = null;
+        this.region = null;
+        this.cityId = null;
+        this.districtId = null;
+        this.street = null;
+        this.buildingNo = null;
+        this.locationNote = null;
+        this.avatarUrl = null;
+
+        this.bio = null;
+        this.instagram = null;
+        this.professionalTitle = null;
+        this.businessName = null;
+
+        this.verificationCodeHash = null;
+        this.verificationCodeExpiresAt = null;
+        this.verificationAttempts = 0;
+        this.verificationFailedTotal = 0;
+        this.verificationLockedUntil = null;
+
+        this.passwordResetCodeHash = null;
+        this.passwordResetCodeExpiresAt = null;
+        this.passwordResetAttempts = 0;
+        this.passwordResetFailedTotal = 0;
+        this.passwordResetLockedUntil = null;
+
+        this.scrubbedAt = scrubbedAt;
     }
 }

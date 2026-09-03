@@ -79,6 +79,29 @@ class SalonServiceAdminTest {
     @Mock
     private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
+    // QA audit (2026-09-03): Phase 290/291 added five more constructor collaborators to
+    // SalonService (the salon-deletion staff cascade). None of this file's 3 tests reach
+    // deactivateSalon's happy path today — should_denyDeletion_when_actorIsSalonAdmin throws on
+    // the SALON_OWNER role check before any of these are touched — so @InjectMocks silently
+    // passing null for all five stayed harmless. But that is exactly the landmine shape flagged
+    // elsewhere in this class (see the CityRepository/UserProfileCacheEvictor comments above):
+    // the next author who adds a SALON_OWNER-actor deactivateSalon test here gets a bare NPE with
+    // no indication which of eighteen constructor parameters is the culprit. Declared defensively.
+    @Mock
+    private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
+
+    @Mock
+    private com.beautica.user.RefreshTokenRepository refreshTokenRepository;
+
+    @Mock
+    private com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
+
+    @Mock
+    private com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
+
+    @Mock
+    private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
+
     @InjectMocks
     private SalonService salonService;
 
