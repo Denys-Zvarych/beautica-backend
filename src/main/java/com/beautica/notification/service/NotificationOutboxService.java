@@ -233,6 +233,27 @@ public class NotificationOutboxService {
         save(OutboxEventType.CLOSURE_REMINDER, bookingId, null);
     }
 
+    /**
+     * Enqueues a {@code SALON_CLOSED} notification entry (Phase 269/293) — one row per affected
+     * VISIT, never per booking (D12). {@code bookingId} MUST be the visit's REPRESENTATIVE
+     * booking: the lowest {@code starts_at} among the visit's declined rows, tied on {@code id} —
+     * see {@code BookingService#declineFutureConfirmedBookingsForSalonClosure}, the sole caller,
+     * for how that representative is chosen. Choosing it deterministically means a retried/re-run
+     * cascade always picks the same aggregate id.
+     *
+     * <p>Same shape as {@link #enqueueClientCancelled(UUID)} — no payload, {@code aggregateId} is
+     * the representative booking's id, and the drain worker re-hydrates the full booking (and, for
+     * a multi-service visit, its siblings) at send time so no client PII or booking note is
+     * duplicated into the outbox row.
+     *
+     * @param bookingId the representative booking of the closed visit
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueSalonClosed(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.SALON_CLOSED, bookingId, null);
+    }
+
     // --- private helpers ---
 
     private void save(OutboxEventType eventType, UUID aggregateId, String payload) {

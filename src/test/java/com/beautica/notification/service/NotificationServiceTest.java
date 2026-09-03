@@ -1,5 +1,9 @@
 package com.beautica.notification.service;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
@@ -16,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -25,10 +30,12 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -807,6 +814,137 @@ class NotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // notifySalonClosed (Phase 269/293)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("notifySalonClosed sends email + push to a registered client, never SMS")
+    void should_sendEmailAndPush_when_notifySalonClosedForRegisteredClient() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking booking = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
+        BookingVisit visit = BookingVisit.single(booking);
+        String bookingId = booking.getId().toString();
+
+        service.notifySalonClosed(visit);
+
+        verify(emailService).sendSalonClosedEmail(eq("client@example.com"), eq(visit));
+        verify(pushService).sendToUser(
+                eq(clientUserId),
+                eq("Салон закрито"),
+                anyString(),
+                eq(Map.of("type", "SALON_CLOSED", "bookingId", bookingId))
+        );
+        verifyNoInteractions(smsService);
+    }
+
+    @Test
+    @DisplayName("notifySalonClosed sends SMS to the OTP-verified guestPhone for a LINK guest visit, "
+            + "and never touches the email/push channels a guest has no account for")
+    void should_sendSms_when_notifySalonClosedForGuestVisit() {
+        Booking booking = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        BookingVisit visit = BookingVisit.single(booking);
+
+        service.notifySalonClosed(visit);
+
+        verify(smsService).send(eq("+380501234567"), anyString());
+        verifyNoInteractions(emailService);
+        verifyNoInteractions(pushService);
+    }
+
+    @Test
+    @DisplayName("notifySalonClosed never sends SMS for a STAFF walk-in — the phone was typed by "
+            + "staff, not proven by the recipient (same gate as notifyBookingStatusChanged)")
+    void should_notSendSms_when_notifySalonClosedForStaffWalkIn() {
+        Booking booking = buildStaffWalkInBookingMockForDecline(null);
+        BookingVisit visit = BookingVisit.single(booking);
+
+        service.notifySalonClosed(visit);
+
+        verifyNoInteractions(smsService);
+        verifyNoInteractions(emailService);
+        verifyNoInteractions(pushService);
+    }
+
+    @Test
+    @DisplayName("notifySalonClosed's push body names EVERY declined service of a multi-service "
+            + "visit (D12) — the whole visit was collapsed to ONE outbox entry, so the copy must "
+            + "not name only the representative's service")
+    void should_namePushBodyForWholeVisit_when_notifySalonClosedForMultiServiceVisit() {
+        UUID clientUserId = UUID.randomUUID();
+        Booking lead = buildBookingMock(UUID.randomUUID(), clientUserId, BookingStatus.DECLINED);
+        BookingVisit visit = visitOf(lead, 3);
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifySalonClosed(visit);
+
+        verify(emailService).sendSalonClosedEmail(anyString(), eq(visit));
+        verify(pushService).sendToUser(eq(clientUserId), anyString(), bodyCaptor.capture(), any(Map.class));
+        assertThat(bodyCaptor.getValue())
+                .contains("3 послуги")
+                .doesNotContain("скасовано Тест послуга");
+    }
+
+    @Test
+    @DisplayName("notifySalonClosed's guest SMS names EVERY declined service of a multi-service visit")
+    void should_nameSmsForWholeVisit_when_notifySalonClosedForMultiServiceGuestVisit() {
+        Booking lead = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        BookingVisit visit = visitOf(lead, 3);
+        ArgumentCaptor<String> smsCaptor = ArgumentCaptor.forClass(String.class);
+
+        service.notifySalonClosed(visit);
+
+        verify(smsService).send(eq("+380501234567"), smsCaptor.capture());
+        assertThat(smsCaptor.getValue()).contains("3 послуги");
+    }
+
+    @Test
+    @DisplayName("notifySalonClosed swallows an SMS gateway failure (D11) — the salon deletion this "
+            + "notification is dispatched from a queue AFTER must never see this exception")
+    void should_swallowException_when_salonClosedSmsGatewayThrows() {
+        Booking booking = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        doThrow(new RuntimeException("gateway down")).when(smsService).send(anyString(), anyString());
+
+        assertThatCode(() -> service.notifySalonClosed(BookingVisit.single(booking)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("notifySalonClosed — QA-authored (Phase 293 audit, case 16): the raw OTP-verified "
+            + "guest_phone is never logged when the SMS gateway throws — only the exception's class "
+            + "name reaches the log line (Anti-Bug §I / PhoneMask discipline; log-capture pattern "
+            + "mirrored from TurbosmsServiceTest, which pins the SAME discipline at the actual "
+            + "gateway boundary — this test pins it at NotificationService's own catch block, one "
+            + "layer up, which has no PhoneMask call at all today because it never references the "
+            + "phone variable in its log message; a future edit that adds it back must trip this)")
+    void should_notLogRawPhone_when_salonClosedSmsFails() {
+        Booking booking = buildGuestBookingMockForSalonClosed(
+                "Тест послуга", OffsetDateTime.parse("2026-08-01T10:00:00+03:00"));
+        doThrow(new RuntimeException("gateway down")).when(smsService).send(anyString(), anyString());
+
+        Logger serviceLogger = (Logger) LoggerFactory.getLogger(NotificationService.class);
+        ListAppender<ILoggingEvent> logAppender = new ListAppender<>();
+        logAppender.start();
+        serviceLogger.addAppender(logAppender);
+        serviceLogger.setLevel(Level.WARN);
+        try {
+            service.notifySalonClosed(BookingVisit.single(booking));
+        } finally {
+            serviceLogger.detachAppender(logAppender);
+        }
+
+        StringBuilder allLogs = new StringBuilder();
+        for (ILoggingEvent event : logAppender.list) {
+            allLogs.append(event.getFormattedMessage()).append('\n');
+        }
+        assertThat(allLogs.toString())
+                .as("guest_phone must never appear in a log line emitted on SMS failure")
+                .doesNotContain("+380501234567");
+    }
+
+    // -------------------------------------------------------------------------
     // sendInviteEmail
     // -------------------------------------------------------------------------
 
@@ -1164,6 +1302,35 @@ class NotificationServiceTest {
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
         lenient().when(sd.getName()).thenReturn("Тест послуга");
+        MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
+        lenient().when(msa.getServiceDefinition()).thenReturn(sd);
+        lenient().when(booking.getMasterService()).thenReturn(msa);
+
+        return booking;
+    }
+
+    /**
+     * Builds a LINK guest booking mock for {@code notifySalonClosed} tests: {@code getClient()}
+     * and {@code getBookingSource()} are strict (both are read on every call, to decide the
+     * SMS-vs-email branch); everything else is {@code lenient} so this composes cleanly with
+     * {@link #visitOf(Booking, int)}, which re-stubs {@code getStartsAt()} on the lead itself.
+     *
+     * <p>Deliberately carries NO {@code providerComment}/{@code status} stub —
+     * {@code notifySalonClosed} never reads either (D10: {@link BookingVisit} exposes no note
+     * accessor, and the salon-closure copy does not branch on booking status the way
+     * {@code notifyBookingStatusChanged} does) — reusing {@code buildGuestBookingMockForDecline}
+     * here would leave those two stubs unread and trip Mockito's strict-stubs check.
+     */
+    private Booking buildGuestBookingMockForSalonClosed(String serviceName, OffsetDateTime startsAt) {
+        Booking booking = mock(Booking.class);
+        lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
+        when(booking.getClient()).thenReturn(null);
+        when(booking.getBookingSource()).thenReturn(BookingSource.LINK);
+        lenient().when(booking.getGuestPhone()).thenReturn("+380501234567");
+        lenient().when(booking.getStartsAt()).thenReturn(startsAt);
+
+        ServiceDefinition sd = mock(ServiceDefinition.class);
+        lenient().when(sd.getName()).thenReturn(serviceName);
         MasterServiceAssignment msa = mock(MasterServiceAssignment.class);
         lenient().when(msa.getServiceDefinition()).thenReturn(sd);
         lenient().when(booking.getMasterService()).thenReturn(msa);

@@ -373,6 +373,53 @@ public class NotificationService {
         );
     }
 
+    /**
+     * Notifies the CLIENT (or guest) that the salon they had a future booking with was deleted by
+     * its owner, and the booking was auto-declined (Phase 269/293 — {@code SALON_CLOSED}).
+     *
+     * <p>Takes a {@link BookingVisit}, not a bare {@code Booking}, because exactly ONE
+     * {@code SALON_CLOSED} outbox row is enqueued per VISIT (D12) — {@code visit} may therefore
+     * describe several declined services at once, and the copy names all of them via
+     * {@link #bookedSubject(BookingVisit)}, never just the representative.
+     *
+     * <p><b>Per-audience delivery (D8).</b> A registered client (an account exists —
+     * {@code booking.getClient() != null}) always has an email on file (schema-guaranteed,
+     * {@code users.email NOT NULL}) — email + push. A guest ({@code LINK}) visit has no account
+     * and no email; its {@code guestPhone} is OTP-verified, so it gets an SMS instead
+     * ({@link #sendSalonClosedGuestSms(BookingVisit)}, mirroring
+     * {@link #sendLinkGuestDeclineSms(Booking)}). A STAFF walk-in's phone was typed by an
+     * employee, not proven by the recipient (Phase 22.1) — it is NOT an eligible SMS destination
+     * and is left a silent no-op, same gate as {@link #notifyBookingStatusChanged(BookingVisit)}.
+     *
+     * <p><b>No booking note is ever read here</b> (D10) — {@link BookingVisit} exposes no
+     * accessor for {@code clientComment}/{@code clientCancellationNote}/{@code providerComment} by
+     * construction, and this method does not read any of them off {@link BookingVisit#lead()}
+     * either, unlike the decline path.
+     */
+    public void notifySalonClosed(BookingVisit visit) {
+        Booking booking = visit.lead();
+        if (booking.getClient() == null) {
+            if (booking.getBookingSource() == BookingSource.LINK) {
+                sendSalonClosedGuestSms(visit);
+            } else {
+                log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
+                        booking.getId());
+            }
+            return;
+        }
+        String clientEmail = booking.getClient().getEmail();
+        UUID clientUserId = booking.getClient().getId();
+        String bookingId = booking.getId().toString();
+
+        emailService.sendSalonClosedEmail(clientEmail, visit);
+        pushService.sendToUser(
+                clientUserId,
+                "Салон закрито",
+                truncate("Салон закрився, і ваше бронювання на " + bookedSubject(visit) + " скасовано"),
+                Map.of("type", "SALON_CLOSED", "bookingId", bookingId)
+        );
+    }
+
     public void notifyClientCancelled(Booking booking) {
         String masterEmail = booking.getMaster().getUser().getEmail();
         UUID masterUserId = booking.getMaster().getUser().getId();
@@ -500,6 +547,46 @@ public class NotificationService {
         }
         return base + Placeholders.format(
                 smsProperties.getSms().getDeclineReason(), Map.of("comment", comment));
+    }
+
+    /**
+     * Dispatches the salon-closure SMS for a {@code LINK} guest visit (Phase 269/293). Mirrors
+     * {@link #sendLinkGuestDeclineSms(Booking)} exactly — same guard, same swallow-and-log-class-
+     * only failure handling (Anti-Bug §I: never log the phone or message text) — the one
+     * difference being the text names the whole VISIT via {@link #bookedSubject(BookingVisit)}
+     * rather than one booking's service, and carries no provider note (D10: {@link BookingVisit}
+     * exposes no note accessor to read in the first place).
+     *
+     * <p>Only the LINK branch of {@link #notifySalonClosed(BookingVisit)} may call this — same
+     * "not the STAFF walk-in" restriction {@link #sendLinkGuestDeclineSms(Booking)} documents.
+     */
+    private void sendSalonClosedGuestSms(BookingVisit visit) {
+        Booking lead = visit.lead();
+        String phone = lead.getGuestPhone();
+        if (phone == null || phone.isBlank()) {
+            log.warn("Guest SALON_CLOSED visit (lead booking {}) has no guestPhone — skipping SMS",
+                    lead.getId());
+            return;
+        }
+        String text = buildSalonClosedSms(visit);
+        try {
+            smsService.send(phone, text);
+        } catch (RuntimeException e) {
+            log.warn("Salon-closed guest SMS failed: {}", e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Renders the salon-closure SMS body. Never reads any booking note — {@link BookingVisit}
+     * exposes no accessor for one (D10) — so there is no reason/comment clause to append, unlike
+     * {@link #buildGuestDeclineSms(Booking)}.
+     */
+    private String buildSalonClosedSms(BookingVisit visit) {
+        OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+        return Placeholders.format(smsProperties.getSms().getSalonClosed(), Map.of(
+                "subject", bookedSubject(visit),
+                "date", SMS_DATE_FMT.format(kyiv),
+                "time", SMS_TIME_FMT.format(kyiv)));
     }
 
     /**

@@ -111,6 +111,17 @@ public class SalonService {
     private final PasswordResetTicketRepository passwordResetTicketRepository;
     private final TokensValidAfterCache tokensValidAfterCache;
 
+    // ── Phase 269/293 — salon-deletion booking cascade ────────────────────────────────────────
+    // BookingService#declineFutureConfirmedBookingsForSalonClosure is the REUSE-FIRST seam this
+    // cascade calls into — it decides which future CONFIRMED bookings need declining and routes
+    // each through the existing declineBookingForBatch / AppointmentTransitionService
+    // #declineAppointmentItems paths, then enqueues one SALON_CLOSED notification per visit. This
+    // is a NEW bean edge (salon.service -> booking.service) but not a circular one: nothing in
+    // BookingService's own dependency graph injects SalonService (verified — grep for
+    // "salon.service.SalonService" under booking/, common/, master/, notification/ before adding
+    // this field turned up only SalonController).
+    private final com.beautica.booking.service.BookingService bookingService;
+
     /**
      * Tombstone email prefix (Phase 291). Combined with {@link #SCRUB_EMAIL_DOMAIN} and the
      * user's own {@code id}, this is the ENTIRE fix for "owner deletes a salon, then cannot
@@ -815,10 +826,13 @@ public class SalonService {
 
     /**
      * Deactivates a salon (Phase 290 — the first destructive write in the salon-deletion
-     * cascade). Beyond the {@code salons} row itself, this now also deactivates the salon's own
-     * staff — see {@link #deactivateSalonStaff(UUID, UUID)} for the full scope. Booking
-     * cancellation, catalogue/favourites cleanup, media purge and the rest of the cascade remain
-     * separate, later phases (293-298) — see {@code docs/backend-phases/phase-290-*.md}
+     * cascade). Beyond the {@code salons} row itself, this also deactivates the salon's own
+     * staff — see {@link #deactivateSalonStaff(UUID, UUID)} for the full scope — and, as of
+     * Phase 269/293, declines every future {@code CONFIRMED} booking at the salon and notifies
+     * the affected clients — see {@link com.beautica.booking.service.BookingService
+     * #declineFutureConfirmedBookingsForSalonClosure} for the full scope (D1-D12 of that phase).
+     * Catalogue/favourites cleanup, media purge and the rest of the cascade remain separate,
+     * later phases (294-298) — see {@code docs/backend-phases/phase-290-*.md}
      * {@code ## Out of scope}.
      *
      * @throws NotFoundException             if {@code ownerId} does not resolve to a user, or if
@@ -874,6 +888,13 @@ public class SalonService {
         salon.setActive(false);
 
         deactivateSalonStaff(ownerId, salonId);
+
+        // Phase 269/293 — decline every future CONFIRMED booking at this salon and notify the
+        // affected clients (one SALON_CLOSED entry per VISIT, D12). Runs inside THIS transaction,
+        // after the idempotency guard and the fail-closed Phase 289 audit precondition above — a
+        // second DELETE on an already-inactive salon never reaches this line, and neither does a
+        // salon a VIOLATIONS_FOUND audit blocked.
+        bookingService.declineFutureConfirmedBookingsForSalonClosure(ownerId, salonId);
 
         // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
         // Also evicts search:salons because a deactivated salon must not appear in discovery

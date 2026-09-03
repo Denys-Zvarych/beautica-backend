@@ -2,6 +2,7 @@ package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingViewAccess;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -1276,6 +1277,152 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("notBefore") OffsetDateTime notBefore,
             @Param("windowEnd") OffsetDateTime windowEnd,
             Pageable pageable);
+
+    // ── Salon-deletion booking cascade (Phase 269/293) ────────────────────────
+
+    /**
+     * Candidates for the salon-deletion booking cascade: every {@code CONFIRMED} booking of
+     * {@code salonId} whose {@code startsAt} is strictly after {@code now} (D3 — the boundary is
+     * applied here, once, against a {@code now} the caller reads once and passes in; a
+     * past-dated {@code CONFIRMED} row is not future work and must never appear in this result).
+     *
+     * <p>Deliberately the SAME narrow-projection shape as
+     * {@link #findConfirmedCandidatesForOverrideConflictCheck} and for the same reason: the
+     * eventual mutation reloads each targeted row itself (via
+     * {@code BookingService#declineBookingForBatch} / {@code AppointmentTransitionService
+     * #declineAppointmentItems}), so this scan only needs enough to GROUP by visit
+     * ({@code appointmentId}), pick the deterministic per-visit representative
+     * ({@code startsAt}, tied on {@code bookingId} — D12), and scope the after-commit cache
+     * eviction ({@code masterId}). No {@code Pageable} cap (§E-3 note): unlike the schedule
+     * override's abuse-prevention concern, a salon-deletion cascade is a one-time terminal event
+     * for that salon and the per-deletion outbox row cap belongs to a later phase (300), not this
+     * query.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.salon.id = :salonId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureBySalonId(
+            @Param("salonId") UUID salonId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Batched twin of {@link #findByIdWithFullGraph} for the salon-deletion booking cascade (perf
+     * finding 1, 2026-09 audit): loads every STANDALONE candidate in {@code ids} in ONE query, with
+     * the SAME entity graph, instead of {@code BookingService#declineFutureConfirmedBookingsForSalonClosure}
+     * calling {@link #findByIdWithFullGraph} once per standalone visit. The per-visit loop's own
+     * SELECT was forcing Hibernate's AUTO flush mode to flush the PREVIOUS visit's still-pending
+     * {@code UPDATE} one row at a time — never letting {@code hibernate.jdbc.batch_size} coalesce
+     * consecutive writes. Loading the whole batch up front removes every per-row SELECT from the
+     * mutation loop, so N declines flush as {@code ceil(N/batch_size)} batches instead of N
+     * individual round trips.
+     *
+     * <p>Deliberately does NOT keep a non-graph variant around (§E-1) — every field this graph
+     * fetches ({@code client}, {@code master.user}, {@code salon}, {@code masterService
+     * .serviceDefinition}) is exactly what {@link #findByIdWithFullGraph} fetches, for the same
+     * downstream reasons (authorization off {@code master}/{@code salon}, the eventual
+     * {@code BookingResponse} mapping off {@code masterService.serviceDefinition}).
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            LEFT JOIN FETCH b.client
+            JOIN FETCH b.master m
+            JOIN FETCH m.user
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.id IN :ids
+            """)
+    List<Booking> findAllByIdInWithFullGraph(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * Atomic bulk-conditional UPDATE for the salon-deletion booking cascade's standalone leg
+     * (perf re-audit, 2026-09, Finding A — supersedes {@code declineIfConfirmed}, the per-row
+     * atomic {@code UPDATE} the PRIOR security re-audit introduced). That fix closed a real
+     * check-then-act race (see git history for its own Javadoc) by moving the freshness check
+     * into the write itself — correct — but paid for it by calling {@code executeUpdate()} once
+     * per standalone booking: a {@code @Modifying} bulk JPQL statement runs immediately and can
+     * never be queued into Hibernate's {@code hibernate.jdbc.batch_size} flush the way
+     * entity-manager {@code save()} calls can, so the write phase regressed from the earlier
+     * perf-1 fix's {@code ⌈M/50⌉} batched flushes back to {@code M} individual round trips.
+     *
+     * <p>This method restores the batching WITHOUT giving up the atomicity: ONE native statement
+     * declines every row in {@code ids} that is STILL {@code CONFIRMED}, and reports exactly
+     * which ones via Postgres {@code RETURNING} — a single round trip regardless of {@code
+     * ids.size()}. No {@code @Modifying} JPQL form can express "affected ids, not just a count",
+     * which is why this is a native query executed via {@code getResultList()} (mirrors {@link
+     * com.beautica.notification.repository.NotificationOutboxRepository#claimPendingBatch}, the
+     * existing {@code UPDATE ... RETURNING} precedent in this codebase).
+     *
+     * <p><b>Atomicity is IDENTICAL to the per-row form it replaces — this is not a relaxation.</b>
+     * PostgreSQL evaluates {@code WHERE status = 'CONFIRMED'} row-by-row within the single
+     * statement and takes each row's lock as it acts on it; a row concurrently flipped to
+     * CANCELLED by its own client between this statement's start and the instant it reaches that
+     * row is excluded from the {@code RETURNING} result exactly as it would be excluded (0
+     * affected) under N separate {@code UPDATE ... WHERE id = ? AND status = 'CONFIRMED'}
+     * statements. There is no window between "check" and "act" for ANY row in {@code ids},
+     * regardless of how many other rows the same statement is also touching.
+     *
+     * <p><b>{@code updated_at} is set explicitly.</b> A native/bulk statement bypasses {@code
+     * AuditableEntity}'s {@code @UpdateTimestamp} Hibernate value generator entirely — that
+     * generator only fires on the ORM's own entity-level flush — so omitting it would silently
+     * stop bumping this column for every cascade-declined standalone booking.
+     *
+     * <p>Callers MUST have already run {@code authz.enforceCanCancelBooking}, {@code
+     * assertNotAppointmentChild} and {@code assertTransition} against a freshly-loaded snapshot
+     * of EVERY id in {@code ids} before calling this method — it performs NO authorization or
+     * transition-legality check of its own, only the atomic write. See {@code
+     * BookingService#declineConfirmedBookingsAtomic}, its only caller.
+     *
+     * <p><b>Stale-entity trap — read before adding a caller.</b> Any {@code Booking} entity for an
+     * id in {@code ids} already resident in this transaction's persistence context (e.g. loaded
+     * moments earlier by {@link #findAllByIdInWithFullGraph}) is left with a stale in-memory
+     * {@code status = CONFIRMED} after this call returns: a native statement writes the database
+     * row directly and never touches the persistence context, so Hibernate has no way to know
+     * that entity is now out of date. Never assign a field on one of those entities after calling
+     * this method in the same transaction — a later setter call, or an {@code
+     * entityManager.find(Booking.class, id)}, silently returns the stale CONFIRMED instance, and a
+     * subsequent flush of that entity could overwrite this statement's own DECLINED write.
+     *
+     * @param ids              standalone-booking ids to attempt, already authorization- and
+     *                         transition-checked by the caller — an id NOT present in the
+     *                         returned list lost the race between that check and this statement
+     *                         and must not be treated as declined
+     * @param reason           {@link CancellationReason#name()} — bound as plain text since this
+     *                         is a native query against a {@code VARCHAR} column, not a JPQL enum
+     *                         reference
+     * @param providerComment  always {@code null} for this cascade (D5); accepted as a parameter
+     *                         rather than hardcoded so this method stays reusable for any future
+     *                         bulk-decline caller
+     * @param now              the SAME {@code now} the caller resolved once at the top of its own
+     *                         scan (D3) — stamped onto every affected row's {@code updated_at},
+     *                         never re-read here
+     * @return the ids, a subset of {@code ids} (never a superset), that were actually {@code
+     *         CONFIRMED} and are now {@code DECLINED}; empty if every id had already left
+     *         {@code CONFIRMED}
+     */
+    @Query(value = """
+            UPDATE bookings
+               SET status = 'DECLINED',
+                   cancellation_reason = :reason,
+                   provider_comment = :providerComment,
+                   updated_at = :now
+             WHERE id IN (:ids)
+               AND status = 'CONFIRMED'
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> declineConfirmedBulk(
+            @Param("ids") Collection<UUID> ids,
+            @Param("reason") String reason,
+            @Param("providerComment") String providerComment,
+            @Param("now") Instant now);
 
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)

@@ -27,7 +27,9 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -1117,6 +1119,101 @@ class AuthorizationServiceTest {
 
         assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── enforceCanManageAppointment(actor, appointment, memo) — cascade-scoped ─
+    // ── memo overload (perf finding 2, 2026-09 re-audit) ───────────────────────
+
+    @Test
+    @DisplayName("enforceCanManageAppointment(actor, appointment, memo) — the SALON_OWNER "
+            + "existsByIdAndOwnerId check is issued AT MOST ONCE across multiple calls sharing the "
+            + "same memo instance: a salon-wide cascade calling this overload once per appointment-"
+            + "visit must not re-issue the identical (salonId, actorId) EXISTS statement for every "
+            + "visit — the bug the 2-arg overload's own per-visit AppointmentAuthorityKey dedup "
+            + "cannot catch, since it only collapses duplicates WITHIN one appointment's items")
+    void should_issueExistsByIdAndOwnerIdOnlyOnce_when_sameMemoSharedAcrossTwoAppointmentVisits() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID appointmentId2 = UUID.randomUUID();
+        UUID masterUserId1 = UUID.randomUUID();
+        UUID masterUserId2 = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId1))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserId1, salonId)));
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId2))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserId2, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo = new HashMap<>();
+
+        assertThatCode(() -> {
+            authorizationService.enforceCanManageAppointment(actorId, appointmentId1, managementAccessMemo);
+            authorizationService.enforceCanManageAppointment(actorId, appointmentId2, managementAccessMemo);
+        }).doesNotThrowAnyException();
+
+        verify(salonRepository, times(1)).existsByIdAndOwnerId(salonId, actorId);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointment(actor, appointment, memo) — still throws "
+            + "ForbiddenException for an unauthorized actor: the memo speeds up a repeated TRUE "
+            + "answer, it must never manufacture a false one")
+    void should_stillThrowForbidden_when_actorUnauthorizedViaMemoOverload() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserId, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(false);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(
+                actorId, appointmentId, new HashMap<>()))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointment(actor, appointment, memo) — security finding, "
+            + "2026-09 re-audit, Finding B: two DIFFERENT actors sharing ONE memo instance must "
+            + "never leak the first actor's cached ownership answer to the second actor for the "
+            + "SAME salonId — the memo is keyed on (actorId, salonId) together, never on salonId "
+            + "alone, so an unrelated actor's lookup can never hit a stale TRUE entry seeded by a "
+            + "different actor")
+    void should_notLeakOwnershipAnswer_when_twoActorsShareOneMemoInstance() {
+        UUID actorA = UUID.randomUUID();
+        UUID actorB = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentIdA = UUID.randomUUID();
+        UUID appointmentIdB = UUID.randomUUID();
+        UUID masterUserIdA = UUID.randomUUID();
+        UUID masterUserIdB = UUID.randomUUID();
+        Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo = new HashMap<>();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentIdA))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserIdA, salonId)));
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentIdB))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserIdB, salonId)));
+
+        // actorA genuinely owns salonId — this call populates the shared memo with a TRUE entry.
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorA, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorA)).thenReturn(true);
+        authorizationService.enforceCanManageAppointment(actorA, appointmentIdA, managementAccessMemo);
+
+        // actorB does NOT own salonId. If the memo were keyed on bare salonId, actorB's lookup
+        // would hit actorA's cached TRUE entry and wrongly succeed without ever calling
+        // existsByIdAndOwnerId for actorB.
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorB, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorB)).thenReturn(false);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(
+                actorB, appointmentIdB, managementAccessMemo))
+                .as("actorB does not own salonId — sharing actorA's memo instance must not let "
+                        + "actorB inherit actorA's cached TRUE answer for the same salonId")
+                .isInstanceOf(ForbiddenException.class);
+        verify(salonRepository, times(1)).existsByIdAndOwnerId(salonId, actorB);
     }
 
     // ── canRescheduleAppointment (Phase 27.2 SpEL predicate, visit-level — no ──

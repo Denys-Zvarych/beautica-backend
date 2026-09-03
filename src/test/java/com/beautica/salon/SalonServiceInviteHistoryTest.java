@@ -133,6 +133,12 @@ class SalonServiceInviteHistoryTest {
     @Mock
     private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
+    // Phase 269/293: SalonService now also constructor-depends on the salon-deletion booking
+    // cascade. Neither listSalonInvites/cancelInvite exercises deactivateSalon, so a plain mock
+    // satisfies the constructor without any stubbing.
+    @Mock
+    private com.beautica.booking.service.BookingService bookingService;
+
     private SalonService salonService;
 
     @BeforeEach
@@ -143,7 +149,8 @@ class SalonServiceInviteHistoryTest {
                 masterServiceRepository, localityWriteValidator, masterService, cityRepository,
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, refreshTokenRepository,
-                deviceTokenRepository, passwordResetTicketRepository, tokensValidAfterCache);
+                deviceTokenRepository, passwordResetTicketRepository, tokensValidAfterCache,
+                bookingService);
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

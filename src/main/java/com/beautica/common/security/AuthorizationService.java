@@ -21,6 +21,7 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
@@ -762,12 +763,136 @@ public class AuthorizationService {
             throw new ForbiddenException("Access denied");
         }
         Role actorRole = roleFromCurrentAuthentication();
-        boolean authorizedForEveryItem = access.stream().allMatch(v ->
-                hasProviderAuthorityOverBooking(v.salonId() == null, v.masterUserId(), v.salonId(), actorUserId, actorRole));
+        // Perf finding 2 (2026-09 audit): a visit's items share the same (masterUserId, salonId) by
+        // construction — VisitPlanner.planChainedItems resolves every chained item off one Master —
+        // so K items previously issued K identical hasManagementAccess/existsByIdAndOwnerId
+        // statements for the SAME salon/actor. Deduping the (independent-master flag, masterUserId,
+        // salonId) triple before the per-row check collapses that down to one statement per DISTINCT
+        // combination — normally 1, never fewer than this method's own "no DB constraint, don't
+        // trust single-master" guarantee requires: a mixed-master visit still gets its own authority
+        // check per distinct master/salon, so allMatch's result is bit-for-bit identical to the
+        // undeduped form, just cheaper to compute.
+        boolean authorizedForEveryItem = access.stream()
+                .map(v -> new AppointmentAuthorityKey(v.salonId() == null, v.masterUserId(), v.salonId()))
+                .distinct()
+                .allMatch(k -> hasProviderAuthorityOverBooking(
+                        k.independentMasterBooking(), k.masterUserId(), k.salonId(), actorUserId, actorRole));
         if (!authorizedForEveryItem) {
             throw new ForbiddenException("Access denied");
         }
     }
+
+    /**
+     * Cascade-scoped overload of {@link #enforceCanManageAppointment(UUID, UUID)} (perf finding 2,
+     * 2026-09 re-audit) — used by {@code AppointmentTransitionService#declineAppointmentItems}'s
+     * memo-carrying sibling, called from {@code BookingService
+     * #declineFutureConfirmedBookingsForSalonClosure}'s appointment-visit loop.
+     *
+     * <p><b>The bug this closes.</b> {@link #enforceCanManageAppointment(UUID, UUID)}'s own
+     * {@link AppointmentAuthorityKey} dedup only collapses duplicate authority checks WITHIN one
+     * appointment's items — a salon-wide closure cascade calls this method once per appointment-
+     * visit, and every visit shares the same {@code (actorId, salonId)} SALON_OWNER pair (one
+     * salon is being deleted, one owner is deleting it), so the {@code
+     * salonRepository.existsByIdAndOwnerId} statement {@link #hasManagementAccess(UUID, UUID, Role)}
+     * issues for that pair was being repeated once per visit — O(distinct appointment-visits)
+     * identical EXISTS checks for an answer that cannot change mid-cascade (the whole cascade runs
+     * inside ONE transaction).
+     *
+     * <p>Identical authorization DECISION to the 2-arg overload — same projection, same per-visit
+     * {@link AppointmentAuthorityKey} dedup, same {@link #hasProviderAuthorityOverRow} kernel. The
+     * only difference is that the SALON_OWNER branch routes through {@code managementAccessMemo}
+     * instead of calling {@code salonRepository.existsByIdAndOwnerId} directly, so a caller sharing
+     * ONE map instance across multiple calls to this overload pays that statement at most once per
+     * distinct {@code salonId} for the whole cascade, not once per visit.
+     *
+     * <p><b>Deliberately NOT a shared core with the 2-arg overload.</b> That overload's own per-call
+     * dedup is keyed on {@link AppointmentAuthorityKey}, which also varies on {@code masterUserId} —
+     * a mixed-master, same-salon visit calls {@code existsByIdAndOwnerId} once per distinct master
+     * under THAT overload today, and this fix must not silently change that overload's own,
+     * already-audited query count for every other caller. Keeping the two implementations separate
+     * (rather than threading an optional memo through one shared method) guarantees the untouched
+     * overload's behaviour — including its statement count — is bit-for-bit unchanged by this fix.
+     *
+     * @param managementAccessMemo call-scoped memo of the SALON_OWNER ownership answer, keyed by
+     *                              {@link MemoKey} (security finding, 2026-09 re-audit — Finding
+     *                              B: keyed on {@code (actorId, salonId)} together, never on bare
+     *                              {@code salonId}, so a memo instance can never be shared across
+     *                              two different actors and answer the SECOND actor's ownership
+     *                              question with the FIRST actor's cached result — see
+     *                              {@link MemoKey}'s own Javadoc) — the caller MUST create one
+     *                              fresh, mutable map per top-level cascade call and MUST NEVER
+     *                              retain or reuse it beyond that call. A memo that outlived its
+     *                              call would be a genuine authorization bug: it could serve a
+     *                              stale ownership answer to a later, unrelated decision for the
+     *                              same actor (e.g. after a salon ownership transfer committed in
+     *                              a LATER transaction). This is deliberately narrower than — and
+     *                              never reuses — {@link ActorSalonAssignmentMemo}'s
+     *                              request-lifetime scope: that class also degrades to a plain
+     *                              read when no HTTP request is bound to the thread, which is
+     *                              exactly the shape of every direct-service-call test/IT for this
+     *                              cascade, so it would silently fail to memoize anything in
+     *                              exactly the case this fix targets.
+     */
+    public void enforceCanManageAppointment(
+            UUID actorUserId, UUID appointmentId, Map<MemoKey, Boolean> managementAccessMemo) {
+        List<BookingCompletionAccess> access =
+                bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId);
+        if (access.isEmpty()) {
+            throw new ForbiddenException("Access denied");
+        }
+        Role actorRole = roleFromCurrentAuthentication();
+        boolean authorizedForEveryItem = access.stream()
+                .map(v -> new AppointmentAuthorityKey(v.salonId() == null, v.masterUserId(), v.salonId()))
+                .distinct()
+                .allMatch(k -> hasProviderAuthorityOverRow(
+                        k.independentMasterBooking(), k.masterUserId(), k.salonId(), actorUserId,
+                        sid -> memoizedManagementAccess(sid, actorUserId, actorRole, managementAccessMemo)));
+        if (!authorizedForEveryItem) {
+            throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * Dedup/memo key for {@link #enforceCanManageAppointment(UUID, UUID, Map)}'s call-scoped
+     * SALON_OWNER ownership memo (security finding, 2026-09 re-audit — Finding B). Keyed on BOTH
+     * {@code actorId} and {@code salonId}, deliberately: the ownership answer this memo caches
+     * ({@code salonRepository.existsByIdAndOwnerId(salonId, actorId)}) depends on both, so a map
+     * keyed on {@code salonId} alone would let a caller who shares ONE memo instance across two
+     * different actors silently inherit the FIRST actor's cached answer for the SECOND actor's
+     * identical-{@code salonId} question — a real authorization bypass, not merely a cache-key
+     * cosmetic. Not reachable today (the only caller, {@code
+     * BookingService#declineFutureConfirmedBookingsForSalonClosure}, creates one fresh map per
+     * call and never shares it across actors), but the type itself should make that bug
+     * unrepresentable rather than merely unreached by today's one caller.
+     */
+    public record MemoKey(UUID actorId, UUID salonId) {}
+
+    /**
+     * The SALON_OWNER branch of {@link #hasManagementAccess(UUID, UUID, Role)}, routed through a
+     * caller-owned memo (perf finding 2, 2026-09 re-audit) — see
+     * {@link #enforceCanManageAppointment(UUID, UUID, Map)}'s Javadoc for the memo's contract.
+     * Every other role is unaffected by this memo: {@code SALON_ADMIN} already has its own
+     * request-scoped memo ({@link ActorSalonAssignmentMemo}), and any other role short-circuits to
+     * {@code false} with no query at all, exactly as {@link #hasManagementAccess(UUID, UUID, Role)}
+     * does today.
+     */
+    private boolean memoizedManagementAccess(
+            UUID salonId, UUID actorId, Role actorRole, Map<MemoKey, Boolean> managementAccessMemo) {
+        if (actorRole != Role.SALON_OWNER) {
+            return hasManagementAccess(salonId, actorId, actorRole);
+        }
+        MemoKey key = new MemoKey(actorId, salonId);
+        return managementAccessMemo.computeIfAbsent(
+                key, k -> salonRepository.existsByIdAndOwnerId(k.salonId(), k.actorId()));
+    }
+
+    /**
+     * Dedup key for {@link #enforceCanManageAppointment}'s batched authority check (perf finding 2,
+     * 2026-09 audit) — two {@link BookingCompletionAccess} rows collapse to one authority check iff
+     * they agree on all three fields, i.e. would have produced the exact same
+     * {@link #hasProviderAuthorityOverBooking(boolean, UUID, UUID, UUID, Role)} call.
+     */
+    private record AppointmentAuthorityKey(boolean independentMasterBooking, UUID masterUserId, UUID salonId) {}
 
     /**
      * Service-layer completion guard (Phase 18.4) — the entity-based twin of

@@ -42,5 +42,16 @@ public enum OutboxEventType {
      * This is a work-queue reminder, not a status transition: nothing that enqueues or drains this
      * event may ever write {@code bookings.status} — see {@code ClosureReminderArchitectureTest}.
      */
-    CLOSURE_REMINDER
+    CLOSURE_REMINDER,
+
+    /**
+     * Notifies the CLIENT (or guest) that the SALON they had a future booking with was deleted by
+     * its owner and the booking was auto-declined (Phase 269/293). One entry per affected VISIT,
+     * never per booking (D12) — {@code aggregate_id} is the representative booking of the visit
+     * (lowest {@code starts_at}, tied on {@code id}), deduplicated on
+     * {@code coalesce(appointment_id, id)} exactly like the locked one-SMS-per-visit rule
+     * (Phase 260 / 22.13). See {@code SalonService#deactivateSalon} and
+     * {@code BookingService#declineFutureConfirmedBookingsForSalonClosure}.
+     */
+    SALON_CLOSED
 }
