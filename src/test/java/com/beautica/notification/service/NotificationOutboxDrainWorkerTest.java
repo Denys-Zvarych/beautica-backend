@@ -453,6 +453,33 @@ class NotificationOutboxDrainWorkerTest {
         assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
     }
 
+    // ── Test 10d: MASTER_REMOVED dispatches to notifyMasterRemoved as a VISIT (Phase 298) ──
+    //
+    // Phase 298 case 6 (D1 drain pin): the failure mode this phase can most plausibly ship
+    // silently is enqueuing MASTER_REMOVED rows that the drain worker's switch has no case for —
+    // the row sits enqueued, nothing ever sends, and no test that only asserts the outbox row
+    // would notice. Deleting `case MASTER_REMOVED ->` from the switch must turn THIS test red.
+
+    @Test
+    @DisplayName("notifyMasterRemoved is called with the resolved visit and status set to SENT "
+            + "when MASTER_REMOVED entry processed")
+    void should_callNotifyMasterRemoved_when_masterRemovedEntryProcessed() {
+        UUID bookingId = UUID.randomUUID();
+        NotificationOutboxEntry outboxEntry = entry(OutboxEventType.MASTER_REMOVED, 0, null, bookingId);
+        Booking booking = mock(Booking.class);
+
+        when(outboxRepository.claimPendingBatch(50)).thenReturn(List.of(outboxEntry));
+        when(booking.getId()).thenReturn(bookingId);
+        when(bookingRepository.findAllByIdsWithGraph(anyList())).thenReturn(List.of(booking));
+
+        worker.drain();
+
+        // MASTER_REMOVED is visit-aware (VISIT_AWARE_EVENTS), exactly like SALON_CLOSED — must
+        // route through the resolved BookingVisit, not a bare Booking.
+        verify(notificationService, times(1)).notifyMasterRemoved(BookingVisit.single(booking));
+        assertThat(outboxEntry.getStatus()).isEqualTo(OutboxStatus.SENT);
+    }
+
     // ── Test 11: booking deleted between enqueue and drain → PENDING ──────────
 
     @Test

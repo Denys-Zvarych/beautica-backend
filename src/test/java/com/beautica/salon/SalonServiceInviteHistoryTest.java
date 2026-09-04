@@ -132,11 +132,10 @@ class SalonServiceInviteHistoryTest {
     @Mock
     private com.beautica.booking.service.BookingService bookingService;
 
-    // Phase 297: SalonService now also constructor-depends on BookingRepository, backing
-    // removeMaster's future-confirmed-booking guard. Neither listSalonInvites/cancelInvite
-    // exercises removeMaster, so a plain mock satisfies the constructor without any stubbing.
-    @Mock
-    private com.beautica.booking.repository.BookingRepository bookingRepository;
+    // Phase 297/298: bookingService above also backs removeMaster's future-confirmed-booking
+    // cascade (declineFutureConfirmedBookingsForMasterRemoval). Phase 297's dedicated
+    // BookingRepository field for a since-superseded 409-only guard was removed as dead code by
+    // Phase 298 — no separate mock is needed here any more.
 
     // Phase 268: SalonService now also constructor-depends on the salon-deletion
     // catalogue/favourites/media cascade. Neither listSalonInvites/cancelInvite exercises
@@ -166,7 +165,7 @@ class SalonServiceInviteHistoryTest {
                 masterServiceRepository, localityWriteValidator, masterService, cityRepository,
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
-                bookingService, bookingRepository, serviceRepository, favoriteRepository, mediaRepository,
+                bookingService, serviceRepository, favoriteRepository, mediaRepository,
                 mediaService, transactionManager);
     }
 

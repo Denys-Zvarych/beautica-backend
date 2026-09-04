@@ -237,6 +237,29 @@ public class EmailNotificationService {
     }
 
     /**
+     * Sends the CLIENT (or, via {@code NotificationService}, notifies a guest by SMS instead) the
+     * "the master left the salon and your booking is cancelled" e-mail (Phase 298 — {@code
+     * MASTER_REMOVED}). Visit-aware for the same reason {@link #sendSalonClosedEmail} is: exactly
+     * ONE outbox row is enqueued per VISIT (D12), keyed to the visit's representative booking, and
+     * the template must name every declined service of that visit, not just the representative's.
+     *
+     * <p>Deliberately NOT a reuse of {@link #sendSalonClosedEmail} — the salon did not close, only
+     * the master left it, and the two facts must never be conflated in client-facing copy.
+     *
+     * <p>Renders only the service name(s) and visit date/time via {@link #applyVisitVariables} —
+     * no booking note of any kind ({@code clientComment}/{@code clientCancellationNote}/
+     * {@code providerComment}) is read here or passed into the template context (locked track-25
+     * rule, D10). {@link BookingVisit} exposes no accessor for any of them, so there is nothing to
+     * accidentally wire in.
+     */
+    public void sendMasterRemovedEmail(String to, BookingVisit visit) {
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(visit.lead().getClient()));
+        applyVisitVariables(ctx, visit);
+        send(to, "Майстра більше немає в салоні — ваше бронювання скасовано", "email/master-removed", ctx);
+    }
+
+    /**
      * Sends the CLIENT the "one service line was cancelled" e-mail — the PER-ITEM decline
      * ({@code AppointmentTransitionService#declineAppointmentItem}, and every legacy single-service
      * decline). Exactly one service is named, because exactly one was cancelled; the rest of the

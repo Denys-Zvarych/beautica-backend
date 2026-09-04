@@ -504,6 +504,72 @@ class EmailNotificationServiceTest {
     }
 
     // -------------------------------------------------------------------------
+    // sendMasterRemovedEmail (Phase 298) — sibling of sendSalonClosedEmail, deliberately NOT a
+    // reuse (the salon did not close, only the master left it).
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("sendMasterRemovedEmail renders the master-removed template (not salon-closed) "
+            + "with all vars and a formatted startsAt")
+    void should_callMailSenderSend_when_sendMasterRemovedEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>master-removed</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendMasterRemovedEmail("client@example.com", BookingVisit.single(booking));
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        verify(mailSender).send(realMessage);
+
+        assertThat(templateCaptor.getValue()).isEqualTo("email/master-removed");
+        assertThat(realMessage.getSubject())
+                .isEqualTo("Майстра більше немає в салоні — ваше бронювання скасовано");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
+        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
+        // D10 pin, same posture as sendSalonClosedEmail's own case 14.
+        assertThat(captured.getVariable("providerComment")).isNull();
+        assertThat(captured.getVariable("clientComment")).isNull();
+        assertThat(captured.getVariable("clientCancellationNote")).isNull();
+        verify(booking, never()).getProviderComment();
+        verify(booking, never()).getClientComment();
+        verify(booking, never()).getClientCancellationNote();
+    }
+
+    @Test
+    @DisplayName("sendMasterRemovedEmail passes EVERY declined service of a multi-service visit "
+            + "into the template context, with the plural label and the visit-level duration (D12)")
+    void should_passEveryService_when_sendMasterRemovedEmailCalledForVisit() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>visit</html>");
+        OffsetDateTime start = OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Манікюр", start);
+        lenient().when(lead.getEndsAt()).thenReturn(start.plusMinutes(45));
+        lenient().when(lead.getDurationMinutesAtBooking()).thenReturn(45);
+        Booking second = buildVisitItemMock("Педикюр", start.plusMinutes(45), 45);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendMasterRemovedEmail("client@example.com", BookingVisit.of(lead, List.of(lead, second)));
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
+        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
+    }
+
+    // -------------------------------------------------------------------------
     // sendBookingDeclinedEmail
     // -------------------------------------------------------------------------
 

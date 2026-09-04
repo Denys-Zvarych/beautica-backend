@@ -1138,6 +1138,112 @@ class BookingServiceTest {
                 .isTrue();
     }
 
+    // ── declineFutureConfirmedBookingsForMasterRemoval (Phase 298 — master-removal sibling of the
+    // salon-closure cascade above; shares declineFutureConfirmed's entire body via D4) ──────────
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — ownership self-assertion, "
+            + "identical rationale to the salon-closure entry point's own: the actor must own "
+            + "salonId, checked by THIS method itself")
+    void should_throwForbidden_when_actorDoesNotOwnSalon_forMasterRemoval() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.declineFutureConfirmedBookingsForMasterRemoval(
+                actorId, salonId, targetMasterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        // The guard must run BEFORE any booking data is touched, and before the second
+        // (master-belongs-to-salon) self-assertion even queries.
+        verifyNoInteractions(bookingRepository);
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — D4's second self-assertion: "
+            + "masterId must actually belong to salonId, so a masterId from a DIFFERENT salon "
+            + "cannot ride in on a salon the caller legitimately owns")
+    void should_throwForbidden_when_masterDoesNotBelongToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.declineFutureConfirmedBookingsForMasterRemoval(
+                actorId, salonId, targetMasterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — mutation check: enqueues "
+            + "MASTER_REMOVED, never SALON_CLOSED, for a standalone future CONFIRMED booking of "
+            + "the removed master — pins that the shared declineFutureConfirmed body is driven by "
+            + "the caller-supplied eventType, not hardcoded to the salon-closure event")
+    void should_enqueueMasterRemoved_notSalonClosed_when_masterRemovalCascadeRuns() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.now(clock).plusDays(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureByMasterId(eq(targetMasterId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(bookingId, null, targetMasterId, startsAt)));
+        Booking booking = buildBookingStartingAt(
+                bookingId, client, master, msa, BookingStatus.CONFIRMED, startsAt);
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(bookingId)))
+                .thenReturn(List.of(booking));
+        when(bookingRepository.declineConfirmedBulk(eq(List.of(bookingId)), any(), any(), any()))
+                .thenReturn(List.of(bookingId));
+
+        bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, targetMasterId);
+
+        verify(outboxService, times(1)).enqueueMasterRemoved(bookingId);
+        verify(outboxService, never()).enqueueSalonClosed(any());
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — D12: a 3-service future visit "
+            + "of the removed master collapses to ONE MASTER_REMOVED entry, keyed to the "
+            + "lowest-startsAt booking, never one per booking")
+    void should_enqueueOneMasterRemovedEntryPerVisit_when_masterHasMultiServiceVisit() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID earliestBookingId = UUID.randomUUID();
+        UUID laterBookingId = UUID.randomUUID();
+        OffsetDateTime earliestStart = OffsetDateTime.now(clock).plusDays(1);
+        OffsetDateTime laterStart = earliestStart.plusHours(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureByMasterId(eq(targetMasterId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(earliestBookingId, appointmentId, targetMasterId, earliestStart),
+                        new SalonClosureBookingCandidate(laterBookingId, appointmentId, targetMasterId, laterStart)));
+        Booking earliestBooking = buildBookingStartingAt(
+                earliestBookingId, client, master, msa, BookingStatus.CONFIRMED, earliestStart);
+        Booking laterBooking = buildBookingStartingAt(
+                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
+                any(), eq(false), any()))
+                .thenReturn(List.of(earliestBooking, laterBooking));
+
+        bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, targetMasterId);
+
+        verify(outboxService, times(1)).enqueueMasterRemoved(earliestBookingId);
+        verify(outboxService, never()).enqueueMasterRemoved(laterBookingId);
+        verify(outboxService, never()).enqueueSalonClosed(any());
+    }
+
     // ── completeBooking ────────────────────────────────────────────────────────
 
     @Test

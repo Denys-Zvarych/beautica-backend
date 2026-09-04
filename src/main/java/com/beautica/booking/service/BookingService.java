@@ -38,6 +38,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
+import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -1402,6 +1403,14 @@ public class BookingService {
      * per-booking wording). Called by {@code SalonService#deactivateSalon} as the cascade step
      * that follows the salon flag flip and staff deactivation.
      *
+     * <p>Thin entry point (Phase 298 D4): the ownership self-assertion and the salon-scoped
+     * candidate scan are the only things specific to salon closure; everything from the grouping
+     * step down is the shared {@link #declineFutureConfirmed} body, reused verbatim by the
+     * master-removal sibling {@link #declineFutureConfirmedBookingsForMasterRemoval}. The rest of
+     * this javadoc describes that shared body and stays attached here as the canonical
+     * description of the whole mechanism — see {@link #declineFutureConfirmed}'s own (short)
+     * javadoc for what is entry-point-specific.
+     *
      * <p><b>D3 — the boundary is {@code startsAt > now}, read ONCE.</b> {@code now} is resolved a
      * single time via {@link #resolveNow()} and reused for the whole scan — never re-read per row
      * — so a `COMPLETED`, `CANCELLED`, `DECLINED`, `NOT_COMPLETED` or past-dated `CONFIRMED` row is
@@ -1504,6 +1513,83 @@ public class BookingService {
         OffsetDateTime now = resolveNow();
         List<SalonClosureBookingCandidate> candidates =
                 bookingRepository.findConfirmedFutureBySalonId(salonId, now);
+        declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.SALON_CLOSED);
+    }
+
+    /**
+     * Master-scoped sibling of {@link #declineFutureConfirmedBookingsForSalonClosure} (Phase 298
+     * D4) — declines every future {@code CONFIRMED} booking of ONE master being removed from a
+     * salon and enqueues one {@code MASTER_REMOVED} notification per affected VISIT, instead of
+     * refusing the removal with a {@code 409} (Phase 297 D3's now-superseded guard). Called by
+     * {@code SalonService#removeMaster}, BEFORE {@code MasterService#deactivateMaster} /
+     * {@code disposeStaffAccounts} run (Phase 298 D5 — load-bearing ordering, not a habit: this
+     * method's own two self-assertions below require the {@code masters} row to still exist and
+     * still belong to {@code salonId}, which the disposal's {@code DELETE FROM masters} branch —
+     * taken only for a master with NO booking/review history at all — would otherwise have
+     * already undone; see {@code SalonService#removeMaster}'s ordered-checklist javadoc for the
+     * mutation-checked mechanism, including why a master WITH a future booking never actually
+     * reaches that branch).
+     *
+     * <p>Shares the ENTIRE grouping/decline/notify/eviction body with the salon-closure cascade
+     * via {@link #declineFutureConfirmed} — only the candidate scan (master-scoped, not
+     * salon-scoped) and the outbox event type differ. See that method's javadoc, and {@link
+     * #declineFutureConfirmedBookingsForSalonClosure}'s longer one, for the shared mechanism.
+     *
+     * <p><b>Two ownership/scope self-assertions</b> (Phase 298 D4), mirroring the salon-closure
+     * entry point's own defense-in-depth posture: {@code actorUserId} must own {@code salonId}
+     * (identical rationale to the salon-closure self-assertion), AND {@code masterId} must
+     * actually belong to {@code salonId} — otherwise a {@code masterId} from a salon the caller
+     * does NOT own could ride in on a salon the caller DOES legitimately own, since {@code
+     * SalonService#removeMaster}'s own re-check runs against the loaded {@code Master} row, not
+     * against this method's caller-supplied ids.
+     *
+     * @param actorUserId the removing {@code SALON_OWNER}'s id — the provider-authority actor for
+     *                     every decline this method performs
+     * @param salonId     the salon the master is being removed from
+     * @param masterId    the master being removed
+     * @throws ForbiddenException {@code actorUserId} does not own {@code salonId}, or {@code
+     *                             masterId} does not belong to {@code salonId}
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void declineFutureConfirmedBookingsForMasterRemoval(UUID actorUserId, UUID salonId, UUID masterId) {
+        if (!salonRepository.existsByIdAndOwnerId(salonId, actorUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        if (!masterRepository.existsByIdAndSalonId(masterId, salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        OffsetDateTime now = resolveNow();
+        List<SalonClosureBookingCandidate> candidates =
+                bookingRepository.findConfirmedFutureByMasterId(masterId, now);
+        declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.MASTER_REMOVED);
+    }
+
+    /**
+     * Shared cascade body behind both {@link #declineFutureConfirmedBookingsForSalonClosure} and
+     * {@link #declineFutureConfirmedBookingsForMasterRemoval} (Phase 298 D4 — REUSE-FIRST: one
+     * method, parameterised by scope, never a second cascade). Everything from the empty-check
+     * down — the per-visit grouping, the batched standalone read, the management-access memo, the
+     * validate-then-bulk-write split, the appointment-items leg, the outbox window, and the slot
+     * and calendar evictions — is identical for both callers; only {@code eventType} decides which
+     * outbox row gets written per visit. A future fix to this cascade lands on both callers or
+     * neither.
+     *
+     * @param actorUserId the provider-authority actor for every decline this call performs —
+     *                     already proven to own {@code salonId} by the caller's own self-assertion
+     * @param candidates  the scope-specific candidate scan result — salon-wide or master-scoped —
+     *                     already resolved by the caller against {@code now}
+     * @param salonId     the salon every one of {@code candidates}' bookings belongs to — used only
+     *                     to scope the after-commit slot-eviction cache key, never re-validated here
+     * @param now         the SAME instant the caller's own candidate scan used (D3 — resolved
+     *                     once, never re-read here), reused only to stamp {@code updated_at} in
+     *                     {@link #declineConfirmedBookingsAtomic}
+     * @param eventType   {@code SALON_CLOSED} or {@code MASTER_REMOVED} — selects which outbox
+     *                     enqueue method runs per visit representative
+     */
+    private void declineFutureConfirmed(
+            UUID actorUserId, List<SalonClosureBookingCandidate> candidates, UUID salonId,
+            OffsetDateTime now, OutboxEventType eventType) {
         if (candidates.isEmpty()) {
             return;
         }
@@ -1594,7 +1680,12 @@ public class BookingService {
         // the dedup key is each visit's own content, not loop position, so processing standalone
         // visits before appointment visits (rather than in candidate-scan order) is unobservable.
         for (UUID representativeId : representativeIds) {
-            outboxService.enqueueSalonClosed(representativeId);
+            switch (eventType) {
+                case SALON_CLOSED -> outboxService.enqueueSalonClosed(representativeId);
+                case MASTER_REMOVED -> outboxService.enqueueMasterRemoved(representativeId);
+                default -> throw new IllegalStateException(
+                        "declineFutureConfirmed does not support outbox event type " + eventType);
+            }
         }
 
         Set<UUID> masterIds = candidates.stream()
@@ -1608,18 +1699,19 @@ public class BookingService {
 
     /**
      * The deterministic representative of one visit's candidate rows for the single
-     * {@code SALON_CLOSED} outbox entry (D12): the lowest {@code startsAt}, tied on
+     * {@code SALON_CLOSED}/{@code MASTER_REMOVED} outbox entry (D12; Phase 298 widens this
+     * helper's use to the master-removal cascade, unchanged): the lowest {@code startsAt}, tied on
      * {@code bookingId} so the choice never depends on scan/insertion order and a re-run against
      * equivalent fixtures always lands on the same row — chosen ONLY among {@code declinedIds}
      * (security re-audit fix, Finding A). Previously this picked from the FULL candidate list
      * regardless of whether the pick itself survived a concurrent race; a representative that lost
      * the race between the candidate scan and its own decline attempt could then be handed to
-     * {@code NotificationOutboxService#enqueueSalonClosed} even though it was never actually
-     * declined. Filtering to {@code declinedIds} first means: (a) a visit where NOTHING
-     * transitioned yields no representative at all (caller must not enqueue), and (b) a visit
-     * where the deterministic pick itself raced away but a SIBLING did transition still yields
-     * exactly one entry — the next-lowest-{@code startsAt} SURVIVOR, still deterministic for a
-     * given survivor set.
+     * {@code NotificationOutboxService#enqueueSalonClosed}/{@code #enqueueMasterRemoved} even
+     * though it was never actually declined. Filtering to {@code declinedIds} first means: (a) a
+     * visit where NOTHING transitioned yields no representative at all (caller must not enqueue),
+     * and (b) a visit where the deterministic pick itself raced away but a SIBLING did transition
+     * still yields exactly one entry — the next-lowest-{@code startsAt} SURVIVOR, still
+     * deterministic for a given survivor set.
      *
      * @param declinedIds the ids, among {@code visit}'s own bookings, that THIS CALL actually
      *                     transitioned to {@code DECLINED} — for a standalone visit, membership in
@@ -1706,7 +1798,7 @@ public class BookingService {
      * @return the subset of {@code bookingIds} that this call actually transitioned to {@code
      *         DECLINED} — never a superset; an id NOT in this set lost the race sometime after
      *         {@link #assertBatchDeclinePreconditions} ran, and the caller MUST NOT enqueue a
-     *         {@code SALON_CLOSED} entry keyed to it
+     *         {@code SALON_CLOSED}/{@code MASTER_REMOVED} entry keyed to it
      */
     private Set<UUID> declineConfirmedBookingsAtomic(
             List<UUID> bookingIds, StatusUpdateRequest req, OffsetDateTime now) {

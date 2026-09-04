@@ -59,16 +59,18 @@ public class NotificationOutboxDrainWorker {
      * case there without adding it here would leave that case resolving every visit to its lead
      * booking alone, which is the exact defect the visit resolver exists to fix.
      *
-     * <p>{@code SALON_CLOSED} (Phase 269/293) is visit-aware too, but for a DIFFERENT reason than
-     * {@code NEW_BOOKING}/{@code STATUS_CHANGED}: those two are enqueued against the visit's lead
-     * booking while every sibling is still a separate row to describe. {@code SALON_CLOSED} is
-     * already deduplicated to ONE entry per visit at enqueue time (D12 —
-     * {@code NotificationOutboxService#enqueueSalonClosed}'s caller picks the representative
-     * booking), so this resolution exists only so the copy can say «3 послуги» instead of naming
-     * one service out of the three that were actually declined.
+     * <p>{@code SALON_CLOSED} (Phase 269/293) and {@code MASTER_REMOVED} (Phase 298) are
+     * visit-aware too, but for a DIFFERENT reason than {@code NEW_BOOKING}/{@code STATUS_CHANGED}:
+     * those two are enqueued against the visit's lead booking while every sibling is still a
+     * separate row to describe. {@code SALON_CLOSED}/{@code MASTER_REMOVED} are already
+     * deduplicated to ONE entry per visit at enqueue time (D12 —
+     * {@code NotificationOutboxService#enqueueSalonClosed}/{@code #enqueueMasterRemoved}'s caller
+     * picks the representative booking), so this resolution exists only so the copy can say
+     * «3 послуги» instead of naming one service out of the three that were actually declined.
      */
-    private static final Set<OutboxEventType> VISIT_AWARE_EVENTS =
-            Set.of(OutboxEventType.NEW_BOOKING, OutboxEventType.STATUS_CHANGED, OutboxEventType.SALON_CLOSED);
+    private static final Set<OutboxEventType> VISIT_AWARE_EVENTS = Set.of(
+            OutboxEventType.NEW_BOOKING, OutboxEventType.STATUS_CHANGED, OutboxEventType.SALON_CLOSED,
+            OutboxEventType.MASTER_REMOVED);
 
     /**
      * Redacts URL query strings, JWT-shaped values, and Bearer header values from
@@ -354,6 +356,7 @@ public class NotificationOutboxDrainWorker {
             case REVIEW_REQUESTED -> notificationService.notifyReviewRequested(getBooking(entry, bookingCache));
             case CLOSURE_REMINDER -> notificationService.notifyClosureReminder(getBooking(entry, bookingCache));
             case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings));
+            case MASTER_REMOVED -> notificationService.notifyMasterRemoved(getVisit(entry, bookingCache, visitSiblings));
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());
                 // Decrypt inviteUrlSealed from payload (Phase 5.4a cipher); aggregateId is the

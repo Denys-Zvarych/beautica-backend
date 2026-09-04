@@ -241,5 +241,27 @@ public class BookingSmsProperties {
         public void setSalonClosed(String salonClosed) {
             this.salonClosed = salonClosed;
         }
+
+        /**
+         * Master-removal template for a GUEST (LINK) visit (Phase 298). Like {@link #salonClosed},
+         * this is the ONLY channel that reaches a guest — they have no account for email/push.
+         * Placeholders: {@code {subject}} (resolved in Java by {@code
+         * NotificationService#bookedSubject}, never here), {@code {date}}, {@code {time}}.
+         * Deliberately NOT a reuse of {@link #salonClosed}'s copy — the salon did not close, only
+         * the master left it. Carries no reason clause and no client name — there is no provider
+         * note to attach (D10: {@code BookingVisit} exposes no note accessor at all).
+         */
+        private String masterRemoved =
+                "Beautica: На жаль, майстер більше не працює в цьому салоні.\n"
+                        + "Ваше бронювання на {subject}\n"
+                        + "{date} о {time} скасовано.";
+
+        public String getMasterRemoved() {
+            return masterRemoved;
+        }
+
+        public void setMasterRemoved(String masterRemoved) {
+            this.masterRemoved = masterRemoved;
+        }
     }
 }

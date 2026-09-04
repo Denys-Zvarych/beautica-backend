@@ -9,7 +9,7 @@ import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.service.SalonService;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
-import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.service.BookingService;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -67,7 +67,7 @@ class SalonServiceRemoveMasterTest {
     private StaffClientReferenceAuditService staffClientReferenceAuditService;
 
     @Mock
-    private BookingRepository bookingRepository;
+    private BookingService bookingService;
 
     @InjectMocks
     private SalonService salonService;
@@ -89,7 +89,7 @@ class SalonServiceRemoveMasterTest {
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessage("Master does not belong to this salon");
 
-        verifyNoInteractions(staffClientReferenceAuditService, bookingRepository);
+        verifyNoInteractions(staffClientReferenceAuditService, bookingService);
         verify(masterService, never()).deactivateMaster(any(), any(Master.class));
     }
 
@@ -113,7 +113,7 @@ class SalonServiceRemoveMasterTest {
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessage("Cannot remove yourself");
 
-        verifyNoInteractions(staffClientReferenceAuditService, bookingRepository);
+        verifyNoInteractions(staffClientReferenceAuditService, bookingService);
         verify(masterService, never()).deactivateMaster(any(), any(Master.class));
     }
 
@@ -142,7 +142,7 @@ class SalonServiceRemoveMasterTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
 
-        verifyNoInteractions(staffClientReferenceAuditService, bookingRepository);
+        verifyNoInteractions(staffClientReferenceAuditService, bookingService);
         verify(masterService, never()).deactivateMaster(any(), any(Master.class));
     }
 

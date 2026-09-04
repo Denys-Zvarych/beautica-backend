@@ -1,6 +1,7 @@
 package com.beautica.salon;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.auth.Role;
 import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
@@ -9,6 +10,7 @@ import com.beautica.review.service.RatingRecalculationService;
 import com.beautica.salon.service.SalonService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -20,11 +22,16 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -81,6 +88,24 @@ class MasterRemovalIT extends AbstractIntegrationTest {
     @BeforeEach
     void setUp() {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+        // Phase 298 — the master-removal booking cascade's appointment-child leg
+        // (AppointmentTransitionService#declineAppointmentItems ->
+        // AuthorizationService#enforceCanManageAppointment) resolves the actor's ROLE from
+        // SecurityContextHolder, unlike the standalone-booking leg's in-memory salon-ownership fast
+        // path, which needs no Authentication at all. A direct service call (no HTTP request, no
+        // JwtAuthenticationFilter) needs a manually-pushed SALON_OWNER authentication for the
+        // multi-service-visit cases below — mirrors SalonDeactivationCascadeIT's identical setup.
+        SecurityContextHolder.getContext().setAuthentication(authFor(Role.SALON_OWNER));
+    }
+
+    @AfterEach
+    void clearAuthentication() {
+        SecurityContextHolder.clearContext();
+    }
+
+    private static Authentication authFor(Role role) {
+        return new UsernamePasswordAuthenticationToken(
+                "test@example.com", null, List.of(new SimpleGrantedAuthority("ROLE_" + role.name())));
     }
 
     // ── case 1 — the common case: nothing points at the master, both rows go ─────────────────
@@ -219,23 +244,132 @@ class MasterRemovalIT extends AbstractIntegrationTest {
         assertThat(userExists(salon.masterUserId())).isFalse();
     }
 
-    // ── case 7 — D3: a future CONFIRMED booking refuses the removal ─────────────────────────
+    // ── case 7 (Phase 298, inverted) — future CONFIRMED bookings are declined + notified, never ──
+    // refused; the removal proceeds.
+    //
+    // NOTE on the D5 ordering pin: this fixture does NOT itself pin the cascade-before-disposal
+    // ordering, verified empirically (mutation-checked, 2026-09-05) — moving the cascade call
+    // AFTER masterService.deactivateMaster()/disposeStaffAccounts() leaves THIS test green,
+    // because MasterRepository#findIdsWithHistoricalReferences' EXISTS probe against `bookings`
+    // matches ANY status (not just terminal ones), so a master with a future CONFIRMED booking
+    // already counts as "has history" and always takes the DETACH branch, whichever order runs
+    // first — Master#detach() nulls only `user`, never `salon`, so the cascade's own
+    // masterRepository.existsByIdAndSalonId self-assertion still finds the row afterward too. The
+    // ordering guard IS real and IS load-bearing, but the fixture it actually protects is a master
+    // with NO booking history at all: cases 1, 4, 5, 6, 14 and 16 below all use a bookingless
+    // master, so disposeStaffAccounts takes the DELETE branch — reordering those turns every one
+    // of them red (masterRepository.existsByIdAndSalonId 403 against an already-deleted row),
+    // which is what actually pins D5. Recorded here rather than silently left for the next reader
+    // to rediscover.
 
     @Test
-    @DisplayName("case 7 — 409 when the master has a future CONFIRMED booking; nothing is written "
-            + "(D3 — Phase 298 inverts this case, it is not deleted)")
-    void should_refuseWith409_when_masterHasFutureConfirmedBooking() {
+    @DisplayName("case 7 (Phase 298, inverted) — a master with one future CONFIRMED booking: the "
+            + "removal SUCCEEDS, the booking is DECLINED/PROVIDER_UNAVAILABLE, exactly one "
+            + "MASTER_REMOVED outbox row is enqueued keyed to it, the master row survives DETACHED "
+            + "(the decline just created is a historical reference) and the users row is gone")
+    void should_declineAndNotify_when_masterHasFutureConfirmedBooking() {
         Salon salon = createSalon();
         UUID clientId = createClient();
         UUID bookingId = insertStandaloneBooking(clientId, salon, "CONFIRMED", FUTURE);
 
-        assertThatThrownBy(() -> salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId()))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+        salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId());
 
-        assertThat(userExists(salon.masterUserId())).isTrue();
-        assertThat(masterExists(salon.masterId())).isTrue();
-        assertThat(bookingStatus(bookingId)).isEqualTo("CONFIRMED");
+        assertThat(bookingStatus(bookingId)).isEqualTo("DECLINED");
+        assertThat(bookingCancellationReason(bookingId)).isEqualTo("PROVIDER_UNAVAILABLE");
+        assertThat(masterRemovedAggregateIds()).containsExactly(bookingId);
+        assertThat(userExists(salon.masterUserId())).isFalse();
+        assertThat(masterExists(salon.masterId()))
+                .as("bookings.master_id is NO ACTION — the row must survive, detached")
+                .isTrue();
+        assertThat(masterUserId(salon.masterId())).isNull();
+        assertThat(masterDetachedAt(salon.masterId())).isNotNull();
+    }
+
+    // ── case 298-2 — a 3-service future visit: three DECLINED rows, ONE MASTER_REMOVED entry ──
+
+    @Test
+    @DisplayName("Phase 298 case 2 — a 3-service future visit: three independent DECLINED "
+            + "bookings, but exactly ONE MASTER_REMOVED outbox row, keyed to the lowest-startsAt "
+            + "booking (D12)")
+    void should_declineAllServicesAndEnqueueOneEntry_when_masterHasMultiServiceVisit() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        UUID appointmentId = insertAppointmentHeader(clientId, salon.salonId());
+        UUID first = insertAppointmentItem(clientId, salon, appointmentId, FUTURE);
+        UUID second = insertAppointmentItem(clientId, salon, appointmentId, FUTURE.plusHours(1));
+        UUID third = insertAppointmentItem(clientId, salon, appointmentId, FUTURE.plusHours(2));
+
+        salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId());
+
+        assertThat(bookingStatus(first)).isEqualTo("DECLINED");
+        assertThat(bookingStatus(second)).isEqualTo("DECLINED");
+        assertThat(bookingStatus(third)).isEqualTo("DECLINED");
+        assertThat(masterRemovedAggregateIds())
+                .as("one entry per VISIT (D12): a 3-service visit collapses to ONE entry")
+                .containsExactly(first);
+    }
+
+    // ── case 298-3 — a standalone booking AND a separate multi-service visit: two entries ──
+
+    @Test
+    @DisplayName("Phase 298 case 3 — a standalone future booking AND a separate multi-service "
+            + "visit of the SAME master: two MASTER_REMOVED entries, one per visit, and every "
+            + "booking DECLINED")
+    void should_enqueueTwoEntries_when_masterHasStandaloneBookingAndSeparateVisit() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        UUID standaloneId = insertStandaloneBooking(clientId, salon, "CONFIRMED", FUTURE);
+        UUID appointmentId = insertAppointmentHeader(clientId, salon.salonId());
+        UUID visitFirst = insertAppointmentItem(clientId, salon, appointmentId, FUTURE.plusHours(5));
+        UUID visitSecond = insertAppointmentItem(clientId, salon, appointmentId, FUTURE.plusHours(6));
+
+        salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId());
+
+        assertThat(bookingStatus(standaloneId)).isEqualTo("DECLINED");
+        assertThat(bookingStatus(visitFirst)).isEqualTo("DECLINED");
+        assertThat(bookingStatus(visitSecond)).isEqualTo("DECLINED");
+        assertThat(masterRemovedAggregateIds())
+                .as("one entry per visit: the standalone booking plus the 2-service visit = 2 total")
+                .containsExactlyInAnyOrder(standaloneId, visitFirst);
+    }
+
+    // ── case 298-4 — past bookings are untouched, and enqueue NOTHING ────────────────────────
+
+    @Test
+    @DisplayName("Phase 298 case 4 — the removed master's PAST booking is untouched (still "
+            + "COMPLETED) and enqueues no MASTER_REMOVED entry")
+    void should_leavePastBookingUntouched_when_masterRemoved() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        UUID pastBookingId = insertStandaloneBooking(clientId, salon, "COMPLETED", PAST);
+
+        salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId());
+
+        assertThat(bookingStatus(pastBookingId)).isEqualTo("COMPLETED");
+        assertThat(masterRemovedAggregateIds()).isEmpty();
+    }
+
+    // ── case 298-7 — a DIFFERENT master's booking at the same salon is left alone ───────────
+
+    @Test
+    @DisplayName("Phase 298 case 7 — a future CONFIRMED booking belonging to a DIFFERENT master "
+            + "of the same salon is NOT declined and enqueues nothing")
+    void should_notTouchOtherMastersBooking_when_masterRemoved() {
+        Salon salon = createSalon();
+        UUID otherMasterUserId = createUser(
+                "mr-c298-7-other-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salon.salonId());
+        UUID otherMasterId = insertMaster(otherMasterUserId, salon.salonId(), "SALON_MASTER");
+        UUID otherMasterServiceId = insertMasterService(otherMasterId, salon.serviceDefId());
+        UUID clientId = createClient();
+        UUID otherMasterBookingId = insertStandaloneBooking(
+                clientId, otherMasterId, otherMasterServiceId, salon.salonId(), "CONFIRMED", FUTURE);
+
+        salonService.removeMaster(salon.ownerId(), salon.salonId(), salon.masterId());
+
+        assertThat(bookingStatus(otherMasterBookingId))
+                .as("a sibling master's booking must never be touched by THIS master's removal")
+                .isEqualTo("CONFIRMED");
+        assertThat(masterRemovedAggregateIds()).doesNotContain(otherMasterBookingId);
     }
 
     // ── case 8 — D6: the owner's own master row cannot be removed here ──────────────────────
@@ -534,6 +668,21 @@ class MasterRemovalIT extends AbstractIntegrationTest {
         return appointmentId;
     }
 
+    /** One CONFIRMED item of a multi-service visit (Phase 298 cases 2/3) — mirrors {@code
+     * SalonDeactivationCascadeIT#insertAppointmentItem}. */
+    private UUID insertAppointmentItem(UUID clientId, Salon salon, UUID appointmentId, OffsetDateTime startsAt) {
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, "
+                        + "appointment_id, status, starts_at, ends_at, price_at_booking, "
+                        + "duration_minutes_at_booking, buffer_minutes_at_booking, booking_source, "
+                        + "created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, 500.00, 45, 0, 'APP', NOW(), NOW())",
+                bookingId, clientId, salon.masterId(), salon.masterServiceId(), salon.salonId(), appointmentId,
+                startsAt, startsAt.plusMinutes(45));
+        return bookingId;
+    }
+
     private void insertReview(UUID bookingId, UUID clientId, UUID masterId, UUID salonId, int rating) {
         jdbcTemplate.update(
                 "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, "
@@ -629,6 +778,18 @@ class MasterRemovalIT extends AbstractIntegrationTest {
     private String bookingStatus(UUID bookingId) {
         return jdbcTemplate.queryForObject(
                 "SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    private String bookingCancellationReason(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT cancellation_reason FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    /** Every {@code MASTER_REMOVED} outbox aggregate id enqueued so far (Phase 298). */
+    private List<UUID> masterRemovedAggregateIds() {
+        return jdbcTemplate.queryForList(
+                "SELECT aggregate_id FROM notification_outbox WHERE event_type = 'MASTER_REMOVED'",
+                UUID.class);
     }
 
     private UUID bookingCreatedByUserId(UUID bookingId) {

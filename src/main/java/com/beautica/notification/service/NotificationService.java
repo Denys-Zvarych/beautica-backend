@@ -433,6 +433,49 @@ public class NotificationService {
         );
     }
 
+    /**
+     * Notifies the CLIENT (or guest) that the master they had a future booking with was removed
+     * from the salon, and the booking was auto-declined (Phase 298 — {@code MASTER_REMOVED}).
+     * Deliberately NOT a reuse of {@link #notifySalonClosed(BookingVisit)} — the salon did not
+     * close, only the master left it, and copy claiming the salon closed would be false in
+     * billable SMS traffic.
+     *
+     * <p>Same per-visit / per-audience shape as {@link #notifySalonClosed(BookingVisit)}: takes a
+     * {@link BookingVisit} (one {@code MASTER_REMOVED} row is enqueued per VISIT, D12), a
+     * registered client gets email + push, a guest ({@code LINK}) visit gets SMS via {@link
+     * #sendMasterRemovedGuestSms(BookingVisit)}, and a STAFF walk-in's unverified phone is left a
+     * silent no-op — identical gate to the salon-closure path.
+     *
+     * <p>Copy states the master is no longer working at this salon and the appointment was
+     * cancelled — it must never imply the salon closed and must never name a replacement master
+     * (no reassignment machinery exists). No booking note is ever read here (same D10 posture as
+     * {@link #notifySalonClosed(BookingVisit)} — {@link BookingVisit} exposes no note accessor).
+     */
+    public void notifyMasterRemoved(BookingVisit visit) {
+        Booking booking = visit.lead();
+        if (booking.getClient() == null) {
+            if (booking.getBookingSource() == BookingSource.LINK) {
+                sendMasterRemovedGuestSms(visit);
+            } else {
+                log.debug("Skipping MASTER_REMOVED notification for account-less non-LINK booking {}",
+                        booking.getId());
+            }
+            return;
+        }
+        String clientEmail = booking.getClient().getEmail();
+        UUID clientUserId = booking.getClient().getId();
+        String bookingId = booking.getId().toString();
+
+        emailService.sendMasterRemovedEmail(clientEmail, visit);
+        pushService.sendToUser(
+                clientUserId,
+                "Майстра більше немає в салоні",
+                truncate("Майстер, який мав прийняти вас на " + bookedSubject(visit) + ", більше не "
+                        + "працює в цьому салоні, і ваше бронювання скасовано"),
+                Map.of("type", "MASTER_REMOVED", "bookingId", bookingId)
+        );
+    }
+
     public void notifyClientCancelled(Booking booking) {
         User masterUser = providerRecipient(booking, "CLIENT_CANCELLED");
         if (masterUser == null) {
@@ -601,6 +644,44 @@ public class NotificationService {
     private String buildSalonClosedSms(BookingVisit visit) {
         OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
         return Placeholders.format(smsProperties.getSms().getSalonClosed(), Map.of(
+                "subject", bookedSubject(visit),
+                "date", SMS_DATE_FMT.format(kyiv),
+                "time", SMS_TIME_FMT.format(kyiv)));
+    }
+
+    /**
+     * Dispatches the master-removal SMS for a {@code LINK} guest visit (Phase 298). Mirrors
+     * {@link #sendSalonClosedGuestSms(BookingVisit)} exactly — same guard, same swallow-and-log-
+     * class-only failure handling (Anti-Bug §I: never log the phone or message text), same
+     * no-note posture (D10) — only the copy template differs.
+     *
+     * <p>Only the LINK branch of {@link #notifyMasterRemoved(BookingVisit)} may call this — same
+     * "not the STAFF walk-in" restriction {@link #sendLinkGuestDeclineSms(Booking)} documents.
+     */
+    private void sendMasterRemovedGuestSms(BookingVisit visit) {
+        Booking lead = visit.lead();
+        String phone = lead.getGuestPhone();
+        if (phone == null || phone.isBlank()) {
+            log.warn("Guest MASTER_REMOVED visit (lead booking {}) has no guestPhone — skipping SMS",
+                    lead.getId());
+            return;
+        }
+        String text = buildMasterRemovedSms(visit);
+        try {
+            smsService.send(phone, text);
+        } catch (RuntimeException e) {
+            log.warn("Master-removed guest SMS failed: {}", e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Renders the master-removal SMS body. Never reads any booking note — {@link BookingVisit}
+     * exposes no accessor for one (D10) — mirrors {@link #buildSalonClosedSms(BookingVisit)}
+     * exactly, with a copy template that names the master leaving, not the salon closing.
+     */
+    private String buildMasterRemovedSms(BookingVisit visit) {
+        OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+        return Placeholders.format(smsProperties.getSms().getMasterRemoved(), Map.of(
                 "subject", bookedSubject(visit),
                 "date", SMS_DATE_FMT.format(kyiv),
                 "time", SMS_TIME_FMT.format(kyiv)));

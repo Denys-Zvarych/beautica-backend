@@ -8,7 +8,6 @@ import com.beautica.auth.Role;
 import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
-import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -71,7 +70,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Instant;
-import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -135,12 +133,13 @@ public class SalonService {
     // this field turned up only SalonController).
     private final com.beautica.booking.service.BookingService bookingService;
 
-    // ── Phase 297 — single-master removal ─────────────────────────────────────────────────────
-    // BookingRepository#countConfirmedFutureByMasterId backs removeMaster's D3 guard — a master
-    // with a future CONFIRMED booking cannot be removed via this endpoint (refused with 409;
-    // Phase 298 will replace the refusal with a cancel-and-notify cascade). A read-only count, not
-    // BookingService — no cascade behaviour is needed on this path, only the check.
-    private final BookingRepository bookingRepository;
+    // ── Phase 297/298 — single-master removal ─────────────────────────────────────────────────
+    // Phase 297 originally injected BookingRepository here for a read-only
+    // countConfirmedFutureByMasterId guard that refused removal with 409 when the master had a
+    // future CONFIRMED booking. Phase 298 replaced that refusal with a cancel-and-notify cascade
+    // (BookingService#declineFutureConfirmedBookingsForMasterRemoval, called from removeMaster
+    // below) — the same bookingService field above now covers this path too, so the dedicated
+    // BookingRepository field/guard was removed as dead code rather than left unused.
 
     // ── Phase 268 — salon-deletion catalogue/favourites/media cascade ────────────────────────
     // ServiceRepository/FavoriteRepository back the two pure-DB steps that run INSIDE the same
@@ -199,6 +198,27 @@ public class SalonService {
      * and explicitly out of scope for this phase.
      */
     private static final int DEACTIVATE_SALON_TIMEOUT_SECONDS = 30;
+
+    /**
+     * Wall-clock ceiling on {@link #removeMaster}'s single transaction (phase 298 audit, MEDIUM).
+     *
+     * <p>Phase 298 added the same risk class {@link #DEACTIVATE_SALON_TIMEOUT_SECONDS} guards
+     * against, one level down: {@code removeMaster} now runs an unbounded cascade — {@link
+     * com.beautica.booking.service.BookingService#declineFutureConfirmedBookingsForMasterRemoval}
+     * scans, bulk-updates, and inserts one outbox notice per future {@code CONFIRMED} booking of
+     * the master being removed — on the request thread, holding one of {@code
+     * maximum-pool-size: 10} connections for the duration.
+     *
+     * <p><b>Why 15, not 30.</b> {@code deactivateSalon}'s cascade fans out over EVERY master at
+     * the salon; this one is scoped to exactly ONE master, so its realistic worst case (a single
+     * master's forward book, realistically low seconds) is a fraction of the salon-wide case. No
+     * hard cap on future-booking count per master exists in the codebase, so N is not
+     * structurally bounded — only bounded in practice by realistic slot density — which is the
+     * same defence-in-depth reasoning as the salon case, just at half the ceiling: fail loudly
+     * well before a pathological master could starve the pool, without being so tight that a
+     * busy-but-legitimate removal trips it.
+     */
+    private static final int REMOVE_MASTER_TIMEOUT_SECONDS = 15;
 
     /**
      * Ceiling on how many ACTIVE salons one {@code SALON_OWNER} may hold (Perf LOW-3).
@@ -1283,10 +1303,23 @@ public class SalonService {
      *       ONE master's user id (D4) — fail-closed: a hard-delete of a user who is also
      *       referenced as a client elsewhere (a booking, a review, an appointment) is refused,
      *       never silently degraded to a false CLEAN result</li>
-     *   <li>{@link BookingRepository#countConfirmedFutureByMasterId} (D3) — a future
-     *       {@code CONFIRMED} booking refuses the removal with {@code 409} naming the count and
-     *       writes nothing; {@code Phase 298} replaces this refusal with a cancel-and-notify
-     *       cascade, it does not delete this check</li>
+     *   <li>{@link com.beautica.booking.service.BookingService
+     *       #declineFutureConfirmedBookingsForMasterRemoval} (Phase 298 — supersedes Phase 297
+     *       D3's {@code 409} refusal) — every future {@code CONFIRMED} booking of this master is
+     *       declined and its client notified, one {@code MASTER_REMOVED} notice per visit, instead
+     *       of blocking the removal. MUST run before the two steps below — that cascade's own
+     *       ownership/scope self-assertions ({@code salonRepository.existsByIdAndOwnerId},
+     *       {@code masterRepository.existsByIdAndSalonId}) require the {@code masters} row to
+     *       still exist and still belong to {@code salonId}; a master with NO booking/review
+     *       history at all takes {@link #disposeStaffAccounts}'s {@code DELETE FROM masters}
+     *       branch (a master WITH a booking — regardless of its status — always takes the DETACH
+     *       branch instead, per {@code MasterRepository#findIdsWithHistoricalReferences}'
+     *       status-agnostic {@code EXISTS}), so running the cascade after disposal would 403 on
+     *       its own self-assertion for exactly that bookingless-master case, not merely fail to
+     *       find anything to decline. Mutation-checked, 2026-09-05: reordering trips 7 existing
+     *       cases (every bookingless-master fixture) — a not-yet-declined future booking never
+     *       reaches the {@code DELETE} branch by construction, so it is NOT the FK-violation
+     *       scenario a first reading of Phase 295 D6's salon-closure rationale might suggest</li>
      * </ol>
      * Only once every check passes does anything write. {@link MasterService#deactivateMaster}
      * MUST run BEFORE {@link #disposeStaffAccounts(UUID, UUID, List)} — it dereferences {@code
@@ -1296,13 +1329,12 @@ public class SalonService {
      * @throws NotFoundException  if {@code masterId} does not resolve to a master row
      * @throws BusinessException  ({@code 409}) if the row is not a {@code SALON_MASTER} (the
      *                            salon's own owner-master or, defense-in-depth, an
-     *                            {@code INDEPENDENT_MASTER}), is already detached, the master's
-     *                            user is referenced as a client elsewhere, or the master has a
-     *                            future CONFIRMED booking
+     *                            {@code INDEPENDENT_MASTER}), is already detached, or the master's
+     *                            user is referenced as a client elsewhere
      * @throws ForbiddenException ({@code 403}) if the loaded row does not actually belong to
      *                            {@code salonId}, or if the actor targets their own master row
      */
-    @Transactional
+    @Transactional(timeout = REMOVE_MASTER_TIMEOUT_SECONDS)
     public void removeMaster(UUID actorId, UUID salonId, UUID masterId) {
         Master master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
@@ -1339,14 +1371,12 @@ public class SalonService {
                     "This master is also referenced as a client and cannot be removed");
         }
 
-        long futureConfirmedCount =
-                bookingRepository.countConfirmedFutureByMasterId(masterId, OffsetDateTime.now(clock));
-        if (futureConfirmedCount > 0) {
-            throw new BusinessException(
-                    HttpStatus.CONFLICT,
-                    "Master has " + futureConfirmedCount
-                            + " future confirmed booking(s) — cancel or reschedule them first");
-        }
+        // Phase 298 — supersedes Phase 297 D3's 409 refusal. MUST run before deactivateMaster /
+        // disposeStaffAccounts below (D5 — load-bearing, not a habit; see the ordered-checklist
+        // javadoc above for the mutation-checked mechanism): this cascade's own self-assertions
+        // require the masters row to still exist and still belong to salonId, which the disposal's
+        // DELETE branch (a bookingless master) would otherwise have already undone.
+        bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, masterId);
 
         // MUST precede disposeStaffAccounts (see javadoc above): deactivateMaster dereferences
         // master.getUser().getId() to key its cache evictions, and a detached row has no user to

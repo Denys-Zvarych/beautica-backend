@@ -907,30 +907,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("windowEnd") OffsetDateTime windowEnd
     );
 
-    /**
-     * The count of a master's still-{@code CONFIRMED} future bookings — Phase 297 D3's
-     * single-master-removal guard ({@code SalonService#removeMaster}). A non-zero count blocks
-     * the removal with {@code 409}: the master would otherwise vanish out from under a client
-     * holding a live appointment. Served by {@code idx_bookings_master_slot_overlap}
-     * ({@code bookings(master_id, starts_at, ends_at) WHERE status = 'CONFIRMED'}, created in
-     * V26, redefined with the narrowed {@code CONFIRMED}-only predicate in V113) —
-     * it leads with {@code master_id} and is already partial on a superset of this predicate, so
-     * no new index is added. ({@code idx_bookings_master_active_starts_at}, V18, was dropped as
-     * redundant by V27 — do not cite it.)
-     *
-     * <p>Deliberately {@code CONFIRMED} only, not {@code PENDING} — Phase 26's booking flow
-     * auto-approves on create, so no booking in this schema is ever left {@code PENDING}, but the
-     * predicate is written to match {@link #findActiveTimeRangesByMasterInRange} rather than
-     * invent a divergent status set.
-     */
-    @Query("""
-            SELECT COUNT(b) FROM Booking b
-            WHERE b.master.id = :masterId
-              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
-              AND b.startsAt > :now
-            """)
-    long countConfirmedFutureByMasterId(@Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
-
     @Query(value = """
             SELECT EXISTS (
               SELECT 1 FROM bookings
@@ -1418,6 +1394,42 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<SalonClosureBookingCandidate> findConfirmedFutureBySalonId(
             @Param("salonId") UUID salonId, @Param("now") OffsetDateTime now);
+
+    // ── Master-removal booking cascade (Phase 298) ────────────────────────────
+
+    /**
+     * Master-scoped sibling of {@link #findConfirmedFutureBySalonId} for the master-removal
+     * booking cascade ({@code BookingService#declineFutureConfirmedBookingsForMasterRemoval}):
+     * every {@code CONFIRMED} booking of {@code masterId} whose {@code startsAt} is strictly
+     * after {@code now} (D3 boundary, read once by the caller — same rationale as the salon-scoped
+     * twin). Reuses {@link SalonClosureBookingCandidate} as-is rather than a duplicate
+     * {@code MasterRemovalBookingCandidate} — the projection's shape (booking id, appointment id,
+     * master id, {@code startsAt}) is entirely scope-agnostic; only the {@code WHERE} predicate
+     * differs (Phase 298 D3). Renaming the projection to something scope-neutral is a reasonable
+     * follow-up, not done here — it would touch every Phase 293 call site for cosmetic reasons
+     * only.
+     *
+     * <p>Served by {@code idx_bookings_master_slot_overlap}
+     * ({@code bookings(master_id, starts_at, ends_at) WHERE status = 'CONFIRMED'}, created in V26,
+     * narrowed to the {@code CONFIRMED}-only predicate in V113) — leads with {@code master_id} and
+     * is already partial on exactly this predicate, so no new index is added. ({@code
+     * idx_bookings_master_active_starts_at}, V18, was dropped as redundant by V27 — the phase doc's
+     * D3 citation of it is stale; do not cite it.)
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureByMasterId(
+            @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
 
     /**
      * Batched twin of {@link #findByIdWithFullGraph} for the salon-deletion booking cascade (perf

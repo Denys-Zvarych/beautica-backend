@@ -14,6 +14,16 @@ import java.util.UUID;
  * {@code bookingId}) — without hydrating a full {@code Booking}/{@code User} entity graph for
  * what can be a salon-wide scan. Mirrors {@code OverrideConflictCandidate}'s shape and purpose.
  *
+ * <p><b>Widened, scope-agnostic use (Phase 298 D3).</b> The exact same projection also backs the
+ * master-removal booking cascade ({@code BookingService
+ * #declineFutureConfirmedBookingsForMasterRemoval}, {@code BookingRepository
+ * #findConfirmedFutureByMasterId}) — every field here is already scope-agnostic (a booking id, its
+ * optional appointment id, its master id, its start instant), so only the scanning query's {@code
+ * WHERE} clause differs between the salon-scoped and master-scoped callers, never this record.
+ * The name is narrower than its use as a result; renaming it to something scope-neutral (e.g.
+ * {@code FutureBookingCandidate}) is a reasonable follow-up, deliberately not done here — it would
+ * touch every Phase 293 call site for cosmetic reasons only.
+ *
  * @param bookingId     the booking's id
  * @param appointmentId non-null iff this is one leg of a multi-service visit
  * @param masterId      the booking's master — used to scope the after-commit cache eviction to

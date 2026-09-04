@@ -141,11 +141,11 @@ class SalonServiceCacheTest {
     // WITHOUT this bean the whole context fails to load with "required a bean of type
     // BookingService" — the same failure mode userProfileCacheEvictor's comment above documents —
     // taking every test in this file red, not just the ones that exercise deactivateSalon.
+    // Phase 297/298: this same BookingService mock also backs removeMaster's future-confirmed-
+    // booking cascade (declineFutureConfirmedBookingsForMasterRemoval). Phase 297's dedicated
+    // BookingRepository bean/field for a since-superseded 409-only guard was removed as dead code
+    // by Phase 298, so no separate mock is needed here any more.
     @MockBean com.beautica.booking.service.BookingService bookingService;
-    // Phase 297: SalonService now also constructor-depends on BookingRepository, backing
-    // removeMaster's future-confirmed-booking guard. Same failure mode as bookingService above
-    // without this bean.
-    @MockBean com.beautica.booking.repository.BookingRepository bookingRepository;
     // Phase 268: SalonService now constructor-depends on the salon-deletion
     // catalogue/favourites/media cascade's five collaborators. WITHOUT these the whole context
     // fails to load with "No qualifying bean of type ..." — the same failure mode documented

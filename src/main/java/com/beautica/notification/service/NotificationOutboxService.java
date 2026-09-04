@@ -254,6 +254,27 @@ public class NotificationOutboxService {
         save(OutboxEventType.SALON_CLOSED, bookingId, null);
     }
 
+    /**
+     * Enqueues a {@code MASTER_REMOVED} notification entry (Phase 298) — one row per affected
+     * VISIT, never per booking, mirroring {@link #enqueueSalonClosed(UUID)}'s exact D12 contract.
+     * {@code bookingId} MUST be the visit's REPRESENTATIVE booking: the lowest {@code starts_at}
+     * among the visit's declined rows, tied on {@code id} — see {@code BookingService
+     * #declineFutureConfirmedBookingsForMasterRemoval}, the sole caller, for how that
+     * representative is chosen.
+     *
+     * <p>Same shape as {@link #enqueueSalonClosed(UUID)} — no payload, {@code aggregateId} is the
+     * representative booking's id, and the drain worker re-hydrates the full booking (and, for a
+     * multi-service visit, its siblings) at send time so no client PII or booking note is
+     * duplicated into the outbox row.
+     *
+     * @param bookingId the representative booking of the visit whose master was removed
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueMasterRemoved(UUID bookingId) {
+        Objects.requireNonNull(bookingId, "bookingId must not be null");
+        save(OutboxEventType.MASTER_REMOVED, bookingId, null);
+    }
+
     // --- private helpers ---
 
     private void save(OutboxEventType eventType, UUID aggregateId, String payload) {
