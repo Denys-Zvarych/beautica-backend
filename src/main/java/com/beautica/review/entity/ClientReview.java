@@ -51,7 +51,14 @@ import java.util.UUID;
         name = "client_reviews",
         indexes = {
                 // Backs "reviews I've received" reads and the recalculateClientRating aggregate.
-                @Index(name = "idx_client_reviews_subject_client", columnList = "subject_client_id")
+                @Index(name = "idx_client_reviews_subject_client", columnList = "subject_client_id"),
+                // V159 (phase 295 audit HIGH-3). Mirrors the DB index so ddl-auto=validate catches
+                // drift. Backs both the third EXISTS arm of
+                // MasterRepository#findIdsWithHistoricalReferences and the RI check Postgres runs
+                // on DELETE FROM masters — client_reviews_author_master_id_fkey is NO ACTION, and
+                // Postgres never indexes the referencing side of an FK on its own. Without it both
+                // Seq Scanned this table once per master of the salon being deleted.
+                @Index(name = "idx_client_reviews_author_master", columnList = "author_master_id")
         }
 )
 @Getter

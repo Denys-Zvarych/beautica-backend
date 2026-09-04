@@ -41,7 +41,7 @@ import java.util.UUID;
  *       which {@code UserProfileResponse.salonId} surfaces.</li>
  *   <li>{@code EmailVerificationProcessor#verifyAndReturnUserId} — flips
  *       {@code users.email_verified}, which {@code UserProfileResponse.emailVerified} surfaces.</li>
- *   <li>{@code SalonService#deactivateSalonStaff} (Phase 290, private helper of
+ *   <li>{@code SalonService#deleteSalonStaff} (Phase 290, private helper of
  *       {@code deactivateSalon}) — flips {@code isActive} FALSE for a deleted salon's
  *       {@code SALON_MASTER}/{@code SALON_ADMIN} accounts, which {@code UserProfileResponse
  *       .isActive} surfaces. This is the FIRST writer of that field on this DTO — no prior code

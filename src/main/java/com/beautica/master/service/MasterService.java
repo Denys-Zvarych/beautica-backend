@@ -633,7 +633,7 @@ public class MasterService {
     /**
      * Batch sibling of {@link #deactivateMaster(UUID, UUID)} for a caller that already holds
      * every {@link Master} row it needs to deactivate — {@code SalonService}'s salon-deletion
-     * cascade ({@code SalonService#deactivateSalonStaff}), the only caller today. Two Phase 290
+     * cascade ({@code SalonService#deleteSalonStaff}), the only caller today. Two Phase 290
      * perf findings, fixed together because the second is a direct consequence of the first:
      *
      * <ul>
@@ -728,7 +728,7 @@ public class MasterService {
      * {@code hasManagementAccess(UUID, UUID)}</b>: that overload calls
      * {@code roleFromCurrentAuthentication()}, which throws {@code ForbiddenException("Not
      * authenticated")} when {@code SecurityContextHolder} carries no {@code Authentication} —
-     * exactly the case for {@code SalonStaffDeactivationCascadeIT}, which calls
+     * exactly the case for {@code SalonStaffHardDeleteIT}, which calls
      * {@code SalonService.deactivateSalon} directly with no web request in play. A check that
      * required an authenticated context would fail that legitimate direct-service caller, not
      * just an attacker — so this guard is self-contained instead, resolving the actor's persisted

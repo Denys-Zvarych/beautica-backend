@@ -20,7 +20,6 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
-import com.beautica.notification.repository.DeviceTokenRepository;
 import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.audit.StaffClientReferenceViolation;
@@ -41,8 +40,6 @@ import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.InviteHistoryRow;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
-import com.beautica.user.PasswordResetTicketRepository;
-import com.beautica.user.RefreshTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -54,7 +51,6 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -95,20 +91,23 @@ public class SalonService {
     // removeAdmin and rotateAdmin rewrite users.salon_id. All three stale the user-profile cache.
     private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
-    // ── Phase 290 — salon-deletion staff-deactivation cascade ─────────────────────────────────
+    // ── Phase 290/295 — salon-deletion staff cascade ──────────────────────────────────────────
     // StaffClientReferenceAuditService backs both the fail-closed precondition
     // (runAuditForSalon) and staff-id resolution (resolveSalonStaffUserIds) that
-    // deactivateSalon's cascade uses — see that method's javadoc. The remaining four back the
-    // per-staff-user session/notification purge: RefreshTokenRepository/DeviceTokenRepository/
-    // PasswordResetTicketRepository mirror the exact precedent PasswordResetService.resetPassword
-    // already establishes for "revoke everything tied to this account", and
-    // TokensValidAfterCache is the read-through cache JwtAuthenticationFilter checks — without
-    // evicting it, a just-deactivated staff member's already-issued access token would keep
-    // working for up to the cache's TTL despite tokensValidAfter being stamped.
+    // deactivateSalon's cascade uses — see deleteSalonStaff's javadoc. TokensValidAfterCache is
+    // the read-through cache JwtAuthenticationFilter checks; the filter has no is_active test and,
+    // after phase 295, no users row left to read either, so an un-evicted entry would keep a
+    // deleted staff member's already-issued access token working for the cache's whole TTL.
+    //
+    // RefreshTokenRepository / DeviceTokenRepository / PasswordResetTicketRepository were injected
+    // here from phase 290 solely to purge those three tables per staff member, because the account
+    // row SURVIVED the cascade. Phase 295 deletes it, and all three tables carry ON DELETE CASCADE
+    // on users (V1:17, V29:3, V55:22) — so the rows cannot outlive the delete, and marking a
+    // password-reset ticket "used" microseconds before destroying it was pure work. Removed rather
+    // than kept as belt-and-braces: unlike a test-cleanup CASCADE (§O-7), a production FK is
+    // fail-LOUD — if one of those clauses is ever dropped, DELETE FROM users raises a foreign-key
+    // violation out of DELETE /salons/{id} instead of silently leaking a session.
     private final StaffClientReferenceAuditService staffClientReferenceAuditService;
-    private final RefreshTokenRepository refreshTokenRepository;
-    private final DeviceTokenRepository deviceTokenRepository;
-    private final PasswordResetTicketRepository passwordResetTicketRepository;
     private final TokensValidAfterCache tokensValidAfterCache;
 
     // ── Phase 269/293 — salon-deletion booking cascade ────────────────────────────────────────
@@ -121,80 +120,6 @@ public class SalonService {
     // "salon.service.SalonService" under booking/, common/, master/, notification/ before adding
     // this field turned up only SalonController).
     private final com.beautica.booking.service.BookingService bookingService;
-
-    /**
-     * Tombstone email prefix (Phase 291). Combined with {@link #SCRUB_EMAIL_DOMAIN} and the
-     * user's own {@code id}, this is the ENTIRE fix for "owner deletes a salon, then cannot
-     * re-invite the master who was in it" — see {@link User#scrubPii}'s javadoc for the full
-     * mechanism.
-     */
-    private static final String SCRUB_EMAIL_PREFIX = "deleted+";
-
-    /**
-     * RFC 2606 reserves the {@code .invalid} TLD specifically for addresses that are guaranteed
-     * to never resolve — unlike {@code .example}/{@code .test}, which are for documentation, this
-     * is exactly the "known-dead address" semantics a tombstone needs. A domain ending in
-     * {@code .beautica.local} would NOT carry that guarantee (nothing stops a future internal
-     * DNS zone from resolving it); this must end in the reserved TLD itself.
-     */
-    private static final String SCRUB_EMAIL_DOMAIN = "@beautica-deleted.invalid";
-
-    /**
-     * Single shared BCrypt hash rotated onto EVERY scrubbed staff row, in every salon deletion,
-     * for the lifetime of this JVM (Phase 291 perf audit — CRITICAL). Computed exactly ONCE, here,
-     * rather than once per staff member inside {@link #deactivateSalonStaff}'s loop.
-     *
-     * <p><strong>The bug this replaces.</strong> The original code called
-     * {@code passwordEncoder.encode(UUID.randomUUID().toString())} per staff member, sequentially,
-     * on the request thread inside the {@code @Transactional} cascade backing
-     * {@code DELETE /salons/{salonId}} — measured at 56.04 ms/encode with this deployment's
-     * {@code BCryptPasswordEncoder} strength (10, see {@code SecurityConfig#passwordEncoder}):
-     * 1.12 s at N=20 staff, 2.80 s at N=50, pure CPU, holding a Hikari connection and a Tomcat
-     * worker the whole time. It did not parallelise, cache, or benefit from an index — it got
-     * strictly worse with every additional staff member on the salon being deleted.
-     *
-     * <p><strong>Per-user freshness bought no security property.</strong> Nobody can ever present
-     * the plaintext for a tombstoned account either way — the "password" rotated in was a
-     * {@code UUID.randomUUID()} value generated and immediately discarded, never stored or
-     * transmitted anywhere. A single shared hash is exactly as unauthenticatable as N distinct
-     * ones, so computing N of them bought nothing.
-     *
-     * <p><strong>This MUST stay real, valid BCrypt — never a non-BCrypt sentinel.</strong>
-     * {@link com.beautica.auth.AuthService#login} calls {@code passwordEncoder.matches()}
-     * <em>before</em> checking {@code user.isActive()} — the comparison against a scrubbed row's
-     * hash genuinely executes on every login attempt against a tombstoned address, it is not
-     * short-circuited away. A non-BCrypt sentinel (e.g. a literal {@code "SCRUBBED"} string) would
-     * return from {@code matches()} in microseconds, while a real BCrypt comparison costs ~56 ms —
-     * a timing side-channel that would let a prober distinguish "this address belongs to a
-     * scrubbed account" from "this address never existed", fingerprinting tombstoned accounts.
-     * Valid-format BCrypt preserves verify-time parity with every other login attempt in the
-     * system, closing that channel.
-     *
-     * <p><strong>Why a fresh per-JVM-boot random value, encoded once here, rather than a
-     * hardcoded source literal.</strong> Both are equally safe from a security standpoint — this
-     * hash protects nothing (there is no plaintext anyone could ever present that it would
-     * accept), so "identical across deployments" carries no exploitable weakness the way it would
-     * for a real credential. The random-per-boot form was chosen anyway: it avoids a fixed BCrypt
-     * string sitting in version control that a future reviewer has to separately re-derive "this
-     * is intentionally not a secret" for, and this repo's own convention is "secrets via env vars,
-     * never hardcoded" — a literal here would look identical to a violation of that rule on sight,
-     * even though it isn't one. The cost is paid exactly once per JVM lifetime (~56 ms at server
-     * boot), not once per scrubbed user, so the O(1)-per-deletion property this fix exists for is
-     * unaffected either way.
-     *
-     * <p>Deliberately constructed with a locally-owned {@link BCryptPasswordEncoder} rather than
-     * the shared {@link PasswordEncoder} bean this class used to inject solely for this call: a
-     * {@code static final} field initializer runs at class-load time, before Spring has built any
-     * bean graph, so the DI container has nothing to hand over yet. That was the class's ONLY use
-     * of an injected {@code PasswordEncoder} — with the per-user {@code encode()} call gone, the
-     * dependency had nothing left to do, so it was removed from the constructor entirely rather
-     * than kept unused (see the phase doc for the corresponding test-fixture cleanup). Strength is
-     * pinned to {@code 10} to match {@code SecurityConfig#passwordEncoder}; there is no
-     * compile-time link between the two, so if that strength ever changes this literal must be
-     * updated by hand.
-     */
-    private static final String SCRUBBED_PASSWORD_HASH =
-            new BCryptPasswordEncoder(10).encode(UUID.randomUUID().toString());
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -212,6 +137,25 @@ public class SalonService {
      * pagination, not a bigger number.
      */
     private static final int MAX_INVITE_HISTORY = 200;
+
+    /**
+     * Wall-clock ceiling on {@link #deactivateSalon}'s single transaction (phase 295 audit,
+     * MEDIUM-4).
+     *
+     * <p>That method runs two unbounded cascades on a request thread — the phase 269/293 decline
+     * of every future CONFIRMED booking at the salon, then the phase 295 staff hard-delete — while
+     * holding one of {@code maximum-pool-size: 10} connections. Realistic worst case for 20-50
+     * staff with a busy forward book is 5-15 s, which also trips Hikari's
+     * {@code leak-detection-threshold: 10000} and logs a false leak alert. With no ceiling at all,
+     * a pathological salon parks a tenth of the pool indefinitely.
+     *
+     * <p>30 s is deliberately well above the realistic worst case and well below "forever": the
+     * point is that the request fails LOUDLY (a rolled-back transaction and a 500, with the salon
+     * still active and re-deletable) rather than silently starving the pool. It is NOT a
+     * performance fix — moving this cascade off the request thread is a separate, later decision
+     * and explicitly out of scope for this phase.
+     */
+    private static final int DEACTIVATE_SALON_TIMEOUT_SECONDS = 30;
 
     /**
      * Ceiling on how many ACTIVE salons one {@code SALON_OWNER} may hold (Perf LOW-3).
@@ -825,15 +769,21 @@ public class SalonService {
     }
 
     /**
-     * Deactivates a salon (Phase 290 — the first destructive write in the salon-deletion
-     * cascade). Beyond the {@code salons} row itself, this also deactivates the salon's own
-     * staff — see {@link #deactivateSalonStaff(UUID, UUID)} for the full scope — and, as of
-     * Phase 269/293, declines every future {@code CONFIRMED} booking at the salon and notifies
-     * the affected clients — see {@link com.beautica.booking.service.BookingService
-     * #declineFutureConfirmedBookingsForSalonClosure} for the full scope (D1-D12 of that phase).
-     * Catalogue/favourites cleanup, media purge and the rest of the cascade remain separate,
-     * later phases (294-298) — see {@code docs/backend-phases/phase-290-*.md}
-     * {@code ## Out of scope}.
+     * Deactivates a salon and destroys its staff (Phase 290, reversed by Phase 295). Beyond the
+     * {@code salons} row itself this performs two cascades, in this order and no other:
+     * <ol>
+     *   <li>every future {@code CONFIRMED} booking at the salon is declined and the affected
+     *       clients are notified, one {@code SALON_CLOSED} notice per visit — see
+     *       {@link com.beautica.booking.service.BookingService
+     *       #declineFutureConfirmedBookingsForSalonClosure} (Phase 269/293, D1-D12);</li>
+     *   <li>the salon's own staff accounts are HARD-DELETED — see
+     *       {@link #deleteSalonStaff(UUID, UUID)} for the full scope, including why the ordering
+     *       between the two is load-bearing (Phase 295 D6).</li>
+     * </ol>
+     * The salon row itself is only deactivated, never deleted: {@code reviews.salon_id} is
+     * {@code NOT NULL … NO ACTION} (V41:3) and the 2026-09-04 reversal named <i>staff</i>.
+     * Catalogue/favourites cleanup and the media/R2 purge remain Phase 268 — see
+     * {@code docs/backend-phases/phase-295-*.md} {@code ## Out of scope}.
      *
      * @throws NotFoundException             if {@code ownerId} does not resolve to a user, or if
      *                                        {@code salonId} does not resolve to a salon owned by
@@ -843,7 +793,7 @@ public class SalonService {
      *                                        audit finds a violation for this salon — the whole
      *                                        deletion aborts before any mutation runs
      */
-    @Transactional
+    @Transactional(timeout = DEACTIVATE_SALON_TIMEOUT_SECONDS)
     public void deactivateSalon(UUID ownerId, UUID salonId) {
         var caller = userRepository.findById(ownerId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + ownerId));
@@ -887,14 +837,32 @@ public class SalonService {
         // it enforces existence + ownership scoping and cannot be dropped.
         salon.setActive(false);
 
-        deactivateSalonStaff(ownerId, salonId);
-
         // Phase 269/293 — decline every future CONFIRMED booking at this salon and notify the
         // affected clients (one SALON_CLOSED entry per VISIT, D12). Runs inside THIS transaction,
         // after the idempotency guard and the fail-closed Phase 289 audit precondition above — a
         // second DELETE on an already-inactive salon never reaches this line, and neither does a
         // salon a VIOLATIONS_FOUND audit blocked.
+        //
+        // !! ORDERING (phase 295 D6) — THIS RUNS BEFORE deleteSalonStaff. !!
+        // It was the other way round through phase 293, when the staff cascade only flipped
+        // is_active. The rule is: the closure cascade reads the salon's bookings and their
+        // masters, so it runs while those rows are still whole. Nothing here may depend on a
+        // masters row that deleteSalonStaff may have just DELETED or DETACHED.
+        //
+        // Honest scope, measured 2026-09-04 (see SalonStaffHardDeleteIT case 11): reversing this
+        // order is currently OBSERVATIONALLY BENIGN, because the SALON_CLOSED notice never reads
+        // the master (it names the client and the visit's services) and phase 294 already made
+        // every read path on this cascade detach-safe. D6's phase doc claims the notice would be
+        // built "from a null master"; it would not. This ordering is therefore DEFENSIVE — the
+        // direction that stays correct without depending on a whole subsystem remaining
+        // detach-safe — not a bug fix. Keep it anyway; the cost is zero and the alternative
+        // couples this method to that invariant forever.
+        //
+        // Phase 293's own contract is otherwise untouched by phase 295: same transition, same
+        // one-notice-per-visit shape, same recipients.
         bookingService.declineFutureConfirmedBookingsForSalonClosure(ownerId, salonId);
+
+        deleteSalonStaff(ownerId, salonId);
 
         // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
         // Also evicts search:salons because a deactivated salon must not appear in discovery
@@ -910,70 +878,91 @@ public class SalonService {
     }
 
     /**
-     * Deactivates {@code salonId}'s own staff — both the {@code masters} rows AND the backing
-     * {@code users} accounts — as part of {@link #deactivateSalon}'s cascade (Phase 290).
+     * HARD-DELETES {@code salonId}'s own staff — the {@code users} accounts unconditionally, and
+     * the {@code masters} rows behind them wherever nothing historical still points at one
+     * (phase 295, the 2026-09-04 reversal recorded in phase 294 § <i>Decisions — CLOSED</i>).
+     * Replaces phase 290's {@code deactivateSalonStaff} and deletes phase 291's PII-scrub
+     * apparatus outright rather than leaving it as an unreachable second erasure policy (D2).
      *
-     * <h3>Masters</h3>
-     * Reuses {@link MasterService#deactivateMasters} over EVERY currently-active master row for
-     * this salon (REUSE-FIRST — this does not reimplement that method's cache-eviction and
-     * rating-recalculation side effects). That one batch call uniformly covers two distinct rows:
+     * <h3>The order is not a preference — it is the only representable one</h3>
+     * <pre>
+     *   1. UPDATE masters SET user_id = NULL, detached_first_name = …, detached_last_name = …,
+     *                         detached_at = now(), is_active = false   -- Master#detach(...)
+     *   2. DELETE FROM users
+     * </pre>
+     * A bare {@code DELETE FROM users} cannot work, and no transaction ordering rescues it.
+     * {@code fk_masters_user_id} is {@code ON DELETE SET NULL} (V157), so the delete writes
+     * {@code masters.user_id = NULL} and nothing else — and that row then satisfies NEITHER arm of
+     * {@code chk_masters_detachment_coherent}: the ATTACHED arm needs {@code detached_at IS NULL}
+     * with a non-null {@code user_id}, the DETACHED arm needs the name snapshot AND
+     * {@code detached_at}. {@code detached_at} cannot be pre-set while the row is still attached
+     * (the ATTACHED arm forbids it), and Postgres cannot defer a CHECK — only UNIQUE / PK / FK /
+     * EXCLUDE are deferrable. So the snapshot and the null MUST land in one statement, before the
+     * account delete. Pinned by {@code MasterDetachmentContractIT} case 5, which is marked
+     * <i>BINDING ON PHASE 295</i>; do NOT weaken the CHECK to make a one-step delete work.
+     *
+     * <h3>Masters — deleted when they can be, detached when they cannot (D1)</h3>
+     * {@link MasterService#deactivateMasters} runs FIRST over every currently-active master row
+     * for this salon, exactly as it did in phase 290 (REUSE-FIRST — it owns the per-master cache
+     * evictions, the single batched {@code SalonStaffChangedEvent} and the salon-rating
+     * recalculation, and it reads {@code master.getUser().getId()} to key those evictions, which
+     * is only possible while the row is still ATTACHED). That batch uniformly covers the salon's
+     * {@code SALON_MASTER} rows AND the owner's own {@code SALON_OWNER}-type row if
+     * "I also work as a master" is enabled here — deactivating the owner's row is correct and
+     * intended (phase 290 D3, carried into 295); DELETING it is not, and cannot happen, because
+     * only rows resolved from the STAFF user list below are deleted or detached.
+     *
+     * <p>Then, for the staff master rows AS A BATCH:
+     * {@link MasterRepository#findIdsWithHistoricalReferences} asks — in ONE query, never per
+     * master (phase 295 audit HIGH-2) — which of them still have a {@code bookings.master_id} /
+     * {@code reviews.master_id} / {@code client_reviews.author_master_id} row pointing at them.
+     * The loop that follows is a pure in-memory branch over that id set.
      * <ul>
-     *   <li>{@code SALON_MASTER}-type rows — the salon's actual staff.</li>
-     *   <li>The owner's OWN {@code SALON_OWNER}-type master row, if "I also work as a master"
-     *       (Phase 12.x) is enabled in THIS salon.</li>
+     *   <li><b>absent from the set</b> → {@code DELETE FROM masters}. The common case: an invited
+     *       master who never
+     *       took a booking. {@code master_services}, {@code weekly_schedules},
+     *       {@code schedule_exceptions} and {@code working_hours} all cascade.</li>
+     *   <li><b>present in the set</b> → {@link Master#detach} — name snapshot, {@code user_id = NULL},
+     *       {@code is_active = false}. The account is still deleted; what survives is a name label
+     *       on a record belonging to somebody else (a client's own past receipt, a review a client
+     *       wrote). Accepted by the user on 2026-09-04 (phase 294 R2); deleting that third-party
+     *       history to erase the label was offered and REJECTED.</li>
      * </ul>
-     * Neither row type is excluded from the batch — deactivating the owner's own row too is
-     * correct and intended (Phase 290 D3 in the phase doc). {@code masters.salon_id} is retained
-     * by {@code deactivateMasters} — it is never nulled, which is exactly what this cascade
-     * needs: nulling it would read as promotion to {@code INDEPENDENT_MASTER}, the opposite of
-     * the deletion intent.
      *
-     * <p>Perf pass (Phase 290 findings #2/#3, see {@code MasterService#deactivateMasters}'
-     * javadoc for the mechanism): passing the already-loaded {@code salonMasters} list straight
-     * to the batch overload avoids a redundant {@code findByIdWithUserAndSalon} SELECT per master
-     * (the query below already JOIN-FETCHed {@code user}) AND collapses what was N
-     * {@code SalonStaffChangedEvent} publishes — each triggering its own
-     * {@code REQUIRES_NEW} salon-rating recalculation and {@code reviews-by-salon} cache scan —
-     * into exactly one for the whole batch.
-     *
-     * <h3>Users</h3>
+     * <h3>Users — deleted unconditionally (D1)</h3>
      * {@code SALON_MASTER}/{@code SALON_ADMIN} accounts ONLY, resolved via
-     * {@link StaffClientReferenceAuditService#resolveSalonStaffUserIds} — Phase 289's
-     * {@code findSalonStaffUserIds} reused, not re-derived. That resolution structurally can
-     * NEVER include the salon's owner: the owner's {@code role} is {@code SALON_OWNER}, which
-     * satisfies neither the {@code masters.salon_id}-joined {@code SALON_MASTER} predicate nor
-     * the {@code users.salon_id}-scoped {@code SALON_ADMIN} predicate. The owner-account
-     * exemption (Phase 290 D3, locked — the owner's {@code users} row is NEVER touched here) is
-     * therefore a structural property of the query, not a branch this method has to remember.
+     * {@link StaffClientReferenceAuditService#resolveSalonStaffUserIds} — phase 289's
+     * {@code findSalonStaffUserIds} reused, not re-derived. That resolution structurally can NEVER
+     * include the salon's owner: the owner's {@code role} is {@code SALON_OWNER}, which satisfies
+     * neither the {@code masters.salon_id}-joined {@code SALON_MASTER} predicate nor the
+     * {@code users.salon_id}-scoped {@code SALON_ADMIN} predicate. The owner-account exemption
+     * (phase 290 D3 / 270 D4, locked — the owner survives deleting their last salon) is therefore
+     * a structural property of the query, not a branch this method has to remember.
      *
-     * <p>For each resolved staff user: {@code isActive = false}; {@code tokensValidAfter} is
-     * stamped so an already-issued access token stops working immediately rather than merely at
-     * its natural TTL expiry ({@code JwtAuthenticationFilter} has no {@code isActive} check —
-     * only the {@code tokensValidAfter} one, via {@link TokensValidAfterCache}); refresh tokens
-     * are purged; any outstanding password-reset ticket is invalidated (defence in depth — a
-     * deactivated account should not be able to complete a reset that was in flight); and device
-     * tokens are purged so the scrubbed account stops receiving push notifications addressed to a
-     * salon it no longer belongs to. As of Phase 291, each resolved staff user's PII is also
-     * scrubbed via {@link User#scrubPii} — see that method's javadoc for the full column-by-column
-     * contract; this is the change that actually fixes the "cannot re-invite" bug.
+     * <p>Everything with {@code ON DELETE CASCADE} on {@code users} goes with the row: refresh
+     * tokens, device tokens, password-reset tickets, media rows, favourites.
+     * {@code created_by_user_id} on {@code bookings}/{@code appointments} nulls out (phase 294
+     * D5), so a walk-in the deleted staff member rang up survives with its attribution cleared.
      *
-     * <p>Perf pass (Phase 290 finding #1): the {@code isActive}/{@code tokensValidAfter} field
-     * mutations and their per-user cache-eviction registrations stay in the per-user loop — each
-     * cache key is a different person, so that fan-out is correctly proportionate to N. The
-     * session/notification purge below it is NOT per-user DML any more: {@code deleteByUserId} /
-     * {@code deleteByUserId} / {@code markAllUsedByUserId} each issued their own JDBC round trip
-     * per staff member (3N total). {@link RefreshTokenRepository#deleteByUserIdIn},
-     * {@link DeviceTokenRepository#deleteByUserIdIn} and
-     * {@link PasswordResetTicketRepository#markAllUsedByUserIdIn} replace them with exactly THREE
-     * bulk statements against the full {@code staffUserIds} list, called once after the loop.
+     * <h3>Idempotency comes from row absence, not a flag (D4)</h3>
+     * Deleting a row is idempotent by construction — a second {@code DELETE /salons/{id}} resolves
+     * an empty staff set and writes nothing. The phase 291 scrub marker column and its guard are gone with
+     * the column (V158).
+     *
+     * <h3>Known limit — R2 avatar blobs</h3>
+     * {@code media_files} cascades on {@code uploader_id} and {@code users.avatar_r2_key} vanishes
+     * with the row, so the R2 objects behind both are orphaned (§O-8). That is phase 268's media
+     * purge, explicitly out of scope here — recorded, not forgotten.
      */
-    private void deactivateSalonStaff(UUID ownerId, UUID salonId) {
-        // Phase 290 perf pass (findings #2/#3): the masters here are already JOIN-FETCHed with
-        // `user` by findBySalonIdAndIsActiveTrueWithUser — passed straight to the batch overload
-        // rather than re-fetched one-by-one via deactivateMaster(ownerId, master.getId()), and
-        // that overload fires exactly ONE SalonStaffChangedEvent for the whole list instead of
-        // one per master (see MasterService#deactivateMasters' javadoc for the full mechanism —
-        // it also collapses the redundant per-master reviews-by-salon cache scan, finding #4).
+    private void deleteSalonStaff(UUID ownerId, UUID salonId) {
+        // Phase 290 perf pass (findings #2/#3), unchanged by phase 295: the masters here are
+        // already JOIN-FETCHed with `user` by findBySalonIdAndIsActiveTrueWithUser — passed
+        // straight to the batch overload rather than re-fetched one-by-one, and that overload
+        // fires exactly ONE SalonStaffChangedEvent for the whole list instead of one per master.
+        //
+        // This MUST stay ahead of the detach/delete below: deactivateMasterInternal dereferences
+        // master.getUser().getId() to key the master-by-user / master-detail-by-user / user-profile
+        // evictions, and a detached row has no user to read that from.
         List<Master> salonMasters = masterRepository
                 .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
                 .getContent();
@@ -984,76 +973,104 @@ public class SalonService {
             return;
         }
 
-        // Perf audit MEDIUM fix: this used to be a per-staff-member call INSIDE the loop below —
-        // N round trips, one per staff member, in the same method whose own comment two lines down
-        // claims the O(1)-in-N property Phase 290 established for the session/notification purges.
-        // Collapsed to ONE bulk statement for the whole staffUserIds list via a native
-        // InviteToken-to-User join (see InviteTokenRepository#redactEmailsBySalonIdAndStaffUserIds
-        // for why a join, not a plain WHERE email IN (...), is required — every staff member needs
-        // a DIFFERENT tombstone).
+        // Phase 295 (replaces phase 291 D9's tombstone REDACTION of the same rows). MUST run
+        // BEFORE the users delete below: the statement joins invite_tokens.email against the staff
+        // member's live users.email, so once the account row is gone the join matches nothing and
+        // the address is stranded in this salon's invite history forever — and a stale PENDING row
+        // would collide with the phase 296 re-invite. One bulk statement for the whole list.
+        inviteTokenRepository.deleteBySalonIdAndStaffUserIds(salonId, staffUserIds);
+
+        // Cache evictions stay per-user — each key is a different person, so the fan-out is
+        // correctly proportionate to N. Both caches are read AFTER this transaction commits by
+        // paths that would otherwise serve a deleted account: TokensValidAfterCache is what
+        // JwtAuthenticationFilter consults, and the user-profile cache backs GET /users/me.
         //
-        // MUST run BEFORE the loop below calls User#scrubPii on any of these users. The join
-        // matches invite_tokens.email against users.email AS IT IS RIGHT NOW — once scrubPii has
-        // rewritten a user's email to their tombstone, the join can no longer find that user's
-        // original address and the redaction silently no-ops for them. Do NOT move this below the
-        // loop: SalonStaffPiiScrubIT#should_redactInviteTokenEmail_when_salonDeactivated and
-        // #should_preserveUnrelatedSalonsPendingInvite_when_salonDeactivated both pin the
-        // resulting end state and go red the moment this call trails scrubPii.
-        inviteTokenRepository.redactEmailsBySalonIdAndStaffUserIds(
-                salonId, staffUserIds, SCRUB_EMAIL_PREFIX, SCRUB_EMAIL_DOMAIN);
-
-        // Per-user mutations and per-user cache-eviction registrations stay in the loop — each
-        // key is a different person (finding #4's "correctly proportionate" call). Only the
-        // session/notification-purge DML below is batched (finding #1): 3N single-row round
-        // trips collapsed to exactly 3 bulk statements against the full staffUserIds list.
-        Instant now = clock.instant();
-        for (User staffUser : userRepository.findAllById(staffUserIds)) {
-            // `staffUser` is a managed entity loaded within THIS @Transactional boundary, so
-            // Hibernate dirty-checking flushes every mutation below on commit — no explicit save().
-            staffUser.setActive(false);
-            staffUser.setTokensValidAfter(now);
-
-            // Phase 291 — email tombstone + PII scrub. This is the actual fix for "owner deletes
-            // a salon, then cannot re-invite the master who was in it": InviteService.sendInvite/
-            // acceptInvite both gate on the GLOBAL, salon-agnostic userRepository.existsByEmail —
-            // intentionally left unchanged (relaxing it would let acceptInvite insert a second row
-            // with the same email and hit users.email's UNIQUE constraint) — so the fix has to be
-            // data-side. Guarded on scrubbedAt == null so a hypothetical re-entry into this loop
-            // for an already-scrubbed row never re-does this work; deactivateSalon's own
-            // idempotency guard (`if (!salon.isActive()) return;`) already prevents this loop from
-            // running twice for the same salon, but this check makes per-user idempotency a
-            // property of scrubPii's own call site, not an accident of the caller two levels up.
-            if (staffUser.getScrubbedAt() == null) {
-                String tombstoneEmail = SCRUB_EMAIL_PREFIX + staffUser.getId() + SCRUB_EMAIL_DOMAIN;
-                // Perf audit CRITICAL fix: was passwordEncoder.encode(UUID.randomUUID()...) HERE,
-                // per staff member, sequentially, on the request thread — 56.04 ms/encode measured,
-                // 1.12 s at N=20, 2.80 s at N=50. Replaced with SCRUBBED_PASSWORD_HASH, a single
-                // BCrypt hash computed exactly once per JVM boot (see that constant's javadoc for
-                // the full reasoning, including why it must stay real BCrypt rather than a
-                // sentinel). This drops the per-deletion cost of this line to O(1) regardless of N.
-                staffUser.scrubPii(tombstoneEmail, SCRUBBED_PASSWORD_HASH, now);
-            }
-
-            UUID staffUserId = staffUser.getId();
+        // !! LOAD-BEARING FOR SECURITY, not a perf nicety (phase 295 audit HIGH-1). !!
+        // The row this cascade deletes is exactly what that cache reads, and the filter's guard is
+        // driven by its answer. Until the audit fix, "no row" and "row with a null
+        // tokens_valid_after" were the SAME Optional.empty() to the filter, so a deleted account's
+        // access token stayed valid for the rest of its 3600s TTL. TokensValidAfterCache now
+        // answers TokenValidityState.ABSENT for a missing row and the filter refuses to
+        // authenticate on it; this eviction is what makes that effective on the very NEXT request
+        // instead of after the cache's 60s TTL, which is only the fallback bound. Do not drop it,
+        // and do not move it inline — evictTokensValidAfterCacheAfterCommit is afterCommit for the
+        // read-through-race reason its own javadoc gives.
+        for (UUID staffUserId : staffUserIds) {
             evictTokensValidAfterCacheAfterCommit(staffUserId);
-            // isActive is surfaced on UserProfileResponse (GET /users/me) — this cascade is a
-            // NEW writer of that DTO's field; see UserProfileCacheEvictor's "complete writer
-            // set" javadoc, updated alongside this change.
             userProfileCacheEvictor.evictAfterCommit(staffUserId);
         }
 
-        refreshTokenRepository.deleteByUserIdIn(staffUserIds);
-        deviceTokenRepository.deleteByUserIdIn(staffUserIds);
-        passwordResetTicketRepository.markAllUsedByUserIdIn(staffUserIds);
+        // ── step 1 of the binding order: settle every masters row that references a staff
+        // account, so that DELETE FROM users below has nothing left pointing at it.
+        //
+        // Deliberately NOT reusing `salonMasters`: that list is is_active-scoped, and a staff
+        // member deactivated by an earlier operation still owns an ATTACHED masters row whose FK
+        // would fire ON DELETE SET NULL and violate chk_masters_detachment_coherent.
+        Instant now = clock.instant();
+        int detached = 0;
+        int deleted = 0;
+        List<Master> staffMasters = masterRepository.findAllByUserIdInWithUser(staffUserIds);
 
-        // Security audit LOW fix: this cascade previously logged nothing at all — rotateAdmin
-        // logs an INFO line for a far less consequential mutation (SalonService#rotateAdmin).
-        // One line per BATCH, not per staff member — ids and a count only, exactly this repo's
-        // PII-in-logs convention (mirrors PhoneMask's "never the raw value" rule for phone
-        // numbers); the tombstone email, the original email, and any other scrubbed value are
-        // NEVER logged, here or anywhere else in this method.
-        log.info("Salon deletion PII scrub: {} staff member(s) scrubbed for salon {} by actor {}",
-                staffUserIds.size(), salonId, ownerId);
+        // ONE set-based probe for the whole batch, resolved BEFORE the loop (phase 295 audit
+        // HIGH-2). The loop below is then a pure in-memory branch and issues no query of its own.
+        // The predecessor asked per master, and because that finder is a native query with no
+        // declared query spaces Hibernate flushed the whole session before each call — so every
+        // iteration flushed the previous iteration's detach UPDATE alone and re-dirty-checked a
+        // persistence context still holding everything the phase 293 decline cascade loaded.
+        // Removing it also makes masterRepository.flush() below the ONLY flush in this method,
+        // which is what finally lets the detach UPDATEs and the master DELETEs batch.
+        //
+        // A salon whose only staff are SALON_ADMINs (no masters rows at all) reaches here with an
+        // empty list — pinned by SalonStaffHardDeleteIT case 5b.
+        //
+        // CORRECTION, measured 2026-09-04 (phase 295 QA). An earlier version of this comment
+        // claimed the guard was load-bearing because "an empty bind renders `IN ()`, which is a
+        // syntax error". That is FALSE on this stack: Hibernate 6 rewrites an empty list bind for
+        // an IN predicate into an always-false form, and calling
+        // findIdsWithHistoricalReferences(List.of()) directly returns an empty list without
+        // throwing (probed against the Testcontainers Postgres, and confirmed by deleting this
+        // guard and watching all 17 cases stay green). The guard is kept because skipping a
+        // pointless round trip is worth one branch — NOT because the query would fail. Do not
+        // "restore" a correctness rationale here.
+        Set<UUID> mastersWithHistory = staffMasters.isEmpty()
+                ? Set.of()
+                : Set.copyOf(masterRepository.findIdsWithHistoricalReferences(
+                        staffMasters.stream().map(Master::getId).toList()));
+
+        for (Master staffMaster : staffMasters) {
+            if (!mastersWithHistory.contains(staffMaster.getId())) {
+                masterRepository.delete(staffMaster);
+                deleted++;
+            } else {
+                // ONE Hibernate UPDATE writing all five columns together — the whole-row CHECK is
+                // evaluated against the result, so the snapshot and the null must not be split.
+                // The name is read off the live users row that is about to be destroyed; this is
+                // the last moment it exists.
+                staffMaster.detach(
+                        staffMaster.getUser().getFirstName(),
+                        staffMaster.getUser().getLastName(),
+                        now);
+                detached++;
+            }
+        }
+
+        // ── step 2 of the binding order. The explicit flush is MANDATORY, not defensive:
+        // deleteAllByIdInBatch is a bulk JPQL DELETE, and Hibernate's AUTO flush only flushes
+        // pending work whose query space overlaps the statement's — `users`, not `masters`. Without
+        // this the detach UPDATEs would still be sitting in the persistence context when the
+        // account rows disappear, the FK's ON DELETE SET NULL would fire first, and the flush that
+        // followed would try to update rows that no longer satisfy the coherence CHECK. flush() on
+        // any repository flushes the whole EntityManager, which is exactly what is wanted here.
+        masterRepository.flush();
+        userRepository.deleteAllByIdInBatch(staffUserIds);
+
+        // Audit trail — one line per BATCH, ids and counts only, never an email or any other
+        // scrubbed value (this repo's PII-in-logs convention). A hard delete of N accounts is the
+        // single most consequential mutation this service performs; it must leave a record of who
+        // ordered it even though the rows it names are gone.
+        log.info("Salon deletion staff hard-delete: {} account(s) deleted, {} master row(s) deleted, "
+                        + "{} master row(s) detached for salon {} by actor {}",
+                staffUserIds.size(), deleted, detached, salonId, ownerId);
     }
 
     /**

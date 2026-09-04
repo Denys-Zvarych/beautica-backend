@@ -82,14 +82,26 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     /**
      * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids
-     * loading the full {@link User} entity on every cache-refresh read. Returns
-     * {@code Optional.empty()} both when the user does not exist and when
-     * {@code tokensValidAfter} is {@code null} (the common "never reset" case); callers
-     * only need to distinguish "no reset since this instant" from "reset happened at
-     * this instant", so the two empty cases are equivalent for this read path.
+     * loading the full {@link User} entity on every cache-refresh read.
+     *
+     * <p><b>Row existence is part of the answer (phase 295 audit, HIGH-1).</b> This REPLACES the
+     * earlier {@code Optional<Instant> findTokensValidAfterById}, which returned
+     * {@code Optional.empty()} for BOTH "no such row" and "row exists with a null
+     * {@code tokens_valid_after}". {@link com.beautica.auth.JwtAuthenticationFilter} read that
+     * single empty as "no validity check applies" and went on to authenticate — so once phase 295
+     * started HARD-DELETING staff accounts, a deleted user's already-issued access token kept
+     * working for the remainder of its TTL. No non-row variant is kept alongside this one
+     * (Anti-Bug §E-1): a caller reaching for the old shape would silently reopen that fail-open.
+     *
+     * <p>Same {@code users_pkey} probe and the same cost as before — the projection widened by one
+     * column that the row already carries, nothing more.
      */
-    @Query("SELECT u.tokensValidAfter FROM User u WHERE u.id = :userId")
-    Optional<Instant> findTokensValidAfterById(@Param("userId") UUID userId);
+    @Query("""
+            SELECT new com.beautica.user.TokensValidAfterRow(u.id, u.tokensValidAfter)
+            FROM User u
+            WHERE u.id = :userId
+            """)
+    Optional<TokensValidAfterRow> findTokensValidAfterRowById(@Param("userId") UUID userId);
 
     /**
      * Acquires a PostgreSQL row-level exclusive lock on the user row before the

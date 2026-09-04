@@ -58,16 +58,16 @@ import java.util.UUID;
  * exists. Rows are never hard-deleted; an expired row displaced by a re-invite is marked
  * {@link RevocationReason#SUPERSEDED} so the history stays complete.
  *
- * <p><strong>{@code email} is redacted, not exempt, when the recipient is scrubbed.</strong>
- * Phase 291's salon-deletion PII scrub ({@code SalonService#deactivateSalonStaff}) rewrites
- * {@link #email} on every row this salon dispatched to a staff member's original address to that
- * same staff member's {@code users.email} tombstone, via
- * {@code InviteTokenRepository#redactEmailsBySalonIdAndStaffUserIds} — scoped to THIS salon, so an
- * unrelated pending invite to the same address from a different salon is untouched. Without this,
- * the salon owner's own invite history ({@code GET /api/v1/salons/{salonId}/invites}) would keep
- * showing the original address indefinitely, defeating the "irreversible scrub" this phase claims.
- * {@code email} stays {@code nullable = false}, so this redacts rather than nulls — see
- * {@code User#scrubPii}'s identical choice for {@code users.email}.
+ * <p><strong>{@code email} rows are DELETED when the recipient's account is deleted.</strong>
+ * Phase 295's salon-deletion cascade ({@code SalonService#deleteSalonStaff}) removes every row
+ * THIS salon dispatched to a staff member whose {@code users} row it is about to hard-delete, via
+ * {@code InviteTokenRepository#deleteBySalonIdAndStaffUserIds} — scoped to THIS salon, so an
+ * unrelated pending invite to the same address from a different salon is untouched. Two reasons,
+ * both load-bearing: the address would otherwise survive the account deletion here and keep
+ * showing in the owner's own invite history ({@code GET /api/v1/salons/{salonId}/invites}), and a
+ * stale PENDING row for this salon would collide with the re-invite that phase 296 exists to
+ * prove works. This supersedes phase 291's tombstone REDACTION of the same rows, which only made
+ * sense while the {@code users} row survived the deletion.
  */
 @Entity
 @Table(name = "invite_tokens")

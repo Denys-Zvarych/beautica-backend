@@ -91,15 +91,6 @@ class SalonServiceAdminTest {
     private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
 
     @Mock
-    private com.beautica.user.RefreshTokenRepository refreshTokenRepository;
-
-    @Mock
-    private com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
-
-    @Mock
-    private com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
-
-    @Mock
     private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
     @InjectMocks

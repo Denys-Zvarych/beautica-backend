@@ -48,7 +48,11 @@ import java.util.UUID;
         name = "platform_categories",
         indexes = {
                 @Index(name = "idx_platform_categories_token_hash", columnList = "token_hash"),
-                @Index(name = "idx_platform_categories_approved_active", columnList = "name")
+                @Index(name = "idx_platform_categories_approved_active", columnList = "name"),
+                // V159 (phase 295 audit MEDIUM-6). requested_by_user_id is REFERENCES users(id)
+                // ON DELETE SET NULL, whose RI trigger fires once per DELETEd user — unindexed,
+                // that was a Seq Scan per staff account in the salon-deletion hard delete.
+                @Index(name = "idx_platform_categories_requested_by", columnList = "requested_by_user_id")
         }
 )
 // @DynamicInsert: created_at is populated by the DB DEFAULT NOW() (see V64). Without

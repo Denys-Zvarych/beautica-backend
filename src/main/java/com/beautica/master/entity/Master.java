@@ -176,24 +176,55 @@ public class Master extends AuditableEntity {
     }
 
     /**
+     * Stands in for {@code detached_first_name} when the hard-deleted account had no first name of
+     * its own — {@code users.first_name} is nullable (V1:6) but
+     * {@code chk_masters_detachment_coherent} (V157) requires the snapshot's first name, so
+     * SOMETHING must be written. Applied by {@link #detach} itself so no caller can produce a row
+     * the CHECK refuses.
+     *
+     * <p>Deliberately the same bare Ukrainian noun as
+     * {@code SalonReviewResponse#DETACHED_MASTER_LABEL}, the neutral label the PUBLIC salon-review
+     * list already renders for a detached master. The coincidence is intended and harmless: that
+     * constant masks a name that exists, this one substitutes for a name that never did, and a
+     * client reading their own past receipt sees the same generic role noun either way. They are
+     * NOT the same constant, because the two decisions are independent — phase 294 cases 9 and 14
+     * pin them as deliberately disagreeing about a NAMED detached master and must never be
+     * "aligned".
+     */
+    public static final String DETACHED_FALLBACK_FIRST_NAME = "Майстер";
+
+    /**
      * Snapshots the display name and severs the account link — the ONLY writer of the three
      * {@code detached_*} columns.
      *
-     * <p>Package-private on purpose: it is called by the phase 295 salon-deletion cascade and by
-     * nothing else. As of phase 294 there is <b>no caller at all</b> — the schema permits
-     * detachment, nothing performs it (D6).
+     * <p>Widened from package-private to {@code public} in phase 295, which added its FIRST and
+     * ONLY production caller: {@code SalonService#deleteSalonStaff}, in {@code
+     * com.beautica.salon.service} — a different package, so package-private was not reachable from
+     * it. Nothing else may call this. Detachment is not a general-purpose master mutation: it is
+     * the second half of "the staff account was hard-deleted", and calling it without deleting the
+     * matching {@code users} row leaves a live account whose provider profile has silently
+     * vanished from every roster.
      *
      * <p>Ordering matters at the DB level too: {@code chk_masters_detachment_coherent} is evaluated
      * against the row as a whole, so the snapshot and the null must land in the same statement —
      * which they do, since Hibernate flushes this entity as one UPDATE.
      *
-     * @param firstName the deleted account's first name; must not be null (the CHECK requires it)
-     * @param lastName  the deleted account's last name; may legitimately be null
+     * <p><b>A null or blank {@code firstName} is normalised to {@link #DETACHED_FALLBACK_FIRST_NAME}
+     * here, not rejected</b> (phase 295). {@code users.first_name} is NULLABLE (V1:6) — an invited
+     * staff member who never completed their profile genuinely has none — while
+     * {@code chk_masters_detachment_coherent} requires {@code detached_first_name IS NOT NULL}. Left
+     * to the caller, that mismatch takes the whole {@code DELETE /salons/&#123;id&#125;} down with a
+     * constraint violation for one nameless master. Normalising INSIDE the mutator makes the CHECK
+     * unviolatable by construction rather than by every caller remembering.
+     *
+     * @param firstName the deleted account's first name; null/blank is normalised, never rejected
+     * @param lastName  the deleted account's last name; may legitimately be null and is stored as is
      * @param at        the detachment instant, from the injected {@code Clock} — never
      *                  {@code Instant.now()}
      */
-    void detach(String firstName, String lastName, Instant at) {
-        this.detachedFirstName = firstName;
+    public void detach(String firstName, String lastName, Instant at) {
+        this.detachedFirstName =
+                (firstName == null || firstName.isBlank()) ? DETACHED_FALLBACK_FIRST_NAME : firstName;
         this.detachedLastName = lastName;
         this.detachedAt = at;
         this.user = null;

@@ -120,6 +120,15 @@ public class StaffClientReferenceAuditService {
                 violations,
                 auditRepository.findClientReviewSubjectViolationsForSalon(AUDITED_STAFF_ROLES, staffUserIds),
                 StaffClientReferenceType.CLIENT_REVIEW_SUBJECT);
+        // Fourth reference site (phase 295 audit, LOW-8). appointments.client_id is nullable and
+        // NO ACTION exactly like bookings.client_id, so an appointment header naming a staff user
+        // with no sibling booking row of the same client blocks DELETE FROM users just as hard —
+        // and, unchecked, converted this guard's deliberate 409 into an FK-violation 500 further
+        // down the cascade. Salon-scoped only; the platform-wide sweep above keeps its three arms.
+        appendViolations(
+                violations,
+                auditRepository.findAppointmentClientViolationsForSalon(AUDITED_STAFF_ROLES, staffUserIds),
+                StaffClientReferenceType.APPOINTMENT_CLIENT);
 
         return StaffClientReferenceAuditResult.of(violations, clock.instant());
     }

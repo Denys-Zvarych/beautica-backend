@@ -1,12 +1,12 @@
 package com.beautica.auth;
 
+import com.beautica.user.TokensValidAfterRow;
 import com.beautica.user.UserRepository;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -23,10 +23,20 @@ import java.util.UUID;
  * below the access-token TTL) precisely so a password reset takes effect for a given user
  * within one refresh window rather than for the token's remaining lifetime.
  *
- * <p>Values are cached as {@link Optional} (never a bare {@code null}) so the common
- * "never reset" case is itself cached — {@code Cache#get(Object, java.util.function.Function)}
- * does not cache a {@code null} return from the mapping function, which would otherwise defeat
- * the cache for the overwhelming majority of users who have never reset their password.
+ * <p>Values are cached as a {@link TokenValidityState} (never a bare {@code null}) so BOTH the
+ * common "never reset" case and the "no such row" case are themselves cached —
+ * {@code Cache#get(Object, java.util.function.Function)} does not cache a {@code null} return from
+ * the mapping function, which would otherwise defeat the cache for the overwhelming majority of
+ * users who have never reset their password, and (worse, since phase 295) for every request
+ * replaying a hard-deleted account's token.
+ *
+ * <p><b>Three states, not {@code Optional<Instant>} (phase 295 audit, HIGH-1).</b> The value type
+ * distinguishes {@code ABSENT} (no {@code users} row — a hard-deleted staff account) from
+ * {@code PRESENT_NO_RESET} (row exists, never reset). Collapsing those two into one empty
+ * {@code Optional} is what let {@link JwtAuthenticationFilter} authenticate a deleted account for
+ * the rest of its token's TTL. The DB cost is unchanged: the same single {@code users_pkey} probe,
+ * now projecting the row as well as the column — see
+ * {@link UserRepository#findTokensValidAfterRowById}.
  */
 @Component
 public class TokensValidAfterCache {
@@ -35,7 +45,7 @@ public class TokensValidAfterCache {
     private static final Duration REFRESH_TTL = Duration.ofSeconds(60);
 
     private final UserRepository userRepository;
-    private final Cache<UUID, Optional<Instant>> cache;
+    private final Cache<UUID, TokenValidityState> cache;
 
     public TokensValidAfterCache(UserRepository userRepository) {
         this.userRepository = userRepository;
@@ -46,11 +56,21 @@ public class TokensValidAfterCache {
     }
 
     /**
-     * @return the user's {@code tokensValidAfter}, or {@link Optional#empty()} if no
-     * password reset has ever occurred for this user (or the user does not exist).
+     * @return {@link TokenValidityState#ABSENT} if no {@code users} row with this id exists,
+     * {@link TokenValidityState#PRESENT_NO_RESET} if the row exists and has never had its
+     * outstanding tokens invalidated, or a {@link TokenValidityState.PresentAt} carrying the
+     * reset stamp. Never {@code null} — see this class's javadoc for why that matters to Caffeine.
      */
-    public Optional<Instant> get(UUID userId) {
-        return cache.get(userId, id -> userRepository.findTokensValidAfterById(id));
+    public TokenValidityState get(UUID userId) {
+        return cache.get(userId, id -> toState(userRepository.findTokensValidAfterRowById(id)));
+    }
+
+    private static TokenValidityState toState(Optional<TokensValidAfterRow> row) {
+        return row
+                .map(r -> r.tokensValidAfter() == null
+                        ? TokenValidityState.PRESENT_NO_RESET
+                        : new TokenValidityState.PresentAt(r.tokensValidAfter()))
+                .orElse(TokenValidityState.ABSENT);
     }
 
     /**

@@ -59,6 +59,40 @@ import static org.mockito.Mockito.when;
 @DisplayName("SalonService — unit")
 class SalonServiceTest {
 
+    /**
+     * {@code deactivateSalon}'s transaction timeout was purely declarative — no test read it, so a
+     * refactor that dropped or defaulted it would have shipped silently. It is not decoration: this
+     * one transaction runs the phase 289 audit, the phase 293 decline cascade, N master
+     * detach/delete statements and a bulk {@code DELETE FROM users}, and it is the only method in
+     * this service that holds row locks across all of them. Without a bound, a pathological salon
+     * pins a Neon connection indefinitely; with it, the client gets a failure and the destructive
+     * half rolls back whole.
+     *
+     * <p>Reflection on the annotation rather than a behavioural test on purpose — Spring's
+     * declarative timeout is applied by the proxy, and any test that could observe it firing would
+     * have to actually stall a real transaction for 30 seconds.
+     */
+    @Test
+    @DisplayName("should_boundTheDeletionTransaction_when_deactivateSalonIsDeclared")
+    void should_boundTheDeletionTransaction_when_deactivateSalonIsDeclared() throws Exception {
+        var annotation = SalonService.class
+                .getMethod("deactivateSalon", UUID.class, UUID.class)
+                .getAnnotation(org.springframework.transaction.annotation.Transactional.class);
+
+        assertThat(annotation)
+                .as("deactivateSalon must stay @Transactional — the audit, the decline cascade "
+                        + "and the users delete are all-or-nothing")
+                .isNotNull();
+        assertThat(annotation.timeout())
+                .as("the salon-deletion transaction must stay explicitly bounded at 30s, not fall "
+                        + "back to the -1 platform default")
+                .isEqualTo(30);
+        assertThat(annotation.readOnly())
+                .as("this is the most destructive mutation in the service — readOnly would make "
+                        + "the whole cascade a silent no-op on some drivers")
+                .isFalse();
+    }
+
     @Mock
     private SalonRepository salonRepository;
 
@@ -111,15 +145,6 @@ class SalonServiceTest {
     // new code (every other test's deactivateSalon call throws before reaching it).
     @Mock
     private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
-
-    @Mock
-    private com.beautica.user.RefreshTokenRepository refreshTokenRepository;
-
-    @Mock
-    private com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
-
-    @Mock
-    private com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
 
     @Mock
     private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;

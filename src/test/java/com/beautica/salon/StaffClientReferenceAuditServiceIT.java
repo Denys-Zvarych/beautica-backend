@@ -293,6 +293,81 @@ class StaffClientReferenceAuditServiceIT extends AbstractIntegrationTest {
         assertThat(result.violations()).isEmpty();
     }
 
+    // ── the FOURTH reference site: appointments.client_id (phase 295 audit, LOW-8) ────────────
+
+    /**
+     * The finder added by the phase 295 audit had NO test of its own — neither its happy path nor
+     * its fail-closed contract. This is the case that only IT can catch: an appointment header
+     * naming a staff user as its client with <b>no sibling {@code bookings} row carrying the same
+     * client id</b>. The three phase 289 finders all report CLEAN on this fixture, so before
+     * {@code findAppointmentClientViolationsForSalon} existed the audit waved the delete through
+     * and {@code appointments.client_id}'s {@code NO ACTION} FK turned the deliberate 409 into an
+     * FK-violation 500 out of {@code deleteAllByIdInBatch}.
+     *
+     * <p>The absence of a sibling booking is the whole point of the fixture, and it is asserted,
+     * not merely arranged — otherwise a future edit could add one and the test would keep passing
+     * while proving nothing about this finder.
+     */
+    @Test
+    @DisplayName("runAuditForSalon: SALON_MASTER referenced as appointments.client_id with NO "
+            + "sibling bookings row — exactly one APPOINTMENT_CLIENT violation, the fail-closed "
+            + "409 the three phase 289 finders would have missed")
+    void should_reportAppointmentViolation_when_staffIsAppointmentClientWithNoSiblingBooking() {
+        Provider provider = createSalonWithMaster();
+        UUID staffUserId = createUser(
+                "audit-appt-master-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", provider.salonId());
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                UUID.randomUUID(), staffUserId, provider.salonId());
+        insertAppointmentHeader(staffUserId, provider.salonId());
+
+        assertThat(countBookingsWithClient(staffUserId))
+                .as("the fixture's whole value is that the THREE phase 289 finders see nothing — "
+                        + "a sibling bookings row here would let BOOKING_CLIENT carry the test")
+                .isZero();
+
+        StaffClientReferenceAuditResult result = auditService.runAuditForSalon(provider.salonId());
+
+        assertThat(result.outcome())
+                .as("an appointment header alone must fail the audit closed — appointments."
+                        + "client_id is nullable NO ACTION exactly like bookings.client_id")
+                .isEqualTo(AuditOutcome.VIOLATIONS_FOUND);
+        assertThat(result.violations()).hasSize(1);
+        StaffClientReferenceViolation violation = result.violations().get(0);
+        assertThat(violation.userId()).isEqualTo(staffUserId);
+        assertThat(violation.role()).isEqualTo(Role.SALON_MASTER);
+        assertThat(violation.referenceType())
+                .as("must be classified as APPOINTMENT_CLIENT, not folded into BOOKING_CLIENT — "
+                        + "the operator repairing this needs to know WHICH table to look in")
+                .isEqualTo(StaffClientReferenceType.APPOINTMENT_CLIENT);
+        assertThat(violation.rowCount()).isEqualTo(1);
+    }
+
+    /**
+     * The negative half of the same finder: a genuine {@code CLIENT} booking a multi-service visit
+     * is the ordinary case and must never be flagged. Without it, a finder that dropped its
+     * {@code a.client.role IN :roles} predicate would still pass the positive above and would
+     * block every salon deletion in production with a spurious 409.
+     */
+    @Test
+    @DisplayName("runAuditForSalon: an appointment whose client is a genuine CLIENT is NOT a "
+            + "violation — pins the role predicate on the appointment finder")
+    void should_notReportAppointmentViolation_when_appointmentClientIsAGenuineClient() {
+        Provider provider = createSalonWithMaster();
+        UUID clientId = createUser(
+                "audit-appt-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        insertAppointmentHeader(clientId, provider.salonId());
+
+        StaffClientReferenceAuditResult result = auditService.runAuditForSalon(provider.salonId());
+
+        assertThat(result.outcome())
+                .as("a CLIENT is exactly who appointments.client_id is FOR — flagging it would "
+                        + "make every salon with a multi-service visit undeletable")
+                .isEqualTo(AuditOutcome.CLEAN);
+        assertThat(result.violations()).isEmpty();
+    }
+
     // ── seeding fixtures — mirrors ClientReviewIT's local house-convention fixtures ────────────
 
     /**
@@ -371,6 +446,27 @@ class StaffClientReferenceAuditServiceIT extends AbstractIntegrationTest {
                 "INSERT INTO reviews (id, booking_id, client_id, master_id, salon_id, rating, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, 5, NOW(), NOW())",
                 UUID.randomUUID(), bookingId, clientId, provider.masterId(), provider.salonId());
+    }
+
+    /**
+     * A visit HEADER with no child bookings rows — legal on its own (nothing in the schema
+     * requires the pair) and exactly the shape that slipped past the phase 289 audit.
+     * {@code booking_source = 'APP'} with a non-null {@code client_id} and null guest fields is
+     * the branch {@code chk_appointment_guest_fields} (V139) accepts.
+     */
+    private UUID insertAppointmentHeader(UUID clientId, UUID salonId) {
+        UUID appointmentId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO appointments (id, client_id, salon_id, status, booking_source, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, 'COMPLETED', 'APP', NOW(), NOW())",
+                appointmentId, clientId, salonId);
+        return appointmentId;
+    }
+
+    private int countBookingsWithClient(UUID clientId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE client_id = ?", Integer.class, clientId);
+        return count == null ? 0 : count;
     }
 
     private void insertClientReview(UUID bookingId, UUID subjectClientId, Provider provider) {

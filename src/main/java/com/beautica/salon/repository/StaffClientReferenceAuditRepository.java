@@ -146,12 +146,39 @@ public interface StaffClientReferenceAuditRepository extends JpaRepository<User,
      * Phase 290's staff-deactivation cascade calls this method DIRECTLY to decide which
      * {@code users} rows to deactivate — an unfiltered owner id here would have deactivated the
      * salon's own owner account, violating the locked owner-exemption rule. Caught by
-     * {@code SalonStaffDeactivationCascadeIT.should_deactivateOwnerMasterRow_butNeverTheOwnerUsersRow_when_salonDeactivated}.
+     * {@code SalonStaffHardDeleteIT.should_leaveOwnerAccountIntact_when_salonDeleted}.
+     *
+     * <p><b>{@code m.user_id IS NOT NULL} is load-bearing since V157 (phase 294/295).</b>
+     * {@code masters.user_id} became nullable so a DETACHED master — one whose staff account the
+     * phase 295 cascade already hard-deleted — can survive as a name-only stub while still
+     * carrying its original {@code salon_id}. Without this predicate the first arm would return a
+     * {@code NULL} "staff user id" for every such stub, which then flows into
+     * {@code userRepository.findAllById(...)}, the {@code IN (:staffUserIds)} arms of the three
+     * audit finders, and the phase 295 delete itself. Not reachable through the cascade today
+     * (its own {@code !salon.isActive()} idempotency guard returns before a second pass), which is
+     * precisely why it must be stated here rather than left to that guard to enforce at a
+     * distance.
+     *
+     * <p><b>The {@code users.role = 'SALON_MASTER'} join on the first arm (phase 295 audit,
+     * MEDIUM-5).</b> The three {@code *ForSalon} finders below each re-assert
+     * {@code role IN :roles} and this class's own javadoc calls that "cheap defense in depth
+     * against a future caller passing a stale or wrongly-scoped id list" — yet the ONE caller that
+     * irreversibly {@code DELETE}s the rows this method names,
+     * {@code SalonService#deleteSalonStaff}, ran without any such re-assert. The first arm alone
+     * decided a hard delete from {@code masters.salon_id} + {@code masters.master_type} +
+     * {@code user_id IS NOT NULL}, never touching {@code users.role}. A {@code SALON_MASTER}-typed
+     * masters row whose user is in fact a {@code SALON_OWNER} — reachable through a hand-written
+     * fixture, a seed script, or any future role transition that does not rewrite
+     * {@code master_type} — would have taken that owner's account with it. The join makes the
+     * destructive path's scoping identical to the read paths' rather than weaker than them.
      */
     @Query(value = """
             SELECT m.user_id AS user_id
             FROM masters m
-            WHERE m.salon_id = :salonId AND m.master_type = 'SALON_MASTER'
+            JOIN users u ON u.id = m.user_id AND u.role = 'SALON_MASTER'
+            WHERE m.salon_id = :salonId
+              AND m.master_type = 'SALON_MASTER'
+              AND m.user_id IS NOT NULL
             UNION
             SELECT u.id AS user_id
             FROM users u
@@ -208,5 +235,40 @@ public interface StaffClientReferenceAuditRepository extends JpaRepository<User,
             GROUP BY cr.subjectClient.id, cr.subjectClient.role
             """)
     List<StaffClientReferenceRowProjection> findClientReviewSubjectViolationsForSalon(
+            @Param("roles") List<Role> roles, @Param("staffUserIds") List<UUID> staffUserIds);
+
+    /**
+     * {@code appointments.client_id} referencing one of {@code staffUserIds} — the FOURTH
+     * reference site, added by the phase 295 audit (LOW-8). Same fail-closed contract, same salon
+     * scoping and the same empty-list caller precondition as the three finders above; see
+     * {@link #findBookingClientViolationsForSalon} for the shared rationale.
+     *
+     * <p><b>Why it is not redundant with the {@code bookings} finder.</b>
+     * {@code appointments.client_id} is nullable and {@code NO ACTION} (V124/V139) — the same
+     * shape as {@code bookings.client_id}, and just as capable of blocking
+     * {@code DELETE FROM users}. Phase 289 checked only three tables, so an appointment header
+     * whose {@code client_id} is a staff user with NO sibling {@code bookings} row carrying the
+     * same id slipped past the audit entirely and turned the deliberate fail-closed 409
+     * ({@code SalonDeletionBlockedException}) into an FK-violation 500 out of
+     * {@code SalonService#deleteSalonStaff}'s {@code deleteAllByIdInBatch}. A multi-service visit
+     * normally has both rows, but nothing in the schema requires it.
+     *
+     * <p>{@code a.client IS NOT NULL} excludes guest (LINK) and staff walk-in visits, which always
+     * carry a null {@code client_id} (V126 / V139's CHECKs) and can never be a violation —
+     * mirroring {@link #findBookingClientViolations}'s guard on the same column shape.
+     *
+     * <p>No platform-wide sibling is added: the offline sweep's three queries exist to discover
+     * pre-existing violations before the cascade shipped, and are run manually. This finder serves
+     * the per-delete precondition, which is the path that fails closed.
+     */
+    @Query("""
+            SELECT a.client.id AS userId, a.client.role AS role, COUNT(a) AS rowCount
+            FROM Appointment a
+            WHERE a.client IS NOT NULL
+              AND a.client.role IN :roles
+              AND a.client.id IN :staffUserIds
+            GROUP BY a.client.id, a.client.role
+            """)
+    List<StaffClientReferenceRowProjection> findAppointmentClientViolationsForSalon(
             @Param("roles") List<Role> roles, @Param("staffUserIds") List<UUID> staffUserIds);
 }

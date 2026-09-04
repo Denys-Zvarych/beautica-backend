@@ -324,4 +324,99 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
               AND (s IS NULL OR s.isActive = true)
             """)
     Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
+
+    // ── phase 295 — salon-deletion staff HARD-DELETE cascade ────────────────────────────────────
+
+    /**
+     * Every {@code masters} row whose account is one of {@code userIds}, ATTACHED rows only, with
+     * {@code user} JOIN FETCH-ed (phase 295).
+     *
+     * <p>Used by {@code SalonService#deleteSalonStaff} to resolve the provider row behind each
+     * staff account it is about to hard-delete, so that row can be deleted or detached FIRST — see
+     * that method for the one representable ordering.
+     *
+     * <p><b>Deliberately NOT {@code is_active}-scoped.</b> A staff member deactivated by an
+     * earlier operation (a rotation, a manual {@code DELETE /masters/{id}}) still has a live
+     * {@code masters} row pointing at their {@code users} row, and {@code masters.user_id} is
+     * UNIQUE — so an {@code is_active = true} filter here would silently skip exactly the rows
+     * whose FK then fires {@code ON DELETE SET NULL} at {@code DELETE FROM users} time and
+     * violates {@code chk_masters_detachment_coherent} (V157). The caller's other master list
+     * ({@link #findBySalonIdAndIsActiveTrueWithUser}) IS active-scoped because it feeds
+     * {@code MasterService#deactivateMasters}, a different job.
+     *
+     * <p><b>The {@code user IS NOT NULL} predicate is not redundant.</b> {@code JOIN FETCH m.user}
+     * is an INNER join and already drops a detached row; the explicit predicate states the intent
+     * that this finder answers "which ATTACHED masters belong to these accounts", so a future
+     * conversion to {@code LEFT JOIN FETCH} (the reflex fix for a NULL-dropping join since V157)
+     * cannot silently start returning already-detached rows for the caller to detach twice.
+     *
+     * <p>Bounded by construction: {@code userIds} is one salon's resolved staff list, and
+     * {@code masters.user_id} is UNIQUE, so this returns at most {@code userIds.size()} rows.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            JOIN FETCH m.user u
+            WHERE u.id IN :userIds
+              AND m.user IS NOT NULL
+            """)
+    List<Master> findAllByUserIdInWithUser(@Param("userIds") Collection<UUID> userIds);
+
+    /**
+     * Which of {@code masterIds} still have at least one historical record pointing at them
+     * (phase 295, D1). A master id ABSENT from the result can be {@code DELETE}d outright; one
+     * PRESENT must be DETACHED instead and survive as a name-only stub.
+     *
+     * <p><b>ONE query for the whole batch, not one per master (phase 295 audit, HIGH-2).</b> The
+     * predecessor {@code countHistoricalReferences(UUID)} was called inside the per-master loop in
+     * {@code SalonService#deleteSalonStaff}. Because it is {@code nativeQuery = true} with no
+     * declared query spaces, Hibernate 6 calls {@code session.flush()} before EVERY invocation —
+     * so each iteration flushed the previous iteration's detach UPDATE on its own (making
+     * {@code hibernate.jdbc.batch_size} and {@code order_updates} inert for that loop) and
+     * dirty-checked the entire persistence context, which at that point still holds everything the
+     * phase 293 decline cascade loaded. Cost was O(N x |persistence context|). Measured on a warm
+     * local socket, 50 masters: 75.2 ms looped vs 6.2 ms set-based; on Railway&rarr;Neon at 2 ms
+     * RTT the loop adds ~100 round trips where this adds 2. The caller now runs a pure in-memory
+     * branch over the returned id set, and {@code masterRepository.flush()} before the account
+     * delete becomes the ONLY flush — which is what finally lets the detach UPDATEs and the master
+     * DELETEs batch.
+     *
+     * <p>Three {@code EXISTS} arms rather than three {@code COUNT(*)}s, so a master with 40 000
+     * bookings costs the same index probe as one with a single booking. The arms are exactly the
+     * three {@code NO ACTION} foreign keys that would otherwise make {@code DELETE FROM masters}
+     * fail with a 500:
+     * <ul>
+     *   <li>{@code bookings.master_id} — {@code V18__create_bookings.sql:6}</li>
+     *   <li>{@code reviews.master_id} — {@code V40__create_reviews.sql:7}</li>
+     *   <li>{@code client_reviews.author_master_id} —
+     *       {@code V128__create_client_reviews_and_user_rating.sql:20}, indexed by
+     *       {@code idx_client_reviews_author_master} (V159) — it had no index at all until then,
+     *       so this arm AND the RI check Postgres runs on {@code DELETE FROM masters} both Seq
+     *       Scanned {@code client_reviews}, once per master.</li>
+     * </ul>
+     * If a future migration adds a FOURTH such reference to {@code masters}, it belongs here in
+     * the same commit — otherwise the delete branch starts throwing a
+     * {@code DataIntegrityViolationException} out of {@code DELETE /salons/{id}}. Pinned by
+     * {@code SalonStaffHardDeleteIT}'s past-booking case, whose mutation check (force this to
+     * return an empty list) fails on exactly that FK violation.
+     *
+     * <p>Native rather than JPQL: JPQL has no {@code EXISTS} over an arbitrary table expression
+     * that Hibernate will compile to independent index probes in a single round trip, and
+     * {@code client_reviews} is not on {@code Master}'s object graph at all.
+     *
+     * <p>Bounded by construction: {@code masterIds} is one salon's resolved staff master list.
+     * {@code SalonService} short-circuits on an empty collection to save a pointless round trip —
+     * <b>not</b> because an empty bind is unsafe. Measured 2026-09-04 (phase 295 QA): Hibernate 6
+     * rewrites an empty list bind for an {@code IN} predicate into an always-false form, and
+     * calling this method with {@code List.of()} returns an empty list without throwing. An
+     * earlier revision of this javadoc asserted the opposite ("a native {@code IN ()} is not valid
+     * SQL"); it was wrong and is corrected here rather than left to mislead the next caller.
+     */
+    @Query(value = """
+            SELECT m.id FROM masters m
+            WHERE m.id IN (:masterIds)
+              AND (   EXISTS (SELECT 1 FROM bookings b        WHERE b.master_id         = m.id)
+                   OR EXISTS (SELECT 1 FROM reviews r         WHERE r.master_id         = m.id)
+                   OR EXISTS (SELECT 1 FROM client_reviews cr WHERE cr.author_master_id = m.id))
+            """, nativeQuery = true)
+    List<UUID> findIdsWithHistoricalReferences(@Param("masterIds") Collection<UUID> masterIds);
 }

@@ -115,20 +115,13 @@ class SalonServiceInviteHistoryTest {
             new com.beautica.common.cache.UserProfileCacheEvictor(
                     new org.springframework.cache.support.NoOpCacheManager());
 
-    // Phase 290: SalonService now constructor-depends on the salon-deletion staff-deactivation
-    // cascade's five collaborators. None of listSalonInvites/cancelInvite exercises
-    // deactivateSalon, so plain mocks satisfy the constructor without any stubbing.
+    // Phase 290/295: SalonService constructor-depends on the salon-deletion staff cascade's two
+    // remaining collaborators (the three token/ticket repositories went with phase 295's hard
+    // delete — ON DELETE CASCADE on `users` covers them). Neither listSalonInvites nor
+    // cancelInvite exercises deactivateSalon, so plain mocks satisfy the constructor without any
+    // stubbing.
     @Mock
     private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
-
-    @Mock
-    private com.beautica.user.RefreshTokenRepository refreshTokenRepository;
-
-    @Mock
-    private com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
-
-    @Mock
-    private com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
 
     @Mock
     private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
@@ -148,8 +141,7 @@ class SalonServiceInviteHistoryTest {
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
                 masterServiceRepository, localityWriteValidator, masterService, cityRepository,
                 locationQueryService, cacheManager, authorizationService, fixedClock,
-                userProfileCacheEvictor, staffClientReferenceAuditService, refreshTokenRepository,
-                deviceTokenRepository, passwordResetTicketRepository, tokensValidAfterCache,
+                userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
                 bookingService);
     }
 

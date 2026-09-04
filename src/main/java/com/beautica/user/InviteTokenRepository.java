@@ -106,64 +106,68 @@ public interface InviteTokenRepository extends JpaRepository<InviteToken, UUID> 
     List<InviteHistoryRow> findSalonInviteHistory(@Param("salonId") UUID salonId, Pageable pageable);
 
     /**
-     * Redacts every {@code invite_tokens.email} row this salon dispatched to any of
-     * {@code staffUserIds}, rewriting each matched row to that SAME staff member's tombstone
-     * (Phase 291 audit-fix, MEDIUM — "an irreversible PII scrub leaves the erased email
-     * recoverable by a single join"; perf audit MEDIUM follow-up — collapsed from N per-staff
-     * {@code @Modifying} updates into this ONE bulk statement for the whole cascade).
+     * Deletes every {@code invite_tokens} row this salon dispatched to any of
+     * {@code staffUserIds}, matched by the staff member's CURRENT {@code users.email}
+     * (phase 295 — the salon-deletion staff HARD-DELETE cascade).
      *
-     * <p>Called from {@code SalonService#deactivateSalonStaff} ONCE, for the entire
-     * {@code staffUserIds} list, BEFORE the per-user loop that calls {@code User#scrubPii} — see
-     * the "MUST run before scrubPii" note below for why a naive single {@code WHERE email IN
-     * (...)} cannot substitute for this join.
+     * <p><strong>Supersedes {@code redactEmailsBySalonIdAndStaffUserIds} (phase 291 D9).</strong>
+     * That statement rewrote the same rows to a {@code deleted+<uuid>@beautica-deleted.invalid}
+     * tombstone because the staff {@code users} row SURVIVED the deletion and its address had to
+     * stop being recoverable by a join. Under the 2026-09-04 reversal the {@code users} row does
+     * not survive, so redaction is the wrong verb twice over: an invite row addressed to an
+     * account that no longer exists is not history, it is a dangling address, and a stale PENDING
+     * one for this salon would collide with the re-invite phase 296 exists to prove works.
      *
-     * <p>{@code email} is {@code nullable = false} (see {@link InviteToken}), so this redacts
-     * rather than nulls — the same "tombstone, don't null" choice {@code User#scrubPii} makes for
-     * {@code users.email}, for the identical reason (a {@code NOT NULL} column).
+     * <p>Called from {@code SalonService#deleteSalonStaff} ONCE for the entire
+     * {@code staffUserIds} list.
+     *
+     * <p><strong>MUST run BEFORE the {@code users} rows are deleted.</strong> The join predicate
+     * resolves each invite row through the staff member's live {@code users} row. Once that row is
+     * gone the join matches nothing and this statement silently deletes zero rows, leaving the
+     * address behind forever. Pinned by {@code SalonStaffHardDeleteIT}; see the call-site comment
+     * in {@code SalonService}.
+     *
+     * <p><strong>{@code lower(t.email) = lower(u.email)}, not a bare {@code =} (phase 295 audit,
+     * LOW-7).</strong> Every write path in this codebase lowercases before persisting
+     * ({@code InviteService:151}, {@code AuthService:119/165/249/382}), but neither column is
+     * {@code citext} and nothing in the schema enforces the case — this repo already hedges the
+     * same way with the {@code lower(email)} expression index {@code ux_invite_tokens_active}
+     * (V101). One legacy or externally-seeded mixed-case row on either side made an exact join
+     * delete zero and strand a PENDING invite, which then blocks the phase 296 re-invite that this
+     * whole statement exists to unblock. The expression form is also what {@code ux_invite_tokens_active}
+     * can serve, so it is not a planner regression.
      *
      * <p>Scoped to {@code salonId} — the salon actually being deleted — NOT a global match on
      * email. A staff member can have a separate, unrelated PENDING invite waiting at the same
      * address from a DIFFERENT salon; that row belongs to that other salon's own history and must
-     * survive this cascade untouched (see {@code
-     * SalonStaffPiiScrubIT#should_preserveUnrelatedSalonsPendingInvite_when_salonDeactivated}).
-     * Deliberately status-blind — no {@code is_used}/{@code revoked_at} predicate — so PENDING,
-     * ACCEPTED, EXPIRED and SUPERSEDED rows are all redacted alike; a salon can plausibly have
-     * re-invited or re-accepted the same address more than once, and none of those rows need to
-     * be loaded as entities to be rewritten.
+     * survive this cascade untouched.
      *
-     * <p><strong>Why a join, not {@code WHERE email IN (:originalEmails)}:</strong> every staff
-     * member needs a DIFFERENT tombstone, derived from their own {@code users.id} — one bulk
-     * statement can't map N distinct target values without joining back to the row that carries
-     * them. JPQL bulk updates cannot express a join, so this is a native {@code UPDATE ... FROM}.
+     * <p>Deliberately status-blind — no {@code is_used}/{@code revoked_at} predicate — so PENDING,
+     * ACCEPTED, EXPIRED and SUPERSEDED rows for this salon+address all go alike. A salon can
+     * plausibly have invited or re-accepted the same address more than once, and every one of
+     * those rows carries the same now-deleted address.
      *
-     * <p><strong>MUST run BEFORE {@code User#scrubPii} touches any of these users'
-     * {@code email}.</strong> The join predicate is {@code t.email = u.email} — it matches an
-     * invite row against the staff member's CURRENT address. Run this after {@code scrubPii},
-     * and {@code u.email} is already the tombstone: the join matches nothing and the redaction
-     * silently no-ops. See the call site comment in {@code SalonService#deactivateSalonStaff}.
+     * <p><strong>Why a join, not {@code WHERE email IN (:emails)}:</strong> the caller resolves
+     * staff by {@code users.id} (phase 289's {@code findSalonStaffUserIds}) and never handles
+     * their addresses — keeping the email inside the statement is also what keeps it out of the
+     * application's logs and heap.
      *
-     * <p>Naturally idempotent even without a {@code scrubbedAt} filter: a staff member already
-     * scrubbed by an earlier run has {@code u.email} equal to their tombstone (a deterministic
-     * function of {@code u.id} alone), and any invite row already redacted to that same tombstone
-     * matches and is rewritten to the identical value — a no-op in effect.
+     * <p>Naturally idempotent: a second run finds no matching {@code users} rows (they are gone)
+     * and deletes nothing.
      *
-     * @param tombstonePrefix {@code SalonService.SCRUB_EMAIL_PREFIX} — passed as a parameter
-     *         rather than inlined into the SQL so this query and {@code User#scrubPii}'s caller
-     *         can never drift onto two different tombstone formats
-     * @param tombstoneSuffix {@code SalonService.SCRUB_EMAIL_DOMAIN}
-     * @return number of {@code invite_tokens} rows rewritten
+     * @param salonId      the salon being deleted
+     * @param staffUserIds the resolved staff {@code users.id} list, never empty (the caller
+     *                     short-circuits on an empty staff set)
+     * @return number of {@code invite_tokens} rows deleted
      */
     @Modifying
     @Query(value = """
-            UPDATE invite_tokens t
-            SET email = :tombstonePrefix || u.id::text || :tombstoneSuffix
-            FROM users u
+            DELETE FROM invite_tokens t
+            USING users u
             WHERE u.id IN (:staffUserIds)
               AND t.salon_id = :salonId
-              AND t.email = u.email
+              AND lower(t.email) = lower(u.email)
             """, nativeQuery = true)
-    int redactEmailsBySalonIdAndStaffUserIds(@Param("salonId") UUID salonId,
-                                              @Param("staffUserIds") List<UUID> staffUserIds,
-                                              @Param("tombstonePrefix") String tombstonePrefix,
-                                              @Param("tombstoneSuffix") String tombstoneSuffix);
+    int deleteBySalonIdAndStaffUserIds(@Param("salonId") UUID salonId,
+                                       @Param("staffUserIds") List<UUID> staffUserIds);
 }

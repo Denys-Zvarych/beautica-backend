@@ -14,5 +14,14 @@ public enum StaffClientReferenceType {
     REVIEW_CLIENT,
 
     /** {@code client_reviews.subject_client_id} — {@code V128__...:19}. */
-    CLIENT_REVIEW_SUBJECT
+    CLIENT_REVIEW_SUBJECT,
+
+    /**
+     * {@code appointments.client_id} — {@code V124__create_appointments.sql}. Added by the phase
+     * 295 audit (LOW-8); checked by the SALON-SCOPED audit only
+     * ({@code findAppointmentClientViolationsForSalon}), which is the fail-closed path in front of
+     * the hard delete. The platform-wide offline sweep has no matching arm — see that finder's
+     * javadoc.
+     */
+    APPOINTMENT_CLIENT
 }

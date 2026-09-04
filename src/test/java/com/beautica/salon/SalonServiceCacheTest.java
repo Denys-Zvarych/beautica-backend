@@ -135,9 +135,6 @@ class SalonServiceCacheTest {
     // comment above documents — taking every test in this file red, not just the three that
     // exercise deactivateSalon.
     @MockBean com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
-    @MockBean com.beautica.user.RefreshTokenRepository refreshTokenRepository;
-    @MockBean com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
-    @MockBean com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
     @MockBean com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
     // Phase 293: SalonService now constructor-depends on BookingService for the salon-closure
     // booking cascade (deactivateSalon calls declineFutureConfirmedBookingsForSalonClosure).

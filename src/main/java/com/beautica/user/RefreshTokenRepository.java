@@ -21,7 +21,7 @@ public interface RefreshTokenRepository extends JpaRepository<RefreshToken, UUID
     /**
      * Bulk sibling of {@link #deleteByUserId} — purges every refresh token for every user in
      * {@code userIds} in ONE statement. Added for the salon-deletion staff cascade (Phase 290
-     * perf finding #1): {@code SalonService.deactivateSalonStaff} previously called
+     * perf finding #1): {@code SalonService.deleteSalonStaff} (then {@code deactivateSalonStaff}) previously called
      * {@link #deleteByUserId} once per staff member (N single-row round trips); this collapses
      * that to exactly one bulk {@code DELETE ... WHERE user_id IN (...)}.
      */
