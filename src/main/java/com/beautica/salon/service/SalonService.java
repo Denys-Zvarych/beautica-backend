@@ -8,6 +8,7 @@ import com.beautica.auth.Role;
 import com.beautica.auth.TokensValidAfterCache;
 import com.beautica.auth.dto.InviteRequest;
 import com.beautica.auth.dto.InviteResponse;
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -20,6 +21,7 @@ import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
+import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.media.entity.EntityType;
@@ -69,6 +71,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -131,6 +134,13 @@ public class SalonService {
     // "salon.service.SalonService" under booking/, common/, master/, notification/ before adding
     // this field turned up only SalonController).
     private final com.beautica.booking.service.BookingService bookingService;
+
+    // ── Phase 297 — single-master removal ─────────────────────────────────────────────────────
+    // BookingRepository#countConfirmedFutureByMasterId backs removeMaster's D3 guard — a master
+    // with a future CONFIRMED booking cannot be removed via this endpoint (refused with 409;
+    // Phase 298 will replace the refusal with a cancel-and-notify cascade). A read-only count, not
+    // BookingService — no cascade behaviour is needed on this path, only the check.
+    private final BookingRepository bookingRepository;
 
     // ── Phase 268 — salon-deletion catalogue/favourites/media cascade ────────────────────────
     // ServiceRepository/FavoriteRepository back the two pure-DB steps that run INSIDE the same
@@ -1016,11 +1026,53 @@ public class SalonService {
     }
 
     /**
-     * HARD-DELETES {@code salonId}'s own staff — the {@code users} accounts unconditionally, and
-     * the {@code masters} rows behind them wherever nothing historical still points at one
-     * (phase 295, the 2026-09-04 reversal recorded in phase 294 § <i>Decisions — CLOSED</i>).
-     * Replaces phase 290's {@code deactivateSalonStaff} and deletes phase 291's PII-scrub
-     * apparatus outright rather than leaving it as an unreachable second erasure policy (D2).
+     * HARD-DELETES {@code salonId}'s own staff — every currently-active master row for the salon
+     * is deactivated, then every {@code SALON_MASTER}/{@code SALON_ADMIN} account of the salon is
+     * disposed of via {@link #disposeStaffAccounts(UUID, UUID, List)} (Phase 297 D1 extraction —
+     * see that method's javadoc for the disposal itself, the binding statement order, and every
+     * invariant it protects). This method is only the salon-wide resolve-then-delegate shell:
+     * {@link MasterService#deactivateMasters} MUST run first (it dereferences
+     * {@code master.getUser().getId()} to key its cache evictions, only possible while the row is
+     * still ATTACHED), and {@link StaffClientReferenceAuditService#resolveSalonStaffUserIds}
+     * resolves the exact staff id list the seam then disposes of.
+     */
+    private void deleteSalonStaff(UUID ownerId, UUID salonId) {
+        // Phase 290 perf pass (findings #2/#3), unchanged by phase 295: the masters here are
+        // already JOIN-FETCHed with `user` by findBySalonIdAndIsActiveTrueWithUser — passed
+        // straight to the batch overload rather than re-fetched one-by-one, and that overload
+        // fires exactly ONE SalonStaffChangedEvent for the whole list instead of one per master.
+        //
+        // This MUST stay ahead of the detach/delete below: deactivateMasterInternal dereferences
+        // master.getUser().getId() to key the master-by-user / master-detail-by-user / user-profile
+        // evictions, and a detached row has no user to read that from.
+        List<Master> salonMasters = masterRepository
+                .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
+                .getContent();
+        masterService.deactivateMasters(ownerId, salonMasters, salonId);
+
+        List<UUID> staffUserIds = staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId);
+        disposeStaffAccounts(ownerId, salonId, staffUserIds);
+    }
+
+    /**
+     * HARD-DELETES the given {@code staffUserIds}' accounts, and the {@code masters} rows behind
+     * them wherever nothing historical still points at one (phase 295, the 2026-09-04 reversal
+     * recorded in phase 294 § <i>Decisions — CLOSED</i>; extracted into this standalone seam by
+     * phase 297 D1). Replaces phase 290's {@code deactivateSalonStaff} and deletes phase 291's
+     * PII-scrub apparatus outright rather than leaving it as an unreachable second erasure policy
+     * (D2).
+     *
+     * <p><b>Two callers, one body (Phase 297 D1 — REUSE-FIRST).</b> {@link
+     * #deleteSalonStaff(UUID, UUID)} calls this with the whole salon's resolved staff list;
+     * {@code removeMaster(UUID, UUID, UUID)} calls it with a single-element
+     * {@code List.of(masterUserId)}. Not a copy, not a variant — the disposal, its binding
+     * statement order, the {@code chk_masters_detachment_coherent} interaction, the invite-token
+     * cleanup and both cache evictions below are a property of the CHECK constraint and the cache
+     * contracts, not of the salon-deletion caller, so they live in exactly one place regardless of
+     * how many masters are being removed at once.
+     *
+     * <p>Idempotent by construction (D4 below) even for a one-element call: a caller that has
+     * already resolved an empty or already-disposed id list writes nothing.
      *
      * <h3>The order is not a preference — it is the only representable one</h3>
      * <pre>
@@ -1040,17 +1092,12 @@ public class SalonService {
      * <i>BINDING ON PHASE 295</i>; do NOT weaken the CHECK to make a one-step delete work.
      *
      * <h3>Masters — deleted when they can be, detached when they cannot (D1)</h3>
-     * {@link MasterService#deactivateMasters} runs FIRST over every currently-active master row
-     * for this salon, exactly as it did in phase 290 (REUSE-FIRST — it owns the per-master cache
-     * evictions, the single batched {@code SalonStaffChangedEvent} and the salon-rating
-     * recalculation, and it reads {@code master.getUser().getId()} to key those evictions, which
-     * is only possible while the row is still ATTACHED). That batch uniformly covers the salon's
-     * {@code SALON_MASTER} rows AND the owner's own {@code SALON_OWNER}-type row if
-     * "I also work as a master" is enabled here — deactivating the owner's row is correct and
-     * intended (phase 290 D3, carried into 295); DELETING it is not, and cannot happen, because
-     * only rows resolved from the STAFF user list below are deleted or detached.
+     * The caller is responsible for deactivating every affected master row FIRST (see
+     * {@link #deleteSalonStaff(UUID, UUID)}'s use of {@link MasterService#deactivateMasters}, or
+     * {@code removeMaster}'s use of {@link MasterService#deactivateMaster}) — this method only
+     * disposes of the account and the master row behind it, it does not deactivate.
      *
-     * <p>Then, for the staff master rows AS A BATCH:
+     * <p>For the staff master rows AS A BATCH:
      * {@link MasterRepository#findIdsWithHistoricalReferences} asks — in ONE query, never per
      * master (phase 295 audit HIGH-2) — which of them still have a {@code bookings.master_id} /
      * {@code reviews.master_id} / {@code client_reviews.author_master_id} row pointing at them.
@@ -1068,14 +1115,13 @@ public class SalonService {
      * </ul>
      *
      * <h3>Users — deleted unconditionally (D1)</h3>
-     * {@code SALON_MASTER}/{@code SALON_ADMIN} accounts ONLY, resolved via
-     * {@link StaffClientReferenceAuditService#resolveSalonStaffUserIds} — phase 289's
-     * {@code findSalonStaffUserIds} reused, not re-derived. That resolution structurally can NEVER
-     * include the salon's owner: the owner's {@code role} is {@code SALON_OWNER}, which satisfies
-     * neither the {@code masters.salon_id}-joined {@code SALON_MASTER} predicate nor the
-     * {@code users.salon_id}-scoped {@code SALON_ADMIN} predicate. The owner-account exemption
-     * (phase 290 D3 / 270 D4, locked — the owner survives deleting their last salon) is therefore
-     * a structural property of the query, not a branch this method has to remember.
+     * {@code staffUserIds} is the caller's resolved {@code SALON_MASTER}/{@code SALON_ADMIN}
+     * account set — for {@link #deleteSalonStaff(UUID, UUID)} via
+     * {@link StaffClientReferenceAuditService#resolveSalonStaffUserIds} (phase 289's
+     * {@code findSalonStaffUserIds} reused, not re-derived; that resolution structurally can
+     * NEVER include the salon's owner — the owner-account exemption, phase 290 D3 / 270 D4, is a
+     * structural property of that query), for {@code removeMaster} the one already-validated
+     * master's user id.
      *
      * <p>Everything with {@code ON DELETE CASCADE} on {@code users} goes with the row: refresh
      * tokens, device tokens, password-reset tickets, media rows, favourites.
@@ -1083,30 +1129,15 @@ public class SalonService {
      * D5), so a walk-in the deleted staff member rang up survives with its attribution cleared.
      *
      * <h3>Idempotency comes from row absence, not a flag (D4)</h3>
-     * Deleting a row is idempotent by construction — a second {@code DELETE /salons/{id}} resolves
-     * an empty staff set and writes nothing. The phase 291 scrub marker column and its guard are gone with
-     * the column (V158).
+     * Deleting a row is idempotent by construction — an empty {@code staffUserIds} writes nothing.
+     * The phase 291 scrub marker column and its guard are gone with the column (V158).
      *
      * <h3>Known limit — R2 avatar blobs</h3>
      * {@code media_files} cascades on {@code uploader_id} and {@code users.avatar_r2_key} vanishes
      * with the row, so the R2 objects behind both are orphaned (§O-8). That is phase 268's media
      * purge, explicitly out of scope here — recorded, not forgotten.
      */
-    private void deleteSalonStaff(UUID ownerId, UUID salonId) {
-        // Phase 290 perf pass (findings #2/#3), unchanged by phase 295: the masters here are
-        // already JOIN-FETCHed with `user` by findBySalonIdAndIsActiveTrueWithUser — passed
-        // straight to the batch overload rather than re-fetched one-by-one, and that overload
-        // fires exactly ONE SalonStaffChangedEvent for the whole list instead of one per master.
-        //
-        // This MUST stay ahead of the detach/delete below: deactivateMasterInternal dereferences
-        // master.getUser().getId() to key the master-by-user / master-detail-by-user / user-profile
-        // evictions, and a detached row has no user to read that from.
-        List<Master> salonMasters = masterRepository
-                .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
-                .getContent();
-        masterService.deactivateMasters(ownerId, salonMasters, salonId);
-
-        List<UUID> staffUserIds = staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId);
+    private void disposeStaffAccounts(UUID actorId, UUID salonId, List<UUID> staffUserIds) {
         if (staffUserIds.isEmpty()) {
             return;
         }
@@ -1141,9 +1172,10 @@ public class SalonService {
         // ── step 1 of the binding order: settle every masters row that references a staff
         // account, so that DELETE FROM users below has nothing left pointing at it.
         //
-        // Deliberately NOT reusing `salonMasters`: that list is is_active-scoped, and a staff
-        // member deactivated by an earlier operation still owns an ATTACHED masters row whose FK
-        // would fire ON DELETE SET NULL and violate chk_masters_detachment_coherent.
+        // Deliberately re-fetched by user id rather than trusting a caller-supplied master list:
+        // an is_active-scoped list (e.g. deleteSalonStaff's now-deactivated salonMasters) or a
+        // master deactivated by an earlier operation still owns an ATTACHED masters row whose FK
+        // would fire ON DELETE SET NULL and violate chk_masters_detachment_coherent if skipped.
         Instant now = clock.instant();
         int detached = 0;
         int deleted = 0;
@@ -1208,7 +1240,133 @@ public class SalonService {
         // ordered it even though the rows it names are gone.
         log.info("Salon deletion staff hard-delete: {} account(s) deleted, {} master row(s) deleted, "
                         + "{} master row(s) detached for salon {} by actor {}",
-                staffUserIds.size(), deleted, detached, salonId, ownerId);
+                staffUserIds.size(), deleted, detached, salonId, actorId);
+    }
+
+    /**
+     * Removes ONE invited master from {@code salonId} (Phase 297) — the SALON_OWNER's way to
+     * dispose of a single master exactly the way {@link #deleteSalonStaff(UUID, UUID)} disposes
+     * of every master when the WHOLE salon is deleted, via the shared {@link
+     * #disposeStaffAccounts(UUID, UUID, List)} seam (D1). Not the same operation as {@code DELETE
+     * /masters/{masterId}} ({@link MasterService#deactivateMaster}) — that flips
+     * {@code is_active = false} globally and leaves the account and the row intact; this
+     * hard-deletes the account and deletes-or-detaches the {@code masters} row behind it,
+     * identically to a salon deletion.
+     *
+     * <p><b>Checks run in this exact order</b> — a caller-supplied {@code masterId} needs its own
+     * guards where the salon-wide deletion path had structural invariants to lean on instead:
+     * <ol>
+     *   <li>{@code masterId} resolves to a master row at all → {@link NotFoundException}</li>
+     *   <li>the row IS a {@code SALON_MASTER}-type master (D6) — a positive assertion, not merely
+     *       an exclusion of {@code SALON_OWNER}. Phase 295's owner exemption is structural for the
+     *       salon-wide deletion path — {@code resolveSalonStaffUserIds} can never select an
+     *       owner's row — but that guarantee does not survive a caller-supplied id:
+     *       {@code masterBelongsToSalon} is true for the owner's own row too, so left unguarded
+     *       this endpoint could hard-delete the salon's owner. A positive assertion also closes
+     *       {@code INDEPENDENT_MASTER}: today that type never carries a non-null {@code salon}, so
+     *       the D5 belongs-to-salon check below happens to catch it too, but that is a DB-unenforced
+     *       cross-file invariant (no CHECK constraint ties {@code master_type} to {@code salon_id}
+     *       nullability) — {@link MasterService#deactivateMaster(UUID, Master)}, which this method
+     *       calls, skips its own {@code assertCanManageMaster} (whose {@code INDEPENDENT_MASTER}
+     *       branch requires {@code master.getUser().getId().equals(actorId)}) entirely, so this
+     *       method must not rely on D5 alone to keep an independent master's account safe from an
+     *       unrelated salon owner</li>
+     *   <li>the row is not already {@link Master#isDetached() detached} — a detached row has no
+     *       account left to delete, and re-detaching it would overwrite the name snapshot with
+     *       {@code null} and trip {@code chk_masters_detachment_coherent}</li>
+     *   <li>{@code salonId} re-check against the loaded row's own salon — defense-in-depth
+     *       re-check of {@code @authz.masterBelongsToSalon} on the controller, mirroring {@link
+     *       #removeAdmin(UUID, UUID, UUID)}'s re-check of {@code adminBelongsToSalon}</li>
+     *   <li>self-removal — {@code actorId} cannot remove their own master row, mirroring {@link
+     *       #removeAdmin(UUID, UUID, UUID)}'s self-removal guard</li>
+     *   <li>{@link StaffClientReferenceAuditService#runAuditForStaffUserIds(List)} against the
+     *       ONE master's user id (D4) — fail-closed: a hard-delete of a user who is also
+     *       referenced as a client elsewhere (a booking, a review, an appointment) is refused,
+     *       never silently degraded to a false CLEAN result</li>
+     *   <li>{@link BookingRepository#countConfirmedFutureByMasterId} (D3) — a future
+     *       {@code CONFIRMED} booking refuses the removal with {@code 409} naming the count and
+     *       writes nothing; {@code Phase 298} replaces this refusal with a cancel-and-notify
+     *       cascade, it does not delete this check</li>
+     * </ol>
+     * Only once every check passes does anything write. {@link MasterService#deactivateMaster}
+     * MUST run BEFORE {@link #disposeStaffAccounts(UUID, UUID, List)} — it dereferences {@code
+     * master.getUser().getId()} to key its cache evictions ({@code MasterService:790-868}), and a
+     * detached row has no user left to read that from.
+     *
+     * @throws NotFoundException  if {@code masterId} does not resolve to a master row
+     * @throws BusinessException  ({@code 409}) if the row is not a {@code SALON_MASTER} (the
+     *                            salon's own owner-master or, defense-in-depth, an
+     *                            {@code INDEPENDENT_MASTER}), is already detached, the master's
+     *                            user is referenced as a client elsewhere, or the master has a
+     *                            future CONFIRMED booking
+     * @throws ForbiddenException ({@code 403}) if the loaded row does not actually belong to
+     *                            {@code salonId}, or if the actor targets their own master row
+     */
+    @Transactional
+    public void removeMaster(UUID actorId, UUID salonId, UUID masterId) {
+        Master master = masterRepository.findByIdWithUserAndSalon(masterId)
+                .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
+
+        if (master.getMasterType() != MasterType.SALON_MASTER) {
+            throw new BusinessException(
+                    HttpStatus.CONFLICT,
+                    master.getMasterType() == MasterType.SALON_OWNER
+                            ? "Use DELETE /salons/{salonId}/master to disable your own master profile"
+                            : "Only an invited SALON_MASTER may be removed here");
+        }
+
+        if (master.isDetached()) {
+            throw new BusinessException(HttpStatus.CONFLICT, "Master is already detached");
+        }
+
+        if (master.getSalon() == null || !salonId.equals(master.getSalon().getId())) {
+            throw new ForbiddenException("Master does not belong to this salon");
+        }
+
+        UUID masterUserId = master.getUser().getId();
+        if (actorId.equals(masterUserId)) {
+            throw new ForbiddenException("Cannot remove yourself");
+        }
+
+        // Fail-closed precondition (D4), scoped to the ONE user being hard-deleted — never the
+        // whole-salon resolution runAuditForSalon(salonId) uses, which would abort a legitimate
+        // single removal over some OTHER master's stray client row.
+        StaffClientReferenceAuditResult audit =
+                staffClientReferenceAuditService.runAuditForStaffUserIds(List.of(masterUserId));
+        if (audit.outcome() == AuditOutcome.VIOLATIONS_FOUND) {
+            throw new BusinessException(
+                    HttpStatus.CONFLICT,
+                    "This master is also referenced as a client and cannot be removed");
+        }
+
+        long futureConfirmedCount =
+                bookingRepository.countConfirmedFutureByMasterId(masterId, OffsetDateTime.now(clock));
+        if (futureConfirmedCount > 0) {
+            throw new BusinessException(
+                    HttpStatus.CONFLICT,
+                    "Master has " + futureConfirmedCount
+                            + " future confirmed booking(s) — cancel or reschedule them first");
+        }
+
+        // MUST precede disposeStaffAccounts (see javadoc above): deactivateMaster dereferences
+        // master.getUser().getId() to key its cache evictions, and a detached row has no user to
+        // read that from. Also fires the single-master rating-recalculation / SalonStaffChangedEvent
+        // path this master's removal must trigger, exactly as deleteSalonStaff's batch does.
+        //
+        // Perf (Phase 297 audit, MEDIUM): calls the already-loaded-row overload
+        // MasterService#deactivateMaster(UUID, Master) — reusing `master` fetched above via
+        // findByIdWithUserAndSalon — instead of MasterService#deactivateMaster(UUID, UUID), which
+        // would re-run that same LEFT JOIN FETCH query plus MasterService's own defense-in-depth
+        // assertCanManageMaster (2 more queries for a SALON_MASTER target). The D5/D6 checks above
+        // in this method, together with the controller's @PreAuthorize(canManageSalon +
+        // masterBelongsToSalon), already prove the identical actor/salon/master triple that
+        // assertCanManageMaster would otherwise re-derive.
+        masterService.deactivateMaster(actorId, master);
+
+        disposeStaffAccounts(actorId, salonId, List.of(masterUserId));
+
+        log.info("Master removal: master {} (user {}) removed from salon {} by actor {}",
+                masterId, masterUserId, salonId, actorId);
     }
 
     /**

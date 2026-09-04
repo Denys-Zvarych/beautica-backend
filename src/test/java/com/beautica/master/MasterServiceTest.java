@@ -21,8 +21,14 @@ import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.service.SalonService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaMethod;
+import com.tngtech.archunit.core.domain.JavaMethodCall;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -45,6 +51,7 @@ import java.time.Clock;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -1708,5 +1715,53 @@ class MasterServiceTest {
                 .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
 
         verifyNoInteractions(masterRepository);
+    }
+
+    // ── Finding 2 (Phase 297 security re-audit, MEDIUM) ─────────────────────────────────────
+    // MasterService#deactivateMaster(UUID, Master) skips assertCanManageMaster entirely (see its
+    // own javadoc "SECURITY — do not call this from anywhere else"). It must be `public` — its
+    // one caller, SalonService#removeMaster, lives in a different package — so nothing but this
+    // test stands between that overload and a second caller that has not done the equivalent
+    // authorization work itself. ArchUnit is already a test dependency (archunit-junit5, see
+    // build.gradle.kts) and already used this way for an identical reason in
+    // ServiceCatalogServiceArchitectureTest: mechanical enforcement, not a javadoc comment a
+    // future reviewer has to remember to re-derive.
+    //
+    // Falsified 2026-09-05: temporarily added a second call site (a throwaway method in
+    // SalonService invoking masterService.deactivateMaster(actorId, master) a second time) —
+    // this test went RED ("expected size 1 but was 2") before the call site was reverted.
+    @Test
+    @DisplayName("deactivateMaster(UUID, Master) — the authorization-skipping overload — has "
+            + "EXACTLY ONE production caller, SalonService#removeMaster")
+    void should_haveExactlyOneCaller_when_deactivateMasterEntityOverloadInvoked() {
+        JavaClasses classes = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("com.beautica");
+
+        JavaMethod overload = classes.get(MasterService.class).getMethods().stream()
+                .filter(m -> m.getName().equals("deactivateMaster"))
+                .filter(m -> m.getRawParameterTypes().size() == 2)
+                .filter(m -> m.getRawParameterTypes().get(0).isEquivalentTo(UUID.class))
+                .filter(m -> m.getRawParameterTypes().get(1).isEquivalentTo(Master.class))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "MasterService.deactivateMaster(UUID, Master) not found — has it been "
+                                + "renamed or removed?"));
+
+        Set<JavaMethodCall> callers = overload.getCallsOfSelf();
+
+        assertThat(callers)
+                .as("production call sites of the authorization-skipping "
+                        + "MasterService.deactivateMaster(UUID, Master) overload — there must be "
+                        + "exactly one, or a new caller has bypassed assertCanManageMaster without "
+                        + "performing the equivalent authorization check itself")
+                .hasSize(1);
+
+        JavaMethodCall theCall = callers.iterator().next();
+        assertThat(theCall.getOrigin().getOwner().isEquivalentTo(SalonService.class))
+                .as("the sole caller must be declared on SalonService, found on %s instead",
+                        theCall.getOrigin().getOwner().getFullName())
+                .isTrue();
+        assertThat(theCall.getOrigin().getName()).isEqualTo("removeMaster");
     }
 }

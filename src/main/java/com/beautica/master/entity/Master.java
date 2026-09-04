@@ -200,7 +200,10 @@ public class Master extends AuditableEntity {
      * <p>Widened from package-private to {@code public} in phase 295, which added its FIRST and
      * ONLY production caller: {@code SalonService#deleteSalonStaff}, in {@code
      * com.beautica.salon.service} — a different package, so package-private was not reachable from
-     * it. Nothing else may call this. Detachment is not a general-purpose master mutation: it is
+     * it. Phase 297 extracted that caller's body into {@code SalonService#disposeStaffAccounts},
+     * now the one physical call site, reached both from {@code deleteSalonStaff}'s salon-wide
+     * cascade and from {@code removeMaster}'s single-master path. Nothing else may call this.
+     * Detachment is not a general-purpose master mutation: it is
      * the second half of "the staff account was hard-deleted", and calling it without deleting the
      * matching {@code users} row leaves a live account whose provider profile has silently
      * vanished from every roster.

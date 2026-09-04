@@ -631,6 +631,43 @@ public class MasterService {
     }
 
     /**
+     * Already-loaded-row sibling of {@link #deactivateMaster(UUID, UUID)}, for a caller that has
+     * ALREADY fetched {@code master} via its own {@code findByIdWithUserAndSalon} in the same
+     * transaction AND already performed an authorization check equivalent to
+     * {@link #assertCanManageMaster} against that exact row. Today's only caller is
+     * {@code SalonService#removeMaster}: its controller {@code @PreAuthorize} runs
+     * {@code canManageSalon} + {@code masterBelongsToSalon}, and the method body itself re-checks
+     * the loaded row's salon and owner-type/detached state (D5/D6) before this call — proving the
+     * identical actor/salon/master triple {@link #assertCanManageMaster} would otherwise
+     * re-derive. Phase 290 fixed the same redundant-refetch/redundant-authz pattern for the
+     * batch path ({@link #deactivateMasters}, see its javadoc "Finding #3"); this reintroduces
+     * that fix for the single-master removal path (Phase 297 perf audit).
+     *
+     * <p>Skips BOTH the extra {@code findByIdWithUserAndSalon} SELECT (avoided entirely — the
+     * caller's row is reused as-is) and {@link #assertCanManageMaster} (avoided entirely — for a
+     * {@code SALON_MASTER}-type target that check fires {@link #canManageSalonStaff}, two more
+     * queries), going straight to the shared {@link #deactivateMasterInternal} body with
+     * {@code publishEvent = true} — same one-event contract as
+     * {@link #deactivateMaster(UUID, UUID)}.
+     *
+     * <p><b>SECURITY — do not call this from anywhere else.</b> It performs NO authorization of
+     * its own. It exists only because the caller has already done the equivalent work; a new
+     * caller that has not done so would bypass {@link #assertCanManageMaster} entirely. The
+     * public {@link #deactivateMaster(UUID, UUID)} above is UNCHANGED and remains the only
+     * entry point reachable from {@code MasterController} — that path still loads its own row
+     * and still runs the full {@link #assertCanManageMaster} check.
+     *
+     * @param actorId the actor driving the deactivation, forwarded unchanged into
+     *                {@link #deactivateMasterInternal} for its own audit/event use — not used
+     *                for authorization in this overload
+     * @param master  the already-loaded, already-authorized row to deactivate
+     */
+    @Transactional
+    public void deactivateMaster(UUID actorId, Master master) {
+        deactivateMasterInternal(actorId, master, true);
+    }
+
+    /**
      * Batch sibling of {@link #deactivateMaster(UUID, UUID)} for a caller that already holds
      * every {@link Master} row it needs to deactivate — {@code SalonService}'s salon-deletion
      * cascade ({@code SalonService#deleteSalonStaff}), the only caller today. Two Phase 290

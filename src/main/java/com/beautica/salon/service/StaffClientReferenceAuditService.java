@@ -29,18 +29,22 @@ import java.util.UUID;
  * {@link StaffClientReferenceAuditResult}. See that result type's javadoc for the full "clean vs.
  * not run" contract.
  *
- * <h3>Two callers — {@link #runAudit()} vs {@link #runAuditForSalon(UUID)}</h3>
+ * <h3>Three callers — {@link #runAudit()}, {@link #runAuditForSalon(UUID)}, {@link
+ * #runAuditForStaffUserIds(List)}</h3>
  *
  * {@link #runAudit()} is the platform-wide, offline/one-off sweep: run manually to discover
  * whether a violating row already exists ANYWHERE, before Phase 290's cascade exists at all.
  * Slow is fine — nothing waits on it, and it must never be called from a request path.
  *
- * <p>{@link #runAuditForSalon(UUID)} is the per-delete precondition Phase 290's
- * {@code DELETE /salons/{salonId}} guard will call — scoped to exactly the salon being deleted,
- * so a delete pays only for its own salon's staff, never a platform-wide scan. See
+ * <p>{@link #runAuditForStaffUserIds(List)} is the actual query body, scoped to an explicit staff
+ * user id list (Phase 297 D4). {@link #runAuditForSalon(UUID)} is a thin resolve-then-delegate
+ * wrapper over it for {@code DELETE /salons/{salonId}} (Phase 290), scoped to exactly the salon
+ * being deleted; {@code SalonService#removeMaster} (Phase 297) calls {@link
+ * #runAuditForStaffUserIds(List)} directly with a one-element list, since a salon-wide resolve
+ * would audit staff the single-master removal never touches. See
  * {@link StaffClientReferenceAuditRepository}'s class javadoc for the full rationale and the
- * measured {@code EXPLAIN (ANALYZE, BUFFERS)} evidence for why these cannot share one query
- * shape.
+ * measured {@code EXPLAIN (ANALYZE, BUFFERS)} evidence for why the platform-wide and per-salon
+ * shapes cannot share one query shape.
  */
 @Service
 @RequiredArgsConstructor
@@ -84,24 +88,44 @@ public class StaffClientReferenceAuditService {
     }
 
     /**
-     * Per-delete precondition — scoped to {@code salonId}'s own staff only. Phase 290's future
+     * Per-delete precondition — scoped to {@code salonId}'s own staff only. Phase 290's
      * {@code DELETE /salons/{salonId}} guard is the intended caller.
      *
-     * <p>Resolves the salon's staff user ids ONCE ({@link
-     * StaffClientReferenceAuditRepository#findSalonStaffUserIds}) and reuses that list across all
-     * three finder queries, rather than re-deriving a per-salon join inside each one — see that
-     * repository's javadoc for the measured reason (a correlated per-row subquery cannot be
-     * pushed down onto `bookings`' client-id index; a pre-resolved {@code IN} list can). A salon
-     * with no staff at all short-circuits to an empty, clean result without issuing any of the
-     * three finder queries — an empty {@code IN} list has no violation to find, and skipping the
-     * calls avoids relying on how Hibernate happens to translate an empty collection bind.
-     *
-     * <p>Same {@code @Transactional(readOnly = true)} torn-snapshot rationale as {@link
-     * #runAudit()} — all reads (the id resolution and the three finders) share one transaction.
+     * <p>Resolves the salon's staff user ids and delegates to {@link
+     * #runAuditForStaffUserIds(List)} (Phase 297 D4 extraction) — see that method's javadoc for
+     * the rest of the contract, including the empty-list short-circuit.
      */
     @Transactional(readOnly = true)
     public StaffClientReferenceAuditResult runAuditForSalon(UUID salonId) {
-        List<UUID> staffUserIds = auditRepository.findSalonStaffUserIds(salonId);
+        return runAuditForStaffUserIds(auditRepository.findSalonStaffUserIds(salonId));
+    }
+
+    /**
+     * The same fail-closed client-reference audit as {@link #runAuditForSalon(UUID)}, run against
+     * an explicit staff user id list rather than resolving one from a salon (Phase 297 D4).
+     *
+     * <p>{@code runAuditForSalon(salonId)} resolves *every* staff user of the salon, which is the
+     * wrong shape for {@code SalonService#removeMaster} — that endpoint removes ONE master, and
+     * auditing the whole salon's staff would abort a legitimate single-master removal because some
+     * OTHER master at the salon has a stray client row. Extracted here so the query bodies below
+     * are written once and both the bulk (salon-wide) and single-master callers reuse them; the
+     * four {@link StaffClientReferenceAuditRepository} finders already accept a {@code
+     * staffUserIds} list, so this is a seam extraction, not a new query.
+     *
+     * <p>Resolves the given ids ONCE and reuses that list across all four finder queries, rather
+     * than re-deriving a per-salon join inside each one — see {@link
+     * StaffClientReferenceAuditRepository}'s javadoc for the measured reason (a correlated
+     * per-row subquery cannot be pushed down onto `bookings`' client-id index; a pre-resolved
+     * {@code IN} list can). An empty list short-circuits to an empty, clean result without issuing
+     * any of the four finder queries — an empty {@code IN} list has no violation to find, and
+     * skipping the calls avoids relying on how Hibernate happens to translate an empty collection
+     * bind.
+     *
+     * <p>Same {@code @Transactional(readOnly = true)} torn-snapshot rationale as {@link
+     * #runAudit()} — all reads (the four finders) share one transaction.
+     */
+    @Transactional(readOnly = true)
+    public StaffClientReferenceAuditResult runAuditForStaffUserIds(List<UUID> staffUserIds) {
         if (staffUserIds.isEmpty()) {
             return StaffClientReferenceAuditResult.of(List.of(), clock.instant());
         }

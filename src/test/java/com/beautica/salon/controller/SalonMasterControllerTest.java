@@ -55,10 +55,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * {@code @WebMvcTest} slice for {@link SalonMasterController} — Phase 12.4.
+ * {@code @WebMvcTest} slice for {@link SalonMasterController} — Phase 12.4, extended by Phase 297
+ * for the {@code DELETE /{salonId}/masters/{masterId}} single-master-removal endpoint.
  *
  * <p>{@link AuthorizationService} is mocked to control {@code @PreAuthorize} outcomes
- * without a real DB. {@link MasterService} is mocked for all business-logic interactions.
+ * without a real DB. {@link MasterService} (and, since Phase 297, {@code SalonService}) is mocked
+ * for all business-logic interactions.
  *
  * <p>Authentication is injected directly via
  * {@code SecurityMockMvcRequestPostProcessors.authentication()} so the
@@ -101,6 +103,10 @@ class SalonMasterControllerTest {
 
     @MockBean
     private MasterService masterService;
+
+    // Phase 297 — the controller now also depends on SalonService for removeMaster.
+    @MockBean
+    private com.beautica.salon.service.SalonService salonService;
 
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
@@ -364,5 +370,147 @@ class SalonMasterControllerTest {
                         .with(authenticatedAs(foreignOwnerId, "other@beautica.test", Role.SALON_OWNER))
                         .with(csrf()))
                 .andExpect(status().isForbidden());
+    }
+
+    // ── DELETE /{salonId}/masters/{masterId} — Phase 297 single-master removal ────────────────
+
+    /**
+     * Owner who owns the salon and targets a master belonging to it → service disposes of the
+     * master, controller returns 204.
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 204 when owner removes a master of their salon")
+    void should_return204_when_ownerRemovesMasterOfOwnedSalon() throws Exception {
+        var ownerUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(eq(masterId), eq(salonId))).thenReturn(true);
+        doNothing().when(salonService).removeMaster(eq(ownerUserId), eq(salonId), eq(masterId));
+
+        log.debug("Act: DELETE {}/{}/masters/{} as SALON_OWNER — must return 204",
+                BASE_URL, salonId, masterId);
+
+        mockMvc.perform(delete(BASE_URL + "/" + salonId + "/masters/" + masterId)
+                        .with(authenticatedAs(ownerUserId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+    }
+
+    /**
+     * The service refuses with a domain conflict (e.g. D3's future-booking guard, or D6's
+     * owner-row / already-detached guards) → must surface as 409.
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 409 when the service refuses the removal")
+    void should_return409_when_serviceRefusesRemoval() throws Exception {
+        var ownerUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(eq(masterId), eq(salonId))).thenReturn(true);
+        doThrow(new com.beautica.common.exception.BusinessException(
+                org.springframework.http.HttpStatus.CONFLICT,
+                "Master has 1 future confirmed booking(s) — cancel or reschedule them first"))
+                .when(salonService).removeMaster(eq(ownerUserId), eq(salonId), eq(masterId));
+
+        log.debug("Act: DELETE {}/{}/masters/{} when service refuses — must return 409",
+                BASE_URL, salonId, masterId);
+
+        mockMvc.perform(delete(BASE_URL + "/" + salonId + "/masters/" + masterId)
+                        .with(authenticatedAs(ownerUserId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isConflict());
+    }
+
+    /**
+     * masterId does not resolve, or resolves to a master of a different salon —
+     * {@code masterBelongsToSalon} returns false, so the SpEL guard denies before the service is
+     * ever reached (D5's IDOR closure).
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when masterBelongsToSalon is false")
+    void should_return403_when_masterDoesNotBelongToSalon() throws Exception {
+        var ownerUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(eq(masterId), eq(salonId))).thenReturn(false);
+
+        log.debug("Act: DELETE {}/{}/masters/{} with masterBelongsToSalon=false — must be 403",
+                BASE_URL, salonId, masterId);
+
+        mockMvc.perform(delete(BASE_URL + "/" + salonId + "/masters/" + masterId)
+                        .with(authenticatedAs(ownerUserId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    /**
+     * SALON_ADMIN must be denied — D5's deliberate divergence from {@code removeAdmin}:
+     * {@code hasRole('SALON_OWNER')} only, never {@code hasAnyRole('SALON_OWNER', 'SALON_ADMIN')}.
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when SALON_ADMIN tries to remove a master")
+    void should_return403_when_salonAdminTriesToRemoveMaster() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        // canManageSalon/masterBelongsToSalon would both return true for an admin acting on
+        // their own salon — but the SALON_OWNER role check fires first (D5), so the 403 here
+        // must be role-driven, not authz-bean-driven.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(eq(masterId), eq(salonId))).thenReturn(true);
+
+        log.debug("Act: DELETE {}/{}/masters/{} as SALON_ADMIN — must be denied with 403",
+                BASE_URL, salonId, masterId);
+
+        mockMvc.perform(delete(BASE_URL + "/" + salonId + "/masters/" + masterId)
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    /**
+     * Owner of salon B targeting salon A — {@code canManageSalon} returns false, so the whole
+     * SpEL guard short-circuits to denied before {@code masterBelongsToSalon} is even relevant.
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when owner targets a salon they do not own")
+    void should_return403_when_ownerRemovesMasterInUnownedSalon() throws Exception {
+        var foreignOwnerId = UUID.randomUUID();
+        var salonAId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(false);
+
+        log.debug("Act: DELETE {}/{}/masters/{} as SALON_OWNER with no ownership — must be 403",
+                BASE_URL, salonAId, masterId);
+
+        mockMvc.perform(delete(BASE_URL + "/" + salonAId + "/masters/" + masterId)
+                        .with(authenticatedAs(foreignOwnerId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+    }
+
+    /**
+     * No Authorization header — filter chain must return 401.
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 401 when no Authorization header")
+    void should_return401_when_noToken_onRemoveMaster() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        log.debug("Act: DELETE {}/{}/masters/{} without credentials — must be 401",
+                BASE_URL, salonId, masterId);
+
+        mockMvc.perform(delete(BASE_URL + "/" + salonId + "/masters/" + masterId)
+                        .with(csrf()))
+                .andExpect(status().isUnauthorized());
     }
 }

@@ -907,6 +907,30 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("windowEnd") OffsetDateTime windowEnd
     );
 
+    /**
+     * The count of a master's still-{@code CONFIRMED} future bookings — Phase 297 D3's
+     * single-master-removal guard ({@code SalonService#removeMaster}). A non-zero count blocks
+     * the removal with {@code 409}: the master would otherwise vanish out from under a client
+     * holding a live appointment. Served by {@code idx_bookings_master_slot_overlap}
+     * ({@code bookings(master_id, starts_at, ends_at) WHERE status = 'CONFIRMED'}, created in
+     * V26, redefined with the narrowed {@code CONFIRMED}-only predicate in V113) —
+     * it leads with {@code master_id} and is already partial on a superset of this predicate, so
+     * no new index is added. ({@code idx_bookings_master_active_starts_at}, V18, was dropped as
+     * redundant by V27 — do not cite it.)
+     *
+     * <p>Deliberately {@code CONFIRMED} only, not {@code PENDING} — Phase 26's booking flow
+     * auto-approves on create, so no booking in this schema is ever left {@code PENDING}, but the
+     * predicate is written to match {@link #findActiveTimeRangesByMasterInRange} rather than
+     * invent a divergent status set.
+     */
+    @Query("""
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    long countConfirmedFutureByMasterId(@Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
+
     @Query(value = """
             SELECT EXISTS (
               SELECT 1 FROM bookings
