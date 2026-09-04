@@ -5,6 +5,7 @@ import com.beautica.salon.entity.Salon;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -228,6 +229,21 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * inactive", which the caller treats identically (Anti-Bug §D — no destination-status oracle).
      */
     boolean existsByIdAndIsActiveTrue(UUID id);
+
+    /**
+     * Nulls both image-URL pointer columns for a deleted salon (Phase 268 D2/D4) — called by
+     * {@code SalonService} strictly AFTER {@code MediaService#deleteBySalon} has attempted the R2
+     * deletes for the corresponding blobs, never before (D4's R2-first-then-DB ordering; the DB
+     * pointer is dropped whether or not the R2 call succeeded — a retained pointer would re-publish
+     * a deleted salon's photo at a live public URL, which is the outcome D4 exists to prevent).
+     *
+     * <p>Runs OUTSIDE the salon-deletion transaction — after commit, on the same thread as the R2
+     * sweep (D8) — so this is its own tiny transaction, not a mutation the caller's {@code @Transactional}
+     * boundary covers.
+     */
+    @Modifying
+    @Query("UPDATE Salon s SET s.avatarUrl = null, s.coverImageUrl = null WHERE s.id = :salonId")
+    int nullImageUrls(@Param("salonId") UUID salonId);
 
     // True iff the given owner already has at least one salon (primary or not).
     // Used in SalonService.createSalon to decide is_primary = true/false.

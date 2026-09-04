@@ -8,14 +8,25 @@ import org.springframework.stereotype.Service;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.Delete;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Error;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import org.springframework.util.StringUtils;
 
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Thin wrapper around the Cloudflare R2 {@link S3Client} for media uploads.
@@ -45,6 +56,9 @@ public class R2StorageService {
     private static final String UPLOAD_FAILED_MESSAGE = "Failed to upload file to media storage";
     private static final String DELETE_FAILED_MESSAGE = "Failed to delete file from media storage";
     private static final String DISABLED_SUFFIX = " — R2 is disabled; no-op";
+
+    /** S3 {@code DeleteObjects} accepts at most this many keys per request. */
+    private static final int MAX_BATCH_DELETE_KEYS = 1000;
 
     private final Optional<S3Client> s3Client;
     private final String bucketName;
@@ -154,6 +168,81 @@ public class R2StorageService {
     }
 
     /**
+     * Batch-deletes multiple objects from the configured R2 bucket in as few HTTP round-trips
+     * as S3's {@code DeleteObjects} API allows — a single request accepts up to {@value
+     * #MAX_BATCH_DELETE_KEYS} keys, so a larger input is chunked at that limit.
+     *
+     * <p><b>Backs {@code MediaService#sweepBlobs}</b> (Phase 268 perf follow-up). The sweep
+     * previously called {@link #deleteFile(String)} once per key — a salon with dozens of
+     * portfolio photos meant dozens of sequential R2 round-trips inside a teardown sweep
+     * that runs synchronously after the deletion transaction commits.
+     *
+     * <p><b>Never throws for a delete failure, partial or total</b> — this is the load-bearing
+     * contract difference from {@link #deleteFile(String)}. {@code DeleteObjects} reports a
+     * per-key failure in its response body (an {@code Errors} entry), not as an exception, so
+     * those keys are simply collected into the returned set. A whole-chunk transport failure
+     * ({@link S3Exception} / {@link SdkClientException} — e.g. the request itself never
+     * reached R2) is likewise absorbed here and every key in that chunk is reported back as
+     * failed, so a caller that already treats "key present in the returned set" as "log and
+     * move on, drop the DB pointer regardless" needs no separate handling for a transport-level
+     * failure versus a reported per-key one.
+     *
+     * <p><b>Disabled mode:</b> logs WARN (key count only, no keys) and returns an empty set,
+     * mirroring {@link #deleteFile(String)}'s no-op contract.
+     *
+     * @param keys R2 object keys to delete; duplicates are removed before chunking, order is
+     *             not preserved in the returned set, an empty input is a no-op
+     * @return the subset of {@code keys} that could not be deleted (never {@code null}); empty
+     *         when every key was deleted or R2 is disabled
+     */
+    public Set<String> deleteFiles(Collection<String> keys) {
+        if (keys.isEmpty()) {
+            return Set.of();
+        }
+        if (!r2Enabled) {
+            // Keys may encode entity UUIDs — omit from WARN log to avoid PII in log aggregators.
+            log.warn("deleteFiles(count={}){}", keys.size(), DISABLED_SUFFIX);
+            return Set.of();
+        }
+
+        List<String> distinctKeys = keys.stream().distinct().toList();
+        Set<String> failedKeys = new HashSet<>();
+        for (int i = 0; i < distinctKeys.size(); i += MAX_BATCH_DELETE_KEYS) {
+            List<String> chunk = distinctKeys.subList(i, Math.min(i + MAX_BATCH_DELETE_KEYS, distinctKeys.size()));
+            failedKeys.addAll(deleteChunk(chunk));
+        }
+        return failedKeys;
+    }
+
+    /** Deletes a single chunk (at most {@value #MAX_BATCH_DELETE_KEYS} keys) via one {@code DeleteObjects} call. */
+    private Set<String> deleteChunk(List<String> chunk) {
+        List<ObjectIdentifier> objectIds = new ArrayList<>(chunk.size());
+        for (String key : chunk) {
+            objectIds.add(ObjectIdentifier.builder().key(key).build());
+        }
+        DeleteObjectsRequest request = DeleteObjectsRequest.builder()
+                .bucket(bucketName)
+                .delete(Delete.builder().objects(objectIds).quiet(false).build())
+                .build();
+
+        try {
+            DeleteObjectsResponse response = s3Client.get().deleteObjects(request);
+            if (response.errors() == null || response.errors().isEmpty()) {
+                return Set.of();
+            }
+            log.warn("R2 batch delete reported {} failed key(s) of {} requested",
+                    response.errors().size(), chunk.size());
+            return response.errors().stream()
+                    .map(S3Error::key)
+                    .collect(Collectors.toSet());
+        } catch (S3Exception | SdkClientException ex) {
+            // Chunk keys may encode entity UUIDs — omit from ERROR log to avoid PII in log aggregators.
+            log.error("R2 batch delete failed for {} key(s): {}", chunk.size(), ex.getClass().getSimpleName());
+            return new HashSet<>(chunk);
+        }
+    }
+
+    /**
      * Builds a public read URL for the given R2 key.
      *
      * <p><b>Disabled mode:</b> returns an empty string so callers can safely concat
@@ -174,6 +263,47 @@ public class R2StorageService {
             return "";
         }
         return publicUrlPrefix + "/" + key;
+    }
+
+    /**
+     * Inverse of {@link #buildPublicUrl}: recovers the R2 key from a previously-built public URL,
+     * or {@link Optional#empty()} when {@code url} cannot possibly be ours.
+     *
+     * <p>Backs the Phase 268 D2 salon-imagery sweep, where {@code salons.avatar_url} /
+     * {@code cover_image_url} store only the public URL (unlike {@code users.avatar_r2_key}, which
+     * stores the raw key directly) — the key must be recovered before it can be handed to
+     * {@link #deleteFile(String)}.
+     *
+     * <p><b>Guards, in this exact order — never reordered, never guessed at:</b>
+     * <ol>
+     *   <li>R2 disabled → empty. No configured prefix to compare against, and nothing to delete
+     *       anyway.</li>
+     *   <li>{@code publicUrlPrefix} blank → empty. <b>Critical</b>: {@code "".startsWith("")} and
+     *       every string's {@code startsWith("/…")} check would otherwise let a blank prefix match
+     *       ANY url and misroute its full path as a "key".</li>
+     *   <li>{@code url} does not start with {@code publicUrlPrefix + "/"} → empty. A URL that is
+     *       not ours (a foreign host, a malformed value, or an attacker-supplied string) must never
+     *       be turned into a delete against a guessed key.</li>
+     *   <li>The remainder after stripping the prefix is blank → empty. A bare prefix with nothing
+     *       after it is not a key.</li>
+     * </ol>
+     *
+     * @param url a previously-stored public URL, possibly {@code null}, blank, foreign, or
+     *            malformed
+     * @return the recovered R2 key, or empty when {@code url} does not carry the configured prefix
+     */
+    public Optional<String> extractKeyFromPublicUrl(String url) {
+        if (!r2Enabled) {
+            return Optional.empty();
+        }
+        if (!StringUtils.hasText(publicUrlPrefix)) {
+            return Optional.empty();
+        }
+        if (url == null || !url.startsWith(publicUrlPrefix + "/")) {
+            return Optional.empty();
+        }
+        String key = url.substring(publicUrlPrefix.length() + 1);
+        return StringUtils.hasText(key) ? Optional.of(key) : Optional.empty();
     }
 
     private static String stripTrailingSlash(String url) {

@@ -19,20 +19,27 @@ import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Error;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -512,5 +519,264 @@ class R2StorageServiceTest {
         assertThat(url)
                 .as("buildPublicUrl must return empty string when R2 is disabled")
                 .isEmpty();
+    }
+
+    // ── Phase 268 D2 — extractKeyFromPublicUrl (inverse of buildPublicUrl) ────
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl recovers the key when the URL carries the configured prefix")
+    void should_recoverKey_when_urlCarriesConfiguredPrefix() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        Optional<String> key = service.extractKeyFromPublicUrl("https://pub.example.r2.dev/portfolio/salons/s1/photo.jpg");
+
+        assertThat(key).contains("portfolio/salons/s1/photo.jpg");
+    }
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl round-trips with buildPublicUrl")
+    void should_roundTrip_when_extractingAKeyBuildPublicUrlProduced() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        String builtUrl = service.buildPublicUrl(KEY);
+
+        Optional<String> extracted = service.extractKeyFromPublicUrl(builtUrl);
+
+        assertThat(extracted).contains(KEY);
+    }
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl returns empty — the D2 safety guard — for a URL from a foreign host")
+    void should_returnEmpty_when_urlLacksConfiguredPrefix() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        Optional<String> key = service.extractKeyFromPublicUrl("https://evil.example.com/portfolio/salons/s1/photo.jpg");
+
+        assertThat(key).isEmpty();
+    }
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl returns empty for a null URL")
+    void should_returnEmpty_when_urlIsNull() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        Optional<String> key = service.extractKeyFromPublicUrl(null);
+
+        assertThat(key).isEmpty();
+    }
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl returns empty for a malformed value that merely CONTAINS the prefix "
+            + "mid-string rather than starting with it")
+    void should_returnEmpty_when_prefixIsNotAtTheStart() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        Optional<String> key = service.extractKeyFromPublicUrl(
+                "https://evil.example.com/redirect?to=" + PUBLIC_URL + "/portfolio/salons/s1/photo.jpg");
+
+        assertThat(key).isEmpty();
+    }
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl returns empty when the URL is exactly the bare prefix with nothing after it")
+    void should_returnEmpty_when_urlIsBarePrefixWithNoRemainder() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        Optional<String> key = service.extractKeyFromPublicUrl(PUBLIC_URL + "/");
+
+        assertThat(key).isEmpty();
+    }
+
+    @Test
+    @DisplayName("extractKeyFromPublicUrl returns empty when R2 is disabled, regardless of the URL")
+    void should_returnEmpty_when_r2Disabled() {
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+
+        Optional<String> key = service.extractKeyFromPublicUrl(PUBLIC_URL + "/some/key.jpg");
+
+        assertThat(key).isEmpty();
+    }
+
+    // ── Phase 268 perf follow-up — deleteFiles (batched delete) ───────────────
+
+    @Test
+    @DisplayName("deleteFiles returns an empty set and never touches S3 for an empty key collection")
+    void should_returnEmptySet_when_deleteFilesCalledWithNoKeys() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        Set<String> failed = service.deleteFiles(List.of());
+
+        assertThat(failed).isEmpty();
+        verifyNoInteractions(s3Client);
+    }
+
+    @Test
+    @DisplayName("deleteFiles returns an empty set without S3 interaction when R2 is disabled")
+    void should_returnEmptySet_when_deleteFilesCalledWithR2Disabled() {
+        R2StorageService service = new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL);
+
+        Set<String> failed = service.deleteFiles(List.of("a", "b"));
+
+        assertThat(failed).isEmpty();
+        verifyNoInteractions(s3Client);
+    }
+
+    @Test
+    @DisplayName("deleteFiles issues ONE DeleteObjects call carrying every key when all keys fit in a single chunk")
+    void should_issueSingleDeleteObjectsCall_when_deleteFilesCalledWithFewKeys() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        ArgumentCaptor<DeleteObjectsRequest> captor = ArgumentCaptor.forClass(DeleteObjectsRequest.class);
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+
+        Set<String> failed = service.deleteFiles(List.of("k-a", "k-b", "k-c"));
+
+        assertThat(failed).isEmpty();
+        verify(s3Client, times(1)).deleteObjects(captor.capture());
+        DeleteObjectsRequest request = captor.getValue();
+        assertThat(request.bucket()).isEqualTo(BUCKET);
+        assertThat(request.delete().objects())
+                .extracting(ObjectIdentifier::key)
+                .containsExactlyInAnyOrder("k-a", "k-b", "k-c");
+    }
+
+    @Test
+    @DisplayName("deleteFiles maps S3's per-key Errors back to the returned failed-key set")
+    void should_mapPerKeyErrors_when_deleteObjectsReportsPartialFailure() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder()
+                        .errors(S3Error.builder().key("k-b").code("AccessDenied").build())
+                        .build());
+
+        Set<String> failed = service.deleteFiles(List.of("k-a", "k-b", "k-c"));
+
+        assertThat(failed).containsExactly("k-b");
+    }
+
+    @Test
+    @DisplayName("deleteFiles reports every key in a chunk as failed, without throwing, when the whole "
+            + "DeleteObjects round-trip throws S3Exception")
+    void should_reportAllKeysFailed_when_deleteObjectsThrowsS3Exception() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        S3Exception sdkException = (S3Exception) S3Exception.builder().message("fail").build();
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class))).thenThrow(sdkException);
+
+        Set<String> failed = service.deleteFiles(List.of("k-a", "k-b"));
+
+        assertThat(failed).containsExactlyInAnyOrder("k-a", "k-b");
+    }
+
+    @Test
+    @DisplayName("deleteFiles reports every key in a chunk as failed, without throwing, when the whole "
+            + "DeleteObjects round-trip throws SdkClientException")
+    void should_reportAllKeysFailed_when_deleteObjectsThrowsSdkClientException() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        SdkClientException sdkException = SdkClientException.builder().message("network down").build();
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class))).thenThrow(sdkException);
+
+        Set<String> failed = service.deleteFiles(List.of("k-a", "k-b"));
+
+        assertThat(failed).containsExactlyInAnyOrder("k-a", "k-b");
+    }
+
+    @Test
+    @DisplayName("deleteFiles chunks at the 1000-key S3 DeleteObjects limit — 1500 keys become two calls")
+    void should_chunkAtOneThousandKeys_when_deleteFilesCalledWithMoreThanTheLimit() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        List<String> keys = IntStream.range(0, 1500)
+                .mapToObj(i -> "key-" + i)
+                .toList();
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+        ArgumentCaptor<DeleteObjectsRequest> captor = ArgumentCaptor.forClass(DeleteObjectsRequest.class);
+
+        Set<String> failed = service.deleteFiles(keys);
+
+        assertThat(failed).isEmpty();
+        verify(s3Client, times(2)).deleteObjects(captor.capture());
+        List<DeleteObjectsRequest> requests = captor.getAllValues();
+        assertThat(requests.get(0).delete().objects()).hasSize(1000);
+        assertThat(requests.get(1).delete().objects()).hasSize(500);
+    }
+
+    @Test
+    @DisplayName("deleteFiles de-duplicates repeated keys before calling S3")
+    void should_deduplicateKeys_when_deleteFilesCalledWithDuplicates() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        ArgumentCaptor<DeleteObjectsRequest> captor = ArgumentCaptor.forClass(DeleteObjectsRequest.class);
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+
+        service.deleteFiles(List.of("k-a", "k-a", "k-b"));
+
+        verify(s3Client).deleteObjects(captor.capture());
+        assertThat(captor.getValue().delete().objects())
+                .extracting(ObjectIdentifier::key)
+                .containsExactlyInAnyOrder("k-a", "k-b");
+    }
+
+    // ── Re-audit gap fill — chunk-count boundary + cross-chunk failure aggregation ────
+
+    @Test
+    @DisplayName("deleteFiles issues exactly ONE DeleteObjects call for exactly 1000 keys — the chunk-size "
+            + "boundary itself, not just a count comfortably under or over it")
+    void should_issueSingleCall_when_deleteFilesCalledWithExactlyOneThousandKeys() {
+        // A loop bound off by one (e.g. `i <= size` instead of `i < size`) would slip an extra,
+        // empty chunk in at exactly the boundary and go undetected by the existing 1500-key test,
+        // which only proves the FIRST chunk caps at 1000 — it never proves 1000 alone stays ONE call.
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        List<String> keys = IntStream.range(0, 1000).mapToObj(i -> "key-" + i).toList();
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+
+        Set<String> failed = service.deleteFiles(keys);
+
+        assertThat(failed).isEmpty();
+        verify(s3Client, times(1)).deleteObjects(any(DeleteObjectsRequest.class));
+    }
+
+    @Test
+    @DisplayName("deleteFiles issues exactly TWO DeleteObjects calls for 1001 keys — one key past the "
+            + "boundary already forces a second, near-empty chunk")
+    void should_issueTwoCalls_when_deleteFilesCalledWithOneThousandAndOneKeys() {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        List<String> keys = IntStream.range(0, 1001).mapToObj(i -> "key-" + i).toList();
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+        ArgumentCaptor<DeleteObjectsRequest> captor = ArgumentCaptor.forClass(DeleteObjectsRequest.class);
+
+        Set<String> failed = service.deleteFiles(keys);
+
+        assertThat(failed).isEmpty();
+        verify(s3Client, times(2)).deleteObjects(captor.capture());
+        List<DeleteObjectsRequest> requests = captor.getAllValues();
+        assertThat(requests.get(0).delete().objects()).hasSize(1000);
+        assertThat(requests.get(1).delete().objects()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("deleteFiles aggregates failed keys ACROSS chunks — a failure reported by chunk 1 does "
+            + "not get overwritten by chunk 2's own (different) failure")
+    void should_aggregateFailedKeysAcrossChunks_when_bothChunksReportDifferentFailures() {
+        // Guards against `failedKeys = deleteChunk(chunk)` (overwrite) silently replacing the
+        // intended `failedKeys.addAll(deleteChunk(chunk))` (accumulate) — every other failure test
+        // in this class uses a single chunk, so none of them can observe that regression; only a
+        // multi-chunk run where EACH chunk independently reports a failure can.
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+        List<String> keys = IntStream.range(0, 1001).mapToObj(i -> "key-" + i).toList();
+        when(s3Client.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(
+                        DeleteObjectsResponse.builder()
+                                .errors(S3Error.builder().key("key-500").code("AccessDenied").build())
+                                .build(),
+                        DeleteObjectsResponse.builder()
+                                .errors(S3Error.builder().key("key-1000").code("AccessDenied").build())
+                                .build());
+
+        Set<String> failed = service.deleteFiles(keys);
+
+        assertThat(failed)
+                .as("both chunk-1's and chunk-2's reported failures must survive in the final set")
+                .containsExactlyInAnyOrder("key-500", "key-1000");
     }
 }

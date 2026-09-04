@@ -142,6 +142,16 @@ class SalonServiceCacheTest {
     // BookingService" — the same failure mode userProfileCacheEvictor's comment above documents —
     // taking every test in this file red, not just the ones that exercise deactivateSalon.
     @MockBean com.beautica.booking.service.BookingService bookingService;
+    // Phase 268: SalonService now constructor-depends on the salon-deletion
+    // catalogue/favourites/media cascade's five collaborators. WITHOUT these the whole context
+    // fails to load with "No qualifying bean of type ..." — the same failure mode documented
+    // above for the phase 290/293 additions. transactionManager itself is NOT mocked here — the
+    // real synchronization-enabling bean from TxConfig above satisfies that constructor slot, so
+    // purgeSalonMediaAfterCommit's afterCommit registration is exercised for real.
+    @MockBean com.beautica.service.repository.ServiceRepository serviceRepository;
+    @MockBean com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
+    @MockBean com.beautica.media.repository.MediaRepository mediaRepository;
+    @MockBean com.beautica.media.service.MediaService mediaService;
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
 

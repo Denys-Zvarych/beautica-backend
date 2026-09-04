@@ -157,6 +157,25 @@ class SalonServiceTest {
     @Mock
     private com.beautica.booking.service.BookingService bookingService;
 
+    // Phase 268: SalonService now constructor-depends on the salon-deletion
+    // catalogue/favourites/media cascade's five collaborators. @InjectMocks passes null for an
+    // UNDECLARED collaborator silently, so compileTestJava stays green and the omission only
+    // surfaces as an NPE at runtime (as it did for deactivateSalon here before these were added).
+    @Mock
+    private com.beautica.service.repository.ServiceRepository serviceRepository;
+
+    @Mock
+    private com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
+
+    @Mock
+    private com.beautica.media.repository.MediaRepository mediaRepository;
+
+    @Mock
+    private com.beautica.media.service.MediaService mediaService;
+
+    @Mock
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
+
     @InjectMocks
     private SalonService salonService;
 

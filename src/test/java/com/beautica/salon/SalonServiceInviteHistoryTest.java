@@ -132,6 +132,24 @@ class SalonServiceInviteHistoryTest {
     @Mock
     private com.beautica.booking.service.BookingService bookingService;
 
+    // Phase 268: SalonService now also constructor-depends on the salon-deletion
+    // catalogue/favourites/media cascade. Neither listSalonInvites/cancelInvite exercises
+    // deactivateSalon, so plain mocks satisfy the constructor without any stubbing.
+    @Mock
+    private com.beautica.service.repository.ServiceRepository serviceRepository;
+
+    @Mock
+    private com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
+
+    @Mock
+    private com.beautica.media.repository.MediaRepository mediaRepository;
+
+    @Mock
+    private com.beautica.media.service.MediaService mediaService;
+
+    @Mock
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
+
     private SalonService salonService;
 
     @BeforeEach
@@ -142,7 +160,8 @@ class SalonServiceInviteHistoryTest {
                 masterServiceRepository, localityWriteValidator, masterService, cityRepository,
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
-                bookingService);
+                bookingService, serviceRepository, favoriteRepository, mediaRepository, mediaService,
+                transactionManager);
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

@@ -55,15 +55,17 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
@@ -627,12 +629,11 @@ class MediaServiceTest {
 
         service.deleteByUploader(uploaderId);
 
+        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call for every row's key,
+        // still strictly BEFORE the DB batch delete.
         InOrder inOrder = inOrder(r2, mediaRepo);
-        inOrder.verify(r2).deleteFile("k-a");
-        inOrder.verify(r2).deleteFile("k-b");
-        inOrder.verify(r2).deleteFile("k-c");
+        inOrder.verify(r2).deleteFiles(List.of("k-a", "k-b", "k-c"));
         inOrder.verify(mediaRepo).deleteAll(rows);
-        verify(r2, times(3)).deleteFile(anyString());
     }
 
     // ------------------------------------- avatar blob coverage in the deleteByUploader sweep
@@ -652,10 +653,12 @@ class MediaServiceTest {
 
         service.deleteByUploader(uploaderId);
 
-        // The avatar blob lives on the users row, not in media_files — a media-rows-only
-        // sweep would leave it publicly retrievable after the account is deleted.
+        // The avatar blob lives on the users row, not in media_files, and is swept separately
+        // (sweepAvatar, single-key) from the batched media_files row sweep (sweepBlobs) — a
+        // media-rows-only sweep would leave the avatar publicly retrievable after the account
+        // is deleted.
         verify(r2).deleteFile("avatars/" + uploaderId + "/photo.jpg");
-        verify(r2).deleteFile("k-a");
+        verify(r2).deleteFiles(List.of("k-a"));
         assertThat(uploader.getAvatarR2Key()).isNull();
         assertThat(uploader.getAvatarUrl()).isNull();
         verify(userRepo).save(uploader);
@@ -826,24 +829,16 @@ class MediaServiceTest {
                 .mediaType(MediaType.PORTFOLIO).r2Key("k-c").r2Url("u-c").build();
         List<MediaFile> rows = List.of(a, b, c);
         when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(rows);
-        // Strict-stubbing mode: "k-a" and "k-c" succeed (explicit no-op), "k-b" throws.
-        // Without the explicit doNothing() on the success cases, Mockito's
-        // PotentialStubbingProblem would itself be thrown and swallowed by the service's
-        // catch — making the test pass for the wrong reason.
-        doNothing().when(r2).deleteFile("k-a");
-        doThrow(new RuntimeException("transient R2 outage")).when(r2).deleteFile("k-b");
-        doNothing().when(r2).deleteFile("k-c");
+        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call carrying all three keys;
+        // R2 reports "k-b" as a per-key failure in the returned set (S3 DeleteObjects semantics —
+        // it does not throw for a partial batch failure).
+        when(r2.deleteFiles(List.of("k-a", "k-b", "k-c"))).thenReturn(Set.of("k-b"));
 
-        // No throw — a single-row failure must not abort the sweep.
+        // No throw — a single-key failure must not abort the sweep.
         service.deleteByUploader(uploaderId);
 
-        // All three R2 deletes were attempted, in order.
-        InOrder inOrder = inOrder(r2);
-        inOrder.verify(r2).deleteFile("k-a");
-        inOrder.verify(r2).deleteFile("k-b");
-        inOrder.verify(r2).deleteFile("k-c");
-        verify(r2, times(3)).deleteFile(anyString());
-        // The DB batch delete still ran exactly once with the full row set.
+        verify(r2, times(1)).deleteFiles(List.of("k-a", "k-b", "k-c"));
+        // The DB batch delete still ran exactly once with the full row set, despite one key failing.
         verify(mediaRepo, times(1)).deleteAll(rows);
     }
 
@@ -866,7 +861,8 @@ class MediaServiceTest {
                 .r2Url("https://r2/" + mockedKey)
                 .build();
         when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of(mf));
-        doThrow(new RuntimeException("mock delete failure")).when(r2).deleteFile(mockedKey);
+        // Batched (Phase 268 perf follow-up): R2 reports the key as failed in the returned set.
+        when(r2.deleteFiles(List.of(mockedKey))).thenReturn(Set.of(mockedKey));
         listAppender.list.clear();
 
         // Act — must not throw even though R2 delete fails
@@ -959,6 +955,189 @@ class MediaServiceTest {
         Pageable captured = pageableCaptor.getValue();
         assertThat(captured.getPageNumber()).isEqualTo(2);
         assertThat(captured.getPageSize()).isEqualTo(25);
+    }
+
+    // ------------------------------------------------------- Phase 268 D3 — deleteBySalon sweep
+
+    @Test
+    @DisplayName("case 6 — deletes every SALON portfolio row's R2 blob and the row itself")
+    void should_deleteSalonPortfolioPhotos_when_deleteBySalonCalled() {
+        UUID salonId = UUID.randomUUID();
+        MediaFile p1 = MediaFile.builder().id(UUID.randomUUID())
+                .entityType(EntityType.SALON).entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
+        MediaFile p2 = MediaFile.builder().id(UUID.randomUUID())
+                .entityType(EntityType.SALON).entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO).r2Key("p-2").r2Url("u-2").build();
+        List<MediaFile> rows = List.of(p1, p2);
+
+        service.deleteBySalon(salonId, null, null, rows);
+
+        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call carrying both keys.
+        verify(r2).deleteFiles(List.of("p-1", "p-2"));
+        verify(mediaRepo).deleteAll(rows);
+    }
+
+    @Test
+    @DisplayName("case 7 — deletes BOTH the avatar and cover R2 blobs, even with zero portfolio rows "
+            + "(must not short-circuit on rows.isEmpty())")
+    void should_deleteAvatarAndCoverBlobs_when_deleteBySalonCalledWithNoPortfolioRows() {
+        UUID salonId = UUID.randomUUID();
+        String avatarUrl = "https://pub.r2.dev/portfolio/salons/" + salonId + "/avatar.jpg";
+        String coverUrl = "https://pub.r2.dev/portfolio/salons/" + salonId + "/cover.jpg";
+        when(r2.extractKeyFromPublicUrl(avatarUrl))
+                .thenReturn(Optional.of("portfolio/salons/" + salonId + "/avatar.jpg"));
+        when(r2.extractKeyFromPublicUrl(coverUrl))
+                .thenReturn(Optional.of("portfolio/salons/" + salonId + "/cover.jpg"));
+
+        service.deleteBySalon(salonId, avatarUrl, coverUrl, List.of());
+
+        // Batched (Phase 268 perf follow-up): both extra keys in one deleteFiles(...) call.
+        verify(r2).deleteFiles(List.of(
+                "portfolio/salons/" + salonId + "/avatar.jpg",
+                "portfolio/salons/" + salonId + "/cover.jpg"));
+        // No portfolio rows to delete — the DB write tx must never be invoked for an empty list.
+        verify(mediaRepo, never()).deleteAll(anyList());
+    }
+
+    @Test
+    @DisplayName("case 9 — a foreign/malformed image URL yields NO deleteFile call for it (D2 safety "
+            + "guard); the portfolio rows are still swept")
+    void should_skipDelete_when_imageUrlLacksConfiguredPrefix() {
+        UUID salonId = UUID.randomUUID();
+        String foreignUrl = "https://evil.example.com/not-ours.jpg";
+        when(r2.extractKeyFromPublicUrl(foreignUrl)).thenReturn(Optional.empty());
+        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
+                .entityType(EntityType.SALON).entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
+
+        service.deleteBySalon(salonId, foreignUrl, null, List.of(portfolio));
+
+        // The batched call never carries anything derived from the foreign URL — only the
+        // legitimate portfolio row's key.
+        verify(r2).deleteFiles(List.of("p-1"));
+    }
+
+    @Test
+    @DisplayName("case 11 — one R2 delete failing (the avatar) does not abort the sweep: the cover "
+            + "and the portfolio row are still deleted, and the DB batch delete still runs")
+    void should_continueSweep_when_oneR2DeleteThrowsDuringDeleteBySalon() {
+        UUID salonId = UUID.randomUUID();
+        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
+        String coverUrl = "https://pub.r2.dev/cover.jpg";
+        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
+        when(r2.extractKeyFromPublicUrl(coverUrl)).thenReturn(Optional.of("cover-key"));
+        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
+                .entityType(EntityType.SALON).entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
+        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call carrying all three keys;
+        // R2 reports only "avatar-key" as a per-key failure in the returned set.
+        when(r2.deleteFiles(List.of("avatar-key", "cover-key", "p-1"))).thenReturn(Set.of("avatar-key"));
+
+        // No throw — the failing avatar delete must not abort the rest of the sweep.
+        service.deleteBySalon(salonId, avatarUrl, coverUrl, List.of(portfolio));
+
+        verify(r2).deleteFiles(List.of("avatar-key", "cover-key", "p-1"));
+        verify(mediaRepo).deleteAll(List.of(portfolio));
+    }
+
+    @Test
+    @DisplayName("case 12 — the sweep completes with NO thrown exception even when every single "
+            + "R2 delete fails, so a salon deletion never rolls back on an R2 outage")
+    void should_completeWithoutThrowing_when_everyR2DeleteFailsDuringDeleteBySalon() {
+        UUID salonId = UUID.randomUUID();
+        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
+        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
+        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
+                .entityType(EntityType.SALON).entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
+        // Batched (Phase 268 perf follow-up): r2.deleteFiles never throws for a delete failure —
+        // it reports every requested key back as failed in the returned set (S3 DeleteObjects
+        // semantics), which is exactly "every single R2 delete fails" in the new contract.
+        when(r2.deleteFiles(List.of("avatar-key", "p-1"))).thenReturn(Set.of("avatar-key", "p-1"));
+
+        assertThatCode(() -> service.deleteBySalon(salonId, avatarUrl, null, List.of(portfolio)))
+                .as("R2 being entirely down must never propagate out of the sweep")
+                .doesNotThrowAnyException();
+
+        // The DB pointer's row is still dropped — D4's accepted-orphan policy.
+        verify(mediaRepo).deleteAll(List.of(portfolio));
+    }
+
+    @Test
+    @DisplayName("case 13 — WARN log omits the R2 key and contains '[key omitted]' when an avatar/cover "
+            + "delete fails during deleteBySalon")
+    void should_notLogR2Key_when_deleteBySalonAvatarDeleteFails() {
+        UUID salonId = UUID.randomUUID();
+        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
+        String rawKey = "portfolio/salons/" + salonId + "/avatar.jpg";
+        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of(rawKey));
+        // Batched (Phase 268 perf follow-up): R2 reports the key as failed in the returned set.
+        when(r2.deleteFiles(List.of(rawKey))).thenReturn(Set.of(rawKey));
+        listAppender.list.clear();
+
+        service.deleteBySalon(salonId, avatarUrl, null, List.of());
+
+        List<ILoggingEvent> warns = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warns).hasSize(1);
+        String formattedMessage = warns.get(0).getFormattedMessage();
+        assertThat(formattedMessage).contains("[key omitted]");
+        assertThat(formattedMessage).doesNotContain(rawKey);
+        assertThat(formattedMessage).doesNotContain(avatarUrl);
+    }
+
+    @Test
+    @DisplayName("evicts the salon's portfolio cache entry after deleteBySalon, even when there were "
+            + "zero portfolio rows to derive the entity from")
+    void should_evictSalonPortfolioCache_when_deleteBySalonCalledWithNoRows() {
+        UUID salonId = UUID.randomUUID();
+        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
+        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
+
+        service.deleteBySalon(salonId, avatarUrl, null, List.of());
+
+        verify(portfolioCache).evictIfPresent(EntityType.SALON.name() + "_" + salonId);
+    }
+
+    @Test
+    @DisplayName("D4 pin, dedicated to deleteBySalon — R2 batch delete happens strictly BEFORE the "
+            + "DB pointer drop, proven independently of the shared deleteByUploader InOrder assertion")
+    void should_deleteR2BlobsBeforeDbRows_when_deleteBySalonCalled() {
+        UUID salonId = UUID.randomUUID();
+        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
+        String coverUrl = "https://pub.r2.dev/cover.jpg";
+        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
+        when(r2.extractKeyFromPublicUrl(coverUrl)).thenReturn(Optional.of("cover-key"));
+        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
+                .entityType(EntityType.SALON).entityId(salonId)
+                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
+
+        service.deleteBySalon(salonId, avatarUrl, coverUrl, List.of(portfolio));
+
+        // D4: R2-first-then-DB. sweepBlobs is shared with deleteByUploader (pinned separately by
+        // should_purgeR2Avatars_when_userIsDeletedBeforeCascade), but this pins the ordering by
+        // name for the SALON path specifically, so a future divergence between the two callers is
+        // caught even if one of them stops sharing sweepBlobs.
+        InOrder inOrder = inOrder(r2, mediaRepo);
+        inOrder.verify(r2).deleteFiles(List.of("avatar-key", "cover-key", "p-1"));
+        inOrder.verify(mediaRepo).deleteAll(List.of(portfolio));
+    }
+
+    @Test
+    @DisplayName("is a true no-op — no R2 delete, no DB call — when there is nothing to sweep at all")
+    void should_doNothing_when_deleteBySalonCalledWithNothingToSweep() {
+        UUID salonId = UUID.randomUUID();
+
+        service.deleteBySalon(salonId, null, null, List.of());
+
+        // extractKeyFromPublicUrl(null) is still called for both URL params (it handles null
+        // gracefully and resolves no key) — the no-op guarantee is that NOTHING is ever handed to
+        // R2, and the DB batch delete never runs.
+        verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyList());
+        verify(mediaRepo, never()).deleteAll(anyList());
     }
 
     // ------------------------------------------------------------------ helpers

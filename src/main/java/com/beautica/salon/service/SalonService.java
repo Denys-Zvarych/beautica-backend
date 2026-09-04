@@ -13,6 +13,8 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.exception.SalonDeletionBlockedException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.favorite.entity.FavoriteTargetType;
+import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.LocationQueryService;
@@ -20,6 +22,10 @@ import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
+import com.beautica.media.entity.EntityType;
+import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.MediaRepository;
+import com.beautica.media.service.MediaService;
 import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.audit.StaffClientReferenceViolation;
@@ -35,8 +41,10 @@ import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.search.service.SearchCacheNames;
+import com.beautica.service.entity.OwnerType;
 import com.beautica.service.repository.MasterServiceCountProjection;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.repository.ServiceRepository;
 import com.beautica.user.InviteHistoryRow;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -52,9 +60,12 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -120,6 +131,28 @@ public class SalonService {
     // "salon.service.SalonService" under booking/, common/, master/, notification/ before adding
     // this field turned up only SalonController).
     private final com.beautica.booking.service.BookingService bookingService;
+
+    // ── Phase 268 — salon-deletion catalogue/favourites/media cascade ────────────────────────
+    // ServiceRepository/FavoriteRepository back the two pure-DB steps that run INSIDE the same
+    // deletion transaction as deleteSalonStaff (deactivateAllByOwner, deleteAllByTargetTypeAndTargetId
+    // — no network, so they roll back with everything else on failure). MediaRepository is read
+    // directly (not through MediaService) so the salon's media_files rows can be captured BEFORE
+    // deleteSalonStaff runs — a staff-uploaded salon photo's row carries ON DELETE CASCADE on
+    // media_files.uploader_id and would otherwise vanish the moment that method hard-deletes the
+    // uploader's users row, orphaning the R2 blob with no row left to name it (a gap the phase doc
+    // itself did not cover — see deactivateSalon's javadoc). MediaService owns the actual R2 sweep
+    // (D3 REUSE-FIRST — the promoted deleteByUploader body) and runs strictly AFTER commit (D8):
+    // its txRead/txWrite are PROPAGATION_REQUIRES_NEW TransactionTemplates, so calling it from
+    // inside deactivateSalon's own @Transactional would join that transaction and hold a DB
+    // connection across dozens of sequential R2 round-trips. transactionManager backs the tiny
+    // standalone transaction purgeSalonMediaAfterCommit opens to null the salon's image-URL
+    // columns AFTER the R2 sweep — D4's R2-first-then-DB ordering, enforced one level up from
+    // MediaService's own internal R2-then-mediaRepo ordering.
+    private final ServiceRepository serviceRepository;
+    private final FavoriteRepository favoriteRepository;
+    private final MediaRepository mediaRepository;
+    private final MediaService mediaService;
+    private final PlatformTransactionManager transactionManager;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -381,6 +414,66 @@ public class SalonService {
      * request rebuilds it from the DB. The cache TTL is short and this path is write-rare,
      * so thundering-herd risk is negligible (PERF-HIGH-2).</p>
      */
+    /**
+     * Phase 268 D2-D4/D8 — permanently purges a deleted salon's R2 imagery and nulls its two
+     * image-URL columns, strictly AFTER the deletion transaction commits.
+     *
+     * <p>Registered as an {@code afterCommit} synchronization, following the EXACT same shape as
+     * {@link #evictSalonDetailCacheAfterCommit(UUID)} — guarded on
+     * {@link TransactionSynchronizationManager#isSynchronizationActive()}, callback runs on the
+     * request thread once the transaction has committed.
+     *
+     * <p><b>Why after commit, never inline (D8).</b> {@link MediaService#deleteBySalon} routes
+     * through {@code MediaService}'s own {@code txRead}/{@code txWrite}
+     * {@code TransactionTemplate}s, both {@code PROPAGATION_REQUIRES_NEW}. Calling it from inside
+     * {@code deactivateSalon}'s own {@code @Transactional(timeout = 30)} would still JOIN that
+     * outer transaction for every statement in between the R2 calls (REQUIRES_NEW only affects the
+     * DB read/write steps, not the R2 network calls sandwiched between them), holding a HikariCP
+     * connection across dozens of sequential R2 round-trips and defeating the very timeout that
+     * exists to bound this method (see {@code DEACTIVATE_SALON_TIMEOUT_SECONDS}'s javadoc).
+     * After-commit makes that timeout structurally safe again: the R2 sweep runs with no
+     * transaction — and therefore no held connection — open at all.
+     *
+     * <p><b>Ordering: R2 first, THEN the DB pointer (D4).</b> {@code mediaService.deleteBySalon}
+     * runs first; only once it returns does this method open its OWN short-lived
+     * {@code PROPAGATION_REQUIRES_NEW} transaction (via {@code transactionManager}, not this
+     * class's own {@code @Transactional} — there is none active here, the outer one already
+     * committed) to null {@code salons.avatar_url}/{@code cover_image_url}. The DB pointer is
+     * dropped whether or not the R2 deletes succeeded — D4 accepts the resulting orphan as the
+     * lesser cost against re-publishing a deleted salon's photo at a live public URL.
+     *
+     * <p><b>Never lets a failure surface as a 500 on an already-committed deletion.</b> The whole
+     * body is wrapped in {@code try/catch (RuntimeException)} + WARN: an exception escaping
+     * {@code afterCommit} propagates out of the synchronization machinery, and the owner's
+     * {@code DELETE /salons/{id}} has already succeeded from their point of view by the time this
+     * callback runs.
+     *
+     * <p><b>Registered LAST</b> (after every cache-eviction registration in {@link
+     * #deactivateSalon}) so a problem in this method's own registration can never prevent the
+     * cheap, purely in-memory cache evictions from being registered first.
+     */
+    private void purgeSalonMediaAfterCommit(
+            UUID salonId, String avatarUrl, String coverImageUrl, List<MediaFile> salonMediaRows) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                try {
+                    mediaService.deleteBySalon(salonId, avatarUrl, coverImageUrl, salonMediaRows);
+
+                    TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                    txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+                    txTemplate.executeWithoutResult(status -> salonRepository.nullImageUrls(salonId));
+                } catch (RuntimeException ex) {
+                    log.warn("Salon media purge failed after commit for salon {}: {}",
+                            salonId, ex.getClass().getSimpleName());
+                }
+            }
+        });
+    }
+
     private void evictSearchSalonsCacheAfterCommit() {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
@@ -769,8 +862,9 @@ public class SalonService {
     }
 
     /**
-     * Deactivates a salon and destroys its staff (Phase 290, reversed by Phase 295). Beyond the
-     * {@code salons} row itself this performs two cascades, in this order and no other:
+     * Deactivates a salon and destroys its staff, catalogue, favourites and imagery (Phase 290,
+     * reversed by Phase 295; catalogue/favourites/media closed by Phase 268). Beyond the
+     * {@code salons} row itself this performs four cascades, in this order and no other:
      * <ol>
      *   <li>every future {@code CONFIRMED} booking at the salon is declined and the affected
      *       clients are notified, one {@code SALON_CLOSED} notice per visit — see
@@ -778,12 +872,27 @@ public class SalonService {
      *       #declineFutureConfirmedBookingsForSalonClosure} (Phase 269/293, D1-D12);</li>
      *   <li>the salon's own staff accounts are HARD-DELETED — see
      *       {@link #deleteSalonStaff(UUID, UUID)} for the full scope, including why the ordering
-     *       between the two is load-bearing (Phase 295 D6).</li>
+     *       between the two is load-bearing (Phase 295 D6);</li>
+     *   <li>the salon's own {@code service_definitions} catalogue is deactivated (never deleted —
+     *       historical bookings and {@code master_service_assignments} still reference these rows)
+     *       and every client's {@code favorites} row pointing at this salon is hard-deleted (Phase
+     *       268 D1/D5) — both pure DB work, inside this same transaction;</li>
+     *   <li>AFTER commit, the salon's R2 imagery (portfolio photos, avatar, cover) is permanently
+     *       swept and the two image-URL columns are nulled — see
+     *       {@link #purgeSalonMediaAfterCommit(UUID, String, String, List)} for why this step runs
+     *       outside the transaction (Phase 268 D2-D4/D8).</li>
      * </ol>
      * The salon row itself is only deactivated, never deleted: {@code reviews.salon_id} is
      * {@code NOT NULL … NO ACTION} (V41:3) and the 2026-09-04 reversal named <i>staff</i>.
-     * Catalogue/favourites cleanup and the media/R2 purge remain Phase 268 — see
-     * {@code docs/backend-phases/phase-295-*.md} {@code ## Out of scope}.
+     *
+     * <p><b>GAP the Phase 268 doc did not cover, closed here.</b> Phase 295's
+     * {@link #deleteSalonStaff(UUID, UUID)} hard-deletes staff {@code users} rows, and
+     * {@code media_files.uploader_id} carries {@code ON DELETE CASCADE} — so a staff-uploaded
+     * salon photo's ROW would vanish before any later entity-keyed read could see it, permanently
+     * orphaning its R2 blob. The fix: this method reads the salon's {@code media_files} rows
+     * (see the local variable block below {@code salon.setActive(false)}) BEFORE
+     * {@link #deleteSalonStaff(UUID, UUID)} runs, and threads that pre-read list all the way into
+     * {@link #purgeSalonMediaAfterCommit(UUID, String, String, List)}.
      *
      * @throws NotFoundException             if {@code ownerId} does not resolve to a user, or if
      *                                        {@code salonId} does not resolve to a salon owned by
@@ -837,6 +946,17 @@ public class SalonService {
         // it enforces existence + ownership scoping and cannot be dropped.
         salon.setActive(false);
 
+        // Phase 268 — capture the salon's image URLs and pre-read its media_files rows NOW, while
+        // `salon` is still managed and every uploader's `users` row is still whole. Both are needed
+        // by the R2 sweep this method registers after commit (purgeSalonMediaAfterCommit), and both
+        // MUST be captured before deleteSalonStaff below: a staff-uploaded salon photo's row carries
+        // ON DELETE CASCADE on media_files.uploader_id, so reading it after that hard-delete would
+        // silently lose the row — and with it the only pointer left to reconcile its R2 blob against.
+        final String avatarUrlAtDeletion = salon.getAvatarUrl();
+        final String coverImageUrlAtDeletion = salon.getCoverImageUrl();
+        final List<MediaFile> salonMediaRows =
+                mediaRepository.findByEntityTypeAndEntityId(EntityType.SALON, salonId);
+
         // Phase 269/293 — decline every future CONFIRMED booking at this salon and notify the
         // affected clients (one SALON_CLOSED entry per VISIT, D12). Runs inside THIS transaction,
         // after the idempotency guard and the fail-closed Phase 289 audit precondition above — a
@@ -864,6 +984,17 @@ public class SalonService {
 
         deleteSalonStaff(ownerId, salonId);
 
+        // Phase 268 D1/D5 — close the two remaining polymorphic-reference tables that carry no FK
+        // to `salons` and therefore never clean themselves up on any hard delete: the salon's own
+        // service catalogue (deactivated, never deleted — historical bookings and
+        // master_service_assignments still reference these rows, see D1) and every client's
+        // favourite pointing at this salon (hard-deleted — D5, a favourite is a preference, not a
+        // record of anything that happened). Both are pure DB work, no network, so they run INSIDE
+        // this transaction and roll back with everything else on failure — unlike the R2 sweep
+        // below, which is deliberately outside it (D8).
+        serviceRepository.deactivateAllByOwner(OwnerType.SALON, salonId);
+        favoriteRepository.deleteAllByTargetTypeAndTargetId(FavoriteTargetType.SALON, salonId);
+
         // Evict after commit — replaces pre-commit @CacheEvict annotations (PERF-MEDIUM-2).
         // Also evicts search:salons because a deactivated salon must not appear in discovery
         // results for the remaining TTL window (PERF-HIGH-2).
@@ -875,6 +1006,13 @@ public class SalonService {
         evictOwnerSalonsCacheAfterCommit(ownerIdOf(salon));
         evictSalonDetailCacheAfterCommit(salonId);
         evictSearchSalonsCacheAfterCommit();
+
+        // Phase 268 D2-D4/D8 — registered LAST, after the cache evictions, so a synchronization
+        // ordering hiccup among the cheap in-memory evictions above can never prevent the R2 sweep
+        // from being registered. Runs the actual R2 deletes + DB pointer null AFTER commit, on the
+        // request thread but outside this transaction — see the field-block comment above and this
+        // method's own javadoc.
+        purgeSalonMediaAfterCommit(salonId, avatarUrlAtDeletion, coverImageUrlAtDeletion, salonMediaRows);
     }
 
     /**
