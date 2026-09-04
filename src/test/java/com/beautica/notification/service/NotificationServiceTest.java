@@ -1189,8 +1189,10 @@ class NotificationServiceTest {
         User masterUser = mock(User.class);
         lenient().when(masterUser.getId()).thenReturn(masterUserId);
         lenient().when(masterUser.getEmail()).thenReturn("master@example.com");
-        Master master = mock(Master.class);
-        lenient().when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the notification paths read the provider name
+        // through Master#displayFirstName()/#displayLastName(), whose attached-vs-detached branch
+        // only executes on a real instance.
+        Master master = Master.builder().user(masterUser).build();
         lenient().when(booking.getMaster()).thenReturn(master);
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
@@ -1217,8 +1219,10 @@ class NotificationServiceTest {
         User masterUser = mock(User.class);
         lenient().when(masterUser.getId()).thenReturn(masterUserId);
         lenient().when(masterUser.getEmail()).thenReturn("master@example.com");
-        Master master = mock(Master.class);
-        lenient().when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the notification paths read the provider name
+        // through Master#displayFirstName()/#displayLastName(), whose attached-vs-detached branch
+        // only executes on a real instance.
+        Master master = Master.builder().user(masterUser).build();
         lenient().when(booking.getMaster()).thenReturn(master);
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
@@ -1261,8 +1265,10 @@ class NotificationServiceTest {
         User masterUser = mock(User.class);
         lenient().when(masterUser.getFirstName()).thenReturn("Тест");
         lenient().when(masterUser.getLastName()).thenReturn("Майстер");
-        Master master = mock(Master.class);
-        lenient().when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the notification paths read the provider name
+        // through Master#displayFirstName()/#displayLastName(), whose attached-vs-detached branch
+        // only executes on a real instance.
+        Master master = Master.builder().user(masterUser).build();
         lenient().when(booking.getMaster()).thenReturn(master);
 
         ServiceDefinition sd = mock(ServiceDefinition.class);
@@ -1296,8 +1302,10 @@ class NotificationServiceTest {
         User masterUser = mock(User.class);
         lenient().when(masterUser.getFirstName()).thenReturn("Тест");
         lenient().when(masterUser.getLastName()).thenReturn("Майстер");
-        Master master = mock(Master.class);
-        lenient().when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the notification paths read the provider name
+        // through Master#displayFirstName()/#displayLastName(), whose attached-vs-detached branch
+        // only executes on a real instance.
+        Master master = Master.builder().user(masterUser).build();
         lenient().when(booking.getMaster()).thenReturn(master);
 
         ServiceDefinition sd = mock(ServiceDefinition.class);

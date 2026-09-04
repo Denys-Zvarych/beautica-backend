@@ -7,7 +7,10 @@ import java.util.UUID;
  *
  * @param masterId     the reviewed master — always present. Key of the {@code master-detail}
  *                     cache backing the public {@code GET /masters/{masterId}} profile.
- * @param masterUserId the {@code users.id} of the reviewed master — always present. Key of the
+ * @param masterUserId the {@code users.id} of the reviewed master. Present for every reachable
+ *                     flow; {@code null} only if the master were detached (V157 / phase 294 —
+ *                     staff account hard-deleted), which no review-create path can produce.
+ *                     {@code evictKey} skips a null key rather than failing. Key of the
  *                     {@code master-detail-by-user} cache backing the master's OWN
  *                     {@code GET /masters/me} view (Phase 240 re-audit, Finding 1). Carried
  *                     separately because that cache is keyed by userId, not masterId

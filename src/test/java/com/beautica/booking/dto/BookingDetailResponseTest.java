@@ -66,9 +66,11 @@ class BookingDetailResponseTest {
         when(masterUser.getProfessionalTitle()).thenReturn("Перукар-стиліст");
         when(masterUser.getLocationNote()).thenReturn("3-й поверх, код 1234");
 
-        master = mock(Master.class);
-        when(master.getId()).thenReturn(masterId);
-        when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the response reads the provider's name through
+        // Master#displayFirstName()/#displayLastName(), whose attached-vs-detached branch only
+        // executes on a real instance. Mocking it would make every masterFirstName assertion below
+        // assert a literal this fixture had itself stubbed.
+        master = Master.builder().id(masterId).user(masterUser).build();
 
         var serviceDef = mock(ServiceDefinition.class);
         when(serviceDef.getName()).thenReturn("Манікюр");
@@ -218,7 +220,7 @@ class BookingDetailResponseTest {
         var laterSalon = mock(Salon.class);
         lenient().when(laterSalon.getName()).thenReturn("Joined-Later Studio");
         lenient().when(laterSalon.getLocationNote()).thenReturn("Later salon note — must NOT surface");
-        when(master.getSalon()).thenReturn(laterSalon);
+        master.setSalon(laterSalon);
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
 
@@ -478,8 +480,8 @@ class BookingDetailResponseTest {
     @DisplayName("masterAvgRating/masterReviewCount are read off the already-loaded Master row when "
             + "the master has reviews")
     void should_mapMasterRating_when_masterHasReviews() {
-        when(master.getAvgRating()).thenReturn(new BigDecimal("4.75"));
-        when(master.getReviewCount()).thenReturn(12);
+        master.setAvgRating(new BigDecimal("4.75"));
+        master.setReviewCount(12);
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
 
@@ -491,8 +493,8 @@ class BookingDetailResponseTest {
     @DisplayName("masterAvgRating is NULL — never 0.00 — for a master with zero reviews, while "
             + "masterReviewCount stays 0 (a true fact, unlike a fabricated zero-star average)")
     void should_returnNullAvgRating_when_masterHasNoReviews() {
-        when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
-        when(master.getReviewCount()).thenReturn(0);
+        master.setAvgRating(new BigDecimal("0.00"));
+        master.setReviewCount(0);
 
         var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
 
@@ -580,7 +582,7 @@ class BookingDetailResponseTest {
         lenient().when(currentSalon.getStreet()).thenReturn("Khreshchatyk");
         lenient().when(currentSalon.getBuildingNo()).thenReturn("22");
         lenient().when(currentSalon.getLocationNote()).thenReturn("B: 5-й поверх, код 9999");
-        when(master.getSalon()).thenReturn(currentSalon);
+        master.setSalon(currentSalon);
 
         // The master's own personal row differs again — it must not surface either, because the
         // booking DOES carry a salon (the COALESCE-fallthrough guard, unchanged by phase 242).

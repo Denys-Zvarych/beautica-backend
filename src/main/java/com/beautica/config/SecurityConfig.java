@@ -99,6 +99,18 @@ public class SecurityConfig {
                         auth.requestMatchers("/api-docs/**", "/api-docs").permitAll();
                     }
                     auth.requestMatchers(HttpMethod.GET, "/actuator/health").permitAll();
+                    // Audit cycle-3 (finding 3) — MUST stay ABOVE the "/salons/{salonId}" matcher
+                    // below, for the same reason "/masters/me" and "/reviews/me" stay above their
+                    // wildcard siblings: a PathPattern "{var}" matches ANY single segment, so
+                    // "/api/v1/salons/{salonId}" pattern-matches the literal "/api/v1/salons/mine"
+                    // too. Spring Security takes the FIRST matching rule, so without this line an
+                    // anonymous request for an owner's full salon list is permitAll at the filter
+                    // chain and @PreAuthorize("hasRole('SALON_OWNER')") (SalonController#getOwnedSalons)
+                    // is its SOLE gate. MVC still routes "mine" to getOwnedSalons (a literal
+                    // @GetMapping beats "/{salonId}"), so the mismatch stays invisible until method
+                    // security is loosened or fails open. Defense in depth (§K): the chain rejects
+                    // anonymous callers BEFORE the DispatcherServlet.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/mine").authenticated();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
                     // Audit fix (finding 5) — MUST stay ABOVE the "{masterId}" matcher below.
@@ -121,6 +133,18 @@ public class SecurityConfig {
                     // Mirrors the salon "/reviews/summary" precedent further down.
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews/summary").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews").permitAll();
+                    // Audit cycle-2 (finding 4) — MUST stay ABOVE the "/reviews/**" matcher below,
+                    // for the same reason "/masters/me" stays above "/masters/{masterId}": a
+                    // trailing "**" matches "/api/v1/reviews/me" too, Spring Security takes the
+                    // FIRST matching rule, and the self-read would then be permitAll at the filter
+                    // chain with @PreAuthorize("hasRole('CLIENT')") (ReviewController#getMyReviews)
+                    // as its SOLE gate. MVC still routes "me" to getMyReviews (a literal
+                    // @GetMapping beats "/reviews/{reviewId}"), so the mismatch stays invisible
+                    // until method security is loosened or fails open. Defense in depth (§K): the
+                    // chain rejects anonymous callers BEFORE the DispatcherServlet. It matters more
+                    // since V157 — a detached master's snapshotted name is reachable through this
+                    // endpoint's review rows.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/me").authenticated();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     // Phase 13.6 (Public Salon Profile). "/reviews/summary" is registered
                     // BEFORE "/reviews" defensively; in practice PathPattern matching for

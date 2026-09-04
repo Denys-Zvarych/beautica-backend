@@ -350,9 +350,15 @@ public class BookingService {
         // ids feed cityLabel/districtLabel, so keeping them on master.getSalon() would pair salon
         // A's street with salon B's city on any booking made before a rotation.
         Salon salon = booking.getSalon();
+        // V157 / phase 294 D3 — NULLABLE on a historical booking whose master was detached (staff
+        // account hard-deleted). Only the independent-master branch reads it, and a null locality
+        // degrades to "no city/district label", which is exactly what the resolver already does for
+        // a master who never set one.
         User masterUser = booking.getMaster().getUser();
-        UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
-        UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
+        UUID cityId = salon != null ? salon.getCityId()
+                : (masterUser != null ? masterUser.getCityId() : null);
+        UUID districtId = salon != null ? salon.getDistrictId()
+                : (masterUser != null ? masterUser.getDistrictId() : null);
 
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
                 cityId == null ? List.of() : List.of(cityId),
@@ -404,13 +410,24 @@ public class BookingService {
      */
     private static UUID discoveryCityId(Booking booking) {
         Salon salon = booking.getSalon();
-        return salon != null ? salon.getCityId() : booking.getMaster().getUser().getCityId();
+        if (salon != null) {
+            return salon.getCityId();
+        }
+        // V157 / phase 294 D3 — a detached master (staff account hard-deleted) has no user row and
+        // therefore no locality. Null degrades to "no label", never an NPE on the client's own list.
+        User masterUser = booking.getMaster().getUser();
+        return masterUser != null ? masterUser.getCityId() : null;
     }
 
     /** Discovery district id: same rule and same source as {@link #discoveryCityId}. */
     private static UUID discoveryDistrictId(Booking booking) {
         Salon salon = booking.getSalon();
-        return salon != null ? salon.getDistrictId() : booking.getMaster().getUser().getDistrictId();
+        if (salon != null) {
+            return salon.getDistrictId();
+        }
+        // Same rule and same null-degradation as discoveryCityId (V157 / phase 294 D3).
+        User masterUser = booking.getMaster().getUser();
+        return masterUser != null ? masterUser.getDistrictId() : null;
     }
 
     /** Batch-resolves locality labels for a page of projections (M2 seam — fixed two queries). */

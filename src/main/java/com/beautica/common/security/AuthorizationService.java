@@ -14,8 +14,10 @@ import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.lang.Nullable;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
@@ -109,7 +111,13 @@ public class AuthorizationService {
         Role actorRole = roleFromAuthentication(auth);
         return masterRepository.findByIdWithUserAndSalon(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-                return m.getUser().getId().equals(actorId);
+                // V157 / phase 294 D1 — masters.user_id is nullable, and
+                // findByIdWithUserAndSalon is a LEFT JOIN FETCH, so it DOES return a detached row.
+                // Identical guard to enforceCanManageMaster/enforceCanManageMasterSchedule, whose
+                // phase-294 fix skipped these two SpEL twins (2026-09 audit finding 3): unguarded,
+                // a detached master id NPEs INSIDE @PreAuthorize and surfaces as 500 rather than
+                // 403. A detached master belongs to nobody: fail CLOSED.
+                return m.getUser() != null && m.getUser().getId().equals(actorId);
             }
             // SALON_OWNER-type master: authorized via primary salon ownership.
             // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
@@ -139,7 +147,13 @@ public class AuthorizationService {
         Role actorRole = roleFromAuthentication(auth);
         return masterRepository.findByIdWithUserAndSalon(masterId).map(m -> {
             if (m.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-                return m.getUser().getId().equals(actorId);
+                // V157 / phase 294 D1 — masters.user_id is nullable, and
+                // findByIdWithUserAndSalon is a LEFT JOIN FETCH, so it DOES return a detached row.
+                // Identical guard to enforceCanManageMaster/enforceCanManageMasterSchedule, whose
+                // phase-294 fix skipped these two SpEL twins (2026-09 audit finding 3): unguarded,
+                // a detached master id NPEs INSIDE @PreAuthorize and surfaces as 500 rather than
+                // 403. A detached master belongs to nobody: fail CLOSED.
+                return m.getUser() != null && m.getUser().getId().equals(actorId);
             }
             // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
             // (owner-operated) masters: authority derives from salon management access.
@@ -213,7 +227,10 @@ public class AuthorizationService {
     public void enforceCanManageMaster(UUID actorId, Master master) {
         boolean allowed;
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-            allowed = master.getUser().getId().equals(actorId);
+            // V157 / phase 294 D1 — masters.user_id is nullable. A DETACHED master (staff account
+            // hard-deleted) belongs to nobody: fail CLOSED, never NPE into a 500 that a caller
+            // could read as "something exists here".
+            allowed = master.getUser() != null && master.getUser().getId().equals(actorId);
         } else if (master.getMasterType() == MasterType.SALON_OWNER) {
             // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
             // (owner-operated) masters: authority derives from salon management access.
@@ -233,7 +250,10 @@ public class AuthorizationService {
     public void enforceCanManageMasterSchedule(UUID actorId, Master master) {
         boolean allowed;
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-            allowed = master.getUser().getId().equals(actorId);
+            // V157 / phase 294 D1 — masters.user_id is nullable. A DETACHED master (staff account
+            // hard-deleted) belongs to nobody: fail CLOSED, never NPE into a 500 that a caller
+            // could read as "something exists here".
+            allowed = master.getUser() != null && master.getUser().getId().equals(actorId);
         } else if (master.getMasterType() == MasterType.SALON_OWNER) {
             // Non-INDEPENDENT branch covers BOTH SALON_MASTER (invited) and SALON_OWNER
             // (owner-operated) masters: authority derives from salon management access.
@@ -485,7 +505,13 @@ public class AuthorizationService {
             if (v.salonOwnerUserId() != null) {
                 return v.salonOwnerUserId().equals(actorId);
             }
-            return v.masterUserId().equals(actorId);
+            // V157 / phase 294 D1 — masterUserId is null for a DETACHED master. Latent today only
+            // because findViewAccessById still INNER-joins bm.user (so such a row never reaches
+            // here), and that join is documented as the next thing to relax — guard now, so the
+            // relaxation is a one-line repository edit rather than three fresh NPEs (2026-09 audit
+            // finding 7). A booking whose provider account no longer exists confers authority on
+            // nobody: fail CLOSED.
+            return v.masterUserId() != null && v.masterUserId().equals(actorId);
         }).orElse(false);
     }
 
@@ -505,7 +531,10 @@ public class AuthorizationService {
             if (v.salonOwnerUserId() != null && v.salonOwnerUserId().equals(actorId)) {
                 return true;
             }
-            if (v.masterUserId().equals(actorId) && actorRole != Role.SALON_MASTER) {
+            // masterUserId null-guard: see canManageBooking above (V157 / phase 294 D1, 2026-09
+            // audit finding 7). Both reads in this method are guarded, not just the first.
+            if (v.masterUserId() != null && v.masterUserId().equals(actorId)
+                    && actorRole != Role.SALON_MASTER) {
                 return true;
             }
             if (actorRole == Role.CLIENT) {
@@ -516,7 +545,7 @@ public class AuthorizationService {
             }
             if (actorRole == Role.SALON_MASTER) {
                 // SALON_MASTER may only view their own bookings — not all bookings at the salon.
-                return v.masterUserId().equals(actorId);
+                return v.masterUserId() != null && v.masterUserId().equals(actorId);
             }
             return false;
         }).orElse(false);
@@ -643,7 +672,10 @@ public class AuthorizationService {
         return bookings.stream()
                 .filter(b -> hasProviderAuthorityOverRow(
                         b.getMaster().getMasterType() == MasterType.INDEPENDENT_MASTER,
-                        b.getMaster().getUser().getId(),
+                        // V157 / phase 294 D1 — null on a detached master. hasProviderAuthorityOverRow
+                        // compares it to a non-null actorId, so null simply never matches: a booking
+                        // whose provider account is gone confers authority on nobody through this leg.
+                        masterUserId(b.getMaster()),
                         liveSalonId(b.getMaster()),
                         actorId,
                         ownedSalonIds::contains))
@@ -655,6 +687,22 @@ public class AuthorizationService {
     private static UUID liveSalonId(Master master) {
         Salon salon = master.getSalon();
         return salon == null ? null : salon.getId();
+    }
+
+    /**
+     * Identifier-only read of the account behind a master, or {@code null} when the master is
+     * DETACHED (V157 / phase 294 D1 — the staff {@code users} row was hard-deleted and only the
+     * historical name stub survives).
+     *
+     * <p>Every caller compares the result against a non-null {@code actorId}, so {@code null} is
+     * inherently fail-closed: a booking whose provider account no longer exists confers provider
+     * authority on nobody. Same identifier-only discipline as {@link #liveSalonId(Master)} — the
+     * {@code getId()} hop is served off the uninitialised proxy without a statement.
+     */
+    @Nullable
+    private static UUID masterUserId(Master master) {
+        User masterUser = master.getUser();
+        return masterUser == null ? null : masterUser.getId();
     }
 
     /**
@@ -708,7 +756,9 @@ public class AuthorizationService {
     public boolean hasProviderAuthorityOverBooking(UUID actorId, Booking booking) {
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-            return hasProviderAuthorityOverBooking(true, master.getUser().getId(), null, actorId, null);
+            // V157 / phase 294 D1 — null on a detached master; compared against a non-null actorId
+            // downstream, so it can never match. Fail closed.
+            return hasProviderAuthorityOverBooking(true, masterUserId(master), null, actorId, null);
         }
         Salon salon = master.getSalon();
         if (salon == null) {
@@ -1123,7 +1173,9 @@ public class AuthorizationService {
         // Fix M1: SALON_MASTER may only view their own bookings, not all bookings at the salon —
         // the previous salon-scoped check leaked other masters' client names and prices to every
         // master at the same salon.
+        // V157 / phase 294 D1 — a detached master's booking is viewable by nobody through this leg.
         if (roleFromCurrentAuthentication() == Role.SALON_MASTER
+                && booking.getMaster().getUser() != null
                 && booking.getMaster().getUser().getId().equals(actorUserId)) {
             return;
         }
@@ -1196,7 +1248,8 @@ public class AuthorizationService {
         // from the salon owner, so the owner-ID equality check below always returns false for them.
         Master master = booking.getMaster();
         if (master.getMasterType() == MasterType.INDEPENDENT_MASTER) {
-            return master.getUser().getId().equals(actorId);
+            // V157 / phase 294 D1 — fail closed on a detached master (user_id nulled).
+            return master.getUser() != null && master.getUser().getId().equals(actorId);
         }
         // SALON_OWNER-type master booking: master.salon.owner.id == actorId grants the owner
         // view authority over their own bookings. SALON_ADMIN still excluded (distinct userId).

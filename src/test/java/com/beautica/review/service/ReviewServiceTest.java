@@ -834,9 +834,10 @@ class ReviewServiceTest {
         when(masterUser.getFirstName()).thenReturn("Iryna");
         when(masterUser.getLastName()).thenReturn("Shevchenko");
 
-        Master master = mock(Master.class);
-        when(master.getId()).thenReturn(MASTER_ID);
-        when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the mapper reads the name through
+        // Master#displayFirstName(), whose attached-vs-detached branch only runs on a real
+        // instance — stubbing the accessor would make the "Iryna" assertion self-referential.
+        Master master = Master.builder().id(MASTER_ID).user(masterUser).build();
 
         com.beautica.service.entity.ServiceDefinition serviceDefinition =
                 mock(com.beautica.service.entity.ServiceDefinition.class);

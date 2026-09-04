@@ -139,6 +139,12 @@ class SalonServiceCacheTest {
     @MockBean com.beautica.notification.repository.DeviceTokenRepository deviceTokenRepository;
     @MockBean com.beautica.user.PasswordResetTicketRepository passwordResetTicketRepository;
     @MockBean com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
+    // Phase 293: SalonService now constructor-depends on BookingService for the salon-closure
+    // booking cascade (deactivateSalon calls declineFutureConfirmedBookingsForSalonClosure).
+    // WITHOUT this bean the whole context fails to load with "required a bean of type
+    // BookingService" — the same failure mode userProfileCacheEvictor's comment above documents —
+    // taking every test in this file red, not just the ones that exercise deactivateSalon.
+    @MockBean com.beautica.booking.service.BookingService bookingService;
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
 

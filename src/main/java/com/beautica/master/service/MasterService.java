@@ -370,6 +370,7 @@ public class MasterService {
     public MasterDetailResponse getMasterDetail(UUID masterId) {
         var master = masterRepository.findByIdWithUserAndSalon(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found"));
+        requireAttached(master);
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
         UUID masterCityId = master.getUser().getCityId();
@@ -389,6 +390,7 @@ public class MasterService {
      */
     @Transactional(readOnly = true)
     public MasterDetailResponse getMasterDetail(Master master) {
+        requireAttached(master);
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
         UUID masterCityId = master.getUser().getCityId();
         UUID oblastId = resolveOblastId(masterCityId);
@@ -1056,6 +1058,35 @@ public class MasterService {
      * @return the affiliated salon's {@code oblastId}, or {@code null} when the master has no
      *         affiliated salon or the salon has no city set
      */
+    /**
+     * Fail-closed guard for every path that builds a {@link MasterDetailResponse} (2026-09 audit
+     * finding 4).
+     *
+     * <p>{@code MasterDetailResponse#from} reads ~12 columns straight off {@code master.getUser()}
+     * — phone number, city, street, building, location note, bio, Instagram, avatar. For a DETACHED
+     * master (V157 / phase 294 — the staff {@code users} row hard-deleted) that association is
+     * {@code null}, so the unguarded read was an NPE reachable ANONYMOUSLY: {@code
+     * GET /api/v1/masters/&#123;masterId&#125;} is {@code permitAll()} ({@code SecurityConfig}) and
+     * {@code findByIdWithUserAndSalon} carries no {@code isActive} predicate, so a detached row is
+     * still fetched — it just cannot be rendered. That is a 500 on an unauthenticated endpoint.
+     *
+     * <p><b>404, deliberately not a masked/partial profile.</b> Patching the two name fields to
+     * {@code displayFirstName()}/{@code displayLastName()} would render the ERASED person's whole
+     * public profile to anonymous callers, which is the opposite of what the delete was for. A
+     * detached master is {@code is_active = false} and unreachable from search, the salon roster and
+     * the catalogue; the profile endpoint must agree with them. The 2026-09-04 product decision that
+     * a deleted master's NAME survives is scoped to a client's OWN past receipt, not to a public
+     * profile page.
+     *
+     * <p>No existence oracle either — {@code NotFoundException} is the same response a never-existent
+     * id gets, so an anonymous caller cannot distinguish "deleted" from "never was".
+     */
+    private static void requireAttached(Master master) {
+        if (master.isDetached()) {
+            throw new NotFoundException("Master not found");
+        }
+    }
+
     private UUID resolveSalonOblastId(Master master, UUID masterCityId, UUID masterOblastId) {
         if (master.getSalon() == null) {
             return null;
@@ -1290,6 +1321,7 @@ public class MasterService {
     public Optional<MasterDetailResponse> findMyMasterDetail(UUID userId) {
         return masterRepository.findActiveByUserIdWithUserAndSalon(userId)
                 .map(master -> {
+                    requireAttached(master);
                     var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
                     UUID masterCityId = master.getUser().getCityId();
                     UUID oblastId = resolveOblastId(masterCityId);

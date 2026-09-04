@@ -163,6 +163,14 @@ public class Appointment extends AuditableEntity {
     // every APP/LINK header; populated on every STAFF header by staffAppointment(...) below. Plain
     // UUID, not a @ManyToOne User — mirrors Booking.createdByUserId byte-for-byte so no read path is
     // tempted to lazily fetch a creator it never renders.
+    //
+    // V157 / phase 294 D5: the FK is now ON DELETE SET NULL, relaxed from V139's ON DELETE RESTRICT.
+    // V139 carried V137:129's attribution argument verbatim and, like it, was explicitly conditioned
+    // on "nothing in the app hard-deletes a user today" while deferring the case to a future erasure
+    // flow. The 2026-09-04 reversal (salon deletion HARD-DELETES staff) is that flow — see
+    // Booking#createdByUserId's javadoc for the full supersession note. Header and children must
+    // never diverge on this clause. Consequence: a non-null value here no longer guarantees a live
+    // `users` row.
     @Column(name = "created_by_user_id")
     private UUID createdByUserId;
 

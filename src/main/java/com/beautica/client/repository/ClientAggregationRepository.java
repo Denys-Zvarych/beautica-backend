@@ -104,6 +104,16 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
      * never re-synced on salon relocation ({@code SalonService.updateSalon} does not touch
      * it), so it can go stale and point at a district the salon no longer occupies. This
      * mirrors {@link com.beautica.booking.dto.BookingDetailResponse#from}'s ternary exactly.
+     *
+     * <p><b>{@code m.user} is a {@code LEFT JOIN} and must stay one</b> (V157 / phase 294 D1 —
+     * 2026-09 audit finding 6). It was an INNER join, which SILENTLY UNDER-COUNTED: every COMPLETED
+     * booking whose master has since been detached (staff {@code users} row hard-deleted) dropped
+     * out of the aggregate entirely, so a salon-employed provider's visits stopped contributing to
+     * the client's own passport ranking even though the salon locality that ranking reads is on the
+     * {@code s} row, not on {@code mu}. With the LEFT join the salon arm of the {@code CASE} is
+     * unaffected and keeps counting; a DETACHED INDEPENDENT master (no salon) resolves to a null
+     * locality and is excluded by this query's own {@code IS NOT NULL} predicate — the correct
+     * answer, since there is no locality left to attribute the visit to.
      */
     @Query("""
             SELECT new com.beautica.client.repository.DistrictCount(
@@ -112,7 +122,7 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
             )
             FROM Booking b
             JOIN b.master m
-            JOIN m.user mu
+            LEFT JOIN m.user mu
             LEFT JOIN m.salon s
             WHERE b.client.id = :clientId
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED
@@ -152,6 +162,16 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
      * point at a city the salon no longer occupies. Exactly the class of bug fixed in
      * {@code findClientBookingDetails} (19.3).
      *
+     *
+     * <p><b>{@code m.user} is a {@code LEFT JOIN} and must stay one</b> (V157 / phase 294 D1 —
+     * 2026-09 audit finding 6). It was an INNER join, which SILENTLY UNDER-COUNTED: every COMPLETED
+     * booking whose master has since been detached (staff {@code users} row hard-deleted) dropped
+     * out of the aggregate entirely, so a salon-employed provider's visits stopped contributing to
+     * the client's own passport ranking even though the salon locality that ranking reads is on the
+     * {@code s} row, not on {@code mu}. With the LEFT join the salon arm of the {@code CASE} is
+     * unaffected and keeps counting; a DETACHED INDEPENDENT master (no salon) resolves to a null
+     * locality and is excluded by this query's own {@code IS NOT NULL} predicate — the correct
+     * answer, since there is no locality left to attribute the visit to.
      * <p>Ranking is done IN SQL (GROUP BY + ORDER BY count DESC, bounded by {@code Pageable});
      * never in memory.
      */
@@ -162,7 +182,7 @@ public interface ClientAggregationRepository extends JpaRepository<Booking, UUID
             )
             FROM Booking b
             JOIN b.master m
-            JOIN m.user mu
+            LEFT JOIN m.user mu
             LEFT JOIN m.salon s
             WHERE b.client.id = :clientId
               AND b.status = com.beautica.booking.enums.BookingStatus.COMPLETED

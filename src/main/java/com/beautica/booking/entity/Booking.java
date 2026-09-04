@@ -325,14 +325,22 @@ public class Booking extends AuditableEntity {
      * <p>Stored as a raw id, deliberately NOT a {@code @ManyToOne User} — nothing on the
      * booking read path renders the creating staff member, so an association here would only
      * add a lazy proxy (and an N+1 risk) to every booking load. The FK integrity lives in the
-     * DB ({@code REFERENCES users(id) ON DELETE RESTRICT}, V137).
+     * DB ({@code REFERENCES users(id) ON DELETE SET NULL}, V157 — was {@code ON DELETE RESTRICT}
+     * in V137).
      *
-     * <p>{@code RESTRICT}, not {@code SET NULL}: the column exists for attribution, and a NULLed
-     * creator is indistinguishable from a pre-V137 row that never had one — so {@code SET NULL}
-     * would let deleting the account under suspicion erase the audit trail undetectably. Nothing
-     * in the app hard-deletes a user today (accounts are deactivated), so this constraint is
-     * unreachable in practice; a future GDPR erasure flow must anonymise the creating user rather
-     * than delete the row. See V137's comment for the full rationale.
+     * <p><b>V157 / phase 294 D5 — the RESTRICT rationale below is SUPERSEDED, keep it only as
+     * history.</b> V137 argued {@code RESTRICT}, not {@code SET NULL}: the column exists for
+     * attribution, and a NULLed creator is indistinguishable from a pre-V137 row that never had
+     * one — so {@code SET NULL} would let deleting the account under suspicion erase the audit
+     * trail undetectably. That argument was explicitly conditioned on "nothing in the app
+     * hard-deletes a user today", and deferred the case to "a future GDPR erasure flow". The
+     * 2026-09-04 reversal (salon deletion HARD-DELETES staff) is that flow, and this FK was the
+     * last constraint standing in its way. The attribution being relaxed is "which staff member of
+     * this now-deleted salon rang up this walk-in" — a fact about a salon that no longer exists.
+     *
+     * <p>Practical consequence for readers: this id was already nullable, and is now nullable for a
+     * second reason — the creating account may have been deleted. Never assume a non-null value
+     * resolves to a live {@code users} row.
      *
      * <p>Nullability is deliberately NOT enforced by {@code chk_bookings_guest_fields} — it is
      * a soft, application-layer expectation for STAFF rows only.

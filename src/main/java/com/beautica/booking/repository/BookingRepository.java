@@ -20,6 +20,47 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
+/**
+ * <b>Every {@code m.user} join in this interface — fetch or projection — is a LEFT join, and must
+ * stay one, with exactly ONE named exception listed below</b> (V157, phase 294 D1; the "fetch"-only
+ * wording was corrected by the 2026-09 audit, finding 8, which found four INNER
+ * {@code JOIN m.user}/{@code JOIN bm.user} PROJECTION joins hiding behind a sentence that only ever
+ * spoke about fetch joins). {@code masters.user_id} became nullable when salon deletion started
+ * hard-deleting staff accounts: a booking whose master has been detached still belongs to the
+ * client who made it and must still load. An INNER {@code JOIN FETCH m.user} silently DROPS such a
+ * row from the result set, which surfaces as a 404 on the client's own past booking rather than as
+ * an error anywhere near the cause. Result sets are byte-for-byte identical for every attached
+ * master, so the relaxation costs nothing today; the entity-count and statement-count gates in
+ * {@code BookingPriceRangeContractIT} are unaffected (a to-one fetch join adds columns, never rows).
+ * Read the provider's name through {@code Master#displayFirstName()} / {@code displayLastName()},
+ * never {@code getMaster().getUser()}.
+ *
+ * <p><b>The ONE remaining INNER {@code bm.user} projection join is {@link #findViewAccessById}, and
+ * the reason it stays is NOT the reason its former twin stayed.</b> Both were once described here as
+ * "equivalently benign, because fail-closed". Fail-closed is not the same as harmless, and the
+ * cycle-2 audit (finding 5) separated the two cases:
+ * <ul>
+ *   <li>{@link #findCompletionAccessById} MOVED to a LEFT join. It is live-wired into four
+ *       {@code AuthorizationService} SpEL predicates ({@code canCancelBooking},
+ *       {@code canCompleteBooking}, {@code canRescheduleBooking}, {@code canReviewClient}), so the
+ *       dropped row was denying a SALON OWNER complete/decline/reschedule/review-client on a booking
+ *       whose master account had been deleted — a 403 for the wrong party, not merely a safe one.
+ *       See that method's javadoc.</li>
+ *   <li>{@link #findViewAccessById} stays INNER purely because NOTHING REACHES IT. Its only two
+ *       callers, {@code AuthorizationService#canViewBooking} and {@code #canManageBooking}, are
+ *       themselves named by no {@code @PreAuthorize} SpEL and no service anywhere in {@code
+ *       src/main} — the whole chain is dead. No production request observes its result, so nothing
+ *       is being denied, and there is no behaviour to preserve or regression test to write.
+ *       <b>The moment that chain acquires a live caller, relax this join too</b> — do not inherit
+ *       the old "fail-closed, therefore benign" reasoning, which is exactly what hid finding 5 for
+ *       a cycle.</li>
+ * </ul>
+ * Either way the {@code v.masterUserId().equals(actorId)} reads in {@code AuthorizationService} are
+ * already null-guarded (2026-09 audit finding 7), so relaxing the remaining join is a one-line edit
+ * plus a regression test, not a null-dereference hunt. Contrast
+ * {@link #findAllCompletionAccessByAppointmentId}, where an inner join silently defeated an ALL-ROWS
+ * contract and was an authorization BYPASS (2026-09 audit finding 2).
+ */
 public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
 
     // ── ID-only paginated queries — two-query pattern (Fix H1 — HHH90003004) ──
@@ -417,7 +458,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -573,6 +614,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@code BookingRepositoryCustomImpl.findIdPage} — the same choke point the provider
      * ID-page queries already use. This unifies both roles' sort discipline onto one code path;
      * see {@code findIdsByClientIdFiltered}'s javadoc for the full contract.
+     *
+     * <p><b>{@code m.user} is a {@code LEFT JOIN} and must stay one</b> (V157 / phase 294 D1 —
+     * 2026-09 audit finding 6). This is an ID-then-hydrate pair: the ID page returns N ids, and an
+     * INNER {@code JOIN m.user} would hydrate only N&minus;1 of them the moment ONE of the page's
+     * bookings has a DETACHED master (staff {@code users} row hard-deleted), silently DESYNCING the
+     * page — {@code totalElements} still says N while the content list is short, and the missing row
+     * is the client's OWN past booking. The name columns therefore {@code COALESCE} onto the V157
+     * {@code detached_*} snapshot, which is exactly what {@code Master#displayFirstName()} /
+     * {@code displayLastName()} return on the entity path, so this projection and
+     * {@code BookingDetailResponse#from(Booking, ...)} render the identical provider name for the
+     * same booking. Every OTHER {@code mu.*} column resolves to {@code null} for a detached master —
+     * {@code professionalTitle}, {@code avatarUrl}, {@code role} ({@code masterType}) and the
+     * independent-master locality fallbacks — which is the SAME contract the entity path already
+     * has ({@code masterUser != null ? masterUser.getRole() : null}); all are declared nullable on
+     * {@link com.beautica.booking.dto.BookingDetailResponse}.
      */
     @Query(value = """
             SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -589,8 +645,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.createdAt,
                 b.client.firstName,
                 b.client.lastName,
-                mu.firstName,
-                mu.lastName,
+                COALESCE(mu.firstName, m.detachedFirstName),
+                COALESCE(mu.lastName, m.detachedLastName),
                 mu.professionalTitle,
                 b.clientComment,
                 b.providerComment,
@@ -615,7 +671,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             FROM Booking b
             JOIN b.client
             JOIN b.master m
-            JOIN m.user mu
+            LEFT JOIN m.user mu
             LEFT JOIN b.salon s
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
@@ -669,7 +725,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -700,7 +756,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -1095,6 +1151,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * but returns the booking's {@code salonId} (null for an independent-master booking) so
      * {@code AuthorizationService.canCompleteBooking} can admit a {@code SALON_ADMIN} assigned
      * to that salon — not only the owner. Returns empty when the booking does not exist.
+     *
+     * <p><b>{@code bm.user} is a {@code LEFT JOIN} (audit cycle-2 finding 5) and must stay one.</b>
+     * It was INNER, which was fail-closed rather than a vulnerability — a DETACHED master's booking
+     * vanished from the projection, {@code Optional.empty()} met each caller's {@code .orElse(false)}
+     * and produced a 403 — but it denied the wrong people: the SALON OWNER lost complete / decline /
+     * reschedule / review-client on a booking whose master account had been deleted, an action that
+     * has nothing to do with the master's own user row. The salon arm of
+     * {@code AuthorizationService#hasProviderAuthorityOverRow} reads only {@code salonId}, and a
+     * detached salon master keeps a non-null {@code bs.id}, so the owner arm now fires unchanged;
+     * the independent-master arm still compares a null {@code masterUserId} against a non-null actor
+     * id and fails closed. All four call sites ({@code canCancelBooking}, {@code canCompleteBooking},
+     * {@code canRescheduleBooking}, {@code canReviewClient}) were already null-guarded by the 2026-09
+     * audit (finding 7). Pinned by {@code MasterDetachmentContractIT} case 13.
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingCompletionAccess(
@@ -1103,7 +1172,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             )
             FROM Booking b
             JOIN b.master bm
-            JOIN bm.user
+            LEFT JOIN bm.user
             LEFT JOIN bm.salon bs
             WHERE b.id = :bookingId
             """)
@@ -1127,6 +1196,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3), so this is at most a 10-row
      * projection read — no {@code JOIN FETCH}, same shape as the previous capped query. Returns
      * empty when the appointment does not exist or has no items (fail-closed at the caller).
+     *
+     * <p><b>{@code bm.user} is a {@code LEFT JOIN} and must NEVER be tightened to an inner one</b>
+     * (V157 / phase 294 D1 — 2026-09 audit finding 2). It was an INNER join, which DEFEATED this
+     * method's own all-rows contract in the one case the contract exists for: a DETACHED master's
+     * item (staff {@code users} row hard-deleted, {@code masters.user_id IS NULL}) simply VANISHED
+     * from the result set. {@code access.isEmpty()} then stayed false, and both callers'
+     * {@code allMatch} passed over the SURVIVING SUBSET — authorizing decline / complete /
+     * not-complete / reschedule across the WHOLE visit, including the item that was never checked.
+     * An inner join here is not a filter, it is an authorization bypass. With the LEFT join the
+     * detached item contributes {@code masterUserId == null}, which
+     * {@code AuthorizationService#hasProviderAuthorityOverRow} already fails closed on for the
+     * independent-master arm, while a salon item still authorizes off its (unchanged)
+     * {@code bs.id} — the correct answer in both shapes.
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingCompletionAccess(
@@ -1135,7 +1217,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             )
             FROM Booking b
             JOIN b.master bm
-            JOIN bm.user
+            LEFT JOIN bm.user
             LEFT JOIN bm.salon bs
             WHERE b.appointment.id = :appointmentId
             ORDER BY b.id
@@ -1334,7 +1416,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -1550,7 +1632,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             LEFT JOIN FETCH b.appointment
@@ -1628,7 +1710,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.cancelToken = :cancelToken

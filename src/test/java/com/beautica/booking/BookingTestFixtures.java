@@ -229,10 +229,17 @@ public class BookingTestFixtures {
         return ids;
     }
 
-    /** Bundle of a seeded salon graph so tests can address the owner, its salon, and its master. */
-    record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
+    /**
+     * Bundle of a seeded salon graph so tests can address the owner, its salon, and its master.
+     *
+     * <p>Widened from package-private to {@code public} (with {@link #createSalon(String)}) for
+     * {@code com.beautica.master.MasterDetachmentContractIT}, which needs a real {@code salons} row
+     * to hang a salon-scoped review off. Reused rather than re-inlined per the REUSE-FIRST rule —
+     * a fourth hand-rolled "INSERT INTO salons" is exactly how these fixtures drift.
+     */
+    public record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
 
-    SalonFixture createSalon(String ownerEmail) {
+    public SalonFixture createSalon(String ownerEmail) {
         UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(

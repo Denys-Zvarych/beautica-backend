@@ -562,6 +562,12 @@ public record BookingDetailResponse(
             OffsetDateTime now
     ) {
         Master master = booking.getMaster();
+        // V157 / phase 294 D3 — NULLABLE. A booking is a HISTORICAL record: the staff account behind
+        // its master may have been hard-deleted, leaving a detached masters stub (user_id = NULL +
+        // a first/last-name snapshot). The client's own past receipt must still render who performed
+        // the service, so the NAME comes from master.displayFirstName()/displayLastName() below, and
+        // every other property read off this reference is null-guarded. Do NOT collapse these guards
+        // back into direct masterUser.getX() calls.
         User masterUser = master.getUser();
         // Phase 242 — the BOOKING's own salon snapshot (bookings.salon_id), NEVER
         // master.getSalon() (the master's LIVE affiliation). See this class's javadoc: after a
@@ -570,9 +576,12 @@ public record BookingDetailResponse(
         Salon salon = booking.getSalon();
         User client = booking.getClient();
 
-        String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
-        String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
-        String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
+        String resolvedStreet = salon != null ? salon.getStreet()
+                : (masterUser != null ? masterUser.getStreet() : null);
+        String resolvedBuildingNo = salon != null ? salon.getBuildingNo()
+                : (masterUser != null ? masterUser.getBuildingNo() : null);
+        String resolvedLocationNote = salon != null ? salon.getLocationNote()
+                : (masterUser != null ? masterUser.getLocationNote() : null);
 
         return new BookingDetailResponse(
                 booking.getId(),
@@ -593,14 +602,16 @@ public record BookingDetailResponse(
                 // a name on their calendar instead of null — guestPhone is intentionally excluded.
                 client != null ? client.getFirstName() : booking.getGuestName(),
                 client != null ? client.getLastName() : booking.getGuestSurname(),
-                masterUser.getFirstName(),
-                masterUser.getLastName(),
-                masterUser.getProfessionalTitle(),
+                master.displayFirstName(),
+                master.displayLastName(),
+                masterUser != null ? masterUser.getProfessionalTitle() : null,
                 booking.getClientComment(),
                 booking.getProviderComment(),
                 booking.getClientCancellationNote(),
-                masterUser.getAvatarUrl(),
-                masterUser.getRole(),
+                // A detached master has no account and therefore no avatar and no role — the stub
+                // carries a name and nothing else. Null here, never a fabricated placeholder.
+                masterUser != null ? masterUser.getAvatarUrl() : null,
+                masterUser != null ? masterUser.getRole() : null,
                 salon != null ? salon.getName() : null,
                 cityLabel,
                 districtLabel,

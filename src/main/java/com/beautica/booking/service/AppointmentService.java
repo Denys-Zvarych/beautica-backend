@@ -26,6 +26,7 @@ import com.beautica.service.service.SalonCatalogCacheEvictor;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.lang.Nullable;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -222,7 +223,7 @@ public class AppointmentService {
      * costs nothing beyond the two taxonomy SELECTs {@code resolveLabels} issues (each skipped when
      * its id is null).
      */
-    DiscoveryLabels resolveVisitLabels(Salon salon, User masterUser) {
+    DiscoveryLabels resolveVisitLabels(Salon salon, @Nullable User masterUser) {
         UUID cityId = visitCityId(salon, masterUser);
         UUID districtId = visitDistrictId(salon, masterUser);
         return discoveryLocationResolver.resolveLabels(
@@ -230,12 +231,23 @@ public class AppointmentService {
                 districtId == null ? List.of() : List.of(districtId));
     }
 
-    private static UUID visitCityId(Salon salon, User masterUser) {
-        return salon != null ? salon.getCityId() : masterUser.getCityId();
+    // V157 / phase 294 D3: masterUser is NULLABLE on a historical visit whose master was detached
+    // (staff account hard-deleted). Only the independent-master branch reads it; a null locality
+    // degrades to "no city/district label", which the resolver already handles for a master who
+    // never set one.
+    private static UUID visitCityId(Salon salon, @Nullable User masterUser) {
+        if (salon != null) {
+            return salon.getCityId();
+        }
+        return masterUser != null ? masterUser.getCityId() : null;
     }
 
-    private static UUID visitDistrictId(Salon salon, User masterUser) {
-        return salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
+    /** Same rule and same null-degradation as {@link #visitCityId(Salon, User)}. */
+    private static UUID visitDistrictId(Salon salon, @Nullable User masterUser) {
+        if (salon != null) {
+            return salon.getDistrictId();
+        }
+        return masterUser != null ? masterUser.getDistrictId() : null;
     }
 
     private UUID doCreateAppointment(UUID clientId, String idempotencyKey, CreateAppointmentRequest request) {

@@ -12,6 +12,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.user.User;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.lang.Nullable;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -111,8 +112,12 @@ public class NotificationService {
      */
     public void notifyNewBooking(BookingVisit visit) {
         Booking booking = visit.lead();
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "NEW_BOOKING");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String clientName = resolveClientName(booking);
         String bookingId = booking.getId().toString();
 
@@ -266,8 +271,12 @@ public class NotificationService {
      * {@link #notifyNewBooking(BookingVisit)} — with «Бронювання перенесено» copy.
      */
     public void notifyBookingRescheduled(Booking booking) {
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "BOOKING_RESCHEDULED");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
@@ -358,8 +367,12 @@ public class NotificationService {
      * handles the guest case for the copy that names the client in the reminder.
      */
     public void notifyClosureReminder(Booking booking) {
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "CLOSURE_REMINDER");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String clientName = resolveClientName(booking);
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
@@ -421,8 +434,12 @@ public class NotificationService {
     }
 
     public void notifyClientCancelled(Booking booking) {
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "CLIENT_CANCELLED");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String clientName = resolveClientName(booking);
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
@@ -674,10 +691,40 @@ public class NotificationService {
         return comment.substring(0, cut) + "…";
     }
 
+    /**
+     * The PROVIDER-side recipient of a booking notification, or {@code null} when there is nobody
+     * left to notify.
+     *
+     * <p>V157 / phase 294 D1 made {@code masters.user_id} nullable: when a salon is deleted the
+     * staff {@code users} row is hard-deleted and the historical {@code masters} row survives as a
+     * name-only stub with no mailbox, no device token and no account. Every provider-facing
+     * notification below therefore starts here and returns early on a detached master instead of
+     * NPEing deep inside the mail/push transport.
+     *
+     * <p>Unreachable as of phase 294 — nothing detaches a master yet (D6). It exists so phase 295's
+     * delete cannot turn a notification into a 500.
+     *
+     * <p>The log line carries identifiers only: no email, no name, no phone (Anti-Bug §I).
+     */
+    @Nullable
+    private static User providerRecipient(Booking booking, String notificationType) {
+        User masterUser = booking.getMaster().getUser();
+        if (masterUser == null) {
+            log.info("Skipping {} for booking {} — master {} is detached (staff account deleted)",
+                    notificationType, booking.getId(), booking.getMaster().getId());
+        }
+        return masterUser;
+    }
+
+    // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().
+    // A detached master (staff account hard-deleted, historical stub kept) has no user row, so the
+    // old two-line walk NPEs; the accessors fall back to the name snapshot taken at detach time.
+    // Still null-safe on either half — users.first_name / users.last_name are both nullable.
     private static String masterName(Master master) {
-        User u = master.getUser();
-        String first = u.getFirstName() == null ? "" : u.getFirstName().trim();
-        String last = u.getLastName() == null ? "" : u.getLastName().trim();
+        String firstName = master.displayFirstName();
+        String lastName = master.displayLastName();
+        String first = firstName == null ? "" : firstName.trim();
+        String last = lastName == null ? "" : lastName.trim();
         return (first + " " + last).trim();
     }
 

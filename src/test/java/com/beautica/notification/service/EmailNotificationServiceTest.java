@@ -1131,8 +1131,10 @@ class EmailNotificationServiceTest {
         lenient().when(masterUser.getFirstName()).thenReturn(masterFirstName);
         lenient().when(masterUser.getLastName()).thenReturn(masterLastName);
 
-        Master master = mock(Master.class);
-        lenient().when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the email templates read the provider's name via
+        // Master#displayFirstName()/#displayLastName(). Only a real instance runs that
+        // attached-vs-detached branch; stubbing the accessors would assert the fixture, not the code.
+        Master master = Master.builder().user(masterUser).build();
 
         ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
         when(serviceDefinition.getName()).thenReturn(serviceName);

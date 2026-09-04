@@ -124,6 +124,14 @@ class SalonServiceTest {
     @Mock
     private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
+    // Phase 293: SalonService now constructor-depends on BookingService for the salon-closure
+    // booking cascade (deactivateSalon calls declineFutureConfirmedBookingsForSalonClosure).
+    // @InjectMocks passes null for an UNDECLARED collaborator silently, so compileTestJava stays
+    // green and the omission only surfaces as an NPE at runtime — declared even though the call
+    // is a void no-op here (every test that reaches it asserts on the surrounding behaviour).
+    @Mock
+    private com.beautica.booking.service.BookingService bookingService;
+
     @InjectMocks
     private SalonService salonService;
 
