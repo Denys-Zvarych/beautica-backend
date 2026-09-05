@@ -5,6 +5,7 @@ import com.beautica.auth.EmailVerificationProcessor;
 import com.beautica.auth.TokenGenerator;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.common.cache.UserProfileCacheEvictor;
+import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.service.MasterService;
@@ -27,6 +28,7 @@ import java.time.Clock;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Cache-eviction integration test for {@link UserService#updateMasterProfile}'s
@@ -317,10 +319,20 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
      * <p>This pins it behaviourally rather than with a {@code verify()} on a mock: a mock verify
      * would restate the source line and still pass if the evictor evicted the wrong key, the
      * wrong cache, or before the commit instead of after it.
+     *
+     * <p><b>Phase 299 changed what "removed" means, and therefore what this test asserts.</b>
+     * {@code removeAdmin} used to null {@code users.salon_id} and leave the account alive, so the
+     * observable stale value was a salonId naming a salon the admin had left. It now routes through
+     * {@code SalonService#disposeStaffAccounts} and HARD-DELETES the {@code users} row, so the
+     * stale value would be an entire profile DTO for an account that no longer exists — a strictly
+     * worse leak, and one that {@code getProfile} itself surfaces: a surviving cache entry short-
+     * circuits the repository lookup and returns the pre-deletion DTO instead of raising
+     * {@link NotFoundException}. That throw is the behavioural assertion below; the cache-key
+     * assertion beside it is what distinguishes a real eviction from a coincidental miss.
      */
     @Test
     @DisplayName("SalonService.removeAdmin evicts the REMOVED ADMIN's user-profile entry — the "
-            + "stale salonId would otherwise name a salon they no longer belong to")
+            + "stale DTO would otherwise outlive the hard-deleted account")
     void should_invalidateUserProfileCache_when_removeAdminCommits() {
         // Arrange — an owner with a salon, and a SALON_ADMIN assigned to it. The admin, not the
         // actor, is the cache key under test: removeAdmin nulls the ADMIN's users.salon_id while
@@ -354,11 +366,18 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
                 salonService.removeAdmin(ownerId, salonId, adminId));
 
         // Assert
-        assertThat(transactionTemplate.execute(status -> userService.getProfile(adminId)).salonId())
-                .as("salonId MUST read null after removal. A surviving value is the cached "
-                        + "pre-removal DTO: the removed admin's app would keep addressing a salon "
-                        + "they were just detached from for the full 5-minute TTL")
+        assertThat(cacheManager.getCache(UserProfileCacheEvictor.USER_PROFILE_CACHE).get(adminId))
+                .as("the admin's key MUST be gone from user-profile after the commit — this is the "
+                        + "eviction itself, asserted where a coincidental miss cannot be mistaken "
+                        + "for one (the precondition above proved the key was populated)")
                 .isNull();
+
+        assertThatThrownBy(() -> transactionTemplate.execute(status -> userService.getProfile(adminId)))
+                .as("getProfile MUST fall through to the repository and raise NotFoundException for "
+                        + "the hard-deleted account. A surviving cache entry would short-circuit "
+                        + "that lookup and hand the removed admin's app a full pre-deletion profile "
+                        + "for the whole 5-minute TTL")
+                .isInstanceOf(NotFoundException.class);
     }
 
     /**
