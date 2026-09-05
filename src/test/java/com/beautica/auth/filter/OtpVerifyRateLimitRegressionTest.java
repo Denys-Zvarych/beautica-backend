@@ -77,7 +77,7 @@ class OtpVerifyRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private MockHttpServletRequest postVerify() {

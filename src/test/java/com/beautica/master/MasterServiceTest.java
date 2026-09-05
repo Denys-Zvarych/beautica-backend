@@ -9,9 +9,6 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
-import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.dto.WorkingHoursRequest;
@@ -24,8 +21,14 @@ import com.beautica.master.repository.WorkingHoursRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.service.SalonService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaMethod;
+import com.tngtech.archunit.core.domain.JavaMethodCall;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -48,14 +51,17 @@ import java.time.Clock;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -70,10 +76,11 @@ class MasterServiceTest {
     @Mock private WorkingHoursRepository workingHoursRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private CacheManager cacheManager;
-    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
-    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
-    // getCityId() returns a non-null value.
-    @Mock private CityRepository cityRepository;
+    // Phase 240 perf MEDIUM fix: resolveOblastId now delegates to the shared cached resolver
+    // (LocationQueryService#resolveCityOblastId) instead of calling CityRepository directly —
+    // must be declared so @InjectMocks can satisfy the constructor parameter (mirrors
+    // SalonServiceTest). MasterService no longer depends on CityRepository at all.
+    @Mock private com.beautica.location.service.LocationQueryService locationQueryService;
     // Phase 13.1: declared so @InjectMocks satisfies the BookingSlugService constructor
     // parameter. The creation paths call getOrCreateSlug(...) after save — a no-op stub
     // (default mock) is sufficient; its return value is ignored by MasterService.
@@ -97,6 +104,13 @@ class MasterServiceTest {
     // publish call NPEs — a mock is correct here, the listener's own behaviour is unit-tested in
     // com.beautica.review.event.SalonStaffRatingListenerTest.
     @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
+    // Audit-fix cycle 2: every create/reactivate/deactivate path now also evicts the
+    // user-profile cache through the shared evictor (a `masters` write stales GET /users/me
+    // via hasMasterProfile). @InjectMocks must have one to wire or those paths NPE. Left as a
+    // bare mock here on purpose — the eviction itself is proved against the REAL evictor and
+    // the REAL CacheConfig in OwnerMasterCacheTest and UserCacheEvictionIT, where a cache
+    // actually exists to observe; verifying a mock call here would only restate the source.
+    @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
     // Phase 29.2 fallout: getMasterCalendar now resolves an absolute-instant "now" for
     // BookingResponse.awaitingClosure. A real fixed-value Clock (not a bare @Mock, which would
     // return null from #instant() and NPE) — the exact instant is irrelevant to every test in
@@ -203,6 +217,9 @@ class MasterServiceTest {
                 .build();
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        // Phase 286: createMasterFromInvite now rejects a deactivated salon — stub active so
+        // this happy-path test still exercises success.
+        when(salon.isActive()).thenReturn(true);
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(masterRepository.save(any(Master.class))).thenReturn(saved);
 
@@ -236,6 +253,9 @@ class MasterServiceTest {
                 .build();
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        // Phase 286: createMasterFromInvite now rejects a deactivated salon — stub active so
+        // this happy-path test still exercises success.
+        when(salon.isActive()).thenReturn(true);
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
         when(masterRepository.save(any(Master.class))).thenReturn(saved);
 
@@ -271,6 +291,28 @@ class MasterServiceTest {
 
         assertThatThrownBy(() -> masterService.createMasterFromInvite(userId, salonId))
                 .isInstanceOf(NotFoundException.class);
+
+        verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("should_throwBusinessException_when_createMasterFromInviteWithInactiveSalon")
+    void should_throwBusinessException_when_createMasterFromInviteWithInactiveSalon() {
+        // Phase 286: defence in depth for InviteService.acceptInvite's own salon-liveness
+        // guard — this method is public and @Transactional, so the invariant belongs here too,
+        // not only on that one caller's discipline.
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(salon.isActive()).thenReturn(false);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        assertThatThrownBy(() -> masterService.createMasterFromInvite(userId, salonId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Salon is not active");
 
         verify(masterRepository, never()).save(any());
     }
@@ -321,8 +363,8 @@ class MasterServiceTest {
         assertThat(response.workingHours().get(0).dayOfWeek()).isEqualTo(1);
         // HIGH-2: cityId must be null when user.getCityId() returns null (fast-path)
         assertThat(response.cityId()).isNull();
-        // CRITICAL: cityRepository must never be called when cityId is null
-        verifyNoInteractions(cityRepository);
+        // CRITICAL: locationQueryService must never be called when cityId is null
+        verifyNoInteractions(locationQueryService);
     }
 
     // ── resolveOblastId paths ─────────────────────────────────────────────────
@@ -333,12 +375,6 @@ class MasterServiceTest {
         UUID masterId = UUID.randomUUID();
         UUID cityUuid = UUID.randomUUID();
         UUID oblastUuid = UUID.randomUUID();
-
-        Oblast oblast = mock(Oblast.class);
-        when(oblast.getId()).thenReturn(oblastUuid);
-
-        City city = mock(City.class);
-        when(city.getOblast()).thenReturn(oblast);
 
         User user = mock(User.class);
         when(user.getFirstName()).thenReturn("Anna");
@@ -354,13 +390,13 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
-        when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.of(city));
+        when(locationQueryService.resolveCityOblastId(cityUuid)).thenReturn(oblastUuid);
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
 
         assertThat(response.cityId()).isEqualTo(cityUuid);
         assertThat(response.oblastId()).isEqualTo(oblastUuid);
-        verify(cityRepository).findByIdWithOblast(cityUuid);
+        verify(locationQueryService).resolveCityOblastId(cityUuid);
     }
 
     @Test
@@ -386,7 +422,7 @@ class MasterServiceTest {
 
         assertThat(response.cityId()).isNull();
         assertThat(response.oblastId()).isNull();
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     @Test
@@ -409,12 +445,129 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
-        when(cityRepository.findByIdWithOblast(cityUuid)).thenReturn(Optional.empty());
+        when(locationQueryService.resolveCityOblastId(cityUuid)).thenReturn(null);
 
         MasterDetailResponse response = masterService.getMasterDetail(masterId);
 
         assertThat(response.oblastId()).isNull();
-        verify(cityRepository).findByIdWithOblast(cityUuid);
+        verify(locationQueryService).resolveCityOblastId(cityUuid);
+    }
+
+    // ── getMasterDetail — embedded salon's oblastId (follow-up to PublicSalonResponse#oblastId) ──
+    // The salon-affiliated master's embedded PublicSalonResponse must resolve oblastId from the
+    // SALON's cityId, not the master's own user.getCityId() — a fixture where the two cities (and
+    // therefore the two oblasts) DIFFER is required, or a bug that swaps/collapses the two
+    // resolutions would still pass (fixture-defang guard, per project memory).
+
+    @Test
+    @DisplayName("should_resolveSalonOblastId_independently_when_masterHasSalonInDifferentCity")
+    void should_resolveSalonOblastId_independently_when_masterHasSalonInDifferentCity() {
+        UUID masterId = UUID.randomUUID();
+        UUID userCityUuid = UUID.randomUUID();
+        UUID userOblastUuid = UUID.randomUUID();
+        UUID salonCityUuid = UUID.randomUUID();
+        UUID salonOblastUuid = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(userCityUuid);
+        when(user.getDistrictId()).thenReturn(null);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(salonCityUuid);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(locationQueryService.resolveCityOblastId(userCityUuid)).thenReturn(userOblastUuid);
+        when(locationQueryService.resolveCityOblastId(salonCityUuid)).thenReturn(salonOblastUuid);
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.oblastId())
+                .as("the master's own oblastId must come from the master's user cityId")
+                .isEqualTo(userOblastUuid);
+        assertThat(response.salon().oblastId())
+                .as("the embedded salon's oblastId must come from the SALON's cityId, not the master's")
+                .isEqualTo(salonOblastUuid);
+        assertThat(response.salon().oblastId()).isNotEqualTo(response.oblastId());
+        // Finding 3 (Phase 240 perf LOW) short-circuit only kicks in when the two cities are
+        // EQUAL — different cities here, so both must still independently reach the resolver.
+        verify(locationQueryService).resolveCityOblastId(userCityUuid);
+        verify(locationQueryService).resolveCityOblastId(salonCityUuid);
+    }
+
+    @Test
+    @DisplayName("should_resolveSalonOblastIdOnce_when_masterAndSalonShareTheSameCity")
+    void should_resolveSalonOblastIdOnce_when_masterAndSalonShareTheSameCity() {
+        // Phase 240 perf LOW (Finding 3): the common case — a salon-affiliated master whose own
+        // city IS the salon's city — must reuse the already-resolved oblastId instead of running
+        // a second resolveCityOblastId call for the SAME cityId.
+        UUID masterId = UUID.randomUUID();
+        UUID sharedCityUuid = UUID.randomUUID();
+        UUID sharedOblastUuid = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(sharedCityUuid);
+        when(user.getDistrictId()).thenReturn(null);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(sharedCityUuid);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+        when(locationQueryService.resolveCityOblastId(sharedCityUuid)).thenReturn(sharedOblastUuid);
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.oblastId()).isEqualTo(sharedOblastUuid);
+        assertThat(response.salon().oblastId())
+                .as("same-city short-circuit must still populate the salon's oblastId")
+                .isEqualTo(sharedOblastUuid);
+        // The short-circuit means only ONE resolver call total, not one per resolveOblastId site.
+        verify(locationQueryService, org.mockito.Mockito.times(1)).resolveCityOblastId(sharedCityUuid);
+    }
+
+    @Test
+    @DisplayName("should_leaveSalonOblastIdNull_when_masterHasNoSalon")
+    void should_leaveSalonOblastIdNull_when_masterHasNoSalon() {
+        UUID masterId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        when(user.getFirstName()).thenReturn("Anna");
+        when(user.getLastName()).thenReturn("Kovalenko");
+        when(user.getCityId()).thenReturn(null);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getUser()).thenReturn(user);
+        when(master.getMasterType()).thenReturn(MasterType.INDEPENDENT_MASTER);
+        when(master.getSalon()).thenReturn(null);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId)).thenReturn(List.of());
+
+        MasterDetailResponse response = masterService.getMasterDetail(masterId);
+
+        assertThat(response.salon()).isNull();
+        // No salon at all — resolveOblastId must never be invoked with a salon cityId.
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     // ── deactivateMaster — cache eviction ─────────────────────────────────────
@@ -422,17 +575,21 @@ class MasterServiceTest {
     @Test
     @DisplayName("should_evictMasterDetailCache_when_deactivateMasterCalled")
     void should_evictMasterDetailCache_when_deactivateMasterCalled() {
-        UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
         User user = mock(User.class);
         when(user.getId()).thenReturn(userId);
 
+        // INDEPENDENT_MASTER + actorId == userId: self-deactivation, so the Phase 290 finding #5
+        // ownership guard (assertCanManageMaster) is satisfied with no salon fixture or
+        // salonRepository/userRepository stubbing needed — this test is about cache eviction,
+        // not authorization.
         Master master = Master.builder()
-                .masterType(MasterType.SALON_MASTER)
+                .masterType(MasterType.INDEPENDENT_MASTER)
                 .isActive(true)
                 .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
         ReflectionTestUtils.setField(master, "user", user);
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
@@ -451,7 +608,7 @@ class MasterServiceTest {
         // non-transactional unit test, then capture and replay afterCommit().
         TransactionSynchronizationManager.initSynchronization();
         try {
-            masterService.deactivateMaster(ownerId, masterId);
+            masterService.deactivateMaster(userId, masterId);
 
             // Capture all registered synchronizations and invoke afterCommit() on each.
             List<TransactionSynchronization> syncs =
@@ -497,6 +654,12 @@ class MasterServiceTest {
         ReflectionTestUtils.setField(master, "salon", salon);
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // Phase 290 finding #5 — assertCanManageMaster's SALON_MASTER branch defers to the same
+        // owner-or-admin check the batch cascade uses; stub the owner half. The role gate
+        // (security fix, Phase 290 audit) must see actorId resolve to SALON_OWNER or this actor
+        // is rejected before existsByIdAndOwnerId is even consulted.
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_OWNER));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
 
         runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
 
@@ -577,7 +740,6 @@ class MasterServiceTest {
     @Test
     @DisplayName("deactivateMaster (INDEPENDENT_MASTER, no salon) — evicts master-service-bookable but is a no-op on the salon-catalog evictor")
     void should_notTouchSalonCatalogEvictor_when_deactivatedMasterHasNoSalon() {
-        UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
@@ -594,7 +756,10 @@ class MasterServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
-        runAndReplayAfterCommit(() -> masterService.deactivateMaster(actorId, masterId));
+        // Phase 290 finding #5 — assertCanManageMaster's INDEPENDENT_MASTER branch requires
+        // self-management (actorId == the master's own user id); an independent master's only
+        // legitimate deactivation caller is themselves.
+        runAndReplayAfterCommit(() -> masterService.deactivateMaster(userId, masterId));
 
         verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
         verify(salonCatalogCacheEvictor, never()).evict(any());
@@ -816,9 +981,10 @@ class MasterServiceTest {
     @Test
     @DisplayName("should_deactivateMaster_when_masterExists")
     void should_deactivateMaster_when_authorizedActorRequests() {
-        // Authorization is exclusively enforced by @PreAuthorize on MasterController — not re-checked here.
+        // Controller-level authorization (@PreAuthorize) is not re-checked here; the Phase 290
+        // finding #5 service-layer guard IS exercised — INDEPENDENT_MASTER + actorId == userId
+        // satisfies it via self-management, with no salon fixture needed.
         // save() is no longer called — Hibernate dirty-checking flushes the mutation on commit.
-        UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
@@ -826,14 +992,14 @@ class MasterServiceTest {
         when(user.getId()).thenReturn(userId);
 
         Master master = Master.builder()
-                .masterType(MasterType.SALON_MASTER)
+                .masterType(MasterType.INDEPENDENT_MASTER)
                 .isActive(true)
                 .build();
         ReflectionTestUtils.setField(master, "user", user);
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
 
-        masterService.deactivateMaster(ownerId, masterId);
+        masterService.deactivateMaster(userId, masterId);
 
         assertThat(master.isActive()).isFalse();
         verify(masterRepository, never()).save(any());
@@ -852,6 +1018,237 @@ class MasterServiceTest {
                 .isInstanceOf(NotFoundException.class);
 
         verify(masterRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("deactivateMaster — Phase 290 finding #5: throws Forbidden when the actor neither "
+            + "owns the master's salon nor is assigned to it as SALON_ADMIN")
+    void should_throwForbidden_when_deactivateMaster_actorDoesNotOwnSalonAndIsNotAdmin() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "user", user);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // Actor holds a role that CAN manage salon staff (SALON_ADMIN) but is not assigned to
+        // THIS salon — the role gate alone must not be sufficient, the assignment must also match.
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_ADMIN));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        // The master must be left untouched — the guard runs BEFORE the mutation.
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    /**
+     * QA audit (2026-09-03) gap fix — every existing {@code assertCanManageMaster}/
+     * {@code assertCanManageSalonStaff} test exercised either the OWNER-positive branch or a
+     * doubly-negative (neither owner nor admin) actor. Nothing proved the SALON_ADMIN-positive
+     * branch of {@code canManageSalonStaff} — {@code userRepository.findSalonIdById(actorId)}
+     * resolving to the master's own salon — actually authorizes. Without this test, inverting
+     * that {@code .map(salonId::equals)} to something that always returns {@code false} would
+     * still pass the whole suite (the owner-positive tests short-circuit past the admin branch
+     * via {@code ||}, and the negative test never gives it a matching salon id to accept).
+     */
+    @Test
+    @DisplayName("deactivateMaster — Phase 290 finding #5: a SALON_ADMIN who is NOT the owner but "
+            + "IS assigned to this salon may deactivate its SALON_MASTER staff")
+    void should_deactivateMaster_when_actorIsSalonAdminNotOwner() {
+        UUID adminActorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(masterUserId);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "id", masterId);
+        ReflectionTestUtils.setField(master, "user", masterUser);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // The admin's persisted role clears the gate...
+        when(userRepository.findRoleById(adminActorId)).thenReturn(Optional.of(Role.SALON_ADMIN));
+        // ...and IS assigned to this salon — the SALON_ADMIN branch of canManageSalonStaff.
+        when(userRepository.findSalonIdById(adminActorId)).thenReturn(Optional.of(salonId));
+
+        runAndReplayAfterCommit(() -> masterService.deactivateMaster(adminActorId, masterId));
+
+        assertThat(master.isActive())
+                .as("the admin-positive branch must actually authorize the mutation")
+                .isFalse();
+        verify(eventPublisher).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
+    }
+
+    /**
+     * Security fix regression test (Phase 290 audit, MEDIUM) — {@code canManageSalonStaff}
+     * previously admitted ANY actor whose {@code users.salon_id} matched the target salon,
+     * with no role check. {@code User.createFromInvite} populates {@code salon_id} for an invited
+     * {@code SALON_MASTER} (a read-only role per the domain rules) exactly as it does for
+     * {@code SALON_ADMIN}, so a master invited to THIS salon satisfied the old guard's second
+     * OR-branch. This actor's {@code findSalonIdById} is stubbed to resolve to the target salon —
+     * proving the role gate, not merely a missing assignment row, is what rejects them.
+     */
+    @Test
+    @DisplayName("deactivateMaster — Phase 290 audit MEDIUM fix: a SALON_MASTER actor assigned to "
+            + "this salon must NOT be treated as its staff manager")
+    void should_throwForbidden_when_deactivateMaster_actorIsSalonMasterAssignedToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User user = mock(User.class);
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = Master.builder()
+                .masterType(MasterType.SALON_MASTER)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(master, "user", user);
+        ReflectionTestUtils.setField(master, "salon", salon);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_MASTER));
+        // lenient(): the fixed guard short-circuits on the role gate before ever reaching this
+        // branch, so this stub is unused on correct code — kept anyway so the mutation check
+        // (deleting the role gate) actually flips this test red instead of silently staying green,
+        // since without it the mutated code would fall through to an unstubbed (empty) default.
+        lenient().when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatThrownBy(() -> masterService.deactivateMaster(actorId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    // ── deactivateMasters — Phase 290 batch cascade (findings #2, #3, #5) ────────
+
+    @Test
+    @DisplayName("deactivateMasters — deactivates every master using the ALREADY-LOADED entities "
+            + "(no findByIdWithUserAndSalon call) and publishes exactly ONE SalonStaffChangedEvent "
+            + "for the whole batch")
+    void should_deactivateEveryMasterAndPublishExactlyOneEvent_when_deactivateMastersBatch() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        User userA = mock(User.class);
+        when(userA.getId()).thenReturn(UUID.randomUUID());
+        User userB = mock(User.class);
+        when(userB.getId()).thenReturn(UUID.randomUUID());
+
+        Master masterA = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+        ReflectionTestUtils.setField(masterA, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(masterA, "user", userA);
+        ReflectionTestUtils.setField(masterA, "salon", salon);
+
+        Master masterB = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+        ReflectionTestUtils.setField(masterB, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(masterB, "user", userB);
+        ReflectionTestUtils.setField(masterB, "salon", salon);
+
+        // Role gate (security fix, Phase 290 audit) — the batch guard resolves the actor's role
+        // ONCE for the whole call, not once per master; see the negative test below for the count
+        // assertion.
+        when(userRepository.findRoleById(ownerId)).thenReturn(Optional.of(Role.SALON_OWNER));
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+
+        masterService.deactivateMasters(ownerId, List.of(masterA, masterB), salonId);
+
+        assertThat(masterA.isActive()).isFalse();
+        assertThat(masterB.isActive()).isFalse();
+        // Finding #3 — the batch never re-fetches a Master it was already handed.
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
+        // Finding #2 — ONE event for N deactivations, not N.
+        verify(eventPublisher, times(1)).publishEvent(
+                new com.beautica.master.event.SalonStaffChangedEvent(salonId));
+        // Role-gate perf invariant — resolved once for the batch, never once per master.
+        verify(userRepository, times(1)).findRoleById(ownerId);
+    }
+
+    @Test
+    @DisplayName("deactivateMasters — empty list is a no-op: no authorization query, no event")
+    void should_doNothing_when_deactivateMastersCalledWithEmptyList() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        masterService.deactivateMasters(ownerId, List.of(), salonId);
+
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    @Test
+    @DisplayName("deactivateMasters — Phase 290 finding #5: throws Forbidden, before any master is "
+            + "mutated or the event is published, when the actor neither owns the salon nor is its admin")
+    void should_throwForbidden_when_deactivateMastersActorUnauthorized() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Master master = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+
+        // Actor holds a role that CAN manage salon staff (SALON_ADMIN) but is not assigned to
+        // THIS salon.
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_ADMIN));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> masterService.deactivateMasters(actorId, List.of(master), salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
+    }
+
+    /**
+     * Security fix regression test (Phase 290 audit, MEDIUM) — batch-cascade sibling of
+     * {@code should_throwForbidden_when_deactivateMaster_actorIsSalonMasterAssignedToSalon}. The
+     * cascade caller ({@code SalonService#deactivateSalon}) always requires {@code SALON_OWNER}
+     * independently, but {@code assertCanManageSalonStaff} is the defense-in-depth layer BEHIND
+     * that gate and must not itself admit a SALON_MASTER on an assignment-only match.
+     */
+    @Test
+    @DisplayName("deactivateMasters — Phase 290 audit MEDIUM fix: a SALON_MASTER actor assigned to "
+            + "this salon must NOT authorize the batch cascade")
+    void should_throwForbidden_when_deactivateMasters_actorIsSalonMasterAssignedToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        Master master = Master.builder().masterType(MasterType.SALON_MASTER).isActive(true).build();
+
+        when(userRepository.findRoleById(actorId)).thenReturn(Optional.of(Role.SALON_MASTER));
+        // lenient(): unreachable once the role gate short-circuits on correct code — see the
+        // single-master sibling test for why it stays.
+        lenient().when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatThrownBy(() -> masterService.deactivateMasters(actorId, List.of(master), salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        assertThat(master.isActive()).isTrue();
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
     }
 
     // V83 removed the POST/DELETE /masters/{id}/schedule-exceptions legacy endpoints and the
@@ -902,17 +1299,28 @@ class MasterServiceTest {
                 .isInstanceOf(NotFoundException.class);
     }
 
+    /**
+     * Audit-fix cycle 2 — the assertion flipped from "throws" to "returns empty" because
+     * {@code findMyMasterDetail} must be able to NEGATIVELY CACHE this outcome, and
+     * {@code @Cacheable} never stores an exception. The user-visible contract is unchanged and is
+     * pinned one layer up: {@code MasterControllerTest
+     * #should_return404_when_salonOwnerHasNoActiveOwnerMasterRow} feeds this same empty Optional
+     * through the controller and asserts 404 (not 403). What is asserted HERE is that a
+     * deactivated master still resolves to "absent" at the DB-filter level — a master holding a
+     * valid JWT must not reach their profile after deactivation.
+     */
     @Test
-    @DisplayName("should_throwNotFound_when_getMyMasterDetail_andMasterIsDeactivated")
-    void should_throwNotFound_when_getMyMasterDetail_andMasterIsDeactivated() {
+    @DisplayName("should_returnEmpty_when_findMyMasterDetail_andMasterIsDeactivated")
+    void should_returnEmpty_when_findMyMasterDetail_andMasterIsDeactivated() {
         UUID userId = UUID.randomUUID();
 
         // DB-level isActive=true filter: deactivated master returns empty Optional,
         // preventing a master with a valid JWT from accessing GET /masters/me.
         when(masterRepository.findActiveByUserIdWithUserAndSalon(userId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> masterService.getMyMasterDetail(userId))
-                .isInstanceOf(NotFoundException.class);
+        assertThat(masterService.findMyMasterDetail(userId))
+                .as("a deactivated master must resolve to absent; the controller turns this into 404")
+                .isEmpty();
     }
 
     // ── createMasterForOwner (entity overload) ────────────────────────────────
@@ -1307,5 +1715,53 @@ class MasterServiceTest {
                 .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
 
         verifyNoInteractions(masterRepository);
+    }
+
+    // ── Finding 2 (Phase 297 security re-audit, MEDIUM) ─────────────────────────────────────
+    // MasterService#deactivateMaster(UUID, Master) skips assertCanManageMaster entirely (see its
+    // own javadoc "SECURITY — do not call this from anywhere else"). It must be `public` — its
+    // one caller, SalonService#removeMaster, lives in a different package — so nothing but this
+    // test stands between that overload and a second caller that has not done the equivalent
+    // authorization work itself. ArchUnit is already a test dependency (archunit-junit5, see
+    // build.gradle.kts) and already used this way for an identical reason in
+    // ServiceCatalogServiceArchitectureTest: mechanical enforcement, not a javadoc comment a
+    // future reviewer has to remember to re-derive.
+    //
+    // Falsified 2026-09-05: temporarily added a second call site (a throwaway method in
+    // SalonService invoking masterService.deactivateMaster(actorId, master) a second time) —
+    // this test went RED ("expected size 1 but was 2") before the call site was reverted.
+    @Test
+    @DisplayName("deactivateMaster(UUID, Master) — the authorization-skipping overload — has "
+            + "EXACTLY ONE production caller, SalonService#removeMaster")
+    void should_haveExactlyOneCaller_when_deactivateMasterEntityOverloadInvoked() {
+        JavaClasses classes = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("com.beautica");
+
+        JavaMethod overload = classes.get(MasterService.class).getMethods().stream()
+                .filter(m -> m.getName().equals("deactivateMaster"))
+                .filter(m -> m.getRawParameterTypes().size() == 2)
+                .filter(m -> m.getRawParameterTypes().get(0).isEquivalentTo(UUID.class))
+                .filter(m -> m.getRawParameterTypes().get(1).isEquivalentTo(Master.class))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "MasterService.deactivateMaster(UUID, Master) not found — has it been "
+                                + "renamed or removed?"));
+
+        Set<JavaMethodCall> callers = overload.getCallsOfSelf();
+
+        assertThat(callers)
+                .as("production call sites of the authorization-skipping "
+                        + "MasterService.deactivateMaster(UUID, Master) overload — there must be "
+                        + "exactly one, or a new caller has bypassed assertCanManageMaster without "
+                        + "performing the equivalent authorization check itself")
+                .hasSize(1);
+
+        JavaMethodCall theCall = callers.iterator().next();
+        assertThat(theCall.getOrigin().getOwner().isEquivalentTo(SalonService.class))
+                .as("the sole caller must be declared on SalonService, found on %s instead",
+                        theCall.getOrigin().getOwner().getFullName())
+                .isTrue();
+        assertThat(theCall.getOrigin().getName()).isEqualTo("removeMaster");
     }
 }

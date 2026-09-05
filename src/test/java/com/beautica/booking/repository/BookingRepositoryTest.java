@@ -271,6 +271,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         em.persist(otherOwner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(salonOwner)
                 .name("Test Salon")
                 .isActive(true)
@@ -313,6 +314,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         em.persist(salonOwner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(salonOwner)
                 .name("Filter Salon")
                 .isActive(true)
@@ -411,6 +413,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         em.persist(salonOwner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(salonOwner)
                 .name("Empty Salon")
                 .isActive(true)
@@ -496,6 +499,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         em.persist(salonOwner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(salonOwner)
                 .name("Happy Salon")
                 .isActive(true)
@@ -590,6 +594,7 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         em.persist(salonOwner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(salonOwner)
                 .name("Status Salon")
                 .isActive(true)

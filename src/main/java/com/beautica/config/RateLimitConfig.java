@@ -178,6 +178,47 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.service-write-capacity:60}")
     private long serviceWriteCapacity;
 
+    // Per-IP cap for GET /api/v1/auth/invite/validate (60-second window). This permitAll() read
+    // is the FIRST thing an invitee's browser hits from the emailed link, and previously had no
+    // throttle at all — it fell through AuthRateLimitFilter's unconditional non-POST early return.
+    // previewInvite is a single row lookup keyed by a SHA-256-hashed 256-bit SecureRandom token
+    // (InviteService / SecureTokenGenerator), so brute force is infeasible regardless of any rate
+    // limit — this bucket bounds LOAD and unlimited-speed REPLAY of an already-leaked link, not
+    // guessing. Sized for the real traffic this endpoint serves: one page load per invitee, plus
+    // the occasional refresh after a network blip, with several people at the SAME office/family
+    // behind one NAT egress doing that for their own separate invites within the same minute.
+    // 30/min clears that comfortably while still capping a scripted flood to half a request per
+    // second. @Value-configurable (unlike the sibling inviteBuckets/salonInviteBuckets, which stay
+    // internal to the filter) because InviteControllerIT alone drives several dozen real HTTP
+    // calls against this exact path from 127.0.0.1 across its test methods — a fixed cap would
+    // make the test suite itself trip the throttle. Raised in application-test.yml, mirroring
+    // register-capacity/login-capacity/etc. above.
+    @Value("${app.rate-limit.invite-validate-capacity:30}")
+    private long inviteValidateCapacity;
+
+    private static final Duration INVITE_VALIDATE_WINDOW = Duration.ofMinutes(1);
+
+    // Per-IP cap for POST /api/v1/auth/invite/accept (15-minute window). Same permitAll(),
+    // previously-unthrottled gap as invite-validate-capacity above (this write fell through to
+    // AuthRateLimitFilter's unmatched-POST else branch). acceptInvite sends no email or SMS
+    // (verification here is structural, not mailed — see InviteService#acceptInvite's Javadoc)
+    // and the token is single-use (a second attempt against the same token fails fast with
+    // INVITE_USED, before any write), so this is purely a load/replay bound too — the 256-bit
+    // hashed token already makes guessing infeasible.
+    //
+    // 15-minute window, not the 60-second window the SEND-invite buckets use, because the
+    // legitimate traffic here is an ONBOARDING SESSION rather than a rapid-fire admin action:
+    // several staff at one salon, behind one shared NAT egress, each tapping their OWN emailed
+    // link and accepting it (plus the occasional retry after a network blip or a duplicate
+    // submit) within the same sitting. 20 requests / 15 min clears a realistic multi-person
+    // office onboarding burst with comfortable headroom while still bounding a scripted replay
+    // of one leaked accept-link to roughly one attempt every 45 seconds. @Value-configurable for
+    // the same InviteControllerIT reason as invite-validate-capacity above.
+    @Value("${app.rate-limit.invite-accept-capacity:20}")
+    private long inviteAcceptCapacity;
+
+    private static final Duration INVITE_ACCEPT_WINDOW = Duration.ofMinutes(15);
+
     // Per-IP cap for POST /api/v1/support/contact (60-minute window).
     // Each successful call sends an email to the support inbox, so this is an
     // email-bomb / outbound-quota DoS surface — kept low (5/hr) to mirror the
@@ -621,6 +662,39 @@ public class RateLimitConfig {
     @Bean
     public LoadingCache<String, Bucket> serviceWriteBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, serviceWriteCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-IP bucket for {@code GET /api/v1/auth/invite/validate}. See
+     * {@link #inviteValidateCapacity}'s field javadoc for sizing and for why this bucket is
+     * {@code @Value}-configurable rather than built internally like its sibling
+     * {@code inviteBuckets} / {@code salonInviteBuckets} in {@code AuthRateLimitFilter}.
+     * {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket
+     * entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> inviteValidateBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                INVITE_VALIDATE_WINDOW.plus(EVICTION_GRACE),
+                inviteValidateCapacity,
+                INVITE_VALIDATE_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/auth/invite/accept}. See
+     * {@link #inviteAcceptCapacity}'s field javadoc for sizing and for why this bucket is
+     * {@code @Value}-configurable rather than built internally. {@code expireAfterAccess} gives
+     * a 5-minute grace past the 15-minute window so a bucket entry is not evicted the instant
+     * the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> inviteAcceptBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                INVITE_ACCEPT_WINDOW.plus(EVICTION_GRACE),
+                inviteAcceptCapacity,
+                INVITE_ACCEPT_WINDOW);
     }
 
     /**

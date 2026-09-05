@@ -2,6 +2,7 @@ package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.BookingViewAccess;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -19,6 +20,47 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
+/**
+ * <b>Every {@code m.user} join in this interface — fetch or projection — is a LEFT join, and must
+ * stay one, with exactly ONE named exception listed below</b> (V157, phase 294 D1; the "fetch"-only
+ * wording was corrected by the 2026-09 audit, finding 8, which found four INNER
+ * {@code JOIN m.user}/{@code JOIN bm.user} PROJECTION joins hiding behind a sentence that only ever
+ * spoke about fetch joins). {@code masters.user_id} became nullable when salon deletion started
+ * hard-deleting staff accounts: a booking whose master has been detached still belongs to the
+ * client who made it and must still load. An INNER {@code JOIN FETCH m.user} silently DROPS such a
+ * row from the result set, which surfaces as a 404 on the client's own past booking rather than as
+ * an error anywhere near the cause. Result sets are byte-for-byte identical for every attached
+ * master, so the relaxation costs nothing today; the entity-count and statement-count gates in
+ * {@code BookingPriceRangeContractIT} are unaffected (a to-one fetch join adds columns, never rows).
+ * Read the provider's name through {@code Master#displayFirstName()} / {@code displayLastName()},
+ * never {@code getMaster().getUser()}.
+ *
+ * <p><b>The ONE remaining INNER {@code bm.user} projection join is {@link #findViewAccessById}, and
+ * the reason it stays is NOT the reason its former twin stayed.</b> Both were once described here as
+ * "equivalently benign, because fail-closed". Fail-closed is not the same as harmless, and the
+ * cycle-2 audit (finding 5) separated the two cases:
+ * <ul>
+ *   <li>{@link #findCompletionAccessById} MOVED to a LEFT join. It is live-wired into four
+ *       {@code AuthorizationService} SpEL predicates ({@code canCancelBooking},
+ *       {@code canCompleteBooking}, {@code canRescheduleBooking}, {@code canReviewClient}), so the
+ *       dropped row was denying a SALON OWNER complete/decline/reschedule/review-client on a booking
+ *       whose master account had been deleted — a 403 for the wrong party, not merely a safe one.
+ *       See that method's javadoc.</li>
+ *   <li>{@link #findViewAccessById} stays INNER purely because NOTHING REACHES IT. Its only two
+ *       callers, {@code AuthorizationService#canViewBooking} and {@code #canManageBooking}, are
+ *       themselves named by no {@code @PreAuthorize} SpEL and no service anywhere in {@code
+ *       src/main} — the whole chain is dead. No production request observes its result, so nothing
+ *       is being denied, and there is no behaviour to preserve or regression test to write.
+ *       <b>The moment that chain acquires a live caller, relax this join too</b> — do not inherit
+ *       the old "fail-closed, therefore benign" reasoning, which is exactly what hid finding 5 for
+ *       a cycle.</li>
+ * </ul>
+ * Either way the {@code v.masterUserId().equals(actorId)} reads in {@code AuthorizationService} are
+ * already null-guarded (2026-09 audit finding 7), so relaxing the remaining join is a one-line edit
+ * plus a regression test, not a null-dereference hunt. Contrast
+ * {@link #findAllCompletionAccessByAppointmentId}, where an inner join silently defeated an ALL-ROWS
+ * contract and was an authorization BYPASS (2026-09 audit finding 2).
+ */
 public interface BookingRepository extends JpaRepository<Booking, UUID>, BookingRepositoryCustom {
 
     // ── ID-only paginated queries — two-query pattern (Fix H1 — HHH90003004) ──
@@ -416,7 +458,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -572,6 +614,21 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@code BookingRepositoryCustomImpl.findIdPage} — the same choke point the provider
      * ID-page queries already use. This unifies both roles' sort discipline onto one code path;
      * see {@code findIdsByClientIdFiltered}'s javadoc for the full contract.
+     *
+     * <p><b>{@code m.user} is a {@code LEFT JOIN} and must stay one</b> (V157 / phase 294 D1 —
+     * 2026-09 audit finding 6). This is an ID-then-hydrate pair: the ID page returns N ids, and an
+     * INNER {@code JOIN m.user} would hydrate only N&minus;1 of them the moment ONE of the page's
+     * bookings has a DETACHED master (staff {@code users} row hard-deleted), silently DESYNCING the
+     * page — {@code totalElements} still says N while the content list is short, and the missing row
+     * is the client's OWN past booking. The name columns therefore {@code COALESCE} onto the V157
+     * {@code detached_*} snapshot, which is exactly what {@code Master#displayFirstName()} /
+     * {@code displayLastName()} return on the entity path, so this projection and
+     * {@code BookingDetailResponse#from(Booking, ...)} render the identical provider name for the
+     * same booking. Every OTHER {@code mu.*} column resolves to {@code null} for a detached master —
+     * {@code professionalTitle}, {@code avatarUrl}, {@code role} ({@code masterType}) and the
+     * independent-master locality fallbacks — which is the SAME contract the entity path already
+     * has ({@code masterUser != null ? masterUser.getRole() : null}); all are declared nullable on
+     * {@link com.beautica.booking.dto.BookingDetailResponse}.
      */
     @Query(value = """
             SELECT new com.beautica.booking.repository.ClientBookingDetailProjection(
@@ -588,8 +645,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
                 b.createdAt,
                 b.client.firstName,
                 b.client.lastName,
-                mu.firstName,
-                mu.lastName,
+                COALESCE(mu.firstName, m.detachedFirstName),
+                COALESCE(mu.lastName, m.detachedLastName),
                 mu.professionalTitle,
                 b.clientComment,
                 b.providerComment,
@@ -614,7 +671,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             FROM Booking b
             JOIN b.client
             JOIN b.master m
-            JOIN m.user mu
+            LEFT JOIN m.user mu
             LEFT JOIN b.salon s
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
@@ -668,7 +725,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             SELECT b FROM Booking b
             LEFT JOIN FETCH b.client
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -699,7 +756,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             LEFT JOIN FETCH b.salon
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -1094,6 +1151,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * but returns the booking's {@code salonId} (null for an independent-master booking) so
      * {@code AuthorizationService.canCompleteBooking} can admit a {@code SALON_ADMIN} assigned
      * to that salon — not only the owner. Returns empty when the booking does not exist.
+     *
+     * <p><b>{@code bm.user} is a {@code LEFT JOIN} (audit cycle-2 finding 5) and must stay one.</b>
+     * It was INNER, which was fail-closed rather than a vulnerability — a DETACHED master's booking
+     * vanished from the projection, {@code Optional.empty()} met each caller's {@code .orElse(false)}
+     * and produced a 403 — but it denied the wrong people: the SALON OWNER lost complete / decline /
+     * reschedule / review-client on a booking whose master account had been deleted, an action that
+     * has nothing to do with the master's own user row. The salon arm of
+     * {@code AuthorizationService#hasProviderAuthorityOverRow} reads only {@code salonId}, and a
+     * detached salon master keeps a non-null {@code bs.id}, so the owner arm now fires unchanged;
+     * the independent-master arm still compares a null {@code masterUserId} against a non-null actor
+     * id and fails closed. All four call sites ({@code canCancelBooking}, {@code canCompleteBooking},
+     * {@code canRescheduleBooking}, {@code canReviewClient}) were already null-guarded by the 2026-09
+     * audit (finding 7). Pinned by {@code MasterDetachmentContractIT} case 13.
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingCompletionAccess(
@@ -1102,7 +1172,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             )
             FROM Booking b
             JOIN b.master bm
-            JOIN bm.user
+            LEFT JOIN bm.user
             LEFT JOIN bm.salon bs
             WHERE b.id = :bookingId
             """)
@@ -1126,6 +1196,19 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * SlotCalculationService.MAX_SERVICES_PER_VISIT} (10 rows, §E-3), so this is at most a 10-row
      * projection read — no {@code JOIN FETCH}, same shape as the previous capped query. Returns
      * empty when the appointment does not exist or has no items (fail-closed at the caller).
+     *
+     * <p><b>{@code bm.user} is a {@code LEFT JOIN} and must NEVER be tightened to an inner one</b>
+     * (V157 / phase 294 D1 — 2026-09 audit finding 2). It was an INNER join, which DEFEATED this
+     * method's own all-rows contract in the one case the contract exists for: a DETACHED master's
+     * item (staff {@code users} row hard-deleted, {@code masters.user_id IS NULL}) simply VANISHED
+     * from the result set. {@code access.isEmpty()} then stayed false, and both callers'
+     * {@code allMatch} passed over the SURVIVING SUBSET — authorizing decline / complete /
+     * not-complete / reschedule across the WHOLE visit, including the item that was never checked.
+     * An inner join here is not a filter, it is an authorization bypass. With the LEFT join the
+     * detached item contributes {@code masterUserId == null}, which
+     * {@code AuthorizationService#hasProviderAuthorityOverRow} already fails closed on for the
+     * independent-master arm, while a salon item still authorizes off its (unchanged)
+     * {@code bs.id} — the correct answer in both shapes.
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingCompletionAccess(
@@ -1134,7 +1217,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             )
             FROM Booking b
             JOIN b.master bm
-            JOIN bm.user
+            LEFT JOIN bm.user
             LEFT JOIN bm.salon bs
             WHERE b.appointment.id = :appointmentId
             ORDER BY b.id
@@ -1277,6 +1360,188 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("windowEnd") OffsetDateTime windowEnd,
             Pageable pageable);
 
+    // ── Salon-deletion booking cascade (Phase 269/293) ────────────────────────
+
+    /**
+     * Candidates for the salon-deletion booking cascade: every {@code CONFIRMED} booking of
+     * {@code salonId} whose {@code startsAt} is strictly after {@code now} (D3 — the boundary is
+     * applied here, once, against a {@code now} the caller reads once and passes in; a
+     * past-dated {@code CONFIRMED} row is not future work and must never appear in this result).
+     *
+     * <p>Deliberately the SAME narrow-projection shape as
+     * {@link #findConfirmedCandidatesForOverrideConflictCheck} and for the same reason: the
+     * eventual mutation reloads each targeted row itself (via
+     * {@code BookingService#declineBookingForBatch} / {@code AppointmentTransitionService
+     * #declineAppointmentItems}), so this scan only needs enough to GROUP by visit
+     * ({@code appointmentId}), pick the deterministic per-visit representative
+     * ({@code startsAt}, tied on {@code bookingId} — D12), and scope the after-commit cache
+     * eviction ({@code masterId}). No {@code Pageable} cap (§E-3 note): unlike the schedule
+     * override's abuse-prevention concern, a salon-deletion cascade is a one-time terminal event
+     * for that salon and the per-deletion outbox row cap belongs to a later phase (300), not this
+     * query.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.salon.id = :salonId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureBySalonId(
+            @Param("salonId") UUID salonId, @Param("now") OffsetDateTime now);
+
+    // ── Master-removal booking cascade (Phase 298) ────────────────────────────
+
+    /**
+     * Master-scoped sibling of {@link #findConfirmedFutureBySalonId} for the master-removal
+     * booking cascade ({@code BookingService#declineFutureConfirmedBookingsForMasterRemoval}):
+     * every {@code CONFIRMED} booking of {@code masterId} whose {@code startsAt} is strictly
+     * after {@code now} (D3 boundary, read once by the caller — same rationale as the salon-scoped
+     * twin). Reuses {@link SalonClosureBookingCandidate} as-is rather than a duplicate
+     * {@code MasterRemovalBookingCandidate} — the projection's shape (booking id, appointment id,
+     * master id, {@code startsAt}) is entirely scope-agnostic; only the {@code WHERE} predicate
+     * differs (Phase 298 D3). Renaming the projection to something scope-neutral is a reasonable
+     * follow-up, not done here — it would touch every Phase 293 call site for cosmetic reasons
+     * only.
+     *
+     * <p>Served by {@code idx_bookings_master_slot_overlap}
+     * ({@code bookings(master_id, starts_at, ends_at) WHERE status = 'CONFIRMED'}, created in V26,
+     * narrowed to the {@code CONFIRMED}-only predicate in V113) — leads with {@code master_id} and
+     * is already partial on exactly this predicate, so no new index is added. ({@code
+     * idx_bookings_master_active_starts_at}, V18, was dropped as redundant by V27 — the phase doc's
+     * D3 citation of it is stale; do not cite it.)
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureByMasterId(
+            @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Batched twin of {@link #findByIdWithFullGraph} for the salon-deletion booking cascade (perf
+     * finding 1, 2026-09 audit): loads every STANDALONE candidate in {@code ids} in ONE query, with
+     * the SAME entity graph, instead of {@code BookingService#declineFutureConfirmedBookingsForSalonClosure}
+     * calling {@link #findByIdWithFullGraph} once per standalone visit. The per-visit loop's own
+     * SELECT was forcing Hibernate's AUTO flush mode to flush the PREVIOUS visit's still-pending
+     * {@code UPDATE} one row at a time — never letting {@code hibernate.jdbc.batch_size} coalesce
+     * consecutive writes. Loading the whole batch up front removes every per-row SELECT from the
+     * mutation loop, so N declines flush as {@code ceil(N/batch_size)} batches instead of N
+     * individual round trips.
+     *
+     * <p>Deliberately does NOT keep a non-graph variant around (§E-1) — every field this graph
+     * fetches ({@code client}, {@code master.user}, {@code salon}, {@code masterService
+     * .serviceDefinition}) is exactly what {@link #findByIdWithFullGraph} fetches, for the same
+     * downstream reasons (authorization off {@code master}/{@code salon}, the eventual
+     * {@code BookingResponse} mapping off {@code masterService.serviceDefinition}).
+     */
+    @Query("""
+            SELECT b FROM Booking b
+            LEFT JOIN FETCH b.client
+            JOIN FETCH b.master m
+            LEFT JOIN FETCH m.user
+            LEFT JOIN FETCH b.salon
+            JOIN FETCH b.masterService ms
+            JOIN FETCH ms.serviceDefinition
+            WHERE b.id IN :ids
+            """)
+    List<Booking> findAllByIdInWithFullGraph(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * Atomic bulk-conditional UPDATE for the salon-deletion booking cascade's standalone leg
+     * (perf re-audit, 2026-09, Finding A — supersedes {@code declineIfConfirmed}, the per-row
+     * atomic {@code UPDATE} the PRIOR security re-audit introduced). That fix closed a real
+     * check-then-act race (see git history for its own Javadoc) by moving the freshness check
+     * into the write itself — correct — but paid for it by calling {@code executeUpdate()} once
+     * per standalone booking: a {@code @Modifying} bulk JPQL statement runs immediately and can
+     * never be queued into Hibernate's {@code hibernate.jdbc.batch_size} flush the way
+     * entity-manager {@code save()} calls can, so the write phase regressed from the earlier
+     * perf-1 fix's {@code ⌈M/50⌉} batched flushes back to {@code M} individual round trips.
+     *
+     * <p>This method restores the batching WITHOUT giving up the atomicity: ONE native statement
+     * declines every row in {@code ids} that is STILL {@code CONFIRMED}, and reports exactly
+     * which ones via Postgres {@code RETURNING} — a single round trip regardless of {@code
+     * ids.size()}. No {@code @Modifying} JPQL form can express "affected ids, not just a count",
+     * which is why this is a native query executed via {@code getResultList()} (mirrors {@link
+     * com.beautica.notification.repository.NotificationOutboxRepository#claimPendingBatch}, the
+     * existing {@code UPDATE ... RETURNING} precedent in this codebase).
+     *
+     * <p><b>Atomicity is IDENTICAL to the per-row form it replaces — this is not a relaxation.</b>
+     * PostgreSQL evaluates {@code WHERE status = 'CONFIRMED'} row-by-row within the single
+     * statement and takes each row's lock as it acts on it; a row concurrently flipped to
+     * CANCELLED by its own client between this statement's start and the instant it reaches that
+     * row is excluded from the {@code RETURNING} result exactly as it would be excluded (0
+     * affected) under N separate {@code UPDATE ... WHERE id = ? AND status = 'CONFIRMED'}
+     * statements. There is no window between "check" and "act" for ANY row in {@code ids},
+     * regardless of how many other rows the same statement is also touching.
+     *
+     * <p><b>{@code updated_at} is set explicitly.</b> A native/bulk statement bypasses {@code
+     * AuditableEntity}'s {@code @UpdateTimestamp} Hibernate value generator entirely — that
+     * generator only fires on the ORM's own entity-level flush — so omitting it would silently
+     * stop bumping this column for every cascade-declined standalone booking.
+     *
+     * <p>Callers MUST have already run {@code authz.enforceCanCancelBooking}, {@code
+     * assertNotAppointmentChild} and {@code assertTransition} against a freshly-loaded snapshot
+     * of EVERY id in {@code ids} before calling this method — it performs NO authorization or
+     * transition-legality check of its own, only the atomic write. See {@code
+     * BookingService#declineConfirmedBookingsAtomic}, its only caller.
+     *
+     * <p><b>Stale-entity trap — read before adding a caller.</b> Any {@code Booking} entity for an
+     * id in {@code ids} already resident in this transaction's persistence context (e.g. loaded
+     * moments earlier by {@link #findAllByIdInWithFullGraph}) is left with a stale in-memory
+     * {@code status = CONFIRMED} after this call returns: a native statement writes the database
+     * row directly and never touches the persistence context, so Hibernate has no way to know
+     * that entity is now out of date. Never assign a field on one of those entities after calling
+     * this method in the same transaction — a later setter call, or an {@code
+     * entityManager.find(Booking.class, id)}, silently returns the stale CONFIRMED instance, and a
+     * subsequent flush of that entity could overwrite this statement's own DECLINED write.
+     *
+     * @param ids              standalone-booking ids to attempt, already authorization- and
+     *                         transition-checked by the caller — an id NOT present in the
+     *                         returned list lost the race between that check and this statement
+     *                         and must not be treated as declined
+     * @param reason           {@link CancellationReason#name()} — bound as plain text since this
+     *                         is a native query against a {@code VARCHAR} column, not a JPQL enum
+     *                         reference
+     * @param providerComment  always {@code null} for this cascade (D5); accepted as a parameter
+     *                         rather than hardcoded so this method stays reusable for any future
+     *                         bulk-decline caller
+     * @param now              the SAME {@code now} the caller resolved once at the top of its own
+     *                         scan (D3) — stamped onto every affected row's {@code updated_at},
+     *                         never re-read here
+     * @return the ids, a subset of {@code ids} (never a superset), that were actually {@code
+     *         CONFIRMED} and are now {@code DECLINED}; empty if every id had already left
+     *         {@code CONFIRMED}
+     */
+    @Query(value = """
+            UPDATE bookings
+               SET status = 'DECLINED',
+                   cancellation_reason = :reason,
+                   provider_comment = :providerComment,
+                   updated_at = :now
+             WHERE id IN (:ids)
+               AND status = 'CONFIRMED'
+            RETURNING id
+            """, nativeQuery = true)
+    List<UUID> declineConfirmedBulk(
+            @Param("ids") Collection<UUID> ids,
+            @Param("reason") String reason,
+            @Param("providerComment") String providerComment,
+            @Param("now") Instant now);
+
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.
@@ -1403,7 +1668,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             LEFT JOIN FETCH b.appointment
@@ -1481,7 +1746,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     @Query("""
             SELECT b FROM Booking b
             JOIN FETCH b.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
             WHERE b.cancelToken = :cancelToken

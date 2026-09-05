@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AvailableSlotResponse;
 import com.beautica.booking.dto.BookingDetailResponse;
@@ -8,12 +9,14 @@ import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
+import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
@@ -535,6 +538,7 @@ class BookingServiceTest {
         // state deactivateSalon leaves behind (it does not cascade).
         Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
         salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .isActive(false)
                 .build());
@@ -560,6 +564,7 @@ class BookingServiceTest {
     void should_createBooking_when_masterSalonIsActive() {
         Master salonMaster = buildMaster(masterId, MasterType.SALON_MASTER);
         salonMaster.setSalon(com.beautica.salon.entity.Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .isActive(true)
                 .build());
@@ -942,6 +947,301 @@ class BookingServiceTest {
 
         assertThatThrownBy(() -> bookingService.declineBookingForBatch(actorId, bookingId, req))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    // ── declineFutureConfirmedBookingsForSalonClosure (Phase 269/293 cascade — security finding 4,
+    // 2026-09 audit) ────────────────────────────────────────────────────────────────────────────
+    // This method is callable from another package (SalonService) and, before this fix, trusted
+    // its salonId argument entirely on the strength of its one caller's own findByIdAndOwnerId
+    // check. Defense-in-depth: the method now asserts ownership itself, first, before touching
+    // any booking data.
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — ownership self-assertion (finding "
+            + "4, 2026-09 audit): the actor must own salonId, checked by THIS method itself rather "
+            + "than trusting the caller (SalonService#deactivateSalon) to have checked first")
+    void should_throwForbidden_when_actorDoesNotOwnSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(false);
+
+        assertThatThrownBy(
+                () -> bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId))
+                .isInstanceOf(ForbiddenException.class);
+
+        // The guard must run BEFORE any booking data is touched — never a query first, ownership
+        // check second.
+        verifyNoInteractions(bookingRepository);
+    }
+
+    // QA note (Phase 293 audit, 2026-09-04, gap 1): this test stubs
+    // bookingRepository.declineConfirmedBulk(...) directly, so it can ONLY pin how
+    // declineFutureConfirmedBookingsForSalonClosure REACTS to an empty RETURNING result — it
+    // cannot fail for, and proves nothing about, the real native SQL predicate
+    // (`WHERE ... AND status = 'CONFIRMED'`) declineConfirmedBulk actually issues. A mutant that
+    // deletes that predicate from the @Query in BookingRepository leaves THIS test green. The
+    // predicate itself is pinned against a real database by
+    // SalonDeactivationCascadeIT#should_leaveNonConfirmedBookingUntouched_when_declineConfirmedBulkCalledDirectly
+    // (case 18) and #should_declineOnlyConfirmedRow_when_declineConfirmedBulkCalledWithMixedStatusIds
+    // (case 20) — see that class's own Javadoc on case 18, which documents this exact split.
+    // Do not read this test's @DisplayName as a claim that IT tests the SQL; it only tests the
+    // Java-side response handling once the repository has already decided the outcome.
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — perf re-audit Finding A: a "
+            + "standalone booking that leaves CONFIRMED mid-cascade (excluded from the bulk "
+            + "UPDATE's RETURNING result) is neither declined nor given a SALON_CLOSED notice — "
+            + "the bulk statement's own WHERE ... AND status = CONFIRMED predicate is the "
+            + "freshness check, evaluated per row inside the single statement, never a Set "
+            + "snapshot taken earlier")
+    void should_skipBookingAndItsNotice_when_bookingLeavesConfirmedMidCascade() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID raceLostBookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.now(clock).plusDays(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureBySalonId(eq(salonId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(raceLostBookingId, null, masterId, startsAt)));
+        Booking raceLostBooking = buildBookingStartingAt(
+                raceLostBookingId, client, master, msa, BookingStatus.CONFIRMED, startsAt);
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(raceLostBookingId)))
+                .thenReturn(List.of(raceLostBooking));
+        // The row left CONFIRMED (e.g. a concurrent client cancel) sometime between the batched
+        // read phase and the bulk write — the bulk UPDATE's own WHERE ... AND status = CONFIRMED
+        // predicate catches it and excludes it from the RETURNING result.
+        when(bookingRepository.declineConfirmedBulk(eq(List.of(raceLostBookingId)), any(), any(), any()))
+                .thenReturn(List.of());
+
+        bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
+
+        verify(outboxService, never()).enqueueSalonClosed(any());
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — QA-authored (Phase 293 audit gap "
+            + "3, security re-audit INFO): even when a candidate's ONLY booking loses the race and "
+            + "is neither declined nor given a SALON_CLOSED notice, its master's availability and "
+            + "calendar caches are STILL evicted — eviction is scoped to every masterId in the "
+            + "ORIGINAL candidate scan, never filtered down to the ids this call actually "
+            + "transitioned. A superset eviction never under-evicts (harmless, per the security "
+            + "audit), but the call must still happen unconditionally on the race outcome; this "
+            + "test is what makes a mutant that skips eviction for a fully-raced-away master "
+            + "observable")
+    void should_stillEvictMasterCaches_when_itsOnlyCandidateBookingLosesTheRace() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID raceLostBookingId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.now(clock).plusDays(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureBySalonId(eq(salonId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(raceLostBookingId, null, masterId, startsAt)));
+        Booking raceLostBooking = buildBookingStartingAt(
+                raceLostBookingId, client, master, msa, BookingStatus.CONFIRMED, startsAt);
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(raceLostBookingId)))
+                .thenReturn(List.of(raceLostBooking));
+        when(bookingRepository.declineConfirmedBulk(eq(List.of(raceLostBookingId)), any(), any(), any()))
+                .thenReturn(List.of());
+
+        bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
+
+        verify(outboxService, never()).enqueueSalonClosed(any());
+        // The master WAS in the candidate scan (findConfirmedFutureBySalonId), even though its
+        // one and only candidate booking never actually transitioned — eviction still runs for it.
+        verify(slotCalculationService).evictMasterAvailabilityCaches(masterId);
+        verify(salonCatalogCacheEvictor).evict(salonId);
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — security re-audit Finding A: when "
+            + "an appointment visit's deterministic D12 representative (earliest startsAt) itself "
+            + "loses the race but a SIBLING item of the SAME visit is actually declined, exactly "
+            + "ONE SALON_CLOSED entry is still enqueued — keyed to the surviving sibling, never to "
+            + "a booking that this call did not actually decline")
+    void should_enqueueOneEntryForSurvivingSibling_when_visitRepresentativeLosesRace() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID earliestBookingId = UUID.randomUUID(); // would-be D12 representative — loses the race
+        UUID laterBookingId = UUID.randomUUID();    // survives — becomes the actual representative
+        OffsetDateTime earliestStart = OffsetDateTime.now(clock).plusDays(1);
+        OffsetDateTime laterStart = earliestStart.plusHours(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureBySalonId(eq(salonId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(earliestBookingId, appointmentId, masterId, earliestStart),
+                        new SalonClosureBookingCandidate(laterBookingId, appointmentId, masterId, laterStart)));
+        Booking survivingSibling = buildBookingStartingAt(
+                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
+        // declineAppointmentItems' own G3 batched freshness recheck filters out whatever raced away
+        // internally — this simulates it returning ONLY the surviving sibling, i.e. the
+        // earliest-startsAt item (the pre-fix D12 pick) lost its own race.
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
+                any(), eq(false), any()))
+                .thenReturn(List.of(survivingSibling));
+
+        bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
+
+        verify(outboxService, times(1)).enqueueSalonClosed(laterBookingId);
+        verify(outboxService, never()).enqueueSalonClosed(earliestBookingId);
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — perf finding 2, 2026-09 re-audit: "
+            + "every appointment-visit in the cascade shares ONE management-access memo instance, "
+            + "never a fresh one per visit — the memo is what lets AuthorizationService answer the "
+            + "SALON_OWNER ownership question at most once per distinct salon for the WHOLE "
+            + "cascade instead of once per visit (see AuthorizationServiceTest for the "
+            + "existsByIdAndOwnerId query-count proof at the AuthorizationService layer itself)")
+    void should_shareOneManagementAccessMemo_when_cascadeSpansMultipleAppointmentVisits() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID appointmentId2 = UUID.randomUUID();
+        UUID bookingId1 = UUID.randomUUID();
+        UUID bookingId2 = UUID.randomUUID();
+        OffsetDateTime start1 = OffsetDateTime.now(clock).plusDays(1);
+        OffsetDateTime start2 = OffsetDateTime.now(clock).plusDays(2);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureBySalonId(eq(salonId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(bookingId1, appointmentId1, masterId, start1),
+                        new SalonClosureBookingCandidate(bookingId2, appointmentId2, masterId, start2)));
+        Booking declined1 = buildBookingStartingAt(bookingId1, client, master, msa, BookingStatus.CONFIRMED, start1);
+        Booking declined2 = buildBookingStartingAt(bookingId2, client, master, msa, BookingStatus.CONFIRMED, start2);
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(actorId), eq(appointmentId1), eq(List.of(bookingId1)), any(), eq(false), any()))
+                .thenReturn(List.of(declined1));
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(actorId), eq(appointmentId2), eq(List.of(bookingId2)), any(), eq(false), any()))
+                .thenReturn(List.of(declined2));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<AuthorizationService.MemoKey, Boolean>> memoCaptor = ArgumentCaptor.forClass(Map.class);
+
+        bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
+
+        verify(appointmentTransitionService, times(2)).declineAppointmentItems(
+                eq(actorId), any(), any(), any(), eq(false), memoCaptor.capture());
+        List<Map<AuthorizationService.MemoKey, Boolean>> memos = memoCaptor.getAllValues();
+        assertThat(memos.get(0))
+                .as("the SAME memo instance is threaded through every appointment-visit call in "
+                        + "one cascade — never a fresh map per visit")
+                .isSameAs(memos.get(1));
+        assertThat(memos.get(0).get(new AuthorizationService.MemoKey(actorId, salonId)))
+                .as("pre-seeded true from the ownership self-assertion this method already ran")
+                .isTrue();
+    }
+
+    // ── declineFutureConfirmedBookingsForMasterRemoval (Phase 298 — master-removal sibling of the
+    // salon-closure cascade above; shares declineFutureConfirmed's entire body via D4) ──────────
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — ownership self-assertion, "
+            + "identical rationale to the salon-closure entry point's own: the actor must own "
+            + "salonId, checked by THIS method itself")
+    void should_throwForbidden_when_actorDoesNotOwnSalon_forMasterRemoval() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.declineFutureConfirmedBookingsForMasterRemoval(
+                actorId, salonId, targetMasterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        // The guard must run BEFORE any booking data is touched, and before the second
+        // (master-belongs-to-salon) self-assertion even queries.
+        verifyNoInteractions(bookingRepository);
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — D4's second self-assertion: "
+            + "masterId must actually belong to salonId, so a masterId from a DIFFERENT salon "
+            + "cannot ride in on a salon the caller legitimately owns")
+    void should_throwForbidden_when_masterDoesNotBelongToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(false);
+
+        assertThatThrownBy(() -> bookingService.declineFutureConfirmedBookingsForMasterRemoval(
+                actorId, salonId, targetMasterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — mutation check: enqueues "
+            + "MASTER_REMOVED, never SALON_CLOSED, for a standalone future CONFIRMED booking of "
+            + "the removed master — pins that the shared declineFutureConfirmed body is driven by "
+            + "the caller-supplied eventType, not hardcoded to the salon-closure event")
+    void should_enqueueMasterRemoved_notSalonClosed_when_masterRemovalCascadeRuns() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        OffsetDateTime startsAt = OffsetDateTime.now(clock).plusDays(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureByMasterId(eq(targetMasterId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(bookingId, null, targetMasterId, startsAt)));
+        Booking booking = buildBookingStartingAt(
+                bookingId, client, master, msa, BookingStatus.CONFIRMED, startsAt);
+        when(bookingRepository.findAllByIdInWithFullGraph(List.of(bookingId)))
+                .thenReturn(List.of(booking));
+        when(bookingRepository.declineConfirmedBulk(eq(List.of(bookingId)), any(), any(), any()))
+                .thenReturn(List.of(bookingId));
+
+        bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, targetMasterId);
+
+        verify(outboxService, times(1)).enqueueMasterRemoved(bookingId);
+        verify(outboxService, never()).enqueueSalonClosed(any());
+    }
+
+    @Test
+    @DisplayName("declineFutureConfirmedBookingsForMasterRemoval — D12: a 3-service future visit "
+            + "of the removed master collapses to ONE MASTER_REMOVED entry, keyed to the "
+            + "lowest-startsAt booking, never one per booking")
+    void should_enqueueOneMasterRemovedEntryPerVisit_when_masterHasMultiServiceVisit() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID targetMasterId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID earliestBookingId = UUID.randomUUID();
+        UUID laterBookingId = UUID.randomUUID();
+        OffsetDateTime earliestStart = OffsetDateTime.now(clock).plusDays(1);
+        OffsetDateTime laterStart = earliestStart.plusHours(1);
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(true);
+        when(bookingRepository.findConfirmedFutureByMasterId(eq(targetMasterId), any()))
+                .thenReturn(List.of(
+                        new SalonClosureBookingCandidate(earliestBookingId, appointmentId, targetMasterId, earliestStart),
+                        new SalonClosureBookingCandidate(laterBookingId, appointmentId, targetMasterId, laterStart)));
+        Booking earliestBooking = buildBookingStartingAt(
+                earliestBookingId, client, master, msa, BookingStatus.CONFIRMED, earliestStart);
+        Booking laterBooking = buildBookingStartingAt(
+                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
+        when(appointmentTransitionService.declineAppointmentItems(
+                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
+                any(), eq(false), any()))
+                .thenReturn(List.of(earliestBooking, laterBooking));
+
+        bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, targetMasterId);
+
+        verify(outboxService, times(1)).enqueueMasterRemoved(earliestBookingId);
+        verify(outboxService, never()).enqueueMasterRemoved(laterBookingId);
+        verify(outboxService, never()).enqueueSalonClosed(any());
     }
 
     // ── completeBooking ────────────────────────────────────────────────────────
@@ -2195,6 +2495,183 @@ class BookingServiceTest {
 
         assertThat(result.data()).isEmpty();
         verify(bookingRepository, never()).findIdsBySalonIdsFiltered(any(), any(), any(), any(), any(), any());
+    }
+
+    // ── Phase 23.4 — GET /bookings/salon/{salonId}: BookingService#getSalonBookings ───────────
+    //
+    // Authorization (owner-or-admin OF THIS salon) lives entirely at the controller's
+    // @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and
+    // @authz.canManageSalon(authentication, #salonId)") gate — see BookingController and
+    // BookingService#getSalonBookings' own javadoc for why (Anti-Bug §D: a GET is a read, so the
+    // SpEL can* form is the canonical placement; duplicating it here would be the "same check on
+    // both layers" anti-pattern §D forbids). These unit tests therefore exercise the service in
+    // isolation from any Authentication/role — actorId is an opaque already-authorized UUID.
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is after 'to' for GET /bookings/salon/{salonId}")
+    void should_throwBadRequest_when_fromIsAfterToForSalonBookings() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null,
+                        LocalDate.of(2026, 7, 31), LocalDate.of(2026, 7, 1), Pageable.unpaged()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("the 366-day span cap is delegated to ScheduleDateMath.assertSpanWithinMax for "
+            + "GET /bookings/salon/{salonId}, not re-implemented inline")
+    void should_delegateSpanCap_toScheduleDateMathForSalonBookings() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 1, 1);
+        LocalDate to = LocalDate.of(2027, 6, 1);
+
+        org.mockito.Mockito.doThrow(
+                        new BusinessException(HttpStatus.BAD_REQUEST, "Date range exceeds the maximum of 366 days"))
+                .when(dateMath).assertSpanWithinMax(from, to);
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null, from, to, Pageable.unpaged()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verify(dateMath).assertToPlusOneDayRepresentable(to);
+        verify(dateMath).assertSpanWithinMax(from, to);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("repository is queried with the salonId scope, masterId filter, and a single-status "
+            + "EnumSet — never a repeatable list, unlike GET /bookings/me's ?status=")
+    void should_passSalonMasterAndStatusFilters_when_provided() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID filterMasterId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, filterMasterId, Set.of(BookingStatus.CONFIRMED), null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getSalonBookings(
+                actorId, salonId, filterMasterId, BookingStatus.CONFIRMED, null, null, pageable);
+
+        assertThat(result.totalElements()).isZero();
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                salonId, filterMasterId, Set.of(BookingStatus.CONFIRMED), null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("omitted masterId/status pass through as null — no dead-branch sentinel, mirroring "
+            + "the optional-predicate contract every other BookingRepositoryCustom method carries")
+    void should_passNullFilters_when_masterIdAndStatusOmitted() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+
+        assertThat(result).isNotNull();
+        verify(bookingRepository).findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("empty id page short-circuits before hydrate — findAllByIdsWithGraph is never called")
+    void should_shortCircuit_when_salonHasNoMatchingBookings() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+
+        assertThat(result.data()).isEmpty();
+        verify(bookingRepository, never()).findAllByIdsWithGraph(any());
+    }
+
+    @Test
+    @DisplayName("mapped detail page is returned when the salon has a non-empty page")
+    void should_returnMappedBookings_when_salonHasNonEmptyPage() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
+                .thenReturn(List.of(existingBooking));
+        when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+
+        assertThat(result.totalElements()).isEqualTo(1);
+        assertThat(result.data()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("providerCanReviewClient is computed per row via the entity-based "
+            + "AuthorizationService#hasProviderAuthorityOverBooking predicate — SALON_ADMIN-safe, "
+            + "unlike loadProviderReviewBatch's batched filterBookingIdsWithProviderAuthority kernel, "
+            + "which throws IllegalArgumentException for that role — for a COMPLETED booking with a "
+            + "registered client")
+    void should_computeProviderCanReviewClient_when_bookingIsCompletedWithRegisteredClient() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking completedBooking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
+                .thenReturn(List.of(completedBooking));
+        when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
+        when(clientReviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
+        when(authz.hasProviderAuthorityOverBooking(actorId, completedBooking)).thenReturn(true);
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+
+        assertThat(result.data()).hasSize(1);
+        assertThat(result.data().get(0).providerCanReviewClient()).isTrue();
+        verify(authz).hasProviderAuthorityOverBooking(actorId, completedBooking);
+    }
+
+    @Test
+    @DisplayName("the per-row provider-authority check is skipped entirely for a CONFIRMED (not yet "
+            + "review-eligible) booking — the cost gate must short-circuit before authz is ever "
+            + "consulted, bounding the extra query count to actual review candidates only")
+    void should_skipProviderAuthorityCheck_when_bookingIsNotReviewEligible() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        Booking confirmedBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(new PageImpl<>(List.of(bookingId)));
+        when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
+                .thenReturn(List.of(confirmedBooking));
+        when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
+        when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
+
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+
+        assertThat(result.data()).hasSize(1);
+        assertThat(result.data().get(0).providerCanReviewClient()).isFalse();
+        verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
+        verifyNoInteractions(clientReviewRepository);
     }
 
     // ── Finding 1: SALON_OWNER multi-salon tests ───────────────────────────────

@@ -7,7 +7,7 @@ import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.CacheConfig;
 import com.beautica.dashboard.service.DashboardService;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
@@ -93,6 +93,13 @@ import static org.mockito.Mockito.when;
         classes = {
                 CacheConfig.class,
                 MasterCachePrefixEvictor.class,
+                // PRE-EXISTING BREAKAGE, unrelated to this slice's subject: MasterService gained a
+                // UserProfileCacheEvictor constructor parameter and this explicit `classes` list
+                // was not updated with it, so the context failed to start and all six tests here
+                // errored out. It is a real collaborator over the real CacheManager this slice
+                // already builds, so listing it is the fix — mocking it would hide a future
+                // constructor change the same way.
+                com.beautica.common.cache.UserProfileCacheEvictor.class,
                 SlotCalculationService.class,
                 MasterService.class,
                 DashboardService.class
@@ -122,7 +129,9 @@ class CachePrefixEvictionKeyShapeTest {
     @MockBean SalonRepository salonRepository;
     @MockBean WorkingHoursRepository workingHoursRepository;
     @MockBean BookingRepository bookingRepository;
-    @MockBean CityRepository cityRepository;
+    // Phase 240 perf MEDIUM fix: MasterService no longer depends on CityRepository — resolveOblastId
+    // now delegates to the shared cached resolver (LocationQueryService#resolveCityOblastId).
+    @MockBean LocationQueryService locationQueryService;
     @MockBean BookingSlugService bookingSlugService;
     @MockBean AuthorizationService authorizationService;
     @MockBean SalonCatalogCacheEvictor salonCatalogCacheEvictor;

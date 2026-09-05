@@ -60,6 +60,30 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     int deactivateById(@Param("id") UUID id);
 
     /**
+     * Bulk-deactivates every ACTIVE service definition owned by {@code (ownerType, ownerId)} —
+     * used by {@code SalonService.deactivateSalon} (Phase 268 D1) to close the direct
+     * salon-owned-catalogue read path when a salon is deleted, on top of the
+     * every-master-deactivated mechanism the staff cascade already provides (the two must agree,
+     * see the phase doc D1).
+     *
+     * <p>Mirrors {@link #deactivateById}'s bulk-JPQL idiom exactly, including its caveat: a bulk
+     * {@code UPDATE} bypasses the persistence context and {@code AuditableEntity}'s
+     * {@code @LastModifiedDate}, so {@code updated_at} is NOT bumped by this call. Not fixed here —
+     * consistent with the existing single-row sibling.
+     *
+     * <p>Scoped by BOTH {@code ownerType} and {@code ownerId} — {@code ownerId} alone is not
+     * unique across owner types (a salon and an independent master can share a UUID only by
+     * astronomical coincidence, but the predicate is cheap and removes the theoretical case
+     * entirely, matching every other owner-scoped finder in this interface).
+     */
+    @Modifying
+    @Query("""
+            UPDATE ServiceDefinition sd SET sd.isActive = false
+            WHERE sd.ownerType = :ownerType AND sd.ownerId = :ownerId AND sd.isActive = true
+            """)
+    int deactivateAllByOwner(@Param("ownerType") OwnerType ownerType, @Param("ownerId") UUID ownerId);
+
+    /**
      * Finds the id of an existing ACTIVE {@link ServiceDefinition} that would collide with a
      * write for {@code (ownerType, ownerId, serviceTypeId)} — the exact key of the partial
      * unique index {@code ux_service_def_owner_service_type_active} (V121), which enforces

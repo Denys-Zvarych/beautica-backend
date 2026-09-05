@@ -2,8 +2,8 @@ package com.beautica.master;
 
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.location.repository.CityRepository;
 import com.beautica.config.CacheConfig;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.WorkingHoursRequest;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.WorkingHours;
@@ -93,7 +93,7 @@ class MasterServiceCacheTest {
     @MockBean SalonRepository salonRepository;
     @MockBean WorkingHoursRepository workingHoursRepository;
     @MockBean BookingRepository bookingRepository;
-    @MockBean CityRepository cityRepository;
+    @MockBean LocationQueryService locationQueryService;
     // Phase 13.1: MasterService now constructor-depends on BookingSlugService.
     // This slice does not exercise the creation paths, so a mock satisfies the wiring.
     @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
@@ -106,6 +106,14 @@ class MasterServiceCacheTest {
     // in SalonPublicProfileIntegrationTest).
     @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // c4d69ac: MasterService now constructor-depends on UserProfileCacheEvictor (evicts the
+    // GET /users/me cache on every create/reactivate/deactivate-master path, since
+    // hasMasterProfile is derived from the masters table). None of these tests assert on
+    // user-profile cache eviction — only master-calendar and master-by-user — so a mock
+    // satisfies the wiring, matching slotCalculationService/salonCatalogCacheEvictor above.
+    // Its own eviction behaviour belongs in a MasterService test slice that actually wires a
+    // user-profile CacheManager entry, not here.
+    @MockBean com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;
@@ -170,10 +178,15 @@ class MasterServiceCacheTest {
         // Real proxy again — see should_evictMasterCalendarCache_when_upsertWorkingHours.
         Object cacheKey = populateRealCalendarEntry(MASTER_ID);
 
+        // ACTOR_ID as the master's own user id: INDEPENDENT_MASTER + self-management satisfies
+        // the Phase 290 finding #5 ownership guard with no salon fixture needed — this test is
+        // about cache eviction, not authorization.
         User user = mock(User.class);
-        when(user.getId()).thenReturn(UUID.randomUUID());
+        when(user.getId()).thenReturn(ACTOR_ID);
 
         Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+        when(master.getMasterType()).thenReturn(com.beautica.master.entity.MasterType.INDEPENDENT_MASTER);
         when(master.getUser()).thenReturn(user);
         when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
         when(masterRepository.save(master)).thenReturn(master);
@@ -195,7 +208,10 @@ class MasterServiceCacheTest {
         Cache masterByUserCache = cacheManager.getCache("master-by-user");
         assertThat(masterByUserCache).isNotNull();
 
-        UUID userAId = UUID.randomUUID();
+        // userAId == ACTOR_ID: INDEPENDENT_MASTER + self-management satisfies the Phase 290
+        // finding #5 ownership guard with no salon fixture needed. The per-key eviction contract
+        // under test (only userA's entry is touched) is unaffected by which id that happens to be.
+        UUID userAId = ACTOR_ID;
         UUID userBId = UUID.randomUUID();
 
         // Prime both entries
@@ -208,6 +224,8 @@ class MasterServiceCacheTest {
         when(userA.getId()).thenReturn(userAId);
 
         Master master = mock(Master.class);
+        when(master.getId()).thenReturn(MASTER_ID);
+        when(master.getMasterType()).thenReturn(com.beautica.master.entity.MasterType.INDEPENDENT_MASTER);
         when(master.getUser()).thenReturn(userA);
         when(masterRepository.findByIdWithUserAndSalon(MASTER_ID)).thenReturn(Optional.of(master));
 

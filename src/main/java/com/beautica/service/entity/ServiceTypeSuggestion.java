@@ -45,7 +45,10 @@ import java.util.UUID;
 @Table(
         name = "service_type_suggestion",
         indexes = {
-                @Index(name = "idx_service_type_suggestion_token_hash", columnList = "token_hash")
+                @Index(name = "idx_service_type_suggestion_token_hash", columnList = "token_hash"),
+                // V159 (phase 295 audit MEDIUM-6). Same ON DELETE SET NULL RI-trigger rationale as
+                // PlatformCategory's index of the same name shape.
+                @Index(name = "idx_service_type_suggestion_requested_by", columnList = "requested_by_user_id")
         }
 )
 // @DynamicInsert: created_at is populated by the DB DEFAULT NOW() (see V76). Without

@@ -285,9 +285,9 @@ class V102HardeningConstraintsMigrationTest extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId, String street, String buildingNo, String locationNote) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, street, building_no, location_note) "
-                        + "VALUES (?, ?, ?, true, ?, ?, ?)",
-                id, ownerId, "V102 Test Salon", street, buildingNo, locationNote);
+                "INSERT INTO salons (id, owner_id, name, is_active, street, building_no, location_note, city_id) "
+                        + "VALUES (?, ?, ?, true, ?, ?, ?, ?)",
+                id, ownerId, "V102 Test Salon", street, buildingNo, locationNote, testCityId());
         return id;
     }
 

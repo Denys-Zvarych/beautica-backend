@@ -99,6 +99,28 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
         return findIdPage(spec, pageable);
     }
 
+    /**
+     * Phase 23.4 — see {@link BookingRepositoryCustom#findIdsBySalonIdFiltered} for the full
+     * contract. {@code masterId} composes via {@link BookingSpecifications#masterIdEquals} only
+     * when non-null — the same optional-predicate discipline {@link #applyDateRange} already
+     * applies to {@code from}/{@code toExclusive}, so a caller that omits it gets a {@code WHERE}
+     * with no {@code master_id} term at all rather than a dead {@code IS NULL OR} branch.
+     */
+    @Override
+    public Page<UUID> findIdsBySalonIdFiltered(
+            UUID salonId, UUID masterId, Collection<BookingStatus> statuses,
+            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.bookingSalonIdEquals(salonId));
+        if (masterId != null) {
+            spec = spec.and(BookingSpecifications.masterIdEquals(masterId));
+        }
+        if (statuses != null && !statuses.isEmpty()) {
+            spec = spec.and(BookingSpecifications.statusIn(statuses));
+        }
+        spec = applyDateRange(spec, from, toExclusive);
+        return findIdPage(spec, pageable);
+    }
+
     // ── Phase 28.1/28.2 — GET /bookings/me?partition= (see BookingRepositoryCustom's class-level
     // comment for why these are separate methods, never extra params on the three above) ────────
 

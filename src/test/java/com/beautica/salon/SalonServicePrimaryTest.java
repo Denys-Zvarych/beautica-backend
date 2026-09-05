@@ -1,9 +1,11 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
@@ -69,6 +71,25 @@ class SalonServicePrimaryTest {
     @Mock
     private CacheManager cacheManager;
 
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value (mirrors MasterServiceTest). CityRepository backs
+    // ONLY the batch resolveOblastIdsByCityIds sibling now (getOwnerSalons) — the single-row
+    // resolveOblastId delegates to the shared LocationQueryService below (Phase 240 perf fix).
+    @Mock
+    private CityRepository cityRepository;
+
+    @Mock
+    private com.beautica.location.service.LocationQueryService locationQueryService;
+
+    // Audit-fix cycle 2: SalonService evicts the affected user's cached profile after commit
+    // (createSalon, removeAdmin, rotateAdmin all mutate a `users` row). @InjectMocks passes null
+    // for an UNDECLARED collaborator silently, so compileTestJava stays green and the omission
+    // only surfaces as an NPE at runtime — this field must exist even when no test here reaches
+    // an evict call.
+    @Mock
+    private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -81,7 +102,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -103,7 +124,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -125,7 +146,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Any Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 
@@ -143,7 +164,7 @@ class SalonServicePrimaryTest {
         User client = buildUser(userId, Role.CLIENT);
         var request = new CreateSalonRequest("Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.createSalon(userId, request))
                 .isInstanceOf(ForbiddenException.class)
@@ -161,6 +182,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(UUID.randomUUID());
 
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .owner(owner)
                 .name("Test")
                 .isActive(true)
@@ -180,7 +202,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Primary Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
@@ -202,7 +224,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
@@ -226,7 +248,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("First Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
             Salon s = inv.getArgument(0);
@@ -256,7 +278,7 @@ class SalonServicePrimaryTest {
         User owner = buildOwner(ownerId);
         var request = new CreateSalonRequest("Second Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> inv.getArgument(0));
 

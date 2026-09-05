@@ -682,8 +682,8 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
      */
     private UUID seedExtraSalonFor(UUID ownerId) {
         UUID salonId = UUID.randomUUID();
-        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                + "VALUES (?, ?, ?, true, NOW(), NOW())", salonId, ownerId, "Salon-" + salonId);
+        jdbcTemplate.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, ownerId, "Salon-" + salonId, testCityId());
         return salonId;
     }
 

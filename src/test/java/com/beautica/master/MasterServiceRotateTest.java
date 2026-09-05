@@ -1,11 +1,12 @@
 package com.beautica.master;
 
+import com.beautica.TestConstants;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
@@ -68,7 +69,9 @@ class MasterServiceRotateTest {
     @Mock private WorkingHoursRepository workingHoursRepository;
     @Mock private BookingRepository bookingRepository;
     @Mock private CacheManager cacheManager;
-    @Mock private CityRepository cityRepository;
+    // Phase 240 perf MEDIUM fix: MasterService no longer depends on CityRepository — resolveOblastId
+    // now delegates to the shared cached resolver (LocationQueryService#resolveCityOblastId).
+    @Mock private LocationQueryService locationQueryService;
     @Mock private com.beautica.booking.service.BookingSlugService bookingSlugService;
     @Mock private AuthorizationService authorizationService;
     // Prefix-eviction fix: rotation's afterCommit master-calendar eviction delegates to the shared
@@ -81,6 +84,11 @@ class MasterServiceRotateTest {
     // publish call NPEs — a mock is correct here, the listener's own behaviour is unit-tested in
     // com.beautica.review.event.SalonStaffRatingListenerTest.
     @Mock private org.springframework.context.ApplicationEventPublisher eventPublisher;
+
+    // Audit-fix cycle 2: MasterService evicts the affected user's cached profile after commit
+    // (deactivateOwnerMaster, deactivateMaster). @InjectMocks passes null for an UNDECLARED
+    // collaborator silently — declared so no path here NPEs on a null evictor.
+    @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
     @InjectMocks
     private MasterService masterService;
@@ -96,8 +104,10 @@ class MasterServiceRotateTest {
 
         User user = mock(User.class);
         when(user.getId()).thenReturn(masterUserId);
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
-        Salon destSalon = Salon.builder().id(destSalonId).isActive(true).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
+        Salon destSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(destSalonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -209,7 +219,8 @@ class MasterServiceRotateTest {
         UUID actorId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
-        Salon salon = Salon.builder().id(salonId).isActive(true).build();
+        Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -232,7 +243,8 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID sourceSalonId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -260,7 +272,8 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID sourceSalonId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)
@@ -283,8 +296,10 @@ class MasterServiceRotateTest {
         UUID masterId = UUID.randomUUID();
         UUID sourceSalonId = UUID.randomUUID();
         UUID destSalonId = UUID.randomUUID();
-        Salon sourceSalon = Salon.builder().id(sourceSalonId).isActive(true).build();
-        Salon inactiveDest = Salon.builder().id(destSalonId).isActive(false).build();
+        Salon sourceSalon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(sourceSalonId).isActive(true).build();
+        Salon inactiveDest = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(destSalonId).isActive(false).build();
         Master master = Master.builder()
                 .id(masterId)
                 .masterType(MasterType.SALON_MASTER)

@@ -55,6 +55,7 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(SalonMasterControllerSecurityTest.class);
 
     private static final String SALON_MASTER_URL = "/api/v1/salons/%s/master";
+    private static final String REMOVE_MASTER_URL = "/api/v1/salons/%s/masters/%s";
     private static final String MASTERS_SLOTS_URL = "/api/v1/masters/%s/slots";
     private static final String BOOKINGS_URL = "/api/v1/bookings";
     private static final String BOOKING_BY_ID_URL = "/api/v1/bookings/%s";
@@ -327,6 +328,138 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
+    // ── Phase 297 — DELETE /{salonId}/masters/{masterId} role matrix ─────────
+
+    /**
+     * Negative-only role matrix for the Phase 297 single-master-removal endpoint, mirroring
+     * this class's existing coverage of the sibling {@code /{salonId}/master} endpoint above.
+     * Full business-logic and one HTTP-level IDOR case ({@code masterBelongsToSalon}) live in
+     * {@code MasterRemovalIT} — these four pin the {@code @PreAuthorize} expression itself
+     * ({@code hasRole('SALON_OWNER') and canManageSalon and masterBelongsToSalon}) independently,
+     * exactly as this class already does for the owner-as-master toggle.
+     */
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when SALON_ADMIN of this salon calls "
+            + "it (D5's deliberate divergence from removeAdmin — hasRole('SALON_OWNER') only)")
+    void should_return403_when_salonAdminCallsRemoveMaster() throws Exception {
+        // Arrange
+        UUID ownerId = insertUser("rm-admin-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = insertSalon(ownerId, "Remove Master Admin Test Salon");
+        UUID targetMasterUserId = insertSalonMasterUser(
+                "rm-admin-target-" + System.nanoTime() + "@beautica.test", salonId);
+        UUID targetMasterId = jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE user_id = ?", UUID.class, targetMasterUserId);
+        UUID adminId = insertSalonAdminUser("rm-admin-caller-" + System.nanoTime() + "@beautica.test", salonId);
+        String adminToken = loginAndGetToken(
+                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, adminId));
+
+        // Act
+        log.debug("Act: DELETE {} as SALON_ADMIN — role guard must deny with 403",
+                String.format(REMOVE_MASTER_URL, salonId, targetMasterId));
+        ResponseEntity<String> response = restTemplate.exchange(
+                String.format(REMOVE_MASTER_URL, salonId, targetMasterId), HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(adminToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("SALON_ADMIN must be denied access to removeMaster, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when SALON_MASTER calls it")
+    void should_return403_when_salonMasterCallsRemoveMaster() throws Exception {
+        // Arrange
+        UUID ownerId = insertUser("rm-sm-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = insertSalon(ownerId, "Remove Master SalonMaster Test Salon");
+        UUID targetMasterUserId = insertSalonMasterUser(
+                "rm-sm-target-" + System.nanoTime() + "@beautica.test", salonId);
+        UUID targetMasterId = jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE user_id = ?", UUID.class, targetMasterUserId);
+        UUID callerMasterUserId = insertSalonMasterUser(
+                "rm-sm-caller-" + System.nanoTime() + "@beautica.test", salonId);
+        String masterToken = loginAndGetToken(
+                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, callerMasterUserId));
+
+        // Act
+        log.debug("Act: DELETE {} as SALON_MASTER — role guard must deny with 403",
+                String.format(REMOVE_MASTER_URL, salonId, targetMasterId));
+        ResponseEntity<String> response = restTemplate.exchange(
+                String.format(REMOVE_MASTER_URL, salonId, targetMasterId), HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(masterToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("SALON_MASTER must be denied access to removeMaster, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when CLIENT calls it")
+    void should_return403_when_clientCallsRemoveMaster() throws Exception {
+        // Arrange
+        UUID ownerId = insertUser("rm-client-owner-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonId = insertSalon(ownerId, "Remove Master Client Test Salon");
+        UUID targetMasterUserId = insertSalonMasterUser(
+                "rm-client-target-" + System.nanoTime() + "@beautica.test", salonId);
+        UUID targetMasterId = jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE user_id = ?", UUID.class, targetMasterUserId);
+        UUID clientId = insertUser("rm-client-caller-" + System.nanoTime() + "@beautica.test", "CLIENT");
+        String clientToken = loginAndGetToken(
+                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, clientId));
+
+        // Act
+        log.debug("Act: DELETE {} as CLIENT — role guard must deny with 403",
+                String.format(REMOVE_MASTER_URL, salonId, targetMasterId));
+        ResponseEntity<String> response = restTemplate.exchange(
+                String.format(REMOVE_MASTER_URL, salonId, targetMasterId), HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(clientToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("CLIENT must be denied access to removeMaster, salonId=%s", salonId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("DELETE /{salonId}/masters/{masterId} — 403 when SALON_OWNER of salon B targets a "
+            + "real master of salon A (IDOR boundary — canManageSalon)")
+    void should_return403_when_ownerBRemovesMasterInSalonOwnedByOwnerA() throws Exception {
+        // Arrange — salon A owned by owner A, with a real master
+        UUID ownerAId = insertUser("rm-idor-owner-a-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        UUID salonAId = insertSalon(ownerAId, "Remove Master Salon A");
+        UUID targetMasterUserId = insertSalonMasterUser(
+                "rm-idor-target-" + System.nanoTime() + "@beautica.test", salonAId);
+        UUID targetMasterId = jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE user_id = ?", UUID.class, targetMasterUserId);
+
+        // Arrange — owner B has their own salon, does NOT own salon A
+        UUID ownerBId = insertUser("rm-idor-owner-b-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
+        insertSalon(ownerBId, "Remove Master Salon B");
+        String ownerBToken = loginAndGetToken(
+                jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, ownerBId));
+
+        // Act — owner B targets salon A's real master
+        log.debug("Act: DELETE {} with Owner B token targeting salon A — canManageSalon must block "
+                        + "with 403", String.format(REMOVE_MASTER_URL, salonAId, targetMasterId));
+        ResponseEntity<String> response = restTemplate.exchange(
+                String.format(REMOVE_MASTER_URL, salonAId, targetMasterId), HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(ownerBToken)),
+                String.class);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("Owner B must not be able to remove a master in salon A (IDOR), salonAId=%s", salonAId)
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM masters WHERE id = ?", Integer.class, targetMasterId))
+                .as("nothing may be written on a denied removeMaster call")
+                .isEqualTo(1);
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     /**
@@ -390,8 +523,8 @@ class SalonMasterControllerSecurityTest extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 

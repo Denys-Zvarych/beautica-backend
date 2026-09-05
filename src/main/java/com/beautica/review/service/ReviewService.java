@@ -1,5 +1,6 @@
 package com.beautica.review.service;
 
+import com.beautica.user.User;
 import org.springframework.data.domain.Sort;
 import java.util.Set;
 import com.beautica.common.web.SortWhitelist;
@@ -132,9 +133,15 @@ public class ReviewService {
         // clientId is the AUTHOR (this method's authenticated principal argument), carried so
         // ClientPassportCacheEvictor can drop that client's cached BEAUTY PASSPORT — its
         // reviewsWritten line just changed. Costs nothing: it is already a parameter.
+        // V157 / phase 294 D1: masters.user_id is nullable. A review can only be written against a
+        // COMPLETED booking whose provider is still live, so this is null in no reachable flow
+        // today — but a null here would NPE on a write path rather than fail a guard, so the read
+        // is guarded and the userId-keyed cache eviction is simply skipped for a detached master
+        // (there is no GET /masters/me for a deleted account to serve stale).
+        User masterUser = booking.getMaster().getUser();
         eventPublisher.publishEvent(new ReviewCreatedEvent(
                 booking.getMaster().getId(),
-                booking.getMaster().getUser().getId(),
+                masterUser != null ? masterUser.getId() : null,
                 salonId,
                 clientId));
         return ReviewResponse.from(saved);

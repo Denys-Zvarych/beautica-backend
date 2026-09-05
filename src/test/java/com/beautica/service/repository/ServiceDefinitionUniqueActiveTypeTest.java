@@ -68,6 +68,7 @@ class ServiceDefinitionUniqueActiveTypeTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Beauty Studio")
                 .isActive(true)

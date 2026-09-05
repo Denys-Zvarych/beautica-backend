@@ -13,6 +13,8 @@ import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
+import com.beautica.master.entity.MasterType;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.RatingCountProjection;
 import org.junit.jupiter.api.BeforeEach;
@@ -62,13 +64,16 @@ class UserServiceTest {
     @Mock
     private ClientReviewRepository clientReviewRepository;
 
+    @Mock
+    private MasterRepository masterRepository;
+
     private UserService userService;
 
     @BeforeEach
     void setUp() {
         userService = new UserService(
                 userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager,
-                clientReviewRepository);
+                clientReviewRepository, masterRepository);
     }
 
     @Test
@@ -211,6 +216,156 @@ class UserServiceTest {
                 .as("an unresolved cityId falls back to null via orElse(null), never throws")
                 .isNull();
         verify(cityRepository, times(1)).findOblastIdById(cityId);
+    }
+
+    // ── Phase 265 — hasMasterProfile (the owner-as-master toggle, derived on read) ─────
+    //
+    // The active/inactive DISCRIMINATION itself is a WHERE clause and is pinned where a WHERE
+    // clause can be observed: MasterRepositoryOwnerMasterFlagTest (a real @DataJpaTest query
+    // test). A Mockito stub cannot see a predicate. What these unit tests pin instead is the
+    // wiring UserService controls — WHICH finder is called, with WHICH arguments, for WHICH
+    // roles, and that its answer reaches the DTO unmodified.
+
+    @Test
+    @DisplayName("getProfile reads hasMasterProfile=true from the ACTIVE SALON_OWNER-type finder for an owner")
+    void should_returnHasMasterProfileTrue_when_ownerHasAnActiveOwnerMasterRow() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Olha", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(true);
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile())
+                .as("the owner-as-master toggle is ON — the flag must echo the active row's existence")
+                .isTrue();
+        // Pins the finder by name and by argument: the SALON-SCOPED sibling
+        // (existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue) must never be used here, since
+        // GET /users/me has no path salon and users.salon_id would answer the wrong question.
+        verify(masterRepository, times(1))
+                .existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER);
+    }
+
+    @Test
+    @DisplayName("getProfile reads hasMasterProfile=false when the owner has no active owner-master row")
+    void should_returnHasMasterProfileFalse_when_salonOwnerHasNoActiveOwnerMasterRow() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "solo@example.com", Role.SALON_OWNER, "Ola", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(false);
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile())
+                .as("no row, or a deactivated one — either way the toggle reads OFF and the client "
+                        + "must not fire GET /masters/me, which would 404")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("getProfile short-circuits hasMasterProfile to false for a CLIENT without querying masters")
+    void should_returnHasMasterProfileFalse_when_callerIsClient() {
+        UUID userId = UUID.randomUUID();
+        User client = buildUser(userId, "client@example.com", Role.CLIENT, "Kate", "Client", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile()).isFalse();
+        verify(masterRepository, never()).existsByUserIdAndMasterTypeAndIsActiveTrue(any(), any());
+    }
+
+    @Test
+    @DisplayName("getProfile short-circuits hasMasterProfile to false for a SALON_ADMIN without querying masters")
+    void should_returnHasMasterProfileFalse_when_callerIsSalonAdmin() {
+        UUID userId = UUID.randomUUID();
+        User admin = buildUser(userId, "admin@example.com", Role.SALON_ADMIN, "Ada", "Admin", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(admin));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile())
+                .as("an admin has no owner-master row by construction — createMasterForOwner "
+                        + "throws ForbiddenException for every role but SALON_OWNER")
+                .isFalse();
+        verify(masterRepository, never()).existsByUserIdAndMasterTypeAndIsActiveTrue(any(), any());
+    }
+
+    // ── Audit fix, finding 1 — the PATCH write-back resolves the flag for real ────────
+    //
+    // These three replace an earlier test that PINNED the defect ("updateProfile always returns
+    // hasMasterProfile=false"). PATCH /users/me returns a full UserProfileResponse on the same
+    // wire type as GET /users/me, so a hard-coded false handed an opted-in owner a body that
+    // contradicted the read they had just made. IndependentMasterController#updateLocality
+    // serialises the same DTO by delegating to this same method, so it is fixed by the same edit
+    // — there is one write path, not two.
+
+    @Test
+    @DisplayName("updateProfile returns hasMasterProfile=true for an opted-in owner — the PATCH body must not contradict GET /users/me")
+    void should_returnHasMasterProfileTrue_when_optedInOwnerPatchesProfile() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Olha", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(true);
+
+        UserProfileResponse response = userService.updateProfile(
+                userId,
+                new UpdateProfileRequest("Olha", "Owner", null, null, null, null, null, null, null, null));
+
+        assertThat(response.hasMasterProfile())
+                .as("the owner-as-master toggle is ON — PATCH must report the same truth GET does, "
+                        + "not a hard-coded false")
+                .isTrue();
+        // Same finder, same arguments as the read path: the salon-scoped sibling must never be
+        // substituted here either (users.salon_id would answer the wrong question).
+        verify(masterRepository, times(1))
+                .existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER);
+    }
+
+    @Test
+    @DisplayName("updateProfile returns hasMasterProfile=false for an opted-out owner")
+    void should_returnHasMasterProfileFalse_when_optedOutOwnerPatchesProfile() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "solo@example.com", Role.SALON_OWNER, "Ola", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(false);
+
+        UserProfileResponse response = userService.updateProfile(
+                userId,
+                new UpdateProfileRequest("Ola", "Owner", null, null, null, null, null, null, null, null));
+
+        assertThat(response.hasMasterProfile())
+                .as("no active owner-master row — the flag is false on BOTH verbs, and it is false "
+                        + "because it was resolved, not because it was hard-coded")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("updateProfile keeps the role short-circuit — a CLIENT PATCH never queries masters")
+    void should_notQueryMasterRepository_when_clientPatchesProfile() {
+        UUID userId = UUID.randomUUID();
+        User client = buildUser(userId, "client@example.com", Role.CLIENT, "Kate", "Client", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+
+        UserProfileResponse response = userService.updateProfile(
+                userId,
+                new UpdateProfileRequest("Kate", "Client", null, null, null, null, null, null, null, null));
+
+        assertThat(response.hasMasterProfile()).isFalse();
+        // Resolving the flag on the write path must not cost the hottest non-owner roles a query:
+        // resolveHasMasterProfile short-circuits on role before touching the repository.
+        verify(masterRepository, never()).existsByUserIdAndMasterTypeAndIsActiveTrue(any(), any());
     }
 
     @Test

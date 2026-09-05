@@ -142,6 +142,26 @@ public abstract class AbstractIntegrationTest {
      *                  {@code INDEPENDENT_MASTER}
      * @param ownerId   {@code service_definitions.owner_id} — the salon or master id
      */
+    /**
+     * Resolves a real, persisted {@code cities.id} row for fixtures that INSERT a {@code salons}
+     * row via raw SQL.
+     *
+     * <p>{@code salons.city_id} carries {@code fk_salons_city_id} (V54) to {@code cities(id)} and,
+     * as of V150, is {@code NOT NULL} — a literal {@code UUID.randomUUID()} fails the FK check
+     * outright, so every fixture that persists a salon must resolve a seeded row instead of
+     * inventing one. Vinnytsia is used everywhere for consistency with
+     * {@link com.beautica.service.ServiceTestFixtures#createSalon} and because it has no urban
+     * districts in the KATOTTH classifier, so no {@code districtId} is required alongside it.
+     *
+     * <p>This is the single shared helper for the ~50 {@code AbstractIntegrationTest} subclasses
+     * that build a salon fixture with raw SQL — do not re-query {@code cities} ad hoc in a new
+     * test; call this instead.
+     */
+    protected UUID testCityId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+    }
+
     protected UUID resolveUnusedServiceTypeId(String ownerType, UUID ownerId) {
         return jdbcTemplate.queryForObject(
                 """

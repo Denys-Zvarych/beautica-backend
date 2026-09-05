@@ -55,6 +55,31 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
             UUID clientId, FavoriteTargetType targetType, UUID targetId);
 
     /**
+     * Hard-deletes every {@code favorites} row pointing at a given {@code (targetType, targetId)}
+     * pair, across ALL clients — backs {@code SalonService.deactivateSalon}'s Phase 268 D5 cascade
+     * ({@code targetType = SALON}), removing every client's favourite for a deleted salon in one
+     * statement rather than a per-client loop (§E — no N+1).
+     *
+     * <p><b>BOTH columns are load-bearing in the predicate.</b> {@code target_id} is polymorphic
+     * with no FK across four target types (see the interface Javadoc), so a {@code MASTER} or
+     * {@code SERVICE} favourite can carry a {@code target_id} that coincidentally equals a
+     * {@code salons.id}. Keying on {@code target_id} alone would delete that unrelated favourite
+     * too — the exact trap the phase's mutation check pins (drop {@code targetType} from the
+     * predicate and the "don't touch a same-id MASTER favourite" test must go red).
+     *
+     * <p>Called inside the SAME transaction as the salon deactivation — pure DB work, no network —
+     * so it rolls back together with the rest of the cascade rather than running after commit like
+     * the R2 sweep.
+     */
+    @Modifying
+    @Query("""
+            DELETE FROM Favorite f
+            WHERE f.targetType = :targetType AND f.targetId = :targetId
+            """)
+    int deleteAllByTargetTypeAndTargetId(
+            @Param("targetType") FavoriteTargetType targetType, @Param("targetId") UUID targetId);
+
+    /**
      * Per-client favorited-masters projection for {@code GET /favorites/masters}.
      *
      * <p>Column layout (stable — index-matched in the service):

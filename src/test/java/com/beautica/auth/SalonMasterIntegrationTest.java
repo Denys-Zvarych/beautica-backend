@@ -480,9 +480,9 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
                 ownerId, email, hash);
         // Insert salon referencing the owner
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) " +
-                "VALUES (?, ?, 'Test Salon', true, NOW(), NOW())",
-                salonId, ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) " +
+                "VALUES (?, ?, 'Test Salon', true, NOW(), NOW(), ?)",
+                salonId, ownerId, testCityId());
         // Now link user back to salon
         jdbcTemplate.update(
                 "UPDATE users SET salon_id = ? WHERE id = ?", salonId, ownerId);

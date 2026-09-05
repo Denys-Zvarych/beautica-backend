@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("SalonRepository — data access layer")
 class SalonRepositoryTest extends AbstractDataJpaTest {
@@ -49,16 +50,19 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(otherOwner);
 
         Salon activeSalon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Active Salon")
                 .isActive(true)
                 .build();
         Salon inactiveSalon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Inactive Salon")
                 .isActive(false)
                 .build();
         Salon otherSalon = Salon.builder()
+                .cityId(testCityId())
                 .owner(otherOwner)
                 .name("Other Owner Salon")
                 .isActive(true)
@@ -99,6 +103,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("My Salon")
                 .isActive(true)
@@ -128,6 +133,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Real Owner Salon")
                 .isActive(true)
@@ -145,6 +151,79 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
                 .isFalse();
     }
 
+    /**
+     * Phase 283 behaviour-identity pin, input 3 of 4 — {@code salonId} resolving to no row.
+     *
+     * <p>{@code existsByIdAndOwnerId} was rewritten from a derived query (which emitted a pointless
+     * {@code left join users} to read back {@code users.id}, already present as {@code
+     * salons.owner_id}) to an explicit native {@code SELECT EXISTS (SELECT 1 ...)}. Since the old
+     * form's join was an OUTER join, the case that could most plausibly have differed is one with
+     * no {@code salons} row at all — pinned here alongside the owner / non-owner cases above and
+     * the inactive case below, which together cover every input class this predicate sees.
+     */
+    @Test
+    @DisplayName("existsByIdAndOwnerId — returns false when the salon id resolves to no row")
+    void should_returnFalse_when_salonIdDoesNotExist() {
+        User owner = new User(
+                "owner-missing-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Olena",
+                "Kovalenko",
+                "+380502222222"
+        );
+        em.persist(owner);
+        em.flush();
+        em.clear();
+
+        boolean result = salonRepository.existsByIdAndOwnerId(UUID.randomUUID(), owner.getId());
+
+        assertThat(result)
+                .as("existsByIdAndOwnerId must return false for a salon id with no row")
+                .isFalse();
+    }
+
+    /**
+     * Phase 283 behaviour-identity pin, input 4 of 4 — a DEACTIVATED salon still answers
+     * {@code true} for its owner.
+     *
+     * <p>This predicate carries no {@code is_active} filter and must not acquire one: see
+     * {@code SalonRepository#findIdsByIdInAndOwnerId}'s Javadoc for why adding one would make the
+     * booking listing's {@code providerCanReviewClient} flag disagree with both
+     * {@code GET /bookings/&#123;id&#125;} and the {@code POST /client-reviews} write gate. The
+     * native-query rewrite must preserve that exactly.
+     */
+    @Test
+    @DisplayName("existsByIdAndOwnerId — returns true for a DEACTIVATED salon owned by the given owner (no is_active predicate)")
+    void should_returnTrue_when_salonIsInactiveButOwnedByOwner() {
+        User owner = new User(
+                "owner-inactive-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Olena",
+                "Kovalenko",
+                "+380503333333"
+        );
+        em.persist(owner);
+
+        Salon inactiveSalon = Salon.builder()
+                .cityId(testCityId())
+                .owner(owner)
+                .name("Closed Branch")
+                .isActive(false)
+                .build();
+        em.persist(inactiveSalon);
+        em.flush();
+        em.clear();
+
+        boolean result = salonRepository.existsByIdAndOwnerId(inactiveSalon.getId(), owner.getId());
+
+        assertThat(result)
+                .as("existsByIdAndOwnerId carries no is_active predicate — a deactivated salon "
+                        + "must still resolve for its owner")
+                .isTrue();
+    }
+
     @Test
     @DisplayName("findByIdAndOwnerId — returns populated Optional when correct owner fetches their salon")
     void should_returnSalon_when_correctOwnerFetchesSalon() {
@@ -159,6 +238,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Olena Beauty")
                 .isActive(true)
@@ -203,6 +283,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(ownerB);
 
         Salon salonA = Salon.builder()
+                .cityId(testCityId())
                 .owner(ownerA)
                 .name("Salon A")
                 .isActive(true)
@@ -234,6 +315,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Active Detail Salon")
                 .isActive(true)
@@ -272,6 +354,7 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Inactive Detail Salon")
                 .isActive(false)
@@ -297,5 +380,59 @@ class SalonRepositoryTest extends AbstractDataJpaTest {
         assertThat(result)
                 .as("findByIdAndIsActiveTrueWithOwner must return empty when no salon matches the given UUID")
                 .isEmpty();
+    }
+
+    // ── V150/V151 "a salon must always have a city" — behavioural enforcement ──────
+
+    @Test
+    @DisplayName("persisting a Salon with a null cityId is rejected — proves the V150/V151 DB "
+            + "constraint (and Salon.cityId nullable=false) actually block the write, not just "
+            + "information_schema metadata")
+    void should_rejectPersist_when_salonCityIdIsNull() {
+        // Arrange — a real, otherwise-valid owner + salon, but with cityId deliberately null.
+        // Bypasses LocalityWriteValidator entirely (that guard lives in SalonService, one layer
+        // above the repository) so this test isolates the DB-level invariant on its own: even if
+        // every application-layer guard were removed or buggy, the column itself must refuse
+        // the write.
+        User owner = new User(
+                "owner-null-city-" + UUID.randomUUID() + "@beautica.test",
+                TestConstants.HASHED_TEST_PASSWORD,
+                Role.SALON_OWNER,
+                "Nadiya",
+                "Bondar",
+                "+380503334455"
+        );
+        em.persist(owner);
+        em.flush();
+
+        Salon cityless = Salon.builder()
+                .owner(owner)
+                .name("Cityless Salon")
+                .isActive(true)
+                .build(); // cityId deliberately left null
+
+        // Act + Assert — saveAndFlush forces the INSERT to execute now rather than deferring to
+        // end-of-test rollback, so a thrown exception here proves the write itself is rejected —
+        // confirmed (see this test's real run) to be a genuine DB-level rejection: Postgres
+        // returns SQLState 23502 ("null value in column city_id ... violates not-null
+        // constraint"), which Spring Data's repository exception translation surfaces as
+        // DataIntegrityViolationException. isInstanceOfAny also tolerates Hibernate's own
+        // not-null property check short-circuiting locally (PropertyValueException) or a bare
+        // PersistenceException wrapper, so this test stays green regardless of which layer
+        // happens to intercept the write, as long as one of them does.
+        //
+        // No follow-up SELECT after this: a failed INSERT leaves the DataJpaTest transaction
+        // aborted (Postgres refuses further statements on that connection until rollback,
+        // SQLState 25P02), and @DataJpaTest rolls the whole transaction back at test end anyway
+        // — the row can never be committed regardless, so re-querying it here would only trip
+        // the aborted-transaction state, not add proof.
+        assertThatThrownBy(() -> salonRepository.saveAndFlush(cityless))
+                .as("a Salon with cityId=null must never be persisted — V150/V151 must reject it "
+                        + "at the DB, and/or Hibernate must refuse the write locally for the "
+                        + "nullable=false mapping")
+                .isInstanceOfAny(
+                        jakarta.persistence.PersistenceException.class,
+                        org.springframework.dao.DataIntegrityViolationException.class,
+                        org.hibernate.PropertyValueException.class);
     }
 }

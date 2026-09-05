@@ -1,0 +1,36 @@
+-- V154 — partial index on users.role, covering only the two staff roles.
+--
+-- WHY.
+-- Phase 289 perf audit (CRITICAL-1): `users.role` carries zero index across all 153 prior
+-- migrations. StaffClientReferenceAuditRepository's three platform-wide queries (and their new
+-- salon-scoped siblings added in this same phase) all filter `role IN ('SALON_MASTER',
+-- 'SALON_ADMIN')` — without an index this is a full Seq Scan on `users` every time, and the
+-- unindexed predicate is exactly what forced the platform-wide booking query's planner to build
+-- its whole staff-id side from a Seq Scan (see V-less finding CRITICAL-2/HIGH-4 in the same
+-- audit; the salon-scoped query fix lives in StaffClientReferenceAuditRepository, not here).
+--
+-- WHY PARTIAL, NOT A PLAIN COLUMN INDEX.
+-- `SALON_MASTER`/`SALON_ADMIN` staff are a small minority of `users` (CLIENT, SALON_OWNER,
+-- INDEPENDENT_MASTER make up the rest — measured locally: 1,442 of 7,350 seeded users, ~20%,
+-- and staff share shrinks further as the client base grows post-launch). A partial index scoped
+-- to `role IN ('SALON_MASTER','SALON_ADMIN')` is maintained only for rows that can ever match
+-- this audit's predicate — every INSERT/UPDATE of a CLIENT/SALON_OWNER/INDEPENDENT_MASTER row
+-- pays nothing to keep it current — while still fully covering every query this audit (or any
+-- future staff-role lookup) can issue, since none of them ever query for a role outside this set.
+--
+-- Column list only (`role`) mirrors the project's own convention for a predicate a JPA @Index
+-- cannot express (see Master.java's `idx_masters_salon_owner_active` comment for the same
+-- pattern) — `User.java`'s `@Table(indexes = ...)` is not updated to list this index, since
+-- Hibernate's ddl-auto=validate does not check partial WHERE predicates either way (see V118's
+-- note on the same gap) and a full-column @Index entry here would misdescribe this index as
+-- unconditional.
+--
+-- Plain CREATE INDEX, not CONCURRENTLY: matches every prior index migration on this table (V2,
+-- V8, V50) and on `bookings`/`masters` elsewhere in this migration set — Flyway wraps each
+-- migration in one transaction, inside which CONCURRENTLY cannot run, and there is no
+-- established convention in this codebase for a `executeInTransaction=false` sidecar. `users` is
+-- read-heavy but not the write-hottest table in the schema (that is `bookings`), so the brief
+-- ACCESS EXCLUSIVE lock this takes is an acceptable routine-deploy cost.
+CREATE INDEX idx_users_staff_role
+    ON users (role)
+    WHERE role IN ('SALON_MASTER', 'SALON_ADMIN');

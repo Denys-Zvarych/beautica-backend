@@ -81,7 +81,7 @@ class GuestAvailabilityGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive());
     }
 
     private static MockHttpServletRequest get(String path, String remoteAddr) {

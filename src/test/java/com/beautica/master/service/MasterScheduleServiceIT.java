@@ -184,9 +184,9 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
                         + "is_active, email_verified) VALUES (?, ?, 'x', 'SALON_OWNER', 'Own', 'Er', true, true)",
                 ownerId, "owner-" + ownerId + "@beautica.test");
         UUID salonId = UUID.randomUUID();
-        jdbc.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+        jdbc.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
         UUID masterId = UUID.randomUUID();
         jdbc.update("INSERT INTO masters (id, user_id, salon_id, master_type, review_count, is_active, "
                         + "created_at, updated_at) VALUES (?, ?, ?, 'SALON_OWNER', 0, true, NOW(), NOW())",

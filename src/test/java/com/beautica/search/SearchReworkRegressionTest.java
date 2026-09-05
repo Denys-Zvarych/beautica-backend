@@ -377,15 +377,20 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     // ── salon-employed master's own locality onto discovery ─────────────────
 
     @Test
-    @DisplayName("Anti-Bug LOW-1 — a legacy salon with NULL city_id/district_id (predates the Phase 10.3 "
-            + "locality columns) never resurrects its employed SALON_MASTER on /search/masters via the "
-            + "master's own personal city/district, even though the DISCOVERY_CITY_EXPR/DISCOVERY_DISTRICT_EXPR "
-            + "COALESCE is data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is "
-            + "the actual guard, not the salon's locality data")
+    @DisplayName("Anti-Bug LOW-1 — a salon with no district_id (a legitimate state — districtless "
+            + "cities exist — the DB no longer permits a null city_id at all as of V150) never "
+            + "resurrects its employed SALON_MASTER on /search/masters via the master's own personal "
+            + "city/district, even though the DISCOVERY_CITY_EXPR/DISCOVERY_DISTRICT_EXPR COALESCE is "
+            + "data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is the "
+            + "actual guard, not the salon's locality data")
     void should_neverSurfaceSalonMasterUnderOwnPersonalLocality_when_salonIsCityLess() throws Exception {
         ensureHttpClient();
         UUID ownerPersonalCity = cityIdByName("Київ");
         UUID ownerPersonalDistrict = districtIdInCity("Київ", 0);
+        // The salon's OWN real city — deliberately NOT Kyiv, so a search scoped to the master's
+        // personal city/district can only return this master if the (broken) guard fell through
+        // to the master's own row instead of the salon's.
+        UUID salonOwnCity = testCityId();
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -394,15 +399,20 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 ownerId, "ms-cityless-owner-" + UUID.randomUUID() + "@beautica.test",
                 "$2a$04$placeholdervaluefortestonlydigest");
 
-        // Legacy salon: city_id/district_id both NULL (never migrated / never updated
-        // since Phase 10.3 added the columns) — SalonService.createSalon/updateSalon
-        // would reject this via LocalityWriteValidator today, but a pre-existing row
-        // can still carry it, per Salon.java §67-72 / LocalityWriteValidator §35-39.
+        // salons.city_id is DB-level NOT NULL as of V150 ("a salon must always have a city"), so
+        // the legacy "both city_id and district_id NULL" premise this test used to seed is no
+        // longer constructible — that INSERT would now throw a DataIntegrityViolationException.
+        // district_id alone stays genuinely nullable (cities without urban districts, e.g.
+        // Vinnytsia — see LocalityWriteValidator), which is exactly what is seeded here: a real
+        // city, no district. The invariant under test — a SALON_MASTER's discovery locality is
+        // never sourced from their own personal city/district — is unaffected by which locality
+        // field is missing; the master's personal Kyiv city/district below is still a DIFFERENT
+        // city than the salon's own, so the assertion is just as sharp as when city_id was null.
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, city_id, district_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, NULL, NULL, true, NOW(), NOW())",
-                salonId, ownerId, "CitylessLegacySalon");
+                        + "VALUES (?, ?, ?, ?, NULL, true, NOW(), NOW())",
+                salonId, ownerId, "DistrictlessSalon", salonOwnCity);
 
         // Worst-case simulation: the employed SALON_MASTER's OWN user row carries a real
         // personal city/district. The live write path (UserService.applyLocality) never
@@ -431,8 +441,10 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         JsonNode page = objectMapper.readTree(underPersonalDistrict.getBody()).path("data");
 
         assertThat(page.path("totalElements").asLong())
-                .as("the SALON_MASTER's own personal district must never resurface them on the public "
-                        + "grid, regardless of the salon's (missing) locality data")
+                .as("the SALON_MASTER's own personal city/district must never resurface them on the "
+                        + "public grid — discovery is keyed on the SALON's own locality, not the "
+                        + "employed master's personal one, regardless of which salon locality field "
+                        + "(here, district_id) happens to be unset")
                 .isZero();
     }
 

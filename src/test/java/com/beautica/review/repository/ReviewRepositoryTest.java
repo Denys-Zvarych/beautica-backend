@@ -869,6 +869,7 @@ class ReviewRepositoryTest extends AbstractDataJpaTest {
         em.persist(owner);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name(name)
                 .avgRating(BigDecimal.ZERO)

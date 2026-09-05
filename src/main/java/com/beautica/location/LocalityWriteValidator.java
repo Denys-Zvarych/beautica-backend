@@ -32,11 +32,14 @@ import java.util.UUID;
  * messages are intentionally generic (no enum constants, no SQL, no internal
  * IDs) — they only name the offending field.
  *
- * <p>This rule is enforced here in the service/validation layer, <em>not</em>
- * by a NOT&nbsp;NULL constraint: cities without urban districts legitimately
- * persist a {@code null} {@code district_id}, and {@code city_id} is promoted
- * to "required going forward for providers" without any data-altering
- * migration (Phase 10.3 throwaway-cleanup note).
+ * <p>{@code district_id} is enforced here in the service/validation layer only,
+ * <em>not</em> by a NOT&nbsp;NULL constraint: cities without urban districts
+ * legitimately persist a {@code null} {@code district_id}. {@code city_id} on
+ * {@code salons}, by contrast, is now ALSO a DB-level NOT NULL constraint
+ * (V150, following through on the Phase 10.3 throwaway-cleanup note) — the
+ * check below stays regardless, since it is what turns a missing city into a
+ * clean 400 {@link BusinessException} instead of a raw
+ * {@code DataIntegrityViolationException} (500) from the DB.
  *
  * <p><strong>Perf (Phase 10.6 fix):</strong> the three former sequential
  * existence round-trips ({@code existsById}, {@code existsByCityId},

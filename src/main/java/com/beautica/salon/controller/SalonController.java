@@ -12,9 +12,14 @@ import com.beautica.salon.dto.InviteRequest;
 import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.RotateAdminRequest;
 import com.beautica.salon.dto.SalonAdminResponse;
+import com.beautica.salon.dto.SalonInviteHistoryResponse;
+import com.beautica.salon.dto.SalonInviteResponse;
 import com.beautica.salon.dto.SalonResponse;
+import com.beautica.salon.dto.SalonStaffMemberResponse;
+import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
+import io.swagger.v3.oas.annotations.Operation;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Pageable;
@@ -62,7 +67,7 @@ public class SalonController {
 
     @GetMapping("/{salonId}")
     public ApiResponse<PublicSalonResponse> getSalon(@PathVariable UUID salonId) {
-        return ApiResponse.ok(PublicSalonResponse.from(salonService.getSalonEntity(salonId)));
+        return ApiResponse.ok(salonService.getPublicSalon(salonId));
     }
 
     @PatchMapping("/{salonId}")
@@ -106,6 +111,68 @@ public class SalonController {
     }
 
     /**
+     * Management-scoped staff roster (Phase 21.5) — masters AND admins in one read, backing the
+     * mobile Персонал tab and the staff-member detail screen for BOTH a {@code SALON_MASTER} and
+     * a {@code SALON_ADMIN}. Unlike {@link #getMastersBySalon} (public, master-only,
+     * PII-masked) this endpoint returns unmasked {@code phoneNumber}/{@code instagram} and
+     * includes admins — so it is management-gated, not {@code permitAll}.
+     *
+     * <p>{@code @authz.canManageSalon} is the IDENTICAL expression already gating
+     * {@link #updateSalon}/{@link #inviteMaster}/{@link #listSalonInvites} — reused verbatim,
+     * not re-derived, so a future role change to salon management cannot diverge between sibling
+     * endpoints.
+     */
+    @Operation(summary = "List salon staff (masters and admins)",
+            description = "Management-scoped roster combining the salon's masters (any type) "
+                    + "and SALON_ADMINs, with unmasked contact details. Requires management "
+                    + "access to the salon (owner or assigned admin).")
+    @GetMapping("/{salonId}/staff")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<SalonStaffMemberResponse>> getSalonStaff(@PathVariable UUID salonId) {
+        return ApiResponse.ok(salonService.getSalonStaff(salonId));
+    }
+
+    /**
+     * Sibling salons (Phase 21.3b) — every ACTIVE salon sharing {@code salonId}'s owner,
+     * <b>excluding {@code salonId} itself</b>. This is the destination candidate set for
+     * {@link #rotateAdmin} ({@code PATCH /{salonId}/admins/{userId}/salon}), which already enforces
+     * the same-owner rule server-side; this read only lets the mobile rotate-admin picker
+     * (mobile Phase 21.6) show the correct choices instead of guessing.
+     *
+     * <p><b>Self is excluded by design:</b> the picker chooses a <em>destination</em>, and
+     * rotating an admin into the salon they already occupy is a no-op that {@code rotateAdmin}
+     * rejects with 400. Offering it would render a guaranteed-to-fail option.
+     *
+     * <p>Why {@code GET /mine} cannot serve this: it is {@code hasRole('SALON_OWNER')} only, so the
+     * {@code SALON_ADMIN} who may legitimately perform the rotation gets 403 — and even for an
+     * owner it returns the CALLER's portfolio, not the portfolio of {@code salonId}'s owner.
+     *
+     * <p>{@code @authz.canManageSalon} is the IDENTICAL expression already gating
+     * {@link #getSalonStaff}/{@link #updateSalon}/{@link #listSalonInvites} — reused verbatim,
+     * not re-derived, so a future role change to salon management cannot diverge between sibling
+     * endpoints. It also places the caller inside exactly the trust boundary {@link #rotateAdmin}
+     * operates in, so this leaks nothing that mutation does not already expose — an argument that
+     * depends on self-rotation remaining legal for a {@code SALON_ADMIN}; see
+     * {@link SalonService#getSiblingSalons} for that coupling.
+     *
+     * <p><b>Returns {@link SiblingSalonOption}, not {@code SalonResponse}.</b> A picker needs the
+     * id it will submit plus enough text to tell two salons apart. The full {@code SalonResponse}
+     * additionally handed an assigned {@code SALON_ADMIN} the owner's UUID and every sibling's
+     * {@code description}, {@code phone}, {@code instagramUrl}, {@code avatarUrl}, legacy
+     * city/region/address, {@code isPrimary} and {@code createdAt} — for salons they hold no
+     * assignment to. See that record's Javadoc.
+     */
+    @Operation(summary = "List sibling salons of the same owner",
+            description = "Active salons sharing this salon's owner, excluding this salon itself, "
+                    + "as id + name + short address. Backs the rotate-admin destination picker. "
+                    + "Requires management access to the salon (owner or assigned admin).")
+    @GetMapping("/{salonId}/sibling-salons")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<SiblingSalonOption>> getSiblingSalons(@PathVariable UUID salonId) {
+        return ApiResponse.ok(salonService.getSiblingSalons(salonId));
+    }
+
+    /**
      * Masters actually bookable for {@code serviceDefId} within {@code salonId} — booking-flow
      * master selection (Phase 23.x), distinct from {@link #getMastersBySalon} (the salon-profile
      * roster). Public/unauthenticated, matching the existing {@code GET /{salonId}/masters} and
@@ -124,6 +191,20 @@ public class SalonController {
         return ApiResponse.ok(bookingMasterService.getBookableMasters(salonId, serviceDefId));
     }
 
+    // Swagger @ApiResponse is written fully qualified in this method only — its simple name
+    // collides with com.beautica.common.ApiResponse, imported above. springdoc scans controller
+    // signatures, not @RestControllerAdvice handlers, so without this declaration the 409's body
+    // has no schema in /api-docs and the generated mobile client has no model for the
+    // SALON_DELETION_BLOCKED payload it must branch on (Phase 290).
+    @io.swagger.v3.oas.annotations.responses.ApiResponse(
+            responseCode = "409",
+            description = "Phase 289's salon-scoped staff-as-client safety audit found a violation "
+                    + "for this salon; the deletion was aborted before any mutation ran. Branch on "
+                    + "`data.code` == SALON_DELETION_BLOCKED, never on `message`. Direct the owner "
+                    + "to contact support — this is not self-service-resolvable.",
+            content = @io.swagger.v3.oas.annotations.media.Content(
+                    schema = @io.swagger.v3.oas.annotations.media.Schema(
+                            implementation = com.beautica.salon.dto.SalonDeletionBlockedResponse.class)))
     @DeleteMapping("/{salonId}")
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<Void> deactivateSalon(
@@ -135,13 +216,26 @@ public class SalonController {
         return ResponseEntity.noContent().build();
     }
 
-    // SALON_OWNER may remove any admin from a salon they own; SALON_ADMIN may remove another
-    // admin from their own salon only. canManageSalon enforces the salon-scoping half of that;
+    // OWNER-ONLY (Phase 299 D7, supersedes D4). This now HARD-DELETES the admin's account
+    // (SalonService#removeAdmin javadoc has the full rationale) instead of only clearing
+    // salon_id, and can newly return 409 when the admin's user is also referenced as a client
+    // elsewhere (SalonService D2 audit). Still 204 on success — mobile's remove-admin flow was
+    // checked to already treat any non-204 as failure.
+    //
+    // D4 had left this admin-callable on the theory that an admin has no calendar/clients/reviews
+    // to lose. That measured blast radius in SALON DATA, which was the right frame while removal
+    // only nulled a column. It is the wrong frame now: the object destroyed is the PERSON'S
+    // ACCOUNT, so admin removal and master removal (Phase 297 D5, already owner-only) are the
+    // identical operation. D4's own premise — "removeAdmin may be admin-callable because it only
+    // nulls a column; this endpoint hard-deletes a person's account" — was falsified by this
+    // phase's D1, so the conclusion is narrowed to match: an owner-grade mutation gets an
+    // owner-grade gate. canManageSalon is KEPT alongside the role check — it is what enforces
+    // that THIS owner owns THIS salon; dropping it would let any owner reach any salon's admins.
     // adminBelongsToSalon additionally confirms #userId is actually a SALON_ADMIN assigned to
     // #salonId — without it a caller with management access to Salon A could probe arbitrary
     // user UUIDs and distinguish "exists elsewhere" from "not an admin" via 403 vs 404 (IDOR).
     @DeleteMapping("/{salonId}/admins/{userId}")
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') "
+    @PreAuthorize("hasRole('SALON_OWNER') "
             + "and @authz.canManageSalon(authentication, #salonId) "
             + "and @authz.adminBelongsToSalon(#userId, #salonId)")
     public ResponseEntity<Void> removeAdmin(
@@ -175,5 +269,44 @@ public class SalonController {
         SalonAdminResponse response =
                 salonService.rotateAdmin(actorId, salonId, userId, request.destinationSalonId());
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    // SALON_OWNER/SALON_ADMIN manage their salon's outbound invites. canManageSalon enforces the
+    // same salon-scoping as updateSalon/inviteMaster above (owner-of-this-salon or
+    // admin-assigned-to-this-salon); a caller without access is denied before either method runs.
+    @Operation(summary = "List the salon's invite history",
+            description = """
+                    Returns every invite the salon has ever dispatched — pending, accepted, \
+                    expired and cancelled alike — newest-first by createdAt, under \
+                    `data.invites`. `status` is derived per row at read time and is one of \
+                    PENDING, ACCEPTED, EXPIRED, CANCELLED; only a PENDING invite can be \
+                    cancelled. The token value is never exposed. Capped at the 200 most recent \
+                    invites; `data.truncated` is true when older invites exist beyond that cap \
+                    and are not included.""")
+    @GetMapping("/{salonId}/invites")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<SalonInviteHistoryResponse> listSalonInvites(
+            @PathVariable UUID salonId
+    ) {
+        return ApiResponse.ok(salonService.listSalonInvites(salonId));
+    }
+
+    @Operation(summary = "Cancel a pending invite",
+            description = """
+                    Revokes an invite that is still PENDING. The row is kept as history, \
+                    relabelled CANCELLED. Any invite that is not PENDING — already accepted, \
+                    already cancelled, superseded by a re-invite, or simply lapsed — returns 404, \
+                    as does an invite belonging to another salon: a non-pending invite must never \
+                    have its recorded outcome rewritten.""")
+    @DeleteMapping("/{salonId}/invites/{inviteId}")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ResponseEntity<Void> cancelInvite(
+            @PathVariable UUID salonId,
+            @PathVariable UUID inviteId,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        salonService.cancelInvite(actorId, salonId, inviteId);
+        return ResponseEntity.noContent().build();
     }
 }

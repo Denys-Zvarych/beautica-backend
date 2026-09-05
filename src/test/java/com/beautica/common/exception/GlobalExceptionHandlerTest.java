@@ -13,6 +13,7 @@ import com.beautica.booking.enums.BookingStatus;
 import com.beautica.common.ApiResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
@@ -31,6 +32,8 @@ import org.springframework.core.MethodParameter;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DeadlockLoserDataAccessException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -46,13 +49,17 @@ import org.springframework.validation.BeanPropertyBindingResult;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.NoHandlerFoundException;
 
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -808,6 +815,74 @@ class GlobalExceptionHandlerTest {
                 .isFalse();
     }
 
+    @Test
+    @DisplayName("handleInviteToken (phase 285) — status reads ex.getStatus(), not a hardcoded value, "
+            + "and the body carries the typed InviteTokenException.Code")
+    void should_returnExStatusWithCode_when_inviteTokenExceptionThrown() {
+        // Arrange — accept's token-not-found case: 404, NOT 400, and this handler must honour that
+        // per-throw-site status rather than fixing one status the way handleVerification fixes 400.
+        var ex = new InviteTokenException(
+                InviteTokenException.Code.INVITE_NOT_FOUND, HttpStatus.NOT_FOUND, "Invite token not found");
+
+        // Act
+        ResponseEntity<ApiResponse<com.beautica.auth.dto.InviteErrorResponse>> response =
+                handler.handleInviteToken(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("handleInviteToken must read ex.getStatus(), not hardcode 400/404/409")
+                .isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getBody().data().code())
+                .as("code must be the stable INVITE_NOT_FOUND constant the mobile client branches on")
+                .isEqualTo(InviteTokenException.Code.INVITE_NOT_FOUND.name());
+        // Message is now hardcoded per Code in the handler, not echoed from ex.getMessage()
+        // (structural guard against a future dynamic detail reaching the wire) — the exception
+        // was constructed above with a distinct message ("Invite token not found") specifically
+        // to prove the handler does NOT echo it.
+        assertThat(response.getBody().message()).isEqualTo("Invalid or expired invite token");
+    }
+
+    @Test
+    @DisplayName("handleInviteToken — honours a 409 CONFLICT status (INVITE_SALON_INACTIVE) exactly "
+            + "as it honours 400/404, proving the status is not hardcoded per-status either")
+    void should_return409_when_inviteTokenExceptionCarriesConflictStatus() {
+        var ex = new InviteTokenException(
+                InviteTokenException.Code.INVITE_SALON_INACTIVE, "This salon is no longer active");
+
+        ResponseEntity<ApiResponse<com.beautica.auth.dto.InviteErrorResponse>> response =
+                handler.handleInviteToken(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().data().code())
+                .isEqualTo(InviteTokenException.Code.INVITE_SALON_INACTIVE.name());
+    }
+
+    @Test
+    @DisplayName("handleInviteToken — emits DEBUG log marker carrying the code, no email/PII")
+    void should_emitDebugLog_when_inviteTokenExceptionThrown() {
+        var ex = new InviteTokenException(InviteTokenException.Code.INVITE_USED, "This invite has already been used");
+        listAppender.list.clear();
+
+        handler.handleInviteToken(ex);
+
+        List<ILoggingEvent> debugEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.DEBUG)
+                .toList();
+        assertThat(debugEvents)
+                .as("handleInviteToken must emit exactly one DEBUG log for server-side triage")
+                .hasSize(1);
+        assertThat(debugEvents.get(0).getFormattedMessage())
+                .as("DEBUG log must carry the code, not a raw message that might one day include PII")
+                .contains("INVITE_USED");
+        boolean emailShapedLogged = listAppender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(m -> m.matches(".*\\S+@\\S+.*"));
+        assertThat(emailShapedLogged)
+                .as("no log event may contain an email-shaped substring — PII at any level")
+                .isFalse();
+    }
+
     /**
      * Minimal, fully-hydrated {@link Booking} fixture used to construct a
      * {@link ClientBookingConflictException} — mirrors the fixture style in
@@ -913,6 +988,74 @@ class GlobalExceptionHandlerTest {
         assertThat(debugEvents.get(0).getFormattedMessage())
                 .as("DEBUG log must contain the non-PII exception class marker")
                 .contains("ClientBookingConflictException");
+    }
+
+    // ── handleSalonDeletionBlocked (Phase 290) ──────────────────────────────────
+    // QA audit (2026-09-03) gap fix — GlobalExceptionHandlerTest had zero coverage of this
+    // handler despite testing every other typed exception's DTO mapping (see the
+    // ClientBookingConflict pair immediately above, whose shape this mirrors). Without this test,
+    // a bug in SalonDeletionBlockedResponse.from(ex) — or a stray HttpStatus.BAD_REQUEST typo —
+    // could ship with the WHOLE suite green: SalonStaffDeactivationCascadeIT only asserts the
+    // exception TYPE thrown by the service (isInstanceOf(SalonDeletionBlockedException.class)),
+    // never what the handler turns it into on the wire.
+
+    @Test
+    @DisplayName("Should return 409 with SALON_DELETION_BLOCKED code and affectedStaffCount "
+            + "when SalonDeletionBlockedException is thrown")
+    void should_return409WithSalonDeletionBlockedCode_when_salonDeletionBlockedExceptionThrown() {
+        // Arrange
+        var ex = new SalonDeletionBlockedException(2);
+
+        // Act
+        ResponseEntity<ApiResponse<SalonDeletionBlockedResponse>> response =
+                handler.handleSalonDeletionBlocked(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("a blocked salon deletion must map to 409")
+                .isEqualTo(HttpStatus.CONFLICT);
+
+        assertThat(response.getBody().success())
+                .as("success must be false")
+                .isFalse();
+
+        // Reference the constant — a rename of SalonDeletionBlockedException.ERROR_CODE must fail
+        // this test, not silently break the mobile client's branch on this 409's data.code.
+        assertThat(response.getBody().data().code())
+                .as("code must be the stable SALON_DELETION_BLOCKED constant")
+                .isEqualTo(SalonDeletionBlockedException.ERROR_CODE);
+
+        assertThat(response.getBody().data().affectedStaffCount())
+                .as("the DISTINCT-staff count computed by the service must reach the wire unchanged")
+                .isEqualTo(2);
+
+        assertThat(response.getBody().message())
+                .as("the top-level message must never echo internal audit detail — code carries "
+                        + "the machine-readable signal")
+                .isEqualTo("Salon cannot be deleted — contact support");
+    }
+
+    @Test
+    @DisplayName("handleSalonDeletionBlocked — emits WARN log, not DEBUG, with affectedStaffCount")
+    void should_emitWarnLog_when_salonDeletionBlockedExceptionThrown() {
+        var ex = new SalonDeletionBlockedException(3);
+        listAppender.list.clear();
+
+        handler.handleSalonDeletionBlocked(ex);
+
+        // This 409 is deliberately logged at WARN, not DEBUG like the other typed 409s (the
+        // handler's own javadoc: "NOT expected user input ... an operational signal worth
+        // surfacing"). A regression to log.debug(...) would silently drop this from default
+        // production log levels — worth its own assertion, not just "some log line exists".
+        List<ILoggingEvent> warnEvents = listAppender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .toList();
+        assertThat(warnEvents)
+                .as("handleSalonDeletionBlocked must emit exactly one WARN log")
+                .hasSize(1);
+        assertThat(warnEvents.get(0).getFormattedMessage())
+                .as("WARN log must carry the affected-staff count for operator triage")
+                .contains("affectedStaffCount=3");
     }
 
     // ── handleBookingElapsed (track 24.x read-only-after-elapse) ───────────────
@@ -1222,6 +1365,104 @@ class GlobalExceptionHandlerTest {
         assertThat(anyLouderLevel)
                 .as("a bounded lock-wait timeout must never be logged at WARN/ERROR")
                 .isFalse();
+    }
+
+    // ── 405 / 406 / 404 — the resolver-shadowing family ───────────────────────
+
+    /**
+     * Anti-Bug §N: every handler in this advice is unit-tested. The ORDERING half — that Spring
+     * reaches this method at all rather than {@code handleGeneric} — cannot be asserted here and
+     * is pinned by {@code GlobalExceptionHandlerResolverOrderTest}; the two are a pair.
+     */
+    @Test
+    @DisplayName("handleMethodNotSupported returns 405 with an Allow header and no leaked detail")
+    void should_return405WithAllowHeader_when_methodNotSupported() {
+        var ex = new HttpRequestMethodNotSupportedException("GET", Set.of("POST"));
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMethodNotSupported(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().success()).isFalse();
+        assertThat(response.getHeaders().get(HttpHeaders.ALLOW))
+                .as("RFC 9110 §15.5.6 requires Allow on every 405 — this is what "
+                        + "DefaultHandlerExceptionResolver used to emit before the catch-all "
+                        + "shadowed it")
+                .containsExactly("POST");
+    }
+
+    @Test
+    @DisplayName("handleMethodNotSupported logs at DEBUG with no throwable attached")
+    void should_logAtDebugWithoutStackTrace_when_methodNotSupported() {
+        handler.handleMethodNotSupported(new HttpRequestMethodNotSupportedException("GET", Set.of("POST")));
+
+        assertThat(listAppender.list)
+                .as("this is client error on an unauthenticated-reachable surface; an ERROR-level "
+                        + "stack trace per request is a log-volume amplifier")
+                .allMatch(e -> e.getLevel() == Level.DEBUG && e.getThrowableProxy() == null);
+    }
+
+    /**
+     * A 405 with no {@code supportedMethods} is possible (Spring's own constructor allows it), and
+     * an unguarded {@code toArray} on a null set would turn the handler ITSELF into the 500 it
+     * exists to prevent.
+     */
+    @Test
+    @DisplayName("handleMethodNotSupported still returns 405 when no supported methods are known")
+    void should_return405WithoutAllowHeader_when_supportedMethodsAreUnknown() {
+        var ex = new HttpRequestMethodNotSupportedException("GET");
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMethodNotSupported(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.METHOD_NOT_ALLOWED);
+        assertThat(response.getHeaders().get(HttpHeaders.ALLOW)).isNull();
+    }
+
+    /**
+     * The body MUST be null. An {@link ApiResponse} envelope cannot be written to a caller whose
+     * {@code Accept} header is what raised the exception, so
+     * {@code AbstractMessageConverterMethodProcessor} re-throws and
+     * {@code ExceptionHandlerExceptionResolver} logs a full stack trace at WARN — moving the
+     * anonymous log-flooding vector from {@code com.beautica} ERROR to {@code org.springframework}
+     * WARN rather than closing it. A null body short-circuits negotiation entirely, which is what
+     * Spring's own {@code ResponseEntityExceptionHandler} does. The wire-level proof lives in
+     * {@code GlobalExceptionHandlerResolverOrderTest}; this asserts the contract at the source.
+     */
+    @Test
+    @DisplayName("handleMediaTypeNotAcceptable returns 406 with an unwritable-by-design empty body")
+    void should_return406_when_acceptHeaderUnsatisfiable() {
+        var ex = new HttpMediaTypeNotAcceptableException(List.of(org.springframework.http.MediaType.APPLICATION_JSON));
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleMediaTypeNotAcceptable(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_ACCEPTABLE);
+        assertThat(response.getBody())
+                .as("a non-null body cannot be serialised to a client that refuses JSON and costs "
+                        + "a WARN-level stack trace per request")
+                .isNull();
+        assertThat(listAppender.list).allMatch(e -> e.getLevel() == Level.DEBUG);
+    }
+
+    /**
+     * {@link NoHandlerFoundException} cannot fire in the current configuration — it is handled
+     * defensively so that flipping {@code spring.web.resources.add-mappings} to false (a normal
+     * thing to do on an API-only service) cannot silently reopen a 500-with-stack-trace path for
+     * every unmatched URL. The handler is therefore unreachable-by-configuration, not dead: this
+     * test is what keeps it correct until the day it becomes reachable.
+     */
+    @Test
+    @DisplayName("handleNoHandlerFound returns 404 at DEBUG and echoes no request detail to the client")
+    void should_return404_when_noHandlerFound() {
+        var ex = new NoHandlerFoundException(HttpMethod.GET.name(), "/api/v1/nope", HttpHeaders.EMPTY);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleNoHandlerFound(ex);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().message())
+                .as("the requested URL must not be reflected back into the response body")
+                .doesNotContain("/api/v1/nope");
+        assertThat(listAppender.list).allMatch(e -> e.getLevel() == Level.DEBUG);
     }
 
     /**

@@ -118,6 +118,17 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * .serviceDefinition} (service name) so the whole {@link MyReviewResponse} row is built in
      * ONE SQL statement — no N+1, no lazy traversal at mapping time.
      *
+     * <p><b>{@code m.user} is a {@code LEFT JOIN} and must stay one</b> (V157 / phase 294 D1 —
+     * 2026-09 audit finding 6). It was an INNER join, which made a client's OWN authored review
+     * DISAPPEAR from {@code GET /reviews/me} the moment the master they reviewed was detached (staff
+     * {@code users} row hard-deleted) — the client's own writing, silently gone, with the paged
+     * {@code totalElements} still counting it (the count query never joined {@code m.user}). The two
+     * name columns {@code COALESCE} onto the V157 {@code detached_*} snapshot, i.e. exactly what
+     * {@code Master#displayFirstName()}/{@code displayLastName()} return, so this list keeps naming
+     * the provider the client actually saw. This is the client's OWN receipt, which the 2026-09-04
+     * product decision explicitly covers — unlike the anonymous salon listing
+     * ({@code SalonReviewResponse}), which masks the name instead.
+     *
      * <p>Filters strictly on {@code r.client.id = :clientId}: the caller-supplied id always
      * originates from the authenticated principal, never a request parameter (principal scoping).
      * {@code ORDER BY r.createdAt DESC} is hardcoded; the service strips any caller-supplied
@@ -127,8 +138,8 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             SELECT new com.beautica.review.dto.MyReviewResponse(
                 r.id,
                 m.id,
-                mu.firstName,
-                mu.lastName,
+                COALESCE(mu.firstName, m.detachedFirstName),
+                COALESCE(mu.lastName, m.detachedLastName),
                 sd.name,
                 CAST(r.rating AS integer),
                 r.comment,
@@ -137,7 +148,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             )
             FROM Review r
             JOIN r.master m
-            JOIN m.user mu
+            LEFT JOIN m.user mu
             JOIN r.booking b
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
@@ -367,12 +378,19 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * <p><strong>Result order is undefined</strong> — same contract as
      * {@link #findByIdsWithGraph}. Callers must reorder using the ID sequence from the
      * {@code findIdsBySalonIdOrderBy...} method that produced {@code ids}.
+     *
+     * <p><b>{@code m.user} is a LEFT fetch and must stay one</b> (V157, phase 294 D1). A review
+     * whose master has been detached (staff account hard-deleted, historical {@code masters} stub
+     * kept) still belongs to the salon and still counts toward its rating; an INNER
+     * {@code JOIN FETCH m.user} would silently drop it from the salon's public review list.
+     * {@code SalonReviewResponse#from} reads the provider name via {@code Master#displayFirstName()}
+     * accordingly.
      */
     @Query("""
             SELECT r FROM Review r
             JOIN FETCH r.client
             JOIN FETCH r.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             JOIN FETCH r.booking b
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition

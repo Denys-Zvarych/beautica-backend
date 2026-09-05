@@ -132,6 +132,10 @@ public record AppointmentDetailResponse(
             String cityLabel, String districtLabel) {
         Booking first = orderedItems.get(0);
         Master master = first.getMaster();
+        // V157 / phase 294 D3 — NULLABLE, exactly as in BookingDetailResponse#from. A visit is a
+        // HISTORICAL record: its master's staff account may have been hard-deleted, leaving a
+        // detached masters stub. The NAME comes from master.displayFirstName()/displayLastName();
+        // every other property read off this reference is null-guarded below.
         User masterUser = master.getUser();
         // Phase 242 — the ITEM's own salon snapshot (bookings.salon_id), NEVER master.getSalon().
         // Every item of a visit is stamped with the same salon at creation (AppointmentService/
@@ -144,9 +148,12 @@ public record AppointmentDetailResponse(
         // Same salon-vs-independent PII rule as BookingDetailResponse#from — the booked salon's own
         // values win outright when the visit was at a salon (even when null), so a salon-master's
         // personal address never leaks onto a salon visit.
-        String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
-        String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
-        String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
+        String resolvedStreet = salon != null ? salon.getStreet()
+                : (masterUser != null ? masterUser.getStreet() : null);
+        String resolvedBuildingNo = salon != null ? salon.getBuildingNo()
+                : (masterUser != null ? masterUser.getBuildingNo() : null);
+        String resolvedLocationNote = salon != null ? salon.getLocationNote()
+                : (masterUser != null ? masterUser.getLocationNote() : null);
 
         // Per-service decline (DECLINED) and no-show (NOT_COMPLETED) lines are excluded from the
         // owed total and total duration — the client must not be shown a price/duration that
@@ -193,11 +200,12 @@ public record AppointmentDetailResponse(
                 appointment.getId(),
                 appointment.getStatus(),
                 master.getId(),
-                masterUser.getFirstName(),
-                masterUser.getLastName(),
-                masterUser.getProfessionalTitle(),
-                masterUser.getAvatarUrl(),
-                masterUser.getRole(),
+                master.displayFirstName(),
+                master.displayLastName(),
+                masterUser != null ? masterUser.getProfessionalTitle() : null,
+                // A detached master has no account: no avatar, no role. Null, never a placeholder.
+                masterUser != null ? masterUser.getAvatarUrl() : null,
+                masterUser != null ? masterUser.getRole() : null,
                 salon != null ? salon.getName() : null,
                 first.getStartsAt().atZoneSameInstant(TimeZones.KYIV),
                 headerEndsAt.atZoneSameInstant(TimeZones.KYIV),

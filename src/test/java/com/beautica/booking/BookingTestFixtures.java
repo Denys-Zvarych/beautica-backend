@@ -82,6 +82,18 @@ public class BookingTestFixtures {
         this.passwordEncoder = passwordEncoder;
     }
 
+    /**
+     * Resolves a real {@code cities.id} row for salon fixtures — mirrors
+     * {@code AbstractIntegrationTest#testCityId()}/{@code ServiceTestFixtures#createSalon}. This
+     * class does not extend {@code AbstractIntegrationTest} (by design, see the class javadoc), so
+     * the tiny query is duplicated here rather than inherited. {@code salons.city_id} is
+     * {@code NOT NULL} as of V150 and carries an FK to {@code cities(id)}.
+     */
+    private UUID testCityId() {
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+    }
+
     public UUID createUser(String email, String role, UUID salonId) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
@@ -217,16 +229,23 @@ public class BookingTestFixtures {
         return ids;
     }
 
-    /** Bundle of a seeded salon graph so tests can address the owner, its salon, and its master. */
-    record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
+    /**
+     * Bundle of a seeded salon graph so tests can address the owner, its salon, and its master.
+     *
+     * <p>Widened from package-private to {@code public} (with {@link #createSalon(String)}) for
+     * {@code com.beautica.master.MasterDetachmentContractIT}, which needs a real {@code salons} row
+     * to hang a salon-scoped review off. Reused rather than re-inlined per the REUSE-FIRST rule —
+     * a fourth hand-rolled "INSERT INTO salons" is exactly how these fixtures drift.
+     */
+    public record SalonFixture(UUID salonId, String ownerEmail, UUID masterId, String masterEmail) {}
 
-    SalonFixture createSalon(String ownerEmail) {
+    public SalonFixture createSalon(String ownerEmail) {
         UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
 
         String masterEmail = "salon-master-" + System.nanoTime() + "@beautica.test";
         UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);

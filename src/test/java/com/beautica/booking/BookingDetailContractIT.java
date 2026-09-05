@@ -634,9 +634,9 @@ class BookingDetailContractIT extends AbstractIntegrationTest {
         // made COALESCE(s.X, mu.X) fall through to the master's own value.
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Contract Bare Salon");
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Contract Bare Salon", testCityId());
 
         String masterEmail = "contract-master-" + System.nanoTime() + "@beautica.test";
         UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);

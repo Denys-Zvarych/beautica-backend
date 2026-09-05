@@ -2,6 +2,7 @@ package com.beautica.notification.service;
 
 import com.beautica.booking.entity.Booking;
 import com.beautica.common.util.SchemeGuard;
+import com.beautica.master.entity.Master;
 import com.beautica.user.User;
 import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
@@ -125,7 +126,7 @@ public class EmailNotificationService {
     public void sendNewBookingEmail(String to, BookingVisit visit) {
         Booking booking = visit.lead();
         var ctx = new Context();
-        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", resolveClientName(booking));
         applyVisitVariables(ctx, visit);
         send(to, "Нове бронювання", "email/new-booking", ctx);
@@ -133,7 +134,7 @@ public class EmailNotificationService {
 
     public void sendBookingRescheduledEmail(String to, Booking booking) {
         var ctx = new Context();
-        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
@@ -147,7 +148,7 @@ public class EmailNotificationService {
      */
     public void sendBookingRescheduledClientEmail(String to, Booking booking) {
         var ctx = new Context();
-        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", fullName(booking.getClient()));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
@@ -184,7 +185,7 @@ public class EmailNotificationService {
         }
         var ctx = new Context();
         ctx.setVariable("clientName", fullName(booking.getClient()));
-        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
         ctx.setVariable("reviewUrl", reviewUrl);
@@ -213,6 +214,49 @@ public class EmailNotificationService {
         ctx.setVariable("startsAt", formatStartsAt(booking));
         ctx.setVariable("bookingUrl", bookingUrl);
         send(to, "Візит завершився — позначте його статус", "email/closure-reminder", ctx);
+    }
+
+    /**
+     * Sends the CLIENT (or, via {@code NotificationService}, notifies a guest by SMS instead) the
+     * "the salon closed and your booking is cancelled" e-mail (Phase 269/293 — {@code
+     * SALON_CLOSED}). Visit-aware for the same reason {@link #sendNewBookingEmail} is: exactly ONE
+     * outbox row is enqueued per VISIT (D12), keyed to the visit's representative booking, and the
+     * template must name every declined service of that visit, not just the representative's.
+     *
+     * <p>Renders only the service name(s) and visit date/time via {@link #applyVisitVariables} —
+     * no booking note of any kind ({@code clientComment}/{@code clientCancellationNote}/
+     * {@code providerComment}) is read here or passed into the template context (locked track-25
+     * rule, D10). {@link BookingVisit} exposes no accessor for any of them, so there is nothing to
+     * accidentally wire in.
+     */
+    public void sendSalonClosedEmail(String to, BookingVisit visit) {
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(visit.lead().getClient()));
+        applyVisitVariables(ctx, visit);
+        send(to, "Салон закрито — ваше бронювання скасовано", "email/salon-closed", ctx);
+    }
+
+    /**
+     * Sends the CLIENT (or, via {@code NotificationService}, notifies a guest by SMS instead) the
+     * "the master left the salon and your booking is cancelled" e-mail (Phase 298 — {@code
+     * MASTER_REMOVED}). Visit-aware for the same reason {@link #sendSalonClosedEmail} is: exactly
+     * ONE outbox row is enqueued per VISIT (D12), keyed to the visit's representative booking, and
+     * the template must name every declined service of that visit, not just the representative's.
+     *
+     * <p>Deliberately NOT a reuse of {@link #sendSalonClosedEmail} — the salon did not close, only
+     * the master left it, and the two facts must never be conflated in client-facing copy.
+     *
+     * <p>Renders only the service name(s) and visit date/time via {@link #applyVisitVariables} —
+     * no booking note of any kind ({@code clientComment}/{@code clientCancellationNote}/
+     * {@code providerComment}) is read here or passed into the template context (locked track-25
+     * rule, D10). {@link BookingVisit} exposes no accessor for any of them, so there is nothing to
+     * accidentally wire in.
+     */
+    public void sendMasterRemovedEmail(String to, BookingVisit visit) {
+        var ctx = new Context();
+        ctx.setVariable("clientName", fullName(visit.lead().getClient()));
+        applyVisitVariables(ctx, visit);
+        send(to, "Майстра більше немає в салоні — ваше бронювання скасовано", "email/master-removed", ctx);
     }
 
     /**
@@ -335,7 +379,7 @@ public class EmailNotificationService {
      */
     public void sendClientCancelledEmail(String to, Booking booking) {
         var ctx = new Context();
-        ctx.setVariable("masterName", fullName(booking.getMaster().getUser()));
+        ctx.setVariable("masterName", masterDisplayName(booking));
         ctx.setVariable("clientName", resolveClientName(booking));
         ctx.setVariable("serviceName", booking.getMasterService().getServiceDefinition().getName());
         ctx.setVariable("startsAt", formatStartsAt(booking));
@@ -387,8 +431,65 @@ public class EmailNotificationService {
         }
     }
 
+    /**
+     * Joins a registered account's name parts, skipping any that are absent (2026-09 audit finding
+     * 10 — the sibling of {@link #masterDisplayName(Booking)}'s defect).
+     *
+     * <p>{@code users.last_name} is NULLABLE ({@code V1__init_schema.sql}); {@code first_name} is
+     * not, but is guarded on the same footing so this helper cannot render the literal string
+     * {@code "null"} into a client- or provider-facing mail body from ANY input. Byte-identical
+     * output to the previous concatenation for every both-parts-present name — the only case any
+     * existing assertion pins.
+     */
     private static String fullName(User user) {
-        return user.getFirstName() + " " + user.getLastName();
+        return joinNameParts(user.getFirstName(), user.getLastName());
+    }
+
+    /**
+     * The single name-joining kernel for this class: {@code "First Last"}, {@code "First"},
+     * {@code "Last"}, or {@code ""} — never {@code "First null"} and never a stray separator.
+     *
+     * <p>Extracted rather than inlined twice so {@link #fullName(User)} and
+     * {@link #masterDisplayName(Booking)} cannot drift on spacing; {@link #resolveClientName(Booking)}
+     * routes its guest branch through it for the same reason.
+     */
+    private static String joinNameParts(String firstName, String lastName) {
+        boolean hasFirst = firstName != null && !firstName.isBlank();
+        boolean hasLast = lastName != null && !lastName.isBlank();
+        if (hasFirst && hasLast) {
+            return firstName + " " + lastName;
+        }
+        if (hasFirst) {
+            return firstName;
+        }
+        return hasLast ? lastName : "";
+    }
+
+    /**
+     * The provider's name for the mail body — {@code Master#displayFirstName()} /
+     * {@code displayLastName()}, never {@code getMaster().getUser()} (V157 / phase 294 D3).
+     *
+     * <p>An email is written about a HISTORICAL booking, and its master's staff account may have
+     * been hard-deleted (salon deletion, 2026-09-04 reversal), leaving a detached {@code masters}
+     * stub whose only content is the name snapshot taken at detach time. Reading the deleted
+     * {@code users} row here would NPE; reading the snapshot renders exactly the name the client
+     * saw when they booked.
+     *
+     * <p>Spacing is byte-identical to {@link #fullName(User)} for every both-parts-present name, so
+     * no rendered mail body changes for any attached master (the existing assertions on
+     * {@code "Майстер Іванов"} and friends are untouched).
+     *
+     * <p><b>Null-handling is NOT the raw concatenation it used to be</b> (2026-09 audit finding 9).
+     * A DETACHED master legitimately carries a null {@code detached_last_name} —
+     * {@code chk_masters_detachment_coherent} (V157) requires only the FIRST name, precisely because
+     * {@code users.last_name} is itself nullable — so the old
+     * {@code displayFirstName() + " " + displayLastName()} rendered the literal
+     * {@code "Олена null"} into a CLIENT-FACING mail body. Both parts now route through
+     * {@link #joinNameParts}, which emits present parts only.
+     */
+    private static String masterDisplayName(Booking booking) {
+        Master master = booking.getMaster();
+        return joinNameParts(master.displayFirstName(), master.displayLastName());
     }
 
     /**
@@ -406,9 +507,10 @@ public class EmailNotificationService {
         if (client != null) {
             return fullName(client);
         }
-        String guestName = booking.getGuestName() == null ? "" : booking.getGuestName();
-        String guestSurname = booking.getGuestSurname() == null ? "" : booking.getGuestSurname();
-        return (guestName + " " + guestSurname).trim();
+        // Routed through the shared kernel (2026-09 audit finding 10) — same output as the previous
+        // null-to-empty + trim() form for every input, including a guest with only one name part,
+        // but now it cannot drift from fullName()/masterDisplayName() on spacing.
+        return joinNameParts(booking.getGuestName(), booking.getGuestSurname());
     }
 
     private static String formatStartsAt(Booking booking) {

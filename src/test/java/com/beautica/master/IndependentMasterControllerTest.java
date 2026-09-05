@@ -190,7 +190,8 @@ class IndependentMasterControllerTest {
                 null, null,         // instagram
                 true,         // isActive
                 true,         // emailVerified
-                null          // salonId
+                null,         // salonId
+                false         // hasMasterProfile — an INDEPENDENT_MASTER's row is not SALON_OWNER-type
         );
     }
 

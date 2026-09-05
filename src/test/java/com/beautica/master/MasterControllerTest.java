@@ -45,6 +45,7 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import com.beautica.master.dto.MasterSummaryResponse;
@@ -284,7 +285,7 @@ class MasterControllerTest {
                 "вул. Хрещатик", "1A", "green door",
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 null, null, null);
-        when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
+        when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(fullDetail));
 
         mockMvc.perform(get(MASTERS_URL + "/me")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -309,7 +310,7 @@ class MasterControllerTest {
                 "вул. Хрещатик", "1A", "green door",
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 cityUuid, oblastUuid, null);
-        when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
+        when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(fullDetail));
 
         mockMvc.perform(get(MASTERS_URL + "/me")
                         .with(authenticatedAs(userId, "master@beautica.test", Role.INDEPENDENT_MASTER))
@@ -344,7 +345,7 @@ class MasterControllerTest {
                 cityUuid, oblastUuid, districtUuid);
 
         // Controller now delegates to a single getMyMasterDetail(UUID) call — stub that method only.
-        when(masterService.getMyMasterDetail(userId)).thenReturn(fullDetail);
+        when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(fullDetail));
 
         log.debug("Act: GET {}/me as INDEPENDENT_MASTER — must return 200 with own full profile", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL + "/me")
@@ -405,15 +406,62 @@ class MasterControllerTest {
     }
 
     @Test
-    @DisplayName("GET /me — 403 when SALON_OWNER requests own profile (role not permitted)")
-    void should_return403_when_salonOwnerRequestsOwnProfile() throws Exception {
-        var ownerId = UUID.randomUUID();
+    @DisplayName("GET /me — 403 when SALON_ADMIN requests own profile (role not permitted)")
+    void should_return403_when_salonAdminRequestsOwnProfile() throws Exception {
+        var adminId = UUID.randomUUID();
 
-        log.debug("Act: GET {}/me as SALON_OWNER — must be denied with 403", MASTERS_URL);
+        log.debug("Act: GET {}/me as SALON_ADMIN — must be denied with 403", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(adminId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        // The role gate, not the service, must be what denies an admin — an unstubbed call here
+        // would have returned null and 200 rather than 403.
+        verify(masterService, never()).findMyMasterDetail(any());
+    }
+
+    /**
+     * Phase 265 inverted this case: it previously asserted 403 for a {@code SALON_OWNER}.
+     * The owner-as-master toggle («Я також працюю як майстер») gives an opted-in owner an active
+     * {@code masterType = SALON_OWNER} row, which {@code findMyMasterDetail}'s
+     * {@code findActiveByUserIdWithUserAndSalon} lookup has always resolved — only the
+     * {@code @PreAuthorize} stood in the way.
+     */
+    @Test
+    @DisplayName("GET /me — 200 when an opted-in SALON_OWNER requests own master profile (Phase 265)")
+    void should_return200_when_salonOwnerWithMasterProfileRequestsOwnProfile() throws Exception {
+        var ownerId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        when(masterService.findMyMasterDetail(ownerId)).thenReturn(Optional.of(stubMasterDetail(masterId, ownerId)));
+
+        log.debug("Act: GET {}/me as SALON_OWNER — must return 200 with own profile", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL + "/me")
                         .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
                         .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()));
+    }
+
+    @Test
+    @DisplayName("GET /me — 404, NOT 403, when a SALON_OWNER has no active owner-master row (Phase 265)")
+    void should_return404_when_salonOwnerHasNoActiveOwnerMasterRow() throws Exception {
+        var ownerId = UUID.randomUUID();
+
+        // Toggled OFF (the row is deactivated, never hard-deleted) or never opted in — both reach
+        // the service and both raise NotFoundException from the active-row lookup.
+        // Audit-fix cycle 2 — the service no longer throws; it returns an empty Optional so the
+        // miss can be negatively cached. The 404 is now produced by MasterController#getMyProfile's
+        // orElseThrow, which is exactly what this test must pin: an empty Optional reaching the
+        // controller MUST still surface as 404 and never as 403, 200-with-null, or a 500.
+        when(masterService.findMyMasterDetail(ownerId)).thenReturn(Optional.empty());
+
+        log.debug("Act: GET {}/me as opted-out SALON_OWNER — must be 404, not 403", MASTERS_URL);
+        mockMvc.perform(get(MASTERS_URL + "/me")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
     }
 
     @Test
@@ -422,7 +470,7 @@ class MasterControllerTest {
         var userId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
 
-        when(masterService.getMyMasterDetail(userId)).thenReturn(stubMasterDetail(masterId, userId));
+        when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(stubMasterDetail(masterId, userId)));
 
         log.debug("Act: GET {}/me as SALON_MASTER — must return 200 with profile", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL + "/me")
@@ -437,8 +485,9 @@ class MasterControllerTest {
     void should_return404_when_masterRecordDoesNotExist() throws Exception {
         var userId = UUID.randomUUID();
 
-        when(masterService.getMyMasterDetail(userId))
-                .thenThrow(new NotFoundException("Master not found"));
+        // Audit-fix cycle 2 — empty Optional (negatively cacheable) replaces the thrown
+        // NotFoundException; the controller's orElseThrow is what turns it into 404.
+        when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.empty());
 
         log.debug("Act: GET {}/me as INDEPENDENT_MASTER with no master record — must return 404", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL + "/me")

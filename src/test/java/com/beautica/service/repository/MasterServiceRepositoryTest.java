@@ -742,7 +742,8 @@ class MasterServiceRepositoryTest extends AbstractDataJpaTest {
                 "Owner",
                 "+380501111111");
         em.persist(owner);
-        Salon salon = Salon.builder().owner(owner).name("Dedup Salon").isActive(true).build();
+        Salon salon = Salon.builder()
+                .cityId(testCityId()).owner(owner).name("Dedup Salon").isActive(true).build();
         em.persist(salon);
 
         User masterUserA = new User(

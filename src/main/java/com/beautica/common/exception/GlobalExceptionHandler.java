@@ -2,9 +2,11 @@ package com.beautica.common.exception;
 
 import com.beautica.auth.dto.EmailAlreadyRegisteredResponse;
 import com.beautica.auth.dto.EmailNotVerifiedResponse;
+import com.beautica.auth.dto.InviteErrorResponse;
 import com.beautica.booking.dto.BookingElapsedResponse;
 import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
+import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
@@ -25,12 +27,15 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.LinkedHashMap;
@@ -186,6 +191,74 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         DuplicateServiceResponse.from(ex),
                         "This service already exists"));
+    }
+
+    /**
+     * Distinct 409 for a salon deletion Phase 289's staff-as-client safety audit blocks (Phase
+     * 290) — the fail-closed precondition on {@code SalonService.deactivateSalon} found a
+     * violation for the salon being deleted and aborted before any mutation ran.
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured
+     * {@link SalonDeletionBlockedResponse} body — carrying the {@code SALON_DELETION_BLOCKED}
+     * code — is emitted instead of the generic conflict message. Logged at WARN, not DEBUG like
+     * the other typed 409s above: this one is NOT expected user input (a violating row can only
+     * exist via a seed/fixture script bypassing the service layer — see the phase 289 doc's
+     * {@code ## Background}), so it is an operational signal worth surfacing, not ordinary flow
+     * control.
+     */
+    @ExceptionHandler(SalonDeletionBlockedException.class)
+    public ResponseEntity<ApiResponse<SalonDeletionBlockedResponse>> handleSalonDeletionBlocked(
+            SalonDeletionBlockedException ex) {
+        log.warn("Salon deletion blocked by staff-as-client safety audit: affectedStaffCount={}",
+                ex.getAffectedStaffCount());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(new ApiResponse<>(false,
+                        SalonDeletionBlockedResponse.from(ex),
+                        "Salon cannot be deleted — contact support"));
+    }
+
+    /**
+     * Typed invite-token failure codes (phase 285) — distinguishes token-not-found / used /
+     * expired / revoked / salon-inactive via {@code data.code}, replacing the single genericised
+     * BAD_REQUEST/CONFLICT body {@link #handleBusiness} used to emit for every one of them
+     * (see {@link InviteTokenException}'s javadoc for why the codes were previously collapsed and
+     * why that is reversed as of phase 285).
+     *
+     * <p>Unlike every other typed handler in this class, the status is NOT hardcoded here — the
+     * case space genuinely spans 400/404/409 (again, see {@link InviteTokenException}), so this
+     * reads {@code ex.getStatus()} rather than fixing one status the way {@link #handleVerification}
+     * fixes 400 for every {@code VerificationException.Code}.
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured {@link InviteErrorResponse}
+     * body is emitted instead of the generic status-genericised message.
+     *
+     * <p><strong>The client-facing {@code message} is hardcoded per {@link InviteTokenException.Code}
+     * here, never {@code ex.getMessage()}.</strong> Every current {@code InviteService} throw site
+     * happens to pass a static literal, but nothing stops a future contributor from interpolating a
+     * salon name, invitee email, or token fragment into one of those messages — which would ship
+     * straight to the wire the way {@link #handleBusiness} deliberately avoids for its
+     * {@code CONFLICT}/{@code BAD_REQUEST} branches. Reading {@code ex.getMessage()} here would
+     * defeat that same discipline for this handler alone, so the mapping below is a structural
+     * guard, not a convention: the wire message cannot vary with what a throw site passes, no
+     * matter what future code does. {@code data.code} — the discriminator the mobile client
+     * actually branches on (phase 285/304) — is unaffected; these strings are human prose only.
+     */
+    @ExceptionHandler(InviteTokenException.class)
+    public ResponseEntity<ApiResponse<InviteErrorResponse>> handleInviteToken(InviteTokenException ex) {
+        log.debug("Invite token rejected: {}", ex.getCode());
+        String clientMessage = switch (ex.getCode()) {
+            case INVITE_NOT_FOUND -> "Invalid or expired invite token";
+            case INVITE_EXPIRED -> "This invite has expired";
+            case INVITE_USED -> "This invite has already been used";
+            case INVITE_REVOKED -> "This invite is no longer valid";
+            case INVITE_SALON_INACTIVE -> "This salon is no longer active";
+        };
+        return ResponseEntity
+                .status(ex.getStatus())
+                .body(new ApiResponse<>(false, new InviteErrorResponse(ex.getCode().name()), clientMessage));
     }
 
     @ExceptionHandler(BusinessException.class)
@@ -553,6 +626,90 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.PAYLOAD_TOO_LARGE)
                 .body(ApiResponse.error("Upload exceeds the maximum allowed size"));
+    }
+
+    /**
+     * Wrong HTTP verb on an existing path — e.g. {@code GET /api/v1/book/{slug}/booking}, which
+     * only maps {@code POST}.
+     *
+     * <h3>Why this handler is load-bearing and not cosmetic</h3>
+     * Spring resolves handler exceptions through an ordered chain:
+     * {@code ExceptionHandlerExceptionResolver} (order 0, i.e. THIS advice) runs BEFORE
+     * {@code DefaultHandlerExceptionResolver} (order 2), which is the component that would
+     * otherwise turn {@link HttpRequestMethodNotSupportedException} into a proper 405. With no
+     * handler here, {@link #handleGeneric}'s {@code @ExceptionHandler(Exception.class)} matched
+     * first and SHADOWED the framework's mapping: every wrong-verb request returned HTTP 500 and
+     * wrote {@code log.error("Unhandled exception", ex)} with a full stack trace.
+     *
+     * <p>That was reachable without credentials. {@code /api/v1/book/**} is {@code permitAll} for
+     * the guest-booking flow, so an anonymous caller looping {@code GET /api/v1/book/x/booking}
+     * produced an unbounded stream of ERROR-level stack traces — log-volume exhaustion on a
+     * metered host, and noise that buries real incidents. A wrong verb is client error, so it
+     * belongs at DEBUG.
+     *
+     * <p>The {@code Allow} header is required by RFC 9110 §15.5.6 on every 405 and is exactly what
+     * {@code DefaultHandlerExceptionResolver} would have emitted; it discloses nothing an
+     * {@code OPTIONS} request would not.
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethodNotSupported(
+            HttpRequestMethodNotSupportedException ex) {
+        log.debug("Method not allowed: {}", ex.getMethod());
+        var response = ResponseEntity.status(HttpStatus.METHOD_NOT_ALLOWED);
+        var supported = ex.getSupportedHttpMethods();
+        if (supported != null && !supported.isEmpty()) {
+            response.allow(supported.toArray(new org.springframework.http.HttpMethod[0]));
+        }
+        return response.body(ApiResponse.error("Request method not supported"));
+    }
+
+    /**
+     * The caller's {@code Accept} header matches nothing this endpoint can produce. Shadowed into
+     * a 500 by {@link #handleGeneric} for exactly the same resolver-ordering reason as
+     * {@link #handleMethodNotSupported} — and reachable from the same unauthenticated surface,
+     * since {@code Accept} is caller-controlled on every request including {@code permitAll} ones.
+     * 406 is the correct status; the response carries no body, so it discloses nothing about what
+     * the endpoint does produce.
+     *
+     * <p><strong>The empty body is the fix, not an oversight.</strong> Returning an
+     * {@link ApiResponse} envelope here is self-defeating by definition: the exception fired
+     * BECAUSE the caller's {@code Accept} header excludes JSON, so Jackson cannot write the
+     * envelope either. {@code AbstractMessageConverterMethodProcessor} re-runs content negotiation
+     * on the handler's own return value, fails again, and re-throws — at which point
+     * {@code ExceptionHandlerExceptionResolver} logs a FULL STACK TRACE at WARN under
+     * {@code org.springframework}, which {@code application.yml} leaves WARN-enabled in prod. That
+     * simply moves the anonymous log-flooding vector from {@code com.beautica} ERROR to Spring
+     * WARN; the caller loops {@code Accept: image/jpeg} and mints stack traces either way. With a
+     * {@code null} body the processor returns early without negotiating, which is exactly what
+     * Spring's own {@code ResponseEntityExceptionHandler} does for this exception.
+     */
+    @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMediaTypeNotAcceptable(
+            HttpMediaTypeNotAcceptableException ex) {
+        log.debug("Not acceptable — {}", ex.getClass().getSimpleName());
+        return ResponseEntity.status(HttpStatus.NOT_ACCEPTABLE).build();
+    }
+
+    /**
+     * Defensive companion to {@link #handleNoResourceFound}. {@link NoHandlerFoundException}
+     * CANNOT fire in the current configuration — Spring only throws it when
+     * {@code spring.mvc.throw-exception-if-no-handler-found} is on AND
+     * {@code spring.web.resources.add-mappings} is off, and this repository sets neither (the
+     * default resource mapping catches every unmatched path and raises
+     * {@link NoResourceFoundException} instead).
+     *
+     * <p>It exists anyway because the day someone disables {@code add-mappings} — a normal thing
+     * to do on an API-only service — the unmatched-path branch would silently move onto
+     * {@link #handleGeneric} and start returning HTTP 500 with a stack trace for every 404-shaped
+     * request, i.e. the exact defect {@link #handleMethodNotSupported} documents, re-opened by a
+     * one-line property change. Three lines now cost less than that regression.
+     */
+    @ExceptionHandler(NoHandlerFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNoHandlerFound(NoHandlerFoundException ex) {
+        log.debug("No handler for {} {}", ex.getHttpMethod(), ex.getRequestURL());
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error("Resource not found"));
     }
 
     @ExceptionHandler(Exception.class)

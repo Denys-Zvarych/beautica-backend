@@ -36,6 +36,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import com.beautica.common.exception.BusinessException;
+import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 
 import java.time.LocalDate;
@@ -57,6 +58,17 @@ public class BookingController {
      */
     private static final Pattern IDEMPOTENCY_KEY_PATTERN =
             Pattern.compile("^[A-Za-z0-9\\-_]{1,64}$");
+
+    /**
+     * Giant-OFFSET clamp ceiling shared by every paginated booking list route (Anti-Bug §J /
+     * SEC-MEDIUM-3): a caller-supplied page number beyond this is silently clamped down to it
+     * rather than executed as-is, so an attacker cannot force an ever-deeper {@code OFFSET} scan
+     * by walking {@code page} up. Phase 23.4 audit fix, Finding 4 (LOW, backend-qa) — previously
+     * duplicated verbatim in both {@link #listMyBookings} and {@link #getSalonBookings}; extracted
+     * to {@link #clampGiantOffset(Pageable)} so there is exactly one implementation to test and
+     * keep in sync.
+     */
+    private static final int MAX_CLAMPED_PAGE_NUMBER = 1000;
 
     private final BookingService bookingService;
 
@@ -156,12 +168,9 @@ public class BookingController {
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
-        // Cap page number to prevent giant OFFSET scans (Anti-Bug §J / SEC-MEDIUM-3).
-        if (pageable.getPageNumber() > 1000) {
-            pageable = PageRequest.of(1000, pageable.getPageSize(), pageable.getSort());
-        }
         return ApiResponse.ok(bookingService.getMyBookings(
-                AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, partition, pageable));
+                AuthenticationUtils.userId(auth), auth, status, from, to, serviceId, partition,
+                clampGiantOffset(pageable)));
     }
 
     // Phase 29.4: three path segments (/me/unclosed-count), same collision-avoidance rationale as
@@ -191,6 +200,61 @@ public class BookingController {
     ) {
         return ApiResponse.ok(bookingService.getMyBookedDays(
                 AuthenticationUtils.userId(auth), auth, from, to));
+    }
+
+    /**
+     * Phase 23.4 — {@code GET /bookings/salon/{salonId}}: a single-salon, paginated booking list
+     * for {@code SALON_OWNER}/{@code SALON_ADMIN}, backing the mobile salon "Розклад" tab and the
+     * salon-wide booking list. Distinct from {@code GET /bookings/me} (see {@code
+     * BookingService#getSalonBookings}'s javadoc for the full rationale): that endpoint aggregates
+     * a {@code SALON_OWNER} across every owned salon with no per-salon filter and rejects {@code
+     * SALON_ADMIN} outright — neither guard is touched by this endpoint.
+     *
+     * <p><b>Authorization.</b> {@code hasAnyRole('SALON_OWNER','SALON_ADMIN')} alone would admit
+     * any owner/admin for ANY salon id — {@code @authz.canManageSalon(authentication, #salonId)}
+     * is the per-salon ownership/assignment assertion (Anti-Bug §D: a GET is a read, so the SpEL
+     * {@code can*} form is the canonical placement — the same expression {@code SalonController}
+     * uses for its own owner-or-admin-of-this-salon endpoints). An owner of a DIFFERENT salon, or
+     * an admin assigned elsewhere, gets 403.
+     *
+     * <p>Route is {@code /api/v1/bookings/salon/{salonId}} — three path segments, so it cannot
+     * collide with the two-segment {@code /{bookingId}} above (same collision-avoidance rationale
+     * {@code /me/booked-days} documents; Spring's {@code PathPattern} prefers the literal {@code
+     * salon} segment over the {@code {bookingId}} variable regardless, but the two-segment shape
+     * keeps that unambiguous).
+     */
+    @Operation(summary = "List salon bookings (owner/admin)")
+    @GetMapping("/salon/{salonId}")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<PageResponse<BookingDetailResponse>> getSalonBookings(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Filter to one master's bookings within the salon. Omit for every master.")
+            @RequestParam(required = false) UUID masterId,
+            @Parameter(description = "Filter by a single status. Omit for no status predicate.")
+            @RequestParam(required = false) BookingStatus status,
+            @Parameter(description = "Bookings starting on/after the start of this local day (Europe/Kyiv). "
+                    + "Omit for an open-ended future window.")
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Bookings starting on/before the end of this local day (Europe/Kyiv), "
+                    + "inclusive. Omit for an open-ended past window.")
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
+            Authentication auth
+    ) {
+        return ApiResponse.ok(bookingService.getSalonBookings(
+                AuthenticationUtils.userId(auth), salonId, masterId, status, from, to,
+                clampGiantOffset(pageable)));
+    }
+
+    /**
+     * Clamps a caller-supplied page number down to {@link #MAX_CLAMPED_PAGE_NUMBER} — see that
+     * constant's javadoc. Page size and sort pass through unchanged; only the page index is capped.
+     */
+    private static Pageable clampGiantOffset(Pageable pageable) {
+        if (pageable.getPageNumber() > MAX_CLAMPED_PAGE_NUMBER) {
+            return PageRequest.of(MAX_CLAMPED_PAGE_NUMBER, pageable.getPageSize(), pageable.getSort());
+        }
+        return pageable;
     }
 
     /**

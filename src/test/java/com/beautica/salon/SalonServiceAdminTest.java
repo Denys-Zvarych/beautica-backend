@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.dto.InviteResponse;
@@ -58,6 +59,39 @@ class SalonServiceAdminTest {
 
     @Mock
     private com.beautica.location.LocalityWriteValidator localityWriteValidator;
+
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
+    // getCityId() returns a non-null value (mirrors MasterServiceTest). CityRepository backs
+    // ONLY the batch resolveOblastIdsByCityIds sibling now (getOwnerSalons) — the single-row
+    // resolveOblastId delegates to the shared LocationQueryService below (Phase 240 perf fix).
+    @Mock
+    private com.beautica.location.repository.CityRepository cityRepository;
+
+    @Mock
+    private com.beautica.location.service.LocationQueryService locationQueryService;
+
+    // Audit-fix cycle 2: SalonService evicts the affected user's cached profile after commit
+    // (createSalon, removeAdmin, rotateAdmin all mutate a `users` row). @InjectMocks passes null
+    // for an UNDECLARED collaborator silently, so compileTestJava stays green and the omission
+    // only surfaces as an NPE at runtime — this field must exist even when no test here reaches
+    // an evict call.
+    @Mock
+    private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    // QA audit (2026-09-03): Phase 290/291 added five more constructor collaborators to
+    // SalonService (the salon-deletion staff cascade). None of this file's 3 tests reach
+    // deactivateSalon's happy path today — should_denyDeletion_when_actorIsSalonAdmin throws on
+    // the SALON_OWNER role check before any of these are touched — so @InjectMocks silently
+    // passing null for all five stayed harmless. But that is exactly the landmine shape flagged
+    // elsewhere in this class (see the CityRepository/UserProfileCacheEvictor comments above):
+    // the next author who adds a SALON_OWNER-actor deactivateSalon test here gets a bare NPE with
+    // no indication which of eighteen constructor parameters is the culprit. Declared defensively.
+    @Mock
+    private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
+
+    @Mock
+    private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
     @InjectMocks
     private SalonService salonService;
@@ -140,6 +174,7 @@ class SalonServiceAdminTest {
 
     private Salon buildSalon(UUID id, User owner, String name) {
         var salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .owner(owner)
                 .name(name)
                 .isActive(true)

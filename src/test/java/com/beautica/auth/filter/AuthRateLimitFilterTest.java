@@ -53,6 +53,8 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets;
     @Mock private LoadingCache<String, Bucket> changePasswordOtpBuckets;
     @Mock private LoadingCache<String, Bucket> serviceWriteBuckets;
+    @Mock private LoadingCache<String, Bucket> inviteValidateBuckets;
+    @Mock private LoadingCache<String, Bucket> inviteAcceptBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -66,7 +68,8 @@ class AuthRateLimitFilterTest {
                 resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets,
                 categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
                 supportContactBuckets, otpSendBuckets, verifyPasswordResetOtpBuckets,
-                changePasswordOtpBuckets, serviceWriteBuckets);
+                changePasswordOtpBuckets, serviceWriteBuckets,
+                inviteValidateBuckets, inviteAcceptBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────

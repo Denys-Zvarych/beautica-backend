@@ -5,8 +5,8 @@ package com.beautica.notification.entity;
  *
  * <p>Values must match the DB CHECK constraint {@code chk_outbox_event}
  * defined in {@code V32__create_notification_outbox.sql} and last widened in
- * {@code V109} (via {@code V94}) — keep this enum in lockstep with the current
- * CHECK, not just the V32 original.
+ * {@code V161} (via {@code V94}, {@code V109}, {@code V131}, {@code V156}) — keep this enum in
+ * lockstep with the current CHECK, not just the V32 original.
  * Any divergence causes an {@link IllegalArgumentException} during Hibernate hydration.
  *
  * <p>Using a typed enum instead of a raw {@code String} prevents unknown event names
@@ -42,5 +42,30 @@ public enum OutboxEventType {
      * This is a work-queue reminder, not a status transition: nothing that enqueues or drains this
      * event may ever write {@code bookings.status} — see {@code ClosureReminderArchitectureTest}.
      */
-    CLOSURE_REMINDER
+    CLOSURE_REMINDER,
+
+    /**
+     * Notifies the CLIENT (or guest) that the SALON they had a future booking with was deleted by
+     * its owner and the booking was auto-declined (Phase 269/293). One entry per affected VISIT,
+     * never per booking (D12) — {@code aggregate_id} is the representative booking of the visit
+     * (lowest {@code starts_at}, tied on {@code id}), deduplicated on
+     * {@code coalesce(appointment_id, id)} exactly like the locked one-SMS-per-visit rule
+     * (Phase 260 / 22.13). See {@code SalonService#deactivateSalon} and
+     * {@code BookingService#declineFutureConfirmedBookingsForSalonClosure}.
+     */
+    SALON_CLOSED,
+
+    /**
+     * Notifies the CLIENT (or guest) that the MASTER they had a future booking with was removed
+     * from the salon and the booking was auto-declined (Phase 298). One entry per affected VISIT,
+     * never per booking — same D12 per-visit contract as {@link #SALON_CLOSED} — {@code
+     * aggregate_id} is the representative booking of the visit (lowest {@code starts_at}, tied on
+     * {@code id}), deduplicated on {@code coalesce(appointment_id, id)}.
+     *
+     * <p>Deliberately NOT a reuse of {@link #SALON_CLOSED}: the salon did not close, only the
+     * master left it, and the two facts must never be conflated in billable client-facing copy.
+     * See {@code SalonService#removeMaster} and
+     * {@code BookingService#declineFutureConfirmedBookingsForMasterRemoval}.
+     */
+    MASTER_REMOVED
 }

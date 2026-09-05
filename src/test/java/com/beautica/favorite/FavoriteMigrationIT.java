@@ -1047,9 +1047,9 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, street, building_no, location_note, "
-                        + "is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'Other Salon Street', '99', 'other note', true, NOW(), NOW())",
-                salonId, ownerUserId, name);
+                        + "is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, 'Other Salon Street', '99', 'other note', true, NOW(), NOW(), ?)",
+                salonId, ownerUserId, name, testCityId());
         return salonId;
     }
 
@@ -1110,9 +1110,9 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                 ownerId, ownerEmail);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, 'Test Salon', true, NOW(), NOW())",
-                salonId, ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, 'Test Salon', true, NOW(), NOW(), ?)",
+                salonId, ownerId, testCityId());
         return salonId;
     }
 

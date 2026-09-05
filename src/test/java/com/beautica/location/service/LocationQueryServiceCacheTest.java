@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -70,6 +71,7 @@ class LocationQueryServiceCacheTest {
         cacheManager.getCache("locationOblasts").clear();
         cacheManager.getCache("locationCitiesByOblast").clear();
         cacheManager.getCache("locationDistrictsByCity").clear();
+        cacheManager.getCache("cityOblastId").clear();
     }
 
     @Test
@@ -149,5 +151,65 @@ class LocationQueryServiceCacheTest {
 
         verify(cityDistrictRepository, times(1)).findByCityIdOrderByNameUkAsc(cityA);
         verify(cityDistrictRepository, times(1)).findByCityIdOrderByNameUkAsc(cityB);
+    }
+
+    // ── resolveCityOblastId (Phase 240 perf MEDIUM fix — shared resolver for SalonService and
+    // MasterService, replacing their private uncached copies) ─────────────────────────────────
+
+    @Test
+    @DisplayName("second resolveCityOblastId(sameId) is cached — CityRepository hit once across two calls")
+    void should_notReHitRepository_when_resolveCityOblastIdCalledTwiceWithSameId() {
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        City city = City.builder().id(cityId)
+                .oblast(Oblast.builder().id(oblastId).build())
+                .katotthCode("c").nameUk("Місто").nameEn("City").build();
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(java.util.Optional.of(city));
+
+        UUID first = service.resolveCityOblastId(cityId);
+        UUID second = service.resolveCityOblastId(cityId);
+
+        assertThat(first).isEqualTo(oblastId);
+        assertThat(second).isEqualTo(oblastId);
+        verify(cityRepository, times(1)).findByIdWithOblast(cityId);
+    }
+
+    @Test
+    @DisplayName("resolveCityOblastId caches per cityId — a different city misses and re-queries (Q19 key isolation)")
+    void should_cacheIndependentlyPerCityId_when_differentCitiesRequestedForOblastId() {
+        UUID cityA = UUID.randomUUID();
+        UUID cityB = UUID.randomUUID();
+        UUID oblastA = UUID.randomUUID();
+        UUID oblastB = UUID.randomUUID();
+        City resolvedCityA = City.builder().id(cityA)
+                .oblast(Oblast.builder().id(oblastA).build())
+                .katotthCode("a").nameUk("А").nameEn("A").build();
+        City resolvedCityB = City.builder().id(cityB)
+                .oblast(Oblast.builder().id(oblastB).build())
+                .katotthCode("b").nameUk("Б").nameEn("B").build();
+        when(cityRepository.findByIdWithOblast(cityA)).thenReturn(java.util.Optional.of(resolvedCityA));
+        when(cityRepository.findByIdWithOblast(cityB)).thenReturn(java.util.Optional.of(resolvedCityB));
+
+        assertThat(service.resolveCityOblastId(cityA)).isEqualTo(oblastA); // miss → query
+        assertThat(service.resolveCityOblastId(cityB)).isEqualTo(oblastB); // distinct key → miss → query
+        assertThat(service.resolveCityOblastId(cityA)).isEqualTo(oblastA); // hit
+        assertThat(service.resolveCityOblastId(cityB)).isEqualTo(oblastB); // hit
+
+        verify(cityRepository, times(1)).findByIdWithOblast(cityA);
+        verify(cityRepository, times(1)).findByIdWithOblast(cityB);
+    }
+
+    @Test
+    @DisplayName("resolveCityOblastId returns null (and caches it) when the cityId does not resolve to a known city")
+    void should_returnAndCacheNull_when_resolveCityOblastIdCalledWithUnknownCityId() {
+        UUID cityId = UUID.randomUUID();
+        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(java.util.Optional.empty());
+
+        UUID first = service.resolveCityOblastId(cityId);
+        UUID second = service.resolveCityOblastId(cityId);
+
+        assertThat(first).isNull();
+        assertThat(second).isNull();
+        verify(cityRepository, times(1)).findByIdWithOblast(cityId);
     }
 }

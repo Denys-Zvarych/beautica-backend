@@ -135,8 +135,18 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
     // ── salon favorites — bounded statement count, independent of N ───────────────
 
     /**
-     * Salon counterpart of the master ledger above — same two-N method, same exact bound, and
-     * the same reason the bound moved from 1 to 2. See that test's javadoc.
+     * Salon counterpart of the master ledger above — same two-N method, same "moved from 1 to 2"
+     * category-derivation history. See that test's javadoc for both.
+     *
+     * <p><b>A further, salon-only bump: 2 -&gt; 3 (V150, "a salon must always have a city").</b>
+     * The master ledger's "locality label resolve is batched away when no row carries one" stays
+     * true for masters — {@code createIndependentMaster} still leaves the master-user's personal
+     * {@code cityId} unset, and {@code users.city_id} is untouched by V150. It is no longer true
+     * for salons: every salon test fixture (including {@link #createSalon}) now sets a real,
+     * non-null {@code cityId} — required for persistence at all, since {@code salons.city_id} is
+     * DB-level {@code NOT NULL} as of V150 — so the locality label batch is now ALWAYS exercised
+     * here, exactly as it will be in production for every real salon. Still EXACT, not a ceiling:
+     * a 3 -&gt; 4 regression would pass unnoticed at {@code <= 4}.
      */
     @Test
     @DisplayName("listSalonFavorites runs the same bounded statement count at any number of favorited salons")
@@ -149,9 +159,10 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                         + "the row count is a per-row lookup", atTwo, atFive)
                 .isEqualTo(atFive);
         assertThat(atFive)
-                .as("EXACTLY two: the content query plus the one batched category derivation; "
-                        + "got %s", atFive)
-                .isEqualTo(2);
+                .as("EXACTLY three: the content query, the locality label resolve (every salon has "
+                        + "a real cityId as of V150, so this is no longer batched away), and the "
+                        + "one batched category derivation; got %s", atFive)
+                .isEqualTo(3);
     }
 
     private long countSalonListStatements(String tag, int n) {
@@ -270,9 +281,9 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                 ownerId, ownerEmail);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, 'Test Salon', true, NOW(), NOW())",
-                salonId, ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, 'Test Salon', true, NOW(), NOW(), ?)",
+                salonId, ownerId, testCityId());
         return salonId;
     }
 

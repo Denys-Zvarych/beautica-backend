@@ -591,17 +591,22 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
     // now agrees with the entity path.
 
     @Test
-    @DisplayName("projection returns NULL locality/address fields — never the master's own — "
-            + "when the salon-employed master's salon has no note/address set")
+    @DisplayName("projection returns NULL district/address fields — never the master's own — "
+            + "when the salon-employed master's salon has no district/note/address set")
     void should_returnNullFields_when_salonEmployedAndSalonFieldsAreNull() {
         User ownerUser = new User(
                 "owner-" + UUID.randomUUID() + "@test.com",
                 "$2a$10$hash", Role.SALON_OWNER, "Owner", "Person", "+380503333333");
         em.persist(ownerUser);
 
-        // Salon deliberately leaves cityId/districtId/street/buildingNo/locationNote unset
-        // (NULL) — the common case for a salon that never filled in its address.
+        // Salon deliberately leaves districtId/street/buildingNo/locationNote unset (NULL) —
+        // the common case for a salon that never filled in the rest of its address. cityId
+        // CANNOT be left unset here (V150: salons.city_id is NOT NULL — this em.persist/flush
+        // would throw a DataIntegrityViolationException with a null cityId), so
+        // discoveryCityId below is asserted against the real resolved value, not null.
+        UUID cityId = testCityId();
         Salon salon = Salon.builder()
+                .cityId(cityId)
                 .owner(ownerUser)
                 .name("Bare Studio")
                 .isActive(true)
@@ -638,7 +643,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         ClientBookingDetailProjection::locationNote)
                 .containsExactly(
                         "Bare Studio",
-                        null,
+                        cityId,
                         null,
                         null,
                         null,
@@ -656,6 +661,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.persist(ownerUser);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(ownerUser)
                 .name("Parity Studio")
                 .isActive(true)

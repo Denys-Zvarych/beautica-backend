@@ -35,6 +35,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Uses real HTTP through {@link TestRestTemplate} backed by a Testcontainers PostgreSQL
  * instance. All fixture data is inserted directly via JDBC (fast, avoids exercising unrelated
  * registration/invite flows). Cleanup is handled by {@link AbstractIntegrationTest#cleanDb()}.
+ *
+ * <p><b>Phase 299 — assertions inverted from "salon_id IS NULL" to row absence.</b> This endpoint
+ * used to only clear {@code salon_id}; it now hard-deletes the admin's {@code users} row via the
+ * shared {@code disposeStaffAccounts} seam. The full hard-delete/cascade/re-invite/token-refusal
+ * contract has its own dedicated suite in {@code AdminRemovalHardDeleteIT} — this file stays
+ * focused on the HTTP-level authorization matrix (owner/admin/cross-salon/cross-owner/self/client)
+ * that predates Phase 299 and is unaffected by it, updated only where an assertion depended on the
+ * old "row survives with salon_id NULL" behaviour.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("SalonController.removeAdmin — remove-admin endpoint (Phase 21.2)")
@@ -61,8 +69,8 @@ class SalonAdminRemovalIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("204 when SALON_OWNER removes an admin from a salon they own; salon_id nulled, role/is_active unchanged")
-    void should_return204AndClearSalonId_when_ownerRemovesAdminFromOwnedSalon() throws Exception {
+    @DisplayName("204 when SALON_OWNER removes an admin from a salon they own; the users row is HARD-DELETED (Phase 299)")
+    void should_return204AndHardDeleteRow_when_ownerRemovesAdminFromOwnedSalon() throws Exception {
         // Arrange
         UUID ownerId = insertUser("owner-remove-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Owner Removes Admin Salon");
@@ -81,20 +89,16 @@ class SalonAdminRemovalIntegrationTest extends AbstractIntegrationTest {
                 .as("owner removing an admin from their own salon must return 204")
                 .isEqualTo(HttpStatus.NO_CONTENT);
 
-        assertThat(readSalonId(adminId))
-                .as("removed admin's salon_id must be null after removal")
-                .isNull();
-        assertThat(readRole(adminId))
-                .as("removed admin's role must remain SALON_ADMIN — this is an unassignment, not a deactivation")
-                .isEqualTo("SALON_ADMIN");
-        assertThat(readIsActive(adminId))
-                .as("removed admin's is_active must remain true")
-                .isTrue();
+        assertThat(userRowExists(adminId))
+                .as("Phase 299: the removed admin's users row must be GONE, not merely detached "
+                        + "(salon_id IS NULL) — a SALON_ADMIN with no salon must not be a producible state")
+                .isFalse();
     }
 
     @Test
-    @DisplayName("204 when SALON_ADMIN removes another admin from their own salon (peer removal, one admin remains)")
-    void should_return204_when_adminRemovesAnotherAdminFromOwnSalon() throws Exception {
+    @DisplayName("403 when SALON_ADMIN attempts to remove another admin from their own salon — "
+            + "Phase 299 D7: admin removal is now a hard account delete, narrowed to SALON_OWNER only")
+    void should_return403_when_adminRemovesAnotherAdminFromOwnSalon() throws Exception {
         // Arrange
         UUID ownerId = insertUser("owner-peer-" + System.nanoTime() + "@beautica.test", "SALON_OWNER");
         UUID salonId = insertSalon(ownerId, "Peer Admin Removal Salon");
@@ -103,20 +107,24 @@ class SalonAdminRemovalIntegrationTest extends AbstractIntegrationTest {
         String actingAdminToken = loginAndGetToken(emailOf(actingAdminId));
 
         // Act
-        log.debug("Act: DELETE {} as SALON_ADMIN removing a peer admin at the same salon — must succeed",
+        log.debug("Act: DELETE {} as SALON_ADMIN removing a peer admin at the same salon — "
+                        + "must now be denied (D7)",
                 String.format(REMOVE_ADMIN_URL, salonId, targetAdminId));
-        ResponseEntity<Void> response = restTemplate.exchange(
+        ResponseEntity<String> response = restTemplate.exchange(
                 String.format(REMOVE_ADMIN_URL, salonId, targetAdminId), HttpMethod.DELETE,
                 new HttpEntity<>(bearerHeaders(actingAdminToken)),
-                Void.class);
+                String.class);
 
         // Assert
         assertThat(response.getStatusCode())
-                .as("admin removing a peer admin at their own salon must return 204")
-                .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(readSalonId(targetAdminId))
-                .as("removed admin's salon_id must be null after removal")
-                .isNull();
+                .as("Phase 299 D7 — a SALON_ADMIN may no longer remove a co-admin; only the owner can")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(userRowExists(targetAdminId))
+                .as("a denied removal must be a true no-op — the target admin's account survives")
+                .isTrue();
+        assertThat(userRowExists(actingAdminId))
+                .as("the acting admin's own row must also be untouched")
+                .isTrue();
     }
 
     @Test
@@ -149,9 +157,9 @@ class SalonAdminRemovalIntegrationTest extends AbstractIntegrationTest {
         assertThat(response.getStatusCode())
                 .as("removing the last admin must be ALLOWED — there is no minimum-admin-count guard")
                 .isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(readSalonId(onlyAdminId))
-                .as("the removed admin's salon_id must be null")
-                .isNull();
+        assertThat(userRowExists(onlyAdminId))
+                .as("Phase 299: the removed admin's users row must be GONE")
+                .isFalse();
         assertThat(countActiveAdminsForSalon(salonId))
                 .as("the salon must be left with ZERO admins — this is the deliberate, documented behaviour, "
                         + "not a bug; a future regression that adds a last-admin guard must fail this assertion")
@@ -294,8 +302,8 @@ class SalonAdminRemovalIntegrationTest extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 
@@ -307,12 +315,12 @@ class SalonAdminRemovalIntegrationTest extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject("SELECT salon_id FROM users WHERE id = ?", UUID.class, userId);
     }
 
-    private String readRole(UUID userId) {
-        return jdbcTemplate.queryForObject("SELECT role FROM users WHERE id = ?", String.class, userId);
-    }
-
-    private Boolean readIsActive(UUID userId) {
-        return jdbcTemplate.queryForObject("SELECT is_active FROM users WHERE id = ?", Boolean.class, userId);
+    // Phase 299 — the row-absence assertion the hard-delete tests use, replacing the old
+    // "salon_id IS NULL, role/is_active unchanged" assertions those tests made before this phase.
+    private boolean userRowExists(UUID userId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM users WHERE id = ?", Integer.class, userId);
+        return count != null && count > 0;
     }
 
     private Integer countActiveAdminsForSalon(UUID salonId) {

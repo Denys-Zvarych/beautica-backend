@@ -64,13 +64,27 @@ public class Salon extends AuditableEntity {
 
     private String address;
 
-    // ---- Phase 10.3 locality (raw UUID FK columns, NULLABLE) -------------
+    // ---- Phase 10.3 locality (raw UUID FK columns) ------------------------
     // FKs to the Phase 10.1 taxonomy (cities / city_districts). Modeled as raw
     // UUIDs — not @ManyToOne — to avoid adding an association traversal surface
     // on Salon (existing salon read paths must not N+1 / LazyInit on locality)
     // and consistent with the User-side representation. Read/write semantics
     // are owned by Phases 10.4/10.6. Legacy city/region/address stay (nullable).
-    @Column(name = "city_id")
+    //
+    // cityId was NULLABLE at the DB level from V54 through V149 — added to an
+    // already-populated table with no backfill, promotion deferred to the
+    // write-path guard (LocalityWriteValidator.validateProviderLocality, called
+    // unconditionally from SalonService#createSalon/#updateSalon). V150/V151
+    // make the invariant ("a salon must always have a city") a real DB
+    // constraint — V150 does NOT clean up any pre-existing null-city row; it
+    // fails loudly and refuses to apply if one exists. Any database carrying
+    // legacy null-city salon rows must have them resolved by hand (backfill
+    // city_id, or otherwise dispose of the row) before V150 can apply — for a
+    // disposable LOCAL dev database only, see
+    // scripts/dev-cleanup-null-city-salons.sql. The validator's null check
+    // stays regardless: it is what turns a null city into a clean 400 instead
+    // of a raw DataIntegrityViolationException (500).
+    @Column(name = "city_id", nullable = false)
     private UUID cityId;
 
     @Column(name = "district_id")

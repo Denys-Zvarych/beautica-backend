@@ -3,6 +3,7 @@ package com.beautica.booking.service;
 import com.beautica.auth.Role;
 import com.beautica.booking.domain.BookingClosureRule;
 import com.beautica.booking.domain.MasterBookability;
+import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.dto.BookingDetailResponse;
 import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
@@ -14,11 +15,13 @@ import com.beautica.booking.dto.UnclosedCountResponse;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
+import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.event.BookingCompletedEvent;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingSpecifications;
 import com.beautica.booking.repository.ClientBookingDetailProjection;
+import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
@@ -35,6 +38,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
+import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -54,6 +58,7 @@ import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -65,16 +70,22 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 @Service
@@ -340,9 +351,15 @@ public class BookingService {
         // ids feed cityLabel/districtLabel, so keeping them on master.getSalon() would pair salon
         // A's street with salon B's city on any booking made before a rotation.
         Salon salon = booking.getSalon();
+        // V157 / phase 294 D3 — NULLABLE on a historical booking whose master was detached (staff
+        // account hard-deleted). Only the independent-master branch reads it, and a null locality
+        // degrades to "no city/district label", which is exactly what the resolver already does for
+        // a master who never set one.
         User masterUser = booking.getMaster().getUser();
-        UUID cityId = salon != null ? salon.getCityId() : masterUser.getCityId();
-        UUID districtId = salon != null ? salon.getDistrictId() : masterUser.getDistrictId();
+        UUID cityId = salon != null ? salon.getCityId()
+                : (masterUser != null ? masterUser.getCityId() : null);
+        UUID districtId = salon != null ? salon.getDistrictId()
+                : (masterUser != null ? masterUser.getDistrictId() : null);
 
         DiscoveryLabels labels = discoveryLocationResolver.resolveLabels(
                 cityId == null ? List.of() : List.of(cityId),
@@ -394,13 +411,24 @@ public class BookingService {
      */
     private static UUID discoveryCityId(Booking booking) {
         Salon salon = booking.getSalon();
-        return salon != null ? salon.getCityId() : booking.getMaster().getUser().getCityId();
+        if (salon != null) {
+            return salon.getCityId();
+        }
+        // V157 / phase 294 D3 — a detached master (staff account hard-deleted) has no user row and
+        // therefore no locality. Null degrades to "no label", never an NPE on the client's own list.
+        User masterUser = booking.getMaster().getUser();
+        return masterUser != null ? masterUser.getCityId() : null;
     }
 
     /** Discovery district id: same rule and same source as {@link #discoveryCityId}. */
     private static UUID discoveryDistrictId(Booking booking) {
         Salon salon = booking.getSalon();
-        return salon != null ? salon.getDistrictId() : booking.getMaster().getUser().getDistrictId();
+        if (salon != null) {
+            return salon.getDistrictId();
+        }
+        // Same rule and same null-degradation as discoveryCityId (V157 / phase 294 D3).
+        User masterUser = booking.getMaster().getUser();
+        return masterUser != null ? masterUser.getDistrictId() : null;
     }
 
     /** Batch-resolves locality labels for a page of projections (M2 seam — fixed two queries). */
@@ -826,6 +854,134 @@ public class BookingService {
     }
 
     /**
+     * Phase 23.4 — {@code GET /bookings/salon/{salonId}}: a single-salon, paginated booking list
+     * for {@code SALON_OWNER}/{@code SALON_ADMIN}, backing the mobile salon "Розклад" tab.
+     *
+     * <p><b>Why this is a dedicated endpoint, not a {@code GET /bookings/me} widening.</b> {@code
+     * GET /bookings/me}'s {@code SALON_OWNER} arm aggregates across EVERY owned salon with no
+     * per-salon filter (see {@link #listProviderBookings}), and rejects {@code SALON_ADMIN}
+     * outright (same rejection this method's sibling {@link #getMyBookings}/{@link
+     * #getMyBookedDays}/{@link #getUnclosedCount} carry, and which stays UNTOUCHED here — this
+     * method does not relax any of those three guards). Neither shape fits a single-salon,
+     * admin-inclusive, master-filterable list, so this is a new query family rather than a branch
+     * bolted onto the existing one.
+     *
+     * <p><b>Authorization lives ENTIRELY at the controller boundary</b> —
+     * {@code @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and
+     * @authz.canManageSalon(authentication, #salonId)")}, the exact SpEL {@code
+     * SalonController}/{@code ServiceController} already use for the same owner-or-admin-of-THIS-
+     * salon check (Anti-Bug §D: a GET is a read, so one {@code can*} DB lookup at the gate is the
+     * canonical placement; a role-only controller check plus a second, separate ownership query
+     * here would be the "duplicate the same check on both layers" anti-pattern §D forbids). No
+     * {@code SalonService} injection was needed — {@code AuthorizationService#canManageSalon} was
+     * already the shared helper backing every sibling salon-management endpoint, so reusing it
+     * here adds no new bean edge and cannot create the {@code BookingService ↔ SalonService}
+     * circular dependency a naive "inject SalonService and assert ownership" approach would risk
+     * ({@code AuthorizationService} was already a {@code BookingService} constructor dependency
+     * before this phase).
+     *
+     * <p><b>Scope predicate is {@code booking.salon.id}</b> ({@link
+     * BookingSpecifications#bookingSalonIdEquals}), never {@code master.salon.id} — see that
+     * method's javadoc for why: this is "which bookings happened AT this salon" (a historical,
+     * per-booking fact), not "which of my currently-owned salons" ({@link
+     * BookingSpecifications#salonIdIn}'s multi-salon aggregate shape, keyed off the master's LIVE
+     * affiliation instead).
+     *
+     * <p><b>{@code providerCanReviewClient} authority is computed per row</b> via {@link
+     * AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)} — the same public,
+     * entity-based predicate {@link #getBooking} already uses for a single row — rather than
+     * {@link #loadProviderReviewBatch}'s page-batched {@code
+     * AuthorizationService#filterBookingIdsWithProviderAuthority}, which explicitly THROWS {@code
+     * IllegalArgumentException} for {@code SALON_ADMIN} ("add the assigned-salon arm before
+     * routing admins to this path" — this endpoint is the first caller that would need it, and
+     * extending that heavily-audited, {@code GET /bookings/me}-shared batch kernel was judged
+     * riskier than the bounded per-row cost paid here). The per-row call is gated behind the same
+     * cheap in-memory {@code isReviewCandidate} check {@link #loadProviderReviewBatch} uses as its
+     * own cost gate (client present AND {@link BookingClosureRule#isProviderReviewEligible}), so
+     * it only runs for rows that could possibly flip the flag — bounded by page size (capped
+     * globally at 100 — Anti-Bug §J), never by the salon's total booking volume.
+     *
+     * <p><b>Index coverage (Phase 23.4 audit fix, Finding 2 — corrects a stale citation).</b>
+     * {@code idx_bookings_salon_status_starts_at} was originally added by V22, but V113 rebuilt it
+     * with a narrower partial predicate — {@code WHERE status IN ('CONFIRMED','COMPLETED')} — so
+     * it covers this method's {@code ?status=} filter only for those two values; a {@code status}
+     * of {@code CANCELLED}/{@code DECLINED}/{@code NOT_COMPLETED} (or no status at all) falls back
+     * to the unfiltered {@code idx_bookings_salon_starts_at} (V19). Neither index carries {@code
+     * master_id}, so the {@code masterId} filter above is served by a dedicated composite index,
+     * {@code idx_bookings_salon_master_starts_at} (V148, status-agnostic — see that migration for
+     * why it cannot reuse V22/V113's partial predicate).
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<BookingDetailResponse> getSalonBookings(
+            UUID actorUserId, UUID salonId, UUID masterId, BookingStatus status,
+            LocalDate from, LocalDate to, Pageable pageable) {
+        if (to != null) {
+            dateMath.assertToPlusOneDayRepresentable(to);
+        }
+        if (from != null && to != null) {
+            if (from.isAfter(to)) {
+                throw new BusinessException(HttpStatus.BAD_REQUEST, "'from' must not be after 'to'");
+            }
+            dateMath.assertSpanWithinMax(from, to);
+        }
+        OffsetDateTime fromTs = from == null ? null : from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive = to == null ? null : to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+
+        Set<BookingStatus> statuses = status == null ? null : EnumSet.of(status);
+        OffsetDateTime now = resolveNow();
+        Pageable normalizedPageable = normalizeBookingSort(pageable);
+
+        Page<UUID> idPage = bookingRepository.findIdsBySalonIdFiltered(
+                salonId, masterId, statuses, fromTs, toExclusive, normalizedPageable);
+        if (idPage.isEmpty()) {
+            return PageResponse.of(List.of(), idPage.getNumber(), idPage.getSize(),
+                    idPage.getTotalElements(), idPage.getTotalPages());
+        }
+
+        List<Booking> hydrated = bookingRepository.findAllByIdsWithGraph(idPage.getContent());
+        // Client -> provider review-existence, batched for the whole page — same as
+        // listProviderBookings, no role dependency (unlike the provider review batch below).
+        Set<UUID> reviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(idPage.getContent()));
+
+        // Provider -> client review-existence batch, restricted to rows that could possibly
+        // qualify (see this method's javadoc for why authority itself is NOT batched here).
+        List<UUID> reviewCandidateIds = hydrated.stream()
+                .filter(b -> b.getClient() != null && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
+                .map(Booking::getId)
+                .toList();
+        Set<UUID> alreadyReviewedByProvider = reviewCandidateIds.isEmpty()
+                ? Set.of()
+                : Set.copyOf(clientReviewRepository.findReviewedBookingIds(reviewCandidateIds));
+
+        DiscoveryLabels labels = resolveBookingLabels(hydrated);
+
+        Map<UUID, Booking> byId = hydrated.stream().collect(Collectors.toMap(Booking::getId, Function.identity()));
+        List<BookingDetailResponse> ordered = idPage.getContent().stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
+                .map(b -> {
+                    UUID cityId = discoveryCityId(b);
+                    UUID districtId = discoveryDistrictId(b);
+                    boolean canReview = canReview(
+                            b.getStatus(), b.getEndsAt(), now, reviewed.contains(b.getId()), b.getClient() != null);
+                    boolean isReviewCandidate = b.getClient() != null
+                            && BookingClosureRule.isProviderReviewEligible(b.getStatus());
+                    boolean hasProviderAuthority = isReviewCandidate
+                            && authz.hasProviderAuthorityOverBooking(actorUserId, b);
+                    boolean providerCanReviewClient = providerCanReviewClient(
+                            hasProviderAuthority, b.getStatus(), b.getClient() != null,
+                            () -> alreadyReviewedByProvider.contains(b.getId()));
+                    return BookingDetailResponse.from(
+                            b, canReview, providerCanReviewClient,
+                            labels.cityLabel(cityId), labels.districtLabel(districtId), now);
+                })
+                .toList();
+
+        return PageResponse.of(ordered, idPage.getNumber(), idPage.getSize(),
+                idPage.getTotalElements(), idPage.getTotalPages());
+    }
+
+    /**
      * Property names {@code GET /bookings/me}'s {@code sort} query parameter may reference
      * (Phase 26.3, narrowed by Phase 26.8). {@code priceAtBooking} was removed from this set —
      * its only caller anywhere in the product was the provider "Мої записи" sort sheet, which
@@ -1230,13 +1386,429 @@ public class BookingService {
      *       method, not an oversight — do not "fix" it back by re-adding the enqueue call here.</li>
      * </ul>
      *
-     * <p>Package-private: the only caller ({@code ScheduleOverrideConflictService}) lives in this same
-     * package. {@link #declineBooking} itself is completely unchanged — same signature, same eviction,
-     * same notification, same tests — this is purely an additive extraction of the shared core the
-     * two now call.
+     * <p>Package-private: both callers live in this same package —
+     * {@code ScheduleOverrideConflictService} (a different class in this package), and, as of
+     * Phase 269/293, {@link #declineFutureConfirmedBookingsForSalonClosure} below (same class, so
+     * no cross-package visibility change was needed to add it). {@link #declineBooking} itself is
+     * completely unchanged — same signature, same eviction, same notification, same tests — this
+     * is purely an additive extraction of the shared core its callers use.
      */
     Booking declineBookingForBatch(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         return declineBookingCore(actorUserId, bookingId, req);
+    }
+
+    /**
+     * Declines every future {@code CONFIRMED} booking at a deleted salon and enqueues one
+     * {@code SALON_CLOSED} notification per affected VISIT (Phase 269/293 — D12; supersedes 269's
+     * per-booking wording). Called by {@code SalonService#deactivateSalon} as the cascade step
+     * that follows the salon flag flip and staff deactivation.
+     *
+     * <p>Thin entry point (Phase 298 D4): the ownership self-assertion and the salon-scoped
+     * candidate scan are the only things specific to salon closure; everything from the grouping
+     * step down is the shared {@link #declineFutureConfirmed} body, reused verbatim by the
+     * master-removal sibling {@link #declineFutureConfirmedBookingsForMasterRemoval}. The rest of
+     * this javadoc describes that shared body and stays attached here as the canonical
+     * description of the whole mechanism — see {@link #declineFutureConfirmed}'s own (short)
+     * javadoc for what is entry-point-specific.
+     *
+     * <p><b>D3 — the boundary is {@code startsAt > now}, read ONCE.</b> {@code now} is resolved a
+     * single time via {@link #resolveNow()} and reused for the whole scan — never re-read per row
+     * — so a `COMPLETED`, `CANCELLED`, `DECLINED`, `NOT_COMPLETED` or past-dated `CONFIRMED` row is
+     * never touched.
+     *
+     * <p><b>D4 — every transition stays per-BOOKING; REUSE, never fork.</b> Candidates are grouped
+     * by {@link SalonClosureBookingCandidate#visitKey()} (= {@code coalesce(appointmentId, id)}).
+     * A standalone booking (no appointment) is validated one row at a time by
+     * {@link #assertBatchDeclinePreconditions} and then declined, together with every other
+     * validated standalone booking in the cascade, by ONE call to
+     * {@link #declineConfirmedBookingsAtomic} — an atomic bulk conditional {@code UPDATE}, see
+     * that method's and {@link BookingRepository#declineConfirmedBulk}'s own Javadoc (perf
+     * re-audit, 2026-09, Finding A) for why this leg no longer reuses
+     * {@code declineBookingCore}'s load-mutate-save shape, and why one bulk statement is exactly
+     * as race-safe as the per-row atomic {@code UPDATE} it replaces. An appointment-child group is
+     * still
+     * declined through {@code AppointmentTransitionService#declineAppointmentItems} — the exact
+     * method {@code ScheduleOverrideConflictService} already reuses for grouped multi-service
+     * conflicts, batched over every conflicting sibling of one visit in a single call rather than
+     * one per sibling; that leg is DELIBERATELY UNCHANGED by the 2026-09 re-audit (it already runs
+     * O(1) queries per visit under its own header lock — see its Javadoc's "Batched freshness
+     * re-check" section). This method only decides WHICH bookings need declining and WHICH of
+     * those two existing paths each visit takes — mirroring
+     * {@code ScheduleOverrideConflictService#declineConflicts} exactly.
+     *
+     * <p><b>D5 — {@code providerComment} stays {@code null}.</b> Both {@code StatusUpdateRequest}
+     * and {@code AppointmentProviderNoteRequest} are built with a {@code null} comment — whole-
+     * visit decline carries no reason (locked project rule); the "why" belongs to the
+     * notification, authored for this purpose, not to a synthetic machine-authored note.
+     *
+     * <p><b>D12 — one {@code SALON_CLOSED} entry per VISIT, keyed to a deterministic
+     * representative chosen among the bookings THIS CALL ACTUALLY DECLINED.</b> After each visit's
+     * decline call returns, at most one {@code outboxService.enqueueSalonClosed} call is made —
+     * never inside {@link #declineConfirmedBookingsAtomic} or {@code declineAppointmentItems}
+     * themselves, both of which stay notification-free for their OTHER existing caller (the D4/D6
+     * seam those methods' own javadoc documents). The representative is the lowest-{@code
+     * startsAt} booking tied on {@code bookingId} ({@link #representativeOf}), chosen ONLY among
+     * the ids that ACTUALLY transitioned this call (security re-audit fix — previously chosen from
+     * the full candidate list regardless of whether the pick itself survived a concurrent race).
+     * If NOTHING in a visit transitioned (every one of its bookings lost the race), that visit
+     * contributes no entry at all — never a notice describing a booking that is not, in fact,
+     * DECLINED. If the deterministic pick itself lost the race but a SIBLING in the same visit
+     * (an appointment visit's other item) did transition, {@link #representativeOf} falls through
+     * to the next-lowest surviving candidate — still exactly one entry, still deterministic for a
+     * given set of survivors.
+     *
+     * <p><b>Eviction</b> is registered ONCE per distinct master actually touched by this cascade
+     * (a whole salon can span several masters, unlike the single-master schedule-override write),
+     * mirroring {@code ScheduleOverrideConflictService}'s one-combined-eviction perf pattern rather
+     * than one eviction pair per declined booking.
+     *
+     * <p><b>D11 — a notification-delivery failure never rolls back the deletion.</b> The
+     * {@code enqueueSalonClosed} call only writes the outbox row inside this SAME transaction
+     * (MANDATORY propagation — commits atomically with the status transitions); actual delivery is
+     * the drain worker's problem, entirely outside this transaction and this method.
+     *
+     * <p><b>Cost (corrected AGAIN, 2026-09 re-audit — Finding A — supersedes the immediately
+     * prior {@code 3 + M + ⌈V/50⌉} estimate, which was itself a security-motivated trade of
+     * batching for atomicity).</b> Let {@code V} = the number of DISTINCT visits that end up with
+     * an outbox entry (bounded by {@code byVisit.size()}). The fixed cost is {@code 4}: the
+     * ownership self-assertion, the candidate scan, the batched standalone-visit load
+     * ({@link BookingRepository#findAllByIdInWithFullGraph}), and — new in this fix — the
+     * standalone WRITE phase is ITSELF now a SINGLE statement, not a per-row loop:
+     * {@link #declineConfirmedBookingsAtomic} issues exactly ONE
+     * {@link BookingRepository#declineConfirmedBulk} call for every validated standalone booking
+     * in the whole cascade, regardless of how many there are. This restores the perf-1 fix's
+     * batching win WITHOUT giving up the per-row atomicity the prior security fix bought — see
+     * {@link BookingRepository#declineConfirmedBulk}'s Javadoc for why a single {@code UPDATE ...
+     * WHERE id IN (:ids) AND status = 'CONFIRMED' RETURNING id} is exactly as race-safe as {@code
+     * M} separate single-row atomic UPDATEs. There is no separate batched-freshness query, because
+     * that one statement folds the freshness check into the write itself, per row, inside the same
+     * statement. The appointment leg is untouched and stays O(1) queries per appointment-visit. The
+     * outbox-INSERT flush is still batched, {@code ⌈V/50⌉}. Total: {@code 4 + ⌈V/50⌉} — the
+     * standalone-booking count no longer appears as a linear term at all, because the write phase
+     * that used to cost one round trip per standalone booking is now a single statement independent
+     * of {@code M}. Do not re-litigate the batching-vs-atomicity trade-off a fourth time: {@link
+     * BookingRepository#declineConfirmedBulk}'s Javadoc explains why this formula gets both
+     * properties at once rather than trading one for the other.
+     *
+     * @param actorUserId the deleting {@code SALON_OWNER}'s id — the provider-authority actor for
+     *                     every decline this method performs
+     * @param salonId      the salon being deleted
+     * @throws ForbiddenException {@code actorUserId} does not own {@code salonId} (security finding
+     *                             4, 2026-09 audit — see the ownership self-assertion below)
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void declineFutureConfirmedBookingsForSalonClosure(UUID actorUserId, UUID salonId) {
+        // Ownership self-assertion (security finding 4, 2026-09 audit — defense-in-depth). This
+        // method is callable from another package (SalonService) and previously trusted `salonId`
+        // entirely on the strength of its ONE caller's own findByIdAndOwnerId check
+        // (SalonService#deactivateSalon). Not exploitable today — every downstream decline still
+        // keys off the BOOKING's own actual salon via enforceCanCancelBooking /
+        // enforceCanManageAppointment, so a rogue caller would 403+rollback rather than mass-decline
+        // — but a method this trusting of a caller-supplied scope id must never rely SOLELY on the
+        // one caller having checked first.
+        if (!salonRepository.existsByIdAndOwnerId(salonId, actorUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        OffsetDateTime now = resolveNow();
+        List<SalonClosureBookingCandidate> candidates =
+                bookingRepository.findConfirmedFutureBySalonId(salonId, now);
+        declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.SALON_CLOSED);
+    }
+
+    /**
+     * Master-scoped sibling of {@link #declineFutureConfirmedBookingsForSalonClosure} (Phase 298
+     * D4) — declines every future {@code CONFIRMED} booking of ONE master being removed from a
+     * salon and enqueues one {@code MASTER_REMOVED} notification per affected VISIT, instead of
+     * refusing the removal with a {@code 409} (Phase 297 D3's now-superseded guard). Called by
+     * {@code SalonService#removeMaster}, BEFORE {@code MasterService#deactivateMaster} /
+     * {@code disposeStaffAccounts} run (Phase 298 D5 — load-bearing ordering, not a habit: this
+     * method's own two self-assertions below require the {@code masters} row to still exist and
+     * still belong to {@code salonId}, which the disposal's {@code DELETE FROM masters} branch —
+     * taken only for a master with NO booking/review history at all — would otherwise have
+     * already undone; see {@code SalonService#removeMaster}'s ordered-checklist javadoc for the
+     * mutation-checked mechanism, including why a master WITH a future booking never actually
+     * reaches that branch).
+     *
+     * <p>Shares the ENTIRE grouping/decline/notify/eviction body with the salon-closure cascade
+     * via {@link #declineFutureConfirmed} — only the candidate scan (master-scoped, not
+     * salon-scoped) and the outbox event type differ. See that method's javadoc, and {@link
+     * #declineFutureConfirmedBookingsForSalonClosure}'s longer one, for the shared mechanism.
+     *
+     * <p><b>Two ownership/scope self-assertions</b> (Phase 298 D4), mirroring the salon-closure
+     * entry point's own defense-in-depth posture: {@code actorUserId} must own {@code salonId}
+     * (identical rationale to the salon-closure self-assertion), AND {@code masterId} must
+     * actually belong to {@code salonId} — otherwise a {@code masterId} from a salon the caller
+     * does NOT own could ride in on a salon the caller DOES legitimately own, since {@code
+     * SalonService#removeMaster}'s own re-check runs against the loaded {@code Master} row, not
+     * against this method's caller-supplied ids.
+     *
+     * @param actorUserId the removing {@code SALON_OWNER}'s id — the provider-authority actor for
+     *                     every decline this method performs
+     * @param salonId     the salon the master is being removed from
+     * @param masterId    the master being removed
+     * @throws ForbiddenException {@code actorUserId} does not own {@code salonId}, or {@code
+     *                             masterId} does not belong to {@code salonId}
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void declineFutureConfirmedBookingsForMasterRemoval(UUID actorUserId, UUID salonId, UUID masterId) {
+        if (!salonRepository.existsByIdAndOwnerId(salonId, actorUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        if (!masterRepository.existsByIdAndSalonId(masterId, salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        OffsetDateTime now = resolveNow();
+        List<SalonClosureBookingCandidate> candidates =
+                bookingRepository.findConfirmedFutureByMasterId(masterId, now);
+        declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.MASTER_REMOVED);
+    }
+
+    /**
+     * Shared cascade body behind both {@link #declineFutureConfirmedBookingsForSalonClosure} and
+     * {@link #declineFutureConfirmedBookingsForMasterRemoval} (Phase 298 D4 — REUSE-FIRST: one
+     * method, parameterised by scope, never a second cascade). Everything from the empty-check
+     * down — the per-visit grouping, the batched standalone read, the management-access memo, the
+     * validate-then-bulk-write split, the appointment-items leg, the outbox window, and the slot
+     * and calendar evictions — is identical for both callers; only {@code eventType} decides which
+     * outbox row gets written per visit. A future fix to this cascade lands on both callers or
+     * neither.
+     *
+     * @param actorUserId the provider-authority actor for every decline this call performs —
+     *                     already proven to own {@code salonId} by the caller's own self-assertion
+     * @param candidates  the scope-specific candidate scan result — salon-wide or master-scoped —
+     *                     already resolved by the caller against {@code now}
+     * @param salonId     the salon every one of {@code candidates}' bookings belongs to — used only
+     *                     to scope the after-commit slot-eviction cache key, never re-validated here
+     * @param now         the SAME instant the caller's own candidate scan used (D3 — resolved
+     *                     once, never re-read here), reused only to stamp {@code updated_at} in
+     *                     {@link #declineConfirmedBookingsAtomic}
+     * @param eventType   {@code SALON_CLOSED} or {@code MASTER_REMOVED} — selects which outbox
+     *                     enqueue method runs per visit representative
+     */
+    private void declineFutureConfirmed(
+            UUID actorUserId, List<SalonClosureBookingCandidate> candidates, UUID salonId,
+            OffsetDateTime now, OutboxEventType eventType) {
+        if (candidates.isEmpty()) {
+            return;
+        }
+
+        StatusUpdateRequest declineRequest =
+                new StatusUpdateRequest(CancellationReason.PROVIDER_UNAVAILABLE, null);
+        AppointmentProviderNoteRequest appointmentNoteRequest = new AppointmentProviderNoteRequest(null);
+
+        Map<UUID, List<SalonClosureBookingCandidate>> byVisit = candidates.stream()
+                .collect(Collectors.groupingBy(
+                        SalonClosureBookingCandidate::visitKey, LinkedHashMap::new, Collectors.toList()));
+
+        // Perf finding 1 (2026-09 audit) — READ phase, entirely up front and batched: never one
+        // query per standalone visit. Loading every standalone booking in ONE query mirrors exactly
+        // how the appointment-item path already batches a whole visit's items in one query
+        // (declineAppointmentItems' loadItemsOrThrow / findConfirmedIdsByAppointmentId) — just
+        // applied across VISITS here instead of within one. There is no longer a separate batched
+        // freshness query (security re-audit, Finding A) — declineConfirmedBookingsAtomic's own
+        // bulk conditional UPDATE (BookingRepository#declineConfirmedBulk) is the freshness check
+        // now, evaluated per row inside that single statement at write time instead of
+        // pre-computed as a Set snapshot that could go stale mid-loop.
+        List<UUID> standaloneBookingIds = byVisit.values().stream()
+                .filter(visit -> visit.get(0).appointmentId() == null)
+                .map(visit -> visit.get(0).bookingId())
+                .toList();
+        Map<UUID, Booking> standaloneBookingsById = standaloneBookingIds.isEmpty()
+                ? Map.of()
+                : bookingRepository.findAllByIdInWithFullGraph(standaloneBookingIds).stream()
+                        .collect(Collectors.toMap(Booking::getId, Function.identity()));
+
+        // Perf finding 2 (2026-09 re-audit) — call-scoped memo of the SALON_OWNER management-access
+        // answer, shared across every appointment-visit's authorization check below. Pre-seeded
+        // with the fact this method ALREADY proved above (the ownership self-assertion): every
+        // candidate here was scanned with `WHERE b.salon.id = :salonId`, so every appointment
+        // visit's own salonId is guaranteed to equal THIS salonId, and actorUserId's ownership of
+        // it is already known true. Seeding removes even the FIRST appointment-visit's EXISTS
+        // query; the memo then continues to serve every subsequent visit's identical lookup from
+        // memory — see AuthorizationService#enforceCanManageAppointment(UUID, UUID, Map)'s Javadoc
+        // for the memo's lifetime contract (never retained past this one method call).
+        Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo = new HashMap<>();
+        managementAccessMemo.put(new AuthorizationService.MemoKey(actorUserId, salonId), true);
+
+        // WRITE phase — standalone bookings first, now itself split into a validate pass (zero
+        // I/O, per-row) and ONE bulk write (perf finding, 2026-09 re-audit — Finding A). Appointment
+        // groups run second: each one still issues its own small, already-batched query set
+        // internally (declineAppointmentItems) exactly as before the re-audit — that leg was never
+        // the target of any finding, since its per-appointment reads-then-writes shape (and its own
+        // header lock) was already correct.
+        List<UUID> validatedStandaloneIds = new ArrayList<>();
+        for (List<SalonClosureBookingCandidate> visit : byVisit.values()) {
+            if (visit.get(0).appointmentId() != null) {
+                continue;
+            }
+            UUID bookingId = visit.get(0).bookingId();
+            Booking booking = standaloneBookingsById.get(bookingId);
+            if (booking == null) {
+                // Vanishingly unlikely (the two batched reads above run moments apart, in the same
+                // transaction, against a row nothing else can delete) — but never silently drop a
+                // visit the candidate scan promised to decline.
+                throw new ForbiddenException("Access denied");
+            }
+            assertBatchDeclinePreconditions(actorUserId, booking, declineRequest);
+            validatedStandaloneIds.add(bookingId);
+        }
+        Set<UUID> transitionedStandaloneIds = declineConfirmedBookingsAtomic(validatedStandaloneIds, declineRequest, now);
+
+        List<UUID> representativeIds = new ArrayList<>(byVisit.size());
+        for (List<SalonClosureBookingCandidate> visit : byVisit.values()) {
+            if (visit.get(0).appointmentId() != null) {
+                continue;
+            }
+            representativeOf(visit, transitionedStandaloneIds).ifPresent(representativeIds::add);
+        }
+        for (List<SalonClosureBookingCandidate> visit : byVisit.values()) {
+            UUID appointmentId = visit.get(0).appointmentId();
+            if (appointmentId == null) {
+                continue;
+            }
+            List<UUID> bookingIds = visit.stream().map(SalonClosureBookingCandidate::bookingId).toList();
+            List<Booking> declined = appointmentTransitionService.declineAppointmentItems(
+                    actorUserId, appointmentId, bookingIds, appointmentNoteRequest, false, managementAccessMemo);
+            Set<UUID> declinedIds = declined.stream().map(Booking::getId).collect(Collectors.toSet());
+            representativeOf(visit, declinedIds).ifPresent(representativeIds::add);
+        }
+
+        // Outbox INSERTs flush in their OWN window, after every decline above is already staged —
+        // never interleaved with a decline's own read. D12 (one row per visit) is preserved exactly:
+        // the dedup key is each visit's own content, not loop position, so processing standalone
+        // visits before appointment visits (rather than in candidate-scan order) is unobservable.
+        for (UUID representativeId : representativeIds) {
+            switch (eventType) {
+                case SALON_CLOSED -> outboxService.enqueueSalonClosed(representativeId);
+                case MASTER_REMOVED -> outboxService.enqueueMasterRemoved(representativeId);
+                default -> throw new IllegalStateException(
+                        "declineFutureConfirmed does not support outbox event type " + eventType);
+            }
+        }
+
+        Set<UUID> masterIds = candidates.stream()
+                .map(SalonClosureBookingCandidate::masterId)
+                .collect(Collectors.toSet());
+        for (UUID masterId : masterIds) {
+            registerSlotEviction(masterId, salonId);
+            evictMasterCalendarAfterCommit(masterId);
+        }
+    }
+
+    /**
+     * The deterministic representative of one visit's candidate rows for the single
+     * {@code SALON_CLOSED}/{@code MASTER_REMOVED} outbox entry (D12; Phase 298 widens this
+     * helper's use to the master-removal cascade, unchanged): the lowest {@code startsAt}, tied on
+     * {@code bookingId} so the choice never depends on scan/insertion order and a re-run against
+     * equivalent fixtures always lands on the same row — chosen ONLY among {@code declinedIds}
+     * (security re-audit fix, Finding A). Previously this picked from the FULL candidate list
+     * regardless of whether the pick itself survived a concurrent race; a representative that lost
+     * the race between the candidate scan and its own decline attempt could then be handed to
+     * {@code NotificationOutboxService#enqueueSalonClosed}/{@code #enqueueMasterRemoved} even
+     * though it was never actually declined. Filtering to {@code declinedIds} first means: (a) a
+     * visit where NOTHING transitioned yields no representative at all (caller must not enqueue),
+     * and (b) a visit where the deterministic pick itself raced away but a SIBLING did transition
+     * still yields exactly one entry — the next-lowest-{@code startsAt} SURVIVOR, still
+     * deterministic for a given survivor set.
+     *
+     * @param declinedIds the ids, among {@code visit}'s own bookings, that THIS CALL actually
+     *                     transitioned to {@code DECLINED} — for a standalone visit, membership in
+     *                     {@link #declineConfirmedBookingsAtomic}'s cascade-wide result set (the
+     *                     bulk {@code UPDATE ... RETURNING}'s own affected-row outcome, still
+     *                     tested per visit here since that set spans every standalone visit in the
+     *                     cascade); for an appointment visit, {@code declineAppointmentItems}' own
+     *                     returned survivor list
+     * @return the representative, or empty iff nothing in this visit transitioned
+     */
+    private static Optional<UUID> representativeOf(
+            List<SalonClosureBookingCandidate> visit, Set<UUID> declinedIds) {
+        return visit.stream()
+                .filter(candidate -> declinedIds.contains(candidate.bookingId()))
+                .min(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
+                        .thenComparing(SalonClosureBookingCandidate::bookingId))
+                .map(SalonClosureBookingCandidate::bookingId);
+    }
+
+    /**
+     * Zero-I/O validation pass for one standalone candidate of
+     * {@link #declineFutureConfirmedBookingsForSalonClosure} (perf re-audit, 2026-09, Finding A —
+     * split out of the former {@code declineBookingForBatchAtomic} so the cascade's write phase
+     * can be batched into ONE bulk statement via {@link #declineConfirmedBookingsAtomic} instead
+     * of one round trip per booking). Runs the EXACT SAME authorization and transition-legality
+     * guards as {@link #declineBookingCore(UUID, Booking, StatusUpdateRequest, Predicate)} against
+     * the already-loaded {@code booking} snapshot — {@link AuthorizationService#enforceCanCancelBooking},
+     * {@link #assertNotAppointmentChild}, {@link #assertTransition} — every one of them an
+     * in-memory check against a row this method never writes to and never re-loads. Authorization
+     * and transition-legality are unchanged by this fix: still enforced per row, still enforced
+     * before that row's id is ever handed to the bulk write.
+     *
+     * @throws BusinessException  {@code req.cancellationReason()} is {@code null}
+     * @throws ForbiddenException the actor lacks provider authority over {@code booking}
+     * @throws NotFoundException  {@code booking} is not a standalone booking, or is not
+     *                             {@code CONFIRMED} at this snapshot (thrown by {@link
+     *                             #assertNotAppointmentChild} / {@link #assertTransition})
+     */
+    private void assertBatchDeclinePreconditions(UUID actorUserId, Booking booking, StatusUpdateRequest req) {
+        if (req.cancellationReason() == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required for declining a booking");
+        }
+        authz.enforceCanCancelBooking(actorUserId, booking);
+        // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
+        // Always a no-op for this call site (the caller already filtered to appointmentId == null
+        // candidates) — kept anyway, defensively, exactly like every other provider transition in
+        // this class (Anti-Bug: never weaken or skip an existing guard for an internal caller).
+        assertNotAppointmentChild(booking);
+        assertTransition(booking, BookingStatus.CONFIRMED, BookingStatus.DECLINED);
+    }
+
+    /**
+     * Bulk atomic write for every standalone candidate {@link #assertBatchDeclinePreconditions}
+     * already validated (perf re-audit, 2026-09, Finding A — restores the perf-1 fix's batching
+     * win the prior, per-row-atomic security fix gave back, WITHOUT relaxing that fix's
+     * atomicity). Issues exactly ONE call to {@link BookingRepository#declineConfirmedBulk} — a
+     * single native {@code UPDATE ... WHERE id IN (:ids) AND status = 'CONFIRMED' RETURNING id} —
+     * for every validated standalone booking in the whole cascade, regardless of {@code
+     * bookingIds.size()}. See that method's Javadoc for why one bulk statement is exactly as
+     * race-safe as {@code bookingIds.size()} separate single-row atomic UPDATEs: PostgreSQL
+     * evaluates the {@code WHERE} clause per row within the one statement, so a row that left
+     * CONFIRMED between {@link #assertBatchDeclinePreconditions}' check and this statement's own
+     * arrival at that row is excluded from the result exactly as it would be under N separate
+     * statements.
+     *
+     * <p><b>Stale-entity trap.</b> After this call returns, every {@code Booking} entity already
+     * loaded in this transaction's persistence context for an id in {@code bookingIds} — including
+     * every entry of {@code standaloneBookingsById} in the caller — carries a stale in-memory
+     * {@code status = CONFIRMED}, regardless of whether that id is actually in the returned
+     * {@code Set}. This is harmless today: nothing in this method's caller re-reads or mutates
+     * those entities after this call. But never assign a field on one of them, or call {@code
+     * entityManager.find(Booking.class, id)} for one of these ids, later in the SAME transaction —
+     * see {@link BookingRepository#declineConfirmedBulk}'s own Javadoc for the full hazard.
+     *
+     * @param bookingIds standalone-booking ids, already authorization- and transition-checked by
+     *                    the caller via {@link #assertBatchDeclinePreconditions} — may be empty,
+     *                    in which case this method issues NO query at all
+     * @param req         the SAME {@link StatusUpdateRequest} every candidate in this cascade
+     *                     shares (D5 — {@code providerComment} is always {@code null})
+     * @param now         the SAME {@code now} {@link #declineFutureConfirmedBookingsForSalonClosure}
+     *                     resolved once at the top of the whole scan (D3) — reused here only to
+     *                     stamp {@code updated_at}, never re-read, so this method introduces no
+     *                     second clock read
+     * @return the subset of {@code bookingIds} that this call actually transitioned to {@code
+     *         DECLINED} — never a superset; an id NOT in this set lost the race sometime after
+     *         {@link #assertBatchDeclinePreconditions} ran, and the caller MUST NOT enqueue a
+     *         {@code SALON_CLOSED}/{@code MASTER_REMOVED} entry keyed to it
+     */
+    private Set<UUID> declineConfirmedBookingsAtomic(
+            List<UUID> bookingIds, StatusUpdateRequest req, OffsetDateTime now) {
+        if (bookingIds.isEmpty()) {
+            return Set.of();
+        }
+        List<UUID> transitionedIds = bookingRepository.declineConfirmedBulk(
+                bookingIds, req.cancellationReason().name(), BookingComments.normalize(req.comment()),
+                now.toInstant());
+        return new HashSet<>(transitionedIds);
     }
 
     /**
@@ -1263,6 +1835,15 @@ public class BookingService {
      * #isStillConfirmed} — the SAME package-private seam G4 introduced, reused rather than
      * duplicated — because {@code Booking} carries no lock this method could hang a rendezvous off
      * instead (see that method's Javadoc).
+     *
+     * <p><b>Perf finding 1 (2026-09 audit).</b> This single-id overload is now a thin wrapper: the
+     * find + the {@code req.cancellationReason() == null} guard stay here (so the existing-but-
+     * foreign-vs-missing 403/400 precedence documented below is unchanged for this method's two
+     * existing callers, {@link #declineBooking} and {@link #declineBookingForBatch(UUID, UUID,
+     * StatusUpdateRequest)}), then delegates to {@link #declineBookingCore(UUID, Booking,
+     * StatusUpdateRequest, Predicate)} — the same core the salon-closure cascade's batched overload
+     * uses, passing {@link #isStillConfirmed} itself as the freshness predicate (identical, lazy,
+     * one-query-per-call semantics to before this split).
      */
     private Booking declineBookingCore(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         // Fix M4: require a reason, consistent with notCompleteBooking
@@ -1278,6 +1859,32 @@ public class BookingService {
         // enforcement is unchanged (below): a foreign provider still gets 403.
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new ForbiddenException("Access denied"));
+        return declineBookingCore(actorUserId, booking, req, this::isStillConfirmed);
+    }
+
+    /**
+     * Shared transition core behind BOTH {@link #declineBookingCore(UUID, UUID, StatusUpdateRequest)}
+     * (the pre-existing single-id path) and {@link #declineBookingForBatch(UUID, Booking,
+     * StatusUpdateRequest, Predicate)} (the salon-closure cascade's batched path, perf finding 1,
+     * 2026-09 audit). {@code booking} must already be a managed entity loaded with the
+     * {@code findByIdWithFullGraph} graph; {@code stillConfirmed} supplies the G5 freshness verdict
+     * (a lazy, per-call query via {@link #isStillConfirmed} for the single-id caller; a pre-computed
+     * batched-{@code Set} lookup, no query at all, for the cascade caller) — see this method's
+     * sibling single-id overload's own Javadoc for the full G5 rationale, which applies here
+     * verbatim regardless of which predicate supplied the answer.
+     *
+     * <p>Runs the {@code req.cancellationReason() == null} guard again defensively — always
+     * unreachable for the single-id caller (already thrown by its own earlier check) and always
+     * false for the cascade caller (its {@code StatusUpdateRequest} is built with a fixed non-null
+     * {@code PROVIDER_UNAVAILABLE} reason, D5) — so this never changes either caller's observable
+     * behaviour, it only keeps this shared core safe against a hypothetical future caller that
+     * skips its own check.
+     */
+    private Booking declineBookingCore(
+            UUID actorUserId, Booking booking, StatusUpdateRequest req, Predicate<UUID> stillConfirmed) {
+        if (req.cancellationReason() == null) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, "Cancellation reason required for declining a booking");
+        }
         authz.enforceCanCancelBooking(actorUserId, booking);
         // Multi-service visit item: refuse the single-booking transition (use /appointments/{id}).
         assertNotAppointmentChild(booking);
@@ -1289,7 +1896,7 @@ public class BookingService {
         // Freshness re-check (G5) — see this method's own Javadoc. Must run immediately before the
         // mutation below: assertTransition above only proves CONFIRMED on the stale pre-load
         // snapshot, not on the current row.
-        if (!isStillConfirmed(booking.getId())) {
+        if (!stillConfirmed.test(booking.getId())) {
             throw new BusinessException(HttpStatus.CONFLICT, "Service changed concurrently — please retry");
         }
         booking.setStatus(BookingStatus.DECLINED);

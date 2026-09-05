@@ -1,9 +1,11 @@
 package com.beautica.salon.repository;
 
+import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.entity.Salon;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -70,7 +72,40 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @Query("SELECT s.id FROM Salon s WHERE s.owner.id = :ownerId AND s.isActive = true")
     List<UUID> findIdsByOwnerIdAndIsActiveTrue(@Param("ownerId") UUID ownerId);
 
-    boolean existsByIdAndOwnerId(UUID id, UUID ownerId);
+    /**
+     * "Is {@code id} a salon owned by {@code ownerId}?" — the hottest authorization predicate in
+     * the application: every {@code @PreAuthorize("@authz.canManageSalon(...)")} endpoint reaches
+     * it through {@code AuthorizationService#hasManagementAccess}'s {@code SALON_OWNER} arm, and
+     * {@code isOwnerOf} / {@code salonsShareOwner} call it too.
+     *
+     * <p><b>Why an explicit query (Phase 283 perf).</b> Left derived, Spring Data emitted
+     * {@code select s1_0.id from salons s1_0 left join users o1_0 on o1_0.id=s1_0.owner_id where
+     * s1_0.id=? and o1_0.id=? fetch first ? rows only} — the {@code OwnerId} path expression made
+     * it join {@code users} purely to read back {@code users.id}, a value already sitting on the
+     * {@code salons} row as the {@code owner_id} FK. The join can never change the result:
+     * {@code salons.owner_id} is {@code UUID NOT NULL REFERENCES users(id)} (V3; later migrations
+     * only touch <em>indexes</em> and a dropped UNIQUE, never the nullability or the FK), so every
+     * {@code salons} row has exactly one matching {@code users} row and a {@code LEFT JOIN} on it
+     * is a pure no-op. Dropping it leaves a single-table lookup on the {@code salons} PK.
+     *
+     * <p><b>The existential-probe shape is preserved deliberately.</b> This is {@code SELECT EXISTS
+     * (SELECT 1 ...)}, NOT {@code count(...) > 0}: Postgres stops at the first qualifying row and
+     * returns a bare boolean, exactly like the derived form's {@code fetch first 1 rows only}
+     * probe. A count rewrite would have been a regression on the app's hottest gate, which is why
+     * the previous pass declined the change outright. Native SQL because HQL has no way to express
+     * a top-level {@code EXISTS} projection without either a {@code count} aggregate or a dummy
+     * {@code FROM} — and the method signature (name, params, {@code boolean} return) is unchanged,
+     * so every one of its ~40 call sites and mocks is untouched.
+     *
+     * <p><b>No {@code is_active} predicate</b>, matching the pre-existing behaviour exactly: a
+     * deactivated salon still answers {@code true} for its owner. {@link
+     * #findIdsByIdInAndOwnerId}'s Javadoc explains why that asymmetry with
+     * {@link #findIdsByOwnerIdAndIsActiveTrue} is load-bearing; do not "tidy" it here.
+     */
+    @Query(
+            value = "SELECT EXISTS (SELECT 1 FROM salons s WHERE s.id = :id AND s.owner_id = :ownerId)",
+            nativeQuery = true)
+    boolean existsByIdAndOwnerId(@Param("id") UUID id, @Param("ownerId") UUID ownerId);
 
     /**
      * Batched twin of {@link #existsByIdAndOwnerId}: of the supplied salon ids, the subset owned
@@ -104,6 +139,89 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     Optional<UUID> findOwnerIdById(@Param("salonId") UUID salonId);
 
     /**
+     * Active salons sharing {@code salonId}'s owner, <b>excluding {@code salonId} itself</b>
+     * (Phase 21.3b — {@code GET /salons/{salonId}/sibling-salons}). This is the destination
+     * candidate set for the rotate-admin mutation
+     * ({@code PATCH /salons/{salonId}/admins/{userId}/salon}), so its predicate is deliberately
+     * the exact complement of what {@code SalonService.rotateAdmin} accepts:
+     * {@code AuthorizationService.salonsShareOwner} (same owner) AND
+     * {@link #existsByIdAndIsActiveTrue} (active) AND {@code destinationSalonId != salonId}
+     * (the no-op 400 guard). A row this query returns is a legal rotation destination; a row it
+     * omits would be rejected by that mutation. The two must not drift — pinned by
+     * {@code SalonSiblingRotationParityIT}.
+     *
+     * <p><b>ONE statement (§E — no N+1).</b> The owner is resolved by a scalar sub-select on the
+     * {@code salons} PK rather than a caller-side {@code findOwnerIdById} round-trip, so no
+     * "resolve owner, then list" two-query chain exists. {@code salonId} not resolving to a salon
+     * yields an empty list (the sub-select produces no row), never an error; the controller's
+     * {@code @authz.canManageSalon} gate already denies that case with 403 before this runs.
+     *
+     * <p><b>No {@code JOIN FETCH s.owner} (Perf MEDIUM-1).</b> It was present to serve
+     * {@code SalonResponse.from}'s {@code salon.getOwner().getId()} read, and cost 38 {@code users}
+     * columns per row — including {@code password_hash} and every verification/password-reset code
+     * hash — to produce one UUID that is already on the {@code salons} row as the FK. The response
+     * shape is now {@code SiblingSalonOption}, which reads no association at all, so nothing here
+     * touches the owner proxy. Even under the old DTO the fetch was unnecessary: {@code /salons/mine}
+     * maps the identical {@code SalonResponse.from} off {@link #findAllByOwnerIdAndIsActiveTrue} with
+     * no {@code JOIN FETCH} and emits no follow-up {@code users} select — Hibernate reads the
+     * identifier straight off the uninitialised proxy.
+     *
+     * <p>The owner predicate is expressed as {@code s.owner.id} (not an explicit join), matching
+     * {@link #findIdsByOwnerIdAndIsActiveTrue} and {@link #findIdsByIdInAndOwnerId} in this same
+     * interface: an {@code @ManyToOne} identifier dereference compiles to the {@code owner_id} FK
+     * column with no {@code users} join at all.
+     *
+     * <p>Ordered by {@code created_at ASC, id ASC} — index-aligned with the partial
+     * {@code idx_salons_owner_active_created} ({@code owner_id, created_at WHERE is_active = true},
+     * V46) that already serves the {@code owner_id + is_active} predicate, and matching the
+     * existing owner-salon ordering convention of
+     * {@link #findTopByOwnerIdAndIsActiveTrueOrderByCreatedAtAsc}. No new index is needed. The
+     * trailing {@code id} is a UNIQUE tiebreaker (Perf MEDIUM-2): {@code created_at} alone is not
+     * unique — two salons created in the same statement/tick share a timestamp and would come back
+     * in an arbitrary, run-to-run-unstable order, which the picker renders as a jumping list. The
+     * index still drives the scan; the tiebreaker only resolves ties <em>within</em> an equal
+     * {@code created_at} group (Postgres Incremental Sort), bounded by
+     * {@code SalonService.MAX_ACTIVE_SALONS_PER_OWNER} rows.
+     *
+     * <p><b>Constructor projection, not an entity (Perf LOW-B).</b> Returning {@code Salon} made
+     * Hibernate select all 22 {@code salons} columns and hydrate one managed entity per row just to
+     * build a 4-field {@code SiblingSalonOption}. {@code SELECT new …} emits exactly the four
+     * columns the DTO carries and hydrates nothing into the persistence context, so this finder is
+     * structurally incapable of dragging an association (or a widened row) back in — see
+     * {@code SalonSiblingProjectionShapeIT}.
+     *
+     * <p>{@code createdAt} is ordered on but not selected. That is legal — the query has no
+     * {@code DISTINCT} and no {@code GROUP BY}, so Postgres may order by any column of the scanned
+     * relation whether or not it is in the target list — and it is what keeps the plan on
+     * {@code idx_salons_owner_active_created}: the index supplies {@code created_at} pre-sorted and
+     * the {@code id} tiebreaker is resolved by an Incremental Sort within each equal-timestamp
+     * group, exactly as under the entity form. Projecting fewer columns cannot change the access
+     * path; it only narrows the heap fetch.
+     */
+    @Query("""
+            SELECT new com.beautica.salon.dto.SiblingSalonOption(s.id, s.name, s.street, s.buildingNo)
+            FROM Salon s
+            WHERE s.isActive = true
+              AND s.id <> :salonId
+              AND s.owner.id = (SELECT src.owner.id FROM Salon src WHERE src.id = :salonId)
+            ORDER BY s.createdAt ASC, s.id ASC
+            """)
+    List<SiblingSalonOption> findActiveSiblingsBySalonId(@Param("salonId") UUID salonId);
+
+    /**
+     * Active-salon headcount for one owner — backs the per-owner portfolio cap enforced by
+     * {@code SalonService.createSalon} ({@code MAX_ACTIVE_SALONS_PER_OWNER}, Perf LOW-3).
+     *
+     * <p>Deliberately separate from {@link #existsByOwnerId}, which
+     * {@code createSalon} also calls: that one carries <b>no</b> {@code isActive} predicate because
+     * it decides {@code is_primary} ("has this owner EVER had a salon?"), whereas the cap governs
+     * the live portfolio — a deactivated salon must free its slot. Collapsing the two would either
+     * make a deactivated first salon re-claim {@code is_primary} or make the cap count soft-deleted
+     * rows. Both are index-served by the partial {@code idx_salons_owner_active_created} (V46).
+     */
+    long countByOwnerIdAndIsActiveTrue(UUID ownerId);
+
+    /**
      * Lightweight existence + active-flag check (Phase 21.3 rotation PERF fix). Used by
      * {@code SalonService.rotateAdmin} to validate the destination salon without loading the full
      * entity — the destination UUID is written directly onto {@code User.salonId} and no entity
@@ -111,6 +229,21 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * inactive", which the caller treats identically (Anti-Bug §D — no destination-status oracle).
      */
     boolean existsByIdAndIsActiveTrue(UUID id);
+
+    /**
+     * Nulls both image-URL pointer columns for a deleted salon (Phase 268 D2/D4) — called by
+     * {@code SalonService} strictly AFTER {@code MediaService#deleteBySalon} has attempted the R2
+     * deletes for the corresponding blobs, never before (D4's R2-first-then-DB ordering; the DB
+     * pointer is dropped whether or not the R2 call succeeded — a retained pointer would re-publish
+     * a deleted salon's photo at a live public URL, which is the outcome D4 exists to prevent).
+     *
+     * <p>Runs OUTSIDE the salon-deletion transaction — after commit, on the same thread as the R2
+     * sweep (D8) — so this is its own tiny transaction, not a mutation the caller's {@code @Transactional}
+     * boundary covers.
+     */
+    @Modifying
+    @Query("UPDATE Salon s SET s.avatarUrl = null, s.coverImageUrl = null WHERE s.id = :salonId")
+    int nullImageUrls(@Param("salonId") UUID salonId);
 
     // True iff the given owner already has at least one salon (primary or not).
     // Used in SalonService.createSalon to decide is_primary = true/false.

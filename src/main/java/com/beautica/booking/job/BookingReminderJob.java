@@ -177,10 +177,14 @@ public class BookingReminderJob {
                 "time", TIME_FMT.format(kyiv)));
     }
 
+    // V157 / phase 294 D3: a reminder is sent about a HISTORICAL booking whose master may have been
+    // detached (staff account hard-deleted), so the name comes from the accessor pair, which falls
+    // back to the detach-time snapshot. Still null-safe on either half.
     private static String masterName(Booking booking) {
-        var user = booking.getMaster().getUser();
-        String first = user.getFirstName() == null ? "" : user.getFirstName().trim();
-        String last = user.getLastName() == null ? "" : user.getLastName().trim();
+        String firstName = booking.getMaster().displayFirstName();
+        String lastName = booking.getMaster().displayLastName();
+        String first = firstName == null ? "" : firstName.trim();
+        String last = lastName == null ? "" : lastName.trim();
         return (first + " " + last).trim();
     }
 }

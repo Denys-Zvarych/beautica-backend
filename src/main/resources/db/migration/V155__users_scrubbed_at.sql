@@ -1,0 +1,27 @@
+-- V155 — users.scrubbed_at: marks when a staff account's PII was scrubbed by the
+-- salon-deletion cascade (Phase 291).
+--
+-- WHY.
+-- Phase 290 deactivates a deleted salon's SALON_MASTER/SALON_ADMIN `users` rows
+-- (is_active = false, tokens_valid_after stamped) but leaves every PII column — including
+-- `email` — untouched. That is the root cause of the bug this phase closes:
+-- `InviteService.sendInvite`/`acceptInvite` both reject on `userRepository.existsByEmail(email)`,
+-- which is intentionally global and salon-agnostic (relaxing it would let `acceptInvite` insert a
+-- SECOND row with the same email and hit `users.email`'s UNIQUE constraint) — so a scrubbed
+-- staff member's original address permanently blocks any future re-invite to that address, even
+-- to a brand-new salon. This phase's fix is data-side: rewrite the scrubbed row's email to a
+-- non-routable per-user tombstone so `existsByEmail(originalEmail)` naturally returns false —
+-- zero change to either invite method.
+--
+-- WHY A SEPARATE COLUMN, NOT JUST "email LIKE 'deleted+%'".
+-- `scrubbed_at` gives the idempotency guard (and its test) something precise and typed to check —
+-- NULL means "never scrubbed", non-NULL is the exact instant the scrub ran — rather than
+-- re-deriving "was this already scrubbed" from a string-matching heuristic against the tombstone
+-- format. It also distinguishes THIS cascade's scrub (salon deletion) from a hypothetical future
+-- self-service "delete my account" flow, which would stamp the same column for a different
+-- trigger — see phase-291's doc `## Decisions` for why one column suffices for both origins.
+--
+-- NULLABLE, no DEFAULT: every pre-existing row (and every newly-registered row) has never been
+-- scrubbed, so NULL is the correct default with no backfill needed.
+ALTER TABLE users
+    ADD COLUMN scrubbed_at TIMESTAMPTZ NULL;

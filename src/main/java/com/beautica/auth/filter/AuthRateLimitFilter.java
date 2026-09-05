@@ -37,6 +37,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
     private static final String CHANGE_PASSWORD_OTP_PATH = "/api/v1/users/me/change-password/request-otp";
     private static final String INVITE_PATH = "/api/v1/auth/invite";
+    // The two invite-TOKEN endpoints an invitee (not the inviting SALON_OWNER/SALON_ADMIN) hits
+    // directly from the emailed link — both permitAll() in SecurityConfig, both exact matches so
+    // neither can collide with INVITE_PATH ("/api/v1/auth/invite", no trailing segment) or with
+    // each other. See INVITE_VALIDATE_CAPACITY / INVITE_ACCEPT_CAPACITY for why each has its own
+    // bucket and sizing rather than sharing inviteBuckets above (that bucket protects an
+    // AUTHENTICATED admin's send-invite action; these protect an UNAUTHENTICATED invitee's
+    // read-then-write flow — different actor population, different risk).
+    private static final String INVITE_VALIDATE_PATH = "/api/v1/auth/invite/validate";
+    private static final String INVITE_ACCEPT_PATH = "/api/v1/auth/invite/accept";
     private static final String LOGOUT_PATH = "/api/v1/auth/logout";
     // The two master-availability READ endpoints, which share ONE bucket (slotsBuckets) because they are
     // the same class of request from the same screen: the client booking calendar fetches
@@ -276,6 +285,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // slice/regression tests — stays unchanged.
     private static final long INVITE_CAPACITY = 15;
     private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
+    // Capacity/window for GET /api/v1/auth/invite/validate and POST /api/v1/auth/invite/accept
+    // are @Value-configurable in RateLimitConfig (inviteValidateBuckets() / inviteAcceptBuckets(),
+    // defaults 30/60s and 20/15min) — UNLIKE inviteBuckets/salonInviteBuckets above, which are
+    // built internally. Reason for the split: InviteControllerIT alone drives dozens of real HTTP
+    // calls against these two exact endpoints from 127.0.0.1 across its test methods (unlike the
+    // send-invite path, which existing integration coverage reaches only a handful of times), so a
+    // fixed low cap would make the test suite itself trip the throttle. Making the cap
+    // @Value-configurable lets application-test.yml raise it the same way it already does for
+    // register/login/service-write/etc., without weakening the production default. See
+    // RateLimitConfig#inviteValidateCapacity / #inviteAcceptCapacity for the full sizing rationale
+    // (both are pure load/replay bounds — the 256-bit hashed token makes guessing infeasible
+    // regardless, and acceptInvite sends no email/SMS).
+    //
+    // Retry-After for the accept bucket must reflect its OWN 15-minute window (mirrors
+    // CANCEL_POST_RETRY_AFTER_SECONDS / GUEST_BOOKING_RETRY_AFTER_SECONDS below) — otherwise a
+    // client honouring Retry-After would spin-retry every 60 s against a budget that will not
+    // have refilled. The validate bucket reuses RETRY_AFTER_SECONDS (its window is 60 s).
+    private static final int INVITE_ACCEPT_RETRY_AFTER_SECONDS = 900;
     // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors INVITE_CAPACITY
     // / INVITE_WINDOW above (kept as its own dedicated constants, not shared, so the two
     // endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
@@ -410,6 +437,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // branches return fast). Built internally rather than injected so the public 16-arg
     // constructor stays stable for the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> inviteBuckets;
+    // Per-IP bucket for GET /api/v1/auth/invite/validate — the LOW-fix flood guard for the
+    // permitAll() invite-preview read that previously fell through the unconditional non-POST
+    // early return with no throttle at all. UNLIKE most buckets below, this one IS an injected
+    // @Qualifier bean (RateLimitConfig#inviteValidateBuckets) rather than built internally — see
+    // the comment on INVITE_ACCEPT_RETRY_AFTER_SECONDS above for why.
+    private final LoadingCache<String, Bucket> inviteValidateBuckets;
+    // Per-IP bucket for POST /api/v1/auth/invite/accept — the LOW-fix flood guard for the
+    // permitAll() invite-acceptance write that previously fell through to the unmatched-POST
+    // else branch with no throttle at all. UNLIKE most buckets below, this one IS an injected
+    // @Qualifier bean (RateLimitConfig#inviteAcceptBuckets) — same reason as inviteValidateBuckets
+    // above.
+    private final LoadingCache<String, Bucket> inviteAcceptBuckets;
     // Per-IP bucket for POST /api/v1/salons/{salonId}/invite — the SEC-fix compensating control
     // closing the gap left when this path (the actual HTTP surface for SalonController.inviteMaster,
     // reachable by SALON_OWNER and, since Phase 21.1, SALON_ADMIN) fell through to the unmatched
@@ -457,7 +496,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
             @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
             @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
-            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets) {
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -477,6 +518,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.verifyPasswordResetOtpBuckets = verifyPasswordResetOtpBuckets;
         this.changePasswordOtpBuckets = changePasswordOtpBuckets;
         this.serviceWriteBuckets = serviceWriteBuckets;
+        this.inviteValidateBuckets = inviteValidateBuckets;
+        this.inviteAcceptBuckets = inviteAcceptBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -807,6 +850,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Invite-validate rate-limit: GET /api/v1/auth/invite/validate — a single literal
+        // equality check on the exact path, checked before the unconditional non-POST bypass
+        // immediately below. Before this branch the endpoint fell straight through that bypass
+        // with NO throttle at all (backlog LOW finding). This does NOT widen the bypass itself —
+        // every other GET in the app still falls through unmatched, exactly as before; this rule
+        // can only ever match the one literal path. See INVITE_VALIDATE_CAPACITY for sizing.
+        if (HttpMethod.GET.matches(method) && INVITE_VALIDATE_PATH.equals(path)) {
+            applyRateLimit(request, response, filterChain, inviteValidateBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         if (!HttpMethod.POST.matches(method)) {
             filterChain.doFilter(request, response);
             return;
@@ -841,6 +895,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
         } else if (INVITE_PATH.equals(path)) {
             cache = inviteBuckets;
+        } else if (INVITE_ACCEPT_PATH.equals(path)) {
+            cache = inviteAcceptBuckets;
+            retryAfterSeconds = INVITE_ACCEPT_RETRY_AFTER_SECONDS;
         } else if (LOGOUT_PATH.equals(path)) {
             cache = logoutBuckets;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {

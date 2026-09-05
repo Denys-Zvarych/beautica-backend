@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import static org.mockito.Mockito.verifyNoInteractions;
 import com.beautica.common.exception.BusinessException;
 import org.springframework.http.HttpStatus;
@@ -16,6 +17,10 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
+import com.beautica.common.exception.SalonDeletionBlockedException;
+import com.beautica.salon.audit.StaffClientReferenceAuditResult;
+import com.beautica.salon.audit.StaffClientReferenceType;
+import com.beautica.salon.audit.StaffClientReferenceViolation;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
@@ -54,6 +59,40 @@ import static org.mockito.Mockito.when;
 @DisplayName("SalonService — unit")
 class SalonServiceTest {
 
+    /**
+     * {@code deactivateSalon}'s transaction timeout was purely declarative — no test read it, so a
+     * refactor that dropped or defaulted it would have shipped silently. It is not decoration: this
+     * one transaction runs the phase 289 audit, the phase 293 decline cascade, N master
+     * detach/delete statements and a bulk {@code DELETE FROM users}, and it is the only method in
+     * this service that holds row locks across all of them. Without a bound, a pathological salon
+     * pins a Neon connection indefinitely; with it, the client gets a failure and the destructive
+     * half rolls back whole.
+     *
+     * <p>Reflection on the annotation rather than a behavioural test on purpose — Spring's
+     * declarative timeout is applied by the proxy, and any test that could observe it firing would
+     * have to actually stall a real transaction for 30 seconds.
+     */
+    @Test
+    @DisplayName("should_boundTheDeletionTransaction_when_deactivateSalonIsDeclared")
+    void should_boundTheDeletionTransaction_when_deactivateSalonIsDeclared() throws Exception {
+        var annotation = SalonService.class
+                .getMethod("deactivateSalon", UUID.class, UUID.class)
+                .getAnnotation(org.springframework.transaction.annotation.Transactional.class);
+
+        assertThat(annotation)
+                .as("deactivateSalon must stay @Transactional — the audit, the decline cascade "
+                        + "and the users delete are all-or-nothing")
+                .isNotNull();
+        assertThat(annotation.timeout())
+                .as("the salon-deletion transaction must stay explicitly bounded at 30s, not fall "
+                        + "back to the -1 platform default")
+                .isEqualTo(30);
+        assertThat(annotation.readOnly())
+                .as("this is the most destructive mutation in the service — readOnly would make "
+                        + "the whole cascade a silent no-op on some drivers")
+                .isFalse();
+    }
+
     @Mock
     private SalonRepository salonRepository;
 
@@ -77,6 +116,66 @@ class SalonServiceTest {
     // which is inactive under MockitoExtension — tested via integration test.
     private CacheManager cacheManager;
 
+    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
+    // parameter — without it the field receives null (used by the batch
+    // resolveOblastIdsByCityIds sibling for getOwnerSalons; the single-row resolveOblastId path
+    // no longer touches this mock — see locationQueryService below).
+    @Mock
+    private com.beautica.location.repository.CityRepository cityRepository;
+
+    // Phase 240 perf MEDIUM fix: resolveOblastId now delegates to the shared cached resolver
+    // (LocationQueryService#resolveCityOblastId) instead of calling CityRepository directly —
+    // must be declared so @InjectMocks can satisfy the constructor parameter (mirrors
+    // MasterServiceTest).
+    @Mock
+    private com.beautica.location.service.LocationQueryService locationQueryService;
+
+    // Audit-fix cycle 2: SalonService evicts the affected user's cached profile after commit
+    // (createSalon, removeAdmin, rotateAdmin all mutate a `users` row). @InjectMocks passes null
+    // for an UNDECLARED collaborator silently, so compileTestJava stays green and the omission
+    // only surfaces as an NPE at runtime — this field must exist even when no test here reaches
+    // an evict call.
+    @Mock
+    private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    // Phase 290: SalonService now constructor-depends on the salon-deletion staff-deactivation
+    // cascade's five collaborators. @InjectMocks passes null for an UNDECLARED collaborator
+    // silently, so compileTestJava stays green and the omission only surfaces as an NPE at
+    // runtime — declared even though only two tests below actually exercise deactivateSalon's
+    // new code (every other test's deactivateSalon call throws before reaching it).
+    @Mock
+    private com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
+
+    @Mock
+    private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
+
+    // Phase 293: SalonService now constructor-depends on BookingService for the salon-closure
+    // booking cascade (deactivateSalon calls declineFutureConfirmedBookingsForSalonClosure).
+    // @InjectMocks passes null for an UNDECLARED collaborator silently, so compileTestJava stays
+    // green and the omission only surfaces as an NPE at runtime — declared even though the call
+    // is a void no-op here (every test that reaches it asserts on the surrounding behaviour).
+    @Mock
+    private com.beautica.booking.service.BookingService bookingService;
+
+    // Phase 268: SalonService now constructor-depends on the salon-deletion
+    // catalogue/favourites/media cascade's five collaborators. @InjectMocks passes null for an
+    // UNDECLARED collaborator silently, so compileTestJava stays green and the omission only
+    // surfaces as an NPE at runtime (as it did for deactivateSalon here before these were added).
+    @Mock
+    private com.beautica.service.repository.ServiceRepository serviceRepository;
+
+    @Mock
+    private com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
+
+    @Mock
+    private com.beautica.media.repository.MediaRepository mediaRepository;
+
+    @Mock
+    private com.beautica.media.service.MediaService mediaService;
+
+    @Mock
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
+
     @InjectMocks
     private SalonService salonService;
 
@@ -88,7 +187,7 @@ class SalonServiceTest {
         var request = new CreateSalonRequest("Second Salon", null, "Kyiv", null, null, null, null, null, null, null, null, null);
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Second Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -119,7 +218,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Geo Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
         when(userRepository.save(owner)).thenReturn(owner);
@@ -139,6 +238,113 @@ class SalonServiceTest {
         verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
         // first-salon path (existsByOwnerId=false) must trigger master auto-creation
         verify(masterService).createMasterForOwner(owner, savedSalon);
+    }
+
+    // ── createSalon / updateSalon — resolveOblastId (mirrors MasterServiceTest) ────────
+    // The oblastId surfaced on SalonResponse is DERIVED from savedSalon.getCityId() at read
+    // time (never stored) — see SalonResponse#from(Salon, UUID) and
+    // SalonService#resolveOblastId(UUID). Neither direction was previously value-asserted:
+    // every prior test in this package either left cityId null or never read
+    // response.oblastId(), so a broken resolveOblastId (e.g. always null, or wired to the
+    // wrong repository method) passed every existing test.
+
+    @Test
+    @DisplayName("createSalon — resolves oblastId from the saved salon's cityId")
+    void should_resolveOblastId_when_createSalonWithCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Geo Salon", null, null, null, null, null, null,
+                cityId, null, null, null, null);
+        var savedSalon = Salon.builder()
+                .owner(owner)
+                .name("Geo Salon")
+                .isActive(true)
+                .cityId(cityId)
+                .build();
+        ReflectionTestUtils.setField(savedSalon, "id", UUID.randomUUID());
+        ReflectionTestUtils.setField(savedSalon, "createdAt", Instant.now());
+
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.cityId()).isEqualTo(cityId);
+        assertThat(response.oblastId())
+                .as("oblastId must resolve to the real parent oblast of the salon's cityId")
+                .isEqualTo(oblastId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
+    }
+
+    @Test
+    @DisplayName("createSalon — leaves oblastId null when the saved salon has no cityId")
+    void should_returnNullOblastId_when_createSalonWithoutCityId() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("No Geo Salon", null, null, null, null, null, null,
+                null, null, null, null, null);
+        var savedSalon = buildSalonNoCity(UUID.randomUUID(), owner, "No Geo Salon");
+
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        assertThat(response.oblastId()).isNull();
+        // CRITICAL guard-branch assertion (Q6): the cityId-null fast path must never hit the DB.
+        verify(locationQueryService, never()).resolveCityOblastId(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — resolves oblastId from the patched salon's cityId")
+    void should_resolveOblastId_when_updateSalonSetsCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+
+        var request = new UpdateSalonRequest("Old Name", null, null, null, null,
+                cityId, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.oblastId())
+                .as("oblastId must resolve to the real parent oblast of the patched cityId")
+                .isEqualTo(oblastId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
+    }
+
+    @Test
+    @DisplayName("updateSalon — leaves oblastId null when the patched cityId does not resolve to a known city")
+    void should_returnNullOblastId_when_updateSalonCityIdUnresolvable() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+
+        var request = new UpdateSalonRequest("Old Name", null, null, null, null,
+                cityId, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(null);
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.oblastId())
+                .as("an orphaned/unresolvable cityId must degrade to null oblastId, never throw")
+                .isNull();
+        verify(locationQueryService).resolveCityOblastId(cityId);
     }
 
     // ── createSalon — Phase 20.x instagram widened validation + normalisation ──
@@ -161,7 +367,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Handle Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -185,7 +391,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "URL Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -224,7 +430,7 @@ class SalonServiceTest {
         User client = buildUser(userId, "client@beautica.com", Role.CLIENT);
         var request = new CreateSalonRequest("My Salon", null, null, null, null, null, null, null, null, null, null, null);
 
-        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+        when(userRepository.findByIdForUpdate(userId)).thenReturn(Optional.of(client));
 
         assertThatThrownBy(() -> salonService.createSalon(userId, request))
                 .isInstanceOf(ForbiddenException.class)
@@ -243,6 +449,56 @@ class SalonServiceTest {
         assertThatThrownBy(() -> salonService.getSalonEntity(salonId))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Salon not found");
+    }
+
+    // ── getPublicSalon — oblastId resolution on the permitAll GET /salons/{salonId} path ──
+    // Follow-up to the createSalon/updateSalon coverage above: PublicSalonResponse#oblastId is
+    // stranded unless THIS resolution path (the one endpoint the mobile owner/admin management
+    // screen actually loads through) is independently value-pinned in both directions.
+
+    @Test
+    @DisplayName("getPublicSalon — resolves oblastId from the salon's cityId")
+    void should_resolveOblastId_when_getPublicSalonWithCityId() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID oblastId = UUID.randomUUID();
+        User owner = buildUser(UUID.randomUUID(), "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = Salon.builder()
+                .owner(owner)
+                .name("Geo Salon")
+                .isActive(true)
+                .cityId(cityId)
+                .build();
+        ReflectionTestUtils.setField(salon, "id", salonId);
+        ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
+
+        when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
+
+        var response = salonService.getPublicSalon(salonId);
+
+        assertThat(response.cityId()).isEqualTo(cityId);
+        assertThat(response.oblastId())
+                .as("oblastId must resolve to the real parent oblast of the salon's cityId")
+                .isEqualTo(oblastId);
+        verify(locationQueryService).resolveCityOblastId(cityId);
+    }
+
+    @Test
+    @DisplayName("getPublicSalon — leaves oblastId null when the salon has no cityId")
+    void should_returnNullOblastId_when_getPublicSalonWithoutCityId() {
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(UUID.randomUUID(), "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalonNoCity(salonId, owner, "No Geo Salon");
+
+        when(salonRepository.findByIdAndIsActiveTrueWithOwner(salonId)).thenReturn(Optional.of(salon));
+
+        var response = salonService.getPublicSalon(salonId);
+
+        assertThat(response.oblastId()).isNull();
+        // CRITICAL guard-branch assertion (Q6, mirrored): the cityId-null fast path must never
+        // hit the DB.
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     @Test
@@ -361,27 +617,211 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("updateSalon — propagates BusinessException from LocalityWriteValidator and does not save")
-    void should_rejectUpdateSalon_when_localityValidationFails() {
+    @DisplayName("updateSalon — propagates BusinessException from LocalityWriteValidator when a supplied cityId is rejected, and does not save")
+    void should_rejectUpdateSalon_when_suppliedCityIdFailsLocalityValidation() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
+        UUID unknownCityId = UUID.randomUUID();
         User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
         Salon salon = buildSalon(salonId, owner, "Old Name");
 
-        // City omitted — validator (the real one) would reject; here the mock is
-        // configured to throw to assert the service propagates and aborts the save.
+        // cityId IS supplied (not omitted) but the (mocked) validator rejects it — e.g. the
+        // taxonomy id does not exist. This is distinct from the omitted-cityId PATCH case
+        // (see should_notValidateOrTouchLocality_when_updateSalonOmitsCityId below): here the
+        // caller explicitly asked for a locality change, so validation must still run and its
+        // rejection must still propagate and abort the save.
         var request = new UpdateSalonRequest("New Name", null, null, null, null,
-                null, null, null, null, null, null, null);
+                unknownCityId, null, null, null, null, null, null);
 
         when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
-        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
+        org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("Selected city does not exist"))
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
         assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
                 .isInstanceOf(com.beautica.common.exception.BusinessException.class)
-                .hasMessageContaining("City is required");
+                .hasMessageContaining("Selected city does not exist");
 
         verify(salonRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — description-only PATCH with cityId omitted skips locality validation and leaves the salon's existing city/district untouched")
+    void should_notValidateOrTouchLocality_when_updateSalonOmitsCityId() {
+        // Regression test for the actual user-reported bug: a PATCH that only changes
+        // description (mobile's notifier does not resend cityId) used to throw
+        // BusinessException("City is required") because validateProviderLocality ran
+        // unconditionally against the raw (null) request.cityId(). A salon's city is
+        // guaranteed non-null (V150/V151), so an omitted cityId in a PATCH must mean
+        // "keep the existing locality", not "reject the request".
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID existingDistrictId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setCityId(existingCityId);
+        salon.setDistrictId(existingDistrictId);
+        salon.setDescription("Old description");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl.
+        var request = new UpdateSalonRequest(null, "New description", null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(response.description()).isEqualTo("New description");
+        assertThat(response.cityId())
+                .as("existing cityId must survive a description-only PATCH unchanged")
+                .isEqualTo(existingCityId);
+        assertThat(response.districtId())
+                .as("existing districtId must survive a description-only PATCH unchanged")
+                .isEqualTo(existingDistrictId);
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — a name-only PATCH that omits locationNote must not wipe the previously saved note")
+    void should_notWipeLocationNote_when_updateSalonOmitsIt() {
+        // Regression for the sibling bug to should_notValidateOrTouchLocality_when_updateSalonOmitsCityId
+        // above: locationNote is OPTIONAL on UpdateSalonRequest (unlike street/buildingNo, which
+        // are @NotBlank and therefore always present), so an unconditional
+        // salon.setLocationNote(request.locationNote()) silently wiped a saved note on ANY PATCH
+        // that didn't resend it — e.g. this name-only edit. A null locationNote in the patch must
+        // mean "not included in this update", matching the cityId PATCH contract.
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setLocationNote("Ring the back doorbell");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl.
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getLocationNote())
+                .as("a null locationNote in the patch must leave the stored note untouched (PATCH semantics)")
+                .isEqualTo("Ring the back doorbell");
+    }
+
+    @Test
+    @DisplayName("updateSalon — an explicit empty-string locationNote clears the previously saved note")
+    void should_clearLocationNote_when_updateSalonSendsEmptyString() {
+        // Pins the other half of the locationNote contract: null means "leave unchanged" (see
+        // should_notWipeLocationNote_when_updateSalonOmitsIt above), but the mobile client's
+        // clear-the-note action sends "" explicitly (salon_management_profile_notifier.dart's
+        // saveAddress() diff-then-omit formula), so "" must still reach the entity and must NOT
+        // be treated the same as null.
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setLocationNote("Ring the back doorbell");
+
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                null, null, null, null, "", null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getLocationNote())
+                .as("an explicit empty string must clear the note, distinct from a null (unchanged) patch")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("updateSalon — a name-only PATCH that omits phone must not wipe the previously saved phone")
+    void should_notWipePhone_when_updateSalonOmitsIt() {
+        // Same contract as should_notWipeLocationNote_when_updateSalonOmitsIt above, pinned for
+        // `phone` because PublicSalonResponse now serves it on the public GET — the mobile
+        // «Контакти» block reads it there, so a PATCH that silently nulled it would blank the
+        // block for every unauthenticated visitor. phone is OPTIONAL on UpdateSalonRequest, so a
+        // null means "not included in this PATCH", never "clear it".
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setPhone("+380509998877");
+
+        // Field order: name, description, city, region, address, cityId, districtId,
+        //              street, buildingNo, locationNote, phone, instagramUrl.
+        var request = new UpdateSalonRequest("Updated Name", null, null, null, null,
+                null, null, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getPhone())
+                .as("a null phone in the patch must leave the stored phone untouched (PATCH semantics)")
+                .isEqualTo("+380509998877");
+    }
+
+    @Test
+    @DisplayName("updateSalon — an explicit empty-string phone clears the previously saved phone verbatim")
+    void should_clearPhone_when_updateSalonSendsEmptyString() {
+        // Pins the other half of the phone contract, mirroring
+        // should_clearLocationNote_when_updateSalonSendsEmptyString above: "" is the mobile
+        // client's explicit clear signal and must reach the entity, distinct from null. It is
+        // stored and served VERBATIM as "" — locked product decision, do NOT normalise blank to
+        // null here or in PublicSalonResponse (see PublicSalonResponseTest
+        // #should_servePhoneVerbatim_when_salonPhoneIsEmptyString); the client treats null and ""
+        // alike as "no phone".
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setPhone("+380509998877");
+
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                null, null, null, null, null, "", null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getPhone())
+                .as("an explicit empty string must clear the phone, distinct from a null (unchanged) patch")
+                .isEmpty();
+    }
+
+    @Test
+    @DisplayName("updateSalon — rejects a districtId supplied without cityId instead of silently dropping it")
+    void should_rejectUpdate_when_districtIdSuppliedWithoutCityId() {
+        // Regression for the LOW finding sibling to the cityId-omitted fix above: the locality
+        // write is gated on cityId != null, so a PATCH supplying districtId but NOT cityId used to
+        // be a silent no-op — the district was neither validated, nor written, nor rejected, and
+        // the caller got a 200 believing their change applied. Fail loud with a clean 400 instead.
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID existingCityId = UUID.randomUUID();
+        UUID orphanDistrictId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Old Name");
+        salon.setCityId(existingCityId);
+
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                null, orphanDistrictId, null, null, null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        assertThatThrownBy(() -> salonService.updateSalon(ownerId, salonId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("cityId");
+
+        verify(salonRepository, never()).save(any());
+        verify(localityWriteValidator, never()).validateProviderLocality(any());
+        assertThat(salon.getDistrictId())
+                .as("the salon's district must remain unset — the rejected districtId must not be written")
+                .isNull();
     }
 
     @Test
@@ -397,7 +837,7 @@ class SalonServiceTest {
                 cityId, null, null, null, null
         );
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
@@ -424,7 +864,7 @@ class SalonServiceTest {
                 null, null, null, null, null
         );
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         org.mockito.Mockito.doThrow(new com.beautica.common.exception.BusinessException("City is required"))
                 .when(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
 
@@ -454,7 +894,7 @@ class SalonServiceTest {
         );
         var savedSalon = buildSalon(UUID.randomUUID(), owner, "Valid Geo Salon");
 
-        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
 
@@ -476,6 +916,7 @@ class SalonServiceTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub: `salon` is a managed entity in-tx; the isActive mutation flushes via
         // Hibernate dirty-checking on commit, so deactivateSalon no longer calls save()
         // (PERF-LOW redundant-write drop). The behavioural contract is the isActive flip below.
@@ -515,6 +956,7 @@ class SalonServiceTest {
 
         when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
         // No save() stub: managed entity flushes via dirty-checking (PERF-LOW redundant-write drop).
 
         salonService.deactivateSalon(ownerId, salonId);
@@ -554,6 +996,65 @@ class SalonServiceTest {
                 .hasMessageContaining("User not found");
 
         verify(salonRepository, never()).findByIdAndOwnerId(any(), any());
+    }
+
+    /**
+     * QA audit (2026-09-03) gap fix — {@code should_abortWithoutMutating_when_auditFindsViolation}
+     * (the Testcontainers IT) proves a violation aborts the deletion, but no test anywhere
+     * asserted the actual VALUE {@code deactivateSalon} computes for
+     * {@link SalonDeletionBlockedException#getAffectedStaffCount()}. Phase 289's own finding is
+     * that violations are CORRELATED, not independent — one bad booking row trips
+     * {@code BOOKING_CLIENT} plus any review/client-review built on that same booking, for the
+     * SAME staff member. A naive {@code violations.size()} (no {@code .distinct()} on the mapped
+     * user ids) would report 3 incidents for 1 person. This pins the collapsing behaviour
+     * directly, at the unit level, without a real DB.
+     */
+    @Test
+    @DisplayName("deactivateSalon — throws SalonDeletionBlockedException with affectedStaffCount "
+            + "collapsed to DISTINCT staff, not a per-violation-row count, and mutates nothing")
+    void should_reportDistinctStaffCount_when_auditFindsCorrelatedViolationsForSameUser() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+
+        UUID correlatedStaffId = UUID.randomUUID();
+        UUID otherStaffId = UUID.randomUUID();
+        StaffClientReferenceAuditResult violating = StaffClientReferenceAuditResult.of(
+                List.of(
+                        // Same staff member, tripped at THREE reference sites by one underlying
+                        // booking — this must collapse to ONE incident, not three.
+                        new StaffClientReferenceViolation(
+                                correlatedStaffId, Role.SALON_MASTER,
+                                StaffClientReferenceType.BOOKING_CLIENT, 1),
+                        new StaffClientReferenceViolation(
+                                correlatedStaffId, Role.SALON_MASTER,
+                                StaffClientReferenceType.REVIEW_CLIENT, 1),
+                        new StaffClientReferenceViolation(
+                                correlatedStaffId, Role.SALON_MASTER,
+                                StaffClientReferenceType.CLIENT_REVIEW_SUBJECT, 1),
+                        // A genuinely different staff member — must still count as a second.
+                        new StaffClientReferenceViolation(
+                                otherStaffId, Role.SALON_ADMIN,
+                                StaffClientReferenceType.BOOKING_CLIENT, 1)),
+                Instant.now());
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        when(staffClientReferenceAuditService.runAuditForSalon(salonId)).thenReturn(violating);
+
+        assertThatThrownBy(() -> salonService.deactivateSalon(ownerId, salonId))
+                .isInstanceOf(SalonDeletionBlockedException.class)
+                .satisfies(ex -> assertThat(((SalonDeletionBlockedException) ex).getAffectedStaffCount())
+                        .as("4 violation rows across 2 distinct staff ids must report 2, not 4")
+                        .isEqualTo(2));
+
+        // Fail-closed: the abort happens before ANY mutation — salon stays active, and the staff
+        // cascade (masters lookup, staff-id resolution) never runs.
+        assertThat(salon.isActive()).isTrue();
+        verify(masterRepository, never()).findBySalonIdAndIsActiveTrueWithUser(any(), any());
+        verify(staffClientReferenceAuditService, never()).resolveSalonStaffUserIds(any());
+        verify(salonRepository, never()).save(any());
     }
 
     @Test
@@ -653,6 +1154,22 @@ class SalonServiceTest {
         verifyNoInteractions(masterRepository);
     }
 
+    /**
+     * Wires the Phase 290 staff-deactivation cascade to a clean no-op for {@code salonId}: audit
+     * CLEAN, no active masters, no staff user ids. The two {@code deactivateSalon} tests that
+     * reach this new code assert something else entirely (the {@code isActive} flip, the
+     * salon-repository call shape) — without these stubs the fail-closed audit call and the
+     * masters/staff loops would NPE on Mockito's default {@code null} return for the unstubbed
+     * {@link StaffClientReferenceAuditResult}/{@link Page} types.
+     */
+    private void stubCleanEmptyStaffCascade(UUID salonId) {
+        when(staffClientReferenceAuditService.runAuditForSalon(salonId))
+                .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.now()));
+        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged()))
+                .thenReturn(Page.empty());
+        when(staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId)).thenReturn(List.of());
+    }
+
     private User buildUser(UUID id, String email, Role role) {
         var user = new User(email, "hashed", role, null, null, null);
         ReflectionTestUtils.setField(user, "id", id);
@@ -660,6 +1177,26 @@ class SalonServiceTest {
     }
 
     private Salon buildSalon(UUID id, User owner, String name) {
+        var salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .owner(owner)
+                .name(name)
+                .isActive(true)
+                .build();
+        ReflectionTestUtils.setField(salon, "id", id);
+        ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
+        return salon;
+    }
+
+    /**
+     * Same as {@link #buildSalon(UUID, User, String)} but WITHOUT a cityId — a real salon can
+     * never reach this state going forward (DB-level {@code NOT NULL} as of V150, plus the
+     * unconditional {@code LocalityWriteValidator} guard on every write path), but the defensive
+     * null-handling in {@code SalonService#resolveOblastId} stays in place for legacy rows and is
+     * exactly what these tests exist to cover — do NOT "fix" them onto {@link #buildSalon} by
+     * giving this salon a real cityId.
+     */
+    private Salon buildSalonNoCity(UUID id, User owner, String name) {
         var salon = Salon.builder()
                 .owner(owner)
                 .name(name)

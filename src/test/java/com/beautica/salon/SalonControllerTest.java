@@ -1,5 +1,6 @@
 package com.beautica.salon;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.JwtAuthenticationFilter;
 import com.beautica.auth.JwtTokenProvider;
 import com.beautica.auth.Role;
@@ -8,6 +9,7 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.config.WebMvcTestSupport;
 import com.beautica.salon.controller.SalonController;
 import com.beautica.salon.dto.CreateSalonRequest;
+import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
@@ -161,8 +163,10 @@ class SalonControllerTest {
 
     private SalonResponse stubSalonResponse(UUID salonId, String name) {
         // Phase 12.1: isPrimary added as the 17th component; false is the safe default for stubs.
+        // oblastId (derived from cityId, never stored) added after cityId; null is the safe
+        // default for stubs with no cityId set.
         return new SalonResponse(salonId, null, name, null, null, null, null,
-                null, null, null, null, null, null, null, null, true, false, null);
+                null, null, null, null, null, null, null, null, null, true, false, null);
     }
 
     // ── POST /api/v1/salons ───────────────────────────────────────────────────
@@ -173,7 +177,7 @@ class SalonControllerTest {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var request = new CreateSalonRequest("My Salon", null, "Kyiv", null, null, null, null,
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
         var stubResponse = stubSalonResponse(salonId, "My Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
@@ -194,10 +198,10 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 403 when CLIENT token is used")
     void should_return403_when_clientTokenUsedToCreateSalon() throws Exception {
         var userId = UUID.randomUUID();
-        // Valid body (street + buildingNo present) so the 403 is attributable to the
-        // CLIENT role gate, not to bean validation — @Valid now fires before @PreAuthorize.
+        // Valid body (street + buildingNo + cityId present) so the 403 is attributable to
+        // the CLIENT role gate, not to bean validation — @Valid now fires before @PreAuthorize.
         var request = new CreateSalonRequest("Forbidden Salon", null, null, null, null, null, null,
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         log.debug("Act: POST {} as CLIENT — must be rejected with 403", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -243,7 +247,9 @@ class SalonControllerTest {
     void should_return200_when_publicGetSalon() throws Exception {
         var salonId = UUID.randomUUID();
         var salon = buildSalonEntity(salonId, "Public Salon");
-        when(salonService.getSalonEntity(salonId)).thenReturn(salon);
+        // Controller now calls SalonService#getPublicSalon directly — DTO assembly (including
+        // the oblastId resolution) moved into the service so it isn't duplicated per-controller.
+        when(salonService.getPublicSalon(salonId)).thenReturn(PublicSalonResponse.from(salon, null));
 
         log.debug("Act: GET {}/{} without credentials — public endpoint", SALONS_URL, salonId);
         mockMvc.perform(get(SALONS_URL + "/" + salonId)
@@ -257,7 +263,7 @@ class SalonControllerTest {
     @DisplayName("GET /api/v1/salons/{id} — 404 when salon does not exist")
     void should_return404_when_salonNotFound() throws Exception {
         var unknownId = UUID.randomUUID();
-        when(salonService.getSalonEntity(unknownId))
+        when(salonService.getPublicSalon(unknownId))
                 .thenThrow(new com.beautica.common.exception.NotFoundException("Salon not found"));
 
         log.debug("Act: GET {}/{} for a salon that does not exist", SALONS_URL, unknownId);
@@ -504,7 +510,7 @@ class SalonControllerTest {
         var userId = UUID.randomUUID();
         var secondSalonId = UUID.randomUUID();
         var request = new CreateSalonRequest("Second Salon", null, "Lviv", null, null, null, null,
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
         var stubResponse = stubSalonResponse(secondSalonId, "Second Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
@@ -526,9 +532,10 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses javascript: scheme")
     void should_return400_when_instagramUrlUsesJavascriptScheme() throws Exception {
         var userId = UUID.randomUUID();
-        // street + buildingNo valid so the 400 is attributable to the instagramUrl scheme, not the required-address reversal.
+        // street + buildingNo + cityId valid so the 400 is attributable to the instagramUrl scheme,
+        // not the required-address reversal or the cityId @NotNull.
         var request = new CreateSalonRequest("Insta Salon JS", null, "Kyiv", null, null, null, "javascript:alert(1)",
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         log.debug("Act: POST {} with instagramUrl='javascript:alert(1)' — must be rejected with 400", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -543,9 +550,10 @@ class SalonControllerTest {
     @DisplayName("POST /api/v1/salons — 400 when instagramUrl uses http: instead of https:")
     void should_return400_when_instagramUrlUsesHttpScheme() throws Exception {
         var userId = UUID.randomUUID();
-        // street + buildingNo valid so the 400 is attributable to the http scheme, not the required-address reversal.
+        // street + buildingNo + cityId valid so the 400 is attributable to the http scheme,
+        // not the required-address reversal or the cityId @NotNull.
         var request = new CreateSalonRequest("Insta Salon HTTP", null, "Kyiv", null, null, null, "http://instagram.com/testuser",
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
 
         log.debug("Act: POST {} with instagramUrl='http://instagram.com/testuser' — must be rejected with 400", SALONS_URL);
         mockMvc.perform(post(SALONS_URL)
@@ -804,7 +812,7 @@ class SalonControllerTest {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var request = new CreateSalonRequest("My Salon", null, null, null, null, null, "@some.handle",
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
         var stubResponse = stubSalonResponse(salonId, "My Salon");
 
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class))).thenReturn(stubResponse);
@@ -885,7 +893,7 @@ class SalonControllerTest {
         var salonId = UUID.randomUUID();
         // No locationNote in the body — proves the reversal did not make locationNote required.
         var request = new CreateSalonRequest("Note-less Salon", null, null, null, null, null, null,
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                TestConstants.DEFAULT_TEST_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
         when(salonService.createSalon(eq(userId), any(CreateSalonRequest.class)))
                 .thenReturn(stubSalonResponse(salonId, "Note-less Salon"));
 
@@ -919,15 +927,97 @@ class SalonControllerTest {
                 .andExpect(jsonPath("$.errors.buildingNo").value("Building number is required"));
     }
 
+    // ── cityId @NotNull — "a salon must always have a city" invariant ─────────
+    // Regression net for closing the create-path hole: before this change a
+    // cityId-less POST /salons succeeded (rejection lived only inside
+    // SalonService#createSalon → LocalityWriteValidator, never reached by these
+    // controller-slice tests). Now @NotNull fires at the DTO boundary, before
+    // the service is ever invoked. Two wire shapes are pinned separately because
+    // they are not the same code path until Bean Validation normalises them:
+    // an omitted key never populates the field, while an explicit JSON null does
+    // deserialize and then hits the same @NotNull check — only reading the code
+    // makes that equivalence obvious, so both are asserted.
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 with errors.cityId when cityId is omitted entirely")
+    void should_return400WithFieldError_when_cityIdOmitted_onCreate() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST {} with cityId key absent from the JSON body — must 400 on the @NotNull", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"street\":\"" + VALID_STREET
+                                + "\",\"buildingNo\":\"" + VALID_BUILDING_NO + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.cityId").value("City is required"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 with errors.cityId when cityId is an explicit JSON null")
+    void should_return400WithFieldError_when_cityIdExplicitNull_onCreate() throws Exception {
+        var userId = UUID.randomUUID();
+
+        log.debug("Act: POST {} with cityId explicitly null (distinct wire shape from omission) — must 400", SALONS_URL);
+        mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"cityId\":null,\"street\":\"" + VALID_STREET
+                                + "\",\"buildingNo\":\"" + VALID_BUILDING_NO + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.errors.cityId").value("City is required"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/salons — 400 (not 500) when cityId is a malformed non-UUID string, via handleMessageNotReadable, without echoing the value")
+    void should_return400_when_cityIdIsMalformedUuid_onCreate() throws Exception {
+        var userId = UUID.randomUUID();
+
+        // Jackson fails to deserialize "not-a-uuid" into UUID cityId — this throws
+        // HttpMessageNotReadableException from the message converter, BEFORE @Valid /
+        // @NotNull ever runs (the object never finishes constructing). That is a
+        // different exception handler (handleMessageNotReadable) than the @NotNull
+        // tests above (handleValidation), and it must produce a generic, non-echoing
+        // message rather than reflecting the bad value back to the caller (§I/§N).
+        log.debug("Act: POST {} with cityId='not-a-uuid' (malformed, not merely absent) — must 400 cleanly, not 500", SALONS_URL);
+        var result = mockMvc.perform(post(SALONS_URL)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Valid Salon\",\"cityId\":\"not-a-uuid\",\"street\":\"" + VALID_STREET
+                                + "\",\"buildingNo\":\"" + VALID_BUILDING_NO + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                // Proves this took the malformed-body path, NOT the @NotNull path above:
+                // handleValidation always populates `errors`; handleMessageNotReadable
+                // never does (ApiResponse.errors is @JsonInclude(NON_NULL) and
+                // ApiResponse.error(..) never sets it), so the whole key is absent from
+                // the JSON rather than merely lacking a `cityId` entry.
+                .andExpect(jsonPath("$.errors").doesNotExist())
+                .andExpect(jsonPath("$.message").value("Request body is malformed or missing required fields"))
+                .andReturn();
+
+        String body = result.getResponse().getContentAsString();
+        assertThat(body)
+                .as("response body must not echo the submitted malformed value back to the caller, body=%s", body)
+                .doesNotContain("not-a-uuid");
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**
-     * Builds a minimal {@link com.beautica.salon.entity.Salon} entity stub for tests that call
-     * {@link SalonService#getSalonEntity} — the controller maps this to
-     * {@link com.beautica.salon.dto.PublicSalonResponse} via its static factory method.
+     * Builds a minimal {@link com.beautica.salon.entity.Salon} entity stub, passed to
+     * {@link com.beautica.salon.dto.PublicSalonResponse#from} when stubbing
+     * {@link SalonService#getPublicSalon} — the controller returns that service's result
+     * directly (DTO assembly, including the {@code oblastId} resolution, lives in the service).
      */
     private com.beautica.salon.entity.Salon buildSalonEntity(UUID salonId, String name) {
         return com.beautica.salon.entity.Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(salonId)
                 .name(name)
                 .build();
