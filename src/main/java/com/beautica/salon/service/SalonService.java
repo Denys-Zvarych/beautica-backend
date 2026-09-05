@@ -1082,14 +1082,18 @@ public class SalonService {
      * PII-scrub apparatus outright rather than leaving it as an unreachable second erasure policy
      * (D2).
      *
-     * <p><b>Two callers, one body (Phase 297 D1 — REUSE-FIRST).</b> {@link
-     * #deleteSalonStaff(UUID, UUID)} calls this with the whole salon's resolved staff list;
-     * {@code removeMaster(UUID, UUID, UUID)} calls it with a single-element
-     * {@code List.of(masterUserId)}. Not a copy, not a variant — the disposal, its binding
-     * statement order, the {@code chk_masters_detachment_coherent} interaction, the invite-token
-     * cleanup and both cache evictions below are a property of the CHECK constraint and the cache
-     * contracts, not of the salon-deletion caller, so they live in exactly one place regardless of
-     * how many masters are being removed at once.
+     * <p><b>Three callers, one body (Phase 297 D1 — REUSE-FIRST; joined by {@code removeAdmin} in
+     * Phase 299).</b> {@link #deleteSalonStaff(UUID, UUID)} calls this with the whole salon's
+     * resolved staff list; {@code removeMaster(UUID, UUID, UUID)} and {@code removeAdmin(UUID,
+     * UUID, UUID)} each call it with a single-element {@code List.of(userId)}. Not a copy, not a
+     * variant — the disposal, its binding statement order, the
+     * {@code chk_masters_detachment_coherent} interaction, the invite-token cleanup and both cache
+     * evictions below are a property of the CHECK constraint and the cache contracts, not of the
+     * salon-deletion caller, so they live in exactly one place regardless of how many staff
+     * accounts are being removed at once. An admin normally contributes an empty
+     * {@code staffMasters} fork below (see {@code removeAdmin}'s javadoc for why); nothing about
+     * this method special-cases that — it is simply what an empty per-user {@code masters} lookup
+     * does.
      *
      * <p>Idempotent by construction (D4 below) even for a one-element call: a caller that has
      * already resolved an empty or already-disposed id list writes nothing.
@@ -1141,7 +1145,7 @@ public class SalonService {
      * {@code findSalonStaffUserIds} reused, not re-derived; that resolution structurally can
      * NEVER include the salon's owner — the owner-account exemption, phase 290 D3 / 270 D4, is a
      * structural property of that query), for {@code removeMaster} the one already-validated
-     * master's user id.
+     * master's user id, for {@code removeAdmin} the one already-validated admin's user id.
      *
      * <p>Everything with {@code ON DELETE CASCADE} on {@code users} goes with the row: refresh
      * tokens, device tokens, password-reset tickets, media rows, favourites.
@@ -1421,25 +1425,59 @@ public class SalonService {
     }
 
     /**
-     * Unassigns a {@code SALON_ADMIN} from a salon (Phase 21.2). {@code actorId} is a
-     * SALON_OWNER acting on any salon they own, or a SALON_ADMIN acting on their own salon —
-     * both halves already enforced by {@code @PreAuthorize} on the controller
-     * ({@code canManageSalon} for salon scoping, {@code adminBelongsToSalon} for confirming
-     * {@code userId} is actually an admin of {@code salonId}).
+     * HARD-DELETES a {@code SALON_ADMIN} from a salon (Phase 21.2; hard-delete behaviour added by
+     * Phase 299). {@code actorId} is a SALON_OWNER acting on a salon they own (D7 — admin callers
+     * were removed when this became a hard delete) — already enforced by {@code @PreAuthorize} on
+     * the controller ({@code hasRole('SALON_OWNER')}, {@code canManageSalon} for salon scoping,
+     * {@code adminBelongsToSalon} for confirming {@code userId} is actually an admin of
+     * {@code salonId}).
      *
-     * <p>This only clears the admin's {@code salon_id} — it is NOT an account deactivation.
-     * {@code role} stays {@code SALON_ADMIN} and {@code isActive} stays {@code true}, so the
-     * user can be invited to (and reassigned to) a salon again later.
+     * <p><b>Phase 299 — reuses the Phase 297 D1 disposal seam, does not re-implement it.</b> The
+     * previous behaviour (documented here until now) only cleared {@code salon_id} and left the
+     * account intact — {@code role} stayed {@code SALON_ADMIN}, {@code isActive} stayed
+     * {@code true}, and a live access/refresh token kept working. That was meant to make the
+     * removed admin re-invitable, but {@code InviteService#acceptInvite}'s {@code existsByEmail}
+     * check means a live row is exactly what makes re-invite impossible (Phase 299 background).
+     * This method now disposes of the account via {@link #disposeStaffAccounts(UUID, UUID, List)}
+     * — the same seam {@link #deleteSalonStaff(UUID, UUID)} and {@code removeMaster} use — so the
+     * {@code users} row, its refresh tokens, device tokens and password-reset tickets are gone,
+     * {@link com.beautica.auth.TokensValidAfterCache} answers {@code ABSENT} on the next request,
+     * and the same email can be re-invited afterward.
+     *
+     * <p><b>The {@code masters}-row fork does not fire for a plain admin.</b> An admin created
+     * through any current code path (self-registration, invite acceptance, owner creation) never
+     * has a {@code masters} row: {@code User.role} is never mutated after creation (no
+     * {@code setRole} call exists in this codebase) and every {@code masters}-row factory —
+     * {@code createMasterForIndependentUser}, {@code createMasterFromInvite},
+     * {@code createMasterForOwner} — is gated on the user already holding the matching role at
+     * creation time. {@code disposeStaffAccounts}'s {@code findAllByUserIdInWithUser} query is
+     * nonetheless keyed by {@code user_id}, not by role, so a dual-role account (a
+     * {@code SALON_ADMIN} who also somehow owns a live {@code masters} row) would still be
+     * disposed of correctly by the existing fork rather than crash or orphan the row — verified,
+     * not merely assumed, and pinned by the same {@code SalonStaffHardDeleteIT} case 5 / 5b this
+     * endpoint now shares. No Phase 298 booking-decline cascade runs here even in that
+     * hypothetical: an admin has no calendar of their own (D3), and today's role-immutability
+     * invariant makes a booked dual-role admin unreachable — if a future feature ever makes
+     * {@code role} mutable, this note is the tripwire to revisit that decision, not a silent gap.
      *
      * <p>Removing the last admin from a salon is intentionally unguarded: owner access is
      * ownership-based, never admin-count-based, so a salon is never left "unmanageable."
      *
-     * @throws NotFoundException   if {@code userId} does not resolve to a user
-     * @throws ForbiddenException  if the reloaded user is not a SALON_ADMIN assigned to
-     *                             {@code salonId} (defense-in-depth re-check of the
-     *                             {@code @PreAuthorize} gate — see {@link
-     *                             com.beautica.common.security.AuthorizationService#adminBelongsToSalon}),
-     *                             or if the actor attempts to remove themselves
+     * <p>No {@code @Transactional} timeout is set, unlike {@code removeMaster}'s
+     * {@code REMOVE_MASTER_TIMEOUT_SECONDS}: that timeout exists solely to bound Phase 298's
+     * unbounded future-booking decline loop, which this method never runs (D3) — the remaining
+     * work is a single-user {@link #disposeStaffAccounts(UUID, UUID, List)} call, the same bounded
+     * shape {@code rotateAdmin} already runs without a timeout.
+     *
+     * @throws NotFoundException  if {@code userId} does not resolve to a user
+     * @throws ForbiddenException if the reloaded user is not a SALON_ADMIN assigned to
+     *                            {@code salonId} (defense-in-depth re-check of the
+     *                            {@code @PreAuthorize} gate — see {@link
+     *                            com.beautica.common.security.AuthorizationService#adminBelongsToSalon}),
+     *                            or if the actor attempts to remove themselves
+     * @throws BusinessException  ({@code 409}) if the admin's user is also referenced as a client
+     *                            elsewhere (a booking, a review, an appointment) — Phase 299 D2,
+     *                            mirrors {@code removeMaster}'s fail-closed audit precondition
      */
     @Transactional
     public void removeAdmin(UUID actorId, UUID salonId, UUID userId) {
@@ -1452,19 +1490,28 @@ public class SalonService {
 
         // Defense-in-depth: redundant with @authz.adminBelongsToSalon on the controller,
         // but matches the existing pattern of service-layer re-validation (e.g.
-        // enforceCanManageMaster) rather than trusting the SpEL gate alone.
+        // enforceCanManageMaster) rather than trusting the SpEL gate alone. This role check is
+        // also what structurally keeps this endpoint away from a SALON_OWNER or SALON_MASTER row
+        // — admin.getRole() can only be SALON_ADMIN past this line.
         if (admin.getRole() != Role.SALON_ADMIN || !salonId.equals(admin.getSalonId())) {
             throw new ForbiddenException("User is not an admin of this salon");
         }
 
-        // `admin` was loaded via findById in THIS @Transactional, so it is a managed entity —
-        // Hibernate dirty-checking flushes the salonId mutation on commit (mirrors
-        // deactivateSalon/updateSalon — no redundant explicit save()).
-        admin.setSalonId(null);
-        // Audit-fix cycle 2 — users.salon_id is surfaced as UserProfileResponse.salonId, so the
-        // removed admin's cached GET /users/me would keep naming the salon they no longer belong
-        // to for the full 5-minute TTL. Keyed on the ADMIN's id, never the actor's.
-        userProfileCacheEvictor.evictAfterCommit(userId);
+        // Fail-closed precondition (Phase 299 D2), scoped to the ONE user being hard-deleted —
+        // mirrors removeMaster's identical guard and the identical reasoning: never the
+        // whole-salon runAuditForSalon(salonId), which would abort this removal over some OTHER
+        // staff member's stray client row.
+        StaffClientReferenceAuditResult audit =
+                staffClientReferenceAuditService.runAuditForStaffUserIds(List.of(userId));
+        if (audit.outcome() == AuditOutcome.VIOLATIONS_FOUND) {
+            throw new BusinessException(
+                    HttpStatus.CONFLICT,
+                    "This admin is also referenced as a client and cannot be removed");
+        }
+
+        disposeStaffAccounts(actorId, salonId, List.of(userId));
+
+        log.info("Admin removal: user {} removed from salon {} by actor {}", userId, salonId, actorId);
     }
 
     /**

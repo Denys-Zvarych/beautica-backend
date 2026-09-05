@@ -216,13 +216,26 @@ public class SalonController {
         return ResponseEntity.noContent().build();
     }
 
-    // SALON_OWNER may remove any admin from a salon they own; SALON_ADMIN may remove another
-    // admin from their own salon only. canManageSalon enforces the salon-scoping half of that;
+    // OWNER-ONLY (Phase 299 D7, supersedes D4). This now HARD-DELETES the admin's account
+    // (SalonService#removeAdmin javadoc has the full rationale) instead of only clearing
+    // salon_id, and can newly return 409 when the admin's user is also referenced as a client
+    // elsewhere (SalonService D2 audit). Still 204 on success — mobile's remove-admin flow was
+    // checked to already treat any non-204 as failure.
+    //
+    // D4 had left this admin-callable on the theory that an admin has no calendar/clients/reviews
+    // to lose. That measured blast radius in SALON DATA, which was the right frame while removal
+    // only nulled a column. It is the wrong frame now: the object destroyed is the PERSON'S
+    // ACCOUNT, so admin removal and master removal (Phase 297 D5, already owner-only) are the
+    // identical operation. D4's own premise — "removeAdmin may be admin-callable because it only
+    // nulls a column; this endpoint hard-deletes a person's account" — was falsified by this
+    // phase's D1, so the conclusion is narrowed to match: an owner-grade mutation gets an
+    // owner-grade gate. canManageSalon is KEPT alongside the role check — it is what enforces
+    // that THIS owner owns THIS salon; dropping it would let any owner reach any salon's admins.
     // adminBelongsToSalon additionally confirms #userId is actually a SALON_ADMIN assigned to
     // #salonId — without it a caller with management access to Salon A could probe arbitrary
     // user UUIDs and distinguish "exists elsewhere" from "not an admin" via 403 vs 404 (IDOR).
     @DeleteMapping("/{salonId}/admins/{userId}")
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') "
+    @PreAuthorize("hasRole('SALON_OWNER') "
             + "and @authz.canManageSalon(authentication, #salonId) "
             + "and @authz.adminBelongsToSalon(#userId, #salonId)")
     public ResponseEntity<Void> removeAdmin(
