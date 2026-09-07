@@ -1186,10 +1186,10 @@ public class SalonService {
         // answers TokenValidityState.ABSENT for a missing row and the filter refuses to
         // authenticate on it; this eviction is what makes that effective on the very NEXT request
         // instead of after the cache's 60s TTL, which is only the fallback bound. Do not drop it,
-        // and do not move it inline — evictTokensValidAfterCacheAfterCommit is afterCommit for the
+        // and do not move it inline — invalidateAfterCommit is afterCommit for the
         // read-through-race reason its own javadoc gives.
         for (UUID staffUserId : staffUserIds) {
-            evictTokensValidAfterCacheAfterCommit(staffUserId);
+            tokensValidAfterCache.invalidateAfterCommit(staffUserId);
             userProfileCacheEvictor.evictAfterCommit(staffUserId);
         }
 
@@ -1403,26 +1403,11 @@ public class SalonService {
                 masterId, masterUserId, salonId, actorId);
     }
 
-    /**
-     * Evicts {@code userId}'s {@link TokensValidAfterCache} entry once the current transaction
-     * commits, never before — mirrors {@code PasswordResetService.evictTokensValidAfterCache}
-     * exactly, and for the identical reason: that cache is a read-through cache backed by the
-     * {@code users.tokens_valid_after} row this method just updated, so an eviction that fires
-     * before commit reopens the stale-read race window {@link TokensValidAfterCache#invalidate}
-     * documents.
-     */
-    private void evictTokensValidAfterCacheAfterCommit(UUID userId) {
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            tokensValidAfterCache.invalidate(userId);
-            return;
-        }
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                tokensValidAfterCache.invalidate(userId);
-            }
-        });
-    }
+    // evictTokensValidAfterCacheAfterCommit was promoted to TokensValidAfterCache#invalidateAfterCommit
+    // in Phase 300 (REUSE-FIRST: a private helper is promoted, never copied) so the CLIENT
+    // account self-deletion cascade (ClientAccountDeletionService, a different package) can share
+    // the identical afterCommit-registration shape. Every call site below now calls
+    // tokensValidAfterCache.invalidateAfterCommit(userId) directly.
 
     /**
      * HARD-DELETES a {@code SALON_ADMIN} from a salon (Phase 21.2; hard-delete behaviour added by

@@ -5,6 +5,8 @@ import com.beautica.user.UserRepository;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Duration;
 import java.util.Optional;
@@ -97,5 +99,34 @@ public class TokensValidAfterCache {
      */
     public void invalidate(UUID userId) {
         cache.invalidate(userId);
+    }
+
+    /**
+     * {@link #invalidate(UUID)}, deferred to run once the current transaction commits — never
+     * before, for the exact read-through-race reason {@link #invalidate(UUID)}'s own javadoc
+     * documents.
+     *
+     * <p>Promoted from {@code SalonService#evictTokensValidAfterCacheAfterCommit} (Phase 300 —
+     * REUSE-FIRST: a private helper is promoted, never copied) so the CLIENT account
+     * self-deletion cascade ({@code ClientAccountDeletionService}, a different package) can share
+     * the identical afterCommit-registration shape rather than re-implementing it. {@code
+     * SalonService} now calls this method directly instead of keeping its own copy.
+     *
+     * <p>Falls back to an immediate {@link #invalidate(UUID)} when no transaction synchronization
+     * is active (mirrors every other {@code *AfterCommit} helper in this codebase) — a caller
+     * outside a transaction has no commit to wait for, and the read-through race this defers
+     * against cannot occur without one.
+     */
+    public void invalidateAfterCommit(UUID userId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            invalidate(userId);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                invalidate(userId);
+            }
+        });
     }
 }

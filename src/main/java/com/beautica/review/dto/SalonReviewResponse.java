@@ -60,20 +60,32 @@ public record SalonReviewResponse(
      */
     public static final String DETACHED_MASTER_LABEL = "Майстер";
 
+    /**
+     * Neutral author label for a self-deleted client (Phase 300 D3) — see {@code
+     * ReviewResponse#DETACHED_CLIENT_LABEL}'s javadoc for the full rationale, including why this is
+     * its own constant rather than a shared one.
+     */
+    public static final String DETACHED_CLIENT_LABEL = "Видалений клієнт";
+
     // Client-name masking logic mirrors ReviewResponse.from exactly — same
-    // "FirstName L." / "FirstName" / "L." / "Anonymous" rules.
+    // "FirstName L." / "FirstName" / "L." / "Anonymous" rules. review.client CAN be null since
+    // Phase 300 (a self-deleted author) — guarded below, same as ReviewResponse.from.
     public static SalonReviewResponse from(Review review) {
-        String firstName = review.getClient().getFirstName();
-        String lastName = review.getClient().getLastName();
         String displayName;
-        if (firstName == null && lastName == null) {
-            displayName = "Anonymous";
-        } else if (firstName != null && lastName != null) {
-            displayName = firstName + " " + lastName.charAt(0) + ".";
-        } else if (firstName != null) {
-            displayName = firstName;
+        if (review.getClient() == null) {
+            displayName = DETACHED_CLIENT_LABEL;
         } else {
-            displayName = lastName.charAt(0) + ".";
+            String firstName = review.getClient().getFirstName();
+            String lastName = review.getClient().getLastName();
+            if (firstName == null && lastName == null) {
+                displayName = "Anonymous";
+            } else if (firstName != null && lastName != null) {
+                displayName = firstName + " " + lastName.charAt(0) + ".";
+            } else if (firstName != null) {
+                displayName = firstName;
+            } else {
+                displayName = lastName.charAt(0) + ".";
+            }
         }
         // V157 / phase 294 — a detached master (staff account hard-deleted) is rendered under the
         // neutral DETACHED_MASTER_LABEL, NOT through displayFirstName()/displayLastName(). This

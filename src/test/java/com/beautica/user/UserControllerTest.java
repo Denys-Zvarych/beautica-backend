@@ -83,6 +83,10 @@ class UserControllerTest {
     @MockBean
     private PasswordResetService passwordResetService;
 
+    /** Required by {@link UserController}'s constructor for the {@code DELETE /me} endpoint (Phase 300). */
+    @MockBean
+    private ClientAccountDeletionService clientAccountDeletionService;
+
     /**
      * Required by {@code SecurityConfig} constructor (via {@code JwtAuthenticationFilter}).
      * The pass-through filter override above does not call {@code jwtTokenProvider} at all,

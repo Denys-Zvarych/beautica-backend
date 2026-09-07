@@ -99,10 +99,18 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      *
      * <p>No {@code ORDER BY} clause: ordering is driven by the caller's ID stream,
      * which is cheaper than a redundant DB sort on an unindexed set.
+     *
+     * <p><b>{@code client} is a {@code LEFT JOIN FETCH}, not INNER</b> (Phase 300 D3 —
+     * {@code reviews.client_id} became nullable so a self-deleted client's review survives with
+     * its rating and comment intact). An INNER join would silently drop that review from every
+     * page it belongs to, with the paged {@code totalElements} still counting it — the same
+     * failure class the V157 audit already fixed for {@code m.user}. {@link
+     * com.beautica.review.dto.ReviewResponse#from} renders the sentinel when {@code getClient()}
+     * is {@code null}.
      */
     @Query("""
             SELECT r FROM Review r
-            JOIN FETCH r.client
+            LEFT JOIN FETCH r.client
             JOIN FETCH r.master
             JOIN FETCH r.booking b
             JOIN FETCH b.masterService ms
@@ -177,7 +185,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     // GET /reviews/{reviewId}, the second ReviewResponse.from() call site.
     @Query("""
             SELECT r FROM Review r
-            JOIN FETCH r.client
+            LEFT JOIN FETCH r.client
             JOIN FETCH r.master
             JOIN FETCH r.booking b
             JOIN FETCH b.masterService ms
@@ -388,7 +396,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      */
     @Query("""
             SELECT r FROM Review r
-            JOIN FETCH r.client
+            LEFT JOIN FETCH r.client
             JOIN FETCH r.master m
             LEFT JOIN FETCH m.user
             JOIN FETCH r.booking b

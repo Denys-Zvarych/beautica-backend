@@ -320,6 +320,33 @@ public class RateLimitConfig {
 
     private static final Duration STAFF_BOOKING_SMS_WINDOW = Duration.ofSeconds(60);
 
+    /**
+     * Per-user cap for {@code DELETE /api/v1/users/me} (Phase 300, perf/security finding 2, 2026-09
+     * audit — MEDIUM, raised independently by both auditors). Before this the endpoint had NO rate
+     * limit at all: {@link com.beautica.auth.filter.AuthRateLimitFilter} only covers {@code
+     * /auth/*}, so a handful of authenticated CLIENTs could each repeatedly open the self-delete
+     * cascade's {@code PESSIMISTIC_WRITE} lock on their own {@code users} row and hold a Hikari
+     * connection for up to the 30s transaction timeout, on the 10-connection pool
+     * ({@code application.yml}) shared by every other tenant.
+     *
+     * <p>User-keyed (not IP-keyed), unlike every bucket built directly in
+     * {@code AuthRateLimitFilter}: this route requires authentication, so — exactly like every other
+     * bucket in {@link #bookingRateLimitFilter}'s {@code BookingRateLimitFilter} — it is throttled
+     * per CALLER, never per source IP (which an authenticated attacker can rotate trivially and which
+     * would incorrectly co-throttle unrelated CLIENTs sharing one NAT egress).
+     *
+     * <p>Sized deliberately small and hourly: a legitimate CLIENT self-deletes their account exactly
+     * ONCE. 3/hour comfortably covers a legitimate retry after a transient failure (network blip, the
+     * {@link com.beautica.user.ClientAccountDeletionService#MAX_FUTURE_BOOKINGS_PER_SELF_DELETE}
+     * cap rejecting a first attempt while the client cancels bookings and retries) without leaving
+     * meaningful headroom for scripted abuse of an irreversible, lock-holding cascade. Configurable
+     * so integration tests can raise the cap.
+     */
+    @Value("${app.rate-limit.self-delete-capacity:3}")
+    private long selfDeleteCapacity;
+
+    private static final Duration SELF_DELETE_WINDOW = Duration.ofMinutes(60);
+
     // Per-user cap for PUT /api/v1/masters/{masterId}/overrides/{date} (the schedule-override
     // write). Own bucket, deliberately NOT shared with bookingDeclineBuckets above (2026-07-26
     // product decision reversal, D6 — see that field's javadoc for why the two used to be one
@@ -786,6 +813,21 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-user bucket (see {@link #selfDeleteCapacity} field javadoc) for
+     * {@code DELETE /api/v1/users/me}, consumed by {@link BookingRateLimitFilter}'s flat
+     * one-token-per-request entry charge. {@code expireAfterAccess} gives a 5-minute grace past
+     * the 60-minute window so a bucket entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> selfDeleteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                SELF_DELETE_WINDOW.plus(EVICTION_GRACE),
+                selfDeleteCapacity,
+                SELF_DELETE_WINDOW);
+    }
+
+    /**
      * Per-user bucket (see {@link #scheduleOverrideWriteCapacity} field javadoc) for
      * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}, consumed by
      * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
@@ -846,7 +888,7 @@ public class RateLimitConfig {
         // singletons — unambiguous by construction.
         return new BookingRateLimitFilter(
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
-                staffBookingSmsBuckets(), objectMapper);
+                staffBookingSmsBuckets(), selfDeleteBuckets(), objectMapper);
     }
 
     /**

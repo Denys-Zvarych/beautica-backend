@@ -77,7 +77,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWith(LoadingCache<String, Bucket> writeBuckets) {
         return new BookingRateLimitFilter(
-                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -87,7 +87,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithDeclineBuckets(LoadingCache<String, Bucket> declineBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -97,7 +97,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithOverrideBuckets(LoadingCache<String, Bucket> overrideBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -109,7 +109,17 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithStaffSmsBuckets(LoadingCache<String, Bucket> staffSmsBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, generousBuckets(), OBJECT_MAPPER);
+    }
+
+    /**
+     * Builds a filter with the given self-delete bucket and UNRELATED, generously-sized siblings —
+     * the mirror of {@link #filterWith(LoadingCache)} for tests that only exercise
+     * {@code DELETE /api/v1/users/me} (Phase 300 perf finding 2).
+     */
+    private BookingRateLimitFilter filterWithSelfDeleteBuckets(LoadingCache<String, Bucket> selfDeleteBuckets) {
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets, OBJECT_MAPPER);
     }
 
     /** A bucket cache with effectively unlimited capacity — for the "other" bucket in a test. */
@@ -202,6 +212,11 @@ class BookingRateLimitFilterTest {
     /** The provider-facing read of a master's calendar — a GET, and never throttled. */
     private static MockHttpServletRequest getMasterBookings(UUID masterId) {
         return new MockHttpServletRequest("GET", "/api/v1/masters/" + masterId + "/bookings");
+    }
+
+    /** Phase 300 — the CLIENT self-deletion endpoint. */
+    private static MockHttpServletRequest deleteMyAccount() {
+        return new MockHttpServletRequest("DELETE", "/api/v1/users/me");
     }
 
     private static MockHttpServletRequest postOverrideConflictsPreview(UUID masterId) {
@@ -458,7 +473,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> declineBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the create/reschedule bucket.
@@ -972,7 +987,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> overrideBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), OBJECT_MAPPER);
+                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the decline bucket.
@@ -1137,7 +1152,7 @@ class BookingRateLimitFilterTest {
     @DisplayName("should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate")
     void should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
         BookingRateLimitFilter filter = new BookingRateLimitFilter(
-                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), OBJECT_MAPPER);
+                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Spend the whole client-create budget.
@@ -1507,5 +1522,149 @@ class BookingRateLimitFilterTest {
         assertThat(secondStaffCreate.getStatus())
                 .as("and exactly one slot existed, so the next real create is throttled")
                 .isEqualTo(429);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Phase 300 perf finding 2 (2026-09 audit, MEDIUM) — DELETE /api/v1/users/me (CLIENT
+    // self-deletion) previously had NO rate limit at all: AuthRateLimitFilter only covers /auth/*.
+    // Reuses this exact per-user Bucket4j mechanism rather than a second, parallel one.
+    // -------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("should_return429_when_sameClientExceedsCapacityOnSelfDeletePath")
+    void should_return429_when_sameClientExceedsCapacityOnSelfDeletePath() throws Exception {
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        MockHttpServletResponse firstResponse = new MockHttpServletResponse();
+        MockFilterChain firstChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), firstResponse, firstChain);
+        assertThat(firstResponse.getStatus())
+                .as("the first self-delete attempt within capacity must be forwarded")
+                .isNotEqualTo(429);
+        assertThat(firstChain.getRequest()).isNotNull();
+
+        MockHttpServletResponse secondResponse = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), secondResponse, secondChain);
+
+        assertThat(secondResponse.getStatus())
+                .as("a second DELETE /users/me from the SAME client within the window must be "
+                        + "throttled — this closes the previously-unthrottled self-delete gap")
+                .isEqualTo(429);
+        assertThat(secondChain.getRequest())
+                .as("a throttled self-delete must NOT reach the hard-delete cascade")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_writeOneHourRetryAfter_when_selfDeleteThrottled")
+    void should_writeOneHourRetryAfter_when_selfDeleteThrottled() throws Exception {
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(deleteMyAccount(), new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse throttled = new MockHttpServletResponse();
+        filter.doFilterInternal(deleteMyAccount(), throttled, new MockFilterChain());
+
+        assertThat(throttled.getStatus()).isEqualTo(429);
+        assertThat(throttled.getHeader("Retry-After"))
+                .as("the self-delete bucket's own 60-minute window")
+                .isEqualTo("3600");
+    }
+
+    @Test
+    @DisplayName("should_keySelfDeleteBucketPerUser_when_twoDifferentClientsCallIt")
+    void should_keySelfDeleteBucketPerUser_when_twoDifferentClientsCallIt() throws Exception {
+        LoadingCache<String, Bucket> buckets = singleSlotBuckets();
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(buckets);
+
+        UUID clientA = UUID.randomUUID();
+        authenticateAs(clientA);
+        filter.doFilterInternal(deleteMyAccount(), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse clientAExhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(deleteMyAccount(), clientAExhausted, new MockFilterChain());
+        assertThat(clientAExhausted.getStatus()).isEqualTo(429);
+
+        SecurityContextHolder.clearContext();
+        UUID clientB = UUID.randomUUID();
+        authenticateAs(clientB);
+        MockHttpServletResponse clientBResponse = new MockHttpServletResponse();
+        MockFilterChain clientBChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), clientBResponse, clientBChain);
+
+        assertThat(clientBResponse.getStatus())
+                .as("client B must not be throttled by client A's exhausted self-delete bucket")
+                .isNotEqualTo(429);
+        assertThat(clientBChain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_useSeparateBucket_when_selfDeleteAndBookingCreateAreBothCalledBySameUser")
+    void should_useSeparateBucket_when_selfDeleteAndBookingCreateAreBothCalledBySameUser() throws Exception {
+        // Exhausting the create/reschedule bucket must NOT throttle self-delete, and vice-versa.
+        LoadingCache<String, Bucket> writeBuckets = singleSlotBuckets();
+        LoadingCache<String, Bucket> selfDeleteBuckets = singleSlotBuckets();
+        BookingRateLimitFilter filter = new BookingRateLimitFilter(
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets, OBJECT_MAPPER);
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse createExhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(postCreate(), createExhausted, new MockFilterChain());
+        assertThat(createExhausted.getStatus()).isEqualTo(429);
+
+        MockHttpServletResponse selfDeleteResponse = new MockHttpServletResponse();
+        MockFilterChain selfDeleteChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), selfDeleteResponse, selfDeleteChain);
+        assertThat(selfDeleteResponse.getStatus())
+                .as("an exhausted create/reschedule bucket must not throttle self-delete — separate bucket")
+                .isNotEqualTo(429);
+        assertThat(selfDeleteChain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_passThrough_when_selfDeleteCallerIsUnauthenticated")
+    void should_passThrough_when_selfDeleteCallerIsUnauthenticated() throws Exception {
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockFilterChain chain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), response, chain);
+
+        assertThat(response.getStatus()).isNotEqualTo(429);
+        assertThat(chain.getRequest())
+                .as("there is no user id to key a bucket on — the downstream 401 rejects instead")
+                .isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_passThrough_when_pathIsUsersMeButMethodIsNotDelete")
+    void should_passThrough_when_pathIsUsersMeButMethodIsNotDelete() throws Exception {
+        // GET/PATCH /users/me are unrelated reads/updates — only the DELETE verb is throttled here.
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        var getResponse = new MockHttpServletResponse();
+        var getChain = new MockFilterChain();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", "/api/v1/users/me"), getResponse, getChain);
+        assertThat(getResponse.getStatus()).isNotEqualTo(429);
+        assertThat(getChain.getRequest()).isNotNull();
+
+        var patchResponse = new MockHttpServletResponse();
+        var patchChain = new MockFilterChain();
+        filter.doFilterInternal(new MockHttpServletRequest("PATCH", "/api/v1/users/me"), patchResponse, patchChain);
+        assertThat(patchResponse.getStatus()).isNotEqualTo(429);
+        assertThat(patchChain.getRequest()).isNotNull();
+
+        // The single-slot bucket must still be intact for the real DELETE.
+        var deleteResponse = new MockHttpServletResponse();
+        var deleteChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), deleteResponse, deleteChain);
+        assertThat(deleteResponse.getStatus())
+                .as("the self-delete bucket must be untouched by the GET/PATCH calls above")
+                .isNotEqualTo(429);
+        assertThat(deleteChain.getRequest()).isNotNull();
     }
 }

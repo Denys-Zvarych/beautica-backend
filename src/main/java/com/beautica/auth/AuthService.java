@@ -445,7 +445,20 @@ public class AuthService {
         denylistAccessToken(accessToken);
     }
 
-    private void denylistAccessToken(String accessToken) {
+    /**
+     * Parses {@code accessToken} and denylists its {@code jti}. Widened from {@code private} to
+     * {@code public} in Phase 300 (REUSE-FIRST: a private helper is promoted, never copied) so
+     * {@code ClientAccountDeletionService} (a different package: {@code com.beautica.user}) can
+     * revoke the deleting CLIENT's own bearer token exactly as {@link #logout} does, without a
+     * second copy of this try/catch. Unlike {@link #logout}, callers of THIS method are
+     * responsible for their own refresh-token cleanup (a hard-deleted user's {@code
+     * refresh_tokens} rows are removed by {@code ON DELETE CASCADE} instead).
+     *
+     * <p>No-op for a {@code null} token (defensive only — every caller's endpoint requires
+     * authentication) and swallows an unparseable one at {@code DEBUG}, exactly as {@link #logout}
+     * always has: a token that cannot be parsed cannot be replayed as itself either.
+     */
+    public void denylistAccessToken(String accessToken) {
         if (accessToken == null) {
             return;
         }

@@ -854,10 +854,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * for both the master and the salon owner, on every keyed create. {@code b.master} itself stays
      * fetch-joined: {@code getMaster().getId()} alone would be served by an uninitialised proxy, so
      * dropping it is a separate behavioural question this note does not settle.
+     *
+     * <p><b>{@code client} is a {@code LEFT JOIN FETCH}</b> (Phase 300 §8 defensive widening — this
+     * query's own {@code WHERE b.client.id = :clientId} predicate already makes a detached row
+     * ({@code client_id IS NULL}) structurally unreachable here, since {@code NULL = :clientId}
+     * never matches; kept an INNER join would have been equally correct today, but a bare INNER
+     * {@code JOIN FETCH} on an association {@code chk_bookings_guest_fields} now allows to be null
+     * is exactly the shape the Phase 300 audit sweep flags, so it is widened here too rather than
+     * left as the one exception).
      */
     @Query("""
             SELECT b FROM Booking b
-            JOIN FETCH b.client
+            LEFT JOIN FETCH b.client
             JOIN FETCH b.master
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition
@@ -1430,6 +1438,87 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<SalonClosureBookingCandidate> findConfirmedFutureByMasterId(
             @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
+
+    // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
+
+    /**
+     * Client-scoped sibling of {@link #findConfirmedFutureBySalonId} / {@link
+     * #findConfirmedFutureByMasterId} for the CLIENT account self-deletion cascade
+     * ({@code BookingService#findFutureConfirmedBookingIdsForClient}): every {@code CONFIRMED}
+     * booking of {@code clientId} whose {@code startsAt} is strictly after {@code now}. Reuses
+     * {@link SalonClosureBookingCandidate} as-is — same scope-agnostic shape, only the {@code
+     * WHERE} predicate differs, exactly as the master-removal sibling already does.
+     *
+     * <p><b>Unlike the salon/master siblings, the caller does NOT reuse {@link
+     * #declineConfirmedBulk} / the shared {@code declineFutureConfirmed} body.</b> A client
+     * self-delete is client-INITIATED (status {@code CANCELLED} / reason {@code
+     * CLIENT_CANCELLED}), not provider-initiated ({@code DECLINED} / {@code
+     * PROVIDER_UNAVAILABLE}), so the caller loops {@code BookingService#cancelBooking} per booking
+     * instead — see that method's Javadoc for the full rationale.
+     *
+     * <p>Served by {@code idx_bookings_client_status_starts_at} (V18) / {@code
+     * idx_bookings_client_starts_at} (V117) / {@code idx_bookings_client_timeline_starts_at}
+     * (V145) — all lead with {@code client_id}; no new index is added.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.SalonClosureBookingCandidate(
+                b.id,
+                b.appointment.id,
+                b.master.id,
+                b.startsAt
+            )
+            FROM Booking b
+            WHERE b.client.id = :clientId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    List<SalonClosureBookingCandidate> findConfirmedFutureByClientId(
+            @Param("clientId") UUID clientId, @Param("now") OffsetDateTime now);
+
+    /**
+     * Every booking row still attached to {@code clientId} — the CLIENT account self-deletion
+     * detach loop ({@code ClientAccountDeletionService}). Called AFTER the future-{@code
+     * CONFIRMED} bookings have already been cancelled and physically deleted
+     * ({@link #findConfirmedFutureByClientId} + {@code deleteAllByIdInBatch}), so every row this
+     * returns is, by construction, past or terminal — exactly the set D4 says to detach, never
+     * delete.
+     *
+     * <p>No {@code JOIN FETCH}: the caller only ever calls {@link
+     * com.beautica.booking.entity.Booking#detachClient(String, java.time.Instant)} on each row,
+     * which touches no lazy association (it nulls {@code client} without dereferencing it) — a
+     * wider fetch graph would cost extra joins this method never needs.
+     *
+     * <p>Deliberately unbounded (no {@code Pageable}): mirrors {@link
+     * #findConfirmedFutureBySalonId}'s note — a self-delete is a one-time terminal event for that
+     * client, not a hot path a caller could abuse for repeated large scans.
+     */
+    List<Booking> findByClientId(UUID clientId);
+
+    /**
+     * The subset of {@code appointmentIds} that still have at least one surviving {@code bookings}
+     * row — the set-based childless-header probe the CLIENT self-deletion cascade uses to decide,
+     * for EVERY remaining visit header in one round trip, whether it survives (detach) or is
+     * physically deleted (Phase 300 D4), after its own future {@code CONFIRMED} legs have already
+     * been cancelled and deleted.
+     *
+     * <p><b>Perf finding 1 (2026-09 audit, HIGH).</b> Replaces a per-appointment {@code
+     * existsByAppointmentId} probe called once per surviving header inside a Java loop — one {@code
+     * SELECT EXISTS} round trip each, ~1.5-4.5s of sequential Neon latency for a client with 150
+     * appointment headers, all held inside the open write transaction's row lock on the {@code
+     * users} row. This method partitions in ONE query instead: the caller collects the result into a
+     * {@code Set<UUID>} and checks membership in memory. Already index-served by the partial index
+     * {@code idx_bookings_appointment} (V125) — same index the replaced method used.
+     *
+     * <p>Deliberately {@code DISTINCT}: a visit header can have several surviving child bookings, and
+     * the caller only needs the set of DISTINCT header ids that have at least one.
+     *
+     * <p><b>Guard the empty case at the call site.</b> An empty {@code appointmentIds} collection
+     * must never reach this query — {@code appointment_id IN ()} is either a SQL syntax error or an
+     * always-false predicate depending on dialect, and either way that round trip is wasted when the
+     * caller already knows the answer is "no surviving ids at all".
+     */
+    @Query("SELECT DISTINCT b.appointment.id FROM Booking b WHERE b.appointment.id IN :appointmentIds")
+    List<UUID> findAppointmentIdsWithSurvivingBookings(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     /**
      * Batched twin of {@link #findByIdWithFullGraph} for the salon-deletion booking cascade (perf

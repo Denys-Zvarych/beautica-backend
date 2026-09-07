@@ -100,4 +100,19 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      */
     @Query("SELECT cr.rating AS rating, COUNT(cr) AS count FROM ClientReview cr WHERE cr.subjectClient.id = :clientId GROUP BY cr.rating")
     List<RatingCountProjection> countBySubjectClientIdGroupByRating(@Param("clientId") UUID clientId);
+
+    /**
+     * Purges every provider&rarr;client review authored ABOUT {@code subjectClientId} — the CLIENT
+     * account self-deletion cascade (Phase 300 D3/D4). Unlike the client&rarr;provider direction
+     * ({@code reviews}, detached and kept), these rows are DELETED outright: they rate the
+     * *client*, the aggregate they feed ({@code users.avg_rating}/{@code review_count}) dies with
+     * the row being deleted anyway, and by the locked two-sided-ratings decision the client is the
+     * only reader of their own rating — a detached {@code client_review} would have no subject, no
+     * aggregate and no reader, so retaining it would relax {@code subject_client_id}'s NOT NULL
+     * (V128:19) for nobody. Must run BEFORE the {@code users} row is deleted — see {@code
+     * ClientAccountDeletionService}.
+     */
+    @Modifying
+    @Query("DELETE FROM ClientReview cr WHERE cr.subjectClient.id = :subjectClientId")
+    void deleteBySubjectClientId(@Param("subjectClientId") UUID subjectClientId);
 }

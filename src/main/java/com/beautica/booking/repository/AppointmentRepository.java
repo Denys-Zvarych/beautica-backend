@@ -1,6 +1,7 @@
 package com.beautica.booking.repository;
 
 import com.beautica.booking.entity.Appointment;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -36,6 +37,22 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
     Optional<Appointment> findActiveByClientIdAndIdempotencyKey(
             @Param("clientId") UUID clientId,
             @Param("idempotencyKey") String idempotencyKey);
+
+    // ── CLIENT account self-deletion detach loop (Phase 300 D4) ───────────────
+
+    /**
+     * Every visit header still attached to {@code clientId} — the header-side twin of {@link
+     * com.beautica.booking.repository.BookingRepository#findByClientId}, used by {@code
+     * ClientAccountDeletionService} AFTER the client's future {@code CONFIRMED} booking legs have
+     * already been cancelled and physically deleted. The caller resolves ALL headers' survivorship
+     * in ONE round trip via {@code BookingRepository#findAppointmentIdsWithSurvivingBookings}
+     * (perf finding 1, 2026-09 audit — replaces a per-header {@code existsByAppointmentId} probe): a
+     * header whose id is absent from that set is physically deleted, a header whose id is present
+     * (at least one surviving past/terminal child) is detached via
+     * {@link Appointment#detachClient(String, java.time.Instant)} — never both, never implicitly
+     * inferred from the header's own status.
+     */
+    List<Appointment> findByClientId(UUID clientId);
 
     // ── Guest (LINK) visit cancel by link (BE-7) ──────────────────────────────
     /**
