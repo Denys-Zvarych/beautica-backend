@@ -15,7 +15,6 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.service.MediaService;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import lombok.RequiredArgsConstructor;
@@ -23,8 +22,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -89,10 +86,10 @@ public class ClientAccountDeletionService {
     private final NotificationOutboxRepository notificationOutboxRepository;
     private final ClientReviewRepository clientReviewRepository;
     private final MediaRepository mediaRepository;
-    private final MediaService mediaService;
     private final TokensValidAfterCache tokensValidAfterCache;
     private final UserProfileCacheEvictor userProfileCacheEvictor;
     private final AuthService authService;
+    private final AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
     private final Clock clock;
 
     /**
@@ -260,7 +257,9 @@ public class ClientAccountDeletionService {
         // opens its own PROPAGATION_REQUIRES_NEW transactions, so an outer rollback here would leave
         // blobs already destroyed. See MediaService#purgeUserBlobsAfterCommit's own Javadoc for why
         // this is R2-only (the DB rows are already gone via CASCADE by the time this callback runs).
-        registerBlobPurgeAfterCommit(clientUserId, avatarR2Key, mediaRows);
+        // Phase 301: promoted to AccountBlobPurgeRegistrar so the staff/independent-master
+        // self-delete flow can share the identical after-commit registration shape.
+        accountBlobPurgeRegistrar.registerAfterCommit(clientUserId, avatarR2Key, mediaRows);
 
         // Step 13 — audit trail. Ids and counts only, never an email or any other PII (this repo's
         // logging convention) — a hard delete of the account is the single most consequential
@@ -271,22 +270,5 @@ public class ClientAccountDeletionService {
                         + "{} booking(s) detached",
                 clientUserId, futureBookingIds.size(), childlessAppointmentIds.size(),
                 detachedAppointments, remainingBookings.size());
-    }
-
-    private void registerBlobPurgeAfterCommit(UUID clientUserId, String avatarR2Key, List<MediaFile> mediaRows) {
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            return;
-        }
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                try {
-                    mediaService.purgeUserBlobsAfterCommit(clientUserId, avatarR2Key, mediaRows);
-                } catch (RuntimeException ex) {
-                    log.warn("Client self-delete blob purge failed after commit for user {}: {}",
-                            clientUserId, ex.getClass().getSimpleName());
-                }
-            }
-        });
     }
 }

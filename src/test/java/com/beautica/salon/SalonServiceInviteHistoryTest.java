@@ -155,6 +155,12 @@ class SalonServiceInviteHistoryTest {
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
+    // Phase 301: SalonService now delegates disposeStaffAccounts to the promoted
+    // StaffAccountDisposalService seam. Neither listSalonInvites/cancelInvite exercises that path,
+    // so a plain mock satisfies the constructor without any stubbing.
+    @Mock
+    private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
+
     private SalonService salonService;
 
     @BeforeEach
@@ -166,7 +172,7 @@ class SalonServiceInviteHistoryTest {
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
                 bookingService, serviceRepository, favoriteRepository, mediaRepository,
-                mediaService, transactionManager);
+                mediaService, transactionManager, staffAccountDisposalService);
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

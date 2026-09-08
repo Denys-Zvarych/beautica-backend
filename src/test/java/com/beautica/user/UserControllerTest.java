@@ -6,15 +6,24 @@ import com.beautica.auth.PasswordResetService;
 import com.beautica.auth.Role;
 import com.beautica.config.WebMvcTestSupport;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
@@ -27,6 +36,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -67,6 +77,34 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @DisplayName("UserController — @WebMvcTest slice")
 class UserControllerTest {
 
+    /**
+     * Enables real method security ({@code @PreAuthorize}) for this slice — mirrors {@code
+     * FavoriteControllerTest}'s identical pattern. Without this, {@code
+     * WebMvcTestSupport}'s own javadoc warns explicitly: a {@code @WebMvcTest} slice loads no
+     * {@code @EnableMethodSecurity} config by default, so a bare authenticated principal of ANY
+     * role sails past every {@code @PreAuthorize("hasAnyRole(...)")} untouched — a coordinator
+     * would otherwise (falsely) believe {@code should_return403_when_deleteMeAsSalonOwner} below
+     * pins the SpEL gate when it would in fact always return 204/200 regardless of role.
+     */
+    @TestConfiguration
+    @EnableMethodSecurity
+    static class SecurityConfig {
+
+        @Bean
+        SecurityFilterChain testSecurityFilterChain(HttpSecurity http,
+                JwtAuthenticationFilter jwtFilter) throws Exception {
+            return http
+                    .csrf(AbstractHttpConfigurer::disable)
+                    .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                    .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
+                    .exceptionHandling(ex -> ex
+                            .authenticationEntryPoint((req, res, exc) ->
+                                    res.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Unauthorized")))
+                    .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
+                    .build();
+        }
+    }
+
     // ── Slice infrastructure ──────────────────────────────────────────────────
 
     @Autowired
@@ -86,6 +124,13 @@ class UserControllerTest {
     /** Required by {@link UserController}'s constructor for the {@code DELETE /me} endpoint (Phase 300). */
     @MockBean
     private ClientAccountDeletionService clientAccountDeletionService;
+
+    /**
+     * Required by {@link UserController}'s constructor for the {@code DELETE /me} endpoint's
+     * non-CLIENT branch (Phase 301 — SALON_ADMIN/SALON_MASTER/INDEPENDENT_MASTER self-delete).
+     */
+    @MockBean
+    private StaffAccountSelfDeletionService staffAccountSelfDeletionService;
 
     /**
      * Required by {@code SecurityConfig} constructor (via {@code JwtAuthenticationFilter}).
@@ -662,5 +707,72 @@ class UserControllerTest {
 
         org.mockito.Mockito.verify(passwordResetService, org.mockito.Mockito.never())
                 .requestResetForUserId(any(UUID.class));
+    }
+
+    // ── DELETE /api/v1/users/me (Phase 300/301) ───────────────────────────────
+    // Isolates the @PreAuthorize SpEL gate itself, independent of either self-delete service's
+    // OWN defence-in-depth role re-check (both are @MockBean here and always "succeed" when
+    // invoked) — this is deliberately the ONE place in the whole self-delete test family where a
+    // @PreAuthorize regression cannot hide behind a service-layer guard also catching it. Real-DB
+    // authorization coverage lives in ClientAccountSelfDeleteAuthorizationIT (SALON_OWNER 403) and
+    // StaffAccountSelfDeleteAuthorizationIT (the full role matrix); this slice is what actually
+    // proves those observed 403s trace back to the SpEL expression and not to a coincidence of two
+    // guards agreeing.
+
+    @Test
+    @DisplayName("DELETE /me as CLIENT → 204, delegates to ClientAccountDeletionService only")
+    void should_return204_when_deleteMeAsClient() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(delete("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "jane@example.com", Role.CLIENT))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+
+        org.mockito.Mockito.verify(clientAccountDeletionService).deleteOwnAccount(eq(userId), any());
+        org.mockito.Mockito.verifyNoInteractions(staffAccountSelfDeletionService);
+    }
+
+    @Test
+    @DisplayName("DELETE /me as SALON_ADMIN/SALON_MASTER/INDEPENDENT_MASTER → 204, delegates to "
+            + "StaffAccountSelfDeletionService only")
+    void should_return204_when_deleteMeAsEachSelfDeletableStaffRole() throws Exception {
+        for (Role role : List.of(Role.SALON_ADMIN, Role.SALON_MASTER, Role.INDEPENDENT_MASTER)) {
+            var userId = UUID.randomUUID();
+
+            mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                            .delete("/api/v1/users/me")
+                            .with(authenticatedAs(userId, "staff@example.com", role))
+                            .with(csrf()))
+                    .andExpect(status().isNoContent());
+
+            org.mockito.Mockito.verify(staffAccountSelfDeletionService).deleteOwnAccount(eq(userId), any());
+        }
+        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService);
+    }
+
+    @Test
+    @DisplayName("DELETE /me as SALON_OWNER → 403 from the @PreAuthorize gate ITSELF — neither "
+            + "self-delete service is even invoked, since both are mocked to unconditionally "
+            + "\"succeed\" here and could not otherwise produce a 403")
+    void should_return403_when_deleteMeAsSalonOwner() throws Exception {
+        var userId = UUID.randomUUID();
+
+        mockMvc.perform(delete("/api/v1/users/me")
+                        .with(authenticatedAs(userId, "owner@example.com", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, staffAccountSelfDeletionService);
+    }
+
+    @Test
+    @DisplayName("DELETE /me with no JWT → 401, neither self-delete service invoked")
+    void should_return401_when_deleteMeWithoutJwt() throws Exception {
+        mockMvc.perform(delete("/api/v1/users/me")
+                        .with(csrf()))
+                .andExpect(status().isUnauthorized());
+
+        org.mockito.Mockito.verifyNoInteractions(clientAccountDeletionService, staffAccountSelfDeletionService);
     }
 }

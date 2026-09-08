@@ -7,8 +7,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
@@ -50,26 +48,25 @@ class ClientAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
         csd = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder);
     }
 
-    @ParameterizedTest(name = "{0} gets 403, never reaches the deletion cascade")
-    @ValueSource(strings = {"SALON_OWNER", "SALON_ADMIN", "SALON_MASTER", "INDEPENDENT_MASTER"})
-    @DisplayName("every non-CLIENT role is refused 403 with the generic \"Access denied\" body, "
-            + "and its account row survives untouched")
-    void should_return403_when_callerIsNotClient(String role) throws Exception {
-        UUID actorId;
-        String email;
-        if ("INDEPENDENT_MASTER".equals(role)) {
-            email = "csd-authz-" + System.nanoTime() + "@beautica.test";
-            var masterId = fixtures.createIndependentMaster(email);
-            actorId = jdbcTemplate.queryForObject(
-                    "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
-        } else if ("SALON_MASTER".equals(role) || "SALON_ADMIN".equals(role)) {
-            ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
-            email = "csd-authz-" + System.nanoTime() + "@beautica.test";
-            actorId = csd.createUser(email, role, salon.salonId(), "Тест", "Персонал");
-        } else {
-            email = "csd-authz-" + System.nanoTime() + "@beautica.test";
-            actorId = csd.createUser(email, role, null, "Тест", "Власник");
-        }
+    /**
+     * Phase 301 narrowed this case list to {@code SALON_OWNER} ONLY. Before phase 301,
+     * {@code DELETE /api/v1/users/me} was {@code hasRole('CLIENT')}-only and every other role
+     * (including {@code SALON_ADMIN}/{@code SALON_MASTER}/{@code INDEPENDENT_MASTER}) 403'd here.
+     * Phase 301 widened the {@code @PreAuthorize} gate to admit those three roles — they now reach
+     * the real self-delete cascade and are asserted 204 by {@code
+     * StaffAccountSelfDeleteAuthorizationIT} instead. {@code SALON_OWNER} is the ONE role that
+     * still 403s post-widening (D1 — {@code salons.owner_id} is {@code NOT NULL NO ACTION}, so an
+     * owner can never self-delete through this route), so it is the only case left in the shipped
+     * CLIENT-flow regression suite. Running this test with the pre-301 case list against the
+     * widened endpoint would falsely fail for SALON_ADMIN/INDEPENDENT_MASTER (204, not 403) — a
+     * regression discovered by this very QA pass, not a hypothetical.
+     */
+    @Test
+    @DisplayName("SALON_OWNER gets 403, never reaches the deletion cascade, and its account row "
+            + "survives untouched — the one role the widened endpoint still refuses (Phase 301 D1)")
+    void should_return403_when_callerIsSalonOwner() throws Exception {
+        String email = "csd-authz-" + System.nanoTime() + "@beautica.test";
+        UUID actorId = csd.createUser(email, "SALON_OWNER", null, "Тест", "Власник");
         String token = fixtures.tokenFor(email);
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -77,7 +74,7 @@ class ClientAccountSelfDeleteAuthorizationIT extends AbstractIntegrationTest {
                 new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
 
         assertThat(response.getStatusCode())
-                .as("role %s must never reach the self-delete cascade", role)
+                .as("SALON_OWNER must never reach the self-delete cascade")
                 .isEqualTo(HttpStatus.FORBIDDEN);
         JsonNode body = objectMapper.readTree(response.getBody());
         assertThat(body.path("message").asText()).isEqualTo("Access denied");

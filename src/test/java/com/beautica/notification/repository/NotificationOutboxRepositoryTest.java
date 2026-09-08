@@ -551,12 +551,14 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         UUID rowSurviveB = insertOutboxRowWithAggregate(OutboxEventType.REVIEW_REQUESTED, "SENT", surviveB);
         UUID rowSurviveC = insertOutboxRowWithAggregate(OutboxEventType.CLIENT_CANCELLED, "DEAD", surviveC);
 
-        // Act — the derived delete stages per-entity Hibernate remove()s in the persistence
-        // context; flush() forces them to the DB so the raw-JDBC assertions below (deliberately
-        // bypassing Hibernate, to prove the DB state rather than an in-memory echo) see the real
-        // outcome. Production is unaffected by this flush timing either way — the surrounding
-        // @Transactional method flushes everything at commit regardless (see the repository
-        // method's javadoc: it deliberately joins the caller's transaction).
+        // Act — deleteByAggregateIdIn is now a @Modifying bulk JPQL DELETE (perf audit, 2026-09,
+        // staff self-delete Finding B) that goes straight to the DB in a single statement; it
+        // never stages per-entity Hibernate remove()s to flush. The rows here were inserted via
+        // raw JDBC (insertOutboxRowWithAggregate), never loaded into the persistence context, so
+        // there is nothing for a bulk DELETE to leave stale. flush() is kept only to force this
+        // test's own pending work (none, currently) out before the raw-JDBC assertions below
+        // (deliberately bypassing Hibernate, to prove DB state rather than an in-memory echo) run
+        // — it is a no-op today, not load-bearing for this assertion.
         repo.deleteByAggregateIdIn(List.of(toDelete1, toDelete2));
         repo.flush();
 

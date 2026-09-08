@@ -14,7 +14,6 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.repository.MediaRepository;
-import com.beautica.media.service.MediaService;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import org.junit.jupiter.api.DisplayName;
@@ -24,8 +23,6 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -84,7 +81,7 @@ class ClientAccountDeletionServiceTest {
     private MediaRepository mediaRepository;
 
     @Mock
-    private MediaService mediaService;
+    private AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
 
     @Mock
     private TokensValidAfterCache tokensValidAfterCache;
@@ -258,7 +255,7 @@ class ClientAccountDeletionServiceTest {
         verify(bookingService, never()).cancelBooking(any(), any(), any());
         verify(bookingRepository, never()).deleteAllByIdInBatch(any());
         verify(userRepository, never()).deleteAllByIdInBatch(any());
-        verifyNoInteractions(appointmentRepository, clientReviewRepository, mediaService, notificationOutboxRepository);
+        verifyNoInteractions(appointmentRepository, clientReviewRepository, accountBlobPurgeRegistrar, notificationOutboxRepository);
     }
 
     @Test
@@ -287,8 +284,9 @@ class ClientAccountDeletionServiceTest {
     }
 
     @Test
-    @DisplayName("registers the R2 blob purge to run strictly after commit, never inline")
-    void should_deferBlobPurge_toAfterCommit_when_transactionSynchronizationActive() {
+    @DisplayName("delegates the R2 blob purge registration to the shared AccountBlobPurgeRegistrar, "
+            + "never calling MediaService inline (Phase 301 — promoted seam)")
+    void should_delegateBlobPurgeRegistration_when_deletingOwnAccount() {
         UUID clientId = UUID.randomUUID();
         User client = buildClient(clientId);
         MediaFile portfolioRow = mock(MediaFile.class);
@@ -300,20 +298,14 @@ class ClientAccountDeletionServiceTest {
         when(appointmentRepository.findByClientId(clientId)).thenReturn(List.of());
         when(bookingRepository.findByClientId(clientId)).thenReturn(List.of());
 
-        TransactionSynchronizationManager.initSynchronization();
-        try {
-            service.deleteOwnAccount(clientId, null);
+        service.deleteOwnAccount(clientId, null);
 
-            verifyNoInteractions(mediaService);
-
-            List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
-            assertThat(syncs).isNotEmpty();
-            syncs.forEach(TransactionSynchronization::afterCommit);
-        } finally {
-            TransactionSynchronizationManager.clearSynchronization();
-        }
-
-        verify(mediaService).purgeUserBlobsAfterCommit(clientId, null, List.of(portfolioRow));
+        // The actual after-commit TransactionSynchronization mechanics now live inside
+        // AccountBlobPurgeRegistrar itself (shared with StaffAccountSelfDeletionService) — pinned
+        // by com.beautica.user.AccountBlobPurgeRegistrarTest (backend-qa follow-up). This test
+        // only pins that the service hands it the correct pre-read pointers, never calling
+        // MediaService directly.
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(clientId, null, List.of(portfolioRow));
     }
 
     @Test
@@ -326,7 +318,7 @@ class ClientAccountDeletionServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verifyNoInteractions(bookingService, appointmentRepository, clientReviewRepository,
-                mediaService, authService, tokensValidAfterCache, userProfileCacheEvictor,
+                accountBlobPurgeRegistrar, authService, tokensValidAfterCache, userProfileCacheEvictor,
                 notificationOutboxRepository);
         verify(bookingRepository, never()).deleteAllByIdInBatch(any());
         verify(userRepository, never()).deleteAllByIdInBatch(any());
@@ -343,7 +335,7 @@ class ClientAccountDeletionServiceTest {
         assertThatThrownBy(() -> service.deleteOwnAccount(userId, "token"))
                 .isInstanceOf(BusinessException.class);
 
-        verifyNoInteractions(bookingService, appointmentRepository, clientReviewRepository, mediaService);
+        verifyNoInteractions(bookingService, appointmentRepository, clientReviewRepository, accountBlobPurgeRegistrar);
         verify(userRepository, never()).deleteAllByIdInBatch(any());
     }
 
@@ -359,7 +351,7 @@ class ClientAccountDeletionServiceTest {
         assertThatThrownBy(() -> service.deleteOwnAccount(clientId, "token"))
                 .isInstanceOf(BusinessException.class);
 
-        verifyNoInteractions(bookingService, appointmentRepository, clientReviewRepository, mediaService);
+        verifyNoInteractions(bookingService, appointmentRepository, clientReviewRepository, accountBlobPurgeRegistrar);
         verify(userRepository, never()).deleteAllByIdInBatch(any());
     }
 

@@ -106,6 +106,8 @@ class BookingServiceTest {
     @Mock
     private NotificationOutboxService outboxService;
     @Mock
+    private com.beautica.notification.repository.NotificationOutboxRepository notificationOutboxRepository;
+    @Mock
     private SlotCalculationService slotCalculationService;
     @Mock
     private com.beautica.review.repository.ReviewRepository reviewRepository;
@@ -155,6 +157,7 @@ class BookingServiceTest {
                 salonRepository,
                 authz,
                 outboxService,
+                notificationOutboxRepository,
                 slotCalculationService,
                 reviewRepository,
                 clientReviewRepository,
@@ -1192,6 +1195,7 @@ class BookingServiceTest {
 
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
         when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(true);
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(targetMasterId)).thenReturn(1);
         when(bookingRepository.findConfirmedFutureByMasterId(eq(targetMasterId), any()))
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(bookingId, null, targetMasterId, startsAt)));
@@ -1224,6 +1228,7 @@ class BookingServiceTest {
 
         when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
         when(masterRepository.existsByIdAndSalonId(targetMasterId, salonId)).thenReturn(true);
+        when(bookingRepository.acquireAdvisoryLockWithTimeout(targetMasterId)).thenReturn(1);
         when(bookingRepository.findConfirmedFutureByMasterId(eq(targetMasterId), any()))
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(earliestBookingId, appointmentId, targetMasterId, earliestStart),
