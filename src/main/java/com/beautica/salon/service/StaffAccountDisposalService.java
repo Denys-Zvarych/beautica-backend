@@ -148,10 +148,13 @@ public class StaffAccountDisposalService {
      * else — the cache-eviction loop, {@code findAllByUserIdInWithUser}, {@code
      * findIdsWithHistoricalReferences}, the detach-or-delete loop, the flush and the {@code users}
      * delete are all keyed on user/master ids, never on {@code salonId}. Only the invite-token
-     * cleanup and the trailing log line touch it, and both tolerate {@code null} — the log line
-     * purely cosmetically (renders {@code null} for an independent master's audit trail; it is
-     * never used programmatically). Every existing caller passes a non-null {@code salonId}, so
-     * this guard is a pure no-op for all three of them.
+     * cleanup and the trailing log line touch it, and both tolerate {@code null} — the log line's
+     * {@code salonClause} omits itself entirely rather than rendering the literal word {@code
+     * null}. That omission left an INDEPENDENT_MASTER self-delete with NO identifying data at all
+     * (backend-security HIGH, phase 301 follow-up), since {@code actorClause} is independently
+     * omitted for {@code SELF_DELETE} — hence {@code staffIdsClause} below, rendered
+     * unconditionally of both. Every existing owner-initiated caller passes a non-null
+     * {@code salonId}, so this guard is a pure no-op for all three of them.
      *
      * @param actorId      the deleting actor's id — the salon owner for the three owner-initiated
      *                     callers, or the departing account's own id for a self-delete
@@ -275,13 +278,25 @@ public class StaffAccountDisposalService {
         // fix) — three of the four callers are NOT a salon deletion, and grepping "Salon deletion"
         // during an incident must not pull in a removeMaster/removeAdmin/self-delete disposal.
         //
+        // `staffIdsClause` is UNCONDITIONAL (backend-security HIGH, phase 301 follow-up) — never
+        // gated on `reason` or `salonId`. The `by actor` and `for salon` clauses below are each
+        // omitted on some path (SELF_DELETE omits the former, an INDEPENDENT_MASTER's null salonId
+        // omits the latter), and an INDEPENDENT_MASTER self-delete hits BOTH omissions at once —
+        // before this clause that combination rendered zero identifying data for the single most
+        // consequential mutation this service performs. Accountability must never depend on which
+        // of the other two clauses happened to be non-empty.
+        //
         // The `by actor` clause is omitted for SELF_DELETE only: on that path actorId ==
         // staffUserIds.get(0) — the deleted account IS the actor — so naming it would read as a
-        // third party having ordered the deletion instead of the account's own owner.
-        String actorClause = reason == StaffDisposalReason.SELF_DELETE ? "" : " by actor " + actorId;
+        // third party having ordered the deletion instead of the account's own owner. The disposed
+        // account's own id still appears via `staffIdsClause` — omitting `by actor` narrates who
+        // did NOT order the deletion, it was never meant to erase who WAS deleted.
+        String staffIdsClause = " for staff " + staffUserIds;
         String salonClause = salonId != null ? " for salon " + salonId : "";
+        String actorClause = reason == StaffDisposalReason.SELF_DELETE ? "" : " by actor " + actorId;
         log.info("{} staff hard-delete: {} account(s) deleted, {} master row(s) deleted, "
-                        + "{} master row(s) detached{}{}",
-                reason.label(), staffUserIds.size(), deleted, detached, salonClause, actorClause);
+                        + "{} master row(s) detached{}{}{}",
+                reason.label(), staffUserIds.size(), deleted, detached,
+                staffIdsClause, salonClause, actorClause);
     }
 }

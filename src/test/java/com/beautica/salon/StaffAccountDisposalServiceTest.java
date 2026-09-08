@@ -20,6 +20,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -336,8 +338,83 @@ class StaffAccountDisposalServiceTest {
     @Test
     @DisplayName("Phase 301 audit-log fix — SELF_DELETE omits the \"by actor\" clause entirely, "
             + "since the deleted account IS the actor and naming it reads as a third party having "
-            + "ordered the deletion")
+            + "ordered the deletion — the account's id still appears via the (always-rendered) "
+            + "staff-ids clause, so this is 'no actor clause', never 'no id anywhere'")
     void should_omitActorClause_when_reasonIsSelfDelete() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, salonId, List.of(actorId), StaffDisposalReason.SELF_DELETE);
+
+        assertThat(appender.list).hasSize(1);
+        String rendered = appender.list.get(0).getFormattedMessage();
+        // Correction (backend-security HIGH follow-up): this used to also assert
+        // .doesNotContain(actorId.toString()) — but for a self-delete actorId == staffUserIds
+        // .get(0), and the fix for the finding renders staffUserIds unconditionally, so that
+        // assertion is now false BY DESIGN. The real intent was always "no `by actor` clause",
+        // not "no id anywhere" — asserting the latter is what let the anonymous-line defect land
+        // in the first place. Reconciled to assert the literal clause text is absent while
+        // allowing (and confirming) the id surfaces through the staff-ids clause instead.
+        assertThat(rendered)
+                .startsWith("Self-delete staff hard-delete:")
+                .doesNotContain("by actor")
+                .contains(actorId.toString());
+    }
+
+    @Test
+    @DisplayName("Phase 301 audit-log fix (part 2) — salonId == null (an INDEPENDENT_MASTER "
+            + "self-delete) omits the \"for salon\" clause entirely instead of rendering the "
+            + "literal word \"null\", and STILL renders the disposed account's own id")
+    void should_omitSalonClause_when_salonIdIsNull() {
+        UUID actorId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, null, List.of(actorId), StaffDisposalReason.SELF_DELETE);
+
+        assertThat(appender.list).hasSize(1);
+        String rendered = appender.list.get(0).getFormattedMessage();
+        // Correction (backend-security HIGH follow-up): this test originally asserted only the
+        // absence of "for salon" and "null" — it was written to catch the literal word "null"
+        // leaking in for an unset salonId, but it inadvertently PINNED the anonymous-line defect:
+        // for an INDEPENDENT_MASTER self-delete this is the exact combination (salonId == null,
+        // reason == SELF_DELETE) that rendered ZERO identifying data. The line must be anonymous
+        // of *salon*, but never of *account* — added the id-presence assertion to say so.
+        assertThat(rendered)
+                .startsWith("Self-delete staff hard-delete:")
+                .doesNotContain("for salon")
+                .doesNotContain("null")
+                .contains(actorId.toString());
+    }
+
+    @Test
+    @DisplayName("backend-security HIGH — an INDEPENDENT_MASTER self-delete (salonId == null AND "
+            + "reason == SELF_DELETE, so BOTH the salon clause and the actor clause are empty) "
+            + "still renders the disposed account's id; accountability must never depend on which "
+            + "of the other two clauses happens to be non-empty")
+    void should_renderStaffAccountId_when_independentMasterSelfDeletes() {
+        UUID actorId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, null, List.of(actorId), StaffDisposalReason.SELF_DELETE);
+
+        assertThat(appender.list).hasSize(1);
+        String rendered = appender.list.get(0).getFormattedMessage();
+        assertThat(rendered)
+                .as("before the fix, this exact combination rendered zero identifying data")
+                .startsWith("Self-delete staff hard-delete:")
+                .doesNotContain("for salon")
+                .doesNotContain("by actor")
+                .contains(actorId.toString());
+    }
+
+    @Test
+    @DisplayName("backend-security HIGH follow-up — a salon-staff self-delete (salonId != null, "
+            + "reason == SELF_DELETE) identifies the salon AND the individual, not just the salon")
+    void should_renderStaffAccountId_when_salonStaffSelfDeletes() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
@@ -349,26 +426,47 @@ class StaffAccountDisposalServiceTest {
         String rendered = appender.list.get(0).getFormattedMessage();
         assertThat(rendered)
                 .startsWith("Self-delete staff hard-delete:")
+                .contains("for salon " + salonId)
                 .doesNotContain("by actor")
-                .doesNotContain(actorId.toString());
+                .contains(actorId.toString());
     }
 
-    @Test
-    @DisplayName("Phase 301 audit-log fix (part 2) — salonId == null (an INDEPENDENT_MASTER "
-            + "self-delete) omits the \"for salon\" clause entirely instead of rendering the "
-            + "literal word \"null\"")
-    void should_omitSalonClause_when_salonIdIsNull() {
+    /**
+     * backend-qa follow-up (2026-09-08): {@code StaffDisposalReason} has FOUR values, but the
+     * three tests above only ever rendered MASTER_REMOVAL and SELF_DELETE — SALON_DELETION and
+     * ADMIN_REMOVAL were exercised only as constructor arguments (in the other tests in this
+     * class, and in {@code SalonServiceRemoveAdminTest}'s {@code verify(...).dispose(...)} against
+     * a MOCKED disposal service), never against the actual rendered log line. A caller-side test
+     * that only asserts "removeAdmin passed StaffDisposalReason.ADMIN_REMOVAL to the mock" proves
+     * nothing about what {@link StaffAccountDisposalService#dispose} does with that enum value —
+     * {@code reason.label()} could silently return the wrong string for ADMIN_REMOVAL specifically
+     * (e.g. a copy-paste of MASTER_REMOVAL's "Master removal") and every existing test would still
+     * pass. This closes that gap for the two previously-unasserted labels.
+     */
+    @ParameterizedTest(name = "{0} renders \"{1} staff hard-delete:\"")
+    @DisplayName("every StaffDisposalReason renders its OWN label, not a neighbour's — "
+            + "SALON_DELETION and ADMIN_REMOVAL were previously asserted only as constructor "
+            + "arguments, never against the rendered log line")
+    @CsvSource({
+            "SALON_DELETION, Salon deletion",
+            "ADMIN_REMOVAL, Admin removal"
+    })
+    void should_renderOwnLabel_when_reasonIsSalonDeletionOrAdminRemoval(
+            StaffDisposalReason reason, String expectedLabel) {
         UUID actorId = UUID.randomUUID();
-        when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
+        UUID salonId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, null, List.of(actorId), StaffDisposalReason.SELF_DELETE);
+        service.dispose(actorId, salonId, List.of(staffUserId), reason);
 
         assertThat(appender.list).hasSize(1);
         String rendered = appender.list.get(0).getFormattedMessage();
         assertThat(rendered)
-                .startsWith("Self-delete staff hard-delete:")
-                .doesNotContain("for salon")
-                .doesNotContain("null");
+                .as("rendered line for reason=%s", reason)
+                .startsWith(expectedLabel + " staff hard-delete:")
+                .contains("by actor " + actorId)
+                .contains("for salon " + salonId);
     }
 }
