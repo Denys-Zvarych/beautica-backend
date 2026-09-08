@@ -15,6 +15,7 @@ import com.beautica.salon.audit.StaffClientReferenceType;
 import com.beautica.salon.audit.StaffClientReferenceViolation;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.StaffAccountDisposalService;
+import com.beautica.salon.service.StaffDisposalReason;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -210,7 +211,8 @@ class StaffAccountSelfDeletionServiceTest {
 
         verifyNoInteractions(bookingService);
         verify(masterRepository, never()).findByUserId(any());
-        verify(staffAccountDisposalService).dispose(userId, salonId, List.of(userId));
+        verify(staffAccountDisposalService)
+                .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
         verify(authService).denylistAccessToken("token-123");
         verify(accountBlobPurgeRegistrar).registerAfterCommit(eq(userId), any(), eq(List.of()));
     }
@@ -238,7 +240,8 @@ class StaffAccountSelfDeletionServiceTest {
         verify(bookingService).acquireMasterLockForSelfDelete(masterId);
         verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
                 userId, masterId, salonId, futureBookingIds);
-        verify(staffAccountDisposalService).dispose(userId, salonId, List.of(userId));
+        verify(staffAccountDisposalService)
+                .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
     }
 
     @Test
@@ -285,7 +288,8 @@ class StaffAccountSelfDeletionServiceTest {
 
         verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
                 eq(userId), eq(masterId), eq(null), any());
-        verify(staffAccountDisposalService).dispose(userId, null, List.of(userId));
+        verify(staffAccountDisposalService)
+                .dispose(userId, null, List.of(userId), StaffDisposalReason.SELF_DELETE);
     }
 
     @Test
@@ -348,7 +352,8 @@ class StaffAccountSelfDeletionServiceTest {
 
         verify(bookingService).disposeFutureConfirmedForMasterSelfDelete(
                 userId, masterId, salonId, exactlyAtCap);
-        verify(staffAccountDisposalService).dispose(userId, salonId, List.of(userId));
+        verify(staffAccountDisposalService)
+                .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
     }
 
     @Test
@@ -375,7 +380,7 @@ class StaffAccountSelfDeletionServiceTest {
                 });
 
         verify(bookingService, never()).disposeFutureConfirmedForMasterSelfDelete(any(), any(), any(), any());
-        verify(staffAccountDisposalService, never()).dispose(any(), any(), any());
+        verify(staffAccountDisposalService, never()).dispose(any(), any(), any(), any());
     }
 
     @Test
@@ -400,7 +405,7 @@ class StaffAccountSelfDeletionServiceTest {
                         + "майбутні записи (максимум 500) і спробуйте ще раз.");
 
         verify(bookingService, never()).disposeFutureConfirmedForMasterSelfDelete(any(), any(), any(), any());
-        verify(staffAccountDisposalService, never()).dispose(any(), any(), any());
+        verify(staffAccountDisposalService, never()).dispose(any(), any(), any(), any());
     }
 
     // ── after-commit registration + denylist ───────────────────────────────────────────────────

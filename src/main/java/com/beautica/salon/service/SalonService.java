@@ -1049,7 +1049,7 @@ public class SalonService {
     /**
      * HARD-DELETES {@code salonId}'s own staff — every currently-active master row for the salon
      * is deactivated, then every {@code SALON_MASTER}/{@code SALON_ADMIN} account of the salon is
-     * disposed of via {@link #disposeStaffAccounts(UUID, UUID, List)} (Phase 297 D1 extraction —
+     * disposed of via {@link #disposeStaffAccounts(UUID, UUID, List, StaffDisposalReason)} (Phase 297 D1 extraction —
      * see that method's javadoc for the disposal itself, the binding statement order, and every
      * invariant it protects). This method is only the salon-wide resolve-then-delegate shell:
      * {@link MasterService#deactivateMasters} MUST run first (it dereferences
@@ -1072,28 +1072,31 @@ public class SalonService {
         masterService.deactivateMasters(ownerId, salonMasters, salonId);
 
         List<UUID> staffUserIds = staffClientReferenceAuditService.resolveSalonStaffUserIds(salonId);
-        disposeStaffAccounts(ownerId, salonId, staffUserIds);
+        disposeStaffAccounts(ownerId, salonId, staffUserIds, StaffDisposalReason.SALON_DELETION);
     }
 
     /**
      * Delegates to {@link StaffAccountDisposalService#dispose} — the promoted staff-account
      * hard-delete seam (Phase 301 — REUSE-FIRST: this private method was MOVED and de-privatised
-     * into its own class, never copied). Kept as a one-line shell purely so {@link
+     * into its own class, never copied). Kept as a one-line shell so {@link
      * #deleteSalonStaff(UUID, UUID)}, {@link #removeMaster(UUID, UUID, UUID)} and {@link
-     * #removeAdmin(UUID, UUID, UUID)} stay unchanged at their call sites; the disposal itself, its
-     * binding statement order, the {@code chk_masters_detachment_coherent} interaction, the
-     * invite-token cleanup and both cache evictions now live on {@link
-     * StaffAccountDisposalService#dispose} — see that method's javadoc for the full contract.
+     * #removeAdmin(UUID, UUID, UUID)} each pass only their own {@link StaffDisposalReason}; the
+     * disposal itself, its binding statement order, the
+     * {@code chk_masters_detachment_coherent} interaction, the invite-token cleanup and both cache
+     * evictions live on {@link StaffAccountDisposalService#dispose} — see that method's javadoc
+     * for the full contract, and {@link StaffDisposalReason}'s javadoc for why the disposal audit
+     * log needs to know which of the three callers this is.
      */
-    private void disposeStaffAccounts(UUID actorId, UUID salonId, List<UUID> staffUserIds) {
-        staffAccountDisposalService.dispose(actorId, salonId, staffUserIds);
+    private void disposeStaffAccounts(
+            UUID actorId, UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason) {
+        staffAccountDisposalService.dispose(actorId, salonId, staffUserIds, reason);
     }
 
     /**
      * Removes ONE invited master from {@code salonId} (Phase 297) — the SALON_OWNER's way to
      * dispose of a single master exactly the way {@link #deleteSalonStaff(UUID, UUID)} disposes
      * of every master when the WHOLE salon is deleted, via the shared {@link
-     * #disposeStaffAccounts(UUID, UUID, List)} seam (D1). Not the same operation as {@code DELETE
+     * #disposeStaffAccounts(UUID, UUID, List, StaffDisposalReason)} seam (D1). Not the same operation as {@code DELETE
      * /masters/{masterId}} ({@link MasterService#deactivateMaster}) — that flips
      * {@code is_active = false} globally and leaves the account and the row intact; this
      * hard-deletes the account and deletes-or-detaches the {@code masters} row behind it,
@@ -1148,7 +1151,7 @@ public class SalonService {
      *       scenario a first reading of Phase 295 D6's salon-closure rationale might suggest</li>
      * </ol>
      * Only once every check passes does anything write. {@link MasterService#deactivateMaster}
-     * MUST run BEFORE {@link #disposeStaffAccounts(UUID, UUID, List)} — it dereferences {@code
+     * MUST run BEFORE {@link #disposeStaffAccounts(UUID, UUID, List, StaffDisposalReason)} — it dereferences {@code
      * master.getUser().getId()} to key its cache evictions ({@code MasterService:790-868}), and a
      * detached row has no user left to read that from.
      *
@@ -1219,7 +1222,7 @@ public class SalonService {
         // assertCanManageMaster would otherwise re-derive.
         masterService.deactivateMaster(actorId, master);
 
-        disposeStaffAccounts(actorId, salonId, List.of(masterUserId));
+        disposeStaffAccounts(actorId, salonId, List.of(masterUserId), StaffDisposalReason.MASTER_REMOVAL);
 
         log.info("Master removal: master {} (user {}) removed from salon {} by actor {}",
                 masterId, masterUserId, salonId, actorId);
@@ -1245,7 +1248,7 @@ public class SalonService {
      * {@code true}, and a live access/refresh token kept working. That was meant to make the
      * removed admin re-invitable, but {@code InviteService#acceptInvite}'s {@code existsByEmail}
      * check means a live row is exactly what makes re-invite impossible (Phase 299 background).
-     * This method now disposes of the account via {@link #disposeStaffAccounts(UUID, UUID, List)}
+     * This method now disposes of the account via {@link #disposeStaffAccounts(UUID, UUID, List, StaffDisposalReason)}
      * — the same seam {@link #deleteSalonStaff(UUID, UUID)} and {@code removeMaster} use — so the
      * {@code users} row, its refresh tokens, device tokens and password-reset tickets are gone,
      * {@link com.beautica.auth.TokensValidAfterCache} answers {@code ABSENT} on the next request,
@@ -1273,7 +1276,7 @@ public class SalonService {
      * <p>No {@code @Transactional} timeout is set, unlike {@code removeMaster}'s
      * {@code REMOVE_MASTER_TIMEOUT_SECONDS}: that timeout exists solely to bound Phase 298's
      * unbounded future-booking decline loop, which this method never runs (D3) — the remaining
-     * work is a single-user {@link #disposeStaffAccounts(UUID, UUID, List)} call, the same bounded
+     * work is a single-user {@link #disposeStaffAccounts(UUID, UUID, List, StaffDisposalReason)} call, the same bounded
      * shape {@code rotateAdmin} already runs without a timeout.
      *
      * @throws NotFoundException  if {@code userId} does not resolve to a user
@@ -1316,7 +1319,7 @@ public class SalonService {
                     "This admin is also referenced as a client and cannot be removed");
         }
 
-        disposeStaffAccounts(actorId, salonId, List.of(userId));
+        disposeStaffAccounts(actorId, salonId, List.of(userId), StaffDisposalReason.ADMIN_REMOVAL);
 
         log.info("Admin removal: user {} removed from salon {} by actor {}", userId, salonId, actorId);
     }

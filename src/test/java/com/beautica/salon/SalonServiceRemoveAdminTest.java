@@ -14,6 +14,7 @@ import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.SalonService;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
+import com.beautica.salon.service.StaffDisposalReason;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
@@ -129,7 +130,8 @@ class SalonServiceRemoveAdminTest {
         // com.beautica.salon.StaffAccountDisposalServiceTest (backend-qa follow-up) — this test
         // only pins that removeAdmin delegates to it with the right arguments, never a parallel
         // implementation.
-        verify(staffAccountDisposalService).dispose(ownerId, salonId, List.of(adminId));
+        verify(staffAccountDisposalService)
+                .dispose(ownerId, salonId, List.of(adminId), StaffDisposalReason.ADMIN_REMOVAL);
     }
 
     @Test

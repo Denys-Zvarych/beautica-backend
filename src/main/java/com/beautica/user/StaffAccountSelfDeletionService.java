@@ -14,6 +14,7 @@ import com.beautica.salon.service.StaffAccountDisposalService;
 import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
+import com.beautica.salon.service.StaffDisposalReason;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -195,7 +196,7 @@ public class StaffAccountSelfDeletionService {
         // masters detach-or-delete branch, the invite-token cleanup (skipped for salonId == null —
         // an INDEPENDENT_MASTER was never invited), the users row delete, and the after-commit
         // tokensValidAfter/user-profile cache evictions for this one user.
-        staffAccountDisposalService.dispose(userId, salonId, List.of(userId));
+        staffAccountDisposalService.dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
 
         // Step 8 — denylist the caller's OWN access token, exactly as AuthService#logout and
         // ClientAccountDeletionService#deleteOwnAccount do. Refresh-token cleanup needs no

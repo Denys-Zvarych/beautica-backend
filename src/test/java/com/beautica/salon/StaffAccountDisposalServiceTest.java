@@ -7,15 +7,23 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.service.StaffAccountDisposalService;
+import com.beautica.salon.service.StaffDisposalReason;
 import com.beautica.user.InviteTokenRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.Clock;
@@ -74,6 +82,23 @@ class StaffAccountDisposalServiceTest {
 
     private StaffAccountDisposalService service;
 
+    /** Bound to dispose()'s own logger: the audit line's wording is part of its contract. */
+    private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
+    private final Logger disposalLogger =
+            (Logger) LoggerFactory.getLogger(StaffAccountDisposalService.class);
+
+    @BeforeEach
+    void attachAppender() {
+        appender.start();
+        disposalLogger.addAppender(appender);
+    }
+
+    @AfterEach
+    void detachAppender() {
+        disposalLogger.detachAppender(appender);
+        appender.stop();
+    }
+
     private StaffAccountDisposalService newService() {
         return new StaffAccountDisposalService(
                 userRepository, inviteTokenRepository, masterRepository, clock,
@@ -97,7 +122,7 @@ class StaffAccountDisposalServiceTest {
     void should_writeNothing_when_staffUserIdsIsEmpty() {
         service = newService();
 
-        service.dispose(UUID.randomUUID(), UUID.randomUUID(), List.of());
+        service.dispose(UUID.randomUUID(), UUID.randomUUID(), List.of(), StaffDisposalReason.SALON_DELETION);
 
         verifyNoInteractions(userRepository, inviteTokenRepository, masterRepository,
                 tokensValidAfterCache, userProfileCacheEvictor);
@@ -113,7 +138,7 @@ class StaffAccountDisposalServiceTest {
         when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(staffUserId));
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
         verify(inviteTokenRepository).deleteBySalonIdAndStaffUserIds(salonId, List.of(staffUserId));
     }
@@ -127,7 +152,7 @@ class StaffAccountDisposalServiceTest {
         when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, null, List.of(staffUserId));
+        service.dispose(actorId, null, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
         verify(inviteTokenRepository, never()).deleteBySalonIdAndStaffUserIds(any(), any(List.class));
         // Every other statement in the body is keyed on user/master ids, never on salonId — this
@@ -148,7 +173,7 @@ class StaffAccountDisposalServiceTest {
         when(masterRepository.findIdsWithHistoricalReferences(List.of(masterId))).thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(staffUserId));
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
         verify(masterRepository).delete(master);
         assertThat(master.isDetached())
@@ -172,7 +197,7 @@ class StaffAccountDisposalServiceTest {
         when(clock.instant()).thenReturn(now);
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(staffUserId));
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
         verify(masterRepository, never()).delete(any(Master.class));
         assertThat(master.getDetachedFirstName()).isEqualTo("Тест");
@@ -202,7 +227,7 @@ class StaffAccountDisposalServiceTest {
         when(clock.instant()).thenReturn(Instant.EPOCH);
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(userWithHistory, userWithoutHistory));
+        service.dispose(actorId, salonId, List.of(userWithHistory, userWithoutHistory), StaffDisposalReason.SALON_DELETION);
 
         assertThat(withHistory.isDetached()).isTrue();
         verify(masterRepository).delete(withoutHistory);
@@ -219,7 +244,7 @@ class StaffAccountDisposalServiceTest {
         when(masterRepository.findAllByUserIdInWithUser(List.of(adminUserId))).thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(adminUserId));
+        service.dispose(actorId, salonId, List.of(adminUserId), StaffDisposalReason.SALON_DELETION);
 
         verify(masterRepository, never()).findIdsWithHistoricalReferences(anyCollection());
         verify(masterRepository).flush();
@@ -243,7 +268,7 @@ class StaffAccountDisposalServiceTest {
         when(clock.instant()).thenReturn(Instant.EPOCH);
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(staffUserId));
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
         InOrder order = inOrder(masterRepository, userRepository);
         order.verify(masterRepository).flush();
@@ -261,7 +286,7 @@ class StaffAccountDisposalServiceTest {
         when(masterRepository.findAllByUserIdInWithUser(List.of(userA, userB))).thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(userA, userB));
+        service.dispose(actorId, salonId, List.of(userA, userB), StaffDisposalReason.SALON_DELETION);
 
         verify(tokensValidAfterCache).invalidateAfterCommit(userA);
         verify(tokensValidAfterCache).invalidateAfterCommit(userB);
@@ -280,9 +305,70 @@ class StaffAccountDisposalServiceTest {
                 .thenReturn(List.of());
         service = newService();
 
-        service.dispose(actorId, salonId, List.of(staffUserId));
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.SALON_DELETION);
 
         verify(userRepository).deleteAllByIdInBatch(eq(List.of(staffUserId)));
         verifyNoMoreInteractions(userRepository);
+    }
+
+    @Test
+    @DisplayName("the audit log names the CALLER'S operation and the actor, for every reason except "
+            + "SELF_DELETE — a MASTER_REMOVAL disposal must not render \"Salon deletion\"")
+    void should_renderReasonLabelAndActor_when_reasonIsNotSelfDelete() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID staffUserId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(staffUserId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, salonId, List.of(staffUserId), StaffDisposalReason.MASTER_REMOVAL);
+
+        assertThat(appender.list).hasSize(1);
+        ILoggingEvent event = appender.list.get(0);
+        assertThat(event.getLevel()).isEqualTo(Level.INFO);
+        String rendered = event.getFormattedMessage();
+        assertThat(rendered)
+                .startsWith("Master removal staff hard-delete:")
+                .contains("by actor " + actorId)
+                .doesNotContain("Salon deletion");
+    }
+
+    @Test
+    @DisplayName("Phase 301 audit-log fix — SELF_DELETE omits the \"by actor\" clause entirely, "
+            + "since the deleted account IS the actor and naming it reads as a third party having "
+            + "ordered the deletion")
+    void should_omitActorClause_when_reasonIsSelfDelete() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, salonId, List.of(actorId), StaffDisposalReason.SELF_DELETE);
+
+        assertThat(appender.list).hasSize(1);
+        String rendered = appender.list.get(0).getFormattedMessage();
+        assertThat(rendered)
+                .startsWith("Self-delete staff hard-delete:")
+                .doesNotContain("by actor")
+                .doesNotContain(actorId.toString());
+    }
+
+    @Test
+    @DisplayName("Phase 301 audit-log fix (part 2) — salonId == null (an INDEPENDENT_MASTER "
+            + "self-delete) omits the \"for salon\" clause entirely instead of rendering the "
+            + "literal word \"null\"")
+    void should_omitSalonClause_when_salonIdIsNull() {
+        UUID actorId = UUID.randomUUID();
+        when(masterRepository.findAllByUserIdInWithUser(List.of(actorId))).thenReturn(List.of());
+        service = newService();
+
+        service.dispose(actorId, null, List.of(actorId), StaffDisposalReason.SELF_DELETE);
+
+        assertThat(appender.list).hasSize(1);
+        String rendered = appender.list.get(0).getFormattedMessage();
+        assertThat(rendered)
+                .startsWith("Self-delete staff hard-delete:")
+                .doesNotContain("for salon")
+                .doesNotContain("null");
     }
 }

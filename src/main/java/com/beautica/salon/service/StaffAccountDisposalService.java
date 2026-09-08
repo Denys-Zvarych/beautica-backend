@@ -159,8 +159,11 @@ public class StaffAccountDisposalService {
      *                     INDEPENDENT_MASTER} self-delete (Phase 301 §3a — the only role with no
      *                     salon above it)
      * @param staffUserIds the resolved staff/independent-master account ids to hard-delete
+     * @param reason       which operation ordered this disposal (Phase 301 audit-log fix) — drives
+     *                     the audit line below only, never a control-flow branch
      */
-    public void dispose(UUID actorId, @Nullable UUID salonId, List<UUID> staffUserIds) {
+    public void dispose(
+            UUID actorId, @Nullable UUID salonId, List<UUID> staffUserIds, StaffDisposalReason reason) {
         if (staffUserIds.isEmpty()) {
             return;
         }
@@ -267,8 +270,18 @@ public class StaffAccountDisposalService {
         // scrubbed value (this repo's PII-in-logs convention). A hard delete of N accounts is the
         // single most consequential mutation this service performs; it must leave a record of who
         // ordered it even though the rows it names are gone.
-        log.info("Salon deletion staff hard-delete: {} account(s) deleted, {} master row(s) deleted, "
-                        + "{} master row(s) detached for salon {} by actor {}",
-                staffUserIds.size(), deleted, detached, salonId, actorId);
+        //
+        // `reason` names the operation instead of hardcoding "Salon deletion" (Phase 301 audit-log
+        // fix) — three of the four callers are NOT a salon deletion, and grepping "Salon deletion"
+        // during an incident must not pull in a removeMaster/removeAdmin/self-delete disposal.
+        //
+        // The `by actor` clause is omitted for SELF_DELETE only: on that path actorId ==
+        // staffUserIds.get(0) — the deleted account IS the actor — so naming it would read as a
+        // third party having ordered the deletion instead of the account's own owner.
+        String actorClause = reason == StaffDisposalReason.SELF_DELETE ? "" : " by actor " + actorId;
+        String salonClause = salonId != null ? " for salon " + salonId : "";
+        log.info("{} staff hard-delete: {} account(s) deleted, {} master row(s) deleted, "
+                        + "{} master row(s) detached{}{}",
+                reason.label(), staffUserIds.size(), deleted, detached, salonClause, actorClause);
     }
 }
