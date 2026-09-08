@@ -4,6 +4,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.ServicePriceShapeMismatchException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
@@ -20,6 +21,7 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.ActiveDuplicateProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
+import com.beautica.service.repository.SalonBulkSetupCandidate;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import org.junit.jupiter.api.DisplayName;
@@ -39,6 +41,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.never;
@@ -63,8 +66,9 @@ import static org.mockito.Mockito.when;
  *       and {@code base_price = priceMin} for RANGE items.</li>
  *   <li>Additive contract: a master with an existing catalogue is not blocked, and no
  *       menu-emptiness predicate is consulted at all.</li>
- *   <li>Advisory lock: taken per master to serialise concurrent additive batches against the
- *       read-then-write duplicate guard. The serialised window is narrow — global
+ *   <li>Advisory lock: taken on the contended V121 key space — the SALON on the on-behalf branch,
+ *       the master row on the independent branch (phase-302 audit HIGH-2) — to serialise
+ *       concurrent additive batches against the read-then-write duplicate guard. The serialised window is narrow — global
  *       reference-data reads (type resolution, category validation) run BEFORE it; the
  *       duplicate guard and the inserts run inside it. A failed acquisition aborts the batch
  *       (500), and a wait exceeding the fused 3s {@code lock_timeout} becomes a retryable
@@ -153,6 +157,21 @@ class ServiceCatalogServiceBulkCreateTest {
         });
     }
 
+    /**
+     * Assignment-only echo stub for the Phase 302 reuse path, where NO ServiceDefinition is
+     * saved. Stubbing {@code serviceRepository.save} here would be an unnecessary stubbing under
+     * strict stubs — and, more usefully, the fact that it is not needed is itself the contract.
+     */
+    private void stubAssignmentSaveEchoesEntity() {
+        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenAnswer(inv -> {
+            MasterServiceAssignment msa = inv.getArgument(0);
+            if (msa.getId() == null) {
+                msa.setId(UUID.randomUUID());
+            }
+            return msa;
+        });
+    }
+
     // ── Happy path (self endpoint) ─────────────────────────────────────────────
 
     @Test
@@ -232,8 +251,8 @@ class ServiceCatalogServiceBulkCreateTest {
     }
 
     @Test
-    @DisplayName("salon on-behalf — batch persists with ownerType=INDEPENDENT_MASTER + ownerId=master.id (services owned by the master row)")
-    void should_createBatchOwnedByMasterRow_when_salonOnBehalfBulkSetup() {
+    @DisplayName("salon on-behalf — batch persists with ownerType=SALON + ownerId=salonId (Phase 302 D1)")
+    void should_createBatchOwnedBySalon_when_salonOnBehalfBulkSetup() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID typeId = UUID.randomUUID();
@@ -259,16 +278,53 @@ class ServiceCatalogServiceBulkCreateTest {
         verify(serviceRepository).save(defCaptor.capture());
 
         assertThat(defCaptor.getValue().getOwnerType())
-                .as("salon-bound master services are owned by the master row, not the salon")
-                .isEqualTo(OwnerType.INDEPENDENT_MASTER);
-        assertThat(defCaptor.getValue().getOwnerId()).isEqualTo(masterId);
+                .as("a salon-bound master's services are SALON-owned — the ownership the salon "
+                        + "catalogue query requires (Phase 302 D1)")
+                .isEqualTo(OwnerType.SALON);
+        assertThat(defCaptor.getValue().getOwnerId())
+                .as("ownerId is the SALON id, not the master row id")
+                .isEqualTo(salonId);
         assertThat(result).hasSize(1);
+
+        // ONE salon-scoped query answers BOTH the reuse lookup (the salon's definitions) and the
+        // conflict (this master's assignments) — audit LOW-3. It is asked about THIS salon and
+        // THIS master, never about another owner's definitions, and the owner-level definition
+        // guard plus its findAllById re-fetch are gone from this branch entirely.
+        verify(serviceRepository).findSalonBulkSetupCandidates(
+                salonId, masterId, java.util.Set.of(typeId));
+        verify(serviceRepository, never()).findActiveDuplicateTypeIds(any(), any(), any());
+        verify(serviceRepository, never()).findAllById(any());
 
         // Parity with the self path: the shared additive core's post-write bookkeeping must run
         // for the on-behalf entry point too. Now that the endpoint is additive, this is reachable
         // on every later "add more services" pass — a stale min_effective_price would misprice the
         // salon master in search on every one of them, not just at first setup.
         verify(masterRepository).refreshMinEffectivePrice(masterId);
+
+        // ── phase-302 audit HIGH-2, re-audit LOW-2: THE LOCK KEY IS THE SALON ──
+        // V121 keys on (owner_type, owner_id, service_type_id), so on this branch the contended
+        // resource is the SALON's definition set, shared by every master in it. A master-keyed
+        // lock let two DIFFERENT masters of one salon take two DIFFERENT locks, both miss
+        // findSalonBulkSetupCandidates' reuse arm, and both INSERT (SALON, salonId, typeId) — the
+        // loser then tripping V121 at flush, where flushBulkBatch can only translate a constraint
+        // NAME, so the client got a DUPLICATE_SERVICE 409 with serviceName AND existingServiceDefId
+        // both null.
+        //
+        // The two-thread race IT (BulkServiceSetupIntegrationTest) is NOT a guard for this: it
+        // goes false-green whenever the two transactions happen not to interleave. This assertion
+        // is deterministic, and the sibling `never()` is what actually fails if the key regresses
+        // to masterId — a bare verify(salonId) would pass on a mock that took BOTH.
+        verify(masterServiceRepository).acquireBulkSetupLockWithTimeout(salonId);
+        verify(masterServiceRepository, never()).acquireBulkSetupLockWithTimeout(masterId);
+
+        // …and it is taken at the right point: after the global reference-data reads (which need
+        // no serialization) and before the salon-scoped read-then-write candidate query, which is
+        // exactly the span the lock exists to serialize.
+        InOrder lockOrder = org.mockito.Mockito.inOrder(
+                serviceTypeRepository, masterServiceRepository, serviceRepository);
+        lockOrder.verify(serviceTypeRepository).findAllById(anyList());
+        lockOrder.verify(masterServiceRepository).acquireBulkSetupLockWithTimeout(salonId);
+        lockOrder.verify(serviceRepository).findSalonBulkSetupCandidates(any(), any(), any());
     }
 
     /**
@@ -303,6 +359,615 @@ class ServiceCatalogServiceBulkCreateTest {
 
         assertThat(result).hasSize(1);
         verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
+    }
+
+    // ── Phase 302 D2/D3/D4 — salon-owned definitions are REUSED, never duplicated ──
+
+    /** A master row already bound to {@code salonId}, as the on-behalf path resolves it. */
+    private Master salonMaster(UUID masterId, UUID salonId) {
+        Salon salon = org.mockito.Mockito.mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = org.mockito.Mockito.mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getSalon()).thenReturn(salon);
+        return master;
+    }
+
+    /** The salon's already-persisted ACTIVE definition for {@code type} — the reuse target. */
+    private ServiceDefinition existingSalonDefinition(
+            UUID defId, UUID salonId, ServiceType type, String basePrice, int durationMinutes) {
+        ServiceDefinition definition = ServiceDefinition.builder()
+                .id(defId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .name(type.getNameUk())
+                .category(type.getPlatformCategoryName())
+                .baseDurationMinutes(durationMinutes)
+                .bufferMinutesAfter(0)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal(basePrice))
+                .isActive(true)
+                .build();
+        definition.setServiceType(type);
+        return definition;
+    }
+
+    /**
+     * The salon's already-persisted ACTIVE definition priced as a RANGE band — the reuse target
+     * for the shape cases {@link #existingSalonDefinition}'s FIXED shape cannot express.
+     */
+    private ServiceDefinition existingSalonRangeDefinition(
+            UUID defId, UUID salonId, ServiceType type, String priceMin, String priceMax,
+            int durationMinutes) {
+        ServiceDefinition definition = ServiceDefinition.builder()
+                .id(defId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .name(type.getNameUk())
+                .category(type.getPlatformCategoryName())
+                .baseDurationMinutes(durationMinutes)
+                .bufferMinutesAfter(0)
+                .priceType(PriceType.RANGE)
+                .basePrice(new BigDecimal(priceMin))
+                .priceMax(new BigDecimal(priceMax))
+                .isActive(true)
+                .build();
+        definition.setServiceType(type);
+        return definition;
+    }
+
+    /**
+     * Stubs the salon branch's SINGLE candidate query. The phase-302 audit (LOW-3) collapsed the
+     * former three round-trips — per-master assignment lookup, owner-level definition lookup and a
+     * bare {@code findAllById} re-fetch — into
+     * {@code ServiceRepository#findSalonBulkSetupCandidates}, which is also where the salon
+     * scoping that closes the rotated-master leak (HIGH-1) lives.
+     *
+     * <p>A candidate's {@code masterAssignmentId} is the whole signal: non-null means "this master
+     * already performs it" (the 409 conflict), null means "the salon offers it, this master does
+     * not" (the reuse path).
+     */
+    private void stubSalonCandidates(UUID salonId, UUID masterId, SalonBulkSetupCandidate... candidates) {
+        when(serviceRepository.findSalonBulkSetupCandidates(
+                org.mockito.ArgumentMatchers.eq(salonId),
+                org.mockito.ArgumentMatchers.eq(masterId),
+                any()))
+                .thenReturn(List.of(candidates));
+    }
+
+    /**
+     * D2 — the core of the phase. A second master in the same salon toggling a service type the
+     * salon already offers must NOT mint a second definition: V121's
+     * {@code ux_service_def_owner_service_type_active} would refuse it. The write degenerates to
+     * the assignment alone, pointing at the salon's existing definition.
+     */
+    @Test
+    @DisplayName("salon on-behalf — a type the salon already offers REUSES the existing definition; no second ServiceDefinition is saved (D2)")
+    void should_reuseSalonDefinition_when_salonAlreadyOffersServiceType() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing = existingSalonDefinition(existingDefId, salonId, type, "350.00", 60);
+
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // The salon offers the type but this master does not perform it → the REUSE row.
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubAssignmentSaveEchoesEntity();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getServiceDefinition())
+                .as("the assignment points at the salon's EXISTING definition")
+                .isSameAs(existing);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).serviceDefinition().id()).isEqualTo(existingDefId);
+    }
+
+    /**
+     * D3 — reuse must never rewrite the shared definition. Name/price/duration on a SALON
+     * definition are salon-level facts; overwriting them from one master's batch item would
+     * change what every other master in the salon offers.
+     */
+    @Test
+    @DisplayName("salon on-behalf — reuse leaves the shared definition's name, price and duration untouched (D3)")
+    void should_notMutateSharedDefinition_when_reusingWithDifferentValues() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing = existingSalonDefinition(existingDefId, salonId, type, "350.00", 60);
+
+        // Deliberately different from the definition on BOTH price and duration.
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 90, "420.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // The salon offers the type but this master does not perform it → the REUSE row.
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubAssignmentSaveEchoesEntity();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        assertThat(existing.getBasePrice())
+                .as("the shared definition's base price is a salon-level fact — untouched by reuse")
+                .isEqualByComparingTo("350.00");
+        assertThat(existing.getBaseDurationMinutes())
+                .as("the shared definition's base duration is untouched by reuse")
+                .isEqualTo(60);
+
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getPriceOverride())
+                .as("the per-master divergence lands on master_services.price_override")
+                .isEqualByComparingTo("420.00");
+        assertThat(msaCaptor.getValue().getDurationOverrideMinutes())
+                .as("and on master_services.duration_override_minutes")
+                .isEqualTo(90);
+    }
+
+    /**
+     * D3's other half: an item that MATCHES the reused definition must not manufacture an
+     * override row. A spurious override would make the master look like a price outlier to
+     * {@code fromPublic}'s masking rule and to every "does this master deviate" read.
+     */
+    @Test
+    @DisplayName("salon on-behalf — reuse with matching price/duration writes NO overrides (D3)")
+    void should_writeNoOverrides_when_reusedItemMatchesDefinition() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing = existingSalonDefinition(existingDefId, salonId, type, "350.00", 60);
+
+        // Same money, different scale — 350 vs 350.00 must compare equal, not produce an override.
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // The salon offers the type but this master does not perform it → the REUSE row.
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubAssignmentSaveEchoesEntity();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getPriceOverride())
+                .as("350 and 350.00 are the same money — compareTo, not equals")
+                .isNull();
+        assertThat(msaCaptor.getValue().getDurationOverrideMinutes()).isNull();
+    }
+
+    /**
+     * D4 — the 409 is re-scoped to THIS master. The owner-level guard is not consulted for a
+     * conflict on the salon branch at all: were it still in play, this test's sibling
+     * ({@link #should_reuseSalonDefinition_when_salonAlreadyOffersServiceType}) would 409.
+     */
+    @Test
+    @DisplayName("salon on-behalf — 409 DUPLICATE_SERVICE when THIS MASTER already offers the type, nothing persisted (D4)")
+    void should_throwDuplicateService_when_salonMasterAlreadyOffersServiceType() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID assignedDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // This master ALREADY performs the type — a non-null assignment id is the conflict signal.
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(
+                typeId,
+                existingSalonDefinition(assignedDefId, salonId, type, "350.00", 60),
+                UUID.randomUUID()));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getServiceName()).isEqualTo("Манікюр");
+                    assertThat(dup.getExistingServiceDefId())
+                            .as("carries the definition the master is already assigned, for the deep-link")
+                            .isEqualTo(assignedDefId);
+                });
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+    }
+
+    /**
+     * D4 reports the FIRST collision in REQUEST order, not in result order — the query's row order
+     * is unspecified, and blaming a later item would make the error non-deterministic across
+     * identical requests. Mirrors the owner-level guard's own ordering contract.
+     */
+    @Test
+    @DisplayName("salon on-behalf — 409 names the FIRST already-offered item in request order (D4)")
+    void should_reportFirstCollidingItemInRequestOrder_when_salonMasterOffersSeveral() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID firstTypeId = UUID.randomUUID();
+        UUID secondTypeId = UUID.randomUUID();
+        UUID firstDefId = UUID.randomUUID();
+        UUID secondDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType firstType = serviceType(firstTypeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceType secondType = serviceType(secondTypeId, "Педикюр", "NAIL_SERVICE", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(firstTypeId, 60, "350.00"),
+                fixedItem(secondTypeId, 90, "450.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(firstType, secondType));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // Result order deliberately REVERSED relative to the request.
+        stubSalonCandidates(salonId, masterId,
+                new SalonBulkSetupCandidate(
+                        secondTypeId,
+                        existingSalonDefinition(secondDefId, salonId, secondType, "450.00", 90),
+                        UUID.randomUUID()),
+                new SalonBulkSetupCandidate(
+                        firstTypeId,
+                        existingSalonDefinition(firstDefId, salonId, firstType, "350.00", 60),
+                        UUID.randomUUID()));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getServiceName())
+                        .as("the FIRST item in request order is blamed, regardless of row order")
+                        .isEqualTo("Манікюр"));
+
+        // Parity with the single-collision sibling: naming the right item is only half the
+        // contract — the batch is all-or-nothing, so the NON-colliding second item must not leak
+        // a partial row either. Without this, a guard that threw AFTER persisting would still
+        // satisfy the ordering assertion above.
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+    }
+
+    /**
+     * The retained INDEPENDENT_MASTER branch (D1). Its master rows have {@code salon_id IS NULL},
+     * so nothing about them moves — and the assignment-level per-master guard must NOT displace
+     * the owner-level definition guard there, which additionally catches an active definition
+     * carrying no assignment.
+     */
+    @Test
+    @DisplayName("independent master — keeps the OWNER-level definition guard, never the per-master assignment one (D1 retained branch)")
+    void should_keepOwnerLevelGuard_when_independentMasterBulkCreates() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        Master master = independentMaster(masterId);
+
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findByUserId(userId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
+        serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+        verify(serviceRepository).save(defCaptor.capture());
+
+        assertThat(defCaptor.getValue().getOwnerType()).isEqualTo(OwnerType.INDEPENDENT_MASTER);
+        assertThat(defCaptor.getValue().getOwnerId()).isEqualTo(masterId);
+
+        verify(serviceRepository).findActiveDuplicateTypeIds(
+                OwnerType.INDEPENDENT_MASTER, masterId, java.util.Set.of(typeId));
+        verify(serviceRepository, never()).findSalonBulkSetupCandidates(any(), any(), any());
+        verify(serviceRepository, never()).findAllById(any());
+    }
+
+    /**
+     * ── Re-audit MEDIUM-1: the reuse branch REJECTS an unrepresentable price shape ──
+     *
+     * <p>{@code master_services} carries a {@code price_override} (a FLOOR) and a
+     * {@code duration_override_minutes}. It has no per-master price TYPE and no per-master
+     * ceiling. So when a batch item's price shape disagrees with the salon definition it reuses,
+     * there is nowhere faithful for the difference to land, and the old reuse branch — which
+     * returns before {@code applyPriceMode} — silently reshaped it, answering {@code 201} with a
+     * body that did not match the request and shipping a wrong client-facing price:
+     *
+     * <pre>
+     *   FIXED 500  definition + RANGE 400–900 item → stored FIXED 400   (band discarded)
+     *   RANGE 400–900 definition + FIXED 600  item → renders 600–900    (ceiling nobody set)
+     *   RANGE 400–900 definition + RANGE 500–800 item → renders 500–900 (ceiling 800 discarded)
+     * </pre>
+     *
+     * <p>D3 routed diverging price/duration VALUES to the overrides and said NOTHING about shape,
+     * so this was undecided, not an accepted trade-off. The three tests below pin the rejection;
+     * {@link #should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling} and the
+     * FIXED↔FIXED reuse tests above pin that the guard does not over-reject.
+     *
+     * <p><b>This first test is the converted {@code
+     * should_overrideWithRangeFloor_when_reusedItemIsRangePriced}</b> — same fixture (a RANGE
+     * 800–1500 item reusing a FIXED 350.00 definition), which under the fix is row 1 of the table
+     * and therefore a 400 rather than an {@code 800.00} override. It was updated rather than
+     * deleted so the case itself keeps a home; the {@code overridePriceFor} floor coverage it
+     * used to provide moved, intact, to the accept-case sibling below.
+     */
+    @Test
+    @DisplayName("salon on-behalf — 400 SERVICE_PRICE_SHAPE_MISMATCH when a RANGE item reuses a "
+            + "FIXED salon definition; nothing persisted (re-audit MEDIUM-1)")
+    void should_return400_when_reusedRangeItemMeetsAFixedSalonDefinition() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing = existingSalonDefinition(existingDefId, salonId, type, "350.00", 60);
+
+        // Duration deliberately MATCHES, isolating the shape rejection from the duration override.
+        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "800.00", "1500.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+
+        ServicePriceShapeMismatchException thrown = catchThrowableOfType(
+                () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
+                ServicePriceShapeMismatchException.class);
+
+        assertThat(thrown)
+                .as("a band the assignment cannot store must be refused, never flattened to its floor")
+                .isNotNull();
+        assertThat(thrown.getStatus()).isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
+        assertThat(thrown.getSalonPriceType())
+                .as("the payload names the SALON's governing shape, so the setup screen can say why")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(thrown.getSalonPriceMin()).isEqualByComparingTo("350.00");
+        assertThat(thrown.getSalonPriceMax())
+                .as("a FIXED salon definition has no ceiling")
+                .isNull();
+        assertThat(thrown.getExistingServiceDefId()).isEqualTo(existingDefId);
+        assertThat(thrown.getServiceName()).isEqualTo("Манікюр");
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+        assertThat(existing.getPriceType())
+                .as("and the shared definition is not reshaped on the way out")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(existing.getPriceMax()).isNull();
+    }
+
+    /** Table row 2 — a FIXED item under a RANGE salon band would advertise a ceiling nobody set. */
+    @Test
+    @DisplayName("salon on-behalf — 400 SERVICE_PRICE_SHAPE_MISMATCH when a FIXED item reuses a "
+            + "RANGE salon definition; nothing persisted (re-audit MEDIUM-1)")
+    void should_return400_when_reusedFixedItemMeetsARangeSalonDefinition() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing =
+                existingSalonRangeDefinition(existingDefId, salonId, type, "400.00", "900.00", 60);
+
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "600.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+
+        ServicePriceShapeMismatchException thrown = catchThrowableOfType(
+                () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
+                ServicePriceShapeMismatchException.class);
+
+        assertThat(thrown)
+                .as("600 would have rendered as 600–900: a public ceiling nobody set for this master")
+                .isNotNull();
+        assertThat(thrown.getSalonPriceType()).isEqualTo(PriceType.RANGE);
+        assertThat(thrown.getSalonPriceMin()).isEqualByComparingTo("400.00");
+        assertThat(thrown.getSalonPriceMax()).isEqualByComparingTo("900.00");
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+    }
+
+    /** Table row 3 — same mode, diverging ceiling: the submitted 800 has nowhere to be stored. */
+    @Test
+    @DisplayName("salon on-behalf — 400 SERVICE_PRICE_SHAPE_MISMATCH when a RANGE item's ceiling "
+            + "differs from the salon band; nothing persisted (re-audit MEDIUM-1)")
+    void should_return400_when_reusedRangeItemCeilingDiffersFromTheSalonBand() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing =
+                existingSalonRangeDefinition(existingDefId, salonId, type, "400.00", "900.00", 60);
+
+        // Floor 500 is representable (price_override), ceiling 800 is not — only the ceiling
+        // differs, so this is the case a floor-only comparison would wave through.
+        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "500.00", "800.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+
+        ServicePriceShapeMismatchException thrown = catchThrowableOfType(
+                () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
+                ServicePriceShapeMismatchException.class);
+
+        assertThat(thrown)
+                .as("500–800 would have rendered as 500–900 — the submitted ceiling silently dropped")
+                .isNotNull();
+        assertThat(thrown.getSalonPriceMax()).isEqualByComparingTo("900.00");
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+    }
+
+    /**
+     * The accept case the guard must not swallow, and the home of the {@code overridePriceFor}
+     * coverage the converted test above used to carry.
+     *
+     * <p>{@code overridePriceFor} sources the item's floor from {@code priceMin} for a RANGE item
+     * and from {@code price} for a FIXED one, because Bean Validation makes the OTHER field null
+     * in each mode. Every OTHER reuse test in this class submits a FIXED item, so all of them stay
+     * green if that ternary is flattened to {@code item.price()}: a RANGE item would then yield a
+     * null floor, write NO override, and silently price this master at the salon definition's own
+     * base price — a real, unnoticed money bug on the exact path Phase 302 introduces. This test
+     * is the only thing standing in the way of that mutant.
+     *
+     * <p>The ceiling MATCHES the salon band (1500.00 both sides), which is precisely why the item
+     * is representable: everything it declares beyond its floor is already what the definition
+     * says, so the floor alone reconstructs it faithfully. The ceiling still must not be written
+     * onto the SHARED definition — that would be the D3 violation with the widest blast radius,
+     * repricing the band for every other master in the salon.
+     */
+    @Test
+    @DisplayName("salon on-behalf — a RANGE item whose ceiling MATCHES the salon band is accepted "
+            + "and overrides with its priceMin floor (D3)")
+    void should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing =
+                existingSalonRangeDefinition(existingDefId, salonId, type, "350.00", "1500.00", 60);
+
+        // RANGE, so item.price() is null by validation and only priceMin carries the floor.
+        // Duration deliberately MATCHES, isolating the price assertion from the duration one.
+        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "800.00", "1500.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubAssignmentSaveEchoesEntity();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getPriceOverride())
+                .as("a RANGE item's floor is priceMin — reading the (null) FIXED price field would "
+                        + "drop the override and price this master at the salon's 350.00")
+                .isEqualByComparingTo("800.00");
+        assertThat(msaCaptor.getValue().getDurationOverrideMinutes())
+                .as("the duration matched the definition, so no duration override is manufactured")
+                .isNull();
+
+        assertThat(existing.getPriceMax())
+                .as("the shared band's ceiling is untouched — writing the item's copy onto the "
+                        + "SHARED definition would rewrite the band for every other master")
+                .isEqualByComparingTo("1500.00");
+        assertThat(existing.getBasePrice())
+                .as("and the shared floor is untouched")
+                .isEqualByComparingTo("350.00");
+        assertThat(existing.getPriceType()).isEqualTo(PriceType.RANGE);
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+
+        assertThat(result.get(0).effectivePrice())
+                .as("the override is what the master's menu actually charges — "
+                        + "COALESCE(priceOverride, base_price)")
+                .isEqualByComparingTo("800.00");
+    }
+
+    /**
+     * The guard must not fire on a scale difference: {@code 1500} and {@code 1500.00} are the same
+     * money. Compared with {@code equals} instead of {@code compareTo}, this identical band would
+     * 400 — an over-rejection that no other test in this class would notice.
+     *
+     * <p>Acceptance is only half the contract, so this test also pins WHAT was accepted. The
+     * sibling {@link #should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling}
+     * cannot cover either assertion below: its fixture submits a ceiling of the SAME scale as the
+     * definition, so a mutant that copies the item's ceiling onto the shared definition is
+     * invisible there — and invisible to {@code isEqualByComparingTo} anywhere. Only a scale-only
+     * fixture, compared on the STORED representation, can see that write.
+     */
+    @Test
+    @DisplayName("salon on-behalf — a RANGE ceiling differing only in SCALE is accepted (compareTo, "
+            + "not equals)")
+    void should_acceptReuse_when_rangeCeilingDiffersOnlyInScale() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing =
+                existingSalonRangeDefinition(existingDefId, salonId, type, "350.00", "1500.00", 60);
+
+        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "800", "1500")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubAssignmentSaveEchoesEntity();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        assertThat(result)
+                .as("1500 and 1500.00 are the same band — the shape guard must use compareTo")
+                .hasSize(1);
+
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        assertThat(msaCaptor.getValue().getPriceOverride())
+                .as("the SUBMITTED floor is what reaches price_override — waving the band through "
+                        + "and then pricing this master at the definition's own 350.00 is an "
+                        + "acceptance that persisted the wrong money")
+                .isEqualByComparingTo("800");
+
+        assertThat(existing.getPriceMax().toPlainString())
+                .as("the shared ceiling keeps the SALON's stored value verbatim: a scale-only "
+                        + "difference is accepted by COMPARING, never by copying the item's 1500 "
+                        + "over the definition's 1500.00 — a rewrite compareTo could never see")
+                .isEqualTo("1500.00");
     }
 
     // ── Additive: no "first-time only" precondition ────────────────────────────

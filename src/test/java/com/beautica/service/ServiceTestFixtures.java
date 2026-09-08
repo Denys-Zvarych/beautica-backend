@@ -233,6 +233,62 @@ class ServiceTestFixtures {
     }
 
     /**
+     * Counts {@code service_definitions} rows for an explicit {@code (owner_type, owner_id)} pair.
+     *
+     * <p>Needed since Phase 302: a salon master's definitions are {@code SALON}-owned, so
+     * {@link #countServiceDefinitionsForMaster} — which keys on the master row id — legitimately
+     * reports zero for them. Assertions about a salon's catalogue must name the salon.
+     */
+    long countServiceDefinitionsForOwner(String ownerType, UUID ownerId) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE owner_type = ? AND owner_id = ?",
+                Long.class, ownerType, ownerId);
+        return count == null ? 0L : count;
+    }
+
+    /**
+     * The ACTIVE {@code service_definitions} a master actually performs, resolved through
+     * {@code master_services} rather than through {@code owner_id}.
+     *
+     * <p>This is the ownership-agnostic notion of "this master's menu", and the one that stayed
+     * true across Phase 302: the assignment row is what says <em>this master performs this
+     * service</em>, whether the definition is owned by the master (independent) or by the salon.
+     */
+    java.util.List<UUID> activeDefinitionIdsAssignedToMaster(UUID masterId) {
+        return jdbcTemplate.queryForList(
+                "SELECT sd.id FROM service_definitions sd "
+                        + "JOIN master_services ms ON ms.service_def_id = sd.id "
+                        + "WHERE ms.master_id = ? AND ms.is_active = TRUE AND sd.is_active = TRUE "
+                        + "ORDER BY sd.created_at",
+                UUID.class, masterId);
+    }
+
+    /**
+     * Gives {@code masterId} an open-ended weekly template with a 09:00–17:00 interval on EVERY
+     * ISO weekday, so the master always has free future slots.
+     *
+     * <p>Required by any assertion against {@code GET /salons/&#123;salonId&#125;/services}: that
+     * catalogue applies the Phase 23.x free-slot bookability gate, so a schedule-less master's
+     * services are invisible there by deliberate contract (Phase 305 D1) — an empty catalogue
+     * would otherwise be mistaken for an ownership bug. Every weekday is seeded rather than just
+     * today's so the fixture cannot go stale when the suite runs after 17:00 local.
+     */
+    void seedUsableSchedule(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
+                scheduleId, masterId, java.time.LocalDate.now(java.time.ZoneId.of("Europe/Kyiv")));
+        for (int isoDow = 1; isoDow <= 7; isoDow++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    UUID.randomUUID(), scheduleId, isoDow,
+                    java.time.LocalTime.of(9, 0), java.time.LocalTime.of(17, 0));
+        }
+    }
+
+    /**
      * Reads the denormalised {@code masters.min_effective_price} (V58) straight from the DB —
      * never through an API projection, so the assertion pins the persisted column that the
      * search/browse ordering actually reads, not a value recomputed on the way out.

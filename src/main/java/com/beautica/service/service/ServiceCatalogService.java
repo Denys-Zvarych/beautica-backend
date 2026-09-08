@@ -4,6 +4,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.ServicePriceShapeMismatchException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
@@ -30,6 +31,7 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.ActiveDuplicateProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
+import com.beautica.service.repository.SalonBulkSetupCandidate;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
@@ -47,14 +49,18 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 
+import java.math.BigDecimal;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Service
@@ -286,14 +292,27 @@ public class ServiceCatalogService {
      *
      * <p>Salon-membership of the target master is verified here as the second half of the
      * controller's {@code @PreAuthorize} role gate (anti-bug §D split), mirroring
-     * {@link #assignServiceToMaster}. Services are owned by the master row, not the salon —
-     * no salon-level catalog entity is created.
+     * {@link #assignServiceToMaster}.
+     *
+     * <p><b>Phase 302 D1 — the definitions are SALON-owned.</b> A salon-bound master's services
+     * persist as {@code ownerType = SALON, ownerId = salonId}, not as master-owned rows. That is
+     * the ownership the salon catalogue query
+     * ({@code MasterServiceRepository#findBookableAssignmentsBySalon}) requires, so a service
+     * created here is actually visible in {@code GET /salons/&#123;salonId&#125;/services};
+     * master-owned rows never were. The per-master {@link MasterServiceAssignment} remains the
+     * thing that says <em>this master performs this service</em>.
+     *
+     * <p><b>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId}</b> — it
+     * is resolved by {@code masterRepository.findById} below. Passing a user id yields
+     * {@code 404 Master not found}, not {@code 403}.
      *
      * <p>Usable whether or not the master already has services — it backs both the initial
      * catalogue-setup screen and later "add more services" passes.
      *
      * @throws ForbiddenException        if the master does not belong to the given salon
-     * @throws DuplicateServiceException (409) if a batch item's service type is already offered
+     * @throws DuplicateServiceException (409) if <em>this master</em> already offers a batch
+     *                                   item's service type (Phase 302 D4 — the salon already
+     *                                   offering it is the reuse path, not a conflict)
      */
     @Transactional
     public List<MasterServiceResponse> bulkCreateSalonMasterServices(
@@ -308,21 +327,57 @@ public class ServiceCatalogService {
             throw new ForbiddenException("Access denied");
         }
 
-        return bulkCreateForMaster(master, OwnerType.INDEPENDENT_MASTER, master.getId(), request);
+        return bulkCreateForMaster(master, OwnerType.SALON, salonId, request);
     }
 
     /**
      * Shared additive bulk-create core for a resolved master.
      *
-     * <p>Services in this platform are owned by the master row regardless of how the master
-     * was created (independent or salon-bound), so both entry points persist
-     * {@code ownerType = INDEPENDENT_MASTER, ownerId = master.id} and a per-definition
-     * {@link MasterServiceAssignment} — identical to {@link #addIndependentMasterService}.
+     * <p><b>Ownership is per entry point, not universal (Phase 302 D1).</b> The two callers pass
+     * different owners and that difference is load-bearing:
+     * <ul>
+     *   <li>{@link #bulkCreateIndependentMasterServices} — {@code (INDEPENDENT_MASTER, master.id)}.
+     *       Its master rows have {@code salon_id IS NULL}; there is no salon to own anything.</li>
+     *   <li>{@link #bulkCreateSalonMasterServices} — {@code (SALON, salonId)}. The salon catalogue
+     *       query admits only SALON-owned definitions, so anything else is created invisible.</li>
+     * </ul>
+     * An earlier revision of this javadoc claimed a single universal "owned by the master row"
+     * rule; that claim was false against the catalogue query and is retired.
      *
-     * <p>Additive by design: the batch is appended to whatever the master already offers, so the
-     * same endpoint serves both the empty-catalogue onboarding screen and a later "add more
-     * services" pass. The only conflict left is a per-service one — a batch item whose
-     * {@link ServiceType} the owner already offers is rejected 409 {@code DUPLICATE_SERVICE}.
+     * <p><b>Find-or-create on the SALON branch (D2).</b> A salon owner is shared by every master
+     * in the salon, and V121's partial unique index
+     * {@code ux_service_def_owner_service_type_active} makes one ACTIVE definition per
+     * {@code (owner_type, owner_id, service_type_id)} a hard database rule. Two masters in one
+     * salon who both perform «Манікюр» therefore cannot each mint a definition — the second insert
+     * would be refused. So the SALON branch REUSES the salon's existing active definition for a
+     * service type and only creates one when none exists, then inserts this master's assignment
+     * either way. The reuse lookup and the per-master conflict check are ONE salon-scoped query
+     * ({@link ServiceRepository#findSalonBulkSetupCandidates}) — the same collision projection
+     * shape the owner-level guard uses, with its outcome split into <em>reuse</em> (the salon's
+     * own definition) and <em>throw</em> (this master already performs it); no parallel lookup is
+     * written (REUSE-FIRST).
+     *
+     * <p><b>Reuse never mutates the shared definition (D3).</b> Name, base price, duration and
+     * category on a reused definition are salon-level facts shared by every master performing it;
+     * rewriting them from one master's batch item would silently change what the whole salon
+     * offers. Per-master divergence goes where it already belongs —
+     * {@code master_services.price_override} / {@code master_services.duration_override_minutes} —
+     * and is left {@code NULL} when the item matches the definition.
+     *
+     * <p><b>Shape divergence is rejected, not reshaped (re-audit MEDIUM-1).</b> Those two override
+     * columns are a floor and a duration; there is no per-master price TYPE and no per-master
+     * ceiling. D3 routed diverging price/duration VALUES to them and said nothing about shape, so
+     * a batch item whose price type or RANGE ceiling disagrees with the reused definition had
+     * nowhere faithful to land and was silently stored as something else. It now 400s with
+     * {@code SERVICE_PRICE_SHAPE_MISMATCH} naming the salon's governing shape — see
+     * {@link #assertReusableShapesAreRepresentable}.
+     *
+     * <p><b>The conflict is per-MASTER on the SALON branch (D4).</b> "The salon already offers
+     * this type" is the reuse path, not a conflict; {@code 409 DUPLICATE_SERVICE} fires only when
+     * <em>this master</em> already has an active assignment for the type. The INDEPENDENT_MASTER
+     * branch keeps the owner-level definition guard verbatim — for it, owner and master are the
+     * same row, and the guard additionally catches an active definition carrying no assignment,
+     * which the assignment-level check cannot see.
      *
      * <p>Rejects duplicate {@code serviceTypeId}s within the batch, derives each service name +
      * category from the chosen {@link ServiceType}, reuses {@link #applyPriceMode} for the
@@ -349,15 +404,26 @@ public class ServiceCatalogService {
         Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
         validateBulkCategoriesActive(typesById.values());
 
-        // TOCTOU guard: serialize concurrent additive bulk adds for the same master.
-        // assertNoActiveDuplicatesInBatch below is a read-then-write check — it reads the
-        // owner's already-taken service types, then inserts. Two concurrent bulk POSTs for the
-        // same master could therefore both read "type X is free" and both proceed. The V121
-        // unique index is the correctness backstop (the loser 500s at flush and is translated to
-        // a 409), but taking a transaction-scoped advisory lock keyed by masterId makes the
-        // second caller wait for the first to commit, so its duplicate guard sees the committed
-        // rows and produces the clean, item-naming 409 instead of a raced constraint violation.
-        // Mirrors the booking overlap-guard advisory lock (anti-bug pattern).
+        // TOCTOU guard: serialize concurrent additive bulk adds against the same DEFINITION key
+        // space. The guard below is a read-then-write check — it reads which of the batch's
+        // service types are already taken, then inserts. Two concurrent bulk POSTs could
+        // therefore both read "type X is free" and both proceed. The V121 unique index is the
+        // correctness backstop (the loser 500s at flush and is translated to a 409), but taking a
+        // transaction-scoped advisory lock makes the second caller wait for the first to commit,
+        // so its guard sees the committed rows and either REUSES them or produces the clean,
+        // item-naming 409 instead of a raced constraint violation. Mirrors the booking
+        // overlap-guard advisory lock (anti-bug pattern).
+        //
+        // THE KEY IS THE OWNER, NOT THE MASTER (phase-302 audit HIGH-2). V121 keys on
+        // (owner_type, owner_id, service_type_id), so on the SALON branch the contended resource
+        // is the SALON's definition set, shared by every master in it. Keying on masterId let two
+        // DIFFERENT masters of one salon take two DIFFERENT locks, both miss
+        // findSalonBulkSetupCandidates' reuse arm, and both INSERT (SALON, salonId, typeId) — the
+        // loser then tripping V121 at flush, where flushBulkBatch can only translate a constraint
+        // NAME, so the client got a DUPLICATE_SERVICE 409 with serviceName AND existingServiceDefId
+        // both null. Locking the owner is strictly stronger than locking the master (two batches
+        // for one master are also two batches for its salon), and exactly ONE key is taken per
+        // transaction, so no lock-ordering discipline is needed.
         //
         // The serialized window is deliberately NARROW — it opens here and closes at commit,
         // covering exactly the read-then-write span: the duplicate guard, the inserts, the flush,
@@ -368,15 +434,37 @@ public class ServiceCatalogService {
         // only REGISTERS an afterCommit synchronization, so the actual evict runs after the
         // transaction commits and therefore after this lock is released (anti-bug §F rule 2 — an
         // inline evict would let a concurrent reader repopulate the cache from a pre-commit snapshot).
-        acquireBulkSetupLockWithTimeout(master.getId());
+        acquireBulkSetupLockWithTimeout(ownerId);
 
-        // PERF: and the V121 duplicate guard for the WHOLE batch in ONE query too, rather than
-        // one findActiveDuplicateId per item. See assertNoActiveDuplicatesInBatch.
-        assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
+        // PERF: and the duplicate guard for the WHOLE batch in ONE query, rather than one
+        // per item. Which guard applies depends on who owns the definitions (D4):
+        //
+        //   SALON  — the owner is shared by every master in the salon, so an owner-level
+        //            definition guard would reject the salon's SECOND master from ever offering
+        //            a type the first already offers. The conflict is per-MASTER, the salon-level
+        //            hit is the reuse path, and resolveSalonBulkCandidates answers BOTH from one
+        //            query (audit LOW-3 — three round-trips inside a now salon-wide serialized
+        //            window multiplied across every concurrent master setup in the salon).
+        //   INDEPENDENT_MASTER — owner and master are the same row, so the pre-existing
+        //            owner-level definition guard is kept verbatim. It is strictly stronger here:
+        //            it also catches an active definition carrying no active assignment, which
+        //            would still violate V121 at INSERT but is invisible to an assignment check.
+        //
+        // Both guards run INSIDE the advisory lock, exactly as before: each is a read-then-write
+        // check whose only race-proof backstop is the V121 index / the master_services unique key.
+        Map<UUID, ServiceDefinition> reusableByTypeId;
+        if (ownerType == OwnerType.SALON) {
+            reusableByTypeId = resolveSalonBulkCandidates(
+                    master.getId(), ownerId, request.items(), typesById);
+        } else {
+            assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
+            reusableByTypeId = Map.of();
+        }
 
         List<MasterServiceResponse> created = request.items().stream()
                 .map(item -> createSingleFromBulkItem(
-                        master, ownerType, ownerId, item, typesById.get(item.serviceTypeId())))
+                        master, ownerType, ownerId, item, typesById.get(item.serviceTypeId()),
+                        reusableByTypeId.get(item.serviceTypeId())))
                 .toList();
 
         // Push the whole batch to the DB in one go, translating a V121 violation exactly as the
@@ -394,12 +482,19 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Takes the transaction-scoped per-master advisory lock that serializes the additive
-     * bulk-create critical section, bounding the wait at the 3s {@code lock_timeout} the
-     * repository query fuses into the same round-trip. The lock lives in its own salt-{@code 2}
-     * key space, so it contends only with other bulk setups for the same master — never with the
-     * booking master/client locks (salts {@code 0}/{@code 1}); see
+     * Takes the transaction-scoped advisory lock that serializes the additive bulk-create critical
+     * section, bounding the wait at the 3s {@code lock_timeout} the repository query fuses into
+     * the same round-trip. The lock lives in its own salt-{@code 2} key space, so it contends only
+     * with other bulk setups for the same key — never with the booking master/client locks (salts
+     * {@code 0}/{@code 1}); see
      * {@link MasterServiceRepository#acquireBulkSetupLockWithTimeout(UUID)}.
+     *
+     * <p><b>{@code ownerId} — the V121 key space, not the master (audit HIGH-2).</b> The contended
+     * resource is one ACTIVE definition per {@code (owner_type, owner_id, service_type_id)}: the
+     * SALON on the salon branch, the master row on the independent branch (where owner and master
+     * are the same row). Keying on the master in a salon let two masters of one salon insert the
+     * same {@code (SALON, salonId, typeId)} and the loser trip V121 at flush, producing a 409 with
+     * a null {@code serviceName} AND a null {@code existingServiceDefId}.
      *
      * <p><b>Why a bounded wait rather than {@code pg_try_advisory_xact_lock}.</b> Under a
      * try-lock the loser of ORDINARY contention fails instantly, before it can re-check
@@ -413,14 +508,14 @@ public class ServiceCatalogService {
      *                           {@code 55P03 lock_not_available}, surfaced by Spring/Hibernate
      *                           exception translation as
      *                           {@link PessimisticLockingFailureException}) — a transient
-     *                           "master is busy, retry" condition, deliberately distinct from the
+     *                           "setup is busy, retry" condition, deliberately distinct from the
      *                           semantically loaded 409 this endpoint reserves for
      *                           {@code DUPLICATE_SERVICE}; 500 when the lock query returns no row
      */
-    private void acquireBulkSetupLockWithTimeout(UUID masterId) {
+    private void acquireBulkSetupLockWithTimeout(UUID ownerId) {
         Integer lockResult;
         try {
-            lockResult = masterServiceRepository.acquireBulkSetupLockWithTimeout(masterId);
+            lockResult = masterServiceRepository.acquireBulkSetupLockWithTimeout(ownerId);
         } catch (PessimisticLockingFailureException ex) {
             // Never echo SQL state, the timeout value or the driver cause to the caller (§I/§N);
             // only the exception's simple class name, at DEBUG, for server-side triage.
@@ -449,7 +544,7 @@ public class ServiceCatalogService {
                 .toList();
 
         Map<UUID, ServiceType> typesById = serviceTypeRepository.findAllById(ids).stream()
-                .collect(java.util.stream.Collectors.toMap(ServiceType::getId, java.util.function.Function.identity()));
+                .collect(Collectors.toMap(ServiceType::getId, Function.identity()));
 
         for (UUID id : ids) {
             ServiceType type = typesById.get(id);
@@ -471,11 +566,11 @@ public class ServiceCatalogService {
      * returned as APPROVED + active triggers the same 400 as
      * {@link #validateCategoryActive(String)}.
      */
-    private void validateBulkCategoriesActive(java.util.Collection<ServiceType> types) {
+    private void validateBulkCategoriesActive(Collection<ServiceType> types) {
         Set<String> requested = types.stream()
                 .map(ServiceType::getPlatformCategoryName)
                 .filter(Objects::nonNull)
-                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+                .collect(Collectors.toCollection(LinkedHashSet::new));
 
         if (requested.isEmpty()) {
             return;
@@ -500,13 +595,44 @@ public class ServiceCatalogService {
      * would need a query lives in {@link #bulkCreateForMaster} so the per-item cost stays
      * O(0) queries — see {@link #assertNoActiveDuplicatesInBatch}. Nothing is flushed here;
      * the caller flushes the batch once.
+     *
+     * <p><b>Reuse branch (Phase 302 D2/D3).</b> When {@code reusable} is non-null the salon
+     * already has an ACTIVE definition for this service type, so ONLY the assignment is
+     * inserted — creating a second definition would violate V121's
+     * {@code ux_service_def_owner_service_type_active}. The reused definition is left
+     * byte-identical; the item's own price/duration land on the assignment as overrides when they
+     * differ from it, and as {@code NULL} when they match.
+     *
+     * <p>Only a REPRESENTABLE shape reaches here: {@code assertReusableShapesAreRepresentable} has
+     * already 400'd any item whose price type differs from the reused definition's, or whose RANGE
+     * ceiling differs from it — {@code master_services} can carry a floor and nothing else, so
+     * such an item could only be persisted as something other than what was submitted
+     * (re-audit MEDIUM-1). That is why this branch can return before {@code applyPriceMode}
+     * without losing information.
+     *
+     * @param reusable the salon's existing active definition for this service type, or
+     *                 {@code null} to create one (always {@code null} on the
+     *                 INDEPENDENT_MASTER branch)
      */
     private MasterServiceResponse createSingleFromBulkItem(
             Master master,
             OwnerType ownerType,
             UUID ownerId,
             BulkServiceItemRequest item,
-            ServiceType serviceType) {
+            ServiceType serviceType,
+            @Nullable ServiceDefinition reusable) {
+
+        if (reusable != null) {
+            MasterServiceAssignment reuseAssignment = MasterServiceAssignment.builder()
+                    .master(master)
+                    .serviceDefinition(reusable)
+                    .priceOverride(overridePriceFor(item, reusable))
+                    .durationOverrideMinutes(overrideDurationFor(item, reusable))
+                    .isActive(true)
+                    .build();
+
+            return MasterServiceResponse.from(masterServiceRepository.save(reuseAssignment));
+        }
 
         String category = serviceType.getPlatformCategoryName();
 
@@ -906,8 +1032,8 @@ public class ServiceCatalogService {
      * </ul>
      */
     private void applyPriceMode(ServiceDefinition definition, PriceType priceType,
-                                 java.math.BigDecimal price, java.math.BigDecimal priceMin,
-                                 java.math.BigDecimal priceMax) {
+                                 BigDecimal price, BigDecimal priceMin,
+                                 BigDecimal priceMax) {
         definition.setPriceType(priceType);
         if (priceType == PriceType.FIXED) {
             definition.setBasePrice(price);
@@ -1363,6 +1489,260 @@ public class ServiceCatalogService {
                         type != null ? type.getNameUk() : null, existingId);
             }
         }
+    }
+
+    /**
+     * Phase 302 D2/D4 — the SALON branch's whole read-then-write critical section, in ONE query
+     * for the whole batch: it both rejects a genuine per-master conflict (409) and returns the
+     * salon definitions the batch should reuse.
+     *
+     * <p><b>Why the SALON branch cannot use the owner-level guard.</b> Under D1 the owner is the
+     * salon, shared by every master in it. Asking "does the OWNER already offer this type" would
+     * reject the salon's second master from ever offering «Манікюр» — the exact opposite of the
+     * phase's goal. The salon already offering a type is the REUSE path; the only genuine
+     * conflict left is <em>this master</em> already performing it, whose backing invariant is
+     * {@code master_services}' {@code UNIQUE (master_id, service_def_id)}.
+     *
+     * <p><b>One round-trip, not three (audit LOW-3).</b> This previously ran a per-master
+     * assignment query, then an owner-level definition query, then a {@code findAllById} that
+     * merely re-fetched definitions the second query had already joined. Once the advisory lock
+     * became salon-keyed (audit HIGH-2) that serialized window is salon-wide, so three round-trips
+     * inside it multiply across every concurrent master setup in the salon.
+     * {@link ServiceRepository#findSalonBulkSetupCandidates} answers all three questions in one
+     * batched (never per-item) statement.
+     *
+     * <p><b>Salon-scoped (audit HIGH-1).</b> The deleted per-master finder matched on
+     * {@code master_id} alone, so a master ROTATED between salons — rotation moves
+     * {@code masters.salon_id} and never touches {@code master_services} — kept ACTIVE assignments
+     * to the SOURCE salon's definitions and was refused in the destination with a 409 disclosing a
+     * source-salon {@code existingServiceDefId}. Scoping lives in the query's owner predicate; its
+     * {@code INDEPENDENT_MASTER} arm keeps the ~60 legacy master-owned rows (phase 303 backfills
+     * them) firing as conflicts.
+     *
+     * @return type id → the salon's reusable ACTIVE definition; empty when the salon offers none
+     *         of the batch's types
+     * @throws DuplicateServiceException (409) naming the first item this master already offers
+     */
+    private Map<UUID, ServiceDefinition> resolveSalonBulkCandidates(
+            UUID masterId, UUID salonId,
+            List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
+
+        if (typesById.isEmpty()) {
+            return Map.of();
+        }
+
+        List<SalonBulkSetupCandidate> candidates = serviceRepository
+                .findSalonBulkSetupCandidates(salonId, masterId, typesById.keySet());
+
+        assertMasterDoesNotAlreadyOffer(candidates, items, typesById);
+        Map<UUID, ServiceDefinition> reusableByTypeId = reusableSalonDefinitions(candidates);
+        assertReusableShapesAreRepresentable(items, reusableByTypeId, typesById);
+        return reusableByTypeId;
+    }
+
+    /**
+     * Phase 302 D3 — rejects a reused item whose price SHAPE the assignment cannot carry, instead
+     * of silently reshaping it (phase-302 re-audit MEDIUM-1).
+     *
+     * <p><b>The gap this closes.</b> The reuse branch writes only a {@code price_override} — a
+     * FLOOR. {@code master_services} has no per-master ceiling column and no per-master price
+     * type, so an item whose shape disagrees with the reused definition used to be persisted as
+     * something the caller never submitted, and the endpoint answered {@code 201} with a body
+     * that did not match the request:
+     * <ul>
+     *   <li>{@code FIXED 500} definition + {@code RANGE 400–900} item → stored {@code FIXED 400},
+     *       the master's band discarded.</li>
+     *   <li>{@code RANGE 400–900} definition + {@code FIXED 600} item → rendered
+     *       {@code 600–900}, a public ceiling nobody set for this master.</li>
+     *   <li>{@code RANGE 400–900} definition + {@code RANGE 500–800} item → rendered
+     *       {@code 500–900}, the submitted ceiling 800 discarded.</li>
+     * </ul>
+     * D3 decided that price/duration <em>values</em> live on the overrides; it said nothing about
+     * shape, so this was undecided rather than an accepted trade-off. The divergence reached
+     * client-facing prices, so the endpoint refuses it.
+     *
+     * <p><b>Accepts everything representable</b>, so the guard cannot over-reject: FIXED against
+     * FIXED at ANY amount (the floor rides on {@code price_override}), and RANGE against RANGE
+     * whose ceiling matches (the floor rides on {@code price_override} exactly as before).
+     *
+     * <p>Rejecting is safe: the reuse branch is new in Phase 302 and has never shipped, so a 400
+     * here breaks no existing caller.
+     *
+     * <p>Pure in-memory — the definitions were already loaded by
+     * {@link ServiceRepository#findSalonBulkSetupCandidates} in this transaction, so the guard
+     * adds no round-trip inside the salon-wide serialized window. Reports the FIRST offending
+     * item in <em>request</em> order, for the same determinism reason as
+     * {@link #assertMasterDoesNotAlreadyOffer}.
+     *
+     * @throws ServicePriceShapeMismatchException (400) naming the salon's governing shape
+     */
+    private static void assertReusableShapesAreRepresentable(
+            List<BulkServiceItemRequest> items,
+            Map<UUID, ServiceDefinition> reusableByTypeId,
+            Map<UUID, ServiceType> typesById) {
+
+        if (reusableByTypeId.isEmpty()) {
+            return;
+        }
+
+        for (BulkServiceItemRequest item : items) {
+            ServiceDefinition reused = reusableByTypeId.get(item.serviceTypeId());
+            if (reused == null || isShapeRepresentableOnAssignment(item, reused)) {
+                continue;
+            }
+            ServiceType type = typesById.get(item.serviceTypeId());
+            throw new ServicePriceShapeMismatchException(
+                    type != null ? type.getNameUk() : null,
+                    reused.getId(),
+                    reused.getPriceType(),
+                    reused.getBasePrice(),
+                    reused.getPriceMax());
+        }
+    }
+
+    /**
+     * True iff {@code item}'s price shape survives the reuse write unchanged — i.e. everything the
+     * item declares beyond its floor is already what the reused definition says.
+     *
+     * <p>The ceiling is compared with {@code compareTo}, never {@code equals}: {@code 900} and
+     * {@code 900.00} are the same money and must not be read as a diverging band (the same rule
+     * {@link #overridePriceFor} applies to the floor).
+     */
+    private static boolean isShapeRepresentableOnAssignment(
+            BulkServiceItemRequest item, ServiceDefinition reused) {
+
+        if (item.priceType() != reused.getPriceType()) {
+            return false;
+        }
+        if (item.priceType() != PriceType.RANGE) {
+            // FIXED against FIXED: the amount IS the floor, and price_override carries it.
+            return true;
+        }
+        BigDecimal itemCeiling = item.priceMax();
+        BigDecimal salonCeiling = reused.getPriceMax();
+        return itemCeiling != null && salonCeiling != null
+                && itemCeiling.compareTo(salonCeiling) == 0;
+    }
+
+    /**
+     * Phase 302 D4 — the per-MASTER conflict half of {@link #resolveSalonBulkCandidates}.
+     *
+     * <p>Keyed on the SERVICE TYPE, not on the definition id: the client picks a type, and a
+     * master must not end up with two rows for the same type even if two owners held a definition
+     * for it. Checking {@code serviceDefId} instead would be satisfied by the assignment unique
+     * constraint alone and would not express this rule.
+     *
+     * <p>Reports the FIRST collision in <em>request</em> order — result order is unspecified, and
+     * blaming a later item for an earlier item's conflict would make the error non-deterministic
+     * across identical requests. The reported {@code existingServiceDefId} prefers the SALON-owned
+     * row when a legacy master-owned definition for the same type also exists: that is the row the
+     * caller is authorised for and can deep-link to.
+     *
+     * <p>Like every read-then-write guard here it is TOCTOU-prone; the assignment unique key is
+     * the actual guarantee, and the advisory lock this runs under makes ordinary contention
+     * produce this clean, item-naming 409 rather than a raced constraint violation.
+     *
+     * @throws DuplicateServiceException (409) naming the first item this master already offers
+     */
+    private static void assertMasterDoesNotAlreadyOffer(List<SalonBulkSetupCandidate> candidates,
+            List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
+
+        Map<UUID, UUID> conflictingDefIdByTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (!candidate.assignedToMaster()) {
+                continue;
+            }
+            boolean salonOwned = candidate.definition().getOwnerType() == OwnerType.SALON;
+            if (salonOwned || !conflictingDefIdByTypeId.containsKey(candidate.serviceTypeId())) {
+                conflictingDefIdByTypeId.put(
+                        candidate.serviceTypeId(), candidate.definition().getId());
+            }
+        }
+
+        for (BulkServiceItemRequest item : items) {
+            UUID existingId = conflictingDefIdByTypeId.get(item.serviceTypeId());
+            if (existingId != null) {
+                ServiceType type = typesById.get(item.serviceTypeId());
+                throw new DuplicateServiceException(
+                        type != null ? type.getNameUk() : null, existingId);
+            }
+        }
+    }
+
+    /**
+     * Phase 302 D2 — the REUSE half of {@link #resolveSalonBulkCandidates}: the salon's own ACTIVE
+     * definitions, keyed by service-type id, so {@link #createSingleFromBulkItem} can attach this
+     * master's assignment to them instead of minting a second definition V121 would refuse.
+     *
+     * <p>Only {@code ownerType = SALON} rows qualify. A legacy {@code INDEPENDENT_MASTER}-owned
+     * definition in the candidate set is a CONFLICT signal only (see
+     * {@link #assertMasterDoesNotAlreadyOffer}); reusing it would leave the salon's catalogue
+     * without the row the catalogue query requires. V121 admits at most one active SALON-owned
+     * definition per {@code (salonId, typeId)}, so at most one row can land per key.
+     *
+     * <p>The definitions arrive already hydrated from the candidate query — the assignment insert
+     * needs the managed entity, D3's override comparison needs its base price/duration, and the
+     * response DTO renders it. Their {@code serviceType} association resolves from the persistence
+     * context ({@code resolveBulkServiceTypes} loaded exactly these types in this transaction), so
+     * no N+1 follows.
+     */
+    private static Map<UUID, ServiceDefinition> reusableSalonDefinitions(
+            List<SalonBulkSetupCandidate> candidates) {
+
+        Map<UUID, ServiceDefinition> reusableByTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (candidate.definition().getOwnerType() == OwnerType.SALON) {
+                reusableByTypeId.put(candidate.serviceTypeId(), candidate.definition());
+            }
+        }
+        return reusableByTypeId;
+    }
+
+    /**
+     * Phase 302 D3 — the {@code master_services.price_override} for a reused definition: the batch
+     * item's own floor when it differs from the salon definition's {@code base_price}, else
+     * {@code null}.
+     *
+     * <p>The item's floor is its FIXED {@code price} or its RANGE {@code priceMin} — the same
+     * canonical floor {@link #applyPriceMode} writes to {@code base_price}, so the two sides of
+     * the comparison are the same quantity. Compared with {@code compareTo}, never
+     * {@code equals}: {@code 500} and {@code 500.00} are the same money and must not produce a
+     * spurious override row.
+     *
+     * <p>Only the floor is overridable — {@code master_services} has no per-master RANGE ceiling
+     * column, so a reusing master inherits the salon definition's band shape. Diverging the band
+     * itself is a salon-level edit, not a per-master one.
+     *
+     * <p><b>Never silently reshapes.</b> An item that would need more than a floor to be stored
+     * faithfully never reaches this method — {@code assertReusableShapesAreRepresentable} 400s it
+     * upstream (re-audit MEDIUM-1). So "the item's floor" here is always the whole of what the
+     * item added to the salon's shape, not a lossy projection of it.
+     */
+    @Nullable
+    private static BigDecimal overridePriceFor(
+            BulkServiceItemRequest item, ServiceDefinition reused) {
+
+        BigDecimal itemFloor =
+                item.priceType() == PriceType.FIXED ? item.price() : item.priceMin();
+        if (itemFloor == null) {
+            return null;
+        }
+        BigDecimal base = reused.getBasePrice();
+        return base != null && base.compareTo(itemFloor) == 0 ? null : itemFloor;
+    }
+
+    /**
+     * Phase 302 D3 — the {@code master_services.duration_override_minutes} for a reused
+     * definition: the batch item's duration when it differs from the salon definition's
+     * {@code base_duration_minutes}, else {@code null}.
+     */
+    @Nullable
+    private static Integer overrideDurationFor(BulkServiceItemRequest item, ServiceDefinition reused) {
+        Integer itemDuration = item.durationMinutes();
+        if (itemDuration == null || itemDuration == reused.getBaseDurationMinutes()) {
+            return null;
+        }
+        return itemDuration;
     }
 
     /**

@@ -157,6 +157,76 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             @Param("typeIds") Collection<UUID> typeIds);
 
     /**
+     * Phase 302 — the ONE query the salon-branch bulk-create critical section runs: every ACTIVE
+     * {@link ServiceDefinition} the batch's service types could collide with or reuse, each paired
+     * with the target master's ACTIVE assignment id (or {@code null} when they do not perform it).
+     *
+     * <p><b>Three round-trips collapsed into one (perf LOW-3).</b> The salon branch previously ran
+     * {@code MasterServiceRepository#findActiveAssignedServiceTypeIds} (the per-master conflict),
+     * then {@link #findActiveDuplicateTypeIds} (the salon's reusable definition ids), then
+     * {@code findAllById} to re-fetch definitions the second query had already joined. All three
+     * answers live in this one row shape. It matters because the advisory lock guarding this
+     * section is keyed on the SALON (audit HIGH-2): the serialized window is salon-wide, so every
+     * extra round-trip inside it multiplies across every concurrent master setup in the salon.
+     *
+     * <p>Batched over {@code typeIds}, never per item. The bulk endpoint accepts up to 100 items,
+     * and the cost of a per-item {@code exists} is <b>100 serialized round-trips held inside the
+     * advisory lock</b> — that, not a flush interaction, is the argument (audit INFO-7 corrected an
+     * earlier comment here that blamed a Hibernate AUTO flush defeating JDBC insert batching: this
+     * guard runs strictly BEFORE any {@code save()}, so nothing is pending to flush).
+     *
+     * <p><b>Salon-scoped, and that scoping is the security fix (audit HIGH-1).</b> The deleted
+     * per-master finder filtered on {@code master_id} ALONE. {@code MasterService.rotateMasterToSalon}
+     * moves {@code masters.salon_id} and never touches {@code master_services}, so a rotated master
+     * keeps ACTIVE assignments to the SOURCE salon's SALON-owned definitions — the "rotated-master
+     * leak" {@code SalonSearchSql} names and every other read query here compensates for. Unscoped,
+     * the destination salon's first bulk-create for such a type answered
+     * {@code 409 DUPLICATE_SERVICE} carrying a SOURCE-salon {@code existingServiceDefId}: a wrong
+     * answer AND a cross-tenant id disclosed to an actor authorised only for the destination. The
+     * owner predicate below is what confines both the conflict and the reuse to definitions this
+     * salon can legitimately be in conflict with.
+     *
+     * <p>The {@code INDEPENDENT_MASTER}/{@code :masterId} arm is deliberate, not incidental: ~60
+     * pre-Phase-302 rows are still master-owned (phase 303 backfills them), and a master who
+     * already performs a type through one of those must keep getting the clean, item-naming 409
+     * rather than a raced V121 violation. Such a row is a CONFLICT, never a reuse candidate — the
+     * caller reuses only {@code ownerType = SALON} rows, since an insert here writes
+     * {@code (SALON, salonId)}.
+     *
+     * <p>The join is {@code LEFT} so a definition the salon offers but this master does not perform
+     * still comes back — that is precisely the reuse row. It cannot multiply rows:
+     * {@code master_services} is {@code UNIQUE (master_id, service_def_id)}, so at most one
+     * assignment matches per definition. Bounded by construction (§E-3) — {@code typeIds} is the
+     * caller's own validated, deduplicated request set, and at most two owners can answer for a
+     * type.
+     *
+     * <p>Read-then-write like every guard on this path (§E-4 — unscoped by role, the caller must
+     * already hold write access to both salon and master): the partial unique index
+     * {@code ux_service_def_owner_service_type_active} and {@code master_services}' unique key stay
+     * the actual guarantees; the salon-keyed advisory lock is what turns ordinary contention into
+     * the clean 409 instead of a constraint violation.
+     */
+    @Query("""
+            SELECT new com.beautica.service.repository.SalonBulkSetupCandidate(
+                       sd.serviceType.id, sd, msa.id)
+            FROM ServiceDefinition sd
+            LEFT JOIN MasterServiceAssignment msa
+                   ON msa.serviceDefinition = sd
+                  AND msa.master.id = :masterId
+                  AND msa.isActive = true
+            WHERE sd.isActive = true
+              AND sd.serviceType.id IN :typeIds
+              AND ((sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+                        AND sd.ownerId = :salonId)
+                OR (sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
+                        AND sd.ownerId = :masterId))
+            """)
+    List<SalonBulkSetupCandidate> findSalonBulkSetupCandidates(
+            @Param("salonId") UUID salonId,
+            @Param("masterId") UUID masterId,
+            @Param("typeIds") Collection<UUID> typeIds);
+
+    /**
      * Resolves the owning salon id for a SALON-owned definition (its {@code ownerId} IS the salon id),
      * or empty for a master-owned (INDEPENDENT_MASTER) definition or an unknown id. Used by
      * {@code ServiceCatalogService.deactivateServiceDefinition} to evict the affected salon's

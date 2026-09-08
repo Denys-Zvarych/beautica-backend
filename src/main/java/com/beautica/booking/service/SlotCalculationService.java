@@ -868,6 +868,21 @@ public class SlotCalculationService {
      * so the catalogue does O(distinct masters) heavy loads, not O(services × masters). Not cached (the
      * per-service {@link #hasBookableFutureSlot} cache backs the hot master-list path; the catalogue is
      * the batched path). The verdict is identical to {@link #hasBookableFutureSlot} for the same window.
+     *
+     * <p><b>Memoised by effective DURATION (phase-302 audit LOW-4).</b> {@code days},
+     * {@code occupiedByDay} and {@code cutoff} are already loop-invariant, so
+     * {@link #hasFreeFutureSlot}'s verdict is a pure function of {@link #effectiveDuration} —
+     * nothing else about the assignment reaches it. The walk is up to
+     * {@code BookingWindow.MAX_DAYS_AHEAD + 1} = 181 days of slot subtraction, and Phase 302 widened
+     * this method's candidate set from "masters assigned to owner-created salon definitions" to every
+     * active salon master's WHOLE menu — a 10-master salon with 20-service menus is 200 evaluations
+     * per catalogue cache miss. The invariant the memo buys is exactly one walk per DISTINCT
+     * effective duration in the master's menu, however many services share it. No collapse ratio
+     * is claimed here: the only data available to measure one is synthetic local seed data, which
+     * neither supports nor refutes a figure. The memo needs no such claim — its worst case is one
+     * walk per assignment, identical to the un-memoised loop, so it is a strict improvement at any
+     * ratio. {@code Duration} is a value type with proper {@code equals}/{@code hashCode}, and the
+     * map is request-local — no staleness window.
      */
     @Transactional(readOnly = true)
     public List<MasterServiceAssignment> filterBookableAssignments(
@@ -880,9 +895,11 @@ public class SlotCalculationService {
         List<EffectiveDayResponse> days = masterScheduleService.resolveEffectiveRange(masterId, from, to);
         Map<LocalDate, List<TimeRange>> occupiedByDay = loadOccupiedByDay(masterId, from, to);
         Instant cutoff = bookableCutoff();
+        Map<Duration, Boolean> verdictByDuration = new HashMap<>();
         List<MasterServiceAssignment> bookable = new ArrayList<>();
         for (MasterServiceAssignment msa : assignments) {
-            if (hasFreeFutureSlot(days, effectiveDuration(msa), occupiedByDay, cutoff)) {
+            if (verdictByDuration.computeIfAbsent(effectiveDuration(msa),
+                    duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff))) {
                 bookable.add(msa);
             }
         }

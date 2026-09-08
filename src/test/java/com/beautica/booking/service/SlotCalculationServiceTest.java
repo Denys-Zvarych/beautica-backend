@@ -1630,6 +1630,113 @@ class SlotCalculationServiceTest {
         }
     }
 
+    // ── filterBookableAssignments — the batched catalogue gate, exercised DIRECTLY ────────────
+    //
+    // Phase-302 re-audit LOW-3: every other reference to this method across src/test is a Mockito
+    // STUB, so nothing invoked the real body. That made the HashMap<Duration,Boolean> memoisation
+    // added last round unpinned: it is provably neutral TODAY only because hasFreeFutureSlot's
+    // verdict is a pure function of effectiveDuration, and nothing asserted that. A future edit
+    // giving hasFreeFutureSlot or effectiveDuration a per-assignment dependency beyond Duration
+    // would make the memo serve a WRONG bookability verdict — advertising an unbookable service
+    // in the salon catalogue — while every suite stayed green.
+
+    /** The whole booking horizon the method computes internally: today(Kyiv) … today + 180. */
+    private static final LocalDate FILTER_TODAY = LocalDate.of(2026, 5, 7);
+    private static final LocalDate FILTER_HORIZON = FILTER_TODAY.plusDays(180);
+
+    /**
+     * Active assignment carrying a per-master {@code durationOverrideMinutes}, the OTHER route to
+     * an effective duration ({@link SlotCalculationService#effectiveDuration} prefers it over the
+     * definition's {@code baseDurationMinutes}).
+     */
+    private static MasterServiceAssignment overriddenAssignment(
+            UUID masterId, int baseMinutes, int overrideMinutes, int bufferMinutes) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(baseMinutes)
+                .bufferMinutesAfter(bufferMinutes)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .serviceDefinition(sd)
+                .master(master)
+                .durationOverrideMinutes(overrideMinutes)
+                .isActive(true)
+                .build();
+    }
+
+    /**
+     * One working day, no bookings, and a calculator that answers the REAL question — does this
+     * duration fit the window — so the filter's verdict is driven by duration and nothing else.
+     */
+    private void stubFilterEnvironment(UUID masterId, LocalDate workingDay, long fittingMinutes) {
+        when(masterScheduleService.resolveEffectiveRange(masterId, FILTER_TODAY, FILTER_HORIZON))
+                .thenReturn(List.of(templateDay(workingDay, LocalTime.of(9, 0), LocalTime.of(17, 0))));
+        when(bookingRepository.findActiveTimeRangesByMasterInRange(eq(masterId), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenAnswer(inv -> ((Duration) inv.getArgument(3)).toMinutes() <= fittingMinutes);
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignments drops the assignment whose duration finds no slot and keeps the one that fits")
+    void should_dropOnlyTheUnbookableDuration_when_filteringAssignments() {
+        UUID masterId = UUID.randomUUID();
+        MasterServiceAssignment fits = activeAssignment(masterId, 30, 0);
+        MasterServiceAssignment tooLong = activeAssignment(masterId, 300, 0);
+        // The day is 9:00–17:00, so 30 minutes fits and 300 does not.
+        stubFilterEnvironment(masterId, FILTER_TODAY.plusDays(1), 120);
+
+        List<MasterServiceAssignment> bookable =
+                slotCalculationService.filterBookableAssignments(masterId, List.of(tooLong, fits));
+
+        assertThat(bookable)
+                .as("only the assignment whose effective duration fits the day survives the gate, "
+                        + "and the survivor keeps the caller's ordering")
+                .containsExactly(fits);
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignments gives the SAME verdict to two assignments reaching one effective duration by different routes")
+    void should_giveSameVerdict_when_twoAssignmentsShareAnEffectiveDurationByDifferentRoutes() {
+        UUID masterId = UUID.randomUUID();
+        // 60 minutes via a per-master override on a 15-minute definition…
+        MasterServiceAssignment viaOverride = overriddenAssignment(masterId, 15, 60, 0);
+        // …and 60 minutes via the definition's own base duration, no override.
+        MasterServiceAssignment viaBaseDuration = activeAssignment(masterId, 60, 0);
+        stubFilterEnvironment(masterId, FILTER_TODAY.plusDays(1), 120);
+
+        List<MasterServiceAssignment> bookable = slotCalculationService
+                .filterBookableAssignments(masterId, List.of(viaOverride, viaBaseDuration));
+
+        assertThat(bookable)
+                .as("the memo keys on Duration alone, so the two routes to 60 minutes MUST agree — "
+                        + "a per-assignment dependency sneaking into effectiveDuration or "
+                        + "hasFreeFutureSlot would make one of these verdicts a lie")
+                .containsExactly(viaOverride, viaBaseDuration);
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator, org.mockito.Mockito.times(1))
+                .hasAvailableSlot(any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue())
+                .as("ONE walk per distinct effective duration — the memoisation invariant itself")
+                .isEqualTo(Duration.ofMinutes(60));
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignments short-circuits on an empty candidate list without touching the schedule or bookings")
+    void should_returnEmptyWithoutLoading_when_noCandidateAssignments() {
+        UUID masterId = UUID.randomUUID();
+
+        List<MasterServiceAssignment> bookable =
+                slotCalculationService.filterBookableAssignments(masterId, List.of());
+
+        assertThat(bookable).isEmpty();
+        verifyNoInteractions(masterScheduleService, bookingRepository, timeSlotCalculator);
+    }
+
     /** Active assignment with a caller-chosen id, so multiple chained ids can be stubbed distinctly. */
     private static MasterServiceAssignment assignment(
             UUID masterId, UUID serviceId, int baseMinutes, int bufferMinutes) {
