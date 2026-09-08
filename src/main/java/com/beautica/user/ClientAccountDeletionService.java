@@ -16,6 +16,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.service.MediaService;
+import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -85,6 +86,7 @@ public class ClientAccountDeletionService {
     private final BookingRepository bookingRepository;
     private final AppointmentRepository appointmentRepository;
     private final BookingService bookingService;
+    private final NotificationOutboxRepository notificationOutboxRepository;
     private final ClientReviewRepository clientReviewRepository;
     private final MediaRepository mediaRepository;
     private final MediaService mediaService;
@@ -157,7 +159,17 @@ public class ClientAccountDeletionService {
 
         // Step 5 — physically delete the now-CANCELLED future booking rows. D4: a future booking
         // is cancelled THEN deleted, never detached — there is no "future receipt" to preserve.
+        //
+        // The cancelBooking loop above (step 4) enqueued one STATUS_CHANGED notification_outbox row
+        // per booking (BookingService#cancelBooking -> outboxService.enqueueStatusChanged). That
+        // row's aggregate_id is a raw UUID with NO FK to bookings (V32) — nothing at the DB level
+        // stops us deleting the very booking it points at. Left alone, the drain worker would claim
+        // the orphaned row, fail to re-hydrate the booking, throw IllegalStateException, and
+        // dead-letter it on every self-delete that cancels a future booking. So the just-enqueued
+        // outbox rows for these ids are removed HERE, in the same transaction, immediately before
+        // the booking rows themselves go — do not read this as redundant cleanup.
         if (!futureBookingIds.isEmpty()) {
+            notificationOutboxRepository.deleteByAggregateIdIn(futureBookingIds);
             bookingRepository.deleteAllByIdInBatch(futureBookingIds);
         }
 

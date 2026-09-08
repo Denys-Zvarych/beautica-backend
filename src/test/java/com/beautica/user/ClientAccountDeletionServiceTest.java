@@ -15,6 +15,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.service.MediaService;
+import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -72,6 +73,9 @@ class ClientAccountDeletionServiceTest {
 
     @Mock
     private BookingService bookingService;
+
+    @Mock
+    private NotificationOutboxRepository notificationOutboxRepository;
 
     @Mock
     private ClientReviewRepository clientReviewRepository;
@@ -134,6 +138,10 @@ class ClientAccountDeletionServiceTest {
         // the salon/master bulk-decline seam — then physically deleted.
         verify(bookingService).cancelBooking(eq(clientId), eq(futureBookingId1), any(CancelBookingRequest.class));
         verify(bookingService).cancelBooking(eq(clientId), eq(futureBookingId2), any(CancelBookingRequest.class));
+        // The STATUS_CHANGED outbox rows cancelBooking just enqueued for these bookings MUST be
+        // deleted before the bookings themselves — aggregate_id carries no FK, so leaving them
+        // would orphan the row and dead-letter it in the drain worker.
+        verify(notificationOutboxRepository).deleteByAggregateIdIn(futureBookingIds);
         verify(bookingRepository).deleteAllByIdInBatch(futureBookingIds);
 
         // Appointment headers: childless one is physically deleted, the surviving one is detached.
@@ -222,6 +230,8 @@ class ClientAccountDeletionServiceTest {
         // appointment_id IN () is wasted work the empty-collection guard must skip entirely.
         verify(bookingRepository, never()).findAppointmentIdsWithSurvivingBookings(any());
         verify(appointmentRepository, never()).deleteAllByIdInBatch(any());
+        // No future bookings — the outbox cleanup's own empty-collection guard must also skip.
+        verify(notificationOutboxRepository, never()).deleteByAggregateIdIn(any());
     }
 
     @Test
@@ -248,7 +258,7 @@ class ClientAccountDeletionServiceTest {
         verify(bookingService, never()).cancelBooking(any(), any(), any());
         verify(bookingRepository, never()).deleteAllByIdInBatch(any());
         verify(userRepository, never()).deleteAllByIdInBatch(any());
-        verifyNoInteractions(appointmentRepository, clientReviewRepository, mediaService);
+        verifyNoInteractions(appointmentRepository, clientReviewRepository, mediaService, notificationOutboxRepository);
     }
 
     @Test
@@ -271,6 +281,7 @@ class ClientAccountDeletionServiceTest {
         service.deleteOwnAccount(clientId, "token");
 
         verify(bookingService, times(exactlyAtCap.size())).cancelBooking(eq(clientId), any(), any());
+        verify(notificationOutboxRepository).deleteByAggregateIdIn(exactlyAtCap);
         verify(bookingRepository).deleteAllByIdInBatch(exactlyAtCap);
         verify(userRepository).deleteAllByIdInBatch(List.of(clientId));
     }
@@ -315,7 +326,8 @@ class ClientAccountDeletionServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verifyNoInteractions(bookingService, appointmentRepository, clientReviewRepository,
-                mediaService, authService, tokensValidAfterCache, userProfileCacheEvictor);
+                mediaService, authService, tokensValidAfterCache, userProfileCacheEvictor,
+                notificationOutboxRepository);
         verify(bookingRepository, never()).deleteAllByIdInBatch(any());
         verify(userRepository, never()).deleteAllByIdInBatch(any());
     }
