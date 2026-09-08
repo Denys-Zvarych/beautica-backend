@@ -1709,7 +1709,12 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * client account to lock or conflict-check against), and by
      * {@code ScheduleOverrideConflictService#applyOverrideWithConflictHandling} (the
      * schedule-override write is master-scoped only — it never takes a client lock at all,
-     * regardless of whether the conflicting bookings it may decline are guest or registered-client).
+     * regardless of whether the conflicting bookings it may decline are guest or registered-client);
+     * and, as of the 2026-09 audit (security LOW), by {@code
+     * BookingService#declineFutureConfirmedBookingsForMasterRemoval} and {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete} — both provider-removal/self-delete
+     * cascades that scan and dispose of a master's future bookings without ever taking a client
+     * lock, and previously took no lock at all.
      * Sets this transaction's {@code lock_timeout}
      * to 3s via {@code set_config('lock_timeout', '3s', true)} (transaction-scoped, equivalent
      * to {@code SET LOCAL}) AND acquires the salt-{@code 0} advisory lock in the SAME

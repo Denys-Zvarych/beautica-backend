@@ -122,6 +122,19 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsByIdAndSalonId(UUID id, UUID salonId);
 
     /**
+     * Ownership self-assertion for the {@code SALON_MASTER}/{@code INDEPENDENT_MASTER} account
+     * self-deletion booking cascade (Phase 301 Q3) — mirrors {@link #existsByIdAndSalonId}'s
+     * pattern (used at {@code BookingService.java:1559} by the master-removal cascade), just keyed
+     * by the acting USER rather than by the salon owner. {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete} calls this to prove {@code
+     * masterId} actually belongs to the deleting caller before bulk-declining any of their
+     * bookings — the caller cannot lean on role-based authorization here, since {@code
+     * SALON_MASTER} is rejected by every existing booking-mutation seam's fast path (§1 of the
+     * phase 301 plan).
+     */
+    boolean existsByIdAndUserId(UUID id, UUID userId);
+
+    /**
      * Returns {@code true} if a master with the given {@code id} belongs to any of the
      * provided {@code salonIds}. Collapses the N-query ownership loop into a single
      * {@code WHERE id = ? AND salon_id IN (...)} existence check.

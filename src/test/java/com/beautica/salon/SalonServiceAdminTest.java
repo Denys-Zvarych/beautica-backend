@@ -93,6 +93,12 @@ class SalonServiceAdminTest {
     @Mock
     private com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
 
+    // Phase 301: SalonService now constructor-depends on the promoted staff-account
+    // hard-delete seam. None of these tests exercise a path that dereferences it, so a plain
+    // mock satisfies the constructor without any stubbing.
+    @Mock
+    private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
+
     @InjectMocks
     private SalonService salonService;
 

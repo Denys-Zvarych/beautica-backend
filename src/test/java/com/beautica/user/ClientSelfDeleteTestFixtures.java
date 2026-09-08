@@ -102,12 +102,88 @@ public class ClientSelfDeleteTestFixtures {
         return new Salon(ownerId, salonId, masterUserId, masterId, serviceDefId, masterServiceId);
     }
 
+    public record SecondMaster(UUID masterUserId, UUID masterId, UUID masterServiceId) {
+    }
+
+    /**
+     * A SECOND {@code SALON_MASTER} + {@code master_services} row in the SAME {@code salon} —
+     * needed to build a multi-service-visit {@code appointments} header whose legs belong to TWO
+     * different masters, so a self-deleting master's booking-disposal cascade can be proven to
+     * collapse the header only when it becomes fully childless, never when a sibling master's leg
+     * survives.
+     */
+    public SecondMaster addSecondMaster(Salon salon) {
+        UUID masterUserId = createUser(
+                "csd-master2-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salon.salonId(),
+                "Другий", "Майстер");
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                masterId, masterUserId, salon.salonId());
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, salon.serviceDefId());
+        return new SecondMaster(masterUserId, masterId, masterServiceId);
+    }
+
+    /**
+     * A {@code SALON_ADMIN} in {@code salon} — deliberately NO {@code masters} row (Phase 301 D3):
+     * an admin has no calendar of their own, so the self-delete booking cascade must never be
+     * reached for this role.
+     */
+    public UUID createSalonAdmin(Salon salon) {
+        return createUser("csd-admin-" + System.nanoTime() + "@beautica.test", "SALON_ADMIN",
+                salon.salonId(), "Тест", "Адмін");
+    }
+
+    public boolean masterIsActive(UUID masterId) {
+        Boolean active = jdbcTemplate.queryForObject(
+                "SELECT is_active FROM masters WHERE id = ?", Boolean.class, masterId);
+        return active != null && active;
+    }
+
+    public UUID masterUserId(UUID masterId) {
+        return jdbcTemplate.queryForObject("SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+    }
+
+    public String masterDetachedFirstName(UUID masterId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT detached_first_name FROM masters WHERE id = ?", String.class, masterId);
+    }
+
+    public OffsetDateTime masterDetachedAt(UUID masterId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT detached_at FROM masters WHERE id = ?", OffsetDateTime.class, masterId);
+    }
+
+    public boolean masterExists(UUID masterId) {
+        return count("SELECT COUNT(*) FROM masters WHERE id = ?", masterId) == 1;
+    }
+
     public UUID insertBooking(UUID clientId, Salon salon, String status, OffsetDateTime startsAt) {
         return insertBooking(clientId, salon, status, startsAt, null);
     }
 
     public UUID insertBooking(UUID clientId, Salon salon, String status, OffsetDateTime startsAt,
                                UUID appointmentId) {
+        return insertBooking(clientId, salon.masterId(), salon.masterServiceId(), salon.salonId(),
+                status, startsAt, appointmentId);
+    }
+
+    /**
+     * {@code Salon}-record-free overload for an {@code INDEPENDENT_MASTER}'s own booking (Phase
+     * 301 — no salon above this role, {@code salonId} is legitimately {@code null}).
+     */
+    public UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId,
+                               String status, OffsetDateTime startsAt) {
+        return insertBooking(clientId, masterId, masterServiceId, salonId, status, startsAt, null);
+    }
+
+    public UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId,
+                               String status, OffsetDateTime startsAt, UUID appointmentId) {
         UUID bookingId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO bookings (id, client_id, master_id, master_service_id, salon_id, "
@@ -115,7 +191,7 @@ public class ClientSelfDeleteTestFixtures {
                         + "duration_minutes_at_booking, buffer_minutes_at_booking, booking_source, "
                         + "created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 500.00, 60, 0, 'APP', NOW(), NOW())",
-                bookingId, clientId, salon.masterId(), salon.masterServiceId(), salon.salonId(),
+                bookingId, clientId, masterId, masterServiceId, salonId,
                 appointmentId, status, startsAt, startsAt.plusMinutes(60));
         return bookingId;
     }

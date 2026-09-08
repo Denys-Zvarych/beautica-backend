@@ -36,7 +36,6 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -101,12 +100,18 @@ class SalonServiceRemoveAdminTest {
     @Mock
     private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
 
+    // Phase 301: SalonService now constructor-depends on the promoted staff-account
+    // hard-delete seam. None of these tests exercise a path that dereferences it, so a plain
+    // mock satisfies the constructor without any stubbing.
+    @Mock
+    private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
+
     @InjectMocks
     private SalonService salonService;
 
     @Test
-    @DisplayName("Phase 299: hard-deletes the admin's account via the shared disposeStaffAccounts "
-            + "seam once the client-reference audit is CLEAN and the admin owns no masters row")
+    @DisplayName("Phase 299/301: delegates the admin's hard-delete to the shared "
+            + "StaffAccountDisposalService seam once the client-reference audit is CLEAN")
     void should_hardDeleteAdminAccount_when_removalIsValidAndAuditIsClean() {
         UUID ownerId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
@@ -116,25 +121,15 @@ class SalonServiceRemoveAdminTest {
         when(userRepository.findById(adminId)).thenReturn(Optional.of(admin));
         when(staffClientReferenceAuditService.runAuditForStaffUserIds(List.of(adminId)))
                 .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.EPOCH));
-        // Phase 299 D1 finding: a plain admin has NO masters row, so the shared seam's
-        // findAllByUserIdInWithUser lookup resolves to an empty list for them — this is the exact
-        // path AdminRemovalHardDeleteIT and SalonStaffHardDeleteIT case 5b already pin.
-        when(masterRepository.findAllByUserIdInWithUser(List.of(adminId))).thenReturn(List.of());
-        lenient().when(clock.instant()).thenReturn(Instant.EPOCH);
 
         salonService.removeAdmin(ownerId, salonId, adminId);
 
-        verify(inviteTokenRepository).deleteBySalonIdAndStaffUserIds(salonId, List.of(adminId));
-        // The afterCommit-vs-immediate fallback branch was promoted verbatim from a private
-        // SalonService method into TokensValidAfterCache.invalidateAfterCommit(UUID) — assert on
-        // that seam, not the mock's internal invalidate(...), which the promoted seam now owns.
-        verify(tokensValidAfterCache).invalidateAfterCommit(adminId);
-        verify(userProfileCacheEvictor).evictAfterCommit(adminId);
-        verify(userRepository).deleteAllByIdInBatch(List.of(adminId));
-        // No masters row existed to detach or delete — findIdsWithHistoricalReferences is only
-        // reachable once staffMasters is non-empty.
-        verify(masterRepository, never()).findIdsWithHistoricalReferences(any());
-        verify(masterRepository, never()).delete(any());
+        // Phase 301: the detach-or-delete/invite-token/cache-eviction/hard-delete mechanics were
+        // promoted out of SalonService into StaffAccountDisposalService#dispose — pinned by
+        // com.beautica.salon.StaffAccountDisposalServiceTest (backend-qa follow-up) — this test
+        // only pins that removeAdmin delegates to it with the right arguments, never a parallel
+        // implementation.
+        verify(staffAccountDisposalService).dispose(ownerId, salonId, List.of(adminId));
     }
 
     @Test
@@ -159,7 +154,8 @@ class SalonServiceRemoveAdminTest {
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
 
-        verifyNoInteractions(inviteTokenRepository, tokensValidAfterCache, userProfileCacheEvictor);
+        verifyNoInteractions(inviteTokenRepository, tokensValidAfterCache, userProfileCacheEvictor,
+                staffAccountDisposalService);
         verify(userRepository, never()).deleteAllByIdInBatch(any());
     }
 
@@ -175,7 +171,7 @@ class SalonServiceRemoveAdminTest {
         assertThatThrownBy(() -> salonService.removeAdmin(ownerId, salonId, missingUserId))
                 .isInstanceOf(NotFoundException.class);
 
-        verifyNoInteractions(staffClientReferenceAuditService, inviteTokenRepository);
+        verifyNoInteractions(staffClientReferenceAuditService, inviteTokenRepository, staffAccountDisposalService);
     }
 
     @Test
@@ -191,7 +187,7 @@ class SalonServiceRemoveAdminTest {
         assertThatThrownBy(() -> salonService.removeAdmin(ownerId, salonId, targetId))
                 .isInstanceOf(ForbiddenException.class);
 
-        verifyNoInteractions(staffClientReferenceAuditService, inviteTokenRepository);
+        verifyNoInteractions(staffClientReferenceAuditService, inviteTokenRepository, staffAccountDisposalService);
     }
 
     @Test
@@ -208,7 +204,7 @@ class SalonServiceRemoveAdminTest {
         assertThatThrownBy(() -> salonService.removeAdmin(ownerId, salonId, adminId))
                 .isInstanceOf(ForbiddenException.class);
 
-        verifyNoInteractions(staffClientReferenceAuditService, inviteTokenRepository);
+        verifyNoInteractions(staffClientReferenceAuditService, inviteTokenRepository, staffAccountDisposalService);
     }
 
     @Test
@@ -221,7 +217,7 @@ class SalonServiceRemoveAdminTest {
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessage("Cannot remove yourself — ask another admin or the owner");
 
-        verifyNoInteractions(userRepository, staffClientReferenceAuditService, inviteTokenRepository);
+        verifyNoInteractions(userRepository, staffClientReferenceAuditService, inviteTokenRepository, staffAccountDisposalService);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

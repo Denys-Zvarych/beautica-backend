@@ -39,6 +39,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.notification.entity.OutboxEventType;
+import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -99,6 +100,7 @@ public class BookingService {
     private final SalonRepository salonRepository;
     private final AuthorizationService authz;
     private final NotificationOutboxService outboxService;
+    private final NotificationOutboxRepository notificationOutboxRepository;
     private final SlotCalculationService slotCalculationService;
     private final ReviewRepository reviewRepository;
     private final ClientReviewRepository clientReviewRepository;
@@ -1543,6 +1545,20 @@ public class BookingService {
      * SalonService#removeMaster}'s own re-check runs against the loaded {@code Master} row, not
      * against this method's caller-supplied ids.
      *
+     * <p><b>Per-master advisory lock (security LOW, 2026-09 audit).</b> Takes the same salt-0
+     * {@link BookingRepository#acquireAdvisoryLockWithTimeout} lock {@code doCreateBooking}/{@code
+     * rescheduleBooking} take before confirming a booking, BEFORE the future-booking scan below,
+     * closing a race where a client's concurrent booking request commits a new {@code CONFIRMED}
+     * booking for {@code masterId} after this method's scan but before {@code removeMaster}
+     * routes the master to DELETE/DETACH — previously that booking survived untouched, leaving a
+     * client with a live appointment with a removed master. Newly observable behaviour: a
+     * concurrent create/reschedule contending for the same master now blocks on this lock for up
+     * to its own 3s {@code lock_timeout} and can surface as a {@code 409} (never previously
+     * possible on this path, since it took no lock at all) instead of always succeeding; a caller
+     * still holding the lock past that window (there is none on this path — the scan below is the
+     * very next statement) would itself see a {@code 409} converted from {@code
+     * CannotAcquireLockException}, never a 500.
+     *
      * @param actorUserId the removing {@code SALON_OWNER}'s id — the provider-authority actor for
      *                     every decline this method performs
      * @param salonId     the salon the master is being removed from
@@ -1557,6 +1573,19 @@ public class BookingService {
         }
         if (!masterRepository.existsByIdAndSalonId(masterId, salonId)) {
             throw new ForbiddenException("Access denied");
+        }
+
+        // Per-master advisory lock (security LOW, 2026-09 audit) — the SAME salt-0 lock
+        // doCreateBooking/rescheduleBooking take before confirming a booking. Taken BEFORE the
+        // future-booking scan below and held for the rest of this transaction (a Postgres
+        // advisory xact lock releases only at commit/rollback): any concurrent create/reschedule
+        // for this master now blocks on this lock (and gets a clean 409 via the fused 3s
+        // lock_timeout, translated by GlobalExceptionHandler) instead of being able to commit a
+        // new CONFIRMED booking for a master mid-removal, which the scan below would never see.
+        // Fused single-round-trip form: this cascade never takes a client lock first.
+        Integer lockResult = bookingRepository.acquireAdvisoryLockWithTimeout(masterId);
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
 
         OffsetDateTime now = resolveNow();
@@ -1596,6 +1625,201 @@ public class BookingService {
                         .thenComparing(SalonClosureBookingCandidate::bookingId))
                 .map(SalonClosureBookingCandidate::bookingId)
                 .toList();
+    }
+
+    // ── SALON_MASTER / INDEPENDENT_MASTER account self-deletion booking cascade (Phase 301 Q3) ──
+
+    /**
+     * Per-master advisory lock seam for {@code StaffAccountSelfDeletionService} (residual-race
+     * fix, 2026-09 re-audit). Takes the SAME salt-0 {@link
+     * BookingRepository#acquireAdvisoryLockWithTimeout} lock {@link
+     * #disposeFutureConfirmedForMasterSelfDelete} used to take itself, but MUST now be called
+     * BEFORE {@link #findFutureConfirmedBookingIdsForMaster} — not after it — and held across
+     * that read, the caller's own cap check, and the eventual write.
+     *
+     * <p><b>Why the lock had to move.</b> {@code StaffAccountSelfDeletionService#deleteOwnAccount}
+     * reads the fixed {@code bookingIds} list via {@link #findFutureConfirmedBookingIdsForMaster}
+     * BEFORE calling {@link #disposeFutureConfirmedForMasterSelfDelete}. A booking that committed
+     * for this master in the gap between that read and the (formerly later) lock acquisition was
+     * never in {@code bookingIds} — the write seam's internal re-scan only maps appointment ids
+     * for the already-fixed list, it never grows the list itself — so that booking survived the
+     * cascade untouched. Acquiring the lock here, first, closes that gap: any concurrent
+     * create/reschedule for {@code masterId} now blocks on this call (clean {@code 409} via the
+     * fused 3s {@code lock_timeout}, translated by {@code GlobalExceptionHandler}) instead of
+     * being able to commit a new {@code CONFIRMED} booking the read below would never see.
+     *
+     * <p>{@link #disposeFutureConfirmedForMasterSelfDelete} no longer acquires this lock itself —
+     * it now documents the precondition instead (see its own javadoc) — so there is exactly one
+     * acquisition per self-delete, not a redundant re-entrant second one.
+     *
+     * @param masterId the departing master's own {@code masters.id}
+     * @throws BusinessException ({@code 500}) the lock could not be acquired at all (mirrors every
+     *                            other {@code acquireAdvisoryLockWithTimeout} call site); a
+     *                            contended lock surfaces as {@code CannotAcquireLockException} →
+     *                            {@code 409} instead, via {@code GlobalExceptionHandler}
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void acquireMasterLockForSelfDelete(UUID masterId) {
+        Integer lockResult = bookingRepository.acquireAdvisoryLockWithTimeout(masterId);
+        if (lockResult == null) {
+            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
+        }
+    }
+
+    /**
+     * Read seam for {@code StaffAccountSelfDeletionService}: every {@code CONFIRMED} booking of
+     * {@code masterId} whose {@code startsAt} is strictly after now, as bare ids ordered by
+     * {@code startsAt} then {@code bookingId} — the exact mirror of {@link
+     * #findFutureConfirmedBookingIdsForClient(UUID)}, including its deterministic tie-break, but
+     * scoped by MASTER rather than by client. Backed by the EXISTING {@link
+     * BookingRepository#findConfirmedFutureByMasterId} — no new query.
+     *
+     * <p>Deliberately NOT a sibling of {@link #declineFutureConfirmedBookingsForSalonClosure} /
+     * {@link #declineFutureConfirmedBookingsForMasterRemoval}: those two authorize on {@code
+     * actorUserId} owning the SALON, which a self-deleting {@code SALON_MASTER} never does. This
+     * read seam performs no authorization of its own — the caller has already proven {@code
+     * masterId} belongs to the caller by loading the {@code masters} row for their own {@code
+     * userId} before calling this method; the WRITE seam below re-asserts that ownership
+     * explicitly, since it is the one that actually mutates rows.
+     *
+     * <p><b>Precondition (residual-race fix, 2026-09 re-audit):</b> the caller MUST already hold
+     * this master's advisory lock, acquired via {@link #acquireMasterLockForSelfDelete} BEFORE
+     * calling this method — not merely before the write seam below — or a booking committed
+     * between an unlocked call to this method and the write can silently survive the cascade. See
+     * {@link #acquireMasterLockForSelfDelete}'s javadoc for the full mechanism.
+     *
+     * @param masterId the departing master's own {@code masters.id}
+     */
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
+    public List<UUID> findFutureConfirmedBookingIdsForMaster(UUID masterId) {
+        OffsetDateTime now = resolveNow();
+        return bookingRepository.findConfirmedFutureByMasterId(masterId, now).stream()
+                .sorted(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
+                        .thenComparing(SalonClosureBookingCandidate::bookingId))
+                .map(SalonClosureBookingCandidate::bookingId)
+                .toList();
+    }
+
+    /**
+     * Disposes of every future {@code CONFIRMED} booking belonging to a self-deleting {@code
+     * SALON_MASTER}/{@code INDEPENDENT_MASTER}'s OWN {@code masters} row (Phase 301 Q3): each row
+     * is bulk-transitioned to {@code DECLINED} then physically hard-deleted in the SAME
+     * transaction — never observable as {@code DECLINED} on a surviving row, so the choice of
+     * reason matters only for coherence, not for anything a client can see — with NO note written
+     * and NO outbox notice enqueued (the notice would name a booking row destroyed microseconds
+     * later, the exact phase-300 dead-letter bug; see {@link #declineConfirmedBulk} — sic, {@link
+     * BookingRepository#declineConfirmedBulk} — 's own Javadoc for the race-safety this relies on).
+     *
+     * <p><b>Why not the shared {@link #declineFutureConfirmed} body the salon/master-removal
+     * cascades share.</b> That method authorizes via {@code enforceCanManageAppointment} / {@code
+     * enforceCanCancelBooking} per booking — both reject {@code ROLE_SALON_MASTER} at the fast
+     * path ({@link AuthorizationService#canCancelBooking}). A {@code SALON_MASTER} can authorize
+     * NO existing booking mutation whatsoever (the structural surprise driving this whole phase —
+     * see the phase 301 plan §1), so this method authorizes on ownership of the {@code masters}
+     * row instead, via the self-assertion below — the same shape {@link
+     * #declineFutureConfirmedBookingsForMasterRemoval} uses for {@code
+     * masterRepository#existsByIdAndSalonId}, just keyed by the acting USER rather than by the
+     * salon owner.
+     *
+     * <p>The appointment-id map is read from a FRESH {@code CONFIRMED}-scoped scan taken BEFORE
+     * the bulk decline below — reading it AFTER would already see the just-declined rows fall out
+     * of the {@code status = 'CONFIRMED'} predicate and silently lose their header. Only ids
+     * {@link BookingRepository#declineConfirmedBulk} actually reports as transitioned are used
+     * for the outbox cleanup, the booking delete and the appointment-header collapse below — never
+     * the full input {@code bookingIds} — because that method is the race-safety boundary: an id
+     * that left {@code CONFIRMED} between the caller's own read and this call (e.g. the client
+     * cancelled it moments earlier) must not be treated as disposed of here.
+     *
+     * <p><b>Precondition — the caller MUST already hold {@code masterId}'s advisory lock
+     * (residual-race fix, 2026-09 re-audit).</b> This method no longer acquires the lock itself.
+     * It used to take it here, but by then {@code StaffAccountSelfDeletionService#deleteOwnAccount}
+     * had already read the fixed {@code bookingIds} list via {@link
+     * #findFutureConfirmedBookingIdsForMaster} — unlocked — leaving a sub-millisecond gap in which
+     * a booking could commit and never make it into {@code bookingIds}, surviving the cascade. The
+     * caller now acquires the SAME lock via {@link #acquireMasterLockForSelfDelete} BEFORE calling
+     * {@link #findFutureConfirmedBookingIdsForMaster}, and holds it across that read, its own cap
+     * check, and this call — see {@link #acquireMasterLockForSelfDelete}'s javadoc for the full
+     * mechanism. A second acquisition here would be a harmless (Postgres advisory xact locks are
+     * re-entrant within a transaction) but redundant round trip, so it is not repeated.
+     *
+     * @param actorUserId the deleting master's own id — the caller already holds a row lock on
+     *                    that user (mirrors {@link #findFutureConfirmedBookingIdsForClient}'s
+     *                    identical no-extra-recheck rationale for the read seam; this write seam
+     *                    still re-asserts ownership of {@code masterId} explicitly below, since
+     *                    unlike the read seam it actually mutates rows)
+     * @param masterId    the departing master's own {@code masters.id} — caller must already hold
+     *                    this master's advisory lock, see the precondition above
+     * @param salonId     the salon {@code masterId} belongs to, or {@code null} for an {@code
+     *                    INDEPENDENT_MASTER} — used only to scope the after-commit slot-eviction
+     *                    cache key, exactly as {@link #declineFutureConfirmed}'s own {@code
+     *                    salonId} parameter, never re-validated here
+     * @param bookingIds  the future {@code CONFIRMED} booking ids to dispose of, already read by
+     *                    the caller via {@link #findFutureConfirmedBookingIdsForMaster}
+     * @throws ForbiddenException {@code masterId} does not belong to {@code actorUserId}
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void disposeFutureConfirmedForMasterSelfDelete(
+            UUID actorUserId, UUID masterId, UUID salonId, List<UUID> bookingIds) {
+        if (!masterRepository.existsByIdAndUserId(masterId, actorUserId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        if (bookingIds.isEmpty()) {
+            return;
+        }
+
+        // Per-master advisory lock — NOT acquired here (residual-race fix, 2026-09 re-audit). The
+        // caller (StaffAccountSelfDeletionService#deleteOwnAccount) already acquired and is still
+        // holding this master's lock, via acquireMasterLockForSelfDelete, called BEFORE its own
+        // findFutureConfirmedBookingIdsForMaster read that produced bookingIds — see this method's
+        // own javadoc "Precondition" section for why the lock had to move earlier than this call.
+
+        OffsetDateTime now = resolveNow();
+        Map<UUID, UUID> appointmentIdByBookingId =
+                bookingRepository.findConfirmedFutureByMasterId(masterId, now).stream()
+                        .filter(candidate -> candidate.appointmentId() != null)
+                        .collect(Collectors.toMap(
+                                SalonClosureBookingCandidate::bookingId,
+                                SalonClosureBookingCandidate::appointmentId));
+
+        List<UUID> transitionedIds = bookingRepository.declineConfirmedBulk(
+                bookingIds, CancellationReason.PROVIDER_UNAVAILABLE.name(), null, clock.instant());
+
+        if (!transitionedIds.isEmpty()) {
+            // Q8 — MUST run immediately before the booking delete, same transaction, same step
+            // (mirrors ClientAccountDeletionService.java:171-174 byte-for-byte): aggregate_id
+            // carries no FK to bookings (V32), so an orphaned outbox row dead-letters in the drain
+            // worker. Belt-and-braces here since this cascade deliberately enqueues nothing (Q3) —
+            // declineConfirmedBulk shares its statement path with flows that DO enqueue, so the
+            // two-line pattern is the house rule for "delete booking rows inside a transaction".
+            notificationOutboxRepository.deleteByAggregateIdIn(transitionedIds);
+            bookingRepository.deleteAllByIdInBatch(transitionedIds);
+
+            Set<UUID> appointmentIds = transitionedIds.stream()
+                    .map(appointmentIdByBookingId::get)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toSet());
+            if (!appointmentIds.isEmpty()) {
+                // MANDATORY, not defensive — mirrors SalonService#disposeStaffAccounts' identical
+                // masterRepository.flush() call and ClientAccountDeletionService's identical
+                // bookingRepository.flush() call: deleteAllByIdInBatch above is a bulk JPQL
+                // DELETE, and Hibernate's AUTO flush only flushes pending work whose query space
+                // overlaps that statement's own (bookings, not appointments).
+                bookingRepository.flush();
+                Set<UUID> survivingAppointmentIds = Set.copyOf(
+                        bookingRepository.findAppointmentIdsWithSurvivingBookings(appointmentIds));
+                List<UUID> childlessAppointmentIds = appointmentIds.stream()
+                        .filter(id -> !survivingAppointmentIds.contains(id))
+                        .toList();
+                if (!childlessAppointmentIds.isEmpty()) {
+                    // Headers with legs belonging to OTHER masters survive untouched — only
+                    // fully-emptied headers go.
+                    appointmentRepository.deleteAllByIdInBatch(childlessAppointmentIds);
+                }
+            }
+        }
+
+        registerSlotEviction(masterId, salonId);
+        evictMasterCalendarAfterCommit(masterId);
     }
 
     /**
