@@ -1565,6 +1565,39 @@ public class BookingService {
         declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.MASTER_REMOVED);
     }
 
+    // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
+
+    /**
+     * Read seam for {@code ClientAccountDeletionService}: every {@code CONFIRMED} booking of
+     * {@code clientId} whose {@code startsAt} is strictly after now, as bare ids ordered by {@code
+     * startsAt} then {@code bookingId} (a deterministic replay order, the same D12-style tie-break
+     * the salon/master closure cascades use for their own per-visit representative pick).
+     *
+     * <p><b>Deliberately NOT a sibling of {@link #declineFutureConfirmedBookingsForSalonClosure} /
+     * {@link #declineFutureConfirmedBookingsForMasterRemoval}.</b> Those two share the bulk {@link
+     * #declineFutureConfirmed} body because a provider-initiated cascade always declines
+     * ({@code DECLINED} / {@code PROVIDER_UNAVAILABLE}) — wrong for a client self-delete, which is
+     * client-INITIATED and must travel the ordinary {@link #cancelBooking(UUID, UUID,
+     * CancelBookingRequest)} path ({@code CANCELLED} / {@code CLIENT_CANCELLED}), one booking at a
+     * time, so each visit's header collapse/lock logic runs exactly as it would for a normal client
+     * cancel. This method performs no mutation of its own — {@code ClientAccountDeletionService}
+     * loops the returned ids through {@link #cancelBooking(UUID, UUID, CancelBookingRequest)}
+     * itself, then physically deletes the now-{@code CANCELLED} rows.
+     *
+     * @param clientId the deleting client's own id — the caller already holds a row lock on that
+     *                 user, so no ownership re-check is needed here (unlike the salon/master
+     *                 siblings, which re-assert ownership of a caller-supplied scope id)
+     */
+    @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
+    public List<UUID> findFutureConfirmedBookingIdsForClient(UUID clientId) {
+        OffsetDateTime now = resolveNow();
+        return bookingRepository.findConfirmedFutureByClientId(clientId, now).stream()
+                .sorted(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
+                        .thenComparing(SalonClosureBookingCandidate::bookingId))
+                .map(SalonClosureBookingCandidate::bookingId)
+                .toList();
+    }
+
     /**
      * Shared cascade body behind both {@link #declineFutureConfirmedBookingsForSalonClosure} and
      * {@link #declineFutureConfirmedBookingsForMasterRemoval} (Phase 298 D4 — REUSE-FIRST: one

@@ -100,6 +100,13 @@ import java.util.UUID;
  *   than the create budget it left also still bounds the lock contention. Per-ACTOR only; the
  *   per-RECIPIENT half lives in {@code StaffBookingService#assertWalkInSmsBudgetForPhone}, because
  *   no per-actor bucket can bound an attacker holding several staff accounts.</li>
+ *   <li><b>{@code selfDeleteBuckets}:</b> {@code DELETE /api/v1/users/me} — the CLIENT
+ *   self-deletion endpoint (Phase 300, perf finding 2, 2026-09 audit). NOT a booking route,
+ *   but throttled through this filter rather than a second, parallel per-user mechanism —
+ *   see {@code USERS_ME_PATH}'s own javadoc. Bounds a token-holder retrying the hard-delete
+ *   cascade, which opens a real row lock on the caller's OWN {@code users} row for up to
+ *   30s per attempt; a legitimate CLIENT self-deletes once, so the budget is small and
+ *   hourly rather than shaped like the other, more frequent booking-write buckets above.</li>
  * </ul>
  *
  * <p><b>Why user-keyed, unlike every bucket in {@link com.beautica.auth.filter.AuthRateLimitFilter}:</b>
@@ -134,6 +141,19 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
 
     private static final String BOOKINGS_PATH = "/api/v1/bookings";
     private static final String BOOKINGS_PATH_PREFIX = "/api/v1/bookings/";
+    /**
+     * {@code DELETE /api/v1/users/me} — the CLIENT self-deletion endpoint (Phase 300, perf finding
+     * 2, 2026-09 audit — MEDIUM, raised independently by both security and perf). Not a booking
+     * route at all, but throttled here anyway rather than through a second, parallel per-user
+     * filter: this class is the ONLY per-authenticated-user Bucket4j mechanism in the app (see the
+     * class Javadoc's "why user-keyed" note), and {@code JwtAuthenticationFilter} has already run by
+     * the time this filter sees the request, so the principal is available exactly as it is for
+     * every other route below. A legitimate CLIENT self-deletes once; the tight
+     * {@code selfDeleteBuckets} budget exists only to bound a token-holder retrying (or scripting)
+     * the irreversible hard-delete cascade, which opens a real {@code PESSIMISTIC_WRITE} row lock on
+     * the caller's own {@code users} row for up to the 30s transaction timeout on every attempt.
+     */
+    private static final String USERS_ME_PATH = "/api/v1/users/me";
     /** BE-3: the multi-service single-visit create endpoint, throttled on the create/reschedule budget. */
     private static final String APPOINTMENTS_PATH = "/api/v1/appointments";
     /** Prefix for the whole {@code /appointments/{id}/*} PATCH mutation family — see class Javadoc. */
@@ -197,10 +217,17 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** {@code Retry-After} for the staff walk-in SMS-spend bucket — matches its 60s refill window. */
     private static final int STAFF_BOOKING_SMS_RETRY_AFTER_SECONDS = 60;
 
+    /**
+     * {@code Retry-After} for the CLIENT self-delete bucket — matches its 60-minute refill window
+     * (see {@code RateLimitConfig#selfDeleteCapacity}'s javadoc for the sizing rationale).
+     */
+    private static final int SELF_DELETE_RETRY_AFTER_SECONDS = 3600;
+
     private final LoadingCache<String, Bucket> bookingWriteBuckets;
     private final LoadingCache<String, Bucket> bookingDeclineBuckets;
     private final LoadingCache<String, Bucket> scheduleOverrideWriteBuckets;
     private final LoadingCache<String, Bucket> staffBookingSmsBuckets;
+    private final LoadingCache<String, Bucket> selfDeleteBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -208,11 +235,13 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> bookingDeclineBuckets,
             LoadingCache<String, Bucket> scheduleOverrideWriteBuckets,
             LoadingCache<String, Bucket> staffBookingSmsBuckets,
+            LoadingCache<String, Bucket> selfDeleteBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
         this.scheduleOverrideWriteBuckets = scheduleOverrideWriteBuckets;
         this.staffBookingSmsBuckets = staffBookingSmsBuckets;
+        this.selfDeleteBuckets = selfDeleteBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -284,6 +313,11 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         String path = resolveMatchPath(request);
         String method = request.getMethod();
 
+        // DELETE /api/v1/users/me — the CLIENT self-deletion endpoint (Phase 300 perf finding 2).
+        // See USERS_ME_PATH's javadoc for why this unrelated route lives in the booking filter.
+        if (HttpMethod.DELETE.matches(method) && USERS_ME_PATH.equals(path)) {
+            return new BucketRoute(selfDeleteBuckets, SELF_DELETE_RETRY_AFTER_SECONDS);
+        }
         // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
         // create) share the bookingWriteBuckets budget: both take the per-client advisory lock, so a
         // visit create is one token on the same threat model as a single-service create.

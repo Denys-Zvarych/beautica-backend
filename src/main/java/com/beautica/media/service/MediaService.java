@@ -567,6 +567,78 @@ public class MediaService {
     }
 
     /**
+     * Permanently purges a self-deleted CLIENT's R2 blobs — the Phase 300 D4/§9 counterpart of
+     * {@link #deleteBySalon}, called by {@code ClientAccountDeletionService} AFTER its deletion
+     * transaction commits (mirroring {@code SalonService}'s {@code purgeSalonMediaAfterCommit}
+     * registration shape exactly).
+     *
+     * <p><b>R2-ONLY — deliberately does NOT reuse {@link #sweepBlobs}.</b> {@code sweepBlobs} also
+     * issues a DB {@code mediaRepo.deleteAll(rows)}, which is exactly right for {@link
+     * #deleteBySalon} (a salon's OWN portfolio rows do not automatically cascade away — only a
+     * hard-deleted STAFF uploader's rows do) but is WRONG here: {@code media_files.uploader_id}
+     * {@code ON DELETE CASCADE}s directly off {@code users.id} (V37:8), so by the time this
+     * {@code afterCommit} callback runs, {@code preReadRows} and the caller's own avatar-column
+     * update have ALREADY vanished from the database — {@code preReadRows} are DETACHED entities
+     * pointing at rows that no longer exist. Calling {@code mediaRepo.deleteAll} on them would
+     * either no-op or throw ({@code merge()} tries to reload a row that is gone), for zero benefit:
+     * the only thing actually left to clean up is the R2 BLOBS themselves, which are outside the
+     * transaction and were never touched by the CASCADE.
+     *
+     * <p><b>Do NOT call {@link #deleteByUploader} inline instead</b> — see that method's own
+     * Javadoc and this class's caller's Javadoc: it opens its OWN {@code PROPAGATION_REQUIRES_NEW}
+     * transactions, so calling it from inside {@code ClientAccountDeletionService}'s own {@code
+     * @Transactional} would let an outer rollback leave the blobs already destroyed.
+     *
+     * <p>Best-effort throughout, same policy as every other sweep in this class: a partial or
+     * total R2 failure is logged at WARN (key omitted) and never re-thrown — the {@code users} row
+     * is already gone by the time this runs, so there is nothing left to roll back to.
+     *
+     * @param clientUserId  the deleted client's id, used only to name the portfolio-cache eviction
+     *                      entry for each distinct {@code (entityType, entityId)} in {@code
+     *                      preReadRows} — a CLIENT never legitimately owns a portfolio entry today
+     *                      (only SALON_OWNER/INDEPENDENT_MASTER/SALON_ADMIN upload one), but this
+     *                      stays correct if that ever changes
+     * @param avatarR2Key   the deleted client's {@code users.avatar_r2_key} at the moment of
+     *                      deletion, pre-read by the caller before the row vanished, or {@code
+     *                      null} if the client never had an avatar
+     * @param preReadRows   the client's {@code media_files} rows, pre-read by the caller (via
+     *                      {@code mediaRepo.findByUploaderId}) before the {@code users} DELETE
+     *                      cascaded them away
+     */
+    public void purgeUserBlobsAfterCommit(UUID clientUserId, String avatarR2Key, List<MediaFile> preReadRows) {
+        List<String> keys = new ArrayList<>(preReadRows.size() + 1);
+        if (avatarR2Key != null) {
+            keys.add(avatarR2Key);
+        }
+        for (MediaFile row : preReadRows) {
+            keys.add(row.getR2Key());
+        }
+        if (keys.isEmpty()) {
+            return;
+        }
+
+        Set<String> failedKeys = r2.deleteFiles(keys);
+        for (String ignored : failedKeys) {
+            // Key may encode an entity UUID — omit from WARN log to avoid PII in log aggregators.
+            log.warn("R2 delete failed during client self-delete blob purge (client={}, key=[key omitted])",
+                    clientUserId);
+        }
+
+        Set<String> distinctCacheKeys = new HashSet<>();
+        for (MediaFile row : preReadRows) {
+            distinctCacheKeys.add(portfolioCacheKey(row.getEntityType(), row.getEntityId()));
+        }
+        if (!distinctCacheKeys.isEmpty()) {
+            Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
+            if (cache != null) {
+                for (String key : distinctCacheKeys) {
+                    cache.evictIfPresent(key);
+                }
+            }
+        }
+    }
+
+    /**
      * Avatar half of {@link #deleteByUploader}: purge the {@code users.avatar_r2_key} blob
      * and null both avatar columns.
      *

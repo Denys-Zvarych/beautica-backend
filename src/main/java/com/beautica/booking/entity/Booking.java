@@ -29,8 +29,10 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 import org.hibernate.annotations.DynamicUpdate;
 import org.springframework.http.HttpStatus;
+import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
@@ -296,6 +298,54 @@ public class Booking extends AuditableEntity {
 
     @Column(name = "guest_phone", length = 20)
     private String guestPhone;
+
+    // ── Client-detachment snapshot (V162, phase 300 D4) ───────────────────────
+    //
+    // Written ONCE, by ClientAccountDeletionService, at the moment the client's `users` row is
+    // hard-deleted; never synced afterwards. NULL <=> attached. This column — not client_id alone
+    // — is the state discriminator in chk_bookings_guest_fields: booking_source is NEVER
+    // rewritten, because it records how the visit was booked and overwriting it would falsify
+    // every source-keyed query. Mirrors masters.detached_at (V157, phase 294).
+    //
+    // No @Setter(AccessLevel.NONE) override needed here: unlike Master, this class carries no
+    // class-level @Setter, so simply not annotating this field already means no public setter is
+    // generated. The only writer is detachClient(...) below, which the DB CHECK
+    // chk_bookings_guest_fields (V162) makes the sole way to leave a satisfiable row.
+    @Nullable
+    @Column(name = "client_detached_at")
+    private Instant clientDetachedAt;
+
+    /**
+     * {@code true} once this booking has been detached from its (now hard-deleted) client
+     * account — mirrors {@code Master#isDetached()}.
+     */
+    public boolean isClientDetached() {
+        return clientDetachedAt != null;
+    }
+
+    /**
+     * Snapshots the sentinel display name and severs the client link — the ONLY writer of
+     * {@link #clientDetachedAt}. Mirrors {@code Master#detach} (:228-235): the sentinel, the
+     * severed association and the stamp are written together as ONE state change, because the
+     * whole-row {@code chk_bookings_guest_fields} CHECK (V162) is evaluated against the result —
+     * splitting this into two statements leaves an intermediate row no arm of the CHECK accepts.
+     *
+     * <p>{@code guestPhone} is deliberately left untouched: every row this method is ever called
+     * on is currently ATTACHED ({@code client} non-null), and every attached arm of the CHECK
+     * already requires {@code guest_phone IS NULL} — there is no PII in this column to scrub.
+     *
+     * @param label the fixed Ukrainian sentinel («Видалений клієнт») — always the same literal,
+     *              never user-supplied, so (unlike {@code Master.detach}'s blank-name fallback)
+     *              no normalization is needed here
+     * @param at    the detachment instant, from the injected {@code Clock} — never
+     *              {@code Instant.now()}
+     */
+    public void detachClient(String label, Instant at) {
+        this.guestName = label;
+        this.guestSurname = null;
+        this.client = null;
+        this.clientDetachedAt = at;
+    }
 
     // Uniqueness is enforced by the V90 partial-unique index (UNIQUE only over non-NULL
     // rows). `unique = true` here would direct Hibernate ddl-auto to recreate the full

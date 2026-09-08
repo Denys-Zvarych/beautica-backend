@@ -3,10 +3,13 @@ package com.beautica.user;
 import com.beautica.auth.PasswordResetService;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.common.security.BearerTokenExtractor;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -22,10 +25,13 @@ public class UserController {
 
     private final UserService userService;
     private final PasswordResetService passwordResetService;
+    private final ClientAccountDeletionService clientAccountDeletionService;
 
-    public UserController(UserService userService, PasswordResetService passwordResetService) {
+    public UserController(UserService userService, PasswordResetService passwordResetService,
+                           ClientAccountDeletionService clientAccountDeletionService) {
         this.userService = userService;
         this.passwordResetService = passwordResetService;
+        this.clientAccountDeletionService = clientAccountDeletionService;
     }
 
     @GetMapping("/me")
@@ -81,5 +87,29 @@ public class UserController {
         UUID userId = AuthenticationUtils.userId(authentication);
         passwordResetService.requestResetForUserId(userId);
         return ResponseEntity.ok(ApiResponse.ok(null, "A reset code has been sent to your email."));
+    }
+
+    /**
+     * Self-deletion (Phase 300 D1/D2). CLIENT-only, bearer token only, no confirmation body — the
+     * irreversibility warning lives in the mobile UI. Hard-deletes the caller's {@code users} row;
+     * see {@link ClientAccountDeletionService#deleteOwnAccount} for the full cascade.
+     *
+     * <p>{@code 204 No Content}, {@code ResponseEntity<Void>} — no {@code ApiResponse<T>}
+     * envelope, mirroring the existing {@code DELETE /salons/{salonId}} shape
+     * ({@code SalonController#deactivateSalon}), the closest existing precedent for a
+     * bearer-token-only, no-body delete endpoint.
+     *
+     * <p>The caller's own bearer token is denylisted as part of the deletion (see the service),
+     * so it is extracted here via the SAME {@link BearerTokenExtractor} {@code AuthController
+     * #logout} and {@link com.beautica.auth.JwtAuthenticationFilter} already use — never a second
+     * ad hoc header parse.
+     */
+    @DeleteMapping("/me")
+    @PreAuthorize("hasRole('CLIENT')")
+    public ResponseEntity<Void> deleteMyAccount(HttpServletRequest request, Authentication authentication) {
+        UUID userId = AuthenticationUtils.userId(authentication);
+        String accessToken = BearerTokenExtractor.extract(request);
+        clientAccountDeletionService.deleteOwnAccount(userId, accessToken);
+        return ResponseEntity.noContent().build();
     }
 }

@@ -24,7 +24,9 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.springframework.lang.Nullable;
 
+import java.time.Instant;
 import java.util.UUID;
 
 /**
@@ -173,6 +175,35 @@ public class Appointment extends AuditableEntity {
     // `users` row.
     @Column(name = "created_by_user_id")
     private UUID createdByUserId;
+
+    // ── Client-detachment snapshot (V162, phase 300 D4) ───────────────────────
+    // Mirror of Booking.clientDetachedAt for the visit header — see that field's javadoc for the
+    // full rationale. Header and children must never diverge on this column.
+    @Nullable
+    @Column(name = "client_detached_at")
+    private Instant clientDetachedAt;
+
+    /**
+     * {@code true} once this visit header has been detached from its (now hard-deleted) client
+     * account — mirrors {@link Booking#isClientDetached()}.
+     */
+    public boolean isClientDetached() {
+        return clientDetachedAt != null;
+    }
+
+    /**
+     * Header twin of {@link Booking#detachClient(String, Instant)} — see that method's javadoc
+     * for the full rationale (one state change, {@code guestPhone} left untouched).
+     *
+     * @param label the fixed Ukrainian sentinel («Видалений клієнт»), never user-supplied
+     * @param at    the detachment instant, from the injected {@code Clock}
+     */
+    public void detachClient(String label, Instant at) {
+        this.guestName = label;
+        this.guestSurname = null;
+        this.client = null;
+        this.clientDetachedAt = at;
+    }
 
     /**
      * Factory for an auto-confirmed guest (LINK) multi-service visit header (BE-7). Enforces the LINK

@@ -13,6 +13,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.validation.annotation.Validated;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -176,4 +177,30 @@ public interface NotificationOutboxRepository extends JpaRepository<Notification
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     void deleteByStatusInAndUpdatedAtBefore(List<OutboxStatus> statuses, Instant cutoff);
+
+    /**
+     * Deletes every outbox row addressed to one of the given {@code aggregateId}s (i.e.
+     * {@code bookingId}s for booking-shaped events such as {@code STATUS_CHANGED}).
+     *
+     * <p>{@code notification_outbox.aggregate_id} carries no FK to {@code bookings} (V32) — it is a
+     * raw UUID the drain worker re-hydrates at send time (see
+     * {@link com.beautica.notification.service.NotificationOutboxService#enqueueStatusChanged}'s
+     * "no client PII duplicated into the payload" convention). That means physically deleting a
+     * booking with a still-{@code PENDING} outbox row pointing at it orphans the row: the drain
+     * worker's {@code getBooking()} finds nothing, throws {@code IllegalStateException}, and the
+     * row is retried into {@code DEAD}. Callers that hard-delete a booking in the same transaction
+     * MUST call this first (or in the same flush) for that booking's id — see
+     * {@code ClientAccountDeletionService#deleteOwnAccount} step 4/5 for the canonical case
+     * (self-delete cancels future bookings, enqueueing {@code STATUS_CHANGED} rows, then physically
+     * deletes those same bookings two statements later).
+     *
+     * <p>Deliberately participates in the CALLER's transaction (unlike
+     * {@link #deleteByStatusInAndUpdatedAtBefore}, which is an isolated housekeeping sweep) — this
+     * delete must commit or roll back atomically with the booking delete it is paired with, so no
+     * explicit {@code @Transactional} propagation is declared here.
+     *
+     * @param aggregateIds the aggregate ids (booking ids) whose pending outbox rows must go; the
+     *                     caller guards the empty-collection case (an {@code IN ()} is wasted work)
+     */
+    void deleteByAggregateIdIn(Collection<UUID> aggregateIds);
 }

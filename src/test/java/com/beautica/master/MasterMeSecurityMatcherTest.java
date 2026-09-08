@@ -136,7 +136,7 @@ class MasterMeSecurityMatcherTest {
         @SuppressWarnings("unchecked")
         BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
             LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
-            return new BookingRateLimitFilter(dummy, dummy, dummy, dummy, objectMapper) {
+            return new BookingRateLimitFilter(dummy, dummy, dummy, dummy, dummy, objectMapper) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,

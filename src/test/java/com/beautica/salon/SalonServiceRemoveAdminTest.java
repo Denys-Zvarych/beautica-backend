@@ -125,7 +125,10 @@ class SalonServiceRemoveAdminTest {
         salonService.removeAdmin(ownerId, salonId, adminId);
 
         verify(inviteTokenRepository).deleteBySalonIdAndStaffUserIds(salonId, List.of(adminId));
-        verify(tokensValidAfterCache).invalidate(adminId);
+        // The afterCommit-vs-immediate fallback branch was promoted verbatim from a private
+        // SalonService method into TokensValidAfterCache.invalidateAfterCommit(UUID) — assert on
+        // that seam, not the mock's internal invalidate(...), which the promoted seam now owns.
+        verify(tokensValidAfterCache).invalidateAfterCommit(adminId);
         verify(userProfileCacheEvictor).evictAfterCommit(adminId);
         verify(userRepository).deleteAllByIdInBatch(List.of(adminId));
         // No masters row existed to detach or delete — findIdsWithHistoricalReferences is only
