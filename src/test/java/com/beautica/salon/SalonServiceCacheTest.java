@@ -136,6 +136,13 @@ class SalonServiceCacheTest {
     // exercise deactivateSalon.
     @MockBean com.beautica.salon.service.StaffClientReferenceAuditService staffClientReferenceAuditService;
     @MockBean com.beautica.auth.TokensValidAfterCache tokensValidAfterCache;
+    // Phase 301: the staff hard-delete cascade that phase 290 inlined in SalonService was
+    // promoted verbatim to StaffAccountDisposalService so salon deletion, owner-initiated staff
+    // removal and staff SELF-DELETE share one implementation. SalonService now constructor-
+    // depends on it (parameter 22). WITHOUT this bean the whole context fails to load with
+    // "No qualifying bean of type StaffAccountDisposalService" — the same failure mode the
+    // phase 290/293 comments above document — taking all 8 tests red, not just the deletion ones.
+    @MockBean com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
     // Phase 293: SalonService now constructor-depends on BookingService for the salon-closure
     // booking cascade (deactivateSalon calls declineFutureConfirmedBookingsForSalonClosure).
     // WITHOUT this bean the whole context fails to load with "required a bean of type

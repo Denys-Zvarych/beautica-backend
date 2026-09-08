@@ -126,6 +126,12 @@ class BookingServiceCacheTest {
     @MockBean SalonRepository salonRepository;
     @MockBean AuthorizationService authz;
     @MockBean NotificationOutboxService outboxService;
+    // Phase 301: the master self-delete cascade deletes the outbox rows whose aggregate (the
+    // booking) it is about to hard-delete, so BookingService now constructor-depends on the
+    // repository directly (parameter 7), not only on NotificationOutboxService above. WITHOUT
+    // this bean the whole context fails to load with "No qualifying bean of type
+    // NotificationOutboxRepository", taking all 4 tests in this file red.
+    @MockBean com.beautica.notification.repository.NotificationOutboxRepository notificationOutboxRepository;
     @MockBean SlotCalculationService slotCalculationService;
     @MockBean ReviewRepository reviewRepository;
     @MockBean ClientReviewRepository clientReviewRepository;
