@@ -1537,11 +1537,19 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId)).isEmpty();
     }
 
-    /** Cases 11 + 12 — D7's side-effect repair, and the boundary Phase 306 will move. */
+    /**
+     * Cases 11 + 12 — D7's side-effect repair, and the boundary Phase 306 moved.
+     *
+     * <p>The second half of this test PINNED the pre-Phase-306 403 for a SALON_ADMIN
+     * ({@code "canManageServiceDefinition's role gate still excludes SALON_ADMIN"}) with an
+     * explicit note that Phase 306 owns this boundary. Phase 306 D1-D3 replaced the stale
+     * {@code ownerUserId.equals(actorId)} identity check with a salon-management check, so an
+     * admin of the definition's salon now passes. INVERTED here rather than left green-by-luck.
+     */
     @Test
-    @DisplayName("the salon owner can now PATCH a definition created for their salon master (200), "
-            + "while a SALON_ADMIN still gets 403 (D7 — 306's subject)")
-    void should_allowOwnerPatchAndDenyAdmin_when_definitionWasCreatedForASalonMaster() throws Exception {
+    @DisplayName("the salon owner can PATCH a definition created for their salon master (200), "
+            + "and since Phase 306 a SALON_ADMIN of the same salon can too (200)")
+    void should_allowOwnerAndAdminPatch_when_definitionWasCreatedForASalonMaster() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-302-patch-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Patch Salon");
@@ -1553,7 +1561,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         UUID defId = createdFrom(created).get(0).serviceDefinition().id();
 
         // findOwnerUserId resolves s.owner.id for a SALON definition, which the owner's actor id
-        // matches. Before this phase it resolved the salon MASTER's user id and every role got 403.
+        // matches. Before Phase 302 it resolved the salon MASTER's user id and every role got 403.
         log.debug("Act: owner PATCHes the definition created for their salon master");
         ResponseEntity<String> ownerPatch = restTemplate.exchange(
                 "/api/v1/services/" + defId, HttpMethod.PATCH,
@@ -1562,14 +1570,14 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 String.class);
 
         assertThat(ownerPatch.getStatusCode())
-                .as("403-today becomes 200: the definition is no longer orphaned on creation (D7)")
+                .as("403-pre-302 becomes 200: the definition is no longer orphaned on creation (D7)")
                 .isEqualTo(HttpStatus.OK);
         assertThat(definitionRow(defId)).containsEntry("name", "Перейменовано");
 
         String adminToken = fixtures.createSalonAdminAndGetToken(
                 salonId, "admin-302-patch-" + System.nanoTime() + "@beautica.test");
 
-        log.debug("Act: SALON_ADMIN PATCHes the same definition — still denied until Phase 306");
+        log.debug("Act: SALON_ADMIN of the SAME salon PATCHes the same definition — Phase 306 D1-D3 now allows it");
         ResponseEntity<String> adminPatch = restTemplate.exchange(
                 "/api/v1/services/" + defId, HttpMethod.PATCH,
                 new HttpEntity<>(java.util.Map.of("name", "Адмін"),
@@ -1577,12 +1585,12 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 String.class);
 
         assertThat(adminPatch.getStatusCode())
-                .as("canManageServiceDefinition's role gate still excludes SALON_ADMIN — pinned "
-                        + "here so Phase 306's change is provably a change")
-                .isEqualTo(HttpStatus.FORBIDDEN);
+                .as("Phase 306 D3: canManageServiceDefinition resolves a SALON_ADMIN of the owning "
+                        + "salon through hasManagementAccess, not the stale identity check")
+                .isEqualTo(HttpStatus.OK);
         assertThat(definitionRow(defId))
-                .as("and the denied PATCH wrote nothing")
-                .containsEntry("name", "Перейменовано");
+                .as("the allowed admin PATCH must have applied")
+                .containsEntry("name", "Адмін");
     }
 
     // ══ Phase 302 QA — gaps the implementation batch's own tests do not reach ══════════════════

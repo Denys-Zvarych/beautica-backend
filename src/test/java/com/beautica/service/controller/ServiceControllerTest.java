@@ -233,6 +233,35 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data.name").value("Classic Manicure"));
     }
 
+    @Test
+    @DisplayName("POST /salons/{id}/services — 201 when SALON_ADMIN of the salon adds a service (Phase 306 D4 — role-only conjunct dropped)")
+    void should_return201_when_salonAdminAddsServiceToSalon() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var serviceId = UUID.randomUUID();
+        var request = new CreateServiceDefinitionRequest(
+                "Classic Manicure", "Basic nail care", "MANICURE", 60, 10,
+                PriceType.FIXED, new BigDecimal("350.00"), null, null, UUID.randomUUID());
+        var stub = stubServiceDefResponse(serviceId, "Classic Manicure");
+
+        // Before Phase 306, hasRole('SALON_OWNER') rejected SALON_ADMIN before canManageSalon was
+        // ever consulted; the annotation is gone, so canManageSalon (already SALON_ADMIN-aware) now
+        // decides alone.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.addServiceToSalon(eq(salonId), any(CreateServiceDefinitionRequest.class)))
+                .thenReturn(stub);
+
+        log.debug("Act: POST /api/v1/salons/{}/services as SALON_ADMIN — must be allowed (D4)", salonId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/services")
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.id").value(serviceId.toString()));
+    }
+
     // ── V111 mandatory service type — HTTP-tier guarantee ──────────────────────
     // The user-facing rule: a service can never be created without a service type. At the
     // web tier the @NotNull(serviceTypeId) bean-validation guard rejects the request with 400
@@ -375,6 +404,79 @@ class ServiceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isConflict());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — 201 when SALON_ADMIN of the salon assigns a service (Phase 306 D4 — role-only conjunct dropped)")
+    void should_return201_when_salonAdminAssignsServiceToMaster() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var assignmentId = UUID.randomUUID();
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var stub = stubMasterServiceResponse(assignmentId, masterId, "Pedicure");
+
+        // Before Phase 306, hasRole('SALON_OWNER') rejected SALON_ADMIN before canManageSalon/
+        // masterBelongsToSalon were ever consulted; the annotation is gone, so those two decide alone.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any(AssignServiceToMasterRequest.class)))
+                .thenReturn(stub);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as SALON_ADMIN — must be allowed (D4)", salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — 403 when the master is not in the salon (masterBelongsToSalon IDOR guard — Phase 306 mutation check (e): dropping this conjunct is caught HERE, not by the IT, because the service layer's own re-check masks it there)")
+    void should_return403_when_singleAssignTargetsMasterInAnotherSalon() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonAId = UUID.randomUUID();
+        var masterInSalonBId = UUID.randomUUID();
+        var request = new AssignServiceToMasterRequest(UUID.randomUUID(), null, null);
+
+        // Owner can manage salon A, but the target master belongs to salon B → guard denies.
+        when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterInSalonBId, salonAId)).thenReturn(false);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services targeting a master in another salon — must return 403",
+                salonAId, masterInSalonBId);
+        mockMvc.perform(post("/api/v1/salons/" + salonAId + "/masters/" + masterInSalonBId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — 403 when SALON_MASTER (read-only role) attempts a single-assign (Phase 306 D6, audit fix #5 — D4 touched this endpoint too)")
+    void should_return403_when_salonMasterAttemptsSingleAssign() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var request = new AssignServiceToMasterRequest(UUID.randomUUID(), null, null);
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as SALON_MASTER — read-only role must be denied with 403",
+                salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
     }
 
     // ── GET /api/v1/masters/{masterId}/services — public ──────────────────────
@@ -1034,19 +1136,23 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /services/{id} — 403 when SALON_ADMIN calls the delete endpoint (role-only gate excludes SALON_ADMIN)")
-    void should_return403_when_salonAdminCallsDeleteService() throws Exception {
-        var userId = UUID.randomUUID();
+    @DisplayName("DELETE /services/{id} — 204 when SALON_ADMIN passes the role gate (Phase 306 D5 — INVERTS the pre-306 403: hasAnyRole now includes SALON_ADMIN); service receives the admin's userId as actorId")
+    void should_return204_when_salonAdminCallsDeleteService() throws Exception {
+        var adminUserId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        // SALON_ADMIN is intentionally NOT in hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER').
+        // Phase 306 D5: hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') now admits
+        // SALON_ADMIN at this role-only gate; deactivateServiceDefinition is void (no-op = success).
+        // The salon-scoping that keeps this safe lives in the service-layer B14 guard
+        // (enforceCanManageServiceDefinition, D3) — mocked away here, exercised by ServiceSecurityTest
+        // case 7's cross-salon arm and AuthorizationServiceTest cases 12/13/16.
 
-        log.debug("Act: DELETE /api/v1/services/{} as SALON_ADMIN — must be denied with 403", serviceDefId);
+        log.debug("Act: DELETE /api/v1/services/{} as SALON_ADMIN — must pass the role gate and return 204", serviceDefId);
         mockMvc.perform(delete("/api/v1/services/" + serviceDefId)
-                        .with(authenticatedAs(userId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
                         .with(csrf()))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isNoContent());
 
-        verify(serviceCatalogService, never()).deactivateServiceDefinition(any(), any());
+        verify(serviceCatalogService).deactivateServiceDefinition(adminUserId, serviceDefId);
     }
 
     @Test
@@ -1744,6 +1850,29 @@ class ServiceControllerTest {
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk by a non-manager — must return 403", salonId, masterId);
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
                         .with(authenticatedAs(userId, "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
+                .bulkCreateSalonMasterServices(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services/bulk — 403 when SALON_MASTER (read-only role) attempts a bulk on-behalf create (Phase 306 D6, audit fix #5 — D4 touched this endpoint too)")
+    void should_return403_when_salonMasterAttemptsBulkOnBehalf() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        var body = "{\"items\":[{\"serviceTypeId\":\"" + UUID.randomUUID()
+                + "\",\"durationMinutes\":60,\"priceType\":\"FIXED\",\"price\":350.00}]}";
+
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_MASTER — read-only role must be denied with 403",
+                salonId, masterId);
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk")
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))

@@ -10,8 +10,10 @@ import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
+import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -506,5 +508,243 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
 
     /** Derived from a run — see the gate's javadoc for the per-statement arithmetic. */
     private static final long PATCH_COMBINED_STATEMENTS = 6L;
+
+    // ── Phase 306 — SALON_ADMIN parity on service management ───────────────────
+
+    @Test
+    @DisplayName("Phase 306 case 1: PATCH /services/{id} — 200 when SALON_ADMIN of the salon updates a salon-owned service definition (INVERTS Phase 302's pinned 403)")
+    void should_return200_when_salonAdminPatchesSalonOwnedServiceDefinition() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-patch-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Patch Salon");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Класичний манікюр");
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                salonId, "p306-admin-patch-" + System.nanoTime() + "@beautica.test");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Класичний манікюр (адмін)", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as SALON_ADMIN of the owning salon — must be allowed (D1-D3)", serviceDefId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(adminToken)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
+        assertThat(body.data().name()).isEqualTo("Класичний манікюр (адмін)");
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 2: PATCH /services/{id}/photo — 200 when SALON_ADMIN of the salon sets the photo")
+    void should_return200_when_salonAdminPatchesServicePhoto() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-photo-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Photo Salon");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Педикюр");
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                salonId, "p306-admin-photo-" + System.nanoTime() + "@beautica.test");
+
+        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/photo.jpg");
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{}/photo as SALON_ADMIN of the owning salon — must be allowed", serviceDefId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
+                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(adminToken)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
+        assertThat(body.data().photoUrl()).isEqualTo("https://cdn.beautica.test/photo.jpg");
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 3: POST /salons/{s}/masters/{m}/services — 201 when SALON_ADMIN single-assigns a service to a master of their salon (D4)")
+    void should_return201_when_salonAdminSingleAssignsServiceToMaster() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-assign-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Assign Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Нарощення вій");
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                salonId, "p306-admin-assign-" + System.nanoTime() + "@beautica.test");
+
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        // Act
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as SALON_ADMIN — must be allowed (D4)", salonId, masterId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
+                new HttpEntity<>(assignRequest, fixtures.bearerHeaders(adminToken)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<MasterServiceResponse>>() {});
+        assertThat(body.data().masterId()).isEqualTo(masterId);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 4: POST /salons/{s}/services — 201 when SALON_ADMIN creates a salon service (D4)")
+    void should_return201_when_salonAdminCreatesSalonService() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-create-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Create Salon");
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                salonId, "p306-admin-create-" + System.nanoTime() + "@beautica.test");
+
+        var request = new CreateServiceDefinitionRequest(
+                "Брови", null, "NAIL_SERVICE", 45, 5,
+                PriceType.FIXED, new BigDecimal("300.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
+
+        // Act
+        log.debug("Act: POST /api/v1/salons/{}/services as SALON_ADMIN — must be allowed (D4)", salonId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(adminToken)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
+        assertThat(body.data().name()).isEqualTo("Брови");
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 6 (regression): SALON_OWNER retains full CRUD on services — create, single-assign, PATCH, photo, DELETE")
+    void should_retainAccess_when_salonOwnerPerformsFullServiceLifecycle() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-regress-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 Owner Regression Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        // create
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Стрижка чоловіча");
+
+        // single-assign
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        ResponseEntity<String> assignResp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
+                new HttpEntity<>(assignRequest, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(assignResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        // PATCH
+        var patch = new UpdateServiceDefinitionRequest(
+                "Стрижка чоловіча преміум", null, null, null, null, null, null, null, null, null);
+        ResponseEntity<String> patchResp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(patchResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // photo
+        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/owner-regress.jpg");
+        ResponseEntity<String> photoResp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
+                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(photoResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // delete
+        log.debug("Act: full owner lifecycle on service {} — create/assign/patch/photo already passed, now DELETE", serviceDefId);
+        ResponseEntity<String> deleteResp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(deleteResp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 7: DELETE /services/{id} — 204 when SALON_ADMIN of the salon deactivates a service; is_active flips false and it disappears from GET /salons/{salonId}/services")
+    void should_return204AndHideFromCatalog_when_salonAdminDeactivatesServiceDefinition() throws Exception {
+        // Arrange — a master with a usable schedule so the salon catalogue's free-slot
+        // bookability gate (Phase 305 D1 / 23.x) would otherwise show this service.
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-delete-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Delete Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Ламінування вій");
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        ResponseEntity<String> assignResp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
+                new HttpEntity<>(assignRequest, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(assignResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        // Sanity: the service is visible in the catalogue BEFORE deletion.
+        ResponseEntity<String> catalogBefore = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(flattenCatalogServiceIds(catalogBefore))
+                .as("sanity check: the service must be visible before deletion")
+                .contains(serviceDefId);
+
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                salonId, "p306-admin-delete-" + System.nanoTime() + "@beautica.test");
+
+        // Act
+        log.debug("Act: DELETE /api/v1/services/{} as SALON_ADMIN of the owning salon — must be allowed (D5)", serviceDefId);
+        ResponseEntity<String> deleteResp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(adminToken)), String.class);
+
+        // Assert
+        assertThat(deleteResp.getStatusCode())
+                .as("SALON_ADMIN of the owning salon must be allowed to DELETE (D5)")
+                .isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT is_active FROM service_definitions WHERE id = ?", Boolean.class, serviceDefId))
+                .as("the definition must flip to is_active = false")
+                .isFalse();
+
+        ResponseEntity<String> catalogAfter = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/services", HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(flattenCatalogServiceIds(catalogAfter))
+                .as("the deactivated service must disappear from the salon catalogue")
+                .doesNotContain(serviceDefId);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 10: PATCH /services/{id} — 200 when an INDEPENDENT_MASTER edits their OWN service definition (D3's unchanged INDEPENDENT_MASTER arm)")
+    void should_return200_when_independentMasterPatchesOwnServiceDefinition() throws Exception {
+        // Arrange
+        String indepToken = fixtures.createIndependentMasterAndGetToken(
+                "p306-indep-patch-" + System.nanoTime() + "@beautica.test");
+        UUID indepServiceId = fixtures.createIndependentMasterService(indepToken, "Ламінування брів");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Ламінування брів преміум", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as the owning INDEPENDENT_MASTER — must be allowed", indepServiceId);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/services/" + indepServiceId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(indepToken)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
+        assertThat(body.data().name()).isEqualTo("Ламінування брів преміум");
+    }
+
+    /** Flattens a {@code GET /salons/{salonId}/services} response body into the set of leaf service ids. */
+    private java.util.List<UUID> flattenCatalogServiceIds(ResponseEntity<String> catalogResponse) throws Exception {
+        assertThat(catalogResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(
+                catalogResponse.getBody(), new TypeReference<ApiResponse<SalonServiceCatalogResponse>>() {});
+        return body.data().categories().stream()
+                .flatMap(group -> group.services().stream())
+                .map(ServiceDefinitionResponse::id)
+                .toList();
+    }
 
 }

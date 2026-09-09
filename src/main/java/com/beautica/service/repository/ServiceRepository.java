@@ -22,9 +22,50 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     List<ServiceDefinition> findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType ownerType, UUID ownerId);
 
     /**
-     * Resolves the owner's user UUID in a single query, avoiding the two-query
-     * chain (load ServiceDefinition + load Salon or Master) previously used in
+     * Owner-access projection for a {@link ServiceDefinition} — Phase 306 D3.
+     *
+     * <p>{@code ownerUserId} is the definition owner's user UUID (SALON → the salon's
+     * {@code owner.id}; INDEPENDENT_MASTER → the master's {@code user.id}) — unchanged from the
+     * original single-column projection and still the sole answer for the INDEPENDENT_MASTER
+     * identity arm.
+     *
+     * <p>{@code salonId} is non-null iff the definition is SALON-owned, null for an
+     * INDEPENDENT_MASTER-owned definition. It lets {@code AuthorizationService} resolve a
+     * {@code SALON_ADMIN} through {@code hasManagementAccess(salonId, actorId, actorRole)} —
+     * the existing salon-management rule {@code canManageSalon} already delegates to — without a
+     * second query. An admin's actor id never equals {@code ownerUserId} (that is always the
+     * owner's id), which is exactly the bug this projection extension fixes.
+     *
+     * <p>{@code salonOwnerId} (Phase 306 audit fix #1, backend-perf MEDIUM) is the salon's
+     * {@code owner.id}, named distinctly from {@code ownerUserId} so the SALON_OWNER identity
+     * check does not have to reason about {@code ownerUserId}'s polymorphic meaning (salon owner
+     * OR independent master, depending on {@code ownerType}). It is non-null exactly when
+     * {@code salonId} is non-null, and always equal to {@code ownerUserId} on that branch — it
+     * rides the SAME {@code LEFT JOIN Salon s} used to resolve {@code salonId}, so adding it costs
+     * no extra join and no extra query.
+     */
+    interface ServiceOwnerAccess {
+        UUID getOwnerUserId();
+
+        UUID getSalonId();
+
+        UUID getSalonOwnerId();
+    }
+
+    /**
+     * Resolves the {@link ServiceOwnerAccess} projection in a single query, avoiding the
+     * two-query chain (load ServiceDefinition + load Salon or Master) previously used in
      * AuthorizationService.canManageServiceDefinition.
+     *
+     * <p>Phase 306 D3 — extended beyond the bare owner user UUID to also project the definition's
+     * salon id (see {@link ServiceOwnerAccess}), so {@code canManageServiceDefinition} and
+     * {@code enforceCanManageServiceDefinition} can resolve a SALON_ADMIN via salon-management
+     * access in the SAME query, not a second round-trip.
+     *
+     * <p>{@code salonId} and {@code salonOwnerId} ride for free on the existing {@code Salon s}
+     * LEFT JOIN: {@code s} is only non-null when {@code sd.ownerType = SALON} (the join's own
+     * {@code ON} condition), so both are already null on the INDEPENDENT_MASTER branch with no
+     * extra CASE needed.
      *
      * Returns empty when no ServiceDefinition with the given id exists.
      */
@@ -32,13 +73,15 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             SELECT CASE sd.ownerType
                 WHEN 'SALON' THEN s.owner.id
                 ELSE m.user.id
-            END
+            END AS ownerUserId,
+            s.id AS salonId,
+            s.owner.id AS salonOwnerId
             FROM ServiceDefinition sd
             LEFT JOIN Salon s ON s.id = sd.ownerId AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
             LEFT JOIN Master m ON m.id = sd.ownerId AND sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
             WHERE sd.id = :serviceDefId
             """)
-    Optional<UUID> findOwnerUserId(@Param("serviceDefId") UUID serviceDefId);
+    Optional<ServiceOwnerAccess> findOwnerUserId(@Param("serviceDefId") UUID serviceDefId);
 
     /**
      * Loads a ServiceDefinition together with its serviceType in a single JOIN FETCH

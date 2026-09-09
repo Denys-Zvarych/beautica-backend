@@ -55,6 +55,12 @@ public class AuthorizationService {
      * Use for: update, invite, schedule management operations.
      * Do NOT use for: delete/deactivate or admin-invite operations — those must also
      * check hasRole('SALON_OWNER') at the call site (e.g., @PreAuthorize annotation).
+     *
+     * <p>Deliberate, user-approved exception (Phase 306 D5, 2026-09-08): {@code DELETE
+     * /services/{id}} uses this method — via {@link #enforceCanManageServiceDefinition} — as the
+     * SOLE scoping guard, admitting SALON_ADMIN to deactivate a ServiceDefinition without an
+     * additional {@code hasRole('SALON_OWNER')} check at the call site. Every other delete/
+     * deactivate call site still needs that extra role check; do not generalize this one carve-out.
      */
     public boolean hasManagementAccess(UUID salonId, UUID actorId) {
         if (salonId == null) return false;
@@ -213,11 +219,30 @@ public class AuthorizationService {
      * returns {@code false} for an unknown id (anti-bug §B/§D — never leak existence via
      * a distinct status).
      *
-     * @throws ForbiddenException if the actor is not the owner of the definition's parent
+     * <p>Phase 306 D3 — shares the SpEL gate's projection AND its predicate shape: SALON-owned
+     * (non-null {@code salonId}) resolves through salon-management access (admitting the salon's
+     * SALON_OWNER and SALON_ADMIN — see {@link #canManageServiceOwnerAccess}), INDEPENDENT_MASTER-
+     * owned (null {@code salonId}) still resolves by identity. Kept equivalent to
+     * {@link #canManageServiceDefinition} on purpose — this is the service-layer half of DELETE's
+     * defense-in-depth (called from {@code ServiceCatalogService.deactivateServiceDefinition}), so
+     * D5's SALON_ADMIN widening at the controller's role gate is meaningless unless this predicate
+     * agrees.
+     *
+     * <p>Per-role query cost (Phase 306 audit fix #1, backend-perf MEDIUM — restored, not traded
+     * away): INDEPENDENT_MASTER-owned → 1 query ({@code findOwnerUserId} only). SALON-owned +
+     * SALON_OWNER actor → 1 query (in-memory {@code salonOwnerId} compare, no
+     * {@code hasManagementAccess} round-trip). SALON-owned + SALON_ADMIN actor → 2 queries
+     * ({@code findOwnerUserId} then {@code hasManagementAccess}'s {@code findSalonIdById} — the
+     * admin's salon assignment is not in the JWT, so this second round-trip is unavoidable).
+     * {@code roleFromCurrentAuthentication()} is only invoked on the SALON-owned branch — the
+     * INDEPENDENT_MASTER-owned branch never touches {@code SecurityContextHolder}.
+     *
+     * @throws ForbiddenException if the actor cannot manage the definition's parent
      */
     public void enforceCanManageServiceDefinition(UUID actorId, UUID serviceDefId) {
         boolean allowed = serviceRepository.findOwnerUserId(serviceDefId)
-                .map(ownerUserId -> ownerUserId.equals(actorId))
+                .map(access -> canManageServiceOwnerAccess(access, actorId,
+                        access.getSalonId() != null ? roleFromCurrentAuthentication() : null))
                 .orElse(false);
         if (!allowed) {
             throw new ForbiddenException("Access denied");
@@ -455,29 +480,77 @@ public class AuthorizationService {
     }
 
     /**
-     * Returns true iff the authenticated actor owns the parent entity of the given
-     * ServiceDefinition:
-     *   ownerType == SALON              → actor must own the salon (ownerId is salonId)
-     *   ownerType == INDEPENDENT_MASTER → actor must be the master's own user (ownerId is masterId)
+     * Returns true iff the authenticated actor may manage the parent entity of the given
+     * ServiceDefinition — Phase 306 D1: salon-management access, not ownership:
+     *   ownerType == SALON              → actor must have management access to that salon
+     *                                      (owner OR admin of it — {@link #hasManagementAccess})
+     *   ownerType == INDEPENDENT_MASTER → actor must be the master's own user (unchanged)
      *
      * Returns false — causing 403 — when the service definition does not exist.
      *
-     * Role fast-path: CLIENT, SALON_MASTER, and SALON_ADMIN can never own a ServiceDefinition,
-     * so they are rejected immediately without any DB round-trip (timing-oracle MEDIUM-1).
-     * Only SALON_OWNER and INDEPENDENT_MASTER proceed to the ownership query.
+     * <p>Role fast-path (D2): CLIENT and SALON_MASTER can never manage a ServiceDefinition, so
+     * they are rejected immediately without any DB round-trip (timing-oracle MEDIUM-1). Only
+     * SALON_OWNER, SALON_ADMIN and INDEPENDENT_MASTER proceed to the ownership query — SALON_ADMIN
+     * was excluded here before Phase 306; {@code canManageSalon} already admitted it, so the two
+     * gates had drifted (background section of the phase doc).
      *
-     * A single JPQL projection query resolves the owner's user UUID directly,
-     * eliminating the two-query chain used previously.
+     * <p>A single JPQL projection query ({@link ServiceRepository.ServiceOwnerAccess}, D3)
+     * resolves the owner's user UUID, the salon id (when SALON-owned), AND the salon's owner id
+     * directly, eliminating the two-query chain used previously.
+     *
+     * <p>Per-role query cost (Phase 306 audit fix #1, backend-perf MEDIUM — D3's single-query
+     * property restored, not traded away): INDEPENDENT_MASTER-owned → 1 query. SALON-owned +
+     * SALON_OWNER actor → 1 query (in-memory {@code salonOwnerId} compare — the projection's
+     * {@code salonOwnerId} rides the same {@code LEFT JOIN Salon s} that resolves {@code salonId},
+     * so no {@code hasManagementAccess} round-trip is needed). SALON-owned + SALON_ADMIN actor →
+     * 2 queries ({@code findOwnerUserId} then {@code hasManagementAccess}'s
+     * {@code findSalonIdById} — the admin's salon assignment is not in the JWT, so this second
+     * round-trip is unavoidable). See {@link #canManageServiceOwnerAccess} for the shared
+     * predicate this method and {@link #enforceCanManageServiceDefinition} both delegate to.
      */
     public boolean canManageServiceDefinition(Authentication auth, UUID serviceDefId) {
         boolean mayManage = auth.getAuthorities().stream().anyMatch(a ->
                 a.getAuthority().equals("ROLE_SALON_OWNER")
+                        || a.getAuthority().equals("ROLE_SALON_ADMIN")
                         || a.getAuthority().equals("ROLE_INDEPENDENT_MASTER"));
-        if (!mayManage) return false;  // CLIENT / SALON_MASTER / SALON_ADMIN → 403, no DB hit
+        if (!mayManage) return false;  // CLIENT / SALON_MASTER → 403, no DB hit
         UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
         return serviceRepository.findOwnerUserId(serviceDefId)
-                .map(ownerUserId -> ownerUserId.equals(actorId))
+                .map(access -> canManageServiceOwnerAccess(access, actorId, actorRole))
                 .orElse(false);
+    }
+
+    /**
+     * Shared predicate behind {@link #canManageServiceDefinition} and
+     * {@link #enforceCanManageServiceDefinition} — kept in ONE place so the SpEL gate and the
+     * service-layer defense-in-depth guard cannot drift (Phase 306 audit finding #4/case 16).
+     *
+     * <p>{@code actorRole} may be {@code null} when {@code access.getSalonId() == null}
+     * (INDEPENDENT_MASTER-owned branch never needs a role, so callers without an
+     * {@code Authentication} — {@link #enforceCanManageServiceDefinition} — are not forced to
+     * resolve {@code roleFromCurrentAuthentication()} and risk an unrelated "Not authenticated"
+     * failure on a request that never touches {@code SecurityContextHolder}).
+     *
+     * <p>Fix #2 (backend-security LOW): both branches compare with {@link Objects#equals}, never
+     * a bare {@code .equals(...)} — a SALON-owned {@link ServiceDefinition} whose salon row was
+     * deleted (deactivated, not deleted — {@code SalonService.java:1026}; {@code owner_id} carries
+     * no FK) projects {@code salonId == null AND ownerUserId == null}. That orphan now falls
+     * through to the null-safe identity compare below and is denied (403), never NPEs (500).
+     */
+    private boolean canManageServiceOwnerAccess(
+            ServiceRepository.ServiceOwnerAccess access, UUID actorId, Role actorRole) {
+        if (access.getSalonId() == null) {
+            // INDEPENDENT_MASTER-owned, or an orphaned definition (salonId AND ownerUserId both
+            // null) — fail closed rather than NPE.
+            return Objects.equals(access.getOwnerUserId(), actorId);
+        }
+        if (actorRole == Role.SALON_OWNER) {
+            return Objects.equals(access.getSalonOwnerId(), actorId);
+        }
+        // SALON_ADMIN (or any other role reaching this branch): admin's salon assignment isn't in
+        // the JWT, so the 2nd query inside hasManagementAccess is unavoidable.
+        return hasManagementAccess(access.getSalonId(), actorId, actorRole);
     }
 
     /**

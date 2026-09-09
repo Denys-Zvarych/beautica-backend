@@ -9,6 +9,7 @@ import com.beautica.service.dto.DuplicateServiceErrorResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.ServicePriceShapeMismatchErrorResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
@@ -118,6 +119,24 @@ public class ServiceController {
                     + "code; the body carries no machine-readable code and `message` is generic.";
 
     /**
+     * Description attached to the {@code 400 SERVICE_PRICE_SHAPE_MISMATCH} declaration on
+     * {@link #bulkCreateMasterServices} — the only endpoint that can raise it. Inherited from
+     * Phase 302 (see {@link ServicePriceShapeMismatchErrorResponse}): the wire contract has been
+     * live and correct since Phase 302 shipped, but Phase 302 was forbidden from touching this
+     * file, so the declaration was missing from {@code /api-docs} until now. The sibling
+     * independent-master bulk endpoint never reuses another owner's definition, so it cannot
+     * raise this error and does not carry this declaration.
+     */
+    private static final String SERVICE_PRICE_SHAPE_MISMATCH_400 =
+            "A batch item's price shape cannot be represented against the salon's existing "
+                    + "active definition for that service type, which this item would reuse "
+                    + "(master_services carries only a price floor override, no per-master "
+                    + "ceiling or price type). The whole batch is rejected — nothing was "
+                    + "written. Branch on `data.code` == SERVICE_PRICE_SHAPE_MISMATCH; "
+                    + "`data.salonPriceType`/`salonPriceMin`/`salonPriceMax` name the salon's "
+                    + "governing shape.";
+
+    /**
      * Description attached to the {@code 429} declaration on every write endpoint in this
      * controller. {@code AuthRateLimitFilter} throttles the single-item write routes
      * (create / update / photo / deactivate) at {@code app.rate-limit.service-write-capacity}
@@ -164,7 +183,10 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/salons/{salonId}/services")
-    @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
+    // Phase 306 D4 — role-only conjunct dropped; @authz.canManageSalon already admits both
+    // SALON_OWNER (by ownership) and SALON_ADMIN (by salon assignment), matching the bulk
+    // on-behalf endpoint below, which never had the extra hasRole conjunct.
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> addServiceToSalon(
             @PathVariable UUID salonId,
             @Valid @RequestBody CreateServiceDefinitionRequest request
@@ -186,7 +208,11 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/salons/{salonId}/masters/{masterId}/services")
-    @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    // Phase 306 D4 — role-only conjunct dropped; @authz.canManageSalon already admits both
+    // SALON_OWNER (by ownership) and SALON_ADMIN (by salon assignment), matching the bulk
+    // on-behalf endpoint below, which never had the extra hasRole conjunct. masterBelongsToSalon
+    // is unchanged — it closes the timing-oracle IDOR regardless of caller role.
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> assignServiceToMaster(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
@@ -381,6 +407,9 @@ public class ServiceController {
                     responseCode = "409", description = DUPLICATE_SERVICE_PER_MASTER_409,
                     content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "400", description = SERVICE_PRICE_SHAPE_MISMATCH_400,
+                    content = @Content(schema = @Schema(implementation = ServicePriceShapeMismatchErrorResponse.class))),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "503", description = BULK_LOCK_TIMEOUT_503),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "429", description = RATE_LIMITED_429)
@@ -408,10 +437,13 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @DeleteMapping("/services/{serviceDefId}")
-    // Role-only fast gate here; ownership is enforced once inside the service against the
-    // already-needed findOwnerUserId projection (anti-bug §D split — no duplicate SpEL
-    // canManage* lookup that would issue a second round-trip).
-    @PreAuthorize("hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER')")
+    // Role-only fast gate here; salon-management/ownership is enforced once inside the service
+    // against the already-needed findOwnerUserId projection (anti-bug §D split — no duplicate
+    // SpEL canManage* lookup that would issue a second round-trip). Phase 306 D5 — SALON_ADMIN
+    // added for full parity with the other service-management writes; the salon-scoping that
+    // keeps this safe lives in enforceCanManageServiceDefinition (D3), which this role-only gate
+    // shares with PATCH.
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
     public ResponseEntity<Void> deactivateServiceDefinition(
             @PathVariable UUID serviceDefId,
             Authentication authentication

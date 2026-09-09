@@ -9,6 +9,8 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.UpdateServiceDefinitionRequest;
+import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.entity.PriceType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -212,6 +214,303 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 .as("status must be 403 when INDEPENDENT_MASTER A tries to delete INDEPENDENT_MASTER B's service, serviceDefId=%s",
                         masterBServiceId)
                 .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    // ── Phase 306 — SALON_ADMIN parity on service management (negative arms) ───
+
+    @Test
+    @DisplayName("Phase 306 case 5: POST /salons/{salonAId}/services — 403 when a SALON_ADMIN of a DIFFERENT salon adds a service; nothing written")
+    void should_return403_when_salonAdminOfDifferentSalonAddsService() throws Exception {
+        // Arrange
+        UUID salonAId = fixtures.insertSalonWithOwner("Owner A Salon (306 admin cross)");
+        String adminBToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Owner B Salon (306 admin cross)"),
+                "p306-adminb-add-" + System.nanoTime() + "@beautica.test");
+
+        var request = new CreateServiceDefinitionRequest(
+                "IDOR Service", null, "NAIL_SERVICE", 30, 0,
+                PriceType.FIXED, new BigDecimal("100.00"), null, null,
+                fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
+
+        long countBefore = fixtures.countServiceDefinitionsForOwner("SALON", salonAId);
+
+        // Act
+        log.debug("Act: POST /api/v1/salons/{}/services as a SALON_ADMIN of a different salon — must be blocked", salonAId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonAId + "/services", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(adminBToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(fixtures.countServiceDefinitionsForOwner("SALON", salonAId))
+                .as("cross-salon admin's rejected POST must not have written anything")
+                .isEqualTo(countBefore);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 5: POST /salons/{salonAId}/masters/{masterAId}/services — 403 when a SALON_ADMIN of a DIFFERENT salon assigns a service; nothing written")
+    void should_return403_when_salonAdminOfDifferentSalonAssignsService() throws Exception {
+        // Arrange
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-ownera-assign-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon (306 assign cross)");
+        UUID masterAId = fixtures.createSalonMaster(salonAId);
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Salon A Service (306)");
+
+        String adminBToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Owner B Salon (306 assign cross)"),
+                "p306-adminb-assign-" + System.nanoTime() + "@beautica.test");
+
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        // Act
+        log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as a SALON_ADMIN of a different salon — must be blocked",
+                salonAId, masterAId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonAId + "/masters/" + masterAId + "/services", HttpMethod.POST,
+                new HttpEntity<>(request, fixtures.bearerHeaders(adminBToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        Integer assignmentCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ? AND service_def_id = ?",
+                Integer.class, masterAId, serviceDefId);
+        assertThat(assignmentCount)
+                .as("cross-salon admin's rejected assignment must not have written a master_services row")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 5: PATCH /services/{id} — 403 when a SALON_ADMIN of a DIFFERENT salon patches a service; row unchanged")
+    void should_return403_when_salonAdminOfDifferentSalonPatchesService() throws Exception {
+        // Arrange
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-ownera-patch-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon (306 patch cross)");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Salon A Service (306 patch)");
+
+        String adminBToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Owner B Salon (306 patch cross)"),
+                "p306-adminb-patch-" + System.nanoTime() + "@beautica.test");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Hijacked Name", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as a SALON_ADMIN of a different salon — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(adminBToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT name FROM service_definitions WHERE id = ?", String.class, serviceDefId))
+                .as("the rejected cross-salon PATCH must not have changed the row")
+                .isEqualTo("Salon A Service (306 patch)");
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 5: PATCH /services/{id}/photo — 403 when a SALON_ADMIN of a DIFFERENT salon sets the photo")
+    void should_return403_when_salonAdminOfDifferentSalonSetsServicePhoto() throws Exception {
+        // Arrange
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-ownera-photo-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon (306 photo cross)");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Salon A Service (306 photo)");
+
+        String adminBToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Owner B Salon (306 photo cross)"),
+                "p306-adminb-photo-" + System.nanoTime() + "@beautica.test");
+
+        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/hijack.jpg");
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{}/photo as a SALON_ADMIN of a different salon — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
+                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(adminBToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT photo_url FROM service_definitions WHERE id = ?", String.class, serviceDefId))
+                .as("the rejected cross-salon photo PATCH must not have changed the row")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 7 (negative arm): DELETE /services/{id} — 403 when a SALON_ADMIN of a DIFFERENT salon deletes a service; it stays active")
+    void should_return403_when_salonAdminOfDifferentSalonDeletesService() throws Exception {
+        // Arrange
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-ownera-del-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon (306 delete cross)");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Salon A Service (306 delete)");
+
+        String adminBToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Owner B Salon (306 delete cross)"),
+                "p306-adminb-del-" + System.nanoTime() + "@beautica.test");
+
+        // Act
+        log.debug("Act: DELETE /api/v1/services/{} as a SALON_ADMIN of a different salon — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(adminBToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT is_active FROM service_definitions WHERE id = ?", Boolean.class, serviceDefId))
+                .as("the definition must stay active after the rejected cross-salon DELETE")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 8: PATCH /services/{id} — 403 when SALON_MASTER (read-only role) patches a service (D6 — SALON_MASTER gains nothing)")
+    void should_return403_when_salonMasterPatchesService() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-master-patch-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 SALON_MASTER Patch Salon");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Salon Service (306 master patch)");
+        String masterToken = fixtures.createSalonMasterAndGetToken(
+                salonId, "p306-master-patch-" + System.nanoTime() + "@beautica.test");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Hijacked by master", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as SALON_MASTER (read-only) — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(masterToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 8: PATCH /services/{id}/photo — 403 when SALON_MASTER (read-only role) sets the photo (D6)")
+    void should_return403_when_salonMasterSetsServicePhoto() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-master-photo-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 SALON_MASTER Photo Salon");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Salon Service (306 master photo)");
+        String masterToken = fixtures.createSalonMasterAndGetToken(
+                salonId, "p306-master-photo-" + System.nanoTime() + "@beautica.test");
+
+        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/master-hijack.jpg");
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{}/photo as SALON_MASTER (read-only) — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
+                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(masterToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 9: PATCH /services/{id} — 403 when CLIENT patches a service")
+    void should_return403_when_clientPatchesService() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-client-patch-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 CLIENT Patch Salon");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Salon Service (306 client patch)");
+        String clientToken = fixtures.createClientAndGetToken(
+                "p306-client-patch-" + System.nanoTime() + "@beautica.test");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Hijacked by client", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as CLIENT — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(clientToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 9: PATCH /services/{id}/photo — 403 when CLIENT sets the photo")
+    void should_return403_when_clientSetsServicePhoto() throws Exception {
+        // Arrange
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "p306-owner-client-photo-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P306 CLIENT Photo Salon");
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Salon Service (306 client photo)");
+        String clientToken = fixtures.createClientAndGetToken(
+                "p306-client-photo-" + System.nanoTime() + "@beautica.test");
+
+        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/client-hijack.jpg");
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{}/photo as CLIENT — must be blocked", serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
+                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(clientToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 10 (negative arm): PATCH /services/{id} — 403 when INDEPENDENT_MASTER A patches INDEPENDENT_MASTER B's service definition")
+    void should_return403_when_independentMasterAPatchesIndependentMasterBService() throws Exception {
+        // Arrange — master B creates a service
+        String masterBToken = fixtures.createIndependentMasterAndGetToken(
+                "p306-indep-b-patch-" + System.nanoTime() + "@beautica.test");
+        UUID masterBServiceId = fixtures.createIndependentMasterService(masterBToken, "Master B Service (306)");
+
+        // Arrange — master A (different independent master)
+        String masterAToken = fixtures.createIndependentMasterAndGetToken(
+                "p306-indep-a-patch-" + System.nanoTime() + "@beautica.test");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Hijacked by master A", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as INDEPENDENT_MASTER A — cross-master IDOR must be blocked",
+                masterBServiceId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + masterBServiceId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(masterAToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 306 case 11: PATCH /services/{id} — 403 when a SALON_ADMIN edits a definition owned by an INDEPENDENT_MASTER (the SALON and INDEPENDENT_MASTER arms do not leak into each other)")
+    void should_return403_when_salonAdminEditsIndependentMasterOwnedService() throws Exception {
+        // Arrange — an independent master creates a service
+        String indepToken = fixtures.createIndependentMasterAndGetToken(
+                "p306-indep-vs-admin-" + System.nanoTime() + "@beautica.test");
+        UUID indepServiceId = fixtures.createIndependentMasterService(indepToken, "Independent Master Service (306)");
+
+        // Arrange — an unrelated salon's admin
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Unrelated Salon (306 admin-vs-indep)"),
+                "p306-admin-vs-indep-" + System.nanoTime() + "@beautica.test");
+
+        var patch = new UpdateServiceDefinitionRequest(
+                "Hijacked by unrelated admin", null, null, null, null, null, null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH /api/v1/services/{} as an unrelated SALON_ADMIN — arms must not leak into each other",
+                indepServiceId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/services/" + indepServiceId, HttpMethod.PATCH,
+                new HttpEntity<>(patch, fixtures.bearerHeaders(adminToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
     }
 
 }

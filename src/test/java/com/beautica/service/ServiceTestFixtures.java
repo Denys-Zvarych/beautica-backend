@@ -204,6 +204,41 @@ class ServiceTestFixtures {
     }
 
     /**
+     * Creates a SALON_MASTER user assigned to {@code salonId} (users.salon_id) and returns a
+     * bearer token. Phase 306 D2/D6 role fast-path rejects SALON_MASTER before any master-row or
+     * salon lookup, so no {@code masters} row is required for the read-only-role rejection tests
+     * this backs.
+     */
+    String createSalonMasterAndGetToken(UUID salonId, String email) throws Exception {
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, true, true)",
+                UUID.randomUUID(), email, hash, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    /** Seeds an email-verified CLIENT and logs in, returning a fresh access token. */
+    String createClientAndGetToken(String email) throws Exception {
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'CLIENT', true, true)",
+                UUID.randomUUID(), email, passwordEncoder.encode(TEST_PASSWORD));
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode())
+                .as("seeded CLIENT must log in, body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    /**
      * Materialises the owner-operated {@code masters} row (the Phase 12.4
      * {@code POST /salons/{salonId}/master} endpoint) and returns its {@code masters.id}. That
      * row's {@code salon_id} is the owner's own salon, so it takes the salon bulk-create branch
