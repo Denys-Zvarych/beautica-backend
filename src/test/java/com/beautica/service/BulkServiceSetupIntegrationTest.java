@@ -11,6 +11,7 @@ import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServicePriceShapeMismatchResponse;
+import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -27,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -35,7 +37,9 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.io.InputStream;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CyclicBarrier;
@@ -1124,6 +1128,138 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(definitionRow(sharedDefId))
                 .as("reuse must never rewrite the salon's shared definition")
                 .isEqualTo(before);
+    }
+
+    // ══ Phase 303 case 10 — a V164-backfilled definition is visible in the catalogue too ══
+    //
+    // A pre-302 service is persisted exactly like insertActiveDefinitionWithoutAssignment above
+    // (ownerType='INDEPENDENT_MASTER', ownerId=master.id) PLUS an active master_services row, then
+    // V164's SQL body is re-applied directly against this Spring-managed dataSource — Testcontainers
+    // already ran V164 once at boot, on an empty schema, where it was the documented no-op, so it
+    // will not re-run through Flyway. Re-executing its body is the same technique
+    // V164SalonOwnedBackfillMigrationTest uses to exercise the migration against legacy-shaped data,
+    // and here it runs through the real HTTP catalogue endpoint the phase doc names for case 10.
+
+    private static String v164MigrationSql;
+
+    private String v164Sql() throws Exception {
+        if (v164MigrationSql == null) {
+            try (InputStream in = new ClassPathResource(
+                    "db/migration/V164__backfill_salon_owned_master_service_definitions.sql")
+                    .getInputStream()) {
+                v164MigrationSql = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        }
+        return v164MigrationSql;
+    }
+
+    /** One simple-query {@code Statement.execute} call — see the class javadoc on the sibling
+     * migration test for why the WHOLE script must be sent as a single call. */
+    private void applyV164Backfill() throws Exception {
+        try (var conn = jdbcTemplate.getDataSource().getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.execute(v164Sql());
+        }
+    }
+
+    @Test
+    @DisplayName("Phase 303 case 10: a pre-302, V164-backfilled service appears in "
+            + "GET /salons/{salonId}/services, promoted owner_type='SALON'")
+    void should_listBackfilledService_when_v164HasPromotedALegacyMasterOwnedDefinition() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-303-backfill-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 303 Backfill Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+
+        log.debug("Arrange: a pre-302 legacy row — INDEPENDENT_MASTER-owned, salon-bound master, "
+                + "with an active assignment — the exact shape V164 backfills");
+        UUID legacyDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterId, legacyDefId);
+
+        assertThat(catalogueServiceIds(salonId))
+                .as("precondition: before V164 runs, a legacy INDEPENDENT_MASTER-owned row is "
+                        + "invisible in the salon catalogue — reproduces the defect Phase 303 fixes")
+                .doesNotContain(legacyDefId);
+
+        log.debug("Act: re-apply V164's SQL body against this legacy row");
+        applyV164Backfill();
+
+        assertThat(definitionRow(legacyDefId))
+                .as("V164 promotes the legacy definition to SALON ownership")
+                .containsEntry("owner_type", "SALON")
+                .containsEntry("owner_id", salonId);
+        assertThat(catalogueServiceIds(salonId))
+                .as("the whole point of Phase 303: a pre-302 service now appears in the catalogue")
+                .contains(legacyDefId);
+    }
+
+    // ══ Phase 303 QA gap 1 (security INFO, closed here) — the ownership flip must be provable over
+    // HTTP, not just at the DB-row level. Phase 302 D7: BEFORE V164 runs, a legacy
+    // INDEPENDENT_MASTER-owned definition belonging to a salon-bound master is unreachable by EVERY
+    // role — AuthorizationService.canManageServiceDefinition resolves the owner user id off
+    // ServiceRepository.findOwnerUserId's INDEPENDENT_MASTER branch (the MASTER's own user, never
+    // the salon owner), and the salon master's real role is SALON_MASTER, which fails
+    // canManageServiceDefinition's role gate before any DB lookup runs at all. V164's whole
+    // user-visible point is that the salon owner regains PATCH/DELETE on these rows — this test
+    // proves it end-to-end through the real endpoints, both BEFORE (403) and AFTER (200/204) V164.
+    @Test
+    @DisplayName("Phase 303 gap 1: PATCH/DELETE on a legacy definition is 403 for the salon owner "
+            + "BEFORE V164, and succeeds AFTER V164 promotes it to SALON ownership")
+    void should_letSalonOwnerPatchAndDeleteBackfilledDefinition_onlyAfterV164Promotion() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-303-http-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 303 HTTP Reachability Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+
+        log.debug("Arrange: the exact pre-302 legacy shape — INDEPENDENT_MASTER-owned, salon-bound "
+                + "master, with an active assignment");
+        UUID legacyDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterId, legacyDefId);
+
+        var rename = new UpdateServiceDefinitionRequest(
+                "Renamed After Backfill", null, null, null, null, null, null, null, null, null);
+
+        log.debug("Act: salon owner attempts PATCH on the legacy row BEFORE V164 runs");
+        ResponseEntity<String> patchBefore = restTemplate.exchange(
+                "/api/v1/services/" + legacyDefId, HttpMethod.PATCH,
+                new HttpEntity<>(rename, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(patchBefore.getStatusCode())
+                .as("precondition reproducing Phase 302 D7: a pre-302 row is unreachable by EVERY "
+                        + "role, including the salon owner who nominally manages this master's salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+
+        log.debug("Act: apply V164 to promote the legacy row to SALON ownership");
+        applyV164Backfill();
+
+        log.debug("Act: salon owner PATCHes the NOW-backfilled row");
+        ResponseEntity<String> patchAfter = restTemplate.exchange(
+                "/api/v1/services/" + legacyDefId, HttpMethod.PATCH,
+                new HttpEntity<>(rename, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(patchAfter.getStatusCode())
+                .as("the whole point of gap 1: V164's ownership flip must be reachable through the "
+                        + "real PATCH endpoint, not merely visible as owner_type='SALON' in the DB")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(definitionRow(legacyDefId)).containsEntry("name", "Renamed After Backfill");
+
+        log.debug("Act: salon owner DELETEs (deactivates) the backfilled row");
+        ResponseEntity<Void> deleteAfter = restTemplate.exchange(
+                "/api/v1/services/" + legacyDefId, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), Void.class);
+        assertThat(deleteAfter.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        Boolean isActive = jdbcTemplate.queryForObject(
+                "SELECT is_active FROM service_definitions WHERE id = ?", Boolean.class, legacyDefId);
+        assertThat(isActive)
+                .as("DELETE on a backfilled definition must reach the real deactivation path too — "
+                        + "V164's repair covers BOTH PATCH and DELETE, not just GET/catalogue visibility")
+                .isFalse();
     }
 
     /** Case 6 — divergence lands on the assignment, never on the shared definition. */
