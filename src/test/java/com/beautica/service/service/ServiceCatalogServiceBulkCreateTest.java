@@ -99,6 +99,10 @@ class ServiceCatalogServiceBulkCreateTest {
     @Mock private ServiceTypeSearchService serviceTypeSearchService;
     @Mock private ServiceTypeRepository serviceTypeRepository;
     @Mock private CacheManager cacheManager;
+    // Phase 304 D1: the salon on-behalf branch now evicts the salon-service-catalog cache via
+    // this collaborator (evictSalonCatalogAfterCommit -> salonCatalogCacheEvictor.evict). Mocked
+    // (rather than left null) so that call is a no-op default-Mockito-stub instead of an NPE.
+    @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
     @InjectMocks private ServiceCatalogService serviceCatalogService;
 
@@ -325,6 +329,64 @@ class ServiceCatalogServiceBulkCreateTest {
         lockOrder.verify(serviceTypeRepository).findAllById(anyList());
         lockOrder.verify(masterServiceRepository).acquireBulkSetupLockWithTimeout(salonId);
         lockOrder.verify(serviceRepository).findSalonBulkSetupCandidates(any(), any(), any());
+    }
+
+    /**
+     * Phase 304 gap (perf INFO): both {@code ServiceCatalogServiceCacheTest} cases 5-8 use a
+     * ONE-item bulk request, so nothing pins that an N-item batch evicts the salon catalogue
+     * ONCE, not N times. The eviction call sits AFTER {@code request.items().stream()...toList()}
+     * in {@code bulkCreateForMaster} — outside the per-item loop — so today it cannot thrash. A
+     * future refactor moving it into {@code createSingleFromBulkItem} (called once per item)
+     * would silently turn every bulk-onboarding call into N cache evictions instead of 1, and
+     * nothing before this test would catch it.
+     *
+     * <p><b>Mutation-red:</b> moving {@code evictSalonCatalogAfterCommit(ownerId)} out of
+     * {@code bulkCreateForMaster} and into the body of {@code createSingleFromBulkItem} (so it
+     * runs once per stream element) turns {@code times(1)} into an observed {@code times(3)} for
+     * this 3-item batch — this test goes red on a real behavioural regression, not a mock wiring
+     * change.
+     */
+    @Test
+    @DisplayName("Phase 304 — a 3-item salon on-behalf batch evicts the salon catalogue exactly "
+            + "ONCE, not once per item")
+    void should_evictSalonCatalogExactlyOnce_when_salonOnBehalfBatchHasMultipleItems() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId1 = UUID.randomUUID();
+        UUID typeId2 = UUID.randomUUID();
+        UUID typeId3 = UUID.randomUUID();
+
+        Salon salon = org.mockito.Mockito.mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+        Master master = org.mockito.Mockito.mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceType type1 = serviceType(typeId1, "Стрижка", "HAIR", true);
+        ServiceType type2 = serviceType(typeId2, "Манікюр", "NAIL_SERVICE", true);
+        ServiceType type3 = serviceType(typeId3, "Фарбування волосся", "HAIR", true);
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixedItem(typeId1, 45, "250.00"),
+                fixedItem(typeId2, 60, "350.00"),
+                rangeItem(typeId3, 120, "800.00", "1500.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type1, type2, type3));
+        when(platformCategoryRepository.findSelectableNamesIn(any()))
+                .thenReturn(List.of("HAIR", "NAIL_SERVICE"));
+        stubSaveEchoesEntities();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        assertThat(result).as("all three items persisted").hasSize(3);
+        verify(serviceRepository, times(3)).save(any(ServiceDefinition.class));
+
+        // No active Spring transaction in this pure-Mockito unit test, so
+        // evictSalonCatalogAfterCommit takes its synchronous else-branch and calls the evictor
+        // directly — exactly once for the whole batch, never once per item.
+        verify(salonCatalogCacheEvictor, times(1)).evict(salonId);
     }
 
     /**

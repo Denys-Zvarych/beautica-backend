@@ -4,7 +4,10 @@ import com.beautica.config.CacheConfig;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.EmailService;
+import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.entity.CatalogCategory;
@@ -30,6 +33,8 @@ import org.springframework.cache.annotation.Cacheable;
 import com.beautica.common.cache.CacheKeyFixtures;
 
 import org.springframework.data.domain.Pageable;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.lang.reflect.Method;
 import java.time.LocalDate;
@@ -532,5 +537,189 @@ class ServiceCatalogServiceCacheTest {
 
         assertThat(own).hasSize(1);
         assertThat(own.get(0).priceOverride()).isEqualByComparingTo(override);
+    }
+
+    // ── Phase 304 — bulkCreateSalonMasterServices salon-catalogue eviction (cases 5-8) ─────────
+
+    private BulkCreateServicesRequest oneItemBulkRequest(UUID serviceTypeId) {
+        return new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(
+                        serviceTypeId, 45, PriceType.FIXED, new BigDecimal("250.00"), null, null)));
+    }
+
+    /** Wires the mocks a happy-path {@code bulkCreateSalonMasterServices} call needs to succeed. */
+    private void stubBulkCreateHappyPath(UUID salonId, UUID masterId, UUID serviceTypeId) {
+        Salon salon = Salon.builder().id(salonId).build();
+        Master master = Master.builder().id(masterId).salon(salon).build();
+        ServiceType serviceType = ServiceType.builder()
+                .id(serviceTypeId)
+                .nameUk("Стрижка")
+                .nameEn("Haircut")
+                .slug("strizhka-304-" + serviceTypeId)
+                .platformCategoryName("HAIR")
+                .active(true)
+                .build();
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(any())).thenReturn(List.of(serviceType));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("HAIR"));
+        when(serviceRepository.save(any(ServiceDefinition.class))).thenAnswer(inv -> {
+            ServiceDefinition def = inv.getArgument(0);
+            def.setId(UUID.randomUUID());
+            return def;
+        });
+        when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenAnswer(inv -> {
+            MasterServiceAssignment msa = inv.getArgument(0);
+            msa.setId(UUID.randomUUID());
+            return msa;
+        });
+    }
+
+    @Test
+    @DisplayName("Phase 304 case 5: bulkCreateSalonMasterServices registers exactly one "
+            + "salon-catalogue eviction, for the target salon only — a sibling salon's cached "
+            + "entry survives untouched (D1)")
+    void should_evictOnlyTargetSalonCatalog_when_bulkCreateSalonMasterServicesCalled() {
+        UUID salonA = UUID.randomUUID();
+        UUID salonB = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        stubBulkCreateHappyPath(salonA, masterId, serviceTypeId);
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonA)).thenReturn(List.of());
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonB)).thenReturn(List.of());
+
+        // Warm both salons' catalogue entries.
+        serviceCatalogService.getSalonServiceCatalog(salonA);
+        serviceCatalogService.getSalonServiceCatalog(salonB);
+
+        // Act — no active Spring transaction here; the eviction runs immediately (else-branch).
+        serviceCatalogService.bulkCreateSalonMasterServices(salonA, masterId, oneItemBulkRequest(serviceTypeId));
+
+        // Salon A recomputes (evicted); salon B stays cached (per-key, not allEntries).
+        serviceCatalogService.getSalonServiceCatalog(salonA);
+        serviceCatalogService.getSalonServiceCatalog(salonB);
+
+        verify(masterServiceRepository, times(2)).findBookableAssignmentsBySalon(salonA);
+        verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonB);
+    }
+
+    @Test
+    @DisplayName("Phase 304 case 6: the salon-catalogue eviction from bulkCreateSalonMasterServices "
+            + "is registered as an afterCommit synchronization, never executed inline (D2)")
+    void should_deferSalonCatalogEvictionToAfterCommit_when_bulkCreateSalonMasterServicesCalled() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        stubBulkCreateHappyPath(salonId, masterId, serviceTypeId);
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        // Warm the catalogue cache.
+        serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            serviceCatalogService.bulkCreateSalonMasterServices(
+                    salonId, masterId, oneItemBulkRequest(serviceTypeId));
+
+            // MUTATION-RED for "move the eviction inline": an inline eviction would already have
+            // cleared this entry here, before commit — a parallel reader would then repopulate the
+            // cache from this pre-commit snapshot (anti-bug §F rule 2).
+            assertThat(cacheManager.getCache("salon-service-catalog").get(salonId))
+                    .as("commit has not happened yet (the synchronization is still active) — the "
+                            + "pre-write cache entry must still be present")
+                    .isNotNull();
+
+            List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
+            assertThat(syncs).as("an afterCommit callback must have been registered").isNotEmpty();
+            syncs.forEach(TransactionSynchronization::afterCommit);
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        assertThat(cacheManager.getCache("salon-service-catalog").get(salonId))
+                .as("after the simulated commit, the entry must be evicted")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 304 case 7: when the surrounding transaction rolls back before commit, the "
+            + "registered salon-catalogue eviction callback is discarded and never runs")
+    void should_neverEvictSalonCatalog_when_transactionRollsBackBeforeCommit() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        stubBulkCreateHappyPath(salonId, masterId, serviceTypeId);
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        // Warm the catalogue cache.
+        serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            serviceCatalogService.bulkCreateSalonMasterServices(
+                    salonId, masterId, oneItemBulkRequest(serviceTypeId));
+
+            List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
+            assertThat(syncs)
+                    .as("the callback must be registered even though the surrounding transaction "
+                            + "will now roll back")
+                    .isNotEmpty();
+
+            // Simulate a rollback: afterCommit is deliberately never invoked here — Spring would
+            // instead call afterCompletion(STATUS_ROLLED_BACK), which this callback does not
+            // override, so nothing evicts.
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        assertThat(cacheManager.getCache("salon-service-catalog").get(salonId))
+                .as("a rolled-back transaction must never evict the cache — the pre-write entry survives")
+                .isNotNull();
+    }
+
+    /**
+     * Phase 304 case 8. Asserts the two evictions {@code bulkCreateSalonMasterServices} actually
+     * fires today: {@code masterServices} (pre-existing, D3 — must stay unchanged) and
+     * {@code salon-service-catalog} (new, D1).
+     *
+     * <p><b>Deliberately does NOT assert {@code available-slots} or the bookable-verdict cache.</b>
+     * Unlike {@code deactivateServiceDefinition} (which removes a service from the bookable set and
+     * therefore must invalidate any cached slot list that could now be wrong), a bulk-CREATE only
+     * ADDS a brand-new service — no existing cached {@code available-slots}/bookable-verdict entry
+     * for THIS master can have gone stale, because no cache entry for the new service existed
+     * before this call. Reading D3's own wording ("the master-prefix sweeps... still fire alongside
+     * the new salon eviction") as requiring those two sweeps HERE as well would be asserting
+     * production behaviour that does not exist on this write path — grepping
+     * {@code bulkCreateForMaster} confirms it only ever called {@code evictMasterServicesCache},
+     * never {@code evictAvailableSlotsCache}/{@code evictBookableFutureSlotsCache}, both before and
+     * after this phase. Flagged in the phase 304 completion report rather than silently asserting a
+     * behaviour this method has never had.
+     */
+    @Test
+    @DisplayName("Phase 304 case 8: bulkCreateSalonMasterServices still evicts masterServices (D3, "
+            + "unchanged) alongside the new salon-catalogue eviction (D1) — both recompute on the "
+            + "very next read")
+    void should_evictBothMasterServicesAndSalonCatalog_when_bulkCreateSalonMasterServicesCalled() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceTypeId = UUID.randomUUID();
+        stubBulkCreateHappyPath(salonId, masterId, serviceTypeId);
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of());
+
+        // Warm both caches.
+        serviceCatalogService.getMasterServices(masterId);
+        serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, oneItemBulkRequest(serviceTypeId));
+
+        // Both must recompute on the very next read.
+        serviceCatalogService.getMasterServices(masterId);
+        serviceCatalogService.getSalonServiceCatalog(salonId);
+
+        verify(masterServiceRepository, times(2))
+                .findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class));
+        verify(masterServiceRepository, times(2)).findBookableAssignmentsBySalon(salonId);
     }
 }

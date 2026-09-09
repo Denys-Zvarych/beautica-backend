@@ -477,6 +477,14 @@ public class ServiceCatalogService {
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
         masterRepository.refreshMinEffectivePrice(master.getId());
         evictMasterServicesCache(List.of(master.getId()));
+        // Phase 304 D1: a SALON-branch batch persists SALON-owned definitions/assignments, which
+        // can change what GET /salons/{salonId}/services returns — evict that salon's catalogue
+        // after commit (REUSE-FIRST: the existing helper, called from one more place). The
+        // INDEPENDENT_MASTER branch's ownerId is the master's own row, not a salon id, so it stays
+        // a no-op here rather than mis-evicting a "salon" keyed by a master id.
+        if (ownerType == OwnerType.SALON) {
+            evictSalonCatalogAfterCommit(ownerId);
+        }
 
         return created;
     }
@@ -785,8 +793,10 @@ public class ServiceCatalogService {
         evictBookableFutureSlotsCache(affectedMasterIds);
 
         // Fix #2/#6 PERF: a SALON-owned definition leaving the bookable set changes the salon catalogue.
-        // findSalonOwnerId returns the salon id only for a SALON-owned def (empty → master-owned, no
-        // catalogue entry). Resolved before the UPDATE (deactivation flips is_active, not ownerType).
+        // findSalonOwnerId returns the salon id only for a SALON-owned def (empty → master-owned, which
+        // post-Phase-302 means an INDEPENDENT master with no salon catalogue entry to evict — a salon
+        // master's definitions are SALON-owned, so this branch already resolves their salon id).
+        // Resolved before the UPDATE (deactivation flips is_active, not ownerType).
         evictSalonCatalogAfterCommit(serviceRepository.findSalonOwnerId(serviceDefId).orElse(null));
 
         // Step 3: execute the update; check after registration so the callback is a

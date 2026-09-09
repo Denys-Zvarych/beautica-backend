@@ -5,9 +5,16 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.UpdateServiceDefinitionRequest;
+import com.beautica.service.entity.PriceType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -22,8 +29,10 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -52,6 +61,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ServiceCatalogFavoriteCacheIT extends AbstractIntegrationTest {
 
     private static final String MASTER_SERVICES_CACHE = "masterServices";
+    private static final String SALON_CATALOG_CACHE = "salon-service-catalog";
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
 
     @Autowired
@@ -66,6 +76,9 @@ class ServiceCatalogFavoriteCacheIT extends AbstractIntegrationTest {
     @Autowired
     private CacheManager cacheManager;
 
+    /** Shared HTTP-fixture helpers (salon/master/service-type setup) — REUSE-FIRST, not re-derived. */
+    private ServiceTestFixtures fixtures;
+
     /**
      * Clears {@code masterServices} explicitly before every test (D3) so ordering between tests
      * can never mask a leak — a neighbouring test's warm entry must never be what a later test's
@@ -78,6 +91,31 @@ class ServiceCatalogFavoriteCacheIT extends AbstractIntegrationTest {
         Cache cache = cacheManager.getCache(MASTER_SERVICES_CACHE);
         assertThat(cache).as("masterServices must be a registered CacheConfig cache").isNotNull();
         cache.clear();
+    }
+
+    /**
+     * Phase 304 — same belt-and-braces reasoning as {@link #clearMasterServicesCache()} above,
+     * applied to {@code salon-service-catalog}: a neighbouring test's warmed entry must never be
+     * what a Phase 304 staleness case's "first read" observes.
+     */
+    @BeforeEach
+    void clearSalonCatalogCache() {
+        Cache cache = cacheManager.getCache(SALON_CATALOG_CACHE);
+        assertThat(cache).as("salon-service-catalog must be a registered CacheConfig cache").isNotNull();
+        cache.clear();
+    }
+
+    /**
+     * Swaps in an HTTP client that supports {@code PATCH}/{@code DELETE} (the JDK default
+     * {@code SimpleClientHttpRequestFactory} cannot send a body on those verbs) — the same setup
+     * every sibling {@code service/} integration test uses (e.g. {@code BulkServiceSetupIntegrationTest},
+     * {@code ServicesIntegrationTest}).
+     */
+    @BeforeEach
+    void setUpFixtures() {
+        restTemplate.getRestTemplate().setRequestFactory(
+                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
     // ── D3 — the cache is genuinely on ──────────────────────────────────────────
@@ -243,6 +281,201 @@ class ServiceCatalogFavoriteCacheIT extends AbstractIntegrationTest {
         List<MasterServiceResponse> asOwner = getMasterServices(master, ownerToken);
 
         assertThat(asOwner).allSatisfy(row -> assertThat(row.isFavorite()).isNull());
+    }
+
+    // ── Phase 304 — salon catalogue cache eviction on master service writes ─────
+    //
+    // Full HTTP + real Postgres + real Caffeine `salon-service-catalog` cache, mirroring the
+    // masterServices isolation tests above. No test here manually evicts the cache before its
+    // "after write" GET (unlike BulkServiceSetupIntegrationTest's documented Phase-304 workaround)
+    // — the very point is proving the production write path evicts on its own.
+
+    @Test
+    @DisplayName("Phase 304 case 1: bulk-creating a service for a salon master evicts that salon's "
+            + "catalogue cache — the very next GET shows the new service, not the stale pre-write list")
+    void should_showNewService_when_salonMasterBulkCreatesAfterCatalogueWasCached() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken("cache-304-c1-owner@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 304 Case 1 Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+
+        // Populate the cache with the pre-write (empty) catalogue.
+        assertThat(catalogueServiceIds(salonId)).isEmpty();
+
+        UUID createdDefId = bulkCreateSalonMasterService(ownerToken, salonId, masterId);
+
+        assertThat(catalogueServiceIds(salonId))
+                .as("the service just bulk-created for this salon's master must appear in the "
+                        + "response body of the very next catalogue read — a missing eviction "
+                        + "would omit it here, not merely fail a mock verification")
+                .contains(createdDefId);
+    }
+
+    @Test
+    @DisplayName("Phase 304 case 2: renaming a service definition evicts the owning salon's "
+            + "catalogue cache — the very next GET shows the new name, not the stale one")
+    void should_showNewName_when_serviceDefinitionRenamedAfterCatalogueWasCached() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken("cache-304-c2-owner@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 304 Case 2 Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+        UUID serviceDefId = bulkCreateSalonMasterService(ownerToken, salonId, masterId);
+
+        // Populate the cache with the pre-rename name.
+        String originalName = catalogueService(salonId, serviceDefId).name();
+        String newName = "Renamed " + UUID.randomUUID();
+        assertThat(newName).isNotEqualTo(originalName);
+
+        renameService(ownerToken, serviceDefId, newName);
+
+        assertThat(catalogueService(salonId, serviceDefId).name())
+                .as("the very next catalogue read must reflect the new name — a stale cache "
+                        + "would keep serving the pre-rename value for the whole TTL")
+                .isEqualTo(newName);
+    }
+
+    @Test
+    @DisplayName("Phase 304 case 3 (regression pin for D4): deleting a service definition still "
+            + "evicts the owning salon's catalogue cache — D4's comment rewrite must never become "
+            + "a body change")
+    void should_omitDeletedService_when_serviceDefinitionDeletedAfterCatalogueWasCached() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken("cache-304-c3-owner@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 304 Case 3 Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+        UUID serviceDefId = bulkCreateSalonMasterService(ownerToken, salonId, masterId);
+
+        // Populate the cache with the pre-delete catalogue.
+        assertThat(catalogueServiceIds(salonId)).contains(serviceDefId);
+
+        deleteService(ownerToken, serviceDefId);
+
+        assertThat(catalogueServiceIds(salonId))
+                .as("a deleted service must be gone from the very next catalogue read")
+                .doesNotContain(serviceDefId);
+    }
+
+    @Test
+    @DisplayName("Phase 304 case 4: a write against one owner does not evict a sibling salon's "
+            + "cached catalogue — per-key eviction, not allEntries=true; and an independent "
+            + "master's write, which owns no salon catalogue, never evicts any salon's entry")
+    void should_notEvictUnrelatedSalonCatalogue_when_oneOwnersServiceWrites() throws Exception {
+        // ── Part A — a SALON-branch write against salon A must not evict salon B ──
+        // (mutation check (c): allEntries=true would wipe this too.)
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken("cache-304-c4-owner-a@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Phase 304 Case 4 Salon A");
+        UUID masterAId = fixtures.createSalonMaster(salonAId);
+        fixtures.seedUsableSchedule(masterAId);
+
+        String ownerBToken = fixtures.createSalonOwnerAndGetToken("cache-304-c4-owner-b@beautica.test");
+        UUID salonBId = fixtures.createSalon(ownerBToken, "Phase 304 Case 4 Salon B");
+        UUID masterBId = fixtures.createSalonMaster(salonBId);
+        fixtures.seedUsableSchedule(masterBId);
+        UUID salonBServiceId = bulkCreateSalonMasterService(ownerBToken, salonBId, masterBId);
+
+        assertThat(catalogueServiceIds(salonBId)).containsExactly(salonBServiceId);
+        Object warmedEntryB = salonCatalogCache().get(salonBId).get();
+
+        bulkCreateSalonMasterService(ownerAToken, salonAId, masterAId);
+
+        assertThat(salonCatalogCache().get(salonBId))
+                .as("salon B's cache entry must survive a write against salon A")
+                .isNotNull();
+        assertThat(salonCatalogCache().get(salonBId).get())
+                .as("same cached object identity: an allEntries=true eviction would have wiped "
+                        + "this too, forcing an unnecessary recompute on the next read")
+                .isSameAs(warmedEntryB);
+        assertThat(catalogueServiceIds(salonBId))
+                .as("salon B's catalogue content is unaffected by salon A's write")
+                .containsExactly(salonBServiceId);
+
+        // ── Part B — an INDEPENDENT_MASTER's write owns no salon catalogue and must evict
+        // nothing (mutation check (d): salonCatalogIdOf wrongly returning ownerId — the
+        // master's OWN id — for a master-owned definition would evict a "salon" cache entry
+        // keyed by that master id). Poison the cache at exactly that key so a wrong eviction
+        // is directly observable rather than an unfalsifiable no-op on a key nothing uses.
+        String indepToken = fixtures.createIndependentMasterAndGetToken("cache-304-c4-indep@beautica.test");
+        UUID indepMasterId = fixtures.resolveMasterIdForUserEmail("cache-304-c4-indep@beautica.test");
+        UUID indepServiceDefId = fixtures.createIndependentMasterService(indepToken, "Case 4 Indep Service");
+
+        Object sentinel = new Object();
+        salonCatalogCache().put(indepMasterId, sentinel);
+
+        renameService(indepToken, indepServiceDefId, "Renamed Indep Service " + UUID.randomUUID());
+
+        assertThat(salonCatalogCache().get(indepMasterId))
+                .as("an independent master's write must never evict a salon-service-catalog entry "
+                        + "keyed by the master's own id — salonCatalogIdOf must return null here")
+                .isNotNull();
+        assertThat(salonCatalogCache().get(indepMasterId).get())
+                .as("the poisoned entry must survive untouched — same object identity")
+                .isSameAs(sentinel);
+    }
+
+    // ── Phase 304 HTTP + cache plumbing ─────────────────────────────────────────
+
+    /** Bulk-creates ONE service for a salon master and returns the created definition's id. */
+    private UUID bulkCreateSalonMasterService(String ownerToken, UUID salonId, UUID masterId) throws Exception {
+        UUID serviceTypeId = fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE");
+        BulkServiceItemRequest item = new BulkServiceItemRequest(
+                serviceTypeId, 60, PriceType.FIXED, new BigDecimal("350.00"), null, null);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk", HttpMethod.POST,
+                new HttpEntity<>(new BulkCreateServicesRequest(List.of(item)), bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        List<MasterServiceResponse> created = objectMapper.readValue(resp.getBody(),
+                new TypeReference<ApiResponse<List<MasterServiceResponse>>>() {}).data();
+        return created.get(0).serviceDefinition().id();
+    }
+
+    /** PATCHes only {@code name} on a service definition — every other field left unchanged. */
+    private void renameService(String ownerToken, UUID serviceDefId, String newName) {
+        UpdateServiceDefinitionRequest request = new UpdateServiceDefinitionRequest(
+                newName, null, null, null, null, null, null, null, null, null);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.PATCH,
+                new HttpEntity<>(request, bearerHeaders(ownerToken)), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    private void deleteService(String ownerToken, UUID serviceDefId) {
+        ResponseEntity<Void> resp = restTemplate.exchange(
+                "/api/v1/services/" + serviceDefId, HttpMethod.DELETE,
+                new HttpEntity<>(bearerHeaders(ownerToken)), Void.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    /** GETs the public salon catalogue exactly as a real client would — no eviction workaround. */
+    private SalonServiceCatalogResponse getSalonCatalogue(UUID salonId) throws Exception {
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                "/api/v1/salons/" + salonId + "/services", String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readValue(resp.getBody(),
+                new TypeReference<ApiResponse<SalonServiceCatalogResponse>>() {}).data();
+    }
+
+    private List<UUID> catalogueServiceIds(UUID salonId) throws Exception {
+        return getSalonCatalogue(salonId).categories().stream()
+                .flatMap(group -> group.services().stream())
+                .map(ServiceDefinitionResponse::id)
+                .toList();
+    }
+
+    private ServiceDefinitionResponse catalogueService(UUID salonId, UUID serviceDefId) throws Exception {
+        Optional<ServiceDefinitionResponse> found = getSalonCatalogue(salonId).categories().stream()
+                .flatMap(group -> group.services().stream())
+                .filter(s -> s.id().equals(serviceDefId))
+                .findFirst();
+        assertThat(found).as("service %s must be present in salon %s's catalogue", serviceDefId, salonId)
+                .isPresent();
+        return found.get();
+    }
+
+    private Cache salonCatalogCache() {
+        Cache cache = cacheManager.getCache(SALON_CATALOG_CACHE);
+        assertThat(cache).as("salon-service-catalog must be registered").isNotNull();
+        return cache;
     }
 
     // ── HTTP plumbing ───────────────────────────────────────────────────────────
