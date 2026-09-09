@@ -28,7 +28,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
-import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -37,9 +36,7 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
-import java.io.InputStream;
 import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CyclicBarrier;
@@ -724,7 +721,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // An ACTIVE definition with NO master_services row at all: nothing shows in the master's
         // menu, yet the definition-level V121 index would still reject an insert for this type.
-        UUID orphanDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        UUID orphanDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixed(seededTypes.get(0).id(), 60, "350.00")));
@@ -774,7 +771,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // Assignmentless again, mirroring the test above; the property under test here is the
         // ROLLBACK, not the route into the duplicate check.
-        UUID existingDefId = insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
+        UUID existingDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixed(types.get(0).id(), 60, "350.00"),
@@ -808,32 +805,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(0L);
     }
 
-    /**
-     * Inserts an ACTIVE {@code service_definitions} row owned by {@code masterId} with NO
-     * {@code master_services} assignment, via JDBC.
-     *
-     * <p>Direct SQL is required, not a bug: no endpoint can produce this state in one call, because
-     * every create path writes the definition and its assignment together. It arises in production
-     * over time — an assignment deactivated while its definition stays active — and it is precisely
-     * the state where a master's visible menu disagrees with the definition-level V121 index.
-     *
-     * <p>{@code owner_type = 'INDEPENDENT_MASTER'} with {@code owner_id = masters.id} mirrors what
-     * {@code bulkCreateForMaster} persists on the INDEPENDENT_MASTER branch — the only branch whose
-     * callers use this helper — so the seeded row lands in the same V121 key space the batch is
-     * about to insert into. Since Phase 302 D1 the SALON branch persists {@code (SALON, salonId)}
-     * instead; a salon-arm variant of this fixture would have to seed that key space.
-     */
-    private UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
-        UUID defId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
-                        + "is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
-                        + "'FIXED', 400.00, 0, true, NOW(), NOW())",
-                defId, masterId, serviceTypeId);
-        return defId;
-    }
+    // insertActiveDefinitionWithoutAssignment was promoted to ServiceTestFixtures (Phase 305
+    // REUSE-FIRST) so SalonCatalogueVisibilityIT's case 12 reuses the exact same legacy-row
+    // recipe instead of re-deriving it; call sites here now read fixtures.insertActiveDefinition...
 
     // ── TOCTOU concurrency regression (Step 2.7 Rule 3) ────────────────────────
 
@@ -1130,73 +1104,6 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(before);
     }
 
-    // ══ Phase 303 case 10 — a V164-backfilled definition is visible in the catalogue too ══
-    //
-    // A pre-302 service is persisted exactly like insertActiveDefinitionWithoutAssignment above
-    // (ownerType='INDEPENDENT_MASTER', ownerId=master.id) PLUS an active master_services row, then
-    // V164's SQL body is re-applied directly against this Spring-managed dataSource — Testcontainers
-    // already ran V164 once at boot, on an empty schema, where it was the documented no-op, so it
-    // will not re-run through Flyway. Re-executing its body is the same technique
-    // V164SalonOwnedBackfillMigrationTest uses to exercise the migration against legacy-shaped data,
-    // and here it runs through the real HTTP catalogue endpoint the phase doc names for case 10.
-
-    private static String v164MigrationSql;
-
-    private String v164Sql() throws Exception {
-        if (v164MigrationSql == null) {
-            try (InputStream in = new ClassPathResource(
-                    "db/migration/V164__backfill_salon_owned_master_service_definitions.sql")
-                    .getInputStream()) {
-                v164MigrationSql = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-            }
-        }
-        return v164MigrationSql;
-    }
-
-    /** One simple-query {@code Statement.execute} call — see the class javadoc on the sibling
-     * migration test for why the WHOLE script must be sent as a single call. */
-    private void applyV164Backfill() throws Exception {
-        try (var conn = jdbcTemplate.getDataSource().getConnection();
-             var stmt = conn.createStatement()) {
-            stmt.execute(v164Sql());
-        }
-    }
-
-    @Test
-    @DisplayName("Phase 303 case 10: a pre-302, V164-backfilled service appears in "
-            + "GET /salons/{salonId}/services, promoted owner_type='SALON'")
-    void should_listBackfilledService_when_v164HasPromotedALegacyMasterOwnedDefinition() throws Exception {
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "owner-303-backfill-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Phase 303 Backfill Salon");
-        UUID masterId = fixtures.createSalonMaster(salonId);
-        fixtures.seedUsableSchedule(masterId);
-
-        log.debug("Arrange: a pre-302 legacy row — INDEPENDENT_MASTER-owned, salon-bound master, "
-                + "with an active assignment — the exact shape V164 backfills");
-        UUID legacyDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
-        jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                UUID.randomUUID(), masterId, legacyDefId);
-
-        assertThat(catalogueServiceIds(salonId))
-                .as("precondition: before V164 runs, a legacy INDEPENDENT_MASTER-owned row is "
-                        + "invisible in the salon catalogue — reproduces the defect Phase 303 fixes")
-                .doesNotContain(legacyDefId);
-
-        log.debug("Act: re-apply V164's SQL body against this legacy row");
-        applyV164Backfill();
-
-        assertThat(definitionRow(legacyDefId))
-                .as("V164 promotes the legacy definition to SALON ownership")
-                .containsEntry("owner_type", "SALON")
-                .containsEntry("owner_id", salonId);
-        assertThat(catalogueServiceIds(salonId))
-                .as("the whole point of Phase 303: a pre-302 service now appears in the catalogue")
-                .contains(legacyDefId);
-    }
-
     // ══ Phase 303 QA gap 1 (security INFO, closed here) — the ownership flip must be provable over
     // HTTP, not just at the DB-row level. Phase 302 D7: BEFORE V164 runs, a legacy
     // INDEPENDENT_MASTER-owned definition belonging to a salon-bound master is unreachable by EVERY
@@ -1218,7 +1125,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Arrange: the exact pre-302 legacy shape — INDEPENDENT_MASTER-owned, salon-bound "
                 + "master, with an active assignment");
-        UUID legacyDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        UUID legacyDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, true, NOW(), NOW())",
@@ -1237,7 +1144,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.FORBIDDEN);
 
         log.debug("Act: apply V164 to promote the legacy row to SALON ownership");
-        applyV164Backfill();
+        fixtures.applyV164Backfill();
 
         log.debug("Act: salon owner PATCHes the NOW-backfilled row");
         ResponseEntity<String> patchAfter = restTemplate.exchange(

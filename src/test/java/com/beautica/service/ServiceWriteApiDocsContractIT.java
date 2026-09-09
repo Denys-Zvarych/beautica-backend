@@ -166,6 +166,76 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
                 .isTrue();
     }
 
+    // ── Phase 305 D3 — 409 DUPLICATE_SERVICE is published as PER-MASTER on the salon-master bulk
+    // endpoint, not the generic per-owner text every other write endpoint carries. Phase 302 D4
+    // narrowed this endpoint's conflict scope: a call that used to 409 for a salon's SECOND master
+    // now returns 201 (the salon's existing definition is reused). The mobile client's error
+    // handling must be regenerated against the true, per-master semantics.
+
+    @Test
+    @DisplayName("Phase 305 D3: POST .../masters/{masterId}/services/bulk documents its 409 "
+            + "DUPLICATE_SERVICE as PER-MASTER (Phase 302 D4), not the generic per-owner text")
+    void should_documentDuplicateServiceAsPerMaster_when_salonMasterBulkEndpointPublishesSpec()
+            throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services/bulk").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services/bulk must exist in /api-docs")
+                .isFalse();
+
+        String description = operation.path("responses").path("409").path("description").asText();
+
+        assertThat(description)
+                .as("the 409 description must name the conflict as PER-MASTER — a dropped or "
+                        + "reverted annotation would fall back to the generic per-owner "
+                        + "DUPLICATE_SERVICE_409 text, which says nothing about Phase 302 D4's "
+                        + "narrowing; description was: %s", description)
+                .contains("per-MASTER")
+                .contains("another master in the same salon");
+    }
+
+    // ── Phase 305 D4 — every {masterId} in this track documents that it is a `masters` row id,
+    // NOT a userId. Passing a userId yields 404 "Master not found", which reads like a missing
+    // master rather than a wrong identifier — a live footgun on the exact screens this track
+    // unblocks (ServiceCatalogService.java masterRepository.findById call sites).
+
+    @ParameterizedTest(name = "{0} {1} — masterId parameter documents \"Master row id (NOT a user id)\"")
+    @CsvSource({
+            "post, /api/v1/salons/{salonId}/masters/{masterId}/services",
+            "post, /api/v1/salons/{salonId}/masters/{masterId}/services/bulk"
+    })
+    @DisplayName("Phase 305 D4: every {masterId} path parameter documents it is a master ROW id, "
+            + "not a userId — asserted so it cannot be dropped in a later annotation tidy-up")
+    void should_documentMasterIdAsRowIdNotUserId_when_endpointTakesMasterIdPathParam(
+            String httpMethod, String openApiPath) throws Exception {
+
+        JsonNode operation = fetchApiDocs().path("paths").path(openApiPath).path(httpMethod);
+        assertThat(operation.isMissingNode())
+                .as("operation %s %s must exist in /api-docs", httpMethod, openApiPath)
+                .isFalse();
+
+        JsonNode masterIdParam = findParameterByName(operation.path("parameters"), "masterId");
+        assertThat(masterIdParam)
+                .as("%s %s must publish a masterId path parameter", httpMethod, openApiPath)
+                .isNotNull();
+
+        assertThat(masterIdParam.path("description").asText())
+                .as("masterId's @Parameter description must state it is a master row id, not a "
+                        + "userId — the exact footgun documented in Phase 305 D4; node=%s",
+                        masterIdParam)
+                .isEqualTo("Master row id (NOT a user id)");
+    }
+
+    private static JsonNode findParameterByName(JsonNode parameters, String name) {
+        for (JsonNode param : parameters) {
+            if (name.equals(param.path("name").asText())) {
+                return param;
+            }
+        }
+        return null;
+    }
+
     private JsonNode fetchApiDocs() throws Exception {
         ResponseEntity<String> resp = restTemplate.getForEntity("/api-docs", String.class);
         assertThat(resp.getStatusCode())

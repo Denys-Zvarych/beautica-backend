@@ -1133,6 +1133,20 @@ public class ServiceCatalogService {
      * load per master), and returns the distinct {@link ServiceDefinition}s that at least one bookable
      * master performs, sorted by {@code (category, name)} so the caller's category grouping keeps the
      * same within-group ordering the previous {@code findBookableServicesBySalon} query produced.
+     *
+     * <p><b>Phase 305 D1 — the free-slot gate applied here is DELIBERATE contract, not a bug.</b> A
+     * candidate assignment is kept only when {@code filterBookableAssignments} finds its master a
+     * free future slot for the service's effective duration; a master with NO working hours
+     * configured resolves zero effective schedule days and is therefore filtered out entirely, so
+     * NONE of their services reach the salon catalogue — even though Phases 302/303 make those
+     * definitions genuinely {@code SALON}-owned. {@code GET /salons/{salonId}/services} answers
+     * "what can a client book here right now?", not "what does this salon's staff list on paper?",
+     * and this is the call frame where that answer is enforced.
+     *
+     * <p><b>Do not "fix" this.</b> Any future finding titled "a master's services are missing from
+     * the salon catalogue" must first check whether that master has working hours configured — see
+     * {@code SalonCatalogueVisibilityIT#should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate}
+     * (Phase 305 D1/D2 condition 5), which pins exactly this behaviour as deliberate.
      */
     private List<ServiceDefinition> bookableDefinitions(List<MasterServiceAssignment> candidates) {
         Map<UUID, List<MasterServiceAssignment>> byMaster = candidates.stream()

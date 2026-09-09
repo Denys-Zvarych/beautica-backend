@@ -4,6 +4,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -11,6 +12,7 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -20,7 +22,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.io.InputStream;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -199,6 +203,22 @@ class ServiceTestFixtures {
         return body.data().accessToken();
     }
 
+    /**
+     * Materialises the owner-operated {@code masters} row (the Phase 12.4
+     * {@code POST /salons/{salonId}/master} endpoint) and returns its {@code masters.id}. That
+     * row's {@code salon_id} is the owner's own salon, so it takes the salon bulk-create branch
+     * with no special-casing (Phase 302 D5).
+     */
+    UUID enableOwnerAsMaster(String ownerToken, UUID salonId) throws Exception {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
+                new HttpEntity<>(bearerHeaders(ownerToken)), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<MasterDetailResponse>>() {})
+                .data().masterId();
+    }
+
     /** Resolves the master row id created when an independent master registers (1:1 with the user). */
     UUID resolveMasterIdForUserEmail(String email) {
         return jdbcTemplate.queryForObject(
@@ -302,6 +322,63 @@ class ServiceTestFixtures {
     }
 
     record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
+    }
+
+    /**
+     * Inserts an ACTIVE {@code service_definitions} row owned by {@code masterId} with NO
+     * {@code master_services} assignment, via JDBC.
+     *
+     * <p>Direct SQL is required, not a bug: no endpoint can produce this state in one call, because
+     * every create path writes the definition and its assignment together. It arises in production
+     * over time — an assignment deactivated while its definition stays active.
+     *
+     * <p>{@code owner_type = 'INDEPENDENT_MASTER'} with {@code owner_id = masters.id} is also the
+     * pre-Phase-302 legacy shape {@code V164__backfill_salon_owned_master_service_definitions.sql}
+     * promotes to {@code SALON} ownership — see {@link #applyV164Backfill()}. Promoted here
+     * (originally {@code BulkServiceSetupIntegrationTest}-private) so
+     * {@code SalonCatalogueVisibilityIT}'s Phase 303 case 12 reuses the exact same legacy row
+     * shape instead of re-deriving it (REUSE-FIRST).
+     */
+    UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
+        UUID defId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
+                        + "'FIXED', 400.00, 0, true, NOW(), NOW())",
+                defId, masterId, serviceTypeId);
+        return defId;
+    }
+
+    private String v164MigrationSql;
+
+    private String v164Sql() throws Exception {
+        if (v164MigrationSql == null) {
+            try (InputStream in = new ClassPathResource(
+                    "db/migration/V164__backfill_salon_owned_master_service_definitions.sql")
+                    .getInputStream()) {
+                v164MigrationSql = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        }
+        return v164MigrationSql;
+    }
+
+    /**
+     * Re-applies V164's SQL body directly against this Spring-managed dataSource — Testcontainers
+     * already ran V164 once at boot, on an empty schema, where it was the documented no-op, so it
+     * will not re-run through Flyway. Re-executing its body is the same technique
+     * {@code V164SalonOwnedBackfillMigrationTest} uses to exercise the migration against
+     * legacy-shaped data seeded mid-test.
+     *
+     * <p>One simple-query {@code Statement.execute} call — the whole script must be sent as a
+     * single call.
+     */
+    void applyV164Backfill() throws Exception {
+        try (var conn = jdbcTemplate.getDataSource().getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.execute(v164Sql());
+        }
     }
 
     HttpHeaders bearerHeaders(String token) {

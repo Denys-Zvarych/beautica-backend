@@ -15,6 +15,7 @@ import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
@@ -56,6 +57,42 @@ public class ServiceController {
             "The owner already offers an active service of this type. One active service per "
                     + "(owner, service type); price and duration are irrelevant. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
+
+    /**
+     * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on the salon-master
+     * bulk endpoint specifically (Phase 305 D3). Phase 302 D4 narrowed this endpoint's conflict
+     * scope from per-SALON to per-MASTER: two different masters in the same salon can both offer
+     * the same service type — the second reuses the salon's existing definition and gets its own
+     * assignment, {@code 201}, not {@code 409} — a breaking behavioural change to a shipped
+     * endpoint (a call that used to return 409 for the second master now returns 201). The 409
+     * fires ONLY when THIS master already has an active assignment for the type.
+     *
+     * <p>Declared separately from {@link #DUPLICATE_SERVICE_409} (used by every other write
+     * endpoint here) because that shared text describes the still-accurate per-OWNER conflict for
+     * every other path; only this endpoint's semantics changed with Phase 302 D4.
+     */
+    private static final String DUPLICATE_SERVICE_PER_MASTER_409 =
+            "The service type is already assigned to THIS master (Phase 302 D4 — the conflict is "
+                    + "per-MASTER, not per-salon: another master in the same salon already offering "
+                    + "this type is NOT a conflict here, the salon's existing definition is reused "
+                    + "and this call returns 201). One active assignment per (master, service "
+                    + "type); price and duration are irrelevant. Branch on `data.code` == "
+                    + "DUPLICATE_SERVICE, never on `message`.";
+
+    /**
+     * Description attached to {@link #getSalonServiceCatalog}'s {@code @Operation} (Phase 305 D2):
+     * states the five-condition visibility rule directly in the published spec so a mobile engineer
+     * reading {@code /api-docs} sees it without spelunking the service layer.
+     */
+    private static final String SALON_CATALOGUE_VISIBILITY_RULE =
+            "A service appears here iff ALL of: (1) its definition is owner_type=SALON with "
+                    + "owner_id=salonId; (2) the definition is active; (3) at least one master_services "
+                    + "assignment for it is active; (4) that assignment's master belongs to this salon "
+                    + "and is active; (5) that master has a free future slot for the service's "
+                    + "effective duration. Condition 5 is DELIBERATE, not a bug: a master with no "
+                    + "working hours configured has none of their services listed here, because this "
+                    + "endpoint answers \"what can a client book right now\", not \"what does the "
+                    + "staff list on paper\".";
 
     /**
      * Description attached to the {@code 503} declaration on the two BULK endpoints — the only
@@ -152,7 +189,7 @@ public class ServiceController {
     @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> assignServiceToMaster(
             @PathVariable UUID salonId,
-            @PathVariable UUID masterId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
             @Valid @RequestBody AssignServiceToMasterRequest request
     ) {
         MasterServiceResponse response =
@@ -203,6 +240,8 @@ public class ServiceController {
      * authenticated CLIENT sees {@code true}/{@code false} per service; every other caller
      * (anonymous, or any other role) sees {@code null}.
      */
+    @Operation(summary = "Salon's public bookable service catalog",
+            description = SALON_CATALOGUE_VISIBILITY_RULE)
     @GetMapping("/salons/{salonId}/services")
     public ApiResponse<SalonServiceCatalogResponse> getSalonServiceCatalog(
             @PathVariable UUID salonId, Authentication authentication) {
@@ -339,7 +378,7 @@ public class ServiceController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    responseCode = "409", description = DUPLICATE_SERVICE_PER_MASTER_409,
                     content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "503", description = BULK_LOCK_TIMEOUT_503),
@@ -350,7 +389,7 @@ public class ServiceController {
     @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMasterServices(
             @PathVariable UUID salonId,
-            @PathVariable UUID masterId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
             @Valid @RequestBody BulkCreateServicesRequest request
     ) {
         List<MasterServiceResponse> response =
