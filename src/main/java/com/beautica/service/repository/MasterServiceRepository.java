@@ -110,6 +110,38 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
 
     boolean existsByMasterIdAndServiceDefinitionId(UUID masterId, UUID serviceDefinitionId);
 
+    /**
+     * ACTIVE-agnostic sibling of {@link #existsByMasterIdAndServiceDefinitionId}, returning the
+     * row itself rather than a boolean — backs both add-path D6 amendments (Phase 307):
+     * {@code ServiceCatalogService#assignServiceToMaster} reactivates an existing {@code is_active
+     * = false} row instead of inserting a second one ({@code master_services}' {@code UNIQUE
+     * (master_id, service_def_id)} is NOT partial, so a plain insert over an inactive row would
+     * trip it at flush), and {@code ServiceCatalogService#unassignServiceFromMaster} loads the
+     * assignment it is about to deactivate. Not filtered on {@code is_active} — the caller decides
+     * what an active vs. inactive result means for its own path.
+     *
+     * <p><b>JOIN FETCHes {@code master} and {@code serviceDefinition} (Phase-307 perf audit
+     * MEDIUM-1/2).</b> {@code unassignServiceFromMaster} used to follow this call with a forced
+     * lazy-proxy init the instant its ownership re-check called {@code getOwnerType()}/
+     * {@code getOwnerId()} on the returned assignment's {@code serviceDefinition} — unlike
+     * {@code getId()}, those columns are not answerable from the uninitialized proxy's FK alone,
+     * so that was a second SELECT on every call. Fetching both associations here collapses the
+     * caller's happy path to ONE query; {@code master} is {@code JOIN FETCH} (an assignment always
+     * has one), {@code serviceDefinition} is {@code LEFT JOIN FETCH} for symmetry with the other
+     * fetch queries in this file. {@code assignServiceToMaster} calls this finder too — the fetched
+     * {@code serviceDefinition} is the same managed instance it already loaded via
+     * {@code ServiceRepository#findByIdWithServiceType}, so Hibernate's first-level cache dedupes
+     * it and no duplicate SQL results.
+     */
+    @Query("""
+            SELECT ms FROM MasterServiceAssignment ms
+            JOIN FETCH ms.master m
+            LEFT JOIN FETCH ms.serviceDefinition sd
+            WHERE m.id = :masterId AND sd.id = :serviceDefinitionId
+            """)
+    Optional<MasterServiceAssignment> findByMasterIdAndServiceDefinitionId(
+            @Param("masterId") UUID masterId, @Param("serviceDefinitionId") UUID serviceDefinitionId);
+
     // Phase 302 D4's per-master conflict finder (findActiveAssignedServiceTypeIds) lived here and
     // was DELETED by the phase-302 audit. It filtered on master_id alone, which made it blind to
     // the rotated-master leak (audit HIGH-1), and it was one of three round-trips the salon-keyed

@@ -54,7 +54,8 @@ import static org.mockito.Mockito.when;
 @SpringBootTest(
         classes = {ServiceCatalogService.class, ServiceTypeLookup.class, ServiceTypeSearchService.class,
                 CatalogCategoryLookup.class, PlatformCategoryOrderLookup.class, SalonCatalogCacheEvictor.class,
-                CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class},
+                CacheConfig.class, com.beautica.common.cache.MasterCachePrefixEvictor.class,
+                com.beautica.config.ClockConfig.class},
         webEnvironment = SpringBootTest.WebEnvironment.NONE
 )
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
@@ -77,12 +78,22 @@ class ServiceCatalogServiceCacheTest {
     // SlotCalculationService. It is not on the @SpringBootTest classes list, so mock it to satisfy
     // the constructor wiring; the catalogue cache test stubs its filter as a pass-through.
     @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    // Phase 307 D4 — ServiceCatalogService now collaborates with BookingRepository for the
+    // per-assignment future-CONFIRMED-booking unassign guard. Not on the @SpringBootTest classes
+    // list, so mock it to satisfy constructor wiring; no test below exercises unassignServiceFromMaster.
+    @MockBean com.beautica.booking.repository.BookingRepository bookingRepository;
     // Phase 23.x (perf/security #2): ServiceCatalogService evicts the salon-service-catalog cache via
     // this collaborator on every definition mutation. It is a REAL bean here (on the @SpringBootTest
     // classes list) so its @CacheEvict fires through the AOP proxy — the salon-catalogue eviction tests
     // below assert an actual recompute, not an annotation-count. @Autowired only to make its presence
     // explicit; ServiceCatalogService injects it by constructor.
     @Autowired SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
+    // Phase 307 MEDIUM-3 (perf audit) — a REAL bean here (on the @SpringBootTest classes list) so
+    // the eviction tests below can delegate the mocked SlotCalculationService's
+    // evictMasterAvailabilityCaches call into the SAME evictor production uses, and observe an
+    // actual Caffeine keyset mutation rather than just a mock invocation count.
+    @Autowired com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     @Autowired ServiceCatalogService serviceCatalogService;
     @Autowired CacheManager cacheManager;
@@ -306,6 +317,31 @@ class ServiceCatalogServiceCacheTest {
         verify(catalogCategoryRepository, times(1)).findAllByOrderBySortOrderAsc();
     }
 
+    /**
+     * Phase 307 MEDIUM-3 (perf audit) removed {@code deactivateServiceDefinition}'s and
+     * {@code unassignServiceFromMaster}'s direct, synchronous {@code evictAvailableSlotsCache}
+     * call — it scanned the SAME {@code available-slots} cache, for the SAME masters, that
+     * {@code evictBookableFutureSlotsCache}'s off-thread sweep
+     * ({@code SlotCalculationService#evictMasterAvailabilityCaches}, keyed off
+     * {@code BOOKING_WRITE_CACHES}) already covers as a superset.
+     *
+     * <p>{@code slotCalculationService} is a {@code @MockBean} in this slice, so that off-thread
+     * sweep is normally a no-op stub here. This helper delegates the mock's
+     * {@code evictMasterAvailabilityCaches} call into the REAL {@link #cachePrefixEvictor} bean
+     * (on the {@code @SpringBootTest} classes list), covering the same three cache names
+     * {@code BOOKING_WRITE_CACHES} does, so the eviction tests below observe an actual Caffeine
+     * keyset mutation — proof the sweep still owns the eviction after MEDIUM-3 — rather than
+     * merely a mock invocation count.
+     */
+    private void delegateSlotEvictionToRealCache() {
+        org.mockito.Mockito.doAnswer(invocation -> {
+            UUID evictedMasterId = invocation.getArgument(0);
+            cachePrefixEvictor.evictByKeyPrefixNow(evictedMasterId,
+                    "available-slots", "master-service-bookable", "master-bookable-days");
+            return null;
+        }).when(slotCalculationService).evictMasterAvailabilityCaches(any());
+    }
+
     @Test
     @DisplayName("deactivateServiceDefinition evicts available-slots cache entries for affected masters")
     void should_evictAvailableSlotsCache_when_deactivateServiceDefinitionCalled() {
@@ -323,6 +359,10 @@ class ServiceCatalogServiceCacheTest {
         //
         // The previous version seeded `new SimpleKey(...)`, which matched the equally-wrong
         // production predicate — so it passed while the real eviction removed nothing.
+        //
+        // Phase 307 MEDIUM-3 — the direct synchronous call this test used to exercise is gone;
+        // delegateSlotEvictionToRealCache wires the off-thread sweep (now the sole evictor) to the
+        // real cache so this test still observes a real eviction, not just a mock call.
         UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
         UUID someServiceId = UUID.randomUUID();
@@ -332,6 +372,7 @@ class ServiceCatalogServiceCacheTest {
         var cacheKey = CacheKeyFixtures.spelKey(masterId, someDate, someServiceId);
         slotsCache.put(cacheKey, List.of("09:00", "10:00"));
 
+        delegateSlotEvictionToRealCache();
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterId));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
@@ -341,6 +382,62 @@ class ServiceCatalogServiceCacheTest {
 
         // Assert — the cache entry for the affected master must be gone.
         assertThat(slotsCache.get(cacheKey)).isNull();
+    }
+
+    /**
+     * Phase 307 audit LOW-4 — closes the gap MEDIUM-3 opened: nothing previously asserted that
+     * {@code available-slots} is evicted on {@code unassignServiceFromMaster} at all (case 16 in
+     * {@code MasterServiceUnassignIT} only proves the salon catalogue). Asserts eviction happens
+     * — NOT that it happens synchronously, since after MEDIUM-3 it is the off-thread sweep behind
+     * {@code evictBookableFutureSlotsCache} that owns it, not a direct call this method makes
+     * itself.
+     */
+    @Test
+    @DisplayName("unassignServiceFromMaster eventually evicts available-slots for the master, via "
+            + "the off-thread sweep (Phase 307 audit LOW-4)")
+    void should_evictAvailableSlotsCache_when_unassignServiceFromMasterCalled() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID someServiceId = UUID.randomUUID();
+        LocalDate someDate = LocalDate.of(2026, 6, 1);
+
+        var slotsCache = cacheManager.getCache("available-slots");
+        var cacheKey = CacheKeyFixtures.spelKey(masterId, someDate, someServiceId);
+        slotsCache.put(cacheKey, List.of("09:00", "10:00"));
+
+        delegateSlotEvictionToRealCache();
+
+        Salon salon = Salon.builder().id(salonId).build();
+        Master master = Master.builder().id(masterId).salon(salon).isActive(true).build();
+        ServiceDefinition serviceDefinition = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .isActive(true)
+                .build();
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .isActive(true)
+                .build();
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+        when(bookingRepository.countConfirmedFutureByMasterServiceId(
+                eq(masterId), eq(assignment.getId()), any())).thenReturn(0L);
+
+        // Act — no active Spring transaction here; the (stubbed, delegating) off-thread sweep runs
+        // immediately in unassignServiceFromMaster's else-branch.
+        serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId);
+
+        // Assert — eventually evicted (behaviourally, via CacheManager), not synchronously: after
+        // MEDIUM-3 the off-thread sweep is the ONLY path that evicts available-slots here.
+        assertThat(slotsCache.get(cacheKey))
+                .as("available-slots must still be evicted for the master after MEDIUM-3 removed "
+                        + "the redundant direct call")
+                .isNull();
     }
 
     // ── platform-category-order cache (perf follow-up, Phase 13.6) ─────────────

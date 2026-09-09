@@ -50,6 +50,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -105,6 +106,15 @@ class ServiceCatalogServiceTest {
     // against the live @Cacheable proxy in CachePrefixEvictionKeyShapeTest.
     @Mock
     private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+
+    // Phase 307 D4 — unassignServiceFromMaster's per-assignment future-CONFIRMED-booking guard.
+    // Only the unassign tests below stub these; every other test in this class throws (or
+    // succeeds) before that guard is reached, so they never touch either mock.
+    @Mock
+    private com.beautica.booking.repository.BookingRepository bookingRepository;
+
+    @Mock
+    private java.time.Clock clock;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -471,8 +481,8 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
-        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
-                .thenReturn(false);
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
@@ -538,8 +548,8 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
-        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
-                .thenReturn(false);
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
@@ -636,10 +646,13 @@ class ServiceCatalogServiceTest {
         when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
         when(serviceDef.getOwnerId()).thenReturn(salonId);
 
+        MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
+        when(activeAssignment.isActive()).thenReturn(true);
+
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
-        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
-                .thenReturn(true);
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(activeAssignment));
 
         AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
 
@@ -650,6 +663,146 @@ class ServiceCatalogServiceTest {
                         .isEqualTo(HttpStatus.CONFLICT));
 
         verify(masterServiceRepository, never()).save(any());
+    }
+
+    // ── unassignServiceFromMaster (Phase 307 perf audit MEDIUM-1/2, LOW-6) ──────
+
+    /**
+     * Phase-307 perf audit LOW-6 — no test previously asserted that the two 404s
+     * {@code unassignServiceFromMaster} can throw carry DISTINCT internal messages.
+     * {@code GlobalExceptionHandler} deliberately genericises every {@code NotFoundException} to
+     * {@code "Resource not found"} at the HTTP boundary (never echo internal messages — anti-bug
+     * §I/§N), so the only place the distinction is observable at all is here, against the raw
+     * exception the service throws — which is exactly the layer MEDIUM-1/2's cold-path
+     * {@code notFoundForUnassign} fallback could silently collapse.
+     */
+    @Test
+    @DisplayName("unassignServiceFromMaster throws NotFoundException naming the MASTER when the "
+            + "master row itself does not exist (Phase 307 LOW-6)")
+    void should_throwNotFoundNamingMaster_when_masterDoesNotExistForUnassign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
+        when(masterRepository.existsById(masterId)).thenReturn(false);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Master not found")
+                .hasMessageContaining(masterId.toString());
+    }
+
+    @Test
+    @DisplayName("unassignServiceFromMaster throws NotFoundException naming the ASSIGNMENT when the "
+            + "master exists but has no active assignment for the pair (Phase 307 LOW-6)")
+    void should_throwNotFoundNamingAssignment_when_masterExistsWithNoActiveAssignment() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
+        when(masterRepository.existsById(masterId)).thenReturn(true);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("No active assignment")
+                .satisfies(ex -> assertThat(ex.getMessage())
+                        .as("must NOT be collapsed to the master-not-found message")
+                        .doesNotContain("Master not found"));
+    }
+
+    /**
+     * Phase-307 audit "judgement call" item — {@code MasterServiceUnassignIT} case 17 documents
+     * that the definition-ownerId re-check added alongside the security audit is unreachable via
+     * the public API today: the write-path invariant means a {@code master_services} row can only
+     * ever link a master to a same-salon definition, so no request can construct an assignment
+     * whose {@code serviceDefinition} is owned by a DIFFERENT salon than the one on the path.
+     *
+     * <p>Chosen resolution: pin the branch directly at THIS unit level with a mocked repository
+     * returning exactly that unconstructable shape — the honest way to test a guard that is
+     * unreachable by construction end-to-end, rather than leaving it completely unexercised.
+     */
+    @Test
+    @DisplayName("unassignServiceFromMaster throws ForbiddenException when the resolved assignment's "
+            + "service definition is owned by a DIFFERENT salon (defense-in-depth guard, "
+            + "unreachable end-to-end by the master_services write-path invariant — see "
+            + "MasterServiceUnassignIT case 17)")
+    void should_throwForbidden_when_assignmentServiceDefinitionOwnedByAnotherSalon() {
+        UUID salonId = UUID.randomUUID();
+        UUID otherSalonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        // Unconstructable in production (write-path invariant) but exactly what the ownerId
+        // re-check exists to defend against if that invariant were ever broken.
+        ServiceDefinition foreignServiceDef = mock(ServiceDefinition.class);
+        when(foreignServiceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(foreignServiceDef.getOwnerId()).thenReturn(otherSalonId);
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(foreignServiceDef);
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("does not belong to this salon");
+    }
+
+    @Test
+    @DisplayName("unassignServiceFromMaster resolves master + assignment in ONE finder call on the "
+            + "happy path — never a separate masterRepository.findById (Phase 307 MEDIUM-1/2)")
+    void should_resolveInOneQuery_when_activeAssignmentExistsForUnassign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID assignmentId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(assignmentId);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+        when(clock.instant()).thenReturn(java.time.Instant.parse("2026-06-01T00:00:00Z"));
+        when(clock.getZone()).thenReturn(java.time.ZoneOffset.UTC);
+        when(bookingRepository.countConfirmedFutureByMasterServiceId(
+                eq(masterId), eq(assignmentId), any())).thenReturn(0L);
+
+        serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId);
+
+        verify(masterServiceRepository, times(1))
+                .findByMasterIdAndServiceDefinitionId(masterId, serviceDefId);
+        verify(masterRepository, never()).findById(any());
+        verify(assignment).setActive(false);
+        verify(masterRepository).refreshMinEffectivePrice(masterId);
     }
 
     // ── addIndependentMasterService ────────────────────────────────────────────

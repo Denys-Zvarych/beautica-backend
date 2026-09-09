@@ -479,6 +479,160 @@ class ServiceControllerTest {
         verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
     }
 
+    // ── DELETE /api/v1/salons/{salonId}/masters/{masterId}/services/{serviceDefId} — Phase 307 ──
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 204 when owner unassigns")
+    void should_return204_when_ownerUnassignsServiceFromMaster() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        // unassignServiceFromMaster is void — default Mockito no-op = success.
+
+        log.debug("Act: DELETE /api/v1/salons/{}/masters/{}/services/{} — owner unassigns", salonId, masterId, serviceDefId);
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+
+        verify(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 204 when SALON_ADMIN of the salon unassigns (D5)")
+    void should_return204_when_salonAdminUnassignsServiceFromMaster() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+
+        log.debug("Act: DELETE /api/v1/salons/{}/masters/{}/services/{} as SALON_ADMIN — must be allowed (D5)",
+                salonId, masterId, serviceDefId);
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+
+        verify(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 403 when the master is not in the salon "
+            + "(masterBelongsToSalon IDOR guard — mutation check (g): dropping this conjunct is caught HERE, not by the IT, "
+            + "because the service layer's own re-check masks it there)")
+    void should_return403_when_unassignTargetsMasterInAnotherSalon() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonAId = UUID.randomUUID();
+        var masterInSalonBId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterInSalonBId, salonAId)).thenReturn(false);
+
+        log.debug("Act: DELETE targeting a master in another salon — must return 403");
+        mockMvc.perform(delete("/api/v1/salons/" + salonAId + "/masters/" + masterInSalonBId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 403 when SALON_MASTER (read-only role) attempts an unassign")
+    void should_return403_when_salonMasterAttemptsUnassign() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        log.debug("Act: DELETE as SALON_MASTER — read-only role must be denied with 403");
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 403 when CLIENT attempts an unassign")
+    void should_return403_when_clientAttemptsUnassign() throws Exception {
+        var clientUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        log.debug("Act: DELETE as CLIENT — must be denied with 403");
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(clientUserId, "client@beautica.test", Role.CLIENT))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 409 when a future CONFIRMED booking blocks the unassign (D4)")
+    void should_return409_when_futureConfirmedBookingBlocksUnassign() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        doThrow(new BusinessException(HttpStatus.CONFLICT, "Master has 1 future confirmed booking(s) for this service"))
+                .when(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+
+        log.debug("Act: DELETE with a future CONFIRMED booking in the way — must return 409");
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 404 when there is no active assignment for the pair (D7)")
+    void should_return404_when_noActiveAssignmentForUnassign() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        doThrow(new com.beautica.common.exception.NotFoundException("No active assignment for master " + masterId
+                + " and service " + serviceDefId))
+                .when(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+
+        log.debug("Act: DELETE an already-inactive pair — must return 404 (D7 idempotency-by-row-state)");
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("DELETE /salons/{salonId}/masters/{masterId}/services/{serviceDefId} — 401 when no Authorization header is present")
+    void should_return401_when_unassignWithoutAuth() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+
+        log.debug("Act: DELETE without Authorization header — must return 401");
+        mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(csrf()))
+                .andExpect(status().isUnauthorized());
+    }
+
     // ── GET /api/v1/masters/{masterId}/services — public ──────────────────────
 
     @Test

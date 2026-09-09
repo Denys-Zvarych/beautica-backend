@@ -224,6 +224,49 @@ public class ServiceController {
     }
 
     /**
+     * Unassigns ONE master from ONE service — NOT {@link #deactivateServiceDefinition}, which
+     * deactivates the shared definition and removes it from EVERY master in the salon at once.
+     * This is the surgical, per-master counterpart (Phase 307): different path, different row,
+     * different blast radius, neither replaces the other.
+     *
+     * <p>Soft-unassigns only — {@code master_services.is_active} flips to {@code false}; the row,
+     * the shared {@link com.beautica.service.entity.ServiceDefinition}, and every other master's
+     * assignment are untouched (D1/D2). A future {@code CONFIRMED} booking through this exact
+     * assignment refuses the call with {@code 409} and writes nothing (D4 — the shipping contract;
+     * Phase 308's cancel-and-notify cascade was deferred by the user). A second call against an
+     * already-inactive pair is a plain {@code 404} (D7).
+     *
+     * <p>Guard mirrors {@link #assignServiceToMaster}: {@code canManageSalon} admits the salon's
+     * owner and admin, {@code masterBelongsToSalon} closes the same timing-oracle IDOR. Service-
+     * layer re-validation still runs — the SpEL gate is never trusted alone.
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} — passing a
+     * user id yields {@code 404}, not {@code 403}.
+     */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Same lone-@ApiResponse guard as every other write endpoint in this file — see
+            // assignServiceToMaster above.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "The master has a future CONFIRMED booking "
+                            + "for this exact service; nothing was written. Cancel or decline it "
+                            + "first, or wait for it to pass."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
+    @DeleteMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    public ResponseEntity<Void> unassignServiceFromMaster(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            @PathVariable UUID serviceDefId
+    ) {
+        serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId);
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
      * Returns the active services offered by the given master.
      *
      * <p><strong>Public endpoint — no authentication required.</strong>

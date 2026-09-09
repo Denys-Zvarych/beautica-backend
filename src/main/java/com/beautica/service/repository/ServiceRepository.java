@@ -248,15 +248,30 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
      * {@code ux_service_def_owner_service_type_active} and {@code master_services}' unique key stay
      * the actual guarantees; the salon-keyed advisory lock is what turns ordinary contention into
      * the clean 409 instead of a constraint violation.
+     *
+     * <p><b>The join is NOT filtered on {@code msa.isActive} (Phase 307 D6).</b> It used to be —
+     * {@code AND msa.isActive = true} in the {@code ON} clause — which made an INACTIVE
+     * (previously-unassigned, see {@code ServiceCatalogService#unassignServiceFromMaster}) row
+     * invisible to this query entirely: the candidate came back with a {@code null}
+     * {@code masterAssignmentId}, {@link #findSalonBulkSetupCandidates}'s caller read that as "no
+     * assignment", the reuse branch inserted a SECOND {@code master_services} row for the same
+     * {@code (master_id, service_def_id)} pair, and — because that unique key is NOT partial —
+     * the insert tripped it at flush and surfaced as an opaque 409. The join now returns the row
+     * regardless of its {@code is_active} state, and {@code msa.isActive} is projected alongside
+     * the id so {@link SalonBulkSetupCandidate#assignedToMaster()} /
+     * {@link SalonBulkSetupCandidate#hasInactiveAssignment()} can tell "already offered" (ACTIVE —
+     * still a conflict) apart from "previously unassigned" (INACTIVE — a reactivation candidate,
+     * not a conflict and not a fresh insert). Cardinality is unaffected: {@code master_services}'
+     * unique key still bounds the join to at most one row per definition regardless of its active
+     * state.
      */
     @Query("""
             SELECT new com.beautica.service.repository.SalonBulkSetupCandidate(
-                       sd.serviceType.id, sd, msa.id)
+                       sd.serviceType.id, sd, msa.id, msa.isActive)
             FROM ServiceDefinition sd
             LEFT JOIN MasterServiceAssignment msa
                    ON msa.serviceDefinition = sd
                   AND msa.master.id = :masterId
-                  AND msa.isActive = true
             WHERE sd.isActive = true
               AND sd.serviceType.id IN :typeIds
               AND ((sd.ownerType = com.beautica.service.entity.OwnerType.SALON

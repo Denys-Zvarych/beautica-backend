@@ -1439,6 +1439,41 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     List<SalonClosureBookingCandidate> findConfirmedFutureByMasterId(
             @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
 
+    // ── Per-master-service unassign guard (Phase 307 D4) ──────────────────────
+
+    /**
+     * Assignment-scoped sibling of {@link #findConfirmedFutureByMasterId} for
+     * {@code ServiceCatalogService#unassignServiceFromMaster}: a COUNT, not a candidate list,
+     * because this phase does not cascade (no cancel, no notification) — it only needs to know
+     * whether to refuse the unassign with {@code 409}.
+     *
+     * <p><b>Scoped to {@code master_service_id}, deliberately narrower than the master-wide
+     * sibling.</b> Unassigning ONE service must not be blocked by a future booking for a
+     * DIFFERENT service the same master performs — the count would otherwise leak across
+     * assignments and over-refuse (phase doc test case 7).
+     *
+     * <p>{@code masterId} is redundant with {@code masterServiceId} (an assignment belongs to
+     * exactly one master) and kept anyway, exactly for the reason
+     * {@code findSalonBulkSetupCandidates}' equally-redundant {@code sd.ownerId IN :salonIds} term
+     * is kept: it is the LEADING column of {@code idx_bookings_master_service_starts_at
+     * (master_id, master_service_id, starts_at)} (Phase 26.4), so the composite index only serves
+     * this as a direct index-range seek when the leading column is actually present in the
+     * predicate — dropping it would leave {@code master_service_id} as a mid-index probe the
+     * planner cannot seek on directly.
+     */
+    @Query("""
+            SELECT COUNT(b)
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.masterService.id = :masterServiceId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    long countConfirmedFutureByMasterServiceId(
+            @Param("masterId") UUID masterId,
+            @Param("masterServiceId") UUID masterServiceId,
+            @Param("now") OffsetDateTime now);
+
     // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
 
     /**

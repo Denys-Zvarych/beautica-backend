@@ -521,7 +521,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         // The salon offers the type but this master does not perform it → the REUSE row.
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
@@ -538,6 +538,72 @@ class ServiceCatalogServiceBulkCreateTest {
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).serviceDefinition().id()).isEqualTo(existingDefId);
+    }
+
+    /**
+     * Phase 307 D6 (bulk path) — the QA gap this test closes: {@code
+     * ServiceCatalogServiceBulkCreateTest} covered the fresh-insert reuse row ({@code
+     * masterAssignmentId=null}) and the ACTIVE-conflict row ({@code masterAssignmentActive=true})
+     * but never the third {@link SalonBulkSetupCandidate} shape — a master's own INACTIVE {@code
+     * master_services} row for the salon's reused definition, i.e. a service this master
+     * unassigned earlier via {@code unassignServiceFromMaster} and is now re-adding through the
+     * bulk screen. {@code reactivatableAssignmentIdByTypeId} (:1742) and {@code
+     * createSingleFromBulkItem}'s reactivation sub-branch (:776-787) existed in the diff with zero
+     * unit coverage — only {@code MasterServiceUnassignIT} case 8 exercised D6, and only through
+     * the SINGLE-assign endpoint, never the bulk one.
+     *
+     * <p>Proves the bulk path REACTIVATES the existing row (mutates the SAME managed entity,
+     * dirty-checked — no {@code masterServiceRepository.save} call) rather than inserting a
+     * second {@code master_services} row for the pair, which would trip the non-partial {@code
+     * UNIQUE (master_id, service_def_id)} at flush.
+     */
+    @Test
+    @DisplayName("salon on-behalf — a master's own INACTIVE assignment for the reused definition is "
+            + "REACTIVATED, not re-inserted (Phase 307 D6, bulk path)")
+    void should_reactivateInactiveAssignment_when_bulkReAddingPreviouslyUnassignedService() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+        UUID inactiveAssignmentId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing = existingSalonDefinition(existingDefId, salonId, type, "350.00", 60);
+        MasterServiceAssignment inactiveAssignment = MasterServiceAssignment.builder()
+                .id(inactiveAssignmentId)
+                .master(master)
+                .serviceDefinition(existing)
+                .isActive(false)
+                .build();
+
+        var request = new BulkCreateServicesRequest(List.of(fixedItem(typeId, 60, "350.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        // masterAssignmentId non-null + masterAssignmentActive=false => hasInactiveAssignment(),
+        // the D6 reactivation candidate — distinct from both the null-id reuse row and the
+        // active=true conflict row already covered elsewhere in this class.
+        stubSalonCandidates(salonId, masterId,
+                new SalonBulkSetupCandidate(typeId, existing, inactiveAssignmentId, false));
+        when(masterServiceRepository.findById(inactiveAssignmentId)).thenReturn(Optional.of(inactiveAssignment));
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
+        verify(masterServiceRepository, never())
+                .save(any(MasterServiceAssignment.class));
+        verify(masterServiceRepository).findById(inactiveAssignmentId);
+
+        assertThat(inactiveAssignment.isActive())
+                .as("D6 — the existing row is reactivated in place, not left inactive")
+                .isTrue();
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).id())
+                .as("the response carries the SAME assignment id — no duplicate row was created")
+                .isEqualTo(inactiveAssignmentId);
     }
 
     /**
@@ -564,7 +630,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         // The salon offers the type but this master does not perform it → the REUSE row.
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
         serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
@@ -611,7 +677,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         // The salon offers the type but this master does not perform it → the REUSE row.
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
         serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
@@ -646,11 +712,11 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
-        // This master ALREADY performs the type — a non-null assignment id is the conflict signal.
+        // This master ALREADY performs the type — a non-null ACTIVE assignment id is the conflict signal.
         stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(
                 typeId,
                 existingSalonDefinition(assignedDefId, salonId, type, "350.00", 60),
-                UUID.randomUUID()));
+                UUID.randomUUID(), true));
 
         assertThatThrownBy(() ->
                 serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request))
@@ -698,11 +764,11 @@ class ServiceCatalogServiceBulkCreateTest {
                 new SalonBulkSetupCandidate(
                         secondTypeId,
                         existingSalonDefinition(secondDefId, salonId, secondType, "450.00", 90),
-                        UUID.randomUUID()),
+                        UUID.randomUUID(), true),
                 new SalonBulkSetupCandidate(
                         firstTypeId,
                         existingSalonDefinition(firstDefId, salonId, firstType, "350.00", 60),
-                        UUID.randomUUID()));
+                        UUID.randomUUID(), true));
 
         assertThatThrownBy(() ->
                 serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request))
@@ -801,7 +867,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
 
         ServicePriceShapeMismatchException thrown = catchThrowableOfType(
                 () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
@@ -849,7 +915,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
 
         ServicePriceShapeMismatchException thrown = catchThrowableOfType(
                 () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
@@ -888,7 +954,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
 
         ServicePriceShapeMismatchException thrown = catchThrowableOfType(
                 () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
@@ -942,7 +1008,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
@@ -1006,7 +1072,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
-        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =

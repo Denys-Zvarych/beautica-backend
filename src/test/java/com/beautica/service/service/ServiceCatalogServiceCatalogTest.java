@@ -58,6 +58,12 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private com.beautica.common.security.AuthorizationService authz;
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private com.beautica.booking.repository.BookingRepository bookingRepository;
+
+    // Fixed, not mocked — this test class never exercises the D4 future-booking guard, so a real
+    // pinned Clock is simpler than stubbing clock.instant() on every unrelated test.
+    private final java.time.Clock clock =
+            java.time.Clock.fixed(java.time.Instant.parse("2026-09-09T00:00:00Z"), java.time.ZoneOffset.UTC);
 
     private ServiceCatalogService service;
 
@@ -81,7 +87,9 @@ class ServiceCatalogServiceCatalogTest {
                 new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 authz,
                 slotCalculationService,
-                salonCatalogCacheEvictor
+                salonCatalogCacheEvictor,
+                bookingRepository,
+                clock
         );
     }
 
