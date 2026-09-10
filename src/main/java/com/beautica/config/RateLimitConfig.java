@@ -153,6 +153,35 @@ public class RateLimitConfig {
     //   - PATCH  /api/v1/services/{serviceDefId}/photo
     //   - DELETE /api/v1/services/{serviceDefId}
     //
+    // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
+    // management read) at this same path+suffix, but it is a read — AuthRateLimitFilter's
+    // method-gated match on this prefix+suffix rule is POST-only, so the GET does NOT share
+    // this bucket and carries no rate limit of its own.
+    //
+    // ACCEPTED RISK, not an oversight (2026-09-10, Phase 309 audit-fix cycle 1, LOW-2). This GET
+    // is deliberately left unthrottled, consistent with EVERY other authenticated GET on
+    // ServiceController and across the codebase generally. Despite this class's name,
+    // AuthRateLimitFilter's buckets are an enumerated allow-list of specific mutation
+    // endpoints (POST/PATCH/DELETE, identified above by path+method) plus a handful of
+    // named authenticated READS with a documented abuse story of their own (e.g. slotsBuckets
+    // for /working-days + /slots) — it is NOT a blanket limiter for all authenticated traffic,
+    // and there is no general per-IP or per-principal limiter that authenticated GETs fall
+    // back to by default. Adding a one-off bucket to only this route would be inconsistent
+    // with that convention and is a broader "should authenticated reads be throttled at all"
+    // decision than this phase owns.
+    //
+    // Trusted callers: only SALON_OWNER or SALON_ADMIN for the target salonId — both gated by
+    // @PreAuthorize's role check + @authz.canManageSalon, so an unauthenticated or
+    // wrong-salon caller never reaches the read regardless of rate.
+    //
+    // What would flip this decision: (a) observed abuse/scraping against this route in
+    // production logs or an incident, or (b) this route (or its authorization predicate) ever
+    // opening to a less-trusted role than SALON_OWNER/SALON_ADMIN, e.g. exposing it to
+    // SALON_MASTER or removing the canManageSalon check. Either should reopen this as a
+    // dedicated finding, not be silently patched in here.
+    //
+    // Listed here only so this inventory stays truthful about every route living at this path.
+    //
     // Every one of these fell through to the unmatched else/non-POST branch of
     // AuthRateLimitFilter with NO bucket at all, which undercut bulkServiceSetupCapacity's own
     // stated rationale: the bulk bucket is capped to bound service_definitions row growth, but an

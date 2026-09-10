@@ -267,6 +267,63 @@ public class ServiceController {
     }
 
     /**
+     * Returns the FULL service list of one master in {@code salonId}, {@code priceOverride}
+     * unmasked — the management read for the salon's OWNER/ADMIN (Phase 309).
+     *
+     * <p><strong>Not a substitute route for {@link #getMasterServices}.</strong> That public
+     * browse masks {@code priceOverride} via {@code MasterServiceResponse.fromPublic} and is
+     * cached with the masked shape; this endpoint returns {@code MasterServiceResponse::from}
+     * straight, unmasked, because a salon owner MANAGING a master's menu needs the exact field
+     * an anonymous browser must not see (Phase 309 D1).
+     *
+     * <p><strong>Authorization diverges from {@link #unassignServiceFromMaster}'s failure code
+     * on purpose (Phase 309 D2).</strong> That DELETE's {@code @PreAuthorize} also carries
+     * {@code @authz.masterBelongsToSalon(#masterId, #salonId)}, so a cross-salon {@code
+     * masterId} 403s there. Here that conjunct is deliberately NOT in the SpEL gate — the
+     * {@code @PreAuthorize} below checks only the role and {@code canManageSalon}; a cross-salon
+     * or nonexistent {@code masterId} is resolved INSIDE
+     * {@link ServiceCatalogService#getSalonMasterServices} and denied with a plain 404, so the
+     * response body cannot distinguish "belongs to another salon" from "no such master".
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} (D3) — a
+     * user id also 404s.
+     *
+     * <p><strong>NOT cached (D4).</strong> Mirrors {@link #getMyServices}; the public {@code
+     * masterServices} cache that backs {@link #getMasterServices} is never read, populated or
+     * evicted by this endpoint.
+     */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit 200 so springdoc does not drop the typed body — see the note on
+            // addIndependentMasterService above; omitting this regenerates the mobile Dart
+            // client to Response<void> and breaks res.data?.data.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "No master with this id in this salon — "
+                            + "also returned when masterId belongs to a different salon, or is a "
+                            + "user id rather than a masters row id (D3); the body never "
+                            + "distinguishes these cases. Note: the sibling DELETE on this same "
+                            + "path (unassign) returns 403, not 404, for the identical "
+                            + "cross-salon-master fact — this GET intentionally uses 404 instead "
+                            + "so an unauthorized caller cannot tell a master belonging to "
+                            + "another salon from one that does not exist at all.")
+            // No 429 here — unlike the write endpoints on this path (POST/DELETE), this GET is
+            // not matched by AuthRateLimitFilter's method-gated serviceWriteBuckets check
+            // (HttpMethod.POST.matches(method) guards that branch), so documenting RATE_LIMITED_429
+            // would claim a status this read never actually returns.
+    })
+    @GetMapping("/salons/{salonId}/masters/{masterId}/services")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<MasterServiceResponse>> getSalonMasterServices(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        return ApiResponse.ok(serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId));
+    }
+
+    /**
      * Returns the active services offered by the given master.
      *
      * <p><strong>Public endpoint — no authentication required.</strong>

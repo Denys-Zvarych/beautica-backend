@@ -119,6 +119,27 @@ class ServiceCatalogServiceTest {
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 
+    // Logback ListAppender — attached to ServiceCatalogService's logger only for the
+    // getSalonMasterServices page-cap boundary tests below (Phase 309 audit-fix LOW-1).
+    private ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> logAppender;
+
+    @org.junit.jupiter.api.BeforeEach
+    void attachLogAppender() {
+        ch.qos.logback.classic.Logger serviceCatalogServiceLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ServiceCatalogService.class);
+        logAppender = new ch.qos.logback.core.read.ListAppender<>();
+        logAppender.start();
+        serviceCatalogServiceLogger.addAppender(logAppender);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void detachLogAppender() {
+        ch.qos.logback.classic.Logger serviceCatalogServiceLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ServiceCatalogService.class);
+        serviceCatalogServiceLogger.detachAppender(logAppender);
+        logAppender.stop();
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────────
 
     /**
@@ -1120,6 +1141,210 @@ class ServiceCatalogServiceTest {
 
         verify(masterServiceRepository, never())
                 .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    // ── getSalonMasterServices (Phase 309) ──────────────────────────────────────
+    //
+    // QA audit gap-fill: the IT suite (SalonMasterServicesReadIT) exercises this method only
+    // through the real @PreAuthorize AOP proxy, which independently re-checks
+    // `@authz.canManageSalon`. A mutation removing the service-layer
+    // `authz.hasManagementAccess(...)` re-check below (Phase 309 D2's defense-in-depth claim,
+    // "a future non-HTTP caller cannot bypass the SpEL gate") left the ENTIRE IT + slice suite
+    // green — confirmed by deliberately deleting that check and re-running
+    // ServiceControllerTest + SalonMasterServicesReadIT (109/109 still passed). These three
+    // tests call the plain Java method directly, bypassing the Spring Security proxy entirely,
+    // so they are the only tests that can catch that specific regression.
+
+    @Test
+    @DisplayName("getSalonMasterServices returns the FULL, unmasked service list when the actor "
+            + "manages the salon and the master belongs to it")
+    void should_returnUnmaskedServices_when_actorManagesSalonAndMasterBelongsToIt() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        BigDecimal override = new BigDecimal("300.00");
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .name("Gel Nails")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(UUID.randomUUID());
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(override);
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).priceOverride())
+                .as("D1 — the management read must return priceOverride unmasked, unlike fromPublic")
+                .isEqualByComparingTo(override);
+        assertThat(result.get(0).priceOverride())
+                .as("override must differ from base_price so masking could not pass unnoticed")
+                .isNotEqualByComparingTo(result.get(0).priceMin());
+        verify(authz).hasManagementAccess(salonId, actorId);
+        verify(masterRepository).existsByIdAndSalonId(masterId, salonId);
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices throws ForbiddenException and never queries the master or "
+            + "its services when the actor does not manage the salon (D2 defense-in-depth — "
+            + "regression net for the service-layer re-check the @PreAuthorize SpEL duplicates)")
+    void should_throwForbiddenAndSkipMasterLookup_when_actorCannotManageSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(false);
+
+        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices throws NotFoundException and never queries services when "
+            + "masterId does not belong to salonId (D2 — cross-salon and nonexistent masters must "
+            + "be indistinguishable)")
+    void should_throwNotFoundAndSkipServicesLookup_when_masterDoesNotBelongToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        // Only existsByIdAndSalonId may gate this check — a bare existsById(masterId) would
+        // return the Mockito default `false` here too, so this alone would not distinguish
+        // "calls existsByIdAndSalonId" from "calls existsById"; the mutation-testing pass in
+        // the QA audit exercised that distinction directly against the real repository instead
+        // (mutating existsByIdAndSalonId -> existsById turned SalonMasterServicesReadIT's Case 3
+        // red). This test still pins the NotFoundException contract and the short-circuit below.
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(false);
+
+        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining(masterId.toString());
+
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    /**
+     * Builds {@code count} mocked, minimally-stubbed {@link MasterServiceAssignment} rows for the
+     * page-cap boundary tests below. A Mockito mock per row is cheap and does not require
+     * building real {@code ServiceDefinition}/{@code Master} fixtures or a DB — the boundary
+     * check only cares about the SIZE of the list {@code getSalonMasterServices} maps, not the
+     * content of each row, so this stays a realistic unit-test fixture rather than an invented
+     * 200-row DB scenario.
+     */
+    private List<MasterServiceAssignment> buildAssignments(int count, UUID masterId) {
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Gel Nails")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        List<MasterServiceAssignment> assignments = new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+            when(assignment.getId()).thenReturn(UUID.randomUUID());
+            when(assignment.getMaster()).thenReturn(master);
+            when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+            when(assignment.isActive()).thenReturn(true);
+            when(assignment.getPriceOverride()).thenReturn(null);
+            when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+            assignments.add(assignment);
+        }
+        return assignments;
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices logs a WARN naming salonId/masterId/cap when the result "
+            + "hits exactly the 200-row page cap (Phase 309 audit-fix LOW-1 — the cap is silent "
+            + "otherwise)")
+    void should_logWarnNamingSalonAndMasterAndCap_when_resultHitsThe200RowCap() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+        // Built BEFORE the when(...).thenReturn(...) call below — nesting a second when(...) call
+        // (buildAssignments mocks its own Master) as an argument expression inside an outer
+        // ongoing when(...).thenReturn(...) trips Mockito's UnfinishedStubbingException.
+        List<MasterServiceAssignment> capacityAssignments = buildAssignments(200, masterId);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(capacityAssignments);
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+
+        assertThat(result).hasSize(200);
+
+        List<ch.qos.logback.classic.spi.ILoggingEvent> warnings = logAppender.list.stream()
+                .filter(event -> event.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .toList();
+        assertThat(warnings).hasSize(1);
+        assertThat(warnings.get(0).getFormattedMessage())
+                .contains(salonId.toString())
+                .contains(masterId.toString())
+                .contains("200");
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices logs nothing when the result is one row below the "
+            + "200-row page cap")
+    void should_notLogWarn_when_resultIsOneRowBelowThe200RowCap() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+        // Built BEFORE the when(...).thenReturn(...) call below — see the sibling cap test for why.
+        List<MasterServiceAssignment> belowCapAssignments = buildAssignments(199, masterId);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(belowCapAssignments);
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+
+        assertThat(result).hasSize(199);
+
+        List<ch.qos.logback.classic.spi.ILoggingEvent> warnings = logAppender.list.stream()
+                .filter(event -> event.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .toList();
+        assertThat(warnings).isEmpty();
     }
 
     // ── deactivateServiceDefinition ────────────────────────────────────────────

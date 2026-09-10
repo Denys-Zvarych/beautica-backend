@@ -167,6 +167,21 @@ class ServiceControllerTest {
                 null, null, null, null);
     }
 
+    /**
+     * Phase 309: variant carrying a non-null {@code priceOverride} distinct from the stub's
+     * {@code base_price}/{@code effectivePrice} (350.00), so the D1 "priceOverride present and
+     * non-null, unmasked" assertion cannot pass by coincidence of an override equal to the
+     * definition's base price.
+     */
+    private MasterServiceResponse stubMasterServiceResponseWithOverride(
+            UUID id, UUID masterId, String name, BigDecimal priceOverride) {
+        var sdResponse = stubServiceDefResponse(UUID.randomUUID(), name);
+        return new MasterServiceResponse(id, masterId, sdResponse,
+                priceOverride, null, priceOverride, 60, true,
+                PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴",
+                null, null, null, null);
+    }
+
     /** Phase 16.4: variant carrying the lifted serviceTypeId + serviceTypeNameUk so the JSON shape can be asserted. */
     private MasterServiceResponse stubMasterServiceResponseWithType(
             UUID id, UUID masterId, String name, UUID serviceTypeId, String serviceTypeNameUk) {
@@ -631,6 +646,153 @@ class ServiceControllerTest {
         mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
                         .with(csrf()))
                 .andExpect(status().isUnauthorized());
+    }
+
+    // ── GET /api/v1/salons/{salonId}/masters/{masterId}/services — Phase 309 management read ──
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 200 when the salon OWNER reads, "
+            + "priceOverride present and non-null (D1 — full variant, never fromPublic)")
+    void should_return200WithPriceOverride_when_ownerReadsSalonMasterServices() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var rowId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponseWithOverride(
+                rowId, masterId, "Gel Nails", new BigDecimal("300.00")));
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(userId, salonId, masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as OWNER", salonId, masterId);
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].priceOverride").value(300.00));
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 200 when SALON_ADMIN of the "
+            + "salon reads (phase 306 parity)")
+    void should_return200_when_salonAdminReadsSalonMasterServices() throws Exception {
+        var adminUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(adminUserId, salonId, masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as SALON_ADMIN", salonId, masterId);
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(adminUserId, "admin@beautica.test", Role.SALON_ADMIN))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(1));
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 404 (not 403) when masterId "
+            + "belongs to a different salon (Phase 309 D2 — diverges from the DELETE precedent's "
+            + "403, since masterBelongsToSalon is deliberately NOT in this endpoint's @PreAuthorize)")
+    void should_return404_when_masterBelongsToAnotherSalon() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterInOtherSalonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(userId, salonId, masterInOtherSalonId))
+                .thenThrow(new com.beautica.common.exception.NotFoundException(
+                        "Master not found: " + masterInOtherSalonId));
+
+        log.debug("Act: GET targeting a master in another salon — must return 404, not 403");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterInOtherSalonId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 404 when masterId is a USER id, "
+            + "not a masters row id (D3)")
+    void should_return404_when_masterIdIsAUserId() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var someUserId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(userId, salonId, someUserId))
+                .thenThrow(new com.beautica.common.exception.NotFoundException(
+                        "Master not found: " + someUserId));
+
+        log.debug("Act: GET with a userId in the masterId slot — must return 404 (D3)");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + someUserId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 403 when SALON_MASTER "
+            + "(read-only role) attempts the management read")
+    void should_return403_when_salonMasterReadsSalonMasterServices() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        log.debug("Act: GET as SALON_MASTER — read-only role must be denied with 403");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 403 when CLIENT attempts the "
+            + "management read")
+    void should_return403_when_clientReadsSalonMasterServices() throws Exception {
+        var clientUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        log.debug("Act: GET as CLIENT — must be denied with 403");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(clientUserId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 401 when no Authorization "
+            + "header is present")
+    void should_return401_when_salonMasterServicesReadWithoutAuth() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+
+        log.debug("Act: GET without Authorization header — must return 401");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 403 when the caller cannot "
+            + "manage this salon (not an owner/admin of it)")
+    void should_return403_when_callerCannotManageSalon() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
+
+        log.debug("Act: GET as a SALON_OWNER who does not manage this salon — must return 403");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "other-owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
     }
 
     // ── GET /api/v1/masters/{masterId}/services — public ──────────────────────

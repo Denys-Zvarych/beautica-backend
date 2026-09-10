@@ -89,6 +89,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     //      — one prefix covers the update, photo-update and deactivate routes. It cannot collide
     //        with /api/v1/service-categories/** or /api/v1/service-types/**, which do not start
     //        with the literal "services/" segment.
+    //
+    // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
+    // management read) at the SAME prefix+suffix as shape 2's salon single-create POST. It does
+    // NOT join serviceWriteBuckets: every branch below that matches SALON_SINGLE_SERVICE_PREFIX/
+    // SUFFIX is additionally gated on HttpMethod.POST.matches(method), so the GET falls through
+    // unthrottled, same as every other authenticated read on this controller. Noted here only so
+    // this inventory stays truthful about every route living at this path.
     private static final String IM_SINGLE_SERVICE_PATH = "/api/v1/independent-masters/me/services";
     private static final String SALON_SINGLE_SERVICE_PREFIX = "/api/v1/salons/";
     private static final String SALON_SINGLE_SERVICE_SUFFIX = "/services";

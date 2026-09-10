@@ -79,6 +79,15 @@ public class ServiceCatalogService {
      */
     private static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_service_type_active";
 
+    /**
+     * Page cap for {@link #getSalonMasterServices(UUID, UUID, UUID)} — matches the established,
+     * unnamed {@code 200} literal on the sibling reads {@link #getMyServices} and
+     * {@link #getMasterServices(UUID)}. Named here only so the boundary check in
+     * {@code getSalonMasterServices} has a single source of truth; the sibling methods are out of
+     * scope for this constant (Phase 309 audit-fix LOW-1) and keep their own literals.
+     */
+    private static final int SALON_MASTER_SERVICES_PAGE_CAP = 200;
+
     private final ServiceRepository serviceRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
@@ -945,6 +954,72 @@ public class ServiceCatalogService {
                 .stream()
                 .map(MasterServiceResponse::from)
                 .toList();
+    }
+
+    /**
+     * Returns the FULL service list of one master in {@code salonId}, {@code priceOverride}
+     * unmasked — the salon OWNER/ADMIN management read this class did not previously expose
+     * (Phase 309 D1). Same query and shape as {@link #getMyServices}, just resolved from a
+     * caller-supplied {@code (salonId, masterId)} pair behind an ownership gate instead of the
+     * principal's own {@code userId}.
+     *
+     * <p><b>Defense-in-depth (Phase 309 D2), same shape as {@link #unassignServiceFromMaster}'s
+     * precedent, DIFFERENT failure code on the master-ownership half.</b> The controller's
+     * {@code @PreAuthorize} already checks {@code hasAnyRole('SALON_OWNER','SALON_ADMIN')} and
+     * {@code @authz.canManageSalon}; {@code actorId} re-proves the identical salon-management
+     * predicate here via {@link com.beautica.common.security.AuthorizationService
+     * #hasManagementAccess(UUID, UUID)} so a future non-HTTP caller cannot bypass the SpEL gate
+     * — mirrors {@code deactivateServiceDefinition}'s idiom. The master-belongs-to-salon half
+     * intentionally does NOT go through {@code @authz.masterBelongsToSalon} — that predicate is
+     * wired into {@code unassignServiceFromMaster}'s {@code @PreAuthorize} SpEL, where a
+     * cross-salon {@code masterId} 403s. Phase 309 D2 requires the OPPOSITE here: a cross-salon
+     * {@code masterId} must 404, indistinguishable from "no such master". So this method calls
+     * {@link MasterRepository#existsByIdAndSalonId} directly — the exact predicate {@code
+     * masterBelongsToSalon} itself delegates to — and denies with {@link NotFoundException}
+     * instead of {@link ForbiddenException}.
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} (D3) — a
+     * user id never satisfies {@code existsByIdAndSalonId} and so also 404s.
+     *
+     * <p><b>NOT cached (D4).</b> Mirrors {@link #getMyServices}: a low-volume, authenticated
+     * management read. The public {@code masterServices} cache — populated ONLY by {@link
+     * #getMasterServices(UUID)} with the masked shape — is never read, populated or evicted
+     * here.
+     *
+     * <p>{@code isActive = true} only (D5) — same visibility as both sibling reads.
+     *
+     * @throws ForbiddenException if the actor cannot manage {@code salonId}
+     * @throws NotFoundException  if {@code masterId} does not exist, or exists in a different salon
+     */
+    @Transactional(readOnly = true)
+    public List<MasterServiceResponse> getSalonMasterServices(UUID actorId, UUID salonId, UUID masterId) {
+        if (!authz.hasManagementAccess(salonId, actorId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        if (!masterRepository.existsByIdAndSalonId(masterId, salonId)) {
+            throw new NotFoundException("Master not found: " + masterId);
+        }
+
+        // Cap matches the sibling reads (getMyServices:944, getMasterServices:917) — this is the
+        // established pattern for this repository method, not a decision this phase makes.
+        // Switching to a real Pageable (caller-supplied page/size) is a separate, broader change.
+        // What IS this phase's concern: the cap is otherwise silent. If a master ever has more
+        // than SALON_MASTER_SERVICES_PAGE_CAP active services, this management view would
+        // truncate without any signal, so flag the boundary loudly instead of leaving it mute.
+        List<MasterServiceResponse> services = masterServiceRepository
+                .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, SALON_MASTER_SERVICES_PAGE_CAP))
+                .stream()
+                .map(MasterServiceResponse::from)
+                .toList();
+
+        if (services.size() == SALON_MASTER_SERVICES_PAGE_CAP) {
+            log.warn(
+                    "getSalonMasterServices returned exactly the {} row cap for salonId={} "
+                            + "masterId={} — result may be silently truncated",
+                    SALON_MASTER_SERVICES_PAGE_CAP, salonId, masterId);
+        }
+
+        return services;
     }
 
     @Transactional
