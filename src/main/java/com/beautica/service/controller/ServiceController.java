@@ -268,22 +268,35 @@ public class ServiceController {
 
     /**
      * Returns the FULL service list of one master in {@code salonId}, {@code priceOverride}
-     * unmasked — the management read for the salon's OWNER/ADMIN (Phase 309).
+     * unmasked — the management read for the salon's OWNER/ADMIN (Phase 309), widened by Phase
+     * 310 to also admit the master's OWN {@code SALON_MASTER} reading their own row.
      *
      * <p><strong>Not a substitute route for {@link #getMasterServices}.</strong> That public
      * browse masks {@code priceOverride} via {@code MasterServiceResponse.fromPublic} and is
      * cached with the masked shape; this endpoint returns {@code MasterServiceResponse::from}
-     * straight, unmasked, because a salon owner MANAGING a master's menu needs the exact field
-     * an anonymous browser must not see (Phase 309 D1).
+     * straight, unmasked, because a salon owner MANAGING a master's menu — or that master reading
+     * their own catalogue (Phase 310) — needs the exact field an anonymous browser must not see
+     * (Phase 309 D1, Phase 310 D4). The public route was deliberately rejected as the SALON_MASTER
+     * path for this reason (Phase 310 background).
+     *
+     * <p><strong>Who is admitted (Phase 310 D2).</strong> {@code @authz.canReadSalonMasterServices}
+     * grants: (1) {@code SALON_OWNER} / {@code SALON_ADMIN} managing {@code salonId} — Phase 309's
+     * behaviour, unchanged; (2) a {@code SALON_MASTER} whose {@code masters} row IS {@code
+     * masterId}, provided {@code salonId} actually owns that row ({@code masterBelongsToSalon},
+     * D2.4) — a {@code SALON_MASTER} reading a PEER master, in their own salon or any other, is
+     * refused. {@code CLIENT} is rejected on a role fast path before any DB hit.
      *
      * <p><strong>Authorization diverges from {@link #unassignServiceFromMaster}'s failure code
-     * on purpose (Phase 309 D2).</strong> That DELETE's {@code @PreAuthorize} also carries
-     * {@code @authz.masterBelongsToSalon(#masterId, #salonId)}, so a cross-salon {@code
-     * masterId} 403s there. Here that conjunct is deliberately NOT in the SpEL gate — the
-     * {@code @PreAuthorize} below checks only the role and {@code canManageSalon}; a cross-salon
-     * or nonexistent {@code masterId} is resolved INSIDE
-     * {@link ServiceCatalogService#getSalonMasterServices} and denied with a plain 404, so the
-     * response body cannot distinguish "belongs to another salon" from "no such master".
+     * on purpose (Phase 309 D2) — unchanged by Phase 310.</strong> That DELETE's {@code
+     * @PreAuthorize} also carries {@code @authz.masterBelongsToSalon(#masterId, #salonId)}, so a
+     * cross-salon {@code masterId} 403s there. Here that conjunct is deliberately NOT in the
+     * owner/admin branch of the SpEL gate — a cross-salon or nonexistent {@code masterId} for an
+     * OWNER/ADMIN caller is resolved INSIDE {@link ServiceCatalogService#getSalonMasterServices}
+     * and denied with a plain 404, so the response body cannot distinguish "belongs to another
+     * salon" from "no such master". Phase 310 does not touch this: the new own-row branch runs
+     * its OWN {@code masterBelongsToSalon} check inside the SpEL predicate instead (D2.4), so a
+     * {@code SALON_MASTER} passing a foreign {@code salonId} alongside their own {@code masterId}
+     * is refused at the gate, before the D3 404 path is ever reached.
      *
      * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} (D3) — a
      * user id also 404s.
@@ -313,7 +326,7 @@ public class ServiceController {
             // would claim a status this read never actually returns.
     })
     @GetMapping("/salons/{salonId}/masters/{masterId}/services")
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    @PreAuthorize("@authz.canReadSalonMasterServices(authentication, #salonId, #masterId)")
     public ApiResponse<List<MasterServiceResponse>> getSalonMasterServices(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,

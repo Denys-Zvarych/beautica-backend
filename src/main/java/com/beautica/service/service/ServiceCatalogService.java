@@ -965,18 +965,38 @@ public class ServiceCatalogService {
      *
      * <p><b>Defense-in-depth (Phase 309 D2), same shape as {@link #unassignServiceFromMaster}'s
      * precedent, DIFFERENT failure code on the master-ownership half.</b> The controller's
-     * {@code @PreAuthorize} already checks {@code hasAnyRole('SALON_OWNER','SALON_ADMIN')} and
-     * {@code @authz.canManageSalon}; {@code actorId} re-proves the identical salon-management
-     * predicate here via {@link com.beautica.common.security.AuthorizationService
-     * #hasManagementAccess(UUID, UUID)} so a future non-HTTP caller cannot bypass the SpEL gate
-     * — mirrors {@code deactivateServiceDefinition}'s idiom. The master-belongs-to-salon half
-     * intentionally does NOT go through {@code @authz.masterBelongsToSalon} — that predicate is
-     * wired into {@code unassignServiceFromMaster}'s {@code @PreAuthorize} SpEL, where a
-     * cross-salon {@code masterId} 403s. Phase 309 D2 requires the OPPOSITE here: a cross-salon
-     * {@code masterId} must 404, indistinguishable from "no such master". So this method calls
-     * {@link MasterRepository#existsByIdAndSalonId} directly — the exact predicate {@code
+     * {@code @PreAuthorize} already checks {@code @authz.canReadSalonMasterServices}; {@code
+     * actorId} re-proves the identical salon-management predicate here via {@link
+     * com.beautica.common.security.AuthorizationService#hasManagementAccess(UUID, UUID)} so a
+     * future non-HTTP caller cannot bypass the SpEL gate — mirrors {@code
+     * deactivateServiceDefinition}'s idiom. The master-belongs-to-salon half intentionally does
+     * NOT go through {@code @authz.masterBelongsToSalon} — that predicate is wired into {@code
+     * unassignServiceFromMaster}'s {@code @PreAuthorize} SpEL, where a cross-salon {@code
+     * masterId} 403s. Phase 309 D2 requires the OPPOSITE here: a cross-salon {@code masterId}
+     * must 404, indistinguishable from "no such master". So this method calls {@link
+     * MasterRepository#existsByIdAndSalonId} directly — the exact predicate {@code
      * masterBelongsToSalon} itself delegates to — and denies with {@link NotFoundException}
      * instead of {@link ForbiddenException}.
+     *
+     * <p><b>Own-row branch (Phase 310 D2/D2.4).</b> A {@code SALON_MASTER} reading their own row
+     * always fails {@code hasManagementAccess} — they are neither {@code SALON_OWNER} nor {@code
+     * SALON_ADMIN} — so it alone would wrongly 403 the exact caller Phase 310 widened the SpEL
+     * gate to admit. Before refusing, this method re-derives the identical own-row grant the SpEL
+     * predicate already proved: the resolved {@code masters} row's {@code user_id} must be the
+     * actor, AND {@code salonId} must actually own that row ({@code masterBelongsToSalon}, D2.4)
+     * — never compare against the {@code masters} row id itself, only {@code masters.user_id}
+     * (user id vs. row id is the confusion this defense-in-depth check exists to catch). The
+     * {@code SALON_OWNER}/{@code SALON_ADMIN} fast path above is unchanged — this branch only
+     * runs when {@code hasManagementAccess} has already failed, so it costs no extra query on the
+     * owner/admin path.
+     *
+     * <p><b>D3 query reuse (perf MEDIUM, 2026-09-11).</b> The own-row branch's {@code
+     * masterBelongsToSalon} call and the D3 check below both resolve {@code
+     * existsByIdAndSalonId(masterId, salonId)} — same predicate, same arguments. On the accepted
+     * own-row path this method captures that result and reuses it for D3 instead of issuing the
+     * identical query twice. The owner/admin fast path is untouched: {@code masterBelongsToSalon}
+     * is never computed there, so D3 still issues its own query, preserving that path's existing
+     * query count.
      *
      * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} (D3) — a
      * user id never satisfies {@code existsByIdAndSalonId} and so also 404s.
@@ -988,15 +1008,36 @@ public class ServiceCatalogService {
      *
      * <p>{@code isActive = true} only (D5) — same visibility as both sibling reads.
      *
-     * @throws ForbiddenException if the actor cannot manage {@code salonId}
+     * @throws ForbiddenException if the actor cannot manage {@code salonId} and does not own
+     *                            {@code masterId} themselves
      * @throws NotFoundException  if {@code masterId} does not exist, or exists in a different salon
      */
     @Transactional(readOnly = true)
     public List<MasterServiceResponse> getSalonMasterServices(UUID actorId, UUID salonId, UUID masterId) {
+        // Perf MEDIUM (2026-09-11): masterBelongsToSalon(masterId, salonId) and the D3 check below
+        // are the SAME existsByIdAndSalonId predicate. On the own-row branch we already prove it
+        // here — capture the result and reuse it for D3 instead of re-querying. Stays null (and D3
+        // falls back to its own query) on the owner/admin fast path, where this branch never runs —
+        // that path's query count (3 for owner, 2 for admin) is unchanged. Only assigned when
+        // ownsMasterRow is true: `||` short-circuits masterBelongsToSalon() away otherwise, so a
+        // non-owning SALON_MASTER still costs exactly the one findByIdWithUserAndSalon query before
+        // its 403, same as before.
+        Boolean masterBelongsToSalon = null;
         if (!authz.hasManagementAccess(salonId, actorId)) {
-            throw new ForbiddenException("Access denied");
+            boolean ownsMasterRow = masterRepository.findByIdWithUserAndSalon(masterId)
+                    .map(m -> m.getUser() != null && m.getUser().getId().equals(actorId))
+                    .orElse(false);
+            if (ownsMasterRow) {
+                masterBelongsToSalon = authz.masterBelongsToSalon(masterId, salonId);
+            }
+            if (!ownsMasterRow || !masterBelongsToSalon) {
+                throw new ForbiddenException("Access denied");
+            }
         }
-        if (!masterRepository.existsByIdAndSalonId(masterId, salonId)) {
+        boolean masterExistsInSalon = masterBelongsToSalon != null
+                ? masterBelongsToSalon
+                : masterRepository.existsByIdAndSalonId(masterId, salonId);
+        if (!masterExistsInSalon) {
             throw new NotFoundException("Master not found: " + masterId);
         }
 

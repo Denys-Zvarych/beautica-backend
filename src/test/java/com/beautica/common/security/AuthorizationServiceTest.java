@@ -325,6 +325,149 @@ class AuthorizationServiceTest {
         assertThat(result).isFalse();
     }
 
+    // ── canReadSalonMasterServices (Phase 310) ────────────────────────────────
+    // GET /salons/{salonId}/masters/{masterId}/services. Modelled on canReadMasterSchedule
+    // above; widens Phase 309's owner/admin-only gate to also admit a SALON_MASTER reading
+    // their OWN row. Fixtures deliberately use THREE distinct UUIDs (actor/user id, masters
+    // row id, salon id) — a predicate that confuses the user id with the masters row id would
+    // pass every test where they happen to coincide (anti-bug playbook §fixture values).
+
+    @Test
+    @DisplayName("canReadSalonMasterServices returns true when a SALON_MASTER reads their OWN row "
+            + "(D2) — actor id, masters row id and salon id are all distinct")
+    void should_returnTrue_when_salonMasterReadsOwnServices() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(masterUser);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        // masterBelongsToSalon's own query (D2.4) — must be consulted even on the own-row branch.
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canReadSalonMasterServices(auth, salonId, masterId);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    @DisplayName("canReadSalonMasterServices returns false when a SALON_MASTER reads a PEER "
+            + "master's row — the single most important negative case (D2)")
+    void should_returnFalse_when_salonMasterReadsPeerMastersServices() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID peerUserId = UUID.randomUUID();
+
+        User peerUser = mock(User.class);
+        when(peerUser.getId()).thenReturn(peerUserId);
+
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(peerUser);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canReadSalonMasterServices(auth, salonId, masterId);
+
+        assertThat(result)
+                .as("a SALON_MASTER must never read a peer master's services")
+                .isFalse();
+        // SALON_MASTER can never satisfy hasManagementAccess — must fail without consulting
+        // either management-access query.
+        verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("canReadSalonMasterServices returns false when a SALON_MASTER's own masterId sits "
+            + "behind a FOREIGN salonId in the path (D2.4)")
+    void should_returnFalse_when_salonMasterOwnRowButForeignSalonId() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID foreignSalonId = UUID.randomUUID();
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(masterUser);
+
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
+        when(masterRepository.existsByIdAndSalonId(masterId, foreignSalonId)).thenReturn(false);
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        boolean result = authorizationService.canReadSalonMasterServices(auth, foreignSalonId, masterId);
+
+        assertThat(result)
+                .as("D2.4 — the path's salonId must actually own this master row, even for the "
+                        + "actor's own masterId")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("canReadSalonMasterServices returns true when the SALON_OWNER manages the PATH's "
+            + "salonId — Phase 309 behaviour preserved, and the master row is never looked up "
+            + "(D3 — an unknown or cross-salon masterId must still reach the service layer's 404)")
+    void should_returnTrue_when_salonOwnerReadsAnyMasterInSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
+
+        boolean result = authorizationService.canReadSalonMasterServices(auth, salonId, masterId);
+
+        assertThat(result).isTrue();
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
+    }
+
+    @Test
+    @DisplayName("canReadSalonMasterServices returns true when the SALON_ADMIN manages the PATH's "
+            + "salonId — Phase 309 behaviour preserved, and the master row is never looked up "
+            + "(D3 — an unknown or cross-salon masterId must still reach the service layer's 404)")
+    void should_returnTrue_when_salonAdminReadsAnyMasterInSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_ADMIN");
+
+        boolean result = authorizationService.canReadSalonMasterServices(auth, salonId, masterId);
+
+        assertThat(result).isTrue();
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
+    }
+
+    @Test
+    @DisplayName("canReadSalonMasterServices returns false WITHOUT a DB hit when actor has "
+            + "ROLE_CLIENT (mutation guard: dropping this fast path must turn this test red, not "
+            + "just any test asserting the boolean alone)")
+    void should_returnFalse_withoutDbHit_when_actorIsClientReadingSalonMasterServices() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Authentication auth = mockAuth(UUID.randomUUID(), "ROLE_CLIENT");
+
+        boolean result = authorizationService.canReadSalonMasterServices(auth, salonId, masterId);
+
+        assertThat(result).isFalse();
+        verify(masterRepository, never()).findByIdWithUserAndSalon(any());
+        verifyNoInteractions(salonRepository, userRepository);
+    }
+
     // ── enforceCanManageSalon ──────────────────────────────────────────────────
 
     @Test

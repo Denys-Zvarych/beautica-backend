@@ -1143,17 +1143,22 @@ class ServiceCatalogServiceTest {
                 .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
     }
 
-    // ── getSalonMasterServices (Phase 309) ──────────────────────────────────────
+    // ── getSalonMasterServices (Phase 309, own-row branch added Phase 310) ────────
     //
     // QA audit gap-fill: the IT suite (SalonMasterServicesReadIT) exercises this method only
     // through the real @PreAuthorize AOP proxy, which independently re-checks
-    // `@authz.canManageSalon`. A mutation removing the service-layer
+    // `@authz.canReadSalonMasterServices`. A mutation removing the service-layer
     // `authz.hasManagementAccess(...)` re-check below (Phase 309 D2's defense-in-depth claim,
     // "a future non-HTTP caller cannot bypass the SpEL gate") left the ENTIRE IT + slice suite
     // green — confirmed by deliberately deleting that check and re-running
     // ServiceControllerTest + SalonMasterServicesReadIT (109/109 still passed). These three
     // tests call the plain Java method directly, bypassing the Spring Security proxy entirely,
     // so they are the only tests that can catch that specific regression.
+    //
+    // Phase 310 added an own-row branch below the hasManagementAccess check — the identical
+    // defense-in-depth idiom for the SALON_MASTER-reads-their-OWN-row grant the SpEL gate now
+    // proves. It only runs once hasManagementAccess has already failed, so it costs the
+    // owner/admin fast path nothing.
 
     @Test
     @DisplayName("getSalonMasterServices returns the FULL, unmasked service list when the actor "
@@ -1207,20 +1212,102 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("getSalonMasterServices throws ForbiddenException and never queries the master or "
-            + "its services when the actor does not manage the salon (D2 defense-in-depth — "
-            + "regression net for the service-layer re-check the @PreAuthorize SpEL duplicates)")
+    @DisplayName("getSalonMasterServices throws ForbiddenException and never queries services when "
+            + "the actor does not manage the salon AND does not own masterId either (D2/Phase 310 "
+            + "defense-in-depth — regression net for the service-layer re-check the @PreAuthorize "
+            + "SpEL duplicates)")
     void should_throwForbiddenAndSkipMasterLookup_when_actorCannotManageSalon() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
 
         when(authz.hasManagementAccess(salonId, actorId)).thenReturn(false);
+        // Own-row check (Phase 310): masterId resolves to nobody in particular here, so the
+        // Mockito default Optional.empty() correctly represents "not the actor's own row".
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId))
                 .isInstanceOf(ForbiddenException.class);
 
+        verify(masterRepository).findByIdWithUserAndSalon(masterId);
         verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices returns the FULL, unmasked service list when a SALON_MASTER "
+            + "reads their OWN row (Phase 310 D2), even though they never satisfy hasManagementAccess")
+    void should_returnUnmaskedServices_when_salonMasterOwnsTheirOwnRow() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(false);
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+        Master ownRowMaster = mock(Master.class);
+        when(ownRowMaster.getUser()).thenReturn(masterUser);
+        when(ownRowMaster.getId()).thenReturn(masterId);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownRowMaster));
+        when(authz.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .name("Gel Nails")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(UUID.randomUUID());
+        when(assignment.getMaster()).thenReturn(ownRowMaster);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(new BigDecimal("300.00"));
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).priceOverride())
+                .as("D4 — the master's own read must return priceOverride unmasked")
+                .isEqualByComparingTo("300.00");
+        // Perf MEDIUM (2026-09-11): D3 must reuse the own-row masterBelongsToSalon result, never
+        // re-query the identical existsByIdAndSalonId(masterId, salonId) predicate a second time.
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices throws ForbiddenException when a SALON_MASTER owns "
+            + "masterId but the path's salonId does NOT (D2.4 defense-in-depth)")
+    void should_throwForbidden_when_salonMasterOwnRowButMasterBelongsToAnotherSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID foreignSalonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(foreignSalonId, actorId)).thenReturn(false);
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+        Master ownRowMaster = mock(Master.class);
+        when(ownRowMaster.getUser()).thenReturn(masterUser);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownRowMaster));
+        when(authz.masterBelongsToSalon(masterId, foreignSalonId)).thenReturn(false);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.getSalonMasterServices(actorId, foreignSalonId, masterId))
+                .isInstanceOf(ForbiddenException.class);
+
         verify(masterServiceRepository, never())
                 .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
     }

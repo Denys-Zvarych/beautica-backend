@@ -203,6 +203,60 @@ public class AuthorizationService {
         }).orElse(false);
     }
 
+    /**
+     * Read predicate for {@code GET /salons/{salonId}/masters/{masterId}/services} (Phase 310
+     * D2). Widens Phase 309's owner/admin-only gate to also admit a {@code SALON_MASTER} reading
+     * <b>their own</b> row.
+     *
+     * <p>Grants, checked in this order:
+     * <ol>
+     *   <li><b>Management access to the PATH's {@code salonId}</b> — {@link
+     *       #hasManagementAccess(UUID, UUID, Role)}, i.e. exactly the {@code canManageSalon}
+     *       check this gate replaced. Deliberately does NOT touch {@code masterRepository} at
+     *       all: whether {@code masterId} exists, or belongs to a different salon, is resolved
+     *       INSIDE {@code ServiceCatalogService#getSalonMasterServices} and denied with a plain
+     *       404 (D3) — the uniform 404-not-403 semantics {@code unassignServiceFromMaster}'s
+     *       sibling DELETE deliberately diverges from. Checking against the master's OWN salon
+     *       (e.g. {@code m.getSalon().getId()}) instead of the path's {@code salonId} would be
+     *       wrong here: for a cross-salon {@code masterId} that resolves to a real master, it
+     *       would 403 the caller at the gate instead of letting the service 404 it — changing an
+     *       observable status code Phase 309 fixed on purpose. Regression-tested by {@code
+     *       SalonMasterServicesReadIT} Cases 3/4.</li>
+     *   <li>Otherwise, the owning master — a {@code SALON_MASTER} whose {@code masters.user_id}
+     *       is the actor — <b>provided the path's {@code salonId} actually owns that master row</b>
+     *       ({@link #masterBelongsToSalon}, D2.4). Without this second check a {@code
+     *       SALON_MASTER} could read their own services through an arbitrary foreign {@code
+     *       salonId} path segment; this closes that IDOR the same way {@code masterBelongsToSalon}
+     *       already closes it on {@code assignServiceToMaster}. This branch DOES need the
+     *       {@code masterRepository} lookup — unlike branch 1, there is no service-layer 404 to
+     *       fall back on for a non-management actor, since {@link #hasManagementAccess} already
+     *       said no.</li>
+     * </ol>
+     *
+     * <p>Role fast path: {@code CLIENT} can never read a master's service list here, so it is
+     * rejected immediately without a DB round-trip — mirrors {@link #canReadMasterSchedule}.
+     *
+     * <p><b>Defense-in-depth.</b> {@code ServiceCatalogService#getSalonMasterServices} re-derives
+     * the identical own-row grant from {@code actorId} before falling back to its own {@code
+     * hasManagementAccess} check, so a future non-HTTP caller of that service method cannot
+     * bypass this SpEL gate (Phase 310) — same idiom as {@code enforceCanManageServiceDefinition}
+     * re-proving {@code canManageServiceDefinition}.
+     */
+    public boolean canReadSalonMasterServices(Authentication auth, UUID salonId, UUID masterId) {
+        boolean isClient = auth.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_CLIENT"));
+        if (isClient) return false;
+        UUID actorId = principalId(auth);
+        Role actorRole = roleFromAuthentication(auth);
+        if (hasManagementAccess(salonId, actorId, actorRole)) {
+            return true;
+        }
+        return masterRepository.findByIdWithUserAndSalon(masterId)
+                .map(m -> m.getUser() != null && m.getUser().getId().equals(actorId))
+                .orElse(false)
+                && masterBelongsToSalon(masterId, salonId);
+    }
+
     public void enforceCanManageSalon(UUID actorId, Salon salon) {
         if (!hasManagementAccess(salon.getId(), actorId)) {
             throw new ForbiddenException("Access denied");

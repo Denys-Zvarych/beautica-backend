@@ -4,7 +4,10 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
+import com.beautica.service.dto.BulkCreateServicesRequest;
+import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.entity.PriceType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
@@ -56,9 +59,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code bearerHeaders} are all shared fixture methods; the single-assign-with-override HTTP
  * call is local to this class since no shared fixture creates an assignment with a
  * non-default {@code priceOverride}.
+ *
+ * <h2>Phase 310 — a SALON_MASTER may read their OWN row</h2>
+ * The "Phase 310" cases below widen the gate this class otherwise pins to owner/admin: a {@code
+ * SALON_MASTER} reading their own {@code masters} row now gets the identical full, unmasked
+ * response (D4), while every other SALON_MASTER read (a peer, a foreign salon, their own
+ * masterId behind a foreign salonId) stays refused — D2/D2.4. {@code
+ * ServiceTestFixtures#createSalonMasterWithRowAndGetToken} is the fixture these cases need: it
+ * seeds BOTH the {@code users} row AND the linked {@code masters} row, unlike {@code
+ * createSalonMasterAndGetToken} (Phase 309's fixture, which deliberately omits the {@code
+ * masters} row for its role-fast-path rejection tests). D5 cases pin that this widening does not
+ * leak into POST, POST .../bulk or DELETE for the master's own row.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("GET /salons/{salonId}/masters/{masterId}/services — Phase 309 management read")
+@DisplayName("GET /salons/{salonId}/masters/{masterId}/services — Phase 309 management read + "
+        + "Phase 310 own-row widening")
 class SalonMasterServicesReadIT extends AbstractIntegrationTest {
 
     private static final String MASTER_SERVICES_CACHE = "masterServices";
@@ -323,6 +338,172 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
         assertThat(cachedEntry.priceOverride())
                 .as("the cached entry must stay the masked shape the public route wrote")
                 .isNull();
+    }
+
+    // ── Phase 310 Case 1 — SALON_MASTER reads their OWN row: 200, full, unmasked (D4) ──────────
+
+    @Test
+    @DisplayName("Phase 310 Case 1: SALON_MASTER reads their OWN row — 200, priceOverride present "
+            + "and unmasked (D4)")
+    void should_return200WithUnmaskedPriceOverride_when_salonMasterReadsOwnRow() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-c1-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 Case 1 Salon");
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-c1-" + System.nanoTime() + "@beautica.test");
+        UUID definitionId = fixtures.createServiceDefinition(ownerToken, salonId, "Phase 310 Case 1 Service");
+        assignWithOverride(ownerToken, salonId, ownMaster.masterId(), definitionId, new BigDecimal("310.00"));
+
+        ResponseEntity<String> resp =
+                getSalonMasterServices(ownMaster.token(), salonId, ownMaster.masterId());
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        List<MasterServiceResponse> services = readServiceList(resp);
+        assertThat(services).hasSize(1);
+        assertThat(services.get(0).priceOverride())
+                .as("D4 — the master's own read must return priceOverride unmasked, not fromPublic")
+                .isNotNull()
+                .isEqualByComparingTo("310.00");
+    }
+
+    // ── Phase 310 Case 2 — a PEER master in the SAME salon: refused (the most important negative) ─
+
+    @Test
+    @DisplayName("Phase 310 Case 2: SALON_MASTER reads a PEER master's row in the SAME salon — "
+            + "refused (the single most important negative case, D2)")
+    void should_returnForbidden_when_salonMasterReadsPeerInSameSalon() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-c2-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 Case 2 Salon");
+        UUID peerMasterId = fixtures.createSalonMaster(salonId);
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-c2-" + System.nanoTime() + "@beautica.test");
+
+        ResponseEntity<String> resp = getSalonMasterServices(ownMaster.token(), salonId, peerMasterId);
+
+        assertThat(resp.getStatusCode())
+                .as("a SALON_MASTER must never read a peer's services, even in their own salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    // ── Phase 310 Case 3 — a master genuinely in ANOTHER salon: refused, no existence oracle ─────
+
+    @Test
+    @DisplayName("Phase 310 Case 3: SALON_MASTER reads a master in ANOTHER salon — refused, body "
+            + "indistinguishable from a nonexistent masterId for this actor")
+    void should_returnForbidden_when_salonMasterReadsMasterInAnotherSalon() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-c3-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 Case 3 Salon");
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-c3-" + System.nanoTime() + "@beautica.test");
+
+        String otherOwnerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-c3-other-" + System.nanoTime() + "@beautica.test");
+        UUID salonB = fixtures.createSalon(otherOwnerToken, "Phase 310 Case 3 Salon B");
+        UUID masterInSalonB = fixtures.createSalonMaster(salonB);
+
+        ResponseEntity<String> foreignMasterResp =
+                getSalonMasterServices(ownMaster.token(), salonId, masterInSalonB);
+        ResponseEntity<String> nonexistentResp =
+                getSalonMasterServices(ownMaster.token(), salonId, UUID.randomUUID());
+
+        assertThat(foreignMasterResp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(nonexistentResp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(foreignMasterResp.getBody())
+                .as("the body must not disclose that the foreign-salon master exists")
+                .isEqualTo(nonexistentResp.getBody());
+    }
+
+    // ── Phase 310 Case 4 (D2.4) — own masterId, FOREIGN salonId in the path: refused ────────────
+
+    @Test
+    @DisplayName("Phase 310 Case 4 (D2.4): SALON_MASTER's own masterId behind a FOREIGN salonId in "
+            + "the path — refused")
+    void should_returnForbidden_when_salonMasterOwnRowButForeignSalonIdInPath() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-c4-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 Case 4 Salon");
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-c4-" + System.nanoTime() + "@beautica.test");
+
+        String otherOwnerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-c4-other-" + System.nanoTime() + "@beautica.test");
+        UUID foreignSalonId = fixtures.createSalon(otherOwnerToken, "Phase 310 Case 4 Foreign Salon");
+
+        ResponseEntity<String> resp =
+                getSalonMasterServices(ownMaster.token(), foreignSalonId, ownMaster.masterId());
+
+        assertThat(resp.getStatusCode())
+                .as("D2.4 — the path's salonId must actually own this master row")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    // ── Phase 310 D5 — the read widening must not leak into write access, for the OWN row ───────
+
+    @Test
+    @DisplayName("Phase 310 D5: SALON_MASTER still 403 on POST .../services for their OWN row")
+    void should_return403_when_salonMasterAttemptsSingleAssignForOwnRow() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-d5a-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 D5a Salon");
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-d5a-" + System.nanoTime() + "@beautica.test");
+        UUID definitionId = fixtures.createServiceDefinition(ownerToken, salonId, "Phase 310 D5a Service");
+        var request = new AssignServiceToMasterRequest(definitionId, null, null);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + ownMaster.masterId() + "/services",
+                HttpMethod.POST, new HttpEntity<>(request, fixtures.bearerHeaders(ownMaster.token())),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("D5 — read widening must not leak into single-assign write access")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 310 D5: SALON_MASTER still 403 on POST .../services/bulk for their OWN row")
+    void should_return403_when_salonMasterAttemptsBulkAssignForOwnRow() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-d5b-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 D5b Salon");
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-d5b-" + System.nanoTime() + "@beautica.test");
+        UUID serviceTypeId = fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE");
+        var request = new BulkCreateServicesRequest(List.of(
+                new BulkServiceItemRequest(
+                        serviceTypeId, 60, PriceType.FIXED, new BigDecimal("350.00"), null, null)));
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + ownMaster.masterId() + "/services/bulk",
+                HttpMethod.POST, new HttpEntity<>(request, fixtures.bearerHeaders(ownMaster.token())),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("D5 — read widening must not leak into bulk-assign write access")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 310 D5: SALON_MASTER still 403 on DELETE .../services/{serviceDefId} for "
+            + "their OWN row")
+    void should_return403_when_salonMasterAttemptsUnassignForOwnRow() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-310-d5c-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 310 D5c Salon");
+        var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
+                salonId, "own-310-d5c-" + System.nanoTime() + "@beautica.test");
+        UUID definitionId = fixtures.createServiceDefinition(ownerToken, salonId, "Phase 310 D5c Service");
+        assignWithOverride(ownerToken, salonId, ownMaster.masterId(), definitionId, null);
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + ownMaster.masterId() + "/services/" + definitionId,
+                HttpMethod.DELETE, new HttpEntity<>(fixtures.bearerHeaders(ownMaster.token())), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("D5 — read widening must not leak into unassign write access")
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     // ── shared setup + HTTP plumbing ────────────────────────────────────────────────────────────

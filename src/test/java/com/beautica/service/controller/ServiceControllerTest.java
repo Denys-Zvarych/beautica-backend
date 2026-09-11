@@ -660,7 +660,7 @@ class ServiceControllerTest {
         var rowId = UUID.randomUUID();
         var stub = List.of(stubMasterServiceResponseWithOverride(
                 rowId, masterId, "Gel Nails", new BigDecimal("300.00")));
-        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId))).thenReturn(true);
         when(serviceCatalogService.getSalonMasterServices(userId, salonId, masterId)).thenReturn(stub);
 
         log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as OWNER", salonId, masterId);
@@ -680,7 +680,7 @@ class ServiceControllerTest {
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
-        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId))).thenReturn(true);
         when(serviceCatalogService.getSalonMasterServices(adminUserId, salonId, masterId)).thenReturn(stub);
 
         log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as SALON_ADMIN", salonId, masterId);
@@ -699,7 +699,8 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var masterInOtherSalonId = UUID.randomUUID();
-        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterInOtherSalonId)))
+                .thenReturn(true);
         when(serviceCatalogService.getSalonMasterServices(userId, salonId, masterInOtherSalonId))
                 .thenThrow(new com.beautica.common.exception.NotFoundException(
                         "Master not found: " + masterInOtherSalonId));
@@ -718,7 +719,8 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var someUserId = UUID.randomUUID();
-        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(someUserId)))
+                .thenReturn(true);
         when(serviceCatalogService.getSalonMasterServices(userId, salonId, someUserId))
                 .thenThrow(new com.beautica.common.exception.NotFoundException(
                         "Master not found: " + someUserId));
@@ -784,11 +786,58 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
-        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId)))
+                .thenReturn(false);
 
         log.debug("Act: GET as a SALON_OWNER who does not manage this salon — must return 403");
         mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
                         .with(authenticatedAs(userId, "other-owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+    }
+
+    // ── GET /api/v1/salons/{salonId}/masters/{masterId}/services — Phase 310 own-row widening ──
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 200 when a SALON_MASTER reads "
+            + "their OWN row (Phase 310 D2) — proves the hasAnyRole('SALON_OWNER','SALON_ADMIN') "
+            + "role gate is gone from this endpoint's @PreAuthorize, not just that the predicate "
+            + "mock returns true")
+    void should_return200_when_salonMasterReadsOwnRow() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var stub = List.of(stubMasterServiceResponseWithOverride(
+                UUID.randomUUID(), masterId, "Gel Nails", new BigDecimal("300.00")));
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId)))
+                .thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(masterUserId, salonId, masterId)).thenReturn(stub);
+
+        log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as the master's OWN SALON_MASTER "
+                + "account", salonId, masterId);
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(masterUserId, "own-master@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data[0].priceOverride").value(300.00));
+    }
+
+    @Test
+    @DisplayName("GET /salons/{salonId}/masters/{masterId}/services — 403 when a SALON_MASTER reads a "
+            + "PEER master's row (predicate denies — the single most important negative case, D2)")
+    void should_return403_when_salonMasterReadsPeerRow() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var peerMasterId = UUID.randomUUID();
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(peerMasterId)))
+                .thenReturn(false);
+
+        log.debug("Act: GET a peer master's services as a SALON_MASTER — must return 403");
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + peerMasterId + "/services")
+                        .with(authenticatedAs(masterUserId, "peer-reader@beautica.test", Role.SALON_MASTER))
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
 

@@ -223,6 +223,41 @@ class ServiceTestFixtures {
         return body.data().accessToken();
     }
 
+    /**
+     * A {@code masters} row id paired with the login token of the SALON_MASTER who owns it — the
+     * shape Phase 310's own-row read tests need, since {@link #createSalonMasterAndGetToken}
+     * deliberately creates NO {@code masters} row (see its javadoc).
+     */
+    record SalonMasterFixture(UUID masterId, String token) {}
+
+    /**
+     * Creates a SALON_MASTER user assigned to {@code salonId} WITH a corresponding {@code
+     * masters} row — unlike {@link #createSalonMasterAndGetToken}, which deliberately omits one
+     * for the role-fast-path rejection tests it backs. Phase 310's own-row read predicate
+     * resolves the actor through {@code masterRepository.findByIdWithUserAndSalon(masterId)} and
+     * compares {@code masters.user_id} to the actor, so a genuine own-row test needs this row to
+     * exist and to be linked to the returned token's user.
+     */
+    SalonMasterFixture createSalonMasterWithRowAndGetToken(UUID salonId, String email) throws Exception {
+        UUID masterUserId = UUID.randomUUID();
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, true, true)",
+                masterUserId, email, hash, salonId);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                masterId, masterUserId, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return new SalonMasterFixture(masterId, body.data().accessToken());
+    }
+
     /** Seeds an email-verified CLIENT and logs in, returning a fresh access token. */
     String createClientAndGetToken(String email) throws Exception {
         jdbcTemplate.update(
