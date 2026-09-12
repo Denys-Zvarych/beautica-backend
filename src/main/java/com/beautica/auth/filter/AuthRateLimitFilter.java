@@ -96,9 +96,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // SUFFIX is additionally gated on HttpMethod.POST.matches(method), so the GET falls through
     // unthrottled, same as every other authenticated read on this controller. Noted here only so
     // this inventory stays truthful about every route living at this path.
+    //
+    // Phase 314 audit gave the SIBLING public read — GET /api/v1/salons/{salonId}/services (shape
+    // 2's OTHER route, the 2-segment one) — its own bucket, catalogueBrowseBuckets (see that
+    // field's javadoc + RateLimitConfig#catalogueBrowseCapacity). It reuses these SAME
+    // SALON_SINGLE_SERVICE_PREFIX/SUFFIX constants but is matched via
+    // isSalonCatalogueServicesPath, which additionally checks the middle segment is a bare
+    // {salonId} with no further "/" — precisely so it does NOT also catch the Phase 309 GET two
+    // paragraphs above, which stays the documented accepted-risk exception it always was.
     private static final String IM_SINGLE_SERVICE_PATH = "/api/v1/independent-masters/me/services";
     private static final String SALON_SINGLE_SERVICE_PREFIX = "/api/v1/salons/";
     private static final String SALON_SINGLE_SERVICE_SUFFIX = "/services";
+    // GET /api/v1/masters/{masterId}/services — the public master-catalogue read, matched by
+    // prefix + suffix (same technique as SALON_SINGLE_SERVICE, {masterId} is one path segment).
+    // Reuses MASTER_AVAILABILITY_PATH_PREFIX ("/api/v1/masters/") for the prefix half. No other
+    // route under that prefix ends in the literal "/services" (unlike the salon side), so a plain
+    // prefix+suffix check is unambiguous here — no disambiguation helper needed.
+    private static final String MASTER_SERVICES_PATH_SUFFIX = "/services";
     private static final String SERVICE_DEF_WRITE_PATH_PREFIX = "/api/v1/services/";
     // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
     // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
@@ -456,6 +470,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // @Qualifier bean (RateLimitConfig#inviteAcceptBuckets) — same reason as inviteValidateBuckets
     // above.
     private final LoadingCache<String, Bucket> inviteAcceptBuckets;
+    // Per-IP bucket for the two public catalogue-browse reads — GET /api/v1/salons/{salonId}/services
+    // and GET /api/v1/masters/{masterId}/services (Phase 314 audit finding, MEDIUM). Both are
+    // permitAll() and were previously unthrottled anywhere in this filter: ServiceCatalogService's
+    // @Cacheable only absorbs repeat hits on the SAME id, so a caller sweeping distinct ids forced
+    // an unbounded stream of cache misses plus a full per-master N+1 read on every request. Like
+    // inviteValidateBuckets/inviteAcceptBuckets above, this is an injected @Qualifier bean
+    // (RateLimitConfig#catalogueBrowseBuckets) rather than built internally, so integration tests
+    // hitting these paths many times from 127.0.0.1 can raise the cap via
+    // app.rate-limit.catalogue-browse-capacity — see that field's javadoc for the full sizing
+    // rationale (60/min, mirroring slotsBuckets).
+    private final LoadingCache<String, Bucket> catalogueBrowseBuckets;
     // Per-IP bucket for POST /api/v1/salons/{salonId}/invite — the SEC-fix compensating control
     // closing the gap left when this path (the actual HTTP surface for SalonController.inviteMaster,
     // reachable by SALON_OWNER and, since Phase 21.1, SALON_ADMIN) fell through to the unmatched
@@ -505,7 +530,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
             @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
             @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
-            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets) {
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -527,6 +553,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.serviceWriteBuckets = serviceWriteBuckets;
         this.inviteValidateBuckets = inviteValidateBuckets;
         this.inviteAcceptBuckets = inviteAcceptBuckets;
+        this.catalogueBrowseBuckets = catalogueBrowseBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -725,6 +752,30 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,
                     searchTokenCost(request));
+            return;
+        }
+
+        // Catalogue-browse rate-limit: GET /api/v1/salons/{salonId}/services AND
+        // GET /api/v1/masters/{masterId}/services — checked before the POST-only guard so these
+        // GET reads are covered. Phase 314 audit finding (MEDIUM): both are permitAll() and were
+        // previously unthrottled anywhere in this filter, letting a caller sweeping distinct
+        // salon/master ids force a cache miss plus a full per-master N+1 read on every request.
+        // Cap: 60 / 60 s per IP (catalogueBrowseBuckets) — see RateLimitConfig#catalogueBrowseCapacity
+        // for the sizing.
+        //
+        // The salon half is matched via isSalonCatalogueServicesPath rather than a bare
+        // prefix+suffix check, specifically so it does NOT also catch
+        // GET /api/v1/salons/{salonId}/masters/{masterId}/services (Phase 309's authenticated
+        // salon-management read, which shares the same "/api/v1/salons/" + "/services" prefix and
+        // suffix but has TWO path variables, not one) — that route stays the documented
+        // accepted-risk exception on RateLimitConfig#serviceWriteCapacity, unthrottled like every
+        // other authenticated GET on ServiceController. The master half needs no such helper:
+        // no other route under MASTER_AVAILABILITY_PATH_PREFIX ends in "/services".
+        if (HttpMethod.GET.matches(method)
+                && (isSalonCatalogueServicesPath(path)
+                        || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
+                                && path.endsWith(MASTER_SERVICES_PATH_SUFFIX)))) {
+            applyRateLimit(request, response, filterChain, catalogueBrowseBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -994,6 +1045,26 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             // Unparsable page — the request will 400 in validation; charge the base cost.
             return SEARCH_TOKENS_FIRST_PAGE;
         }
+    }
+
+    /**
+     * True only for {@code /api/v1/salons/{salonId}/services} — the public catalogue-browse GET —
+     * never for {@code /api/v1/salons/{salonId}/masters/{masterId}/services} (Phase 309's
+     * authenticated salon-management read), even though both share the literal
+     * {@link #SALON_SINGLE_SERVICE_PREFIX} prefix and {@link #SALON_SINGLE_SERVICE_SUFFIX} suffix.
+     * The two are told apart by the segment BETWEEN prefix and suffix: for the catalogue route it
+     * is a bare {@code {salonId}} (no further "/"); for the management route it is
+     * {@code {salonId}/masters/{masterId}} (contains "/"). Callers must still check
+     * {@code startsWith}/{@code endsWith} themselves — this method assumes both already hold.
+     */
+    private static boolean isSalonCatalogueServicesPath(String path) {
+        if (!path.startsWith(SALON_SINGLE_SERVICE_PREFIX) || !path.endsWith(SALON_SINGLE_SERVICE_SUFFIX)) {
+            return false;
+        }
+        String middle = path.substring(
+                SALON_SINGLE_SERVICE_PREFIX.length(),
+                path.length() - SALON_SINGLE_SERVICE_SUFFIX.length());
+        return !middle.isEmpty() && middle.indexOf('/') < 0;
     }
 
     private void applyRateLimit(HttpServletRequest request,

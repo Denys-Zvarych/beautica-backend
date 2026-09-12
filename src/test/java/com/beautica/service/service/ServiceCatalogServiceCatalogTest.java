@@ -1,12 +1,19 @@
 package com.beautica.service.service;
 
+import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.entity.CatalogCategory;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
@@ -20,7 +27,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
 
+import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import com.beautica.common.exception.BusinessException;
@@ -31,6 +40,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -519,5 +529,192 @@ class ServiceCatalogServiceCatalogTest {
 
         assertThat(result).isEmpty();
         verify(serviceTypeRepository).findActiveByPlatformCategoryName("NOPE");
+    }
+
+    // ── getSalonServiceCatalog — Phase 314 D3's rendering table (unit level) ─────────────────
+    //
+    // Every fixture below deliberately makes the aggregate DIVERGE from the definition's own
+    // band (per the phase doc's fixture rule) so a bug that reads sd.getBasePrice()/getPriceMax()
+    // instead of the resolved per-master band cannot hide behind a coincidental match.
+
+    @Test
+    @DisplayName("Case 21 (D3): min == max across bookable masters renders FIXED with priceMax null "
+            + "— the common case, not a degenerate range")
+    void should_renderFixed_when_aggregateMinEqualsMax() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        MasterServiceAssignment inherited = assignment(master, sd, null, null, null);
+
+        stubBookable(salonId, List.of(inherited), Map.of(masterId, List.of(inherited)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.FIXED);
+        assertThat(row.priceMin()).isEqualByComparingTo("700.00");
+        assertThat(row.priceMax()).isNull();
+        assertThat(row.priceDisplay()).isEqualTo("700 ₴");
+    }
+
+    @Test
+    @DisplayName("Case 22 (D3): min < max across bookable masters renders RANGE, with neither bound "
+            + "equal to the definition's own band — a coincidental match cannot defang this")
+    void should_renderRange_when_aggregateMinLessThanMax() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterAId = UUID.randomUUID();
+        UUID masterBId = UUID.randomUUID();
+        Master masterA = master(masterAId);
+        Master masterB = master(masterBId);
+        // Definition's own band (400 FIXED) matches NEITHER the aggregate floor (500) nor
+        // ceiling (800) — a fixture where they coincide would defang this assertion.
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "400.00", null);
+        MasterServiceAssignment a = assignment(masterA, sd, PriceType.FIXED, new BigDecimal("500.00"), null);
+        MasterServiceAssignment b = assignment(masterB, sd, PriceType.FIXED, new BigDecimal("800.00"), null);
+
+        stubBookable(salonId, List.of(a, b),
+                Map.of(masterAId, List.of(a), masterBId, List.of(b)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(row.priceMin()).isEqualByComparingTo("500.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("800.00");
+        assertThat(row.priceDisplay()).isEqualTo("від 500 до 800 ₴");
+    }
+
+    @Test
+    @DisplayName("Case 23a (D3): exactly one bookable FIXED-band master reproduces that master's "
+            + "own band exactly — case 21's path")
+    void should_reproduceSoleMastersOwnBand_when_onlyOneMasterContributesFixed() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.RANGE, "400.00", "900.00");
+        MasterServiceAssignment ownBand =
+                assignment(master, sd, PriceType.FIXED, new BigDecimal("650.00"), null);
+
+        stubBookable(salonId, List.of(ownBand), Map.of(masterId, List.of(ownBand)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.FIXED);
+        assertThat(row.priceMin()).isEqualByComparingTo("650.00");
+        assertThat(row.priceMax()).isNull();
+    }
+
+    @Test
+    @DisplayName("Case 23b (D3): exactly one bookable RANGE-band master reproduces that master's "
+            + "own band exactly — case 22's path")
+    void should_reproduceSoleMastersOwnBand_when_onlyOneMasterContributesRange() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        MasterServiceAssignment ownBand = assignment(
+                master, sd, PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"));
+
+        stubBookable(salonId, List.of(ownBand), Map.of(masterId, List.of(ownBand)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(row.priceMin()).isEqualByComparingTo("500.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("800.00");
+    }
+
+    @Test
+    @DisplayName("D3/D1: a RANGE definition where every bookable master took the same FIXED band "
+            + "renders FIXED — the rendered shape is computed, never read from sd.getPriceType()")
+    void should_renderFixed_when_everyMasterTookTheSameFixedBandOnARangeDefinition() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterAId = UUID.randomUUID();
+        UUID masterBId = UUID.randomUUID();
+        Master masterA = master(masterAId);
+        Master masterB = master(masterBId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.RANGE, "400.00", "900.00");
+        MasterServiceAssignment a = assignment(masterA, sd, PriceType.FIXED, new BigDecimal("700.00"), null);
+        MasterServiceAssignment b = assignment(masterB, sd, PriceType.FIXED, new BigDecimal("700.00"), null);
+
+        stubBookable(salonId, List.of(a, b), Map.of(masterAId, List.of(a), masterBId, List.of(b)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType())
+                .as("computed display shape, not sd.getPriceType() (which is RANGE here)")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(row.priceMin()).isEqualByComparingTo("700.00");
+        assertThat(row.priceMax()).isNull();
+    }
+
+    @Test
+    @DisplayName("D1: a null base_price whose masters are all Inherited falls back to the "
+            + "definition rendering rather than emitting a half-formed band")
+    void should_fallBackToDefinition_when_everyContributorResolvesToANullFloor() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, null, null);
+        MasterServiceAssignment inherited = assignment(master, sd, null, null, null);
+
+        stubBookable(salonId, List.of(inherited), Map.of(masterId, List.of(inherited)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceMin()).isNull();
+        assertThat(row.priceDisplay()).isNull();
+    }
+
+    /** Stubs {@code findBookableAssignmentsBySalon} + a no-op-filtering {@code filterBookableAssignments}. */
+    private void stubBookable(UUID salonId, List<MasterServiceAssignment> candidates,
+            Map<UUID, List<MasterServiceAssignment>> byMaster) {
+        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(candidates);
+        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : byMaster.entrySet()) {
+            when(slotCalculationService.filterBookableAssignments(eq(entry.getKey()), anyList()))
+                    .thenReturn(entry.getValue());
+        }
+    }
+
+    private ServiceDefinitionResponse onlyRow(SalonServiceCatalogResponse response) {
+        List<ServiceDefinitionResponse> rows = response.categories().stream()
+                .flatMap(g -> g.services().stream())
+                .toList();
+        assertThat(rows).as("expected exactly one aggregated catalogue row").hasSize(1);
+        return rows.get(0);
+    }
+
+    private Master master(UUID id) {
+        return Master.builder().id(id).build();
+    }
+
+    private ServiceDefinition serviceDefinition(
+            String category, PriceType priceType, String basePrice, String priceMax) {
+        return ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Манікюр")
+                .category(category)
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .priceType(priceType)
+                .basePrice(basePrice != null ? new BigDecimal(basePrice) : null)
+                .priceMax(priceMax != null ? new BigDecimal(priceMax) : null)
+                .isActive(true)
+                .build();
+    }
+
+    private MasterServiceAssignment assignment(Master master, ServiceDefinition sd,
+            PriceType typeOverride, BigDecimal priceOverride, BigDecimal maxOverride) {
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(sd)
+                .priceTypeOverride(typeOverride)
+                .priceOverride(priceOverride)
+                .priceMaxOverride(maxOverride)
+                .isActive(true)
+                .build();
     }
 }

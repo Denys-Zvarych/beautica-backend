@@ -673,8 +673,7 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("Case 23: GET /masters/{m}/services (the CACHED public route backing the "
             + "\"masterServices\" cache, D11's first row) reflects the band edit immediately with "
-            + "no manual eviction; GET /salons/{s}/services stays on the UNCHANGED shared "
-            + "definition's price")
+            + "no manual eviction; GET /salons/{s}/services (Phase 314's aggregate) reflects it too")
     void should_reflectEditImmediately_when_readingAfterPatch() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-311-c23-" + System.nanoTime() + "@beautica.test");
@@ -693,15 +692,15 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
         patchBand(ownerToken, salonId, masterId, assignment.definitionId(),
                 new UpdateMasterServiceBandRequest(PriceType.FIXED, new BigDecimal("999.00"), null, null, null, null));
 
-        // Until Phase 314 lands, GET /salons/{s}/services renders ServiceDefinitionResponse.from
-        // the SHARED DEFINITION alone (ServiceCatalogService#getSalonServiceCatalog) — it does not
-        // yet aggregate master bands, so it correctly shows the UNCHANGED definition price (600),
-        // matching case 5's "the shared definition is byte-for-byte unchanged". This is NOT a
-        // stale-cache bug: evictSalonCatalogAfterCommit fired (D11 "always"), there is simply
-        // nothing band-dependent in this response yet.
+        // Phase 314 D1/D7/D11 composed: GET /salons/{s}/services now prices the row as the union
+        // hull of its bookable masters' RESOLVED bands, not the shared definition's own (unchanged)
+        // band — with exactly one bookable master here, the hull IS that master's band, so the
+        // catalogue must reflect the edit on the very next read (evictSalonCatalogAfterCommit
+        // firing, D11 "always", is what makes this possible with no manual eviction workaround).
+        // See SalonCatalogueAggregatePriceIT case 13 for the dedicated end-to-end proof.
         assertThat(catalogueMinPrice(salonId, assignment.definitionId()))
-                .as("the shared definition's own price is untouched by a per-master band edit (D2/D9)")
-                .isEqualByComparingTo("600.00");
+                .as("Phase 314: the catalogue aggregates the sole bookable master's edited band")
+                .isEqualByComparingTo("999.00");
         // The PUBLIC masterServices read — MasterServiceResponse.from -> ServicePricing.ofAssignment
         // -> fromPublic (masks priceOverride only, keeps priceMin) — DOES resolve the master's own
         // band (D9), and its "masterServices" cache entry MUST be gone with no manual eviction

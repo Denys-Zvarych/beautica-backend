@@ -405,9 +405,9 @@ public final class SalonSearchSql {
                 FROM salons s
                 LEFT JOIN LATERAL (
                     SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
+                           MAX(CASE WHEN COALESCE(ms.price_type_override, sd.price_type) = 'RANGE'
+                                    THEN COALESCE(ms.price_max_override, sd.price_max)
+                                    ELSE COALESCE(ms.price_override, sd.base_price) END) AS pmax
                     FROM master_services ms
                     JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
                     JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id

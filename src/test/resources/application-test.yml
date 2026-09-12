@@ -28,6 +28,12 @@ app:
     login-capacity: 100000
     refresh-capacity: 100000
     slots-capacity: 100000
+    # High so ITs firing many real HTTP GETs against GET /salons/{salonId}/services and
+    # GET /masters/{masterId}/services from 127.0.0.1 (ServicesIntegrationTest,
+    # SalonCatalogueAggregatePriceIT, SalonSearchPriceBandIT and friends) are not themselves
+    # rate-limited — production default stays the tight 60/60s in RateLimitConfig. Mirrors
+    # service-write-capacity's reasoning exactly (same "60-second-long PASS masking a 429" trap).
+    catalogue-browse-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000

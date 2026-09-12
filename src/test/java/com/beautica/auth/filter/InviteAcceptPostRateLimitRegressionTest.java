@@ -64,10 +64,10 @@ class InviteAcceptPostRateLimitRegressionTest {
     }
 
     /**
-     * 21 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
-     * the 21st (invite-accept, LAST) is constrained; every other bucket — including the 20th
-     * (invite-validate) — is permissive, so a 429 here can only have come from the branch under
-     * test.
+     * 22 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
+     * the 21st (invite-accept) is constrained; every other bucket — including the 20th
+     * (invite-validate) and the 22nd (catalogue-browse) — is permissive, so a 429 here can only
+     * have come from the branch under test.
      */
     private AuthRateLimitFilter filterWithTinyInviteAcceptBucket() {
         return new AuthRateLimitFilter(
@@ -76,7 +76,7 @@ class InviteAcceptPostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(),
-                permissive(), tinyInviteAcceptCache());
+                permissive(), tinyInviteAcceptCache(), permissive());
     }
 
     private static MockHttpServletRequest postAccept(String remoteAddr) {

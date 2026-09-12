@@ -40,6 +40,52 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.slots-capacity:60}")
     private long slotsCapacity;
 
+    /**
+     * Per-IP cap for the two public catalogue-browse reads (60-second window):
+     * <ul>
+     *   <li>{@code GET /api/v1/salons/{salonId}/services}</li>
+     *   <li>{@code GET /api/v1/masters/{masterId}/services}</li>
+     * </ul>
+     * Phase 314 audit finding (MEDIUM). Both are {@code permitAll()} in {@code SecurityConfig}.
+     * {@code ServiceCatalogService}'s {@code @Cacheable(key = "#salonId"/"#masterId")} only
+     * absorbs repeat hits on the SAME id — a caller sweeping distinct salon/master ids forces a
+     * cache miss plus a full per-master N+1 read (3 SQL statements per master) on every request,
+     * previously with no throttle anywhere in {@link com.beautica.auth.filter.AuthRateLimitFilter}
+     * at all. The per-master N+1 itself is a separate, already-tracked fix (Phase 315) — this
+     * bucket bounds the RATE at which one source can trigger it in the meantime.
+     *
+     * <p>Deliberately does NOT cover {@code GET /api/v1/salons/{salonId}/masters/{masterId}/services}
+     * (Phase 309's authenticated salon-management read) — that route stays the documented
+     * ACCEPTED RISK on {@link #serviceWriteCapacity}'s javadoc, unthrottled like every other
+     * authenticated GET in this class. It is a different route (4 path segments after
+     * {@code /salons/}, not 2) reachable only by an already-authorized SALON_OWNER/SALON_ADMIN
+     * for their own salon, not the anonymous catalogue read this bucket protects — see
+     * {@code AuthRateLimitFilter#isSalonCatalogueServicesPath} for how the matcher tells the two
+     * apart despite both ending in the literal {@code "/services"}.
+     *
+     * <p><b>Sizing (60/min, same as {@link #slotsCapacity}).</b> Both target reads are
+     * ONE-PER-PAGE-VIEW on the mobile client: opening a salon's detail page fetches its service
+     * catalogue exactly once, and opening a master's public profile fetches theirs exactly once
+     * (unlike the discovery search box, which fires a request per settled keystroke — see
+     * {@code searchBandwidth}'s {@code SEARCH_CAPACITY} javadoc for that different traffic shape).
+     * A human rapidly opening a dozen distinct salon/master pages in one minute — an aggressive
+     * browsing session, not a realistic one — still uses well under a fifth of this budget. 60/min
+     * mirrors {@code slotsCapacity}'s own reasoning (a user paging months + tapping days makes a
+     * handful of requests per minute, nowhere near the cap) and is generous enough that it should
+     * never surface to a real user; it exists to cap sustained per-IP enumeration across many
+     * distinct ids, not to throttle legitimate page views. IP-keyed for consistency with every
+     * other bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs, and both
+     * routes are permitAll anyway) — Ukrainian mobile users sharing one CGNAT egress still fit
+     * comfortably under this ceiling for the same reason a shared booking link does (see
+     * {@code GUEST_AVAILABILITY_CAPACITY}). Configurable so integration tests on 127.0.0.1 (which
+     * fire many real HTTP GETs against these two paths, e.g. {@code ServicesIntegrationTest},
+     * {@code SalonCatalogueAggregatePriceIT}, {@code SalonSearchPriceBandIT}) can raise the cap —
+     * see {@code application-test.yml}'s {@code catalogue-browse-capacity} override, mirroring
+     * {@code service-write-capacity}.
+     */
+    @Value("${app.rate-limit.catalogue-browse-capacity:60}")
+    private long catalogueBrowseCapacity;
+
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
@@ -181,6 +227,11 @@ public class RateLimitConfig {
     // dedicated finding, not be silently patched in here.
     //
     // Listed here only so this inventory stays truthful about every route living at this path.
+    //
+    // Phase 314 audit added catalogueBrowseCapacity (see that field's javadoc) for the SIBLING
+    // public reads GET /api/v1/salons/{salonId}/services and GET /api/v1/masters/{masterId}/services
+    // — deliberately NOT this route. Nothing above changes: this GET is still the accepted-risk
+    // exception it always was.
     //
     // Every one of these fell through to the unmatched else/non-POST branch of
     // AuthRateLimitFilter with NO bucket at all, which undercut bulkServiceSetupCapacity's own
@@ -508,6 +559,11 @@ public class RateLimitConfig {
     @Bean
     public LoadingCache<String, Bucket> slotsBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, slotsCapacity, ONE_MINUTE);
+    }
+
+    @Bean
+    public LoadingCache<String, Bucket> catalogueBrowseBuckets() {
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, catalogueBrowseCapacity, ONE_MINUTE);
     }
 
     @Bean

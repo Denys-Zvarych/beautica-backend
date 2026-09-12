@@ -55,6 +55,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -1554,6 +1555,12 @@ public class ServiceCatalogService {
      *
      * <p>The result is the WHOLE catalog (not paginated) so the mobile client can group it by
      * category client-side; the candidate query is bounded by salon scope, not a caller-supplied size.
+     *
+     * <p><b>Pricing (Phase 314).</b> Each row's {@code priceType}/{@code priceMin}/{@code priceMax}/
+     * {@code priceDisplay} is the union hull of its bookable masters' RESOLVED bands — see
+     * {@link #priceForSalonCatalogue} — never the shared {@link ServiceDefinition}'s own band. This
+     * costs no extra query: the same {@code candidates} loaded above carry every value the
+     * aggregation needs (D5).
      */
     @Transactional(readOnly = true)
     @Cacheable(value = "salon-service-catalog", key = "#salonId", sync = true)
@@ -1565,14 +1572,24 @@ public class ServiceCatalogService {
             return new SalonServiceCatalogResponse(List.of());
         }
 
-        List<ServiceDefinition> definitions = bookableDefinitions(candidates);
-        if (definitions.isEmpty()) {
+        Map<UUID, List<MasterServiceAssignment>> bookableByDefinition = bookableDefinitions(candidates);
+        if (bookableByDefinition.isEmpty()) {
             return new SalonServiceCatalogResponse(List.of());
         }
 
         CategoryOrderAndNames orderAndNames = buildCategoryOrderAndNames();
         Map<String, Integer> categoryOrder = orderAndNames.order();
         Map<String, String> categoryDisplayNames = orderAndNames.displayNames();
+
+        // Phase 314 D2 — one representative ServiceDefinition per surviving group, sorted
+        // (category, name) exactly as the pre-314 `bookableDefinitions` did; the assignment list
+        // behind each definition is what D1's aggregation reads, never the definition alone.
+        List<ServiceDefinition> definitions = bookableByDefinition.values().stream()
+                .map(assignments -> assignments.get(0).getServiceDefinition())
+                .sorted(Comparator
+                        .comparing((ServiceDefinition sd) -> Objects.requireNonNullElse(sd.getCategory(), ""))
+                        .thenComparing(ServiceDefinition::getName))
+                .toList();
 
         Map<String, List<ServiceDefinition>> byCategory = definitions.stream()
                 .collect(Collectors.groupingBy(
@@ -1589,7 +1606,9 @@ public class ServiceCatalogService {
                         e.getKey(),
                         categoryDisplayNames.getOrDefault(e.getKey(), e.getKey()),
                         e.getValue().size(),
-                        e.getValue().stream().map(ServiceDefinitionResponse::from).toList()))
+                        e.getValue().stream()
+                                .map(sd -> priceForSalonCatalogue(sd, bookableByDefinition.get(sd.getId())))
+                                .toList()))
                 .toList();
 
         return new SalonServiceCatalogResponse(categories);
@@ -1598,9 +1617,12 @@ public class ServiceCatalogService {
     /**
      * Groups the candidate assignments by master, runs the batched free-slot gate once per master
      * ({@code SlotCalculationService#filterBookableAssignments} — one schedule resolve + one booking
-     * load per master), and returns the distinct {@link ServiceDefinition}s that at least one bookable
-     * master performs, sorted by {@code (category, name)} so the caller's category grouping keeps the
-     * same within-group ordering the previous {@code findBookableServicesBySalon} query produced.
+     * load per master), and returns the surviving assignments grouped by {@code serviceDefinition.id}
+     * (Phase 314 D2). Earlier this collapsed straight to distinct {@link ServiceDefinition}s and threw
+     * the assignments away; that made it impossible to tell WHICH masters' bands should price the row,
+     * so this reshaping is required before {@link #priceForSalonCatalogue} can aggregate correctly —
+     * aggregating over the raw, un-filtered {@code candidates} would let a filtered-out master's band
+     * still set the salon's displayed floor or ceiling.
      *
      * <p><b>Phase 305 D1 — the free-slot gate applied here is DELIBERATE contract, not a bug.</b> A
      * candidate assignment is kept only when {@code filterBookableAssignments} finds its master a
@@ -1616,23 +1638,72 @@ public class ServiceCatalogService {
      * {@code SalonCatalogueVisibilityIT#should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate}
      * (Phase 305 D1/D2 condition 5), which pins exactly this behaviour as deliberate.
      */
-    private List<ServiceDefinition> bookableDefinitions(List<MasterServiceAssignment> candidates) {
+    private Map<UUID, List<MasterServiceAssignment>> bookableDefinitions(
+            List<MasterServiceAssignment> candidates) {
         Map<UUID, List<MasterServiceAssignment>> byMaster = candidates.stream()
                 .collect(Collectors.groupingBy(a -> a.getMaster().getId()));
 
-        Map<UUID, ServiceDefinition> bookableById = new LinkedHashMap<>();
+        Map<UUID, List<MasterServiceAssignment>> bookableByDefinition = new LinkedHashMap<>();
         for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : byMaster.entrySet()) {
             for (MasterServiceAssignment msa :
                     slotCalculationService.filterBookableAssignments(entry.getKey(), entry.getValue())) {
-                bookableById.putIfAbsent(msa.getServiceDefinition().getId(), msa.getServiceDefinition());
+                bookableByDefinition
+                        .computeIfAbsent(msa.getServiceDefinition().getId(), key -> new ArrayList<>())
+                        .add(msa);
             }
         }
 
-        return bookableById.values().stream()
-                .sorted(Comparator
-                        .comparing((ServiceDefinition sd) -> Objects.requireNonNullElse(sd.getCategory(), ""))
-                        .thenComparing(ServiceDefinition::getName))
-                .toList();
+        return bookableByDefinition;
+    }
+
+    /**
+     * Phase 314 D1/D3 — prices one salon-catalogue row as the union hull of {@code assignments}'
+     * RESOLVED bands ({@link ServicePricing#ofAssignment}), never {@code sd}'s own band. Pure
+     * in-memory work over the already-loaded, already-bookable-filtered assignment list — no
+     * repository call happens here (D5): the statement count for this method is zero.
+     *
+     * <p>{@code assignments} is guaranteed non-empty and non-null by construction — it is exactly
+     * the value {@link #bookableDefinitions} stored under {@code sd.getId()}, which is only ever
+     * populated by an {@code add}, never a put of an empty list.
+     */
+    private ServiceDefinitionResponse priceForSalonCatalogue(
+            ServiceDefinition sd, List<MasterServiceAssignment> assignments) {
+        BigDecimal min = null;
+        BigDecimal max = null;
+
+        for (MasterServiceAssignment msa : assignments) {
+            ServicePricing pricing = ServicePricing.ofAssignment(msa);
+            BigDecimal floor = pricing.priceMin();
+            if (floor == null) {
+                // D1 — ServiceDefinition.basePrice carries no entity-level @NotNull; skip a
+                // contributor that resolves to no floor rather than let it corrupt the hull.
+                continue;
+            }
+            // FIXED resolves to a null ceiling (ServicePricing contract) — the degenerate
+            // interval [floor, floor], per D1's ceiling(msa) rule.
+            BigDecimal ceiling = pricing.priceMax() != null ? pricing.priceMax() : floor;
+
+            min = min == null ? floor : min.min(floor);
+            max = max == null ? ceiling : max.max(ceiling);
+        }
+
+        if (min == null) {
+            // D1 — every contributor was null; fall back to the definition rather than emit a
+            // half-formed band (case 14).
+            return ServiceDefinitionResponse.from(sd);
+        }
+
+        // D4 — every contributing band is closed by construction (chk_master_service_price_mode
+        // + MasterServiceBand.validate). Assert it anyway so a future loosening of either
+        // guarantee fails loudly here rather than rendering an inverted band to a customer.
+        if (max.compareTo(min) < 0) {
+            throw new IllegalStateException(
+                    "salon catalogue price aggregate produced max < min for service definition "
+                            + sd.getId());
+        }
+
+        BigDecimal renderedMax = max.compareTo(min) == 0 ? null : max;
+        return ServiceDefinitionResponse.fromSalonAggregate(sd, min, renderedMax);
     }
 
     /**
