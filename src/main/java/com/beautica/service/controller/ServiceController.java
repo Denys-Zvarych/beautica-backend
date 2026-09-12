@@ -199,11 +199,18 @@ public class ServiceController {
     // master row (master_type = SALON_OWNER): that row's salon_id equals #salonId, so
     // masterBelongsToSalon resolves true. No owner-specific branch is required.
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
-            // Same lone-@ApiResponse guard as every other write endpoint in this file: the 429
-            // alone would be read by springdoc as the COMPLETE response set and drop the
-            // auto-derived typed 200, regenerating the mobile client to Response<void>.
+            // Same lone-@ApiResponse guard as every other write endpoint in this file: an
+            // explicit set without the 200 would be read by springdoc as the COMPLETE response
+            // set and drop the auto-derived typed 200, regenerating the mobile client to
+            // Response<void>. Phase 313 D4 adds the 409: springdoc does not scan
+            // GlobalExceptionHandler, so DuplicateServiceException's schema needs declaring here.
+            // Reuses DUPLICATE_SERVICE_PER_MASTER_409 and DuplicateServiceErrorResponse verbatim
+            // from the bulk endpoint below — same per-master conflict, same body shape.
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_PER_MASTER_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "429", description = RATE_LIMITED_429)
     })

@@ -76,7 +76,7 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
             "post,  /api/v1/independent-masters/me/services/bulk,               409",
             "post,  /api/v1/salons/{salonId}/masters/{masterId}/services/bulk,  409",
             "patch, /api/v1/services/{serviceDefId},                            409",
-            "post,  /api/v1/salons/{salonId}/masters/{masterId}/services,       429",
+            "post,  /api/v1/salons/{salonId}/masters/{masterId}/services,       409",
             "patch, /api/v1/services/{serviceDefId}/photo,                      429"
     })
     @DisplayName("each typed service write endpoint documents a schema-bearing 200 response")
@@ -193,6 +193,64 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
                         + "narrowing; description was: %s", description)
                 .contains("per-MASTER")
                 .contains("another master in the same salon");
+    }
+
+    // ── Phase 313 D4 — single-assign declares its 409 DUPLICATE_SERVICE schema AND keeps its
+    // typed 200 alongside the pre-existing 429. springdoc does not scan GlobalExceptionHandler, so
+    // without the endpoint-level @ApiResponse the 409 body has no schema in /api-docs at all
+    // (case 11); the lone-@ApiResponse trap would otherwise drop the auto-derived typed 200 the
+    // moment the annotation set became "409, 429" without an explicit 200 entry (case 12).
+
+    @Test
+    @DisplayName("Phase 313 case 11: POST .../masters/{masterId}/services declares a 409 whose "
+            + "schema $refs DuplicateServiceErrorResponse, reusing the bulk endpoint's schema")
+    void should_documentDuplicateServiceSchema_when_singleAssignEndpointPublishesSpec() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services must exist in /api-docs")
+                .isFalse();
+
+        JsonNode response409 = operation.path("responses").path("409");
+        assertThat(response409.isMissingNode())
+                .as("Phase 313 D4 — the single-assign endpoint must declare a 409 response")
+                .isFalse();
+
+        JsonNode schema409 = response409.path("content").elements().hasNext()
+                ? response409.path("content").elements().next().path("schema")
+                : com.fasterxml.jackson.databind.node.MissingNode.getInstance();
+        assertThat(schema409.path("$ref").asText())
+                .as("the 409 schema must $ref DuplicateServiceErrorResponse, the same schema the "
+                        + "bulk endpoint declares — no parallel error DTO; schema was: %s", schema409)
+                .endsWith("/DuplicateServiceErrorResponse");
+    }
+
+    @Test
+    @DisplayName("Phase 313 case 12: POST .../masters/{masterId}/services still declares a typed "
+            + "200 AND its pre-existing 429, alongside the new 409 — the lone-@ApiResponse "
+            + "regression guard for a THREE-entry @ApiResponses set")
+    void should_keepTyped200And429_when_singleAssignEndpointGains409() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services must exist in /api-docs")
+                .isFalse();
+
+        JsonNode responses = operation.path("responses");
+        JsonNode successContent = responses.path("200").path("content");
+        assertThat(successContent.isMissingNode() || successContent.isEmpty())
+                .as("200 response MUST carry a content block — an empty/void success means "
+                        + "springdoc dropped the typed return schema; responses were: %s", responses)
+                .isFalse();
+        assertThat(responses.has("429"))
+                .as("the pre-existing 429 rate-limit response must survive alongside the new 409; "
+                        + "responses were: %s", responses)
+                .isTrue();
+        assertThat(responses.has("409"))
+                .as("the new 409 must be present too; responses were: %s", responses)
+                .isTrue();
     }
 
     // ── Phase 305 D4 — every {masterId} in this track documents that it is a `masters` row id,

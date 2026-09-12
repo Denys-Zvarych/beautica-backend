@@ -399,8 +399,11 @@ class ServiceControllerTest {
     }
 
     @Test
-    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — 409 when same service assigned twice")
-    void should_return409_when_duplicateAssignment() throws Exception {
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — 409 when the service layer "
+            + "raises an UNTYPED conflict (generic GlobalExceptionHandler fallback, not the real "
+            + "duplicate-assignment path — that is now the TYPED DuplicateServiceException below, "
+            + "Phase 313 D2)")
+    void should_return409_when_serviceLayerRaisesUntypedConflict() throws Exception {
         var userId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
@@ -412,7 +415,7 @@ class ServiceControllerTest {
         when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any()))
                 .thenThrow(new BusinessException(HttpStatus.CONFLICT, "Already assigned"));
 
-        log.debug("Act: POST same assignment twice — second call must return 409");
+        log.debug("Act: POST assign — service layer throws a generic untyped BusinessException(CONFLICT)");
         mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
                         .with(csrf())
@@ -2397,5 +2400,65 @@ class ServiceControllerTest {
                 .andExpect(jsonPath("$.data.code").value("DUPLICATE_SERVICE"))
                 .andExpect(jsonPath("$.data.existingServiceDefId").value(existingServiceDefId.toString()))
                 .andExpect(jsonPath("$.data.serviceName").value("Манікюр"));
+    }
+
+    // ── Phase 313 D2/D4 — single-assign's 409 is now the SAME typed DUPLICATE_SERVICE shape ────
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — Phase 313 D2: 409 "
+            + "DUPLICATE_SERVICE naming the definition the master already offers, byte-identical "
+            + "to the bulk endpoint's shape")
+    void should_return409WithDuplicateServiceCode_when_masterAlreadyOffersService() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any()))
+                .thenThrow(new com.beautica.common.exception.DuplicateServiceException(
+                        "Манікюр", serviceDefId));
+
+        log.debug("Act: POST same assignment twice — second call must return the TYPED 409");
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.data.code").value("DUPLICATE_SERVICE"))
+                .andExpect(jsonPath("$.data.existingServiceDefId").value(serviceDefId.toString()))
+                .andExpect(jsonPath("$.data.serviceName").value("Манікюр"));
+    }
+
+    @Test
+    @DisplayName("POST /salons/{salonId}/masters/{masterId}/services — Phase 313 D1: 404 when the "
+            + "service definition is deactivated, no new exception/handler arm involved")
+    void should_return404_when_serviceDefinitionIsDeactivated() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.assignServiceToMaster(eq(salonId), eq(masterId), any()))
+                .thenThrow(new com.beautica.common.exception.NotFoundException(
+                        "Service definition not found: " + serviceDefId));
+
+        log.debug("Act: POST assign against a deactivated definition — must be 404, generic body");
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Resource not found"))
+                .andExpect(jsonPath("$.data").value(org.hamcrest.Matchers.nullValue()));
     }
 }

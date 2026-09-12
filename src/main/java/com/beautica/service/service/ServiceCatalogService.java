@@ -182,6 +182,16 @@ public class ServiceCatalogService {
             throw new ForbiddenException("Service definition does not belong to this salon");
         }
 
+        // Phase 313 D1 — a deactivated definition is 404, indistinguishable from a nonexistent
+        // one. MUST run after the ownership check above so a caller probing another salon's ids
+        // still gets 403, not a 404 that would confirm the id exists. This checks
+        // service_definitions.is_active — a different column, on a different table, from the
+        // master_services.is_active read a few lines below (Phase 307 D6's reactivation branch);
+        // conflating the two breaks MasterServiceUnassignIT case 8.
+        if (!serviceDef.isActive()) {
+            throw new NotFoundException("Service definition not found: " + request.serviceDefId());
+        }
+
         // Phase 307 D6 — ACTIVE-agnostic lookup, not existsByMasterIdAndServiceDefinitionId:
         // master_services' UNIQUE (master_id, service_def_id) is NOT partial, so an existing
         // INACTIVE row (the master previously unassigned this exact service via
@@ -193,7 +203,10 @@ public class ServiceCatalogService {
 
         MasterServiceAssignment saved;
         if (existingAssignment.isPresent() && existingAssignment.get().isActive()) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Service already assigned to this master");
+            // Phase 313 D2 — typed, matching the bulk and independent-master paths: same
+            // constructor, same GlobalExceptionHandler arm, same 409 DuplicateServiceErrorResponse
+            // body, same data.code == DUPLICATE_SERVICE. No parallel mechanism.
+            throw new DuplicateServiceException(serviceDef.getName(), serviceDef.getId());
         } else if (existingAssignment.isPresent()) {
             MasterServiceAssignment existing = existingAssignment.get();
             existing.setActive(true);

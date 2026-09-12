@@ -493,6 +493,9 @@ class ServiceCatalogServiceTest {
         when(serviceDef.getOwnerId()).thenReturn(salonId);
         when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
         when(serviceDef.getBaseDurationMinutes()).thenReturn(60);
+        // Phase 313 D1 — assignServiceToMaster now guards on this; every test that expects the
+        // method to proceed past the ownership check must stub it true.
+        when(serviceDef.isActive()).thenReturn(true);
 
         MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
         when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
@@ -560,6 +563,8 @@ class ServiceCatalogServiceTest {
         when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
         when(serviceDef.getBaseDurationMinutes()).thenReturn(60);
         when(serviceDef.getServiceType()).thenReturn(serviceType);
+        // Phase 313 D1 — must proceed past the guard for this test to reach the assignment save.
+        when(serviceDef.isActive()).thenReturn(true);
 
         MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
         when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
@@ -651,8 +656,10 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("throws BusinessException with 409 when service already assigned to master")
-    void should_throw409_when_serviceAlreadyAssignedToMaster() {
+    @DisplayName("Phase 313 D2: throws the TYPED DuplicateServiceException (not a bare "
+            + "BusinessException) carrying serviceName + existingServiceDefId when service already "
+            + "assigned to master")
+    void should_throwTypedDuplicateServiceException_when_serviceAlreadyAssignedToMaster() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
@@ -664,8 +671,11 @@ class ServiceCatalogServiceTest {
         when(master.getSalon()).thenReturn(salon);
 
         ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getId()).thenReturn(serviceDefId);
         when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
         when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.getName()).thenReturn("Манікюр");
+        when(serviceDef.isActive()).thenReturn(true);
 
         MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
         when(activeAssignment.isActive()).thenReturn(true);
@@ -679,11 +689,141 @@ class ServiceCatalogServiceTest {
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
-                        .isEqualTo(HttpStatus.CONFLICT));
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+                    assertThat(dup.getServiceName())
+                            .as("D2 — serviceName is the definition's OWN name, not the type's")
+                            .isEqualTo("Манікюр");
+                    assertThat(dup.getExistingServiceDefId())
+                            .as("D2 — existingServiceDefId is the definition the caller just named")
+                            .isEqualTo(serviceDefId);
+                });
 
         verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Phase 313 D1: throws NotFoundException (not 201) when the service definition is "
+            + "deactivated (is_active = false), even though ownership and everything else is valid")
+    void should_throwNotFound_when_serviceDefinitionIsDeactivated() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.isActive()).thenReturn(false);
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                .isInstanceOf(NotFoundException.class);
+
+        // D1 must fire before the assignment lookup is ever consulted — no reactivation branch
+        // (D3) can run for a definition that is gone.
+        verify(masterServiceRepository, never()).findByMasterIdAndServiceDefinitionId(any(), any());
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Phase 313 D1 (QA addition): throws NotFoundException, not DuplicateServiceException, "
+            + "when the master ALREADY ACTIVELY offers the now-deactivated definition — D1 must win "
+            + "over D2's duplicate branch too, not merely over D3's reactivation branch (case 8 covers "
+            + "only the inactive-assignment side of that boundary)")
+    void should_throwNotFound_notDuplicate_when_definitionDeactivatedWhileAssignmentStaysActive() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.isActive()).thenReturn(false);
+
+        // An ACTIVE existing assignment for this exact pair — deliberately lenient: under the
+        // CORRECT implementation D1 fires before this repository call is ever made, so the stub
+        // must not trip Mockito's strict-stubs UnnecessaryStubbingException. If a future
+        // regression moves D1's guard so it only runs in the "no assignment" / "inactive
+        // assignment" branches (exactly the two states cases 1 and 8 exercise), this stub IS
+        // consulted, the duplicate branch fires, and the assertion below goes red.
+        MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
+        org.mockito.Mockito.lenient().when(activeAssignment.isActive()).thenReturn(true);
+        org.mockito.Mockito.lenient()
+                .when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(activeAssignment));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                .as("an existing ACTIVE assignment must not route this into D2's duplicate branch "
+                        + "once the definition itself is deactivated")
+                .isInstanceOf(NotFoundException.class)
+                .isNotInstanceOf(DuplicateServiceException.class);
+
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Phase 313 D1 ordering: a foreign salon's deactivated definition still throws "
+            + "ForbiddenException, not NotFoundException — the ownership check runs first")
+    void should_throwForbidden_notNotFound_when_deactivatedServiceDefBelongsToDifferentSalon() {
+        UUID salonId = UUID.randomUUID();
+        UUID attackerSalonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition foreignServiceDef = mock(ServiceDefinition.class);
+        when(foreignServiceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(foreignServiceDef.getOwnerId()).thenReturn(attackerSalonId);
+        // Deliberately NOT stubbing isActive(): the 403 must fire from the ownership mismatch
+        // alone, without D1's isActive() guard ever being consulted — asserting that would be an
+        // unnecessary stubbing under Mockito's strict stubs, which is itself the proof that D1's
+        // check is unreached here.
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                .as("a caller probing another salon's id must get 403, not a 404 that would "
+                        + "confirm the id exists")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("does not belong to this salon");
+
+        verify(masterServiceRepository, never()).save(any());
+        verify(foreignServiceDef, never())
+                .isActive();
     }
 
     // ── unassignServiceFromMaster (Phase 307 perf audit MEDIUM-1/2, LOW-6) ──────
