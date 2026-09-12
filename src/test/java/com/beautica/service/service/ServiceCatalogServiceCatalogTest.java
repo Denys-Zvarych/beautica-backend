@@ -665,15 +665,18 @@ class ServiceCatalogServiceCatalogTest {
         assertThat(row.priceDisplay()).isNull();
     }
 
-    /** Stubs {@code findBookableAssignmentsBySalon} + a no-op-filtering {@code filterBookableAssignments}. */
+    /**
+     * Stubs {@code findBookableAssignmentsBySalon} + the batched free-slot gate (Phase 315). The
+     * mocked slice stubs the batch method's RESULT directly ({@code byMaster}, masterId -> its
+     * bookable subset) rather than re-deriving it from {@code candidates} — these unit tests exercise
+     * the pricing/grouping reshape downstream of the gate, not the gate itself (that is the
+     * Testcontainers {@code SalonCatalogueBatchLoadIT}'s job).
+     */
     private void stubBookable(UUID salonId, List<MasterServiceAssignment> candidates,
             Map<UUID, List<MasterServiceAssignment>> byMaster) {
         when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(candidates);
-        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : byMaster.entrySet()) {
-            when(slotCalculationService.filterBookableAssignments(eq(entry.getKey()), anyList()))
-                    .thenReturn(entry.getValue());
-        }
+        when(slotCalculationService.filterBookableAssignmentsBatch(any())).thenReturn(byMaster);
     }
 
     private ServiceDefinitionResponse onlyRow(SalonServiceCatalogResponse response) {

@@ -620,8 +620,10 @@ class ServiceCatalogServiceCacheTest {
                         .id(UUID.randomUUID()).master(master2).serviceDefinition(manicure).isActive(true).build();
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId1)).thenReturn(List.of(a1));
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId2)).thenReturn(List.of(a2));
-        when(slotCalculationService.filterBookableAssignments(any(), any()))
-                .thenAnswer(inv -> inv.getArgument(1));
+        // Phase 315: the batched gate is stubbed as a pass-through, echoing back the map it was called
+        // with (one entry per master, byMaster's own grouping) rather than the old per-master list.
+        when(slotCalculationService.filterBookableAssignmentsBatch(any()))
+                .thenAnswer(inv -> inv.getArgument(0));
         when(platformCategoryRepository.findApprovedActive())
                 .thenReturn(List.of(com.beautica.service.entity.PlatformCategory.ofApproved("MANICURE", "Манікюр")));
 

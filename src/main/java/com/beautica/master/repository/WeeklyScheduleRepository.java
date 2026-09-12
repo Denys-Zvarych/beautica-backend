@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDate;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -95,6 +96,41 @@ public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, 
             """)
     List<WeeklySchedule> findOverlappingRangeWithIntervals(
             @Param("masterId") UUID masterId,
+            @Param("from") LocalDate from,
+            @Param("to") LocalDate to);
+
+    /**
+     * Phase 315 (D1/D2/D4) — the multi-master sibling of {@link #findOverlappingRangeWithIntervals},
+     * used ONLY by {@code MasterScheduleService}'s batched loader (the shared private loading step
+     * behind both {@code foldRange} — the single-master case — and {@code resolveEffectiveRangeBatch}),
+     * so a salon-catalogue read resolves every master's overlapping templates in ONE statement instead
+     * of one per master.
+     *
+     * <p><b>{@code ORDER BY ws.master.id, ws.validFrom DESC, ws.id ASC} — the phase's one behaviour
+     * change (D4).</b> {@code firstCovering} (the in-memory fold) picks the FIRST row in the list that
+     * {@code contains(date)} via {@code Stream#findFirst}. {@link #findOverlappingRangeWithIntervals}
+     * carries no {@code ORDER BY}, which is harmless for a single master under the expected invariant
+     * that at most one template covers any given date — but batching interleaves rows from every
+     * master in one physical result set, and an unordered query's row order is not guaranteed stable
+     * under that interleaving. If one master ever holds two overlapping covering templates for the
+     * same date (a data shape the service layer does not otherwise forbid), an unordered batch could
+     * silently flip which template wins with no test failing. The explicit order makes the winner
+     * deterministic — the MOST RECENT template ({@code validFrom DESC}) wins, {@code id ASC} as the
+     * final tiebreak so the ordering is total — which makes a previously UNDEFINED case DEFINED. It
+     * does not change the verdict for any date covered by exactly one template, which is every
+     * date in every fixture this codebase has today. The single-master finder above is intentionally
+     * left untouched — no existing consumer's query, order, or verdict moves.
+     */
+    @Query("""
+            SELECT DISTINCT ws FROM WeeklySchedule ws
+            LEFT JOIN FETCH ws.intervals
+            WHERE ws.master.id IN :masterIds
+              AND ws.validFrom <= :to
+              AND (ws.validTo IS NULL OR ws.validTo >= :from)
+            ORDER BY ws.master.id, ws.validFrom DESC, ws.id ASC
+            """)
+    List<WeeklySchedule> findOverlappingRangeWithIntervalsByMasterIds(
+            @Param("masterIds") Collection<UUID> masterIds,
             @Param("from") LocalDate from,
             @Param("to") LocalDate to);
 

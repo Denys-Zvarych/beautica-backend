@@ -40,6 +40,7 @@ import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -2143,10 +2144,11 @@ class ServiceCatalogServiceTest {
 
     /**
      * Wraps a catalog {@link ServiceDefinition} in a bookable {@link MasterServiceAssignment} performed
-     * by a fresh master. Phase 23.x: the catalogue now loads candidate ASSIGNMENTS
-     * ({@code findBookableAssignmentsBySalon}) and runs the free-slot gate
-     * ({@code slotCalculationService.filterBookableAssignments}) per master, so each catalog fixture is
-     * an assignment rather than a bare definition.
+     * by a fresh master. Phase 23.x: the catalogue loads candidate ASSIGNMENTS
+     * ({@code findBookableAssignmentsBySalon}) and runs them through the free-slot gate
+     * ({@code slotCalculationService.filterBookableAssignmentsBatch} since Phase 315, batched once
+     * across the whole salon rather than per master), so each catalog fixture is an assignment rather
+     * than a bare definition.
      */
     private MasterServiceAssignment assignmentFor(ServiceDefinition def) {
         Master master = Master.builder().id(UUID.randomUUID()).isActive(true).build();
@@ -2159,14 +2161,17 @@ class ServiceCatalogServiceTest {
     }
 
     /**
-     * Stubs the batched free-slot gate as a pass-through: every candidate assignment is bookable.
-     * Exclusion/booked-out behaviour is exercised end-to-end in the Testcontainers catalogue ITs;
-     * here the unit tests focus on grouping/ordering/dedup over the bookable set.
+     * Stubs the batched free-slot gate (Phase 315) as a pass-through: every candidate assignment is
+     * bookable, for every master. Exclusion/booked-out behaviour is exercised end-to-end in the
+     * Testcontainers catalogue ITs; here the unit tests focus on grouping/ordering/dedup over the
+     * bookable set. The stub echoes back exactly the map it was called with — the batch method's
+     * contract (D3) is "one entry per requested master, in the same shape it was asked about" for a
+     * pass-through gate, so the identity answer is the correct fake, not a simplification of it.
      */
     private void stubAllAssignmentsBookable() {
-        org.mockito.Mockito.lenient().when(slotCalculationService.filterBookableAssignments(
-                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
-                .thenAnswer(inv -> inv.getArgument(1));
+        org.mockito.Mockito.lenient().when(slotCalculationService.filterBookableAssignmentsBatch(
+                        org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> inv.getArgument(0));
     }
 
     private com.beautica.service.entity.PlatformCategory approvedCategory(String name) {
@@ -2336,9 +2341,9 @@ class ServiceCatalogServiceTest {
         // free-slot gate the Testcontainers catalogue ITs prove end-to-end.
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
                 .thenReturn(List.of(assignmentFor(manicure)));
-        when(slotCalculationService.filterBookableAssignments(
-                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
-                .thenReturn(List.of());
+        when(slotCalculationService.filterBookableAssignmentsBatch(
+                org.mockito.ArgumentMatchers.any()))
+                .thenReturn(Map.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
 

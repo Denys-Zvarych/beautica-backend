@@ -23,10 +23,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>{@code GET /api/v1/salons/{salonId}/services} and {@code GET /api/v1/masters/{masterId}/services}
  * are {@code permitAll()} in {@code SecurityConfig}. {@code ServiceCatalogService}'s
  * {@code @Cacheable(key = "#salonId"/"#masterId")} only absorbs repeat hits on the SAME id — a
- * caller sweeping distinct ids forced a cache miss plus a full per-master N+1 read (3 SQL
- * statements per master) on every request, previously with no throttle anywhere in
- * {@link AuthRateLimitFilter} at all. Both share ONE bucket, {@code catalogueBrowseBuckets}
- * (see {@code RateLimitConfig#catalogueBrowseCapacity} for the 60/60s sizing rationale).
+ * caller sweeping distinct ids forced a cache miss plus, on a cold key, a per-master N+1 read on
+ * every request, previously with no throttle anywhere in {@link AuthRateLimitFilter} at all.
+ * <b>Phase 315 killed the N+1 itself</b> ({@code SlotCalculationService#filterBookableAssignmentsBatch}
+ * now resolves every master in the salon in a statement count invariant in master count — see
+ * {@code SalonCatalogueBatchLoadIT}'s D6 ledger, which corrects the finding's claimed "3 SQL
+ * statements per master" to the measured 4: two schedule/override bulk loads, one lazy
+ * {@code WeeklySchedule.discreteTimes} batch-fetch the finding did not enumerate, and one booking
+ * load). The throttle below is therefore now a backstop on an O(1) read, not blast-radius control
+ * over an O(masters) one — it stays in place regardless, since a cold key is still a real cache miss
+ * regardless of how cheap the miss became. Both browse paths share ONE bucket,
+ * {@code catalogueBrowseBuckets} (see {@code RateLimitConfig#catalogueBrowseCapacity} for the
+ * 60/60s sizing rationale).
  *
  * <p>The production bucket is an injected {@code @Qualifier} bean whose capacity is raised to
  * 100 000 in {@code src/test/resources/application-test.yml} so {@code ServicesIntegrationTest},
@@ -132,7 +140,7 @@ class CatalogueBrowseGetRateLimitRegressionTest {
                 .contains("application/json");
         assertThat(lastChain.getRequest())
                 .as("the throttled salon-catalogue request must NOT be forwarded down the filter "
-                        + "chain — the per-master N+1 read must never run for a throttled caller")
+                        + "chain — the cold-key catalogue read must never run for a throttled caller")
                 .isNull();
     }
 

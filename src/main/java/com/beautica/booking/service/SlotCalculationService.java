@@ -10,6 +10,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.TimeSlotCalculator;
 import com.beautica.common.util.TimeSlotCalculator.TimeRange;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingMasterTimeRange;
 import com.beautica.booking.repository.BookingTimeRange;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterWorkingDayResponse;
@@ -30,7 +31,9 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -860,50 +863,92 @@ public class SlotCalculationService {
     }
 
     /**
-     * Batched catalogue gate: given ONE master and its candidate assignments (each with
-     * {@code serviceDefinition} initialised), returns the subset that is bookable within the standard
-     * booking horizon (today … today + {@code MAX_DAYS_AHEAD}, computed internally so the horizon lives
-     * in the booking package). Resolves the master's schedule range ONCE and loads the window's bookings
-     * ONCE, then tests each assignment's effective duration against the shared in-memory free-slot walk —
-     * so the catalogue does O(distinct masters) heavy loads, not O(services × masters). Not cached (the
-     * per-service {@link #hasBookableFutureSlot} cache backs the hot master-list path; the catalogue is
-     * the batched path). The verdict is identical to {@link #hasBookableFutureSlot} for the same window.
+     * Batched catalogue gate (Phase 315): given a WHOLE salon's candidates pre-grouped by master (each
+     * assignment with {@code serviceDefinition} initialised), returns each master's bookable subset
+     * within the standard booking horizon (today … today + {@code MAX_DAYS_AHEAD}, computed internally
+     * so the horizon lives in the booking package). Resolves EVERY master's schedule range in ONE
+     * statement and EVERY master's window bookings in ONE statement — total, not per master — then
+     * tests each assignment's effective duration against the shared in-memory free-slot walk. This
+     * REPLACES the pre-315 {@code filterBookableAssignments(UUID, List)}, which paid one schedule
+     * resolve + one booking load PER DISTINCT MASTER (the N+1 this phase kills; see
+     * {@code SalonCatalogueBatchLoadIT}'s D6 ledger for the exact per-master statement enumeration).
+     * Not cached (the per-service {@link #hasBookableFutureSlot} cache backs the hot master-list path;
+     * the catalogue is the batched path). The verdict for each master is identical to
+     * {@link #hasBookableFutureSlot} for the same window — batching is a LOADING STRATEGY, the returned
+     * set never changes (D7).
      *
-     * <p><b>Memoised by effective DURATION (phase-302 audit LOW-4).</b> {@code days},
-     * {@code occupiedByDay} and {@code cutoff} are already loop-invariant, so
-     * {@link #hasFreeFutureSlot}'s verdict is a pure function of {@link #effectiveDuration} —
-     * nothing else about the assignment reaches it. The walk is up to
-     * {@code BookingWindow.MAX_DAYS_AHEAD + 1} = 181 days of slot subtraction, and Phase 302 widened
-     * this method's candidate set from "masters assigned to owner-created salon definitions" to every
-     * active salon master's WHOLE menu — a 10-master salon with 20-service menus is 200 evaluations
-     * per catalogue cache miss. The invariant the memo buys is exactly one walk per DISTINCT
-     * effective duration in the master's menu, however many services share it. No collapse ratio
-     * is claimed here: the only data available to measure one is synthetic local seed data, which
-     * neither supports nor refutes a figure. The memo needs no such claim — its worst case is one
-     * walk per assignment, identical to the un-memoised loop, so it is a strict improvement at any
-     * ratio. {@code Duration} is a value type with proper {@code equals}/{@code hashCode}, and the
-     * map is request-local — no staleness window.
+     * <p><b>D3.3 — the empty-assignment short-circuit survives PER MASTER, at zero cost.</b> A master
+     * whose assignment list is empty contributes {@code List.of()} without being included in either
+     * batched load's {@code IN (:masterIds)} set — mirroring the pre-315 method's
+     * {@code assignments.isEmpty() → List.of()} guard, now applied per entry instead of gating the
+     * whole call.
+     *
+     * <p><b>D3 — every requested master gets an entry; absent ≠ empty.</b> The result carries one entry
+     * per key of {@code assignmentsByMaster}, in its iteration order — including a master whose
+     * assignments loaded but whose gate evaluated every duration to {@code false} (a genuine empty
+     * {@code List.of()}, distinct from "never asked"). Bookings are read via
+     * {@code occupiedByMaster.getOrDefault(masterId, Map.of())}: a master with zero CONFIRMED bookings
+     * in the window resolves to an empty inner map, never a {@code NullPointerException} (the #1 bug
+     * this phase's fold identified — see {@link #loadOccupiedByDayBatch}). Schedule days are read via
+     * {@code daysByMaster.getOrDefault(masterId, List.of())}, though {@code
+     * MasterScheduleService#resolveEffectiveRangeBatch} already guarantees an entry (a full
+     * {@code NO_SCHEDULE} list) for every master it was asked about — the default here is defensive,
+     * not load-bearing.
+     *
+     * <p><b>Memoised by effective DURATION, per master (phase-302 audit LOW-4; kept per master by
+     * Phase 315).</b> {@code days}, {@code occupiedByDay} and {@code cutoff} are loop-invariant WITHIN
+     * one master's evaluation, so {@link #hasFreeFutureSlot}'s verdict is a pure function of
+     * {@link #effectiveDuration} for that master. The memo map is allocated FRESH per master — sharing
+     * one memo across the whole batch would let master A's duration-600 verdict answer for master B's
+     * identical duration, which is wrong whenever the two masters' schedules or bookings differ (case 7
+     * pins this). {@code Duration} is a value type with proper {@code equals}/{@code hashCode}.
+     *
+     * <p>Bind-parameter ceiling / no chunking (D11): documented on
+     * {@code MasterScheduleService#resolveEffectiveRangeBatch} and
+     * {@code BookingRepository#findActiveTimeRangesByMasterIdsInRange}, which this method calls.
      */
     @Transactional(readOnly = true)
-    public List<MasterServiceAssignment> filterBookableAssignments(
-            UUID masterId, List<MasterServiceAssignment> assignments) {
-        if (assignments.isEmpty()) {
-            return List.of();
+    public Map<UUID, List<MasterServiceAssignment>> filterBookableAssignmentsBatch(
+            Map<UUID, List<MasterServiceAssignment>> assignmentsByMaster) {
+        List<UUID> loadedMasterIds = assignmentsByMaster.entrySet().stream()
+                .filter(e -> !e.getValue().isEmpty())
+                .map(Map.Entry::getKey)
+                .toList();
+
+        Map<UUID, List<EffectiveDayResponse>> daysByMaster;
+        Map<UUID, Map<LocalDate, List<TimeRange>>> occupiedByMaster;
+        if (loadedMasterIds.isEmpty()) {
+            daysByMaster = Map.of();
+            occupiedByMaster = Map.of();
+        } else {
+            LocalDate from = LocalDate.now(kyivClock);
+            LocalDate to = from.plusDays(BookingWindow.MAX_DAYS_AHEAD);
+            daysByMaster = masterScheduleService.resolveEffectiveRangeBatch(loadedMasterIds, from, to);
+            occupiedByMaster = loadOccupiedByDayBatch(loadedMasterIds, from, to);
         }
-        LocalDate from = LocalDate.now(kyivClock);
-        LocalDate to = from.plusDays(BookingWindow.MAX_DAYS_AHEAD);
-        List<EffectiveDayResponse> days = masterScheduleService.resolveEffectiveRange(masterId, from, to);
-        Map<LocalDate, List<TimeRange>> occupiedByDay = loadOccupiedByDay(masterId, from, to);
         Instant cutoff = bookableCutoff();
-        Map<Duration, Boolean> verdictByDuration = new HashMap<>();
-        List<MasterServiceAssignment> bookable = new ArrayList<>();
-        for (MasterServiceAssignment msa : assignments) {
-            if (verdictByDuration.computeIfAbsent(effectiveDuration(msa),
-                    duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff))) {
-                bookable.add(msa);
+
+        Map<UUID, List<MasterServiceAssignment>> result = new LinkedHashMap<>();
+        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : assignmentsByMaster.entrySet()) {
+            UUID masterId = entry.getKey();
+            List<MasterServiceAssignment> assignments = entry.getValue();
+            if (assignments.isEmpty()) {
+                result.put(masterId, List.of());
+                continue;
             }
+            List<EffectiveDayResponse> days = daysByMaster.getOrDefault(masterId, List.of());
+            Map<LocalDate, List<TimeRange>> occupiedByDay = occupiedByMaster.getOrDefault(masterId, Map.of());
+            Map<Duration, Boolean> verdictByDuration = new HashMap<>();
+            List<MasterServiceAssignment> bookable = new ArrayList<>();
+            for (MasterServiceAssignment msa : assignments) {
+                if (verdictByDuration.computeIfAbsent(effectiveDuration(msa),
+                        duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff))) {
+                    bookable.add(msa);
+                }
+            }
+            result.put(masterId, bookable);
         }
-        return bookable;
+        return result;
     }
 
     // ── shared internals ────────────────────────────────────────────────────────────────────
@@ -1233,6 +1278,40 @@ public class SlotCalculationService {
             }
         }
         return byDay;
+    }
+
+    /**
+     * Phase 315 (D1/D3.1) — the multi-master sibling of {@link #loadOccupiedByDay}: loads EVERY
+     * requested master's CONFIRMED bookings across the SAME {@code [from, to]} window in ONE query
+     * (D4's {@link BookingMasterTimeRange} projection carries {@code masterId} so the single result
+     * set can be regrouped), then buckets each master's rows by Kyiv-civil date exactly as the
+     * single-master method does. Used ONLY by {@link #filterBookableAssignmentsBatch}.
+     *
+     * <p><b>D3.1 — the #1 bug this phase's fold identified.</b> A master with zero CONFIRMED bookings
+     * in the window is simply absent from the returned outer map — {@code Collectors.groupingBy}
+     * cannot invent an empty entry for a master it never saw a row for. That is the CORRECT shape:
+     * every caller must read via {@code occupiedByMaster.getOrDefault(masterId, Map.of())}
+     * ({@link #isDayBookable}'s existing {@code occupiedByDay.getOrDefault(day.date(), List.of())}
+     * inner lookup was already null-safe; only the outer lookup needed the same treatment). A bare
+     * {@code occupiedByMaster.get(masterId)} NPEs on the very first fully-free master in a batch —
+     * the mutation this method's design guards against.
+     */
+    private Map<UUID, Map<LocalDate, List<TimeRange>>> loadOccupiedByDayBatch(
+            Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+        OffsetDateTime windowStart = from.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime windowEnd = to.plusDays(1).atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        Map<UUID, Map<LocalDate, List<TimeRange>>> byMaster = new HashMap<>();
+        for (BookingMasterTimeRange b : bookingRepository
+                .findActiveTimeRangesByMasterIdsInRange(masterIds, windowStart, windowEnd)) {
+            TimeRange range = new TimeRange(b.startsAt().toInstant(), b.endsAt().toInstant());
+            LocalDate firstDay = LocalDate.ofInstant(range.start(), TimeZones.KYIV);
+            LocalDate lastDay = LocalDate.ofInstant(range.end().minusNanos(1), TimeZones.KYIV);
+            Map<LocalDate, List<TimeRange>> byDay = byMaster.computeIfAbsent(b.masterId(), k -> new HashMap<>());
+            for (LocalDate d = firstDay; !d.isAfter(lastDay); d = d.plusDays(1)) {
+                byDay.computeIfAbsent(d, k -> new ArrayList<>()).add(range);
+            }
+        }
+        return byMaster;
     }
 
     /**

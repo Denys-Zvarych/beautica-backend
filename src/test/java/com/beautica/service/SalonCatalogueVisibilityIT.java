@@ -203,9 +203,11 @@ class SalonCatalogueVisibilityIT extends AbstractIntegrationTest {
      * the salon catalogue" must first check whether that master has working hours configured. If
      * they do not, this test — and the phase-305 doc's D1 — is the answer, not a bug report.
      *
-     * <p><b>Mutation check (a):</b> removing the {@code filterBookableAssignments} call from
-     * {@code ServiceCatalogService#bookableDefinitions} must turn this test red. If it stays green,
-     * this test is asserting the wrong thing and D1 is unpinned.
+     * <p><b>Mutation check (a):</b> removing the {@code filterBookableAssignmentsBatch} call from
+     * {@code ServiceCatalogService#bookableDefinitions} (Phase 315: batched, one call for the whole
+     * salon — the pre-315 per-master {@code filterBookableAssignments} this note used to name no
+     * longer exists) must turn this test red. If it stays green, this test is asserting the wrong
+     * thing and D1 is unpinned.
      */
     @Test
     @DisplayName("Case 5 (D1 — DELIBERATE, not a bug): a master with NO working hours configured — "

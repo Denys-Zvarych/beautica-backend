@@ -1539,14 +1539,17 @@ public class ServiceCatalogService {
      * assigned, and with ≥1 free future slot after existing bookings are subtracted. This is the same
      * verdict the booking master-list uses ({@code BookingMasterService#getBookableMasters}), so the
      * catalogue and the master picker can never disagree. Candidate assignments are loaded once
-     * ({@code findBookableAssignmentsBySalon}), grouped by master, and each master's schedule + booking
-     * window is resolved ONCE by {@code SlotCalculationService#filterBookableAssignments} — O(distinct
-     * masters) heavy loads, not O(services × masters).
+     * ({@code findBookableAssignmentsBySalon}), grouped by master, and EVERY master's schedule + booking
+     * window is resolved in ONE statement each — total, not per master — by
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch} (Phase 315: O(1) heavy loads for
+     * the whole salon, not O(distinct masters); see that method's javadoc and
+     * {@code SalonCatalogueBatchLoadIT} for the statement-count gate).
      *
      * <p><b>Caching (perf/security #2).</b> Cached in {@code salon-service-catalog} keyed on
      * {@code salonId} (60-sec TTL, {@code sync=true}) — this is a {@code permitAll} endpoint whose body
-     * runs an O(distinct masters) free-slot compute per hit (schedule resolve + booking load per master),
-     * a DB-amplification / stampede surface without a result cache. {@code sync=true} collapses the
+     * runs a free-slot compute per hit (one batched schedule resolve + one batched booking load for the
+     * whole salon, Phase 315), a DB-amplification / stampede surface without a result cache. {@code
+     * sync=true} collapses the
      * thundering herd when a popular salon's entry expires (§F-7). Explicit eviction runs afterCommit via
      * {@link SalonCatalogCacheEvictor} from every write that can flip the bookable-service set: a
      * booking / cancellation / schedule change on any master in the salon (evicted at those write sites
@@ -1615,23 +1618,33 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Groups the candidate assignments by master, runs the batched free-slot gate once per master
-     * ({@code SlotCalculationService#filterBookableAssignments} — one schedule resolve + one booking
-     * load per master), and returns the surviving assignments grouped by {@code serviceDefinition.id}
+     * Groups the candidate assignments by master, runs the batched free-slot gate ONCE for the WHOLE
+     * salon ({@code SlotCalculationService#filterBookableAssignmentsBatch} — Phase 315: one schedule
+     * resolve statement and one booking-load statement for every master in the salon COMBINED, not one
+     * of each per master), and returns the surviving assignments grouped by {@code serviceDefinition.id}
      * (Phase 314 D2). Earlier this collapsed straight to distinct {@link ServiceDefinition}s and threw
      * the assignments away; that made it impossible to tell WHICH masters' bands should price the row,
      * so this reshaping is required before {@link #priceForSalonCatalogue} can aggregate correctly —
      * aggregating over the raw, un-filtered {@code candidates} would let a filtered-out master's band
      * still set the salon's displayed floor or ceiling.
      *
+     * <p><b>Phase 315 — batching changed WHEN rows load, never WHAT this method returns.</b> The
+     * pre-315 body called {@code filterBookableAssignments} once per master in a loop; this calls
+     * {@code filterBookableAssignmentsBatch} exactly once with every master's candidates pre-grouped.
+     * The per-master gate logic, the per-master {@code verdictByDuration} memo and the free-slot walk
+     * are byte-for-byte the same code, reached through one call instead of N — the union this method
+     * assembles from the batch result is identical, master for master and assignment for assignment, to
+     * the union the old per-master loop assembled (pinned by {@code SalonCatalogueBatchLoadIT} case 11,
+     * the non-vacuous batch-vs-N-singleton-calls differential).
+     *
      * <p><b>Phase 305 D1 — the free-slot gate applied here is DELIBERATE contract, not a bug.</b> A
-     * candidate assignment is kept only when {@code filterBookableAssignments} finds its master a
-     * free future slot for the service's effective duration; a master with NO working hours
-     * configured resolves zero effective schedule days and is therefore filtered out entirely, so
-     * NONE of their services reach the salon catalogue — even though Phases 302/303 make those
-     * definitions genuinely {@code SALON}-owned. {@code GET /salons/{salonId}/services} answers
-     * "what can a client book here right now?", not "what does this salon's staff list on paper?",
-     * and this is the call frame where that answer is enforced.
+     * candidate assignment is kept only when the batched gate finds its master a free future slot for
+     * the service's effective duration; a master with NO working hours configured resolves zero
+     * effective schedule days and is therefore filtered out entirely, so NONE of their services reach
+     * the salon catalogue — even though Phases 302/303 make those definitions genuinely
+     * {@code SALON}-owned. {@code GET /salons/{salonId}/services} answers "what can a client book here
+     * right now?", not "what does this salon's staff list on paper?", and this is the call frame where
+     * that answer is enforced.
      *
      * <p><b>Do not "fix" this.</b> Any future finding titled "a master's services are missing from
      * the salon catalogue" must first check whether that master has working hours configured — see
@@ -1643,10 +1656,12 @@ public class ServiceCatalogService {
         Map<UUID, List<MasterServiceAssignment>> byMaster = candidates.stream()
                 .collect(Collectors.groupingBy(a -> a.getMaster().getId()));
 
+        Map<UUID, List<MasterServiceAssignment>> bookableByMaster =
+                slotCalculationService.filterBookableAssignmentsBatch(byMaster);
+
         Map<UUID, List<MasterServiceAssignment>> bookableByDefinition = new LinkedHashMap<>();
-        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : byMaster.entrySet()) {
-            for (MasterServiceAssignment msa :
-                    slotCalculationService.filterBookableAssignments(entry.getKey(), entry.getValue())) {
+        for (List<MasterServiceAssignment> bookable : bookableByMaster.values()) {
+            for (MasterServiceAssignment msa : bookable) {
                 bookableByDefinition
                         .computeIfAbsent(msa.getServiceDefinition().getId(), key -> new ArrayList<>())
                         .add(msa);

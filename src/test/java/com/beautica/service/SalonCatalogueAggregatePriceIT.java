@@ -519,19 +519,26 @@ class SalonCatalogueAggregatePriceIT extends AbstractIntegrationTest {
     // ── Case 15 — statement-count invariance (D5) ───────────────────────────────────────────────
 
     /**
-     * <b>Measurement corrected from the phase doc's literal "1 master vs 10 masters" framing.</b>
-     * Empirically (this test, first written literally per the doc): a 1-master salon costs 6
-     * {@code prepareStatementCount}, a 10-master salon costs 41 — NOT equal, and NOT a Phase 314
-     * regression. {@code SlotCalculationService#filterBookableAssignments} runs one schedule-resolve
+     * <b>Historical note (measurement corrected from the phase doc's literal "1 master vs 10
+     * masters" framing, PRE-Phase-315).</b> When this test was first written, a 1-master salon cost
+     * 6 {@code prepareStatementCount} and a 10-master salon cost 41 — NOT equal, and NOT a Phase 314
+     * regression. {@code SlotCalculationService#filterBookableAssignments} ran one schedule-resolve
      * query ({@code resolveEffectiveRange}) and one booking-load query ({@code loadOccupiedByDay})
-     * PER MASTER (see its own javadoc: "O(distinct masters) heavy loads") — a cost that predates
-     * this phase entirely and legitimately scales with master count.
+     * PER MASTER (see its own javadoc at the time: "O(distinct masters) heavy loads") — a cost that
+     * predated Phase 314 and legitimately scaled with master count. <b>Phase 315 changed this</b>:
+     * {@code filterBookableAssignmentsBatch} now resolves every master's schedule and bookings in
+     * ONE statement each, for the WHOLE salon — master-count invariance is asserted directly by
+     * {@code SalonCatalogueBatchLoadIT} case 9, with a named absolute constant for the 1-master
+     * base and an explicit caveat for {@code EXPLICIT_TIMES} fixtures (case 12). This test's OWN
+     * assertion below is unchanged and stays green under the batched gate — it was never actually
+     * measuring master-count scaling (see the next paragraph), so Phase 315 does not touch it.
      *
      * <p>What D5 actually guards against — a per-definition repository call inside the
      * aggregation loop (mutation 9: replacing the in-memory grouping with
      * {@code findBookableAssignmentsBySalonAndServiceDef}) — is correctly isolated by holding
      * MASTER COUNT FIXED (one master, so the schedule/booking cost above is identical in both
-     * runs) and varying the NUMBER OF DISTINCT SERVICE DEFINITIONS that master offers instead:
+     * runs, whether that cost is the pre-315 per-master load or the post-315 batched-for-one load)
+     * and varying the NUMBER OF DISTINCT SERVICE DEFINITIONS that master offers instead:
      * {@code bookableDefinitions}/{@code priceForSalonCatalogue} are pure in-memory work over the
      * ALREADY-loaded {@code findBookableAssignmentsBySalon} result set (D5), so growing the
      * definition count must add zero additional statements. A per-definition lookup bug would
