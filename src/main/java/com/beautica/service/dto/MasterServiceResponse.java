@@ -89,35 +89,39 @@ public record MasterServiceResponse(
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         // ServiceDefinitionResponse.from already runs ServicePricing.ofDefinition internally, so
-        // sdResponse ALREADY carries the derived display band.
+        // sdResponse carries the SHARED DEFINITION's band — used here only for the nested
+        // serviceDefinition object and the service-type fields, never for this response's own
+        // top-level priceType/priceMin/priceMax/priceDisplay (see below).
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
 
-        // Money and duration are derived in exactly one place — ServicePricing (Phase 31.4 D2) —
-        // so this menu DTO and the BEAUTY WISH LIST (FavoriteServiceResponse) can never print
-        // different prices for the same service. effectivePrice = COALESCE(priceOverride,
-        // base_price) (null when both are null — no @NotNull on the basePrice entity field, so
-        // callers must still null-check).
+        // Phase 311 D9 — REVERSES the pre-311 perf shortcut this comment used to document. Before
+        // V165, master_services had no per-master ceiling or shape, so ofAssignment's band was
+        // wholly the definition's band by construction — lifting it from sdResponse instead of
+        // re-deriving it via ServicePricing.ofAssignment was a pure perf win (2026-08 perf audit
+        // F4): it saved a second, discarded PriceDisplayFormatter.format call.
         //
-        // The band below is lifted from sdResponse rather than re-derived via
-        // ServicePricing.ofAssignment. The two are identical BY CONSTRUCTION — ofAssignment
-        // sources priceType/priceMin/priceMax/priceDisplay wholly from the definition and applies
-        // the override only to effectivePrice — so calling it here would run
-        // PriceDisplayFormatter.format a second time per row and discard the result (2026-08 perf
-        // audit F4). effectivePriceOf/effectiveDurationMinutesOf are the same formulas ServicePricing
-        // .derive itself calls, not a second implementation.
+        // That premise died with V165: an assignment holding its OWN band (Phase 311 D2) now
+        // legitimately disagrees with the definition's band, and sdResponse's band is the
+        // definition's — exactly the value that would render a STALE price here. ofAssignment is
+        // no longer a duplicate computation; it is the only correct one. Money and duration are
+        // still derived in exactly one place (ServicePricing, Phase 31.4 D2), so this menu DTO and
+        // the wish list (FavoriteServiceResponse, which already called ofAssignment) can never
+        // print different prices for the same assignment.
+        ServicePricing pricing = ServicePricing.ofAssignment(msa);
+
         return new MasterServiceResponse(
                 msa.getId(),
                 msa.getMaster().getId(),
                 sdResponse,
                 msa.getPriceOverride(),
                 msa.getDurationOverrideMinutes(),
-                ServicePricing.effectivePriceOf(msa),
-                ServicePricing.effectiveDurationMinutesOf(msa),
+                pricing.effectivePrice(),
+                pricing.effectiveDurationMinutes(),
                 msa.isActive(),
-                sdResponse.priceType(),
-                sdResponse.priceMin(),
-                sdResponse.priceMax(),
-                sdResponse.priceDisplay(),
+                pricing.priceType(),
+                pricing.priceMin(),
+                pricing.priceMax(),
+                pricing.priceDisplay(),
                 sdResponse.serviceTypeId(),
                 sdResponse.serviceTypeNameUk(),
                 sdResponse.serviceTypeSlug(),

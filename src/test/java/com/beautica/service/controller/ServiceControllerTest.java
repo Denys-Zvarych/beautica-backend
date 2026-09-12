@@ -379,7 +379,7 @@ class ServiceControllerTest {
         var masterId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         var assignmentId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         var stub = stubMasterServiceResponse(assignmentId, masterId, "Pedicure");
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
@@ -408,7 +408,7 @@ class ServiceControllerTest {
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
@@ -432,7 +432,7 @@ class ServiceControllerTest {
         var masterId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         var assignmentId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         var stub = stubMasterServiceResponse(assignmentId, masterId, "Pedicure");
 
         // Before Phase 306, hasRole('SALON_OWNER') rejected SALON_ADMIN before canManageSalon/
@@ -459,7 +459,7 @@ class ServiceControllerTest {
         var userId = UUID.randomUUID();
         var salonAId = UUID.randomUUID();
         var masterInSalonBId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(UUID.randomUUID(), null, null);
+        var request = new AssignServiceToMasterRequest(UUID.randomUUID(), null, null, null, null);
 
         // Owner can manage salon A, but the target master belongs to salon B → guard denies.
         when(authorizationService.canManageSalon(any(), eq(salonAId))).thenReturn(true);
@@ -483,7 +483,7 @@ class ServiceControllerTest {
         var masterUserId = UUID.randomUUID();
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(UUID.randomUUID(), null, null);
+        var request = new AssignServiceToMasterRequest(UUID.randomUUID(), null, null, null, null);
 
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as SALON_MASTER — read-only role must be denied with 403",
                 salonId, masterId);
@@ -495,6 +495,175 @@ class ServiceControllerTest {
                 .andExpect(status().isForbidden());
 
         verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+    }
+
+    // ── PATCH /api/v1/salons/{salonId}/masters/{masterId}/services/{serviceDefId} — Phase 311 ──
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 200 when owner edits the band")
+    void should_return200_when_ownerEditsMasterServiceBand() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var assignmentId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
+        var stub = stubMasterServiceResponse(assignmentId, masterId, "Manicure");
+
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.updateMasterServiceBand(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId),
+                any(com.beautica.service.dto.UpdateMasterServiceBandRequest.class)))
+                .thenReturn(stub);
+
+        log.debug("Act: PATCH .../masters/{}/services/{} — owner edits band", masterId, serviceDefId);
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()));
+    }
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 200 when a SALON_MASTER "
+            + "edits their OWN row (Phase 311 D5 — the ONE write a SALON_MASTER may perform)")
+    void should_return200_when_salonMasterEditsOwnBand() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var assignmentId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
+        var stub = stubMasterServiceResponse(assignmentId, masterId, "Manicure");
+
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.updateMasterServiceBand(eq(masterUserId), eq(salonId), eq(masterId), eq(serviceDefId),
+                any(com.beautica.service.dto.UpdateMasterServiceBandRequest.class)))
+                .thenReturn(stub);
+
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 403 when a SALON_MASTER "
+            + "edits a PEER's row (canEditMasterServiceBand denies)")
+    void should_return403_when_salonMasterEditsPeerBand() throws Exception {
+        var masterUserId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var peerMasterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("111.00"), null, null, null, null);
+
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(peerMasterId))).thenReturn(false);
+
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + peerMasterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(masterUserId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isForbidden());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 400 for a partial band "
+            + "(price with no priceType, D2) — rejected by bean validation before the service layer")
+    void should_return400_when_bandIsPartial() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                null, new BigDecimal("750.00"), null, null, null, null);
+
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 400 for an empty patch "
+            + "(D4) — rejected by bean validation before the service layer")
+    void should_return400_when_patchIsEmpty() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                null, null, null, null, null, null);
+
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 404 when no active "
+            + "assignment exists for (masterId, serviceDefId)")
+    void should_return404_when_noActiveAssignmentForBandEdit() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
+
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        when(serviceCatalogService.updateMasterServiceBand(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId),
+                any(com.beautica.service.dto.UpdateMasterServiceBandRequest.class)))
+                .thenThrow(new com.beautica.common.exception.NotFoundException(
+                        "No active assignment for master " + masterId + " and service " + serviceDefId));
+
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    @DisplayName("PATCH .../masters/{masterId}/services/{serviceDefId} — 401 when unauthenticated")
+    void should_return401_when_bandEditWithoutAuth() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
+
+        mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isUnauthorized());
     }
 
     // ── DELETE /api/v1/salons/{salonId}/masters/{masterId}/services/{serviceDefId} — Phase 307 ──
@@ -2413,7 +2582,7 @@ class ServiceControllerTest {
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
@@ -2442,7 +2611,7 @@ class ServiceControllerTest {
         var salonId = UUID.randomUUID();
         var masterId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);

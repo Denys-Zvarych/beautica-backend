@@ -325,7 +325,7 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
         assertThat(unassign(ownerToken, salonId, masterId, assignment.definitionId()).getStatusCode())
                 .isEqualTo(HttpStatus.NO_CONTENT);
 
-        var request = new AssignServiceToMasterRequest(assignment.definitionId(), null, null);
+        var request = new AssignServiceToMasterRequest(assignment.definitionId(), null, null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(ownerToken)), String.class);
@@ -355,7 +355,7 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
         UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
         Assignment assignment = bulkCreateOneService(ownerToken, salonId, masterId, typeId);
 
-        var request = new AssignServiceToMasterRequest(assignment.definitionId(), null, null);
+        var request = new AssignServiceToMasterRequest(assignment.definitionId(), null, null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(ownerToken)), String.class);

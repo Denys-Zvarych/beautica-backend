@@ -440,6 +440,153 @@ class ServiceCatalogServiceCacheTest {
                 .isNull();
     }
 
+    // ── Phase 311 D11 — updateMasterServiceBand's CONDITIONAL eviction ─────────
+
+    /**
+     * Builds a resolvable {@code (salonId, masterId, serviceDefId)} triple for
+     * {@code updateMasterServiceBand}: a SALON-owned, active {@link ServiceDefinition}, an active
+     * {@link Master} belonging to {@code salonId}, and a {@link MasterServiceAssignment} carrying
+     * the given PRE-EDIT override state. {@code masterServiceRepository
+     * .findByMasterIdAndServiceDefinitionId} is stubbed to return it.
+     */
+    private MasterServiceAssignment stubBandAssignment(
+            UUID salonId, UUID masterId, UUID serviceDefId,
+            BigDecimal existingPriceOverride, Integer existingDurationOverride) {
+        Salon salon = Salon.builder().id(salonId).build();
+        Master master = Master.builder().id(masterId).salon(salon).isActive(true).build();
+        ServiceDefinition serviceDefinition = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("400.00"))
+                .isActive(true)
+                .build();
+        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(serviceDefinition)
+                .priceOverride(existingPriceOverride)
+                .priceTypeOverride(existingPriceOverride != null ? PriceType.FIXED : null)
+                .durationOverrideMinutes(existingDurationOverride)
+                .isActive(true)
+                .build();
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+        return assignment;
+    }
+
+    @Test
+    @DisplayName("Phase 311 D11: updateMasterServiceBand ALWAYS evicts masterServices and "
+            + "salon-service-catalog, for a band-only edit")
+    void should_evictMasterServicesAndSalonCatalog_when_updateMasterServiceBandCalled() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        stubBandAssignment(salonId, masterId, serviceDefId, null, null);
+
+        var masterServicesCache = cacheManager.getCache("masterServices");
+        masterServicesCache.put(masterId, List.of());
+        var salonCatalogCache = cacheManager.getCache("salon-service-catalog");
+        salonCatalogCache.put(salonId, "stale-catalog-snapshot");
+
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
+
+        // Act — no active Spring transaction here; eviction runs immediately in the else-branch.
+        serviceCatalogService.updateMasterServiceBand(UUID.randomUUID(), salonId, masterId, serviceDefId, request);
+
+        assertThat(masterServicesCache.get(masterId)).isNull();
+        assertThat(salonCatalogCache.get(salonId)).isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 311 D11 / case 24 / mutation 12: a DURATION edit evicts available-slots for "
+            + "the master")
+    void should_evictAvailableSlotsCache_when_updateMasterServiceBandChangesDuration() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID someServiceId = UUID.randomUUID();
+        LocalDate someDate = LocalDate.of(2026, 6, 1);
+        stubBandAssignment(salonId, masterId, serviceDefId, null, null);
+
+        var slotsCache = cacheManager.getCache("available-slots");
+        var cacheKey = CacheKeyFixtures.spelKey(masterId, someDate, someServiceId);
+        slotsCache.put(cacheKey, List.of("09:00", "10:00"));
+        delegateSlotEvictionToRealCache();
+
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                null, null, null, 90, null, null);
+
+        serviceCatalogService.updateMasterServiceBand(UUID.randomUUID(), salonId, masterId, serviceDefId, request);
+
+        assertThat(slotsCache.get(cacheKey))
+                .as("duration_override_minutes changed (null -> 90) — slot caches MUST sweep")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("Phase 311 D11 / case 24 / mutation 12: a BAND-ONLY edit does NOT evict "
+            + "available-slots — the conditional's whole point")
+    void should_notEvictAvailableSlotsCache_when_updateMasterServiceBandOnlyChangesBand() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID someServiceId = UUID.randomUUID();
+        LocalDate someDate = LocalDate.of(2026, 6, 1);
+        stubBandAssignment(salonId, masterId, serviceDefId, null, null);
+
+        var slotsCache = cacheManager.getCache("available-slots");
+        var cacheKey = CacheKeyFixtures.spelKey(masterId, someDate, someServiceId);
+        slotsCache.put(cacheKey, List.of("09:00", "10:00"));
+        delegateSlotEvictionToRealCache();
+
+        // Band-only: no durationOverrideMinutes, no clearDurationOverride.
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("750.00"), null, null, null, null);
+
+        serviceCatalogService.updateMasterServiceBand(UUID.randomUUID(), salonId, masterId, serviceDefId, request);
+
+        assertThat(slotsCache.get(cacheKey))
+                .as("a band-only edit must NOT sweep slot caches — duration is unchanged")
+                .isNotNull();
+    }
+
+    @Test
+    @DisplayName("Phase 311 D11 / case 25 / mutation 13: a floor change refreshes "
+            + "masters.min_effective_price")
+    void should_refreshMinEffectivePrice_when_updateMasterServiceBandChangesFloor() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        stubBandAssignment(salonId, masterId, serviceDefId, new BigDecimal("500.00"), null);
+
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("300.00"), null, null, null, null);
+
+        serviceCatalogService.updateMasterServiceBand(UUID.randomUUID(), salonId, masterId, serviceDefId, request);
+
+        verify(masterRepository, times(1)).refreshMinEffectivePrice(masterId);
+    }
+
+    @Test
+    @DisplayName("Phase 311 D11: a duration-only edit does NOT refresh min_effective_price — the "
+            + "floor did not change")
+    void should_notRefreshMinEffectivePrice_when_updateMasterServiceBandOnlyChangesDuration() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        stubBandAssignment(salonId, masterId, serviceDefId, null, null);
+
+        var request = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                null, null, null, 90, null, null);
+
+        serviceCatalogService.updateMasterServiceBand(UUID.randomUUID(), salonId, masterId, serviceDefId, request);
+
+        verify(masterRepository, org.mockito.Mockito.never()).refreshMinEffectivePrice(any());
+    }
+
     // ── platform-category-order cache (perf follow-up, Phase 13.6) ─────────────
 
     @Test

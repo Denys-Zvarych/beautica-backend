@@ -118,7 +118,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, createRequest);
 
         // Assign with a price override to verify effectivePrice resolution
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, new BigDecimal("550.00"), null);
+        var assignRequest = new AssignServiceToMasterRequest(
+                serviceDefId, PriceType.FIXED, new BigDecimal("550.00"), null, null);
 
         log.debug("Act step 2: POST /api/v1/salons/{}/masters/{}/services to assign service", salonId, masterId);
         ResponseEntity<String> assignResp = restTemplate.exchange(
@@ -173,7 +174,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 fixtures.resolveServiceTypeIdForCategory("NAIL_SERVICE"));
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, createRequest);
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // First assignment — must succeed
         log.debug("Act step 1: first assignment of service {} to master {} — must return 201", serviceDefId, masterId);
@@ -576,7 +577,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         String adminToken = fixtures.createSalonAdminAndGetToken(
                 salonId, "p306-admin-assign-" + System.nanoTime() + "@beautica.test");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // Act
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as SALON_ADMIN — must be allowed (D4)", salonId, masterId);
@@ -632,7 +633,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Стрижка чоловіча");
 
         // single-assign
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         ResponseEntity<String> assignResp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(assignRequest, fixtures.bearerHeaders(ownerToken)), String.class);
@@ -672,7 +673,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         UUID masterId = fixtures.createSalonMaster(salonId);
         fixtures.seedUsableSchedule(masterId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Ламінування вій");
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         ResponseEntity<String> assignResp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(assignRequest, fixtures.bearerHeaders(ownerToken)), String.class);

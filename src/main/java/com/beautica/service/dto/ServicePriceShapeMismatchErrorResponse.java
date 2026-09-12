@@ -35,7 +35,13 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * ({@code POST /salons/{salonId}/masters/{masterId}/services/bulk}); the sibling independent-master
  * bulk endpoint never reuses another owner's definition, so it cannot raise this error and does not
  * carry this declaration.
+ *
+ * @deprecated See {@link com.beautica.common.exception.ServicePriceShapeMismatchException}'s
+ *     {@code @deprecated} javadoc — retired by Phase 312 D3. The {@code @ApiResponse} that
+ *     declared this schema on the bulk endpoint is removed, so this type is no longer referenced
+ *     from {@code /api-docs}; kept only because Phase 312 Step 0 found a live mobile consumer (D4).
  */
+@Deprecated
 @Schema(name = "ServicePriceShapeMismatchErrorResponse",
         description = "400 response body when a bulk item's price shape cannot be represented "
                 + "against the salon definition it would reuse. Branch on `data.code` "

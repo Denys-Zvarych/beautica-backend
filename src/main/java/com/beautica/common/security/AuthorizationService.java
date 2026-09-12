@@ -243,6 +243,47 @@ public class AuthorizationService {
      * re-proving {@code canManageServiceDefinition}.
      */
     public boolean canReadSalonMasterServices(Authentication auth, UUID salonId, UUID masterId) {
+        return isOwnerAdminOrSelfMaster(auth, salonId, masterId);
+    }
+
+    /**
+     * Phase 311 D5 — the ONLY {@code master_services} write a {@code SALON_MASTER} may perform,
+     * and only on their OWN row. Admits the {@code SALON_OWNER} of {@code salonId}, a
+     * {@code SALON_ADMIN} assigned to it, and the {@code SALON_MASTER} whose {@code masters} row
+     * IS {@code masterId} — the identical audience {@link #canReadSalonMasterServices} admits.
+     *
+     * <p><b>Deliberately its own entry point, not a call to the read predicate.</b> A later
+     * widening of the READ gate (e.g. admitting a peer master, or a receptionist role) must not
+     * silently widen this WRITE gate too, and {@code grep canEditMasterServiceBand} must remain
+     * the complete answer to "where can a SALON_MASTER write?". Both methods delegate to the same
+     * private helper so the shared traversal is written once (promote-don't-duplicate), but they
+     * are two named, independently-evolvable public symbols.
+     *
+     * <p>{@code canManageServiceDefinition} is NOT touched by this phase — its
+     * {@code SALON_MASTER}/{@code CLIENT} fast-reject (Phase 306 D2, a deliberate timing-oracle
+     * property) continues to gate {@code PATCH /services/{serviceDefId}} and
+     * {@code DELETE /services/{id}}, which a master must stay out of (D6).
+     *
+     * <p><b>Cross-tenant fix (post-311 audit).</b> {@link #isOwnerAdminOrSelfMaster}'s management
+     * branch does NOT itself verify {@code masterId} belongs to {@code salonId} — deliberately, for
+     * {@link #canReadSalonMasterServices} (see that method's javadoc: a cross-salon
+     * {@code masterId} must fall through to the service layer's own 404, not 403 here). This WRITE
+     * gate has no such 404 fallback, so it ANDs {@link #masterBelongsToSalon} itself, matching the
+     * controller's {@code @PreAuthorize("@authz.canEditMasterServiceBand(...) and
+     * @authz.masterBelongsToSalon(...)")} compound expression and this method's service-layer twin
+     * {@link #enforceCanEditMasterServiceBand}.
+     */
+    public boolean canEditMasterServiceBand(Authentication auth, UUID salonId, UUID masterId) {
+        return isOwnerAdminOrSelfMaster(auth, salonId, masterId) && masterBelongsToSalon(masterId, salonId);
+    }
+
+    /**
+     * Shared traversal behind {@link #canReadSalonMasterServices} and
+     * {@link #canEditMasterServiceBand} (Phase 311 D5) — promoted out of the former's body rather
+     * than duplicated, mirroring {@link #canManageServiceOwnerAccess}'s role as the single shared
+     * predicate behind a SpEL gate and its service-layer defense-in-depth twin.
+     */
+    private boolean isOwnerAdminOrSelfMaster(Authentication auth, UUID salonId, UUID masterId) {
         boolean isClient = auth.getAuthorities().stream()
                 .anyMatch(a -> a.getAuthority().equals("ROLE_CLIENT"));
         if (isClient) return false;
@@ -255,6 +296,39 @@ public class AuthorizationService {
                 .map(m -> m.getUser() != null && m.getUser().getId().equals(actorId))
                 .orElse(false)
                 && masterBelongsToSalon(masterId, salonId);
+    }
+
+    /**
+     * Service-layer (defense-in-depth) twin of {@link #canEditMasterServiceBand}, mirroring the
+     * {@link #enforceCanManageServiceDefinition} idiom — re-proves the SpEL gate's grant using the
+     * caller-supplied {@code actorId} so a future non-HTTP caller of
+     * {@code ServiceCatalogService#updateMasterServiceBand} cannot bypass it (same correction
+     * Phase 310 applied to {@code getSalonMasterServices}).
+     *
+     * <p><b>Cross-tenant fix (post-311 audit).</b> The management branch used to return on
+     * {@link #hasManagementAccess} alone, without checking {@code masterId} actually belongs to
+     * {@code salonId} — unlike the controller's {@code @PreAuthorize}, which ANDs
+     * {@link #masterBelongsToSalon} as a separate conjunct. That let a SALON_OWNER/SALON_ADMIN
+     * managing their own salon pass this guard for a master belonging to a DIFFERENT salon; the
+     * SpEL gate rejected it first over HTTP, but a non-HTTP caller of
+     * {@code ServiceCatalogService#updateMasterServiceBand} would not have been protected. Now
+     * mirrors the compound SpEL exactly, matching {@link #canEditMasterServiceBand}'s own fix.
+     *
+     * @throws ForbiddenException if the actor is neither managing {@code salonId} nor the
+     *                             {@code SALON_MASTER} of {@code masterId} within it, or if
+     *                             {@code masterId} does not belong to {@code salonId}
+     */
+    public void enforceCanEditMasterServiceBand(UUID actorId, UUID salonId, UUID masterId) {
+        Role actorRole = roleFromCurrentAuthentication();
+        if (hasManagementAccess(salonId, actorId, actorRole) && masterBelongsToSalon(masterId, salonId)) {
+            return;
+        }
+        boolean ownsMasterRow = masterRepository.findByIdWithUserAndSalon(masterId)
+                .map(m -> m.getUser() != null && m.getUser().getId().equals(actorId))
+                .orElse(false);
+        if (!ownsMasterRow || !masterBelongsToSalon(masterId, salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
     }
 
     public void enforceCanManageSalon(UUID actorId, Salon salon) {

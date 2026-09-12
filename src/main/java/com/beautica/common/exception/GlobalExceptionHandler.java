@@ -212,7 +212,14 @@ public class GlobalExceptionHandler {
      * {@link #handleBusiness} applies to every other {@code BAD_REQUEST}. The salon's numbers
      * travel in the typed payload, where they are structured data the client formats, not prose
      * that a future throw site could accidentally widen.
+     *
+     * @deprecated Retired by Phase 312 D3 — {@link ServicePriceShapeMismatchException}'s only
+     *     throw site is gone (Phase 311's V165 makes every batch item's shape representable), so
+     *     this arm is UNREACHABLE in production. Kept wired, not deleted, because Phase 312 Step 0
+     *     found a live mobile consumer of the wire contract (D4); delete alongside the exception
+     *     and its DTOs in the mobile follow-up phase that removes that client branch.
      */
+    @Deprecated
     @ExceptionHandler(ServicePriceShapeMismatchException.class)
     public ResponseEntity<ApiResponse<ServicePriceShapeMismatchResponse>> handleServicePriceShapeMismatch(
             ServicePriceShapeMismatchException ex) {

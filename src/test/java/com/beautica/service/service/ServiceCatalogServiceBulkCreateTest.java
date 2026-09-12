@@ -4,7 +4,6 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.exception.ServicePriceShapeMismatchException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
@@ -41,7 +40,6 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.never;
@@ -821,37 +819,34 @@ class ServiceCatalogServiceBulkCreateTest {
     }
 
     /**
-     * ── Re-audit MEDIUM-1: the reuse branch REJECTS an unrepresentable price shape ──
+     * ── Phase 312 D3 — the reuse branch STORES a differing price shape instead of rejecting it ──
      *
-     * <p>{@code master_services} carries a {@code price_override} (a FLOOR) and a
-     * {@code duration_override_minutes}. It has no per-master price TYPE and no per-master
-     * ceiling. So when a batch item's price shape disagrees with the salon definition it reuses,
-     * there is nowhere faithful for the difference to land, and the old reuse branch — which
-     * returns before {@code applyPriceMode} — silently reshaped it, answering {@code 201} with a
-     * body that did not match the request and shipping a wrong client-facing price:
+     * <p>{@code master_services} used to carry only a {@code price_override} (a FLOOR) and a
+     * {@code duration_override_minutes}, with no per-master price TYPE and no per-master ceiling.
+     * So when a batch item's price shape disagreed with the salon definition it reused, the
+     * Phase 302 re-audit MEDIUM-1 guard ({@code assertReusableShapesAreRepresentable} /
+     * {@code isShapeRepresentableOnAssignment}) rejected the batch with {@code 400
+     * SERVICE_PRICE_SHAPE_MISMATCH} rather than silently reshaping it.
+     *
+     * <p>Phase 311's V165 gives {@code master_services} its own {@code price_type_override} and
+     * {@code price_max_override}, so every shape the item can express is now representable — the
+     * guard is retired (Phase 312 D3) and this branch stores the master's OWN band instead:
      *
      * <pre>
-     *   FIXED 500  definition + RANGE 400–900 item → stored FIXED 400   (band discarded)
-     *   RANGE 400–900 definition + FIXED 600  item → renders 600–900    (ceiling nobody set)
-     *   RANGE 400–900 definition + RANGE 500–800 item → renders 500–900 (ceiling 800 discarded)
+     *   FIXED 500     definition + RANGE 800–1500 item → OWN band RANGE 800–1500 stored
+     *   RANGE 400–900 definition + FIXED 600     item → OWN band FIXED 600 stored
+     *   RANGE 400–900 definition + RANGE 500–800 item → OWN band RANGE 500–800 stored (ceiling KEPT)
      * </pre>
      *
-     * <p>D3 routed diverging price/duration VALUES to the overrides and said NOTHING about shape,
-     * so this was undecided, not an accepted trade-off. The three tests below pin the rejection;
-     * {@link #should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling} and the
-     * FIXED↔FIXED reuse tests above pin that the guard does not over-reject.
-     *
-     * <p><b>This first test is the converted {@code
-     * should_overrideWithRangeFloor_when_reusedItemIsRangePriced}</b> — same fixture (a RANGE
-     * 800–1500 item reusing a FIXED 350.00 definition), which under the fix is row 1 of the table
-     * and therefore a 400 rather than an {@code 800.00} override. It was updated rather than
-     * deleted so the case itself keeps a home; the {@code overridePriceFor} floor coverage it
-     * used to provide moved, intact, to the accept-case sibling below.
+     * <p>The three tests below are the INVERTED {@code should_return400_when_...} cases — same
+     * fixtures, opposite outcome — kept as the same cases (not deleted) per Phase 312's mandate
+     * that Phase 302's rejection tests be inverted, not dropped. The shared definition must stay
+     * byte-identical in every case: reuse never mutates it (Phase 311 D3 unchanged).
      */
     @Test
-    @DisplayName("salon on-behalf — 400 SERVICE_PRICE_SHAPE_MISMATCH when a RANGE item reuses a "
-            + "FIXED salon definition; nothing persisted (re-audit MEDIUM-1)")
-    void should_return400_when_reusedRangeItemMeetsAFixedSalonDefinition() {
+    @DisplayName("salon on-behalf — 201, a RANGE item reusing a FIXED salon definition stores its "
+            + "OWN RANGE band on the assignment (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnBand_when_reusedRangeItemMeetsAFixedSalonDefinition() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID typeId = UUID.randomUUID();
@@ -861,45 +856,45 @@ class ServiceCatalogServiceBulkCreateTest {
         ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
         ServiceDefinition existing = existingSalonDefinition(existingDefId, salonId, type, "350.00", 60);
 
-        // Duration deliberately MATCHES, isolating the shape rejection from the duration override.
+        // Duration deliberately MATCHES, isolating the band assertion from a duration override.
         var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "800.00", "1500.00")));
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
+        stubAssignmentSaveEchoesEntity();
 
-        ServicePriceShapeMismatchException thrown = catchThrowableOfType(
-                () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
-                ServicePriceShapeMismatchException.class);
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
 
-        assertThat(thrown)
-                .as("a band the assignment cannot store must be refused, never flattened to its floor")
-                .isNotNull();
-        assertThat(thrown.getStatus()).isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST);
-        assertThat(thrown.getSalonPriceType())
-                .as("the payload names the SALON's governing shape, so the setup screen can say why")
-                .isEqualTo(PriceType.FIXED);
-        assertThat(thrown.getSalonPriceMin()).isEqualByComparingTo("350.00");
-        assertThat(thrown.getSalonPriceMax())
-                .as("a FIXED salon definition has no ceiling")
-                .isNull();
-        assertThat(thrown.getExistingServiceDefId()).isEqualTo(existingDefId);
-        assertThat(thrown.getServiceName()).isEqualTo("Манікюр");
+        assertThat(result)
+                .as("a band the assignment can now store must be accepted, not rejected")
+                .hasSize(1);
 
-        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
-        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        MasterServiceAssignment saved = msaCaptor.getValue();
+        assertThat(saved.getPriceTypeOverride())
+                .as("the master's OWN shape, independent of the FIXED salon definition")
+                .isEqualTo(PriceType.RANGE);
+        assertThat(saved.getPriceOverride()).isEqualByComparingTo("800.00");
+        assertThat(saved.getPriceMaxOverride()).isEqualByComparingTo("1500.00");
+
         assertThat(existing.getPriceType())
-                .as("and the shared definition is not reshaped on the way out")
+                .as("the shared definition is not reshaped on the way out")
                 .isEqualTo(PriceType.FIXED);
         assertThat(existing.getPriceMax()).isNull();
+        assertThat(existing.getBasePrice()).isEqualByComparingTo("350.00");
+        verify(serviceRepository, never()).save(any(ServiceDefinition.class));
     }
 
-    /** Table row 2 — a FIXED item under a RANGE salon band would advertise a ceiling nobody set. */
+    /** Table row 2 (inverted) — a FIXED item under a RANGE salon band now stores its own FIXED price. */
     @Test
-    @DisplayName("salon on-behalf — 400 SERVICE_PRICE_SHAPE_MISMATCH when a FIXED item reuses a "
-            + "RANGE salon definition; nothing persisted (re-audit MEDIUM-1)")
-    void should_return400_when_reusedFixedItemMeetsARangeSalonDefinition() {
+    @DisplayName("salon on-behalf — 201, a FIXED item reusing a RANGE salon definition stores its "
+            + "OWN FIXED price on the assignment (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnBand_when_reusedFixedItemMeetsARangeSalonDefinition() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID typeId = UUID.randomUUID();
@@ -916,27 +911,34 @@ class ServiceCatalogServiceBulkCreateTest {
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
+        stubAssignmentSaveEchoesEntity();
 
-        ServicePriceShapeMismatchException thrown = catchThrowableOfType(
-                () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
-                ServicePriceShapeMismatchException.class);
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
 
-        assertThat(thrown)
-                .as("600 would have rendered as 600–900: a public ceiling nobody set for this master")
-                .isNotNull();
-        assertThat(thrown.getSalonPriceType()).isEqualTo(PriceType.RANGE);
-        assertThat(thrown.getSalonPriceMin()).isEqualByComparingTo("400.00");
-        assertThat(thrown.getSalonPriceMax()).isEqualByComparingTo("900.00");
+        assertThat(result).hasSize(1);
 
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        MasterServiceAssignment saved = msaCaptor.getValue();
+        assertThat(saved.getPriceTypeOverride())
+                .as("600 renders as a SINGLE price, never 600–900 — a ceiling nobody set")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(saved.getPriceOverride()).isEqualByComparingTo("600.00");
+        assertThat(saved.getPriceMaxOverride()).isNull();
+
+        assertThat(existing.getPriceType()).isEqualTo(PriceType.RANGE);
+        assertThat(existing.getBasePrice()).isEqualByComparingTo("400.00");
+        assertThat(existing.getPriceMax()).isEqualByComparingTo("900.00");
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
-        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
     }
 
-    /** Table row 3 — same mode, diverging ceiling: the submitted 800 has nowhere to be stored. */
+    /** Table row 3 (inverted) — a diverging RANGE ceiling is now the master's own, kept verbatim. */
     @Test
-    @DisplayName("salon on-behalf — 400 SERVICE_PRICE_SHAPE_MISMATCH when a RANGE item's ceiling "
-            + "differs from the salon band; nothing persisted (re-audit MEDIUM-1)")
-    void should_return400_when_reusedRangeItemCeilingDiffersFromTheSalonBand() {
+    @DisplayName("salon on-behalf — 201, a RANGE item whose ceiling differs from the salon band "
+            + "stores its OWN ceiling (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnBand_when_reusedRangeItemCeilingDiffersFromTheSalonBand() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID typeId = UUID.randomUUID();
@@ -947,50 +949,108 @@ class ServiceCatalogServiceBulkCreateTest {
         ServiceDefinition existing =
                 existingSalonRangeDefinition(existingDefId, salonId, type, "400.00", "900.00", 60);
 
-        // Floor 500 is representable (price_override), ceiling 800 is not — only the ceiling
-        // differs, so this is the case a floor-only comparison would wave through.
+        // Floor 500 AND ceiling 800 both diverge from the salon's 400-900 band.
         var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "500.00", "800.00")));
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
         when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
         stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
+        stubAssignmentSaveEchoesEntity();
 
-        ServicePriceShapeMismatchException thrown = catchThrowableOfType(
-                () -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request),
-                ServicePriceShapeMismatchException.class);
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
 
-        assertThat(thrown)
-                .as("500–800 would have rendered as 500–900 — the submitted ceiling silently dropped")
-                .isNotNull();
-        assertThat(thrown.getSalonPriceMax()).isEqualByComparingTo("900.00");
+        assertThat(result).hasSize(1);
 
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        MasterServiceAssignment saved = msaCaptor.getValue();
+        assertThat(saved.getPriceTypeOverride()).isEqualTo(PriceType.RANGE);
+        assertThat(saved.getPriceOverride()).isEqualByComparingTo("500.00");
+        assertThat(saved.getPriceMaxOverride())
+                .as("the SUBMITTED ceiling is kept, not silently replaced by the salon's 900")
+                .isEqualByComparingTo("800.00");
+
+        assertThat(existing.getPriceMax())
+                .as("the shared band's ceiling is untouched")
+                .isEqualByComparingTo("900.00");
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
-        verify(masterServiceRepository, never()).save(any(MasterServiceAssignment.class));
     }
 
     /**
-     * The accept case the guard must not swallow, and the home of the {@code overridePriceFor}
-     * coverage the converted test above used to carry.
+     * The Inherited case: a RANGE item whose FULL band (floor AND ceiling) matches the salon's
+     * writes NO override at all (Phase 311 D2 all-or-nothing) — the assignment keeps tracking the
+     * shared definition rather than freezing a redundant copy of its own values.
      *
-     * <p>{@code overridePriceFor} sources the item's floor from {@code priceMin} for a RANGE item
-     * and from {@code price} for a FIXED one, because Bean Validation makes the OTHER field null
-     * in each mode. Every OTHER reuse test in this class submits a FIXED item, so all of them stay
-     * green if that ternary is flattened to {@code item.price()}: a RANGE item would then yield a
-     * null floor, write NO override, and silently price this master at the salon definition's own
-     * base price — a real, unnoticed money bug on the exact path Phase 302 introduces. This test
-     * is the only thing standing in the way of that mutant.
-     *
-     * <p>The ceiling MATCHES the salon band (1500.00 both sides), which is precisely why the item
-     * is representable: everything it declares beyond its floor is already what the definition
-     * says, so the floor alone reconstructs it faithfully. The ceiling still must not be written
-     * onto the SHARED definition — that would be the D3 violation with the widest blast radius,
-     * repricing the band for every other master in the salon.
+     * <p>Renamed from {@code should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling}:
+     * that test's fixture had a DIVERGING floor (800 vs 350) and a matching ceiling (1500), which
+     * under Phase 311 D2's all-or-nothing rule is an OWN band (any divergence in the triple means
+     * the whole triple is written), not a floor-only override — see
+     * {@link #should_storeOwnBand_when_reusedRangeItemFloorDivergesButCeilingMatches} below, which
+     * carries that fixture forward. This test instead proves the genuinely-matching case stays
+     * Inherited, which is what the {@code overridePriceFor} floor-comparison logic it inherited
+     * from used to guard.
      */
     @Test
-    @DisplayName("salon on-behalf — a RANGE item whose ceiling MATCHES the salon band is accepted "
-            + "and overrides with its priceMin floor (D3)")
-    void should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling() {
+    @DisplayName("salon on-behalf — a RANGE item whose full band MATCHES the salon's stays "
+            + "Inherited (no override written at all)")
+    void should_stayInherited_when_reusedRangeItemFullyMatchesTheSalonBand() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID typeId = UUID.randomUUID();
+        UUID existingDefId = UUID.randomUUID();
+
+        Master master = salonMaster(masterId, salonId);
+        ServiceType type = serviceType(typeId, "Манікюр", "NAIL_SERVICE", true);
+        ServiceDefinition existing =
+                existingSalonRangeDefinition(existingDefId, salonId, type, "350.00", "1500.00", 60);
+
+        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "350.00", "1500.00")));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
+        when(platformCategoryRepository.findSelectableNamesIn(any())).thenReturn(List.of("NAIL_SERVICE"));
+        stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
+        stubAssignmentSaveEchoesEntity();
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+
+        assertThat(result).hasSize(1);
+
+        ArgumentCaptor<MasterServiceAssignment> msaCaptor =
+                ArgumentCaptor.forClass(MasterServiceAssignment.class);
+        verify(masterServiceRepository).save(msaCaptor.capture());
+        MasterServiceAssignment saved = msaCaptor.getValue();
+        assertThat(saved.getPriceTypeOverride())
+                .as("a fully-matching band needs no override — Inherited, tracking the definition")
+                .isNull();
+        assertThat(saved.getPriceOverride()).isNull();
+        assertThat(saved.getPriceMaxOverride()).isNull();
+
+        assertThat(result.get(0).effectivePrice())
+                .as("effective price still resolves off the (matching) shared definition")
+                .isEqualByComparingTo("350.00");
+    }
+
+    /**
+     * The accept case whose floor DIVERGES (so it must write an own band even though its ceiling
+     * happens to equal the salon's) — carries forward the fixture and floor-sourcing coverage from
+     * the pre-312 {@code should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling}.
+     *
+     * <p>{@code resolveBulkReuseBand} sources the item's floor from {@code priceMin} for a RANGE
+     * item and from {@code price} for a FIXED one, because Bean Validation makes the OTHER field
+     * null in each mode. Every OTHER reuse test in this class submits a FIXED item, so all of them
+     * stay green if that ternary is flattened to {@code item.price()}: a RANGE item would then
+     * yield a null floor and either NPE or silently price this master at the salon definition's
+     * own base price. This test is the only thing standing in the way of that mutant.
+     */
+    @Test
+    @DisplayName("salon on-behalf — a RANGE item whose floor diverges but ceiling MATCHES the "
+            + "salon band still stores a full OWN band (Phase 311 D2 all-or-nothing)")
+    void should_storeOwnBand_when_reusedRangeItemFloorDivergesButCeilingMatches() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID typeId = UUID.randomUUID();
@@ -1017,11 +1077,17 @@ class ServiceCatalogServiceBulkCreateTest {
         ArgumentCaptor<MasterServiceAssignment> msaCaptor =
                 ArgumentCaptor.forClass(MasterServiceAssignment.class);
         verify(masterServiceRepository).save(msaCaptor.capture());
-        assertThat(msaCaptor.getValue().getPriceOverride())
+        MasterServiceAssignment saved = msaCaptor.getValue();
+        assertThat(saved.getPriceTypeOverride())
+                .as("floor diverges, so D2's all-or-nothing rule writes the WHOLE triple, even "
+                        + "though the ceiling happens to equal the salon's")
+                .isEqualTo(PriceType.RANGE);
+        assertThat(saved.getPriceOverride())
                 .as("a RANGE item's floor is priceMin — reading the (null) FIXED price field would "
                         + "drop the override and price this master at the salon's 350.00")
                 .isEqualByComparingTo("800.00");
-        assertThat(msaCaptor.getValue().getDurationOverrideMinutes())
+        assertThat(saved.getPriceMaxOverride()).isEqualByComparingTo("1500.00");
+        assertThat(saved.getDurationOverrideMinutes())
                 .as("the duration matched the definition, so no duration override is manufactured")
                 .isNull();
 
@@ -1036,27 +1102,22 @@ class ServiceCatalogServiceBulkCreateTest {
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
 
         assertThat(result.get(0).effectivePrice())
-                .as("the override is what the master's menu actually charges — "
-                        + "COALESCE(priceOverride, base_price)")
+                .as("the override is what the master's menu actually charges — the resolved band's "
+                        + "own floor")
                 .isEqualByComparingTo("800.00");
     }
 
     /**
-     * The guard must not fire on a scale difference: {@code 1500} and {@code 1500.00} are the same
-     * money. Compared with {@code equals} instead of {@code compareTo}, this identical band would
-     * 400 — an over-rejection that no other test in this class would notice.
-     *
-     * <p>Acceptance is only half the contract, so this test also pins WHAT was accepted. The
-     * sibling {@link #should_overrideWithRangeFloor_when_reusedRangeItemMatchesTheSalonCeiling}
-     * cannot cover either assertion below: its fixture submits a ceiling of the SAME scale as the
-     * definition, so a mutant that copies the item's ceiling onto the shared definition is
-     * invisible there — and invisible to {@code isEqualByComparingTo} anywhere. Only a scale-only
-     * fixture, compared on the STORED representation, can see that write.
+     * The guard's compareTo-not-equals property, re-targeted at the Inherited decision now that
+     * there is no rejection to over-trigger: {@code 1500} and {@code 1500.00} are the same money,
+     * and a scale-only difference must still resolve to Inherited, not a spuriously-written own
+     * band. Compared with {@code equals} instead of {@code compareTo}, this identical band would
+     * be misread as diverging and would needlessly freeze a copy of the salon's own numbers.
      */
     @Test
-    @DisplayName("salon on-behalf — a RANGE ceiling differing only in SCALE is accepted (compareTo, "
-            + "not equals)")
-    void should_acceptReuse_when_rangeCeilingDiffersOnlyInScale() {
+    @DisplayName("salon on-behalf — a RANGE band matching the salon's only in SCALE (1500 vs "
+            + "1500.00) still resolves to Inherited (compareTo, not equals)")
+    void should_stayInherited_when_reusedRangeItemMatchesOnlyInScale() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID typeId = UUID.randomUUID();
@@ -1067,7 +1128,7 @@ class ServiceCatalogServiceBulkCreateTest {
         ServiceDefinition existing =
                 existingSalonRangeDefinition(existingDefId, salonId, type, "350.00", "1500.00", 60);
 
-        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "800", "1500")));
+        var request = new BulkCreateServicesRequest(List.of(rangeItem(typeId, 60, "350", "1500")));
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceTypeRepository.findAllById(anyList())).thenReturn(List.of(type));
@@ -1079,24 +1140,24 @@ class ServiceCatalogServiceBulkCreateTest {
                 serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
 
         assertThat(result)
-                .as("1500 and 1500.00 are the same band — the shape guard must use compareTo")
+                .as("1500 and 1500.00 are the same band — must not be misread as diverging")
                 .hasSize(1);
 
         ArgumentCaptor<MasterServiceAssignment> msaCaptor =
                 ArgumentCaptor.forClass(MasterServiceAssignment.class);
         verify(masterServiceRepository).save(msaCaptor.capture());
-        assertThat(msaCaptor.getValue().getPriceOverride())
-                .as("the SUBMITTED floor is what reaches price_override — waving the band through "
-                        + "and then pricing this master at the definition's own 350.00 is an "
-                        + "acceptance that persisted the wrong money")
-                .isEqualByComparingTo("800");
+        MasterServiceAssignment saved = msaCaptor.getValue();
+        assertThat(saved.getPriceTypeOverride())
+                .as("a scale-only difference must still resolve to Inherited, via compareTo")
+                .isNull();
+        assertThat(saved.getPriceOverride()).isNull();
+        assertThat(saved.getPriceMaxOverride()).isNull();
 
         assertThat(existing.getPriceMax().toPlainString())
-                .as("the shared ceiling keeps the SALON's stored value verbatim: a scale-only "
-                        + "difference is accepted by COMPARING, never by copying the item's 1500 "
-                        + "over the definition's 1500.00 — a rewrite compareTo could never see")
+                .as("the shared definition keeps its own stored scale verbatim — untouched either way")
                 .isEqualTo("1500.00");
     }
+
 
     // ── Additive: no "first-time only" precondition ────────────────────────────
 

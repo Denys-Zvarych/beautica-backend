@@ -122,9 +122,15 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
                 .as("D1 — priceOverride must be present and unmasked")
                 .isNotNull()
                 .isEqualByComparingTo("300.00");
+        // Phase 311 D9 changed priceMin's resolution to COALESCE(override, base_price), so for a
+        // FIXED own band priceMin now legitimately EQUALS priceOverride (300.00) — comparing
+        // against priceMin here would no longer prove anything about masking. Compare against the
+        // DEFINITION's own base_price (500.00, ServiceTestFixtures' default) instead, which is
+        // what "override must differ from base_price" actually means.
         assertThat(services.get(0).priceOverride())
-                .as("override must differ from base_price so masking could not pass unnoticed")
-                .isNotEqualByComparingTo(services.get(0).priceMin());
+                .as("override must differ from the definition's own base_price so masking could "
+                        + "not pass unnoticed")
+                .isNotEqualByComparingTo(new BigDecimal("500.00"));
     }
 
     // ── Case 2 — ADMIN parity (phase 306) ───────────────────────────────────────────────────────
@@ -450,7 +456,7 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
         var ownMaster = fixtures.createSalonMasterWithRowAndGetToken(
                 salonId, "own-310-d5a-" + System.nanoTime() + "@beautica.test");
         UUID definitionId = fixtures.createServiceDefinition(ownerToken, salonId, "Phase 310 D5a Service");
-        var request = new AssignServiceToMasterRequest(definitionId, null, null);
+        var request = new AssignServiceToMasterRequest(definitionId, null, null, null, null);
 
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + ownMaster.masterId() + "/services",
@@ -511,7 +517,10 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
     private MasterServiceResponse assignWithOverride(
             String ownerToken, UUID salonId, UUID masterId, UUID serviceDefId, BigDecimal priceOverride)
             throws Exception {
-        var request = new AssignServiceToMasterRequest(serviceDefId, priceOverride, null);
+        // Phase 312 D1 — a non-null floor now requires a shape; every caller here assigns
+        // against a FIXED definition (ServiceTestFixtures.createServiceDefinition's default).
+        var request = new AssignServiceToMasterRequest(
+                serviceDefId, priceOverride != null ? PriceType.FIXED : null, priceOverride, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(ownerToken)), String.class);

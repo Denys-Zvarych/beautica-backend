@@ -509,7 +509,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(Optional.empty());
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
                 salonId, masterId, request);
@@ -578,7 +578,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(Optional.empty());
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
                 salonId, masterId, request);
@@ -614,7 +614,7 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -645,7 +645,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -685,7 +685,7 @@ class ServiceCatalogServiceTest {
         when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
                 .thenReturn(Optional.of(activeAssignment));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -726,7 +726,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -774,7 +774,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -812,7 +812,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -1344,9 +1344,14 @@ class ServiceCatalogServiceTest {
         assertThat(result.get(0).priceOverride())
                 .as("D1 — the management read must return priceOverride unmasked, unlike fromPublic")
                 .isEqualByComparingTo(override);
+        // Phase 311 D9 changed priceMin's resolution to COALESCE(override, base_price), so for a
+        // FIXED own band priceMin now legitimately EQUALS priceOverride — comparing against
+        // priceMin no longer proves anything about masking. Compare against the DEFINITION's own
+        // base_price directly instead.
         assertThat(result.get(0).priceOverride())
-                .as("override must differ from base_price so masking could not pass unnoticed")
-                .isNotEqualByComparingTo(result.get(0).priceMin());
+                .as("override must differ from the definition's own base_price so masking could "
+                        + "not pass unnoticed")
+                .isNotEqualByComparingTo(serviceDef.getBasePrice());
         verify(authz).hasManagementAccess(salonId, actorId);
         verify(masterRepository).existsByIdAndSalonId(masterId, salonId);
     }

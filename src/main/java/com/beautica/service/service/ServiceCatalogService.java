@@ -5,7 +5,6 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
-import com.beautica.common.exception.ServicePriceShapeMismatchException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
@@ -15,13 +14,16 @@ import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.dto.MasterServiceBand;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.ServicePricing;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
+import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -208,16 +210,25 @@ public class ServiceCatalogService {
             // body, same data.code == DUPLICATE_SERVICE. No parallel mechanism.
             throw new DuplicateServiceException(serviceDef.getName(), serviceDef.getId());
         } else if (existingAssignment.isPresent()) {
+            // Phase 312 D1/D2 — the request's own @AssertTrue (MasterServiceBand.isLegal) has
+            // already refused a partial or incoherent band before this method runs; write the
+            // complete triple together so a reactivated row can never carry a bare
+            // price_override, which V165's chk_master_service_price_mode would refuse at flush
+            // (the 311/312 merge-unit hazard).
             MasterServiceAssignment existing = existingAssignment.get();
             existing.setActive(true);
+            existing.setPriceTypeOverride(request.priceType());
             existing.setPriceOverride(request.priceOverride());
+            existing.setPriceMaxOverride(request.priceMax());
             existing.setDurationOverrideMinutes(request.durationOverrideMinutes());
             saved = existing;
         } else {
             MasterServiceAssignment assignment = MasterServiceAssignment.builder()
                     .master(master)
                     .serviceDefinition(serviceDef)
+                    .priceTypeOverride(request.priceType())
                     .priceOverride(request.priceOverride())
+                    .priceMaxOverride(request.priceMax())
                     .durationOverrideMinutes(request.durationOverrideMinutes())
                     .isActive(true)
                     .build();
@@ -237,6 +248,135 @@ public class ServiceCatalogService {
         evictSalonCatalogAfterCommit(salonId);
 
         return MasterServiceResponse.from(saved);
+    }
+
+    /**
+     * Edits ONE master's OWN price band and/or duration override on ONE assignment (Phase 311) —
+     * the only {@code PATCH}/{@code PUT} anywhere on {@code master_services}. Mirrors the
+     * assign/unassign pair's URL and lookup: same natural key {@code (masterId, serviceDefId)},
+     * same {@link MasterServiceRepository#findByMasterIdAndServiceDefinitionId} finder, same
+     * ownership re-checks as {@link #assignServiceToMaster} (D1 — no new repository method).
+     *
+     * <p><b>D2 — all-or-nothing.</b> {@code request}'s bean validation (its {@code @AssertTrue}
+     * methods, calling {@link MasterServiceBand#isLegal}) has already refused a partial or
+     * incoherent band before this method runs; this method only decides WHICH of the three
+     * mutually-exclusive shapes the request represents:
+     * <ul>
+     *   <li>{@code clearBand = true} — reverts to Inherited: all three band columns NULL.</li>
+     *   <li>Any of {@code priceType}/{@code price}/{@code priceMax} present — the master's own,
+     *       already-validated band; all three columns are written together.</li>
+     *   <li>Neither — the band is left byte-for-byte untouched (D4's "null means unchanged").</li>
+     * </ul>
+     * {@code durationOverrideMinutes}/{@code clearDurationOverride} are resolved independently
+     * (D2 — duration carries no shape and no ceiling).
+     *
+     * <p><b>D5 — service-layer defense-in-depth.</b> {@link AuthorizationService
+     * #enforceCanEditMasterServiceBand} re-proves the controller's {@code @PreAuthorize} grant
+     * before anything is loaded, exactly as {@link #assignServiceToMaster}'s own
+     * {@code masterBelongsToSalon} re-check and {@link #deactivateServiceDefinition}'s
+     * {@code enforceCanManageServiceDefinition} never trust the SpEL gate alone.
+     *
+     * <p><b>D10 — bookings are never touched, and never block.</b> Unlike
+     * {@link #unassignServiceFromMaster}, there is no future-{@code CONFIRMED}-booking guard: a
+     * booking's frozen {@code priceAtBooking}/{@code priceMaxAtBooking} are snapshots the locked
+     * product decision forbids re-deriving, so an existing booking is simply irrelevant to this
+     * write.
+     *
+     * <p><b>D11 — eviction is conditional, not blanket.</b> {@code masterServices} and
+     * {@code salon-service-catalog} evict unconditionally (any band or duration change can move
+     * what those caches serve); {@code available-slots}/bookable-verdict evicts ONLY when the
+     * duration actually changed (a band-only edit does not feed slot maths); and
+     * {@code masters.min_effective_price} refreshes ONLY when the resolved floor actually changed
+     * (a RANGE ceiling moving alone does not). Both conditionals compare the RESOLVED value
+     * before/after, not merely "was a field present in the request" — a request that happens to
+     * restate the current value must not trigger a needless sweep.
+     *
+     * @throws NotFoundException  if no ACTIVE assignment exists for {@code (masterId, serviceDefId)}
+     * @throws ForbiddenException if the actor cannot manage {@code salonId} and is not the
+     *                            {@code SALON_MASTER} of {@code masterId}
+     */
+    @Transactional
+    public MasterServiceResponse updateMasterServiceBand(
+            UUID actorId,
+            UUID salonId,
+            UUID masterId,
+            UUID serviceDefId,
+            UpdateMasterServiceBandRequest request) {
+
+        // D5 defense-in-depth — re-prove the SpEL gate before loading anything (mirrors
+        // deactivateServiceDefinition's enforceCanManageServiceDefinition idiom; actorId is
+        // resolved by the controller via AuthenticationUtils.userId, same as that method).
+        authz.enforceCanEditMasterServiceBand(actorId, salonId, masterId);
+
+        MasterServiceAssignment assignment = masterServiceRepository
+                .findByMasterIdAndServiceDefinitionId(masterId, serviceDefId)
+                .filter(MasterServiceAssignment::isActive)
+                .orElseThrow(() -> new NotFoundException(
+                        "No active assignment for master " + masterId + " and service " + serviceDefId));
+
+        Master master = assignment.getMaster();
+        if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        ServiceDefinition serviceDef = assignment.getServiceDefinition();
+        if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
+            throw new ForbiddenException("Service definition does not belong to this salon");
+        }
+
+        // D11 — capture the RESOLVED floor/duration before mutating, so the eviction/refresh
+        // conditionals below compare actual values, not merely "was a field present".
+        BigDecimal floorBefore = ServicePricing.effectivePriceOf(assignment);
+        Integer durationBefore = assignment.getDurationOverrideMinutes();
+
+        boolean bandFieldsPresent = request.priceType() != null
+                || request.price() != null
+                || request.priceMax() != null;
+        if (Boolean.TRUE.equals(request.clearBand())) {
+            // D2 — revert to Inherited: all three columns NULL, tracking the definition again.
+            assignment.setPriceTypeOverride(null);
+            assignment.setPriceOverride(null);
+            assignment.setPriceMaxOverride(null);
+        } else if (bandFieldsPresent) {
+            // Already proven legal by the request's own bean validation (MasterServiceBand
+            // .isLegal, via its @AssertTrue methods) — write the complete, own band atomically.
+            assignment.setPriceTypeOverride(request.priceType());
+            assignment.setPriceOverride(request.price());
+            assignment.setPriceMaxOverride(request.priceMax());
+        }
+        // else: band untouched (D4 — null means "leave unchanged").
+
+        if (Boolean.TRUE.equals(request.clearDurationOverride())) {
+            assignment.setDurationOverrideMinutes(null);
+        } else if (request.durationOverrideMinutes() != null) {
+            assignment.setDurationOverrideMinutes(request.durationOverrideMinutes());
+        }
+        // else: duration untouched.
+
+        BigDecimal floorAfter = ServicePricing.effectivePriceOf(assignment);
+        Integer durationAfter = assignment.getDurationOverrideMinutes();
+
+        // D11 — always: the band or duration may have changed what these caches serve.
+        evictMasterServicesCache(List.of(masterId));
+        evictSalonCatalogAfterCommit(salonId);
+        // D11 — conditional: duration feeds slot maths, a band-only change does not.
+        if (!Objects.equals(durationBefore, durationAfter)) {
+            evictBookableFutureSlotsCache(List.of(masterId));
+        }
+        // D11 — conditional: min_effective_price is keyed off the floor alone; a RANGE ceiling
+        // moving without the floor moving does not require a refresh.
+        if (bigDecimalChanged(floorBefore, floorAfter)) {
+            masterRepository.refreshMinEffectivePrice(masterId);
+        }
+
+        return MasterServiceResponse.from(assignment);
+    }
+
+    /** Null-safe, scale-insensitive BigDecimal inequality — {@code compareTo}, never {@code equals}. */
+    private static boolean bigDecimalChanged(BigDecimal before, BigDecimal after) {
+        if (before == null || after == null) {
+            return !Objects.equals(before, after);
+        }
+        return before.compareTo(after) != 0;
     }
 
     /**
@@ -534,17 +674,19 @@ public class ServiceCatalogService {
      * <p><b>Reuse never mutates the shared definition (D3).</b> Name, base price, duration and
      * category on a reused definition are salon-level facts shared by every master performing it;
      * rewriting them from one master's batch item would silently change what the whole salon
-     * offers. Per-master divergence goes where it already belongs —
-     * {@code master_services.price_override} / {@code master_services.duration_override_minutes} —
-     * and is left {@code NULL} when the item matches the definition.
+     * offers. Per-master divergence goes where it already belongs — the {@code master_services}
+     * band ({@code price_type_override} / {@code price_override} / {@code price_max_override},
+     * Phase 311) and {@code duration_override_minutes} — and is left {@code NULL} (Inherited)
+     * when the item's full band matches the definition's.
      *
-     * <p><b>Shape divergence is rejected, not reshaped (re-audit MEDIUM-1).</b> Those two override
-     * columns are a floor and a duration; there is no per-master price TYPE and no per-master
-     * ceiling. D3 routed diverging price/duration VALUES to them and said nothing about shape, so
-     * a batch item whose price type or RANGE ceiling disagrees with the reused definition had
-     * nowhere faithful to land and was silently stored as something else. It now 400s with
-     * {@code SERVICE_PRICE_SHAPE_MISMATCH} naming the salon's governing shape — see
-     * {@link #assertReusableShapesAreRepresentable}.
+     * <p><b>Shape divergence is STORED, not rejected (Phase 312 — supersedes the re-audit
+     * MEDIUM-1 guard this javadoc used to describe).</b> Before V165, {@code master_services} had
+     * only a floor and a duration — no per-master price TYPE and no per-master ceiling — so a
+     * batch item whose price type or RANGE ceiling disagreed with the reused definition had
+     * nowhere faithful to land and was rejected with {@code 400 SERVICE_PRICE_SHAPE_MISMATCH}.
+     * Phase 311's {@code price_type_override}/{@code price_max_override} columns make every
+     * shape representable, so Phase 312 retires that guard: see
+     * {@link #resolveBulkReuseBand}, which now stores the item's own band instead.
      *
      * <p><b>The conflict is per-MASTER on the SALON branch (D4).</b> "The salon already offers
      * this type" is the reuse path, not a conflict; {@code 409 DUPLICATE_SERVICE} fires only when
@@ -788,19 +930,20 @@ public class ServiceCatalogService {
      * O(0) queries — see {@link #assertNoActiveDuplicatesInBatch}. Nothing is flushed here;
      * the caller flushes the batch once.
      *
-     * <p><b>Reuse branch (Phase 302 D2/D3).</b> When {@code reusable} is non-null the salon
-     * already has an ACTIVE definition for this service type, so ONLY the assignment is
-     * inserted — creating a second definition would violate V121's
-     * {@code ux_service_def_owner_service_type_active}. The reused definition is left
-     * byte-identical; the item's own price/duration land on the assignment as overrides when they
-     * differ from it, and as {@code NULL} when they match.
+     * <p><b>Reuse branch (Phase 302 D2/D3, band resolution Phase 312 D3/D9).</b> When
+     * {@code reusable} is non-null the salon already has an ACTIVE definition for this service
+     * type, so ONLY the assignment is inserted — creating a second definition would violate
+     * V121's {@code ux_service_def_owner_service_type_active}. The reused definition is left
+     * byte-identical; {@link #resolveBulkReuseBand} decides whether the item's band matches the
+     * reused definition's (Inherited — all three {@code master_services} band columns
+     * {@code NULL}) or must be stored as the master's own, fully-specified band. Duration follows
+     * its own, independent "override when it differs" rule via {@link #overrideDurationFor}
+     * (Phase 311 D2 — duration carries no shape and no ceiling).
      *
-     * <p>Only a REPRESENTABLE shape reaches here: {@code assertReusableShapesAreRepresentable} has
-     * already 400'd any item whose price type differs from the reused definition's, or whose RANGE
-     * ceiling differs from it — {@code master_services} can carry a floor and nothing else, so
-     * such an item could only be persisted as something other than what was submitted
-     * (re-audit MEDIUM-1). That is why this branch can return before {@code applyPriceMode}
-     * without losing information.
+     * <p>Since V165 (Phase 311) every shape the item can express is representable on the
+     * assignment — the superseded Phase 302 guard that used to reject a differing shape
+     * ({@code assertReusableShapesAreRepresentable} / {@code isShapeRepresentableOnAssignment})
+     * is retired (Phase 312 D3); this branch now STORES a differing shape instead of 400ing it.
      *
      * <p><b>Reactivation sub-branch (Phase 307 D6).</b> When {@code reactivateAssignmentId} is
      * ALSO non-null, the master holds an {@code is_active = false} row for the reused definition —
@@ -834,15 +977,21 @@ public class ServiceCatalogService {
                 // already hydrated by findSalonBulkSetupCandidates in this transaction.
                 existing.setServiceDefinition(reusable);
                 existing.setActive(true);
-                existing.setPriceOverride(overridePriceFor(item, reusable));
+                ResolvedBand band = resolveBulkReuseBand(item, reusable);
+                existing.setPriceTypeOverride(band.priceType());
+                existing.setPriceOverride(band.price());
+                existing.setPriceMaxOverride(band.priceMax());
                 existing.setDurationOverrideMinutes(overrideDurationFor(item, reusable));
                 return MasterServiceResponse.from(existing);
             }
 
+            ResolvedBand band = resolveBulkReuseBand(item, reusable);
             MasterServiceAssignment reuseAssignment = MasterServiceAssignment.builder()
                     .master(master)
                     .serviceDefinition(reusable)
-                    .priceOverride(overridePriceFor(item, reusable))
+                    .priceTypeOverride(band.priceType())
+                    .priceOverride(band.price())
+                    .priceMaxOverride(band.priceMax())
                     .durationOverrideMinutes(overrideDurationFor(item, reusable))
                     .isActive(true)
                     .build();
@@ -1839,7 +1988,6 @@ public class ServiceCatalogService {
 
         assertMasterDoesNotAlreadyOffer(candidates, items, typesById);
         Map<UUID, ServiceDefinition> reusableByTypeId = reusableSalonDefinitions(candidates);
-        assertReusableShapesAreRepresentable(items, reusableByTypeId, typesById);
         Map<UUID, UUID> reactivateAssignmentIdByTypeId = reactivatableAssignmentIdByTypeId(candidates);
         return new SalonBulkCandidateResolution(reusableByTypeId, reactivateAssignmentIdByTypeId);
     }
@@ -1876,87 +2024,100 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Phase 302 D3 — rejects a reused item whose price SHAPE the assignment cannot carry, instead
-     * of silently reshaping it (phase-302 re-audit MEDIUM-1).
-     *
-     * <p><b>The gap this closes.</b> The reuse branch writes only a {@code price_override} — a
-     * FLOOR. {@code master_services} has no per-master ceiling column and no per-master price
-     * type, so an item whose shape disagrees with the reused definition used to be persisted as
-     * something the caller never submitted, and the endpoint answered {@code 201} with a body
-     * that did not match the request:
+     * Phase 312 D3/D9 — resolves the FULL per-master band a reused item writes onto
+     * {@code master_services}, superseding the Phase 302 guard that used to REJECT a shape
+     * differing from the reused definition's ({@code assertReusableShapesAreRepresentable} /
+     * {@code isShapeRepresentableOnAssignment}, retired). V165 (Phase 311) gives
+     * {@code master_services} its own shape and ceiling, so every shape the item can express is
+     * now representable — the reuse branch stores it instead of discarding it:
      * <ul>
-     *   <li>{@code FIXED 500} definition + {@code RANGE 400–900} item → stored {@code FIXED 400},
-     *       the master's band discarded.</li>
-     *   <li>{@code RANGE 400–900} definition + {@code FIXED 600} item → rendered
-     *       {@code 600–900}, a public ceiling nobody set for this master.</li>
-     *   <li>{@code RANGE 400–900} definition + {@code RANGE 500–800} item → rendered
-     *       {@code 500–900}, the submitted ceiling 800 discarded.</li>
+     *   <li>{@code FIXED 500} definition + {@code RANGE 400–900} item → the master's OWN
+     *       {@code RANGE 400–900} band is stored (previously flattened to {@code FIXED 400}).</li>
+     *   <li>{@code RANGE 400–900} definition + {@code FIXED 600} item → the master's OWN
+     *       {@code FIXED 600} is stored (previously rendered {@code 600–900}, a ceiling nobody
+     *       set).</li>
+     *   <li>{@code RANGE 400–900} definition + {@code RANGE 500–800} item → the master's OWN
+     *       ceiling {@code 800} is stored (previously discarded in favour of the salon's 900).</li>
      * </ul>
-     * D3 decided that price/duration <em>values</em> live on the overrides; it said nothing about
-     * shape, so this was undecided rather than an accepted trade-off. The divergence reached
-     * client-facing prices, so the endpoint refuses it.
      *
-     * <p><b>Accepts everything representable</b>, so the guard cannot over-reject: FIXED against
-     * FIXED at ANY amount (the floor rides on {@code price_override}), and RANGE against RANGE
-     * whose ceiling matches (the floor rides on {@code price_override} exactly as before).
+     * <p><b>Inherited when the item's band matches the reused definition's, own band otherwise
+     * (Phase 311 D2 — all-or-nothing).</b> An item whose type, floor AND (for RANGE) ceiling all
+     * equal the reused definition's needs no override at all: leaving the three columns
+     * {@code NULL} means this assignment keeps tracking the shared definition, exactly as a plain
+     * FIXED-against-FIXED reuse always has. Any other item is stored as a complete, independent
+     * band — never a partial one, which {@link MasterServiceBand#isLegal} guards as
+     * defense-in-depth (D2's one-truth-table property, Phase 312's whole point: this is the SAME
+     * validator {@code updateMasterServiceBand} and {@link #assignServiceToMaster} defer to, not
+     * a second copy of the comparisons).
      *
-     * <p>Rejecting is safe: the reuse branch is new in Phase 302 and has never shipped, so a 400
-     * here breaks no existing caller.
+     * <p>The floor/ceiling comparison uses {@code compareTo}, never {@code equals}: {@code 900}
+     * and {@code 900.00} are the same money and must not be read as a diverging band.
      *
-     * <p>Pure in-memory — the definitions were already loaded by
-     * {@link ServiceRepository#findSalonBulkSetupCandidates} in this transaction, so the guard
-     * adds no round-trip inside the salon-wide serialized window. Reports the FIRST offending
-     * item in <em>request</em> order, for the same determinism reason as
-     * {@link #assertMasterDoesNotAlreadyOffer}.
+     * <p>Pure in-memory — {@code reused} was already loaded by
+     * {@link ServiceRepository#findSalonBulkSetupCandidates} in this transaction, so this adds no
+     * round-trip inside the salon-wide serialized window.
      *
-     * @throws ServicePriceShapeMismatchException (400) naming the salon's governing shape
+     * @param item   the batch item being written; already internally coherent — {@code @Valid}'s
+     *               {@code @ServicePriceValid} on {@link BulkServiceItemRequest} guarantees a
+     *               FIXED item carries only {@code price} and a RANGE item carries a STRICTLY
+     *               increasing {@code priceMin < priceMax} pair — {@code ServicePriceValidator}
+     *               rejects {@code priceMax == priceMin} — before this method ever runs
+     * @param reused the salon's existing active definition this item reuses
+     * @return the triple to write onto the new/reactivated {@link MasterServiceAssignment}; all
+     *         three {@code null} for Inherited, or all three populated for an own band
      */
-    private static void assertReusableShapesAreRepresentable(
-            List<BulkServiceItemRequest> items,
-            Map<UUID, ServiceDefinition> reusableByTypeId,
-            Map<UUID, ServiceType> typesById) {
-
-        if (reusableByTypeId.isEmpty()) {
-            return;
+    private static ResolvedBand resolveBulkReuseBand(BulkServiceItemRequest item, ServiceDefinition reused) {
+        if (bulkItemBandMatchesDefinition(item, reused)) {
+            return ResolvedBand.INHERITED;
         }
 
-        for (BulkServiceItemRequest item : items) {
-            ServiceDefinition reused = reusableByTypeId.get(item.serviceTypeId());
-            if (reused == null || isShapeRepresentableOnAssignment(item, reused)) {
-                continue;
-            }
-            ServiceType type = typesById.get(item.serviceTypeId());
-            throw new ServicePriceShapeMismatchException(
-                    type != null ? type.getNameUk() : null,
-                    reused.getId(),
-                    reused.getPriceType(),
-                    reused.getBasePrice(),
-                    reused.getPriceMax());
+        BigDecimal floor = item.priceType() == PriceType.FIXED ? item.price() : item.priceMin();
+        BigDecimal ceiling = item.priceType() == PriceType.RANGE ? item.priceMax() : null;
+
+        // Assertion, not a guard — and no longer a vacuous one. @ServicePriceValid on
+        // BulkServiceItemRequest and MasterServiceBand.isLegal now agree on the strict (>)
+        // floor/ceiling comparison (Phase 312 D8), so this fires only if the two truth tables
+        // genuinely drift, or if the field translation above (definition-shaped priceMin/priceMax
+        // → band-shaped price/priceMax) stops being faithful. Either is a bug, not a bad request,
+        // hence IllegalStateException rather than a 400.
+        if (!MasterServiceBand.isLegal(item.priceType(), floor, ceiling)) {
+            throw new IllegalStateException(
+                    "Bulk item band failed the MasterServiceBand invariant after passing "
+                            + "@ServicePriceValid — validator drift: " + item);
         }
+        return new ResolvedBand(item.priceType(), floor, ceiling);
     }
 
     /**
-     * True iff {@code item}'s price shape survives the reuse write unchanged — i.e. everything the
-     * item declares beyond its floor is already what the reused definition says.
-     *
-     * <p>The ceiling is compared with {@code compareTo}, never {@code equals}: {@code 900} and
-     * {@code 900.00} are the same money and must not be read as a diverging band (the same rule
-     * {@link #overridePriceFor} applies to the floor).
+     * True iff {@code item}'s full band (shape, floor, and — for RANGE — ceiling) is
+     * byte-for-byte what {@code reused} already offers, i.e. the assignment needs no override at
+     * all and can stay Inherited (Phase 311 D2).
      */
-    private static boolean isShapeRepresentableOnAssignment(
-            BulkServiceItemRequest item, ServiceDefinition reused) {
-
+    private static boolean bulkItemBandMatchesDefinition(BulkServiceItemRequest item, ServiceDefinition reused) {
         if (item.priceType() != reused.getPriceType()) {
             return false;
         }
+        BigDecimal itemFloor = item.priceType() == PriceType.FIXED ? item.price() : item.priceMin();
+        BigDecimal reusedFloor = reused.getBasePrice();
+        if (itemFloor == null || reusedFloor == null || itemFloor.compareTo(reusedFloor) != 0) {
+            return false;
+        }
         if (item.priceType() != PriceType.RANGE) {
-            // FIXED against FIXED: the amount IS the floor, and price_override carries it.
             return true;
         }
         BigDecimal itemCeiling = item.priceMax();
-        BigDecimal salonCeiling = reused.getPriceMax();
-        return itemCeiling != null && salonCeiling != null
-                && itemCeiling.compareTo(salonCeiling) == 0;
+        BigDecimal reusedCeiling = reused.getPriceMax();
+        return itemCeiling != null && reusedCeiling != null
+                && itemCeiling.compareTo(reusedCeiling) == 0;
+    }
+
+    /**
+     * The band {@link #resolveBulkReuseBand} decides to write onto a reused-definition
+     * assignment: either {@link #INHERITED} (all three {@code master_services} band columns
+     * {@code NULL}) or a fully-specified own band — never partial (Phase 311 D2).
+     */
+    private record ResolvedBand(PriceType priceType, BigDecimal price, BigDecimal priceMax) {
+        private static final ResolvedBand INHERITED = new ResolvedBand(null, null, null);
     }
 
     /**
@@ -2031,39 +2192,6 @@ public class ServiceCatalogService {
             }
         }
         return reusableByTypeId;
-    }
-
-    /**
-     * Phase 302 D3 — the {@code master_services.price_override} for a reused definition: the batch
-     * item's own floor when it differs from the salon definition's {@code base_price}, else
-     * {@code null}.
-     *
-     * <p>The item's floor is its FIXED {@code price} or its RANGE {@code priceMin} — the same
-     * canonical floor {@link #applyPriceMode} writes to {@code base_price}, so the two sides of
-     * the comparison are the same quantity. Compared with {@code compareTo}, never
-     * {@code equals}: {@code 500} and {@code 500.00} are the same money and must not produce a
-     * spurious override row.
-     *
-     * <p>Only the floor is overridable — {@code master_services} has no per-master RANGE ceiling
-     * column, so a reusing master inherits the salon definition's band shape. Diverging the band
-     * itself is a salon-level edit, not a per-master one.
-     *
-     * <p><b>Never silently reshapes.</b> An item that would need more than a floor to be stored
-     * faithfully never reaches this method — {@code assertReusableShapesAreRepresentable} 400s it
-     * upstream (re-audit MEDIUM-1). So "the item's floor" here is always the whole of what the
-     * item added to the salon's shape, not a lossy projection of it.
-     */
-    @Nullable
-    private static BigDecimal overridePriceFor(
-            BulkServiceItemRequest item, ServiceDefinition reused) {
-
-        BigDecimal itemFloor =
-                item.priceType() == PriceType.FIXED ? item.price() : item.priceMin();
-        if (itemFloor == null) {
-            return null;
-        }
-        BigDecimal base = reused.getBasePrice();
-        return base != null && base.compareTo(itemFloor) == 0 ? null : itemFloor;
     }
 
     /**

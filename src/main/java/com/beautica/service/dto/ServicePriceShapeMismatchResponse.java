@@ -27,7 +27,12 @@ import java.util.UUID;
  * <p>Not a {@code permitAll} surface: the only endpoint that can raise this is the salon
  * on-behalf bulk create, behind a role gate plus the salon-management ownership check, so echoing
  * the salon's own price band leaks nothing (anti-bug §I concerns unauthenticated responses).
+ *
+ * @deprecated See {@link ServicePriceShapeMismatchException}'s {@code @deprecated} javadoc —
+ *     retired by Phase 312 D3, kept only because Phase 312 Step 0 found a live mobile consumer
+ *     (D4). No production code constructs this any more.
  */
+@Deprecated
 @Schema(name = "ServicePriceShapeMismatchResponse",
         description = "Payload under `data` of the 400 SERVICE_PRICE_SHAPE_MISMATCH response. "
                 + "Branch on `code`; the remaining fields describe the salon definition's "

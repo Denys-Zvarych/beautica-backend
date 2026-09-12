@@ -10,7 +10,6 @@ import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
-import com.beautica.service.dto.ServicePriceShapeMismatchResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.service.ServiceCatalogService;
@@ -139,13 +138,6 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     private DuplicateServiceResponse duplicateBodyFrom(ResponseEntity<String> resp) throws Exception {
         return objectMapper.readValue(
                 resp.getBody(), new TypeReference<ApiResponse<DuplicateServiceResponse>>() {}).data();
-    }
-
-    private ServicePriceShapeMismatchResponse shapeMismatchBodyFrom(ResponseEntity<String> resp)
-            throws Exception {
-        return objectMapper.readValue(
-                resp.getBody(),
-                new TypeReference<ApiResponse<ServicePriceShapeMismatchResponse>>() {}).data();
     }
 
     /** Active {@code service_definitions} ids owned by the master, so append tests can prove identity, not just count. */
@@ -976,6 +968,17 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
+     * Phase 312 — one {@code master_services} row's full price band, read raw so assertions pin
+     * the table (and V165's {@code chk_master_service_price_mode} coherence) directly, not a DTO.
+     */
+    private java.util.Map<String, Object> assignmentBandRow(UUID masterId, UUID defId) {
+        return jdbcTemplate.queryForMap(
+                "SELECT price_type_override, price_override, price_max_override "
+                        + "FROM master_services WHERE master_id = ? AND service_def_id = ?",
+                masterId, defId);
+    }
+
+    /**
      * The master's PUBLIC menu, read over the wire from {@code GET /masters/{id}/services} — the
      * surface a client actually renders a price from.
      *
@@ -1218,36 +1221,27 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
-     * ── Re-audit MEDIUM-1 — the reuse branch REJECTS an unrepresentable price shape ──
+     * ── Phase 312 D3 — the reuse branch STORES a differing price shape instead of rejecting it ──
      *
-     * <p>{@code master_services} carries a {@code price_override} (a FLOOR) and a
-     * {@code duration_override_minutes}; it has NO per-master price type and NO per-master
-     * ceiling. So when a batch item's price shape disagrees with the salon definition it reuses,
-     * the difference has nowhere faithful to land, and the reuse branch — which returns before
-     * {@code applyPriceMode} — used to answer {@code 201} with a body that did not match the
-     * request, shipping a wrong CLIENT-FACING price:
+     * <p>Before Phase 311's V165, {@code master_services} carried only a {@code price_override}
+     * (a FLOOR) and a {@code duration_override_minutes} — no per-master price type and no
+     * per-master ceiling — so a batch item whose price shape disagreed with the reused salon
+     * definition had nowhere faithful to land, and the Phase 302 re-audit MEDIUM-1 guard rejected
+     * it with {@code 400 SERVICE_PRICE_SHAPE_MISMATCH}.
      *
-     * <pre>
-     *   FIXED 500     definition + RANGE 400–900 item → stored FIXED 400   (band discarded)
-     *   RANGE 400–900 definition + FIXED 600     item → renders 600–900    (ceiling nobody set)
-     *   RANGE 400–900 definition + RANGE 500–800 item → renders 500–900    (ceiling 800 dropped)
-     * </pre>
-     *
-     * <p>Phase 302 D3 routed diverging price/duration VALUES to the overrides and said NOTHING
-     * about shape, so this was undecided, not an accepted trade-off. All three rows are exercised
-     * here end-to-end, over the wire, against the real database — the unit test can prove the
-     * guard fires, only this can prove the transaction leaves nothing behind.
-     *
-     * <p>Rejecting breaks no existing caller: the reuse branch is new in Phase 302 and has never
-     * shipped, so no client has ever seen the reshaped 201.
+     * <p>V165 gives {@code master_services} its own {@code price_type_override} and
+     * {@code price_max_override}, so every shape is now representable — Phase 312 retires the
+     * guard and this branch STORES the master's own band instead. This is the INVERTED
+     * {@code should_return400_when_reusingItemPriceShapeDiffersFromSalonDefinition} — same three
+     * rows, opposite outcome, kept as the same test (not deleted) per Phase 312's mandate.
      */
     @Test
-    @DisplayName("a reused item whose price SHAPE differs from the salon definition → 400 "
-            + "SERVICE_PRICE_SHAPE_MISMATCH, nothing persisted (re-audit MEDIUM-1)")
-    void should_return400_when_reusingItemPriceShapeDiffersFromSalonDefinition() throws Exception {
+    @DisplayName("a reused item whose price SHAPE differs from the salon definition → 201, the "
+            + "item's OWN band is stored (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnBand_when_reusingItemPriceShapeDiffersFromSalonDefinition() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "owner-302-shape-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Shape Salon");
+                "owner-312-shape-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Shape Salon");
         UUID firstMasterId = fixtures.createSalonMaster(salonId);
         UUID secondMasterId = fixtures.createSalonMaster(salonId);
 
@@ -1260,87 +1254,118 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                         fixed(fixedTypeId, 60, "500.00"),
                         range(rangeTypeId, 60, "400.00", "900.00"))));
         assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        List<MasterServiceResponse> seeded = createdFrom(seed);
+        UUID fixedDefId = seeded.get(0).serviceDefinition().id();
+        UUID rangeDefId = seeded.get(1).serviceDefinition().id();
         assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isEqualTo(2L);
 
         log.debug("Act row 1: RANGE 400–900 item against the salon's FIXED 500 definition");
         ResponseEntity<String> rangeOverFixed = postSalonBulk(ownerToken, salonId, secondMasterId,
                 new BulkCreateServicesRequest(List.of(range(fixedTypeId, 60, "400.00", "900.00"))));
-
         assertThat(rangeOverFixed.getStatusCode())
-                .as("a band cannot be stored as a floor — refuse rather than flatten it to FIXED 400")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        ServicePriceShapeMismatchResponse body1 = shapeMismatchBodyFrom(rangeOverFixed);
-        assertThat(body1.code())
-                .as("a machine-readable code, not handleBusiness's payload-less \"Invalid request\"")
-                .isEqualTo("SERVICE_PRICE_SHAPE_MISMATCH");
-        assertThat(body1.salonPriceType())
-                .as("the payload names the SALON's governing shape so the owner can be told why")
-                .isEqualTo(PriceType.FIXED);
-        assertThat(body1.salonPriceMin()).isEqualByComparingTo("500.00");
-        assertThat(body1.salonPriceMax()).as("a FIXED definition has no ceiling").isNull();
-        assertThat(body1.existingServiceDefId()).as("deep-linkable to the salon's row").isNotNull();
+                .as("V165 makes every shape representable — store the master's own band, don't reject it")
+                .isEqualTo(HttpStatus.CREATED);
+        java.util.Map<String, Object> row1 = assignmentBandRow(secondMasterId, fixedDefId);
+        assertThat(row1.get("price_type_override")).isEqualTo("RANGE");
+        assertThat((BigDecimal) row1.get("price_override")).isEqualByComparingTo("400.00");
+        assertThat((BigDecimal) row1.get("price_max_override")).isEqualByComparingTo("900.00");
 
         log.debug("Act row 2: FIXED 600 item against the salon's RANGE 400–900 definition");
+        // A DIFFERENT service type than row 1, so this does not collide with the assignment just
+        // made above — both land on the SAME second master, proving neither write disturbs the other.
         ResponseEntity<String> fixedOverRange = postSalonBulk(ownerToken, salonId, secondMasterId,
                 new BulkCreateServicesRequest(List.of(fixed(rangeTypeId, 60, "600.00"))));
+        assertThat(fixedOverRange.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        java.util.Map<String, Object> row2 = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(row2.get("price_type_override")).isEqualTo("FIXED");
+        assertThat((BigDecimal) row2.get("price_override")).isEqualByComparingTo("600.00");
+        assertThat(row2.get("price_max_override"))
+                .as("FIXED has no ceiling — must not inherit the salon's 900")
+                .isNull();
 
-        assertThat(fixedOverRange.getStatusCode())
-                .as("600 would have rendered 600–900 — a public ceiling nobody set for this master")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        ServicePriceShapeMismatchResponse body2 = shapeMismatchBodyFrom(fixedOverRange);
-        assertThat(body2.code()).isEqualTo("SERVICE_PRICE_SHAPE_MISMATCH");
-        assertThat(body2.salonPriceType()).isEqualTo(PriceType.RANGE);
-        assertThat(body2.salonPriceMin()).isEqualByComparingTo("400.00");
-        assertThat(body2.salonPriceMax()).isEqualByComparingTo("900.00");
-
-        log.debug("Act row 3: RANGE 500–800 item against the salon's RANGE 400–900 definition");
-        ResponseEntity<String> narrowerBand = postSalonBulk(ownerToken, salonId, secondMasterId,
-                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "500.00", "800.00"))));
-
-        assertThat(narrowerBand.getStatusCode())
-                .as("only the ceiling differs — the case a floor-only comparison waves through, "
-                        + "and it would have rendered 500–900")
-                .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(shapeMismatchBodyFrom(narrowerBand).salonPriceMax()).isEqualByComparingTo("900.00");
-
-        // ── nothing persisted, by any of the three rejected calls ──
-        assertThat(activeAssignmentCountForMaster(secondMasterId))
-                .as("the rejected batches leave the second master with no assignment at all")
-                .isZero();
+        // ── the shared definitions are byte-for-byte unchanged by either reuse ──
+        assertThat(definitionRow(fixedDefId).get("price_type")).isEqualTo("FIXED");
+        assertThat(definitionRow(rangeDefId).get("price_type")).isEqualTo("RANGE");
+        assertThat((BigDecimal) definitionRow(rangeDefId).get("base_price")).isEqualByComparingTo("400.00");
         assertThat(countActiveDefinitionsForOwner("SALON", salonId))
-                .as("and mint no definition — the salon still has exactly the two it started with")
+                .as("reuse mints no definition")
                 .isEqualTo(2L);
 
-        // ── and nothing was PUBLISHED (re-audit cycle 2) ──
-        // The status assertions above prove the guard fires; this proves the consequence the guard
-        // exists for. Without the guard, row 2 stores a 600 price_override against the salon's
-        // RANGE 400–900 definition and this endpoint renders the master at 600–900 — a public
-        // ceiling nobody set. That band is a COMBINATION of the assignment's override and the
-        // shared definition's price_max, so neither the DB assertions above nor the create-response
-        // can see it; only the rendered menu can.
-        assertThat(publicMenuOf(secondMasterId))
-                .as("a refused shape must publish NOTHING — not a silently reshaped band on the "
-                        + "master's public menu")
-                .isEmpty();
+        // ── and the PUBLISHED band matches what was submitted, not a reshaped combination ──
+        List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
+        MasterServiceResponse renderedRangeOverFixed = menu.stream()
+                .filter(row -> row.serviceDefinition().id().equals(fixedDefId)).findFirst().orElseThrow();
+        assertThat(renderedRangeOverFixed.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(renderedRangeOverFixed.priceMax()).isEqualByComparingTo("900.00");
+        assertThat(renderedRangeOverFixed.effectivePrice()).isEqualByComparingTo("400.00");
+
+        MasterServiceResponse renderedFixedOverRange = menu.stream()
+                .filter(row -> row.serviceDefinition().id().equals(rangeDefId)).findFirst().orElseThrow();
+        assertThat(renderedFixedOverRange.priceType())
+                .as("600 renders as a SINGLE price, never 600–900 — the exact defect the retired "
+                        + "guard existed to prevent, now solved by storing the master's own shape")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(renderedFixedOverRange.priceMax()).isNull();
+        assertThat(renderedFixedOverRange.effectivePrice()).isEqualByComparingTo("600.00");
     }
 
     /**
-     * The accept side of the same guard, so it cannot over-reject the two shapes that ARE
-     * representable: a FIXED item at any amount against a FIXED definition (the amount IS the
-     * floor), and a RANGE item whose ceiling MATCHES the salon band (only the floor differs, and
-     * the floor is exactly what {@code price_override} stores).
-     *
-     * <p>Without this test the MEDIUM-1 guard could be tightened to "reject any divergence at all"
-     * and every rejection test above would still pass — while the phase's whole point, per-master
-     * price divergence, silently stopped working.
+     * A diverging RANGE ceiling (only the ceiling differs, floor is representable either way) —
+     * also now STORED as the master's own, not silently dropped in favour of the salon's.
      */
     @Test
-    @DisplayName("a reused item whose price shape MATCHES the salon definition is accepted — the "
-            + "floor lands on price_override, the shared definition is untouched")
-    void should_accept_when_reusedItemPriceShapeMatchesSalonDefinition() throws Exception {
+    @DisplayName("a reused RANGE item whose ceiling differs from the salon band → 201, the item's "
+            + "OWN ceiling is stored, not the salon's (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnCeiling_when_reusedRangeItemCeilingDiffersFromTheSalonBand() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "owner-302-shape-ok-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Shape OK Salon");
+                "owner-312-ceiling-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Ceiling Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID rangeDefId = createdFrom(seed).get(0).serviceDefinition().id();
+
+        log.debug("Act: RANGE 500–800 — only the ceiling differs from the salon's 400–900");
+        ResponseEntity<String> narrowerBand = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "500.00", "800.00"))));
+        assertThat(narrowerBand.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        java.util.Map<String, Object> row = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(row.get("price_type_override")).isEqualTo("RANGE");
+        assertThat((BigDecimal) row.get("price_override")).isEqualByComparingTo("500.00");
+        assertThat((BigDecimal) row.get("price_max_override"))
+                .as("the SUBMITTED ceiling is kept — the salon's 900 must not silently win")
+                .isEqualByComparingTo("800.00");
+        assertThat((BigDecimal) definitionRow(rangeDefId).get("base_price"))
+                .as("the shared definition's own floor is untouched")
+                .isEqualByComparingTo("400.00");
+
+        List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
+        MasterServiceResponse rendered = menu.get(0);
+        assertThat(rendered.priceMax())
+                .as("the rendered ceiling is the master's OWN 800, not the salon's 900")
+                .isEqualByComparingTo("800.00");
+        assertThat(rendered.effectivePrice()).isEqualByComparingTo("500.00");
+    }
+
+    /**
+     * The accept side of the same resolution, so it cannot over-write: a FIXED item at any amount
+     * against a FIXED definition, and a RANGE item whose ceiling MATCHES the salon band — both
+     * representable pre-312 too, both still accepted, and both still an OWN band (not Inherited)
+     * because their FLOOR diverges from the salon's (Phase 311 D2 all-or-nothing: any divergence
+     * in the triple writes the whole triple).
+     */
+    @Test
+    @DisplayName("a reused item whose price shape MATCHES the salon definition's shape is accepted "
+            + "— its own floor (and, for RANGE, its own ceiling) are stored as a full own band")
+    void should_storeOwnBand_when_reusedItemPriceShapeMatchesSalonDefinition() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-shape-ok-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Shape OK Salon");
         UUID firstMasterId = fixtures.createSalonMaster(salonId);
         UUID secondMasterId = fixtures.createSalonMaster(salonId);
 
@@ -1359,27 +1384,26 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         java.util.Map<String, Object> rangeBefore = definitionRow(rangeDefId);
 
         log.debug("Act: FIXED 600 over FIXED 500, and RANGE 500–900 over RANGE 400–900 — both "
-                + "representable as a price_override floor");
+                + "representable, and both stored as this master's own band");
         ResponseEntity<String> accepted = postSalonBulk(ownerToken, salonId, secondMasterId,
                 new BulkCreateServicesRequest(List.of(
                         fixed(fixedTypeId, 60, "600.00"),
                         range(rangeTypeId, 60, "500.00", "900.00"))));
 
-        assertThat(accepted.getStatusCode())
-                .as("the guard must refuse only what the assignment cannot store")
-                .isEqualTo(HttpStatus.CREATED);
+        assertThat(accepted.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
-        assertThat((BigDecimal) jdbcTemplate.queryForMap(
-                "SELECT price_override FROM master_services WHERE master_id = ? AND service_def_id = ?",
-                secondMasterId, fixedDefId).get("price_override"))
-                .as("FIXED against FIXED: any amount rides on price_override")
-                .isEqualByComparingTo("600.00");
-        assertThat((BigDecimal) jdbcTemplate.queryForMap(
-                "SELECT price_override FROM master_services WHERE master_id = ? AND service_def_id = ?",
-                secondMasterId, rangeDefId).get("price_override"))
-                .as("RANGE with a matching ceiling: the floor rides on price_override, and the "
-                        + "ceiling is already what the salon band says")
-                .isEqualByComparingTo("500.00");
+        java.util.Map<String, Object> fixedRow = assignmentBandRow(secondMasterId, fixedDefId);
+        assertThat(fixedRow.get("price_type_override")).isEqualTo("FIXED");
+        assertThat((BigDecimal) fixedRow.get("price_override")).isEqualByComparingTo("600.00");
+        assertThat(fixedRow.get("price_max_override")).isNull();
+
+        java.util.Map<String, Object> rangeRow = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(rangeRow.get("price_type_override"))
+                .as("floor diverges (500 vs 400), so D2's all-or-nothing rule writes the WHOLE "
+                        + "triple even though the ceiling matches")
+                .isEqualTo("RANGE");
+        assertThat((BigDecimal) rangeRow.get("price_override")).isEqualByComparingTo("500.00");
+        assertThat((BigDecimal) rangeRow.get("price_max_override")).isEqualByComparingTo("900.00");
 
         assertThat(definitionRow(fixedDefId))
                 .as("neither shared definition is rewritten by the accepted reuse")
@@ -1389,14 +1413,6 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .as("reuse mints no definition")
                 .isEqualTo(2L);
 
-        // ── the RENDERED band is what was submitted (re-audit cycle 2) ──
-        // The whole point of the MEDIUM-1 guard is that a reused row's PUBLIC price must equal the
-        // request. The band a client sees is a COMBINATION of two rows — priceType/priceMax come
-        // off the SHARED definition while effectivePrice comes off the per-master override — so it
-        // is invisible to the master_services and service_definitions assertions above and to the
-        // create-response. It is asserted here, on the permitAll browse route, or nowhere.
-        // (priceDisplay/priceMin are deliberately NOT asserted: ServicePricing.derive ignoring
-        // price_override is a separately backlogged defect, not this phase's contract.)
         List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
         assertThat(menu).hasSize(2);
         MasterServiceResponse renderedFixed = menu.stream()
@@ -1407,22 +1423,145 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .findFirst().orElseThrow();
 
         assertThat(renderedFixed)
-                .as("FIXED 600 was submitted, so the master must render as a single price — a "
-                        + "ceiling appearing here is the exact defect the shape guard exists for")
                 .extracting(MasterServiceResponse::priceType, MasterServiceResponse::priceMax)
                 .containsExactly(PriceType.FIXED, null);
-        assertThat(renderedFixed.effectivePrice())
-                .as("and at the master's own 600, not the salon definition's 500")
-                .isEqualByComparingTo("600.00");
+        assertThat(renderedFixed.effectivePrice()).isEqualByComparingTo("600.00");
 
-        assertThat(renderedRange)
-                .as("RANGE 500–900 was submitted, and 900 is exactly the salon band's ceiling")
-                .extracting(MasterServiceResponse::priceType)
-                .isEqualTo(PriceType.RANGE);
+        assertThat(renderedRange.priceType()).isEqualTo(PriceType.RANGE);
         assertThat(renderedRange.priceMax()).isEqualByComparingTo("900.00");
-        assertThat(renderedRange.effectivePrice())
-                .as("the floor rendered is the master's own 500, not the salon's 400")
-                .isEqualByComparingTo("500.00");
+        assertThat(renderedRange.effectivePrice()).isEqualByComparingTo("500.00");
+    }
+
+    /**
+     * A reused item whose FULL band matches the salon's exactly stays Inherited — no override row
+     * at all — rather than freezing a redundant copy (Phase 311 D2). Regression coverage for the
+     * decision {@link #should_storeOwnBand_when_reusedItemPriceShapeMatchesSalonDefinition} cannot
+     * exercise, since both its rows diverge on the floor.
+     */
+    @Test
+    @DisplayName("a reused item whose FULL band matches the salon definition's exactly stays "
+            + "Inherited — no override columns are written at all")
+    void should_stayInherited_when_reusedItemFullyMatchesSalonDefinition() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-inherited-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Inherited Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID rangeDefId = createdFrom(seed).get(0).serviceDefinition().id();
+
+        ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        java.util.Map<String, Object> row = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(row.get("price_type_override")).isNull();
+        assertThat(row.get("price_override")).isNull();
+        assertThat(row.get("price_max_override")).isNull();
+    }
+
+    /**
+     * Phase 312 test case 15 — an item with an internally incoherent band (RANGE, no ceiling)
+     * still 400s and the whole batch is rejected with nothing written, even in the post-retirement
+     * world: {@link BulkServiceItemRequest}'s own {@code @ServicePriceValid} guards this
+     * independently of the retired shape guard, and Phase 312's explicit
+     * {@code ServiceCatalogService#resolveBulkReuseBand} defense-in-depth call backs it up for the
+     * write itself. Mixed with a second, otherwise-valid item to prove the ALL-OR-NOTHING batch
+     * property survives the retirement.
+     */
+    @Test
+    @DisplayName("a batch with one internally-incoherent item (RANGE, no ceiling) → 400, the WHOLE "
+            + "batch is rejected — nothing written, not even the other valid item")
+    void should_return400AndWriteNothing_when_oneBulkItemHasAnIncoherentBand() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-incoherent-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Incoherent Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        UUID fixedTypeId = seededTypes.get(0).id();
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        // A hand-built raw JSON body: a valid FIXED item plus a RANGE item missing priceMax —
+        // bean validation must still reject it even though no shape-vs-definition guard exists.
+        String body = "{\"items\":["
+                + "{\"serviceTypeId\":\"" + fixedTypeId + "\",\"durationMinutes\":60,"
+                + "\"priceType\":\"FIXED\",\"price\":500.00},"
+                + "{\"serviceTypeId\":\"" + rangeTypeId + "\",\"durationMinutes\":60,"
+                + "\"priceType\":\"RANGE\",\"priceMin\":400.00}"
+                + "]}";
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk",
+                HttpMethod.POST,
+                new HttpEntity<>(body, fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("priceMax is required for RANGE — @ServicePriceValid still guards this "
+                        + "independently of the retired shape-vs-definition guard")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(activeAssignmentCountForMaster(masterId))
+                .as("all-or-nothing: the batch's other, individually-valid item must not persist")
+                .isZero();
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isZero();
+    }
+
+    /**
+     * QA audit (2026-09-12), Risk 3 of the 311+312 merge unit — originally filed as a documented
+     * DRIFT, now an AGREEMENT pin after Phase 312 D8.
+     *
+     * <p>At the time this test was written, {@code MasterServiceBand.isLegal} used {@code >=} —
+     * deliberately mirroring {@code chk_master_service_price_mode} (V165) exactly — so a
+     * degenerate RANGE band (floor == ceiling) was legal via {@code PATCH} and single-assign, but
+     * this bulk path rejected the identical band, because a bulk item is gated by the
+     * pre-existing {@code @ServicePriceValid} /
+     * {@link com.beautica.service.validation.ServicePriceValidator}, which has always required
+     * priceMax STRICTLY greater than priceMin for RANGE. That was a real, surprising three-way
+     * asymmetry, and this test existed to pin it so nobody "fixed" one side without the other
+     * noticing.
+     *
+     * <p>Phase 312 D8 resolved the asymmetry by tightening {@code MasterServiceBand.isLegal} from
+     * {@code >=} to strict {@code >}, converging it onto {@code ServicePriceValidator}'s
+     * already-strict rule ({@code MasterServiceBandCreateIT} Case 10 is now the reversed twin of
+     * this test — the POST and PATCH degenerate bodies are rejected too). The {@code 400} this
+     * test asserts is therefore now the SAME answer bulk, PATCH and single-assign all give, not a
+     * drift — this is the bulk arm of the cross-path agreement pin, paired with
+     * {@code MasterServiceBandCreateIT} Case 10. That this QA-authored test needed no assertion
+     * change at all to remain correct is itself evidence D8 is the convergent direction. If any
+     * path's degenerate boundary is ever loosened again, this test must be updated alongside
+     * Case 10, not deleted.
+     */
+    @Test
+    @DisplayName("a bulk item reusing a salon definition with a degenerate RANGE own band "
+            + "(floor == ceiling) → 400, AS PATCH and single-assign now do too (D8 agreement)")
+    void should_return400_when_bulkItemAttemptsADegenerateRangeBand_asPatchAndSingleAssignNowDoToo() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-degenerate-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Degenerate Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        log.debug("Act: second master reuses the same type with a RANGE 600-600 own band — "
+                + "degenerate floor==ceiling, now rejected everywhere after Phase 312 D8");
+        ResponseEntity<String> degenerate = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "600.00", "600.00"))));
+
+        assertThat(degenerate.getStatusCode())
+                .as("bulk's @ServicePriceValid rejects priceMax == priceMin for RANGE, and after "
+                        + "Phase 312 D8 MasterServiceBand.isLegal agrees (strict >, not >=) — all "
+                        + "three write paths now reject this band identically")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(activeAssignmentCountForMaster(secondMasterId))
+                .as("nothing written for the rejected second master")
+                .isZero();
     }
 
     /** Case 7 — the 409 that survives, re-scoped to the master. */

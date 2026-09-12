@@ -120,7 +120,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
         String ownerBToken = fixtures.createSalonOwnerAndGetToken(
                 "sec-owner-b-assign-" + System.nanoTime() + "@beautica.test");
 
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // Act
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services with Owner B token — IDOR must be blocked",
@@ -261,7 +261,7 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
                 fixtures.insertSalonWithOwner("Owner B Salon (306 assign cross)"),
                 "p306-adminb-assign-" + System.nanoTime() + "@beautica.test");
 
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // Act
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services as a SALON_ADMIN of a different salon — must be blocked",
@@ -511,6 +511,45 @@ class ServiceSecurityTest extends AbstractIntegrationTest {
 
         // Assert
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("Phase 311: PATCH /salons/{salonAId}/masters/{masterAId}/services/{serviceDefId} — "
+            + "403 when a SALON_ADMIN of a DIFFERENT salon edits master A's band; row unchanged")
+    void should_return403_when_salonAdminOfDifferentSalonEditsMasterServiceBand() throws Exception {
+        // Arrange
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
+                "p311-ownera-band-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Owner A Salon (311 band cross)");
+        UUID masterAId = fixtures.createSalonMaster(salonAId);
+        UUID serviceDefId = fixtures.createServiceDefinition(ownerAToken, salonAId, "Salon A Service (311 band)");
+        var assign = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
+        ResponseEntity<String> assignResp = restTemplate.exchange(
+                "/api/v1/salons/" + salonAId + "/masters/" + masterAId + "/services", HttpMethod.POST,
+                new HttpEntity<>(assign, fixtures.bearerHeaders(ownerAToken)), String.class);
+        assertThat(assignResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        String adminBToken = fixtures.createSalonAdminAndGetToken(
+                fixtures.insertSalonWithOwner("Owner B Salon (311 band cross)"),
+                "p311-adminb-band-" + System.nanoTime() + "@beautica.test");
+
+        var bandPatch = new com.beautica.service.dto.UpdateMasterServiceBandRequest(
+                PriceType.FIXED, new BigDecimal("999.00"), null, null, null, null);
+
+        // Act
+        log.debug("Act: PATCH .../masters/{}/services/{} as a SALON_ADMIN of a different salon — "
+                + "must be blocked", masterAId, serviceDefId);
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/salons/" + salonAId + "/masters/" + masterAId + "/services/" + serviceDefId,
+                HttpMethod.PATCH, new HttpEntity<>(bandPatch, fixtures.bearerHeaders(adminBToken)), String.class);
+
+        // Assert
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT price_override FROM master_services WHERE master_id = ? AND service_def_id = ?",
+                BigDecimal.class, masterAId, serviceDefId))
+                .as("the rejected cross-salon band PATCH must not have written anything")
+                .isNull();
     }
 
 }

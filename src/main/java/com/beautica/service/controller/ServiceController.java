@@ -9,7 +9,7 @@ import com.beautica.service.dto.DuplicateServiceErrorResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
-import com.beautica.service.dto.ServicePriceShapeMismatchErrorResponse;
+import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
@@ -119,24 +119,6 @@ public class ServiceController {
                     + "code; the body carries no machine-readable code and `message` is generic.";
 
     /**
-     * Description attached to the {@code 400 SERVICE_PRICE_SHAPE_MISMATCH} declaration on
-     * {@link #bulkCreateMasterServices} — the only endpoint that can raise it. Inherited from
-     * Phase 302 (see {@link ServicePriceShapeMismatchErrorResponse}): the wire contract has been
-     * live and correct since Phase 302 shipped, but Phase 302 was forbidden from touching this
-     * file, so the declaration was missing from {@code /api-docs} until now. The sibling
-     * independent-master bulk endpoint never reuses another owner's definition, so it cannot
-     * raise this error and does not carry this declaration.
-     */
-    private static final String SERVICE_PRICE_SHAPE_MISMATCH_400 =
-            "A batch item's price shape cannot be represented against the salon's existing "
-                    + "active definition for that service type, which this item would reuse "
-                    + "(master_services carries only a price floor override, no per-master "
-                    + "ceiling or price type). The whole batch is rejected — nothing was "
-                    + "written. Branch on `data.code` == SERVICE_PRICE_SHAPE_MISMATCH; "
-                    + "`data.salonPriceType`/`salonPriceMin`/`salonPriceMax` name the salon's "
-                    + "governing shape.";
-
-    /**
      * Description attached to the {@code 429} declaration on every write endpoint in this
      * controller. {@code AuthRateLimitFilter} throttles the single-item write routes
      * (create / update / photo / deactivate) at {@code app.rate-limit.service-write-capacity}
@@ -228,6 +210,66 @@ public class ServiceController {
         MasterServiceResponse response =
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    /**
+     * Edits ONE master's OWN price band and/or duration override (Phase 311) — the only
+     * {@code PATCH}/{@code PUT} anywhere on {@code master_services}. Same path as
+     * {@link #unassignServiceFromMaster}'s {@code DELETE}, one verb apart (D1):
+     * {@code POST .../services} assigns, this {@code PATCH} edits the assignment's band, and
+     * {@code DELETE .../services/{serviceDefId}} unassigns.
+     *
+     * <p><b>D5 — narrows the "SALON_MASTER is read-only" invariant for ONE row and ONE column
+     * group.</b> Unlike every other write in this controller, {@code @authz.canEditMasterServiceBand}
+     * ALSO admits the {@code SALON_MASTER} whose own {@code masters} row is {@code #masterId} —
+     * they may edit their own band and nothing else (Phase 306 D6 / Phase 310 D5 still hold for
+     * every other endpoint). The predicate is a NEW, independent entry point from
+     * {@code canReadSalonMasterServices}; it does not reuse or widen that read gate, and
+     * {@code canManageServiceDefinition} — which still fast-rejects {@code SALON_MASTER} — is
+     * untouched.
+     *
+     * <p><b>D4 — {@code null} means "leave unchanged"; {@code clearBand}/{@code
+     * clearDurationOverride} are the explicit reverts.</b> See
+     * {@link UpdateMasterServiceBandRequest}'s javadoc for the full request contract.
+     *
+     * <p><b>D3 — no envelope against the salon definition's band.</b> Every {@code 400} below is
+     * the standard bean-validation envelope; {@code SERVICE_PRICE_SHAPE_MISMATCH} is never raised
+     * by this endpoint (that code means "cannot be represented against the salon's definition", a
+     * condition this phase abolishes).
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId}. An
+     * INACTIVE assignment is {@code 404}, not silently reactivated — reactivation is
+     * {@code POST .../services}'s job (Phase 307 D6).
+     */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Same lone-@ApiResponse guard as every other write endpoint in this file — see
+            // assignServiceToMaster above.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "400", description = "Incoherent band, partial band, a "
+                            + "contradictory clearBand/clearDurationOverride combination, or an "
+                            + "entirely empty patch — standard validation envelope (Phase 311 D3, "
+                            + "D4). SERVICE_PRICE_SHAPE_MISMATCH is never raised here."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "No ACTIVE assignment for (masterId, "
+                            + "serviceDefId) — also returned when master/definition are missing, "
+                            + "in another salon, or the assignment is inactive."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
+    @PatchMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
+    @PreAuthorize("@authz.canEditMasterServiceBand(authentication, #salonId, #masterId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    public ResponseEntity<ApiResponse<MasterServiceResponse>> updateMasterServiceBand(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            @PathVariable UUID serviceDefId,
+            @Valid @RequestBody UpdateMasterServiceBandRequest request,
+            Authentication authentication
+    ) {
+        MasterServiceResponse response = serviceCatalogService.updateMasterServiceBand(
+                AuthenticationUtils.userId(authentication), salonId, masterId, serviceDefId, request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     /**
@@ -526,9 +568,15 @@ public class ServiceController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "409", description = DUPLICATE_SERVICE_PER_MASTER_409,
                     content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
-            @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "400", description = SERVICE_PRICE_SHAPE_MISMATCH_400,
-                    content = @Content(schema = @Schema(implementation = ServicePriceShapeMismatchErrorResponse.class))),
+            // Phase 312 D3/D4 — the 400 SERVICE_PRICE_SHAPE_MISMATCH declaration that used to sit
+            // here is RETIRED: Phase 311's V165 gives master_services its own shape and ceiling,
+            // so no batch item's price shape is unrepresentable any more (it is stored, not
+            // rejected — see ServiceCatalogService#resolveBulkReuseBand). The exception, its
+            // response DTOs and the GlobalExceptionHandler arm are kept (not deleted) and marked
+            // @Deprecated: Step 0's mobile grep found a live consumer (service_repository.dart /
+            // failures.dart / service_setup_screen.dart branch on this code), so removing the
+            // wire contract here is safe (the endpoint simply never raises it again), but deleting
+            // the Java types is not — that is a mobile-side follow-up phase's job.
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "503", description = BULK_LOCK_TIMEOUT_503),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(

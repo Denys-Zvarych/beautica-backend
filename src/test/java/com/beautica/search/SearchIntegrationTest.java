@@ -4192,10 +4192,18 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      */
     private void linkMasterToOwnedDef(UUID masterId, UUID serviceDefId,
                                       BigDecimal priceOverride, boolean msActive) {
+        // Phase 311 V165's chk_master_service_price_mode forbids a partial band: a non-null
+        // price_override now REQUIRES price_type_override alongside it. Every caller of this
+        // helper that passes an override means "this master fixed their own single price" (the
+        // pre-311 semantic — search's price-band tests only ever assert on the resulting floor),
+        // so FIXED is set here whenever priceOverride is non-null; a null override stays fully
+        // Inherited (both columns NULL), unchanged.
+        String priceTypeOverride = priceOverride != null ? "FIXED" : null;
         jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, price_override, is_active, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, NOW(), NOW())",
-                UUID.randomUUID(), masterId, serviceDefId, priceOverride, msActive);
+                "INSERT INTO master_services (id, master_id, service_def_id, price_override, " +
+                        "price_type_override, is_active, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())",
+                UUID.randomUUID(), masterId, serviceDefId, priceOverride, priceTypeOverride, msActive);
     }
 
     /**

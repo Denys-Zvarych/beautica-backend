@@ -81,11 +81,23 @@ class V164SalonOwnedBackfillMigrationTest {
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
         jdbc = new JdbcTemplate(dataSource);
 
-        // Full chain, including V164, against an EMPTY schema — proves the "fresh DB => no-op"
-        // half of D6 and records V164 in flyway_schema_history for the FlywayHistory test below.
+        // Full chain UP TO AND INCLUDING V164, against an EMPTY schema — proves the "fresh DB =>
+        // no-op" half of D6 and records V164 in flyway_schema_history for the FlywayHistory test
+        // below. Capped at V164 (Phase 311 fix): this class re-applies V164's raw SQL body a
+        // SECOND time inside several test methods (applyV164()) against synthetic fixture rows
+        // that deliberately diverge in price — exactly the shape V164's repoint logic writes a
+        // bare price_override for (case 7). Migrating past V165 first would let that later
+        // migration's chk_master_service_price_mode CHECK see a re-applied V164 write a partial
+        // band (price_override set, price_type_override untouched — V164 predates that column and
+        // can never know about it) and reject it with a DataIntegrityViolationException that has
+        // nothing to do with V164 itself. Real deployments never hit this: V164 ran once, when the
+        // schema head truly WAS V164, and V165's own D8 backfill (which V164 cannot see either)
+        // is what keeps production data legal before the CHECK is added. Capping the target here
+        // makes the test's schema match what V164 actually ran against.
         Flyway.configure()
                 .dataSource(dataSource)
                 .locations("classpath:db/migration")
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("164"))
                 .load()
                 .migrate();
 

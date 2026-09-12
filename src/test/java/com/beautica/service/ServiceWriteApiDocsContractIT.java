@@ -285,6 +285,50 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
                 .isEqualTo("Master row id (NOT a user id)");
     }
 
+    // ── Phase 312 D3 — the retired SERVICE_PRICE_SHAPE_MISMATCH 400 no longer appears in the
+    // published spec at all, and its removal did not collapse the bulk endpoint's other
+    // declarations (case 18 + the case 19 lone-@ApiResponse regression guard, doubly-checked here
+    // even though the parameterized case above already exercises the same endpoint).
+
+    @Test
+    @DisplayName("Phase 312 case 18: POST .../masters/{masterId}/services/bulk no longer declares "
+            + "a 400 SERVICE_PRICE_SHAPE_MISMATCH response at all")
+    void should_notDeclare400ShapeMismatch_when_bulkEndpointPublishesSpec() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services/bulk").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services/bulk must exist in /api-docs")
+                .isFalse();
+
+        JsonNode responses = operation.path("responses");
+        assertThat(responses.has("400"))
+                .as("Phase 311's V165 makes every batch item's price shape representable, so this "
+                        + "endpoint never 400s on shape any more — the retired @ApiResponse must "
+                        + "not reappear; responses were: %s", responses)
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("Phase 312 case 19: POST .../masters/{masterId}/services/bulk still declares a "
+            + "typed 200 alongside its remaining 409/503/429 after the 400 was removed — removing "
+            + "one @ApiResponse entry must not collapse the set")
+    void should_keepTyped200And409And503And429_when_shapeMismatch400IsRemoved() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services/bulk").path("post");
+
+        JsonNode responses = operation.path("responses");
+        JsonNode successContent = responses.path("200").path("content");
+        assertThat(successContent.isMissingNode() || successContent.isEmpty())
+                .as("200 response MUST carry a content block — an empty/void success means "
+                        + "springdoc dropped the typed return schema after the 400 was removed; "
+                        + "responses were: %s", responses)
+                .isFalse();
+        assertThat(responses.has("409")).isTrue();
+        assertThat(responses.has("503")).isTrue();
+        assertThat(responses.has("429")).isTrue();
+    }
+
     private static JsonNode findParameterByName(JsonNode parameters, String name) {
         for (JsonNode param : parameters) {
             if (name.equals(param.path("name").asText())) {

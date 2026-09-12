@@ -238,7 +238,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         log.debug("Step 5 complete — serviceDefId={}", serviceDefId);
 
         // ── Step 6: assign the service to the owner-master ────────────────────
-        var assignReq = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignReq = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         ResponseEntity<String> assignResp = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(assignReq, bearerHeaders(ownerToken)),

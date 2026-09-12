@@ -411,7 +411,7 @@ class SingleAssignContractParityIT extends AbstractIntegrationTest {
     // ── shared HTTP plumbing ─────────────────────────────────────────────────────────────────────
 
     private ResponseEntity<String> assignSingle(String token, UUID salonId, UUID masterId, UUID serviceDefId) {
-        var request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         return restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(request, fixtures.bearerHeaders(token)), String.class);

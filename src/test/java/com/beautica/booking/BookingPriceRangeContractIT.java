@@ -2378,10 +2378,18 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 serviceDefId, ownerType, ownerId,
                 fixtures.resolveUnusedServiceTypeId(ownerType, ownerId), basePrice, priceMax);
         UUID masterServiceId = UUID.randomUUID();
+        // Phase 311 V165's chk_master_service_price_mode forbids a partial band: price_override
+        // set with price_type_override NULL is now a CHECK violation, not merely stale data. A
+        // non-null priceOverride here has always meant "the master fixed their own price" (see the
+        // callers' comments — "never a range"), i.e. an own FIXED band, so price_type_override is
+        // set to FIXED alongside it and price_max_override stays NULL — mirroring exactly what
+        // V165's D8 backfill does for real pre-existing rows of this same shape.
+        String priceTypeOverride = priceOverride != null ? "FIXED" : null;
         jdbcTemplate.update(
-                "INSERT INTO master_services (id, master_id, service_def_id, price_override, is_active, "
-                        + "created_at, updated_at) VALUES (?, ?, ?, ?, true, NOW(), NOW())",
-                masterServiceId, masterId, serviceDefId, priceOverride);
+                "INSERT INTO master_services (id, master_id, service_def_id, price_override, "
+                        + "price_type_override, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId, priceOverride, priceTypeOverride);
         return masterServiceId;
     }
 

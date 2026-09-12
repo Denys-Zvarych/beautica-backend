@@ -50,7 +50,22 @@ import java.util.UUID;
  *
  * <p><b>Breaks no existing caller:</b> the reuse branch is new in Phase 302 and has never
  * shipped, so no client has ever seen the reshaped {@code 201}.
+ *
+ * @deprecated Retired by Phase 312 D3: Phase 311's V165 gives {@code master_services} its own
+ *     price type and ceiling, so no batch item's shape is unrepresentable any more — the reuse
+ *     branch now STORES a differing shape ({@code ServiceCatalogService#resolveBulkReuseBand})
+ *     instead of throwing this. <b>No production code throws this any more</b> — it is kept,
+ *     not deleted, only because Phase 312 Step 0's mobile grep (D4) found a live consumer
+ *     ({@code beautica-mobile/lib/features/services/data/service_repository.dart},
+ *     {@code lib/core/errors/failures.dart}'s {@code ServicePriceShapeMismatchFailure}, and the
+ *     branch in {@code service_setup_screen.dart}) still parses {@code data.code ==
+ *     "SERVICE_PRICE_SHAPE_MISMATCH"}. Delete this class, {@link
+ *     com.beautica.service.dto.ServicePriceShapeMismatchResponse}, {@link
+ *     com.beautica.service.dto.ServicePriceShapeMismatchErrorResponse} and the
+ *     {@code GlobalExceptionHandler} arm together, in the mobile follow-up phase that removes
+ *     that client branch — not before.
  */
+@Deprecated
 public class ServicePriceShapeMismatchException extends BusinessException {
 
     /**

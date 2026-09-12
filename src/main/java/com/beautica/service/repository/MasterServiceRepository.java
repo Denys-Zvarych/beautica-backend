@@ -132,11 +132,22 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * {@code serviceDefinition} is the same managed instance it already loaded via
      * {@code ServiceRepository#findByIdWithServiceType}, so Hibernate's first-level cache dedupes
      * it and no duplicate SQL results.
+     *
+     * <p><b>{@code LEFT JOIN FETCH sd.serviceType} (Phase 311).</b> {@code
+     * ServiceCatalogService#updateMasterServiceBand} is a THIRD caller of this finder, and unlike
+     * the first two it builds a {@code MasterServiceResponse} (via {@code
+     * ServiceDefinitionResponse.from}, which reads {@code serviceType.getNameUk()}/{@code
+     * getSlug()}) WITHOUT first pre-warming the definition through {@code
+     * ServiceRepository#findByIdWithServiceType} the way {@code assignServiceToMaster} does. Without
+     * this fetch, {@code serviceType} stays an uninitialized proxy and throws {@code
+     * LazyInitializationException} the moment the response is built — mirrors {@link
+     * #findByMasterIdAndIsActiveTrueWithGraph}'s identical fetch, for the identical reason.
      */
     @Query("""
             SELECT ms FROM MasterServiceAssignment ms
             JOIN FETCH ms.master m
             LEFT JOIN FETCH ms.serviceDefinition sd
+            LEFT JOIN FETCH sd.serviceType
             WHERE m.id = :masterId AND sd.id = :serviceDefinitionId
             """)
     Optional<MasterServiceAssignment> findByMasterIdAndServiceDefinitionId(
