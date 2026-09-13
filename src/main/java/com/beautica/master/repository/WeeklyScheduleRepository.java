@@ -120,9 +120,19 @@ public interface WeeklyScheduleRepository extends JpaRepository<WeeklySchedule, 
      * does not change the verdict for any date covered by exactly one template, which is every
      * date in every fixture this codebase has today. The single-master finder above is intentionally
      * left untouched — no existing consumer's query, order, or verdict moves.
+     *
+     * <p><b>No {@code DISTINCT} (2026-09-13 perf audit, LOW).</b> Hibernate 6 de-duplicates the
+     * root entities of a {@code JOIN FETCH}ed collection in its own result transformer, and passes
+     * an HQL {@code distinct} straight through to SQL as {@code SELECT DISTINCT}. On this batched
+     * query the projected row is the template JOINed to its {@code working_intervals}, so the
+     * interval columns differ on every row and the {@code Unique}/{@code HashAggregate} Postgres
+     * adds can de-duplicate nothing — it is a sort/hash over the whole N-master cartesian for no
+     * rows removed. Dropping it changes neither the returned entities nor their order (the
+     * explicit {@code ORDER BY} above is what fixes the order); the batch-vs-singleton differential
+     * in {@code SalonCatalogueBatchLoadIT} case 11 pins that equality.
      */
     @Query("""
-            SELECT DISTINCT ws FROM WeeklySchedule ws
+            SELECT ws FROM WeeklySchedule ws
             LEFT JOIN FETCH ws.intervals
             WHERE ws.master.id IN :masterIds
               AND ws.validFrom <= :to

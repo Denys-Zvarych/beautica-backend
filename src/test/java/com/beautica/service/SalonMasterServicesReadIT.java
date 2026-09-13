@@ -37,12 +37,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * read.
  *
  * <h2>Why this is not a duplicate of the public browse read</h2>
- * {@code GET /masters/{masterId}/services} (public, cached, {@code fromPublic}-masked) and this
- * endpoint run the SAME underlying query — the only difference is one {@code .map} call
- * ({@link com.beautica.service.dto.MasterServiceResponse#fromPublic}) and an ownership gate.
- * Case 1 pins the D1 claim directly (unmasked {@code priceOverride}); the contrast case pins it
- * against the public route in one assertion pair, as the phase spec requires — two unrelated
- * tests would not prove the contrast.
+ * {@code GET /masters/{masterId}/services} (public, {@code permitAll}, cached per {@code masterId})
+ * and this endpoint run the SAME underlying query and now return the SAME payload. <b>What
+ * separates them is audience and caching, not the DTO</b> — the {@code fromPublic} mask that used
+ * to null {@code priceOverride} on the public route was RETIRED by the 2026-09-13 audit (S5)
+ * because it was recoverable by subtraction from {@code effectivePrice} and the nested
+ * definition's {@code priceMin}, i.e. it was a control that did not control. Case 1 pins the D1
+ * claim directly (the management read returns {@code priceOverride} unmasked); case 7 pins the
+ * routes against each other in one assertion pair and asserts they AGREE — two unrelated tests
+ * would not prove the relationship either way.
  *
  * <h2>D2 — 404, not 403, on a cross-salon or nonexistent master</h2>
  * Deliberately diverges from {@code DELETE .../services/{serviceDefId}} (Phase 307), whose
@@ -265,13 +268,26 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
     }
 
-    // ── Case 7 — THE central contrast: public masks, management does not (one assertion pair) ──
+    // ── Case 7 — the two routes now agree on the DTO; what separates them is audience + cache ──
 
+    /**
+     * <b>Rewritten 2026-09-13 (audit S5).</b> This case used to pin "the public browse masks
+     * priceOverride, the management read does not" as the phase's central claim. The mask has been
+     * RETIRED: it nulled one field while the same response still carried {@code effectivePrice}
+     * ({@code COALESCE(priceOverride, base_price)}) and the nested definition's {@code priceMin}
+     * ({@code base_price}), so the "hidden" value — and the master's deviation from the salon's
+     * list price — was recoverable by subtraction. A control that does not control must not be
+     * shipped as one.
+     *
+     * <p>What the two routes still differ in, and what this case now pins: the public one is
+     * {@code permitAll} and CACHED per {@code masterId} across every caller including anonymous
+     * ones; the management one is authorization-gated and uncached. The payloads are identical.
+     */
     @Test
-    @DisplayName("Case 7: for the SAME master, GET /masters/{id}/services masks priceOverride while "
-            + "GET /salons/{s}/masters/{m}/services does not — the phase's central claim, pinned in "
-            + "one test")
-    void should_maskOnPublicRoute_butNotOnManagementRoute_forSameMaster() throws Exception {
+    @DisplayName("Case 7 (S5): for the SAME master, the public browse and the management read "
+            + "return the SAME priceOverride — the retired mask was recoverable by subtraction, so "
+            + "the routes are separated by audience and caching, not by a masked field")
+    void should_returnIdenticalPriceOverrideOnBothRoutes_forSameMaster() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-309-c7-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Phase 309 Case 7 Salon");
@@ -287,13 +303,20 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
         assertThat(managementResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         MasterServiceResponse publicRow = readServiceList(publicResp).get(0);
         MasterServiceResponse managementRow = readServiceList(managementResp).get(0);
-        assertThat(publicRow.priceOverride())
-                .as("public browse must mask priceOverride (fromPublic)")
-                .isNull();
         assertThat(managementRow.priceOverride())
-                .as("management read must return it unmasked (D1)")
+                .as("management read must return it unmasked (D1) — unchanged")
                 .isNotNull()
                 .isEqualByComparingTo("275.50");
+        assertThat(publicRow.priceOverride())
+                .as("S5 — the public browse serves the same value: catalogue prices on this route "
+                        + "are public by product design, and masking this ONE field never hid it")
+                .isEqualByComparingTo("275.50");
+        assertThat(publicRow.effectivePrice().subtract(
+                        publicRow.serviceDefinition().priceMin()).signum())
+                .as("the non-vacuity of the whole decision: effectivePrice and the nested "
+                        + "definition's base_price are BOTH on the public row, so their difference "
+                        + "already disclosed the deviation the old mask claimed to hide")
+                .isNotZero();
     }
 
     // ── Case 8 — the public masterServices cache is neither populated nor evicted (D4) ─────────
@@ -338,12 +361,17 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
         assertThat(cachedRaw)
                 .as("D4 — the management read must NOT evict the public cache either")
                 .isNotNull().hasSize(1);
-        // Same masked shape — proves the entry is untouched, not silently refreshed with a
-        // different (unmasked) value by a regression.
+        // The entry is untouched — proven by isFavorite, which the public route always writes as
+        // null (Phase 32.1 D1/D4) and the management read would not. priceOverride can no longer
+        // serve as the discriminator: since S5 retired the mask, both routes carry the same value.
         MasterServiceResponse cachedEntry = (MasterServiceResponse) cachedRaw.get(0);
-        assertThat(cachedEntry.priceOverride())
-                .as("the cached entry must stay the masked shape the public route wrote")
+        assertThat(cachedEntry.isFavorite())
+                .as("this cache is shared with anonymous callers, so it must never hold a "
+                        + "caller-specific flag — and a management read must not have rewritten it")
                 .isNull();
+        assertThat(cachedEntry.priceOverride())
+                .as("S5 — the cached (public) entry carries priceOverride like every other route")
+                .isEqualByComparingTo("199.00");
     }
 
     // ── Phase 310 Case 1 — SALON_MASTER reads their OWN row: 200, full, unmasked (D4) ──────────
@@ -367,7 +395,8 @@ class SalonMasterServicesReadIT extends AbstractIntegrationTest {
         List<MasterServiceResponse> services = readServiceList(resp);
         assertThat(services).hasSize(1);
         assertThat(services.get(0).priceOverride())
-                .as("D4 — the master's own read must return priceOverride unmasked, not fromPublic")
+                .as("D4 — the master's own read returns priceOverride (S5: so does the public route "
+                        + "now; what this case pins is that the OWN read is served at all)")
                 .isNotNull()
                 .isEqualByComparingTo("310.00");
     }

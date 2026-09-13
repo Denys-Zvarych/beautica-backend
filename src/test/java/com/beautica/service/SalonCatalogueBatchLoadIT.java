@@ -25,6 +25,7 @@ import org.assertj.core.api.SoftAssertions;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
+import com.beautica.support.NotATimedTest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -464,6 +465,14 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
     private static final long ONE_MASTER_STATEMENT_COUNT = 5L;
 
     @Test
+    @NotATimedTest(reason = "Sweeps 1, 3, 5, 10 and 20 masters — 39 masters across 5 salons, each "
+            + "with its own schedule and service band — BECAUSE the master-count sweep IS the "
+            + "experiment: the invariant only exists if it is measured at several cardinalities. "
+            + "The assertion is a prepareStatementCount equality across the sweep plus an absolute "
+            + "constant on the 1-master leg; it makes no latency claim whatsoever. Measured 6.709s "
+            + "quiet / 11.164s under concurrent load against the 10s ceiling, so a red "
+            + "SlowTestExtension here reports machine load, not a regression. Dropping counts to "
+            + "fit the budget would delete the invariance the case exists to pin.")
     @DisplayName("Case 9 (D8): getSalonServiceCatalog's prepareStatementCount is STRICTLY EQUAL "
             + "from 1 to 20 masters over the same service set, and the 1-master figure equals the "
             + "named absolute constant")
@@ -578,6 +587,12 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
      * differs between them — masters vs rows — so the two hypotheses actually diverge here).
      */
     @Test
+    @NotATimedTest(reason = "Seeds 51 masters + 51 schedule rows twice over a 180-day window "
+            + "BECAUSE 51 is the batch_fetch_size boundary this case exists to cross. The "
+            + "assertion is a prepareStatementCount equality, not a latency bound: SlowTestExtension "
+            + "measures a quantity this test makes no claim about, and on a loaded machine the "
+            + "fixture build alone has been observed at 14.6s against a 5.66s quiet-machine figure. "
+            + "Trimming the fixture would delete the boundary crossing, i.e. the test.")
     @DisplayName("Case 12 (D8 caveat): the discreteTimes surcharge is O(rows/50), independent of "
             + "master count, pinned across the batch_fetch_size=50 boundary (51 rows either way)")
     void should_makeDiscreteTimesSurchargeIndependentOfMasterCount() throws Exception {
@@ -645,6 +660,12 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
      * {@code ceil(rows / 50) + 4}, not just the plateau below it.
      */
     @Test
+    @NotATimedTest(reason = "Builds a 50-master salon AND a 51-master salon BECAUSE 50-vs-51 is the "
+            + "batch_fetch_size boundary whose crossing is the whole assertion. The assertion is "
+            + "prepareStatementCount == base and base + 1 — a statement-count gate, not a latency "
+            + "gate. Measured 8.52s quiet / 19.9s under concurrent load against a 10s ceiling: the "
+            + "wall clock here reports machine load, not a regression. Shrinking either salon "
+            + "destroys the boundary the case pins.")
     @DisplayName("Case 14 (D8 boundary): prepareStatementCount grows by exactly one more statement the "
             + "instant schedule rows cross the batch_fetch_size=50 boundary (50 vs 51 masters)")
     void should_growStatementCountByOne_whenScheduleRowsCrossTheBatchFetchSizeBoundary() throws Exception {

@@ -35,6 +35,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
@@ -59,6 +60,29 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — unit")
 class ServiceCatalogServiceTest {
 
+    /**
+     * The authenticated actor id every service call under test is invoked with.
+     * {@code authz} is a mock, so its {@code enforce*} guards are no-ops here — the point
+     * of a named constant is that the VERIFICATIONS below can assert the exact actor the
+     * production code passed to the authorization service (2026-09-13 audit, Q17).
+     */
+    private static final UUID ACTOR_ID = UUID.fromString("0000ac70-0000-4000-8000-000000000001");
+
+    /** The page the controller supplies by default (@PageableDefault(size = 200)) — P7. */
+    private static final Pageable DEFAULT_PAGE = PageRequest.of(0, 200);
+
+    // ── Constructor-wiring collaborators (2026-09-13 audit, Q19) ────────────────────────────────
+    //
+    // Some of the mocks below are never stubbed and never verified by this file. That is NOT dead
+    // weight and they must NOT be deleted: ServiceCatalogService is @RequiredArgsConstructor, so a
+    // missing @Mock makes Mockito inject NULL for that parameter (and a missing @MockBean makes the
+    // Spring context fail to start). An inert mock returns a default; a null NPEs the moment any
+    // future test reaches the collaborator. The audit's own S1 fix proved this the hard way — adding
+    // the AuthorizationService guard to the bulk path NPE'd every salon-branch test in
+    // ServiceCatalogServiceBulkCreateTest because that file had no authz mock at all.
+    //
+    // The ONE genuinely removable case was MasterCachePrefixEvictor: it was a never-read field on
+    // the PRODUCTION class too, so the fix was deleting the constructor parameter, not the mock.
     @Mock
     private ServiceRepository serviceRepository;
 
@@ -100,13 +124,6 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
-
-    // Prefix-eviction fix: doEvictAvailableSlots now delegates to the shared evictor, so @InjectMocks
-    // must have one to wire or deactivateServiceDefinition NPEs. A mock is right at this tier — it
-    // asserts the write path REQUESTS eviction; that the request matches a real cache key is proven
-    // against the live @Cacheable proxy in CachePrefixEvictionKeyShapeTest.
-    @Mock
-    private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
 
     // Phase 307 D4 — unassignServiceFromMaster's per-assignment future-CONFIRMED-booking guard.
     // Only the unassign tests below stub these; every other test in this class throws (or
@@ -851,7 +868,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.existsById(masterId)).thenReturn(false);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId))
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Master not found")
                 .hasMessageContaining(masterId.toString());
@@ -870,7 +887,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.existsById(masterId)).thenReturn(true);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId))
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("No active assignment")
                 .satisfies(ex -> assertThat(ex.getMessage())
@@ -921,7 +938,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(Optional.of(assignment));
 
         assertThatThrownBy(() ->
-                serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId))
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("does not belong to this salon");
     }
@@ -958,7 +975,7 @@ class ServiceCatalogServiceTest {
         when(bookingRepository.countConfirmedFutureByMasterServiceId(
                 eq(masterId), eq(assignmentId), any())).thenReturn(0L);
 
-        serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId);
+        serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId);
 
         verify(masterServiceRepository, times(1))
                 .findByMasterIdAndServiceDefinitionId(masterId, serviceDefId);
@@ -1109,9 +1126,9 @@ class ServiceCatalogServiceTest {
      * changing the price the client is quoted.
      */
     @Test
-    @DisplayName("getMasterServices masks priceOverride for the public browse route while "
-            + "getMyServices keeps it — and the masked row still quotes the overridden price")
-    void should_maskPriceOverrideOnPublicPathOnly_when_masterHasAnOverride() {
+    @DisplayName("getMasterServices serves priceOverride UNMASKED on the public browse route, "
+            + "identically to getMyServices — S5 retired the mask that did not mask")
+    void should_servePriceOverrideUnmasked_when_masterHasAnOverride() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         BigDecimal override = new BigDecimal("700.00");
@@ -1144,88 +1161,27 @@ class ServiceCatalogServiceTest {
         MasterServiceResponse publicRow = serviceCatalogService.getMasterServices(masterId).get(0);
         MasterServiceResponse ownRow = serviceCatalogService.getMyServices(userId).get(0);
 
+        // S5 (2026-09-13 audit). The mask that used to null this field was recoverable by
+        // subtraction — the SAME response still carries effectivePrice (700) and the nested
+        // definition's priceMin (= base_price, 500), so "does this master deviate, and by how
+        // much" was answerable from the masked payload. The assertions below pin the RESOLUTION:
+        // the ineffective control is gone and the field is served, because catalogue prices on
+        // this route are public by product design.
         assertThat(publicRow.priceOverride())
-                .as("an anonymous caller must not learn that this master deviates from the salon's "
-                        + "definition price")
-                .isNull();
+                .as("S5 — the public browse no longer pretends to mask a field that was derivable "
+                        + "from effectivePrice minus the nested definition's priceMin")
+                .isEqualByComparingTo(override);
         assertThat(publicRow.effectivePrice())
-                .as("masking must not change what the client is quoted — the override is still "
-                        + "APPLIED, it is merely not itemised")
+                .as("the override is APPLIED, exactly as before — this never depended on the mask")
                 .isEqualByComparingTo(override);
+        assertThat(publicRow.serviceDefinition().priceMin())
+                .as("the non-vacuity of this test: base_price is ALSO on the public row, which is "
+                        + "precisely why masking priceOverride alone controlled nothing")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
         assertThat(ownRow.priceOverride())
-                .as("the master's own authenticated view keeps the field")
+                .as("the master's own authenticated view is unchanged — and now identical to the "
+                        + "public one for this field")
                 .isEqualByComparingTo(override);
-    }
-
-    /**
-     * {@code fromPublic} is a 15-argument POSITIONAL copy constructor: it must null out
-     * {@code priceOverride} and copy the other 14 fields VERBATIM. That shape is exactly where a
-     * transposition of two adjacent same-typed arguments (e.g. swapping {@code priceMin} and
-     * {@code priceMax}, or {@code serviceTypeNameUk} and {@code serviceTypeSlug}) compiles cleanly
-     * and passes any assertion that reuses the same value across fields — it is only caught by
-     * asserting every field with a value distinct from its siblings.
-     *
-     * <p>We use AssertJ's recursive comparison instead of 14 {@code extracting(...)} calls for two
-     * reasons: (1) it is future-proof — a 16th field added to the record is covered automatically,
-     * with no test change required, and (2) it directly detects a transposition, because two
-     * same-typed adjacent fields holding swapped (but otherwise valid-looking) values will fail the
-     * per-field equality check that field-by-field extraction could be written to miss if the
-     * assertions were copy-pasted with the wrong accessor.
-     */
-    @Test
-    @DisplayName("fromPublic preserves every field verbatim except priceOverride, which is masked to null")
-    void should_preserveEveryFieldExceptPriceOverride_when_fromPublicIsApplied() {
-        ServiceDefinitionResponse nestedServiceDefinition = new ServiceDefinitionResponse(
-                UUID.randomUUID(),
-                "Класичний манікюр",
-                "Аппаратний манікюр з покриттям гель-лак",
-                "NAILS",
-                45,
-                10,
-                true,
-                UUID.randomUUID(),
-                "Манікюр класичний",
-                "manicure-classic",
-                "https://cdn.beautica.example/photos/manicure-classic.jpg",
-                PriceType.FIXED,
-                new BigDecimal("500.00"),
-                new BigDecimal("600.00"),
-                "500.00 ₴",
-                null
-        );
-
-        MasterServiceResponse full = new MasterServiceResponse(
-                UUID.randomUUID(),
-                UUID.randomUUID(),
-                nestedServiceDefinition,
-                new BigDecimal("111.11"),
-                15,
-                new BigDecimal("222.22"),
-                30,
-                true,
-                PriceType.RANGE,
-                new BigDecimal("333.33"),
-                new BigDecimal("444.44"),
-                "від 333.33 до 444.44 ₴",
-                UUID.randomUUID(),
-                "Манікюр",
-                "manicure",
-                null
-        );
-
-        MasterServiceResponse masked = MasterServiceResponse.fromPublic(full);
-
-        assertThat(masked)
-                .as("every field other than priceOverride must survive fromPublic unchanged — "
-                        + "a recursive comparison catches both dropped fields and transposed "
-                        + "same-typed arguments that a partial field-by-field assertion could miss")
-                .usingRecursiveComparison()
-                .ignoringFields("priceOverride")
-                .isEqualTo(full);
-        assertThat(masked.priceOverride())
-                .as("priceOverride is provider-internal bookkeeping and must be masked to null on "
-                        + "the anonymous browse route regardless of every other field surviving intact")
-                .isNull();
     }
 
     // ── getMyServices ───────────────────────────────────────────────────────────
@@ -1339,7 +1295,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(List.of(assignment));
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).priceOverride())
@@ -1372,7 +1328,7 @@ class ServiceCatalogServiceTest {
         // Mockito default Optional.empty() correctly represents "not the actor's own row".
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId))
+        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE))
                 .isInstanceOf(ForbiddenException.class);
 
         verify(masterRepository).findByIdWithUserAndSalon(masterId);
@@ -1422,7 +1378,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(List.of(assignment));
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
 
         assertThat(result).hasSize(1);
         assertThat(result.get(0).priceOverride())
@@ -1451,7 +1407,7 @@ class ServiceCatalogServiceTest {
         when(authz.masterBelongsToSalon(masterId, foreignSalonId)).thenReturn(false);
 
         assertThatThrownBy(() ->
-                serviceCatalogService.getSalonMasterServices(actorId, foreignSalonId, masterId))
+                serviceCatalogService.getSalonMasterServices(actorId, foreignSalonId, masterId, DEFAULT_PAGE))
                 .isInstanceOf(ForbiddenException.class);
 
         verify(masterServiceRepository, never())
@@ -1476,7 +1432,7 @@ class ServiceCatalogServiceTest {
         // red). This test still pins the NotFoundException contract and the short-circuit below.
         when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(false);
 
-        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId))
+        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining(masterId.toString());
 
@@ -1540,7 +1496,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(capacityAssignments);
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
 
         assertThat(result).hasSize(200);
 
@@ -1570,7 +1526,7 @@ class ServiceCatalogServiceTest {
                 .thenReturn(belowCapAssignments);
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId);
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
 
         assertThat(result).hasSize(199);
 
@@ -1632,6 +1588,25 @@ class ServiceCatalogServiceTest {
 
         verify(serviceRepository).deactivateById(serviceDefId);
         verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Q20: a definition no master performs SKIPS the bulk min_effective_price refresh "
+            + "entirely — the affectedMasterIds.isEmpty() guard had no never-verification")
+    void should_skipMinEffectivePriceRefresh_when_noMasterPerformsTheDefinition() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        // No master performs it — the branch the guard exists for.
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of());
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
+
+        verify(serviceRepository).deactivateById(serviceDefId);
+        verify(masterRepository, never()).refreshMinEffectivePriceForAll(any());
+        verify(masterRepository, never()).refreshMinEffectivePrice(any());
     }
 
     @Test

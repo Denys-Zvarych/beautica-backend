@@ -44,6 +44,7 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
@@ -82,15 +83,6 @@ public class ServiceCatalogService {
      */
     private static final String DUPLICATE_SERVICE_INDEX = "ux_service_def_owner_service_type_active";
 
-    /**
-     * Page cap for {@link #getSalonMasterServices(UUID, UUID, UUID)} — matches the established,
-     * unnamed {@code 200} literal on the sibling reads {@link #getMyServices} and
-     * {@link #getMasterServices(UUID)}. Named here only so the boundary check in
-     * {@code getSalonMasterServices} has a single source of truth; the sibling methods are out of
-     * scope for this constant (Phase 309 audit-fix LOW-1) and keep their own literals.
-     */
-    private static final int SALON_MASTER_SERVICES_PAGE_CAP = 200;
-
     private final ServiceRepository serviceRepository;
     private final MasterServiceRepository masterServiceRepository;
     private final SalonRepository salonRepository;
@@ -103,13 +95,16 @@ public class ServiceCatalogService {
     private final ServiceTypeSearchService serviceTypeSearchService;
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
-    // Phase 307 MEDIUM-3 (perf audit) retired this class's only synchronous, direct-call use
-    // (evictAvailableSlotsCache/doEvictAvailableSlots) — the off-thread sweep behind
+    // NOTE (2026-09-13 audit, Q18/Q19): the MasterCachePrefixEvictor collaborator that used to sit
+    // here is GONE. Phase 307 MEDIUM-3 retired this class's only synchronous, direct-call use of it
+    // (evictAvailableSlotsCache / doEvictAvailableSlots) — the off-thread sweep behind
     // evictBookableFutureSlotsCache already covers "available-slots" as a superset
-    // (SlotCalculationService#BOOKING_WRITE_CACHES). Left wired rather than removed: deleting the
-    // constructor parameter ripples into every @InjectMocks/@SpringBootTest construction site of
-    // this class across the test suite for no behavioural gain, out of scope for this fix.
-    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    // (SlotCalculationService#BOOKING_WRITE_CACHES) — after which the field was a never-read
+    // @RequiredArgsConstructor parameter kept only to avoid touching construction sites. It was
+    // also the ONE dead test mock that genuinely could not be deleted on its own (removing it under
+    // @InjectMocks injects null for the parameter), so deleting the parameter itself is what
+    // actually resolves it. Do not re-add it: an eviction this class needs goes through
+    // evictBookableFutureSlotsCache, not a second synchronous keyset scan on the committing thread.
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
@@ -356,6 +351,16 @@ public class ServiceCatalogService {
         BigDecimal floorAfter = ServicePricing.effectivePriceOf(assignment);
         Integer durationAfter = assignment.getDurationOverrideMinutes();
 
+        // S4 (2026-09-13 audit) — a SALON_MASTER may write this row (Phase 311 D5, deliberate), and
+        // the write immediately moves PUBLIC state: the salon-catalogue price hull and, when the
+        // floor moves, masters.min_effective_price (the search band). Without this line there is no
+        // record of WHICH actor moved a salon's advertised price. IDs and numbers only — this
+        // endpoint carries no free text and no PII, and none may be added here (§I).
+        log.info("master service band changed actor={} salon={} master={} serviceDef={} "
+                        + "floor {}->{} duration {}->{}",
+                actorId, salonId, masterId, serviceDefId,
+                floorBefore, floorAfter, durationBefore, durationAfter);
+
         // D11 — always: the band or duration may have changed what these caches serve.
         evictMasterServicesCache(List.of(masterId));
         evictSalonCatalogAfterCommit(salonId);
@@ -425,7 +430,15 @@ public class ServiceCatalogService {
      * @throws BusinessException  (409) if a future CONFIRMED booking exists for this assignment
      */
     @Transactional
-    public void unassignServiceFromMaster(UUID salonId, UUID masterId, UUID serviceDefId) {
+    public void unassignServiceFromMaster(UUID actorId, UUID salonId, UUID masterId, UUID serviceDefId) {
+
+        // Defense-in-depth (2026-09-13 audit, S1) — re-prove the controller's
+        // @PreAuthorize("@authz.canManageSalon(...)") gate from the caller-supplied actorId before
+        // loading anything, exactly as updateMasterServiceBand / deactivateServiceDefinition /
+        // getSalonMasterServices already do. The tenant re-checks below (master -> salon,
+        // definition -> salon) validate the OBJECT; this validates the ACTOR, and only the SpEL
+        // gate did that until now.
+        authz.enforceCanManageSalon(actorId, salonId);
 
         // MEDIUM-1/2 (Phase-307 perf audit) — one JOIN-FETCH query resolves the assignment AND its
         // master AND its service definition together, so the happy path costs ONE round trip
@@ -631,9 +644,13 @@ public class ServiceCatalogService {
      */
     @Transactional
     public List<MasterServiceResponse> bulkCreateSalonMasterServices(
+            UUID actorId,
             UUID salonId,
             UUID masterId,
             BulkCreateServicesRequest request) {
+
+        // Defense-in-depth (2026-09-13 audit, S1) — see unassignServiceFromMaster for the rationale.
+        authz.enforceCanManageSalon(actorId, salonId);
 
         Master master = masterRepository.findById(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
@@ -787,11 +804,20 @@ public class ServiceCatalogService {
             reactivateAssignmentIdByTypeId = Map.of();
         }
 
+        // PERF (2026-09-13 audit, P1/P4): resolve EVERY reactivation target in ONE findAllById
+        // before the per-item walk. createSingleFromBulkItem used to call
+        // masterServiceRepository.findById(reactivateAssignmentId) per item — up to 100 serialized
+        // SELECTs, all of them inside the salon-keyed advisory lock, for rows the caller already
+        // knew the ids of. The per-item walk is back to O(0) queries, which is what
+        // createSingleFromBulkItem's own javadoc has always claimed.
+        Map<UUID, MasterServiceAssignment> reactivateAssignmentByTypeId =
+                loadReactivationTargets(reactivateAssignmentIdByTypeId);
+
         List<MasterServiceResponse> created = request.items().stream()
                 .map(item -> createSingleFromBulkItem(
                         master, ownerType, ownerId, item, typesById.get(item.serviceTypeId()),
                         reusableByTypeId.get(item.serviceTypeId()),
-                        reactivateAssignmentIdByTypeId.get(item.serviceTypeId())))
+                        reactivateAssignmentByTypeId.get(item.serviceTypeId())))
                 .toList();
 
         // Push the whole batch to the DB in one go, translating a V121 violation exactly as the
@@ -956,9 +982,11 @@ public class ServiceCatalogService {
      * @param reusable               the salon's existing active definition for this service type,
      *                               or {@code null} to create one (always {@code null} on the
      *                               INDEPENDENT_MASTER branch)
-     * @param reactivateAssignmentId the master's own INACTIVE {@code master_services} row id for
+     * @param reactivateAssignment   the master's own INACTIVE {@code master_services} row for
      *                               {@code reusable}, or {@code null} to insert a fresh assignment
-     *                               (always {@code null} when {@code reusable} is {@code null})
+     *                               (always {@code null} when {@code reusable} is {@code null}).
+     *                               Pre-loaded in ONE batch by {@link #loadReactivationTargets};
+     *                               this method must do no I/O of its own (2026-09-13 audit, P1)
      */
     private MasterServiceResponse createSingleFromBulkItem(
             Master master,
@@ -967,13 +995,11 @@ public class ServiceCatalogService {
             BulkServiceItemRequest item,
             ServiceType serviceType,
             @Nullable ServiceDefinition reusable,
-            @Nullable UUID reactivateAssignmentId) {
+            @Nullable MasterServiceAssignment reactivateAssignment) {
 
         if (reusable != null) {
-            if (reactivateAssignmentId != null) {
-                MasterServiceAssignment existing = masterServiceRepository.findById(reactivateAssignmentId)
-                        .orElseThrow(() -> new IllegalStateException(
-                                "Reactivation candidate vanished mid-transaction: " + reactivateAssignmentId));
+            if (reactivateAssignment != null) {
+                MasterServiceAssignment existing = reactivateAssignment;
                 // Avoid a lazy load of existing.serviceDefinition: reusable is the same row,
                 // already hydrated by findSalonBulkSetupCandidates in this transaction.
                 existing.setServiceDefinition(reusable);
@@ -1078,18 +1104,18 @@ public class ServiceCatalogService {
         // redundant DB round-trip because the JOIN FETCH graph query already returns
         // nothing for a non-existent master.
         //
-        // fromPublic masks priceOverride: this method backs ONLY the permitAll browse route
-        // (ServiceController#getMasterServices), so an anonymous caller must not learn whether a
-        // master prices away from their salon's definition. Masking happens INSIDE the cached
-        // method on purpose — the "masterServices" cache is populated by, and read by, this public
-        // path alone, so the cache holds the already-masked shape and no authenticated path can
-        // pick up a masked entry. The provider's own view goes through getMyServices, which is
-        // uncached and keeps the full variant.
+        // No masking (2026-09-13 audit, S5). This method backs ONLY the permitAll browse route
+        // (ServiceController#getMasterServices) and used to run MasterServiceResponse.fromPublic to
+        // null priceOverride for an anonymous caller. That mask was ineffective and has been
+        // retired: the same row still carries effectivePrice = COALESCE(priceOverride, base_price)
+        // and the nested definition's priceMin = base_price, so the "hidden" value was recoverable
+        // by subtraction — see MasterServiceResponse's retirement note for why the resolution is to
+        // drop the claim rather than the fields the client consumes. Catalogue prices on this route
+        // are public by product design.
         return masterServiceRepository
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
-                .map(MasterServiceResponse::fromPublic)
                 .toList();
     }
 
@@ -1176,7 +1202,8 @@ public class ServiceCatalogService {
      * @throws NotFoundException  if {@code masterId} does not exist, or exists in a different salon
      */
     @Transactional(readOnly = true)
-    public List<MasterServiceResponse> getSalonMasterServices(UUID actorId, UUID salonId, UUID masterId) {
+    public List<MasterServiceResponse> getSalonMasterServices(
+            UUID actorId, UUID salonId, UUID masterId, Pageable pageable) {
         // Perf MEDIUM (2026-09-11): masterBelongsToSalon(masterId, salonId) and the D3 check below
         // are the SAME existsByIdAndSalonId predicate. On the own-row branch we already prove it
         // here — capture the result and reuse it for D3 instead of re-querying. Stays null (and D3
@@ -1204,23 +1231,26 @@ public class ServiceCatalogService {
             throw new NotFoundException("Master not found: " + masterId);
         }
 
-        // Cap matches the sibling reads (getMyServices:944, getMasterServices:917) — this is the
-        // established pattern for this repository method, not a decision this phase makes.
-        // Switching to a real Pageable (caller-supplied page/size) is a separate, broader change.
-        // What IS this phase's concern: the cap is otherwise silent. If a master ever has more
-        // than SALON_MASTER_SERVICES_PAGE_CAP active services, this management view would
-        // truncate without any signal, so flag the boundary loudly instead of leaving it mute.
+        // ADDITIVE pagination (2026-09-13 audit, P7). This used to hard-code
+        // PageRequest.of(0, SALON_MASTER_SERVICES_PAGE_CAP) and log.warn on exact-cap — truncation
+        // was DETECTED but never ESCAPABLE. The controller now supplies a Pageable defaulting to
+        // that same size, so every existing caller is byte-identical while a caller who does hit
+        // the cap can page past it. The warn is kept and — since the cycle-2 audit (B10) — genuinely
+        // narrowed to the first page by a `pageNumber == 0` gate: it flags the boundary for a
+        // client that is not paging, and stays silent for one that is. Until B10 the comment
+        // claimed that narrowing and the code had no gate at all, so a legitimate client paging
+        // with ?size=50 logged a warning on every full page.
         List<MasterServiceResponse> services = masterServiceRepository
-                .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, SALON_MASTER_SERVICES_PAGE_CAP))
+                .findByMasterIdAndIsActiveTrueWithGraph(masterId, pageable)
                 .stream()
                 .map(MasterServiceResponse::from)
                 .toList();
 
-        if (services.size() == SALON_MASTER_SERVICES_PAGE_CAP) {
+        if (pageable.getPageNumber() == 0 && services.size() == pageable.getPageSize()) {
             log.warn(
-                    "getSalonMasterServices returned exactly the {} row cap for salonId={} "
-                            + "masterId={} — result may be silently truncated",
-                    SALON_MASTER_SERVICES_PAGE_CAP, salonId, masterId);
+                    "getSalonMasterServices returned exactly the {} row page size for salonId={} "
+                            + "masterId={} page={} — a non-paging client may be truncated",
+                    pageable.getPageSize(), salonId, masterId, pageable.getPageNumber());
         }
 
         return services;
@@ -2076,6 +2106,43 @@ public class ServiceCatalogService {
         Map<UUID, ServiceDefinition> reusableByTypeId = reusableSalonDefinitions(candidates);
         Map<UUID, UUID> reactivateAssignmentIdByTypeId = reactivatableAssignmentIdByTypeId(candidates);
         return new SalonBulkCandidateResolution(reusableByTypeId, reactivateAssignmentIdByTypeId);
+    }
+
+    /**
+     * Phase 307 D6 + 2026-09-13 audit P1 — resolves every reactivation target in ONE
+     * {@code findAllById}, keyed back by service-type id for the per-item walk.
+     *
+     * <p>{@link #createSingleFromBulkItem} previously issued {@code findById} per item, inside the
+     * salon-keyed advisory lock, for ids the caller had already projected. A 100-item batch where
+     * every item is a reactivation therefore held that salon-wide lock across 100 serialized
+     * round-trips. One batched read replaces them.
+     *
+     * <p>A missing row is the same {@link IllegalStateException} the per-item lookup raised: the
+     * ids come from {@code findSalonBulkSetupCandidates} inside this very transaction, so a gap
+     * means the row vanished mid-transaction and the batch must not silently insert a duplicate
+     * against {@code master_services}' non-partial {@code UNIQUE (master_id, service_def_id)}.
+     */
+    private Map<UUID, MasterServiceAssignment> loadReactivationTargets(
+            Map<UUID, UUID> reactivateAssignmentIdByTypeId) {
+
+        if (reactivateAssignmentIdByTypeId.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
+                .findAllById(reactivateAssignmentIdByTypeId.values()).stream()
+                .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
+
+        Map<UUID, MasterServiceAssignment> byTypeId = new LinkedHashMap<>();
+        reactivateAssignmentIdByTypeId.forEach((typeId, assignmentId) -> {
+            MasterServiceAssignment assignment = byId.get(assignmentId);
+            if (assignment == null) {
+                throw new IllegalStateException(
+                        "Reactivation candidate vanished mid-transaction: " + assignmentId);
+            }
+            byTypeId.put(typeId, assignment);
+        });
+        return byTypeId;
     }
 
     /**

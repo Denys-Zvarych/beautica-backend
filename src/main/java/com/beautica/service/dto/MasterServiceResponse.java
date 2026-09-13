@@ -144,45 +144,28 @@ public record MasterServiceResponse(
     }
 
     /**
-     * Masked variant for the {@code permitAll} browse route
-     * ({@code GET /masters/&#123;masterId&#125;/services}), mirroring the
-     * {@code MasterDetailResponse#fromPublic} precedent.
+     * <b>RETIRED (2026-09-13 audit, S5): there is no masked public variant any more.</b>
      *
-     * <p><b>What is stripped and why.</b> {@code priceOverride} is a PROVIDER-INTERNAL bookkeeping
-     * field: it is non-null exactly when this master charges something other than the salon's
-     * definition price, so serving it raw to an anonymous caller discloses whether — and by how
-     * much — a master deviates from their salon's list price. That is commercially sensitive and
-     * has no consumer: the discovery flow prices off {@code effectivePrice} (the
-     * {@code COALESCE(priceOverride, base_price)} floor) and renders bands off
-     * {@code priceMin}/{@code priceMax}/{@code priceDisplay}, all of which are retained here. The
-     * masked field is the only one dropped; nothing else about the row changes.
+     * <p>{@code fromPublic} used to null {@code priceOverride} on the {@code permitAll} browse
+     * route ({@code GET /masters/&#123;masterId&#125;/services}), calling it "commercially
+     * sensitive". <b>The control did not control.</b> The same response kept {@code effectivePrice}
+     * — {@code COALESCE(priceOverride, base_price)} — and the nested
+     * {@link ServiceDefinitionResponse#priceMin()}, which IS {@code base_price}. Any anonymous
+     * caller recovered the masked value, and its deviation from the salon's list price, by
+     * subtraction. Phase 311 widened the leak further: {@code priceType} and {@code priceMax} now
+     * carry the master's OWN band on the same public route.
      *
-     * <p><b>Wire compatibility.</b> {@code priceOverride} is already absent from the vast majority
-     * of responses today — any master who has NOT set an override serialises it as null — and it
-     * is not a required property in the generated OpenAPI schema. Masking therefore emits a shape
-     * clients already handle, and does not alter the schema: the property stays declared and
-     * optional, only the runtime value becomes absent on this one anonymous route. Authenticated
-     * routes ({@code GET /masters/me/services} and every write path) keep the full
-     * {@link #from} variant, so a provider still sees their own override.
+     * <p>The contradiction is resolved in the direction the product already settled: a salon's
+     * catalogue prices, per master, ARE public — that is what the discovery and booking flows
+     * render, and the salon-search price band
+     * ({@code SalonSearchSql}'s {@code pr} lateral) publishes the same numbers to unauthenticated
+     * callers anyway. So the ineffective mask and its confidentiality claim are gone rather than
+     * kept as a guarantee that does not hold. Fields the mobile client consumes are all retained.
+     *
+     * <p><b>Do not re-add a partial mask here.</b> A mask on this DTO is only meaningful if it
+     * also removes {@code effectivePrice} and the nested definition band, which the client needs;
+     * "hide one derivable field" is theatre, and shipping it as a security control is worse than
+     * shipping neither. If public price visibility ever becomes a product question, it is a
+     * question about the ROUTE, not about one field on this record.
      */
-    public static MasterServiceResponse fromPublic(MasterServiceResponse full) {
-        return new MasterServiceResponse(
-                full.id(),
-                full.masterId(),
-                full.serviceDefinition(),
-                null,             // priceOverride — provider-internal, masked for anonymous callers
-                full.durationOverrideMinutes(),
-                full.effectivePrice(),
-                full.effectiveDurationMinutes(),
-                full.isActive(),
-                full.priceType(),
-                full.priceMin(),
-                full.priceMax(),
-                full.priceDisplay(),
-                full.serviceTypeId(),
-                full.serviceTypeNameUk(),
-                full.serviceTypeSlug(),
-                full.isFavorite()   // passed through verbatim, never hardcoded — see field javadoc
-        );
-    }
 }

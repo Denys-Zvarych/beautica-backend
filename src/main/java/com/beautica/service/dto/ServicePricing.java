@@ -106,15 +106,6 @@ public record ServicePricing(
     }
 
     /**
-     * The override-aware duration ALONE —
-     * {@code COALESCE(durationOverrideMinutes, baseDurationMinutes)}. Companion to
-     * {@link #effectivePriceOf}; see its javadoc for why the band-free variant exists.
-     */
-    public static int effectiveDurationMinutesOf(MasterServiceAssignment msa) {
-        return effectiveDurationMinutes(msa.getServiceDefinition(), msa.getDurationOverrideMinutes());
-    }
-
-    /**
      * The one implementation of Phase 311 D9's resolution rule. {@code priceTypeOverride == null}
      * (a bare definition via {@link #ofDefinition}, or an Inherited assignment) resolves every
      * component from {@code sd}; a non-null override resolves {@code priceType} and

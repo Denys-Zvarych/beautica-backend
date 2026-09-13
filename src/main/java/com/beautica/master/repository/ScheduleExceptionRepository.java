@@ -60,9 +60,14 @@ public interface ScheduleExceptionRepository extends JpaRepository<ScheduleExcep
      * incidental row order, for the same reason the sibling {@code WeeklySchedule} query is — batching
      * interleaves rows across masters, and an unordered query gives no guarantee about which duplicate
      * physically arrives first. The single-master finder above is intentionally left untouched.
+     *
+     * <p><b>No {@code DISTINCT}</b> — same reasoning as
+     * {@code WeeklyScheduleRepository#findOverlappingRangeWithIntervalsByMasterIds}: Hibernate 6
+     * de-duplicates fetched roots itself, while an HQL {@code distinct} reaches SQL verbatim and
+     * makes Postgres hash/sort the whole override x interval cartesian to remove nothing.
      */
     @Query("""
-            SELECT DISTINCT se FROM ScheduleException se
+            SELECT se FROM ScheduleException se
             LEFT JOIN FETCH se.intervals
             WHERE se.master.id IN :masterIds
               AND se.date BETWEEN :from AND :to

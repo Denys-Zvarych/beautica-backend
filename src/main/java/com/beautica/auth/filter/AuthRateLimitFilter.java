@@ -764,13 +764,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // for the sizing.
         //
         // The salon half is matched via isSalonCatalogueServicesPath rather than a bare
-        // prefix+suffix check, specifically so it does NOT also catch
-        // GET /api/v1/salons/{salonId}/masters/{masterId}/services (Phase 309's authenticated
-        // salon-management read, which shares the same "/api/v1/salons/" + "/services" prefix and
-        // suffix but has TWO path variables, not one) — that route stays the documented
-        // accepted-risk exception on RateLimitConfig#serviceWriteCapacity, unthrottled like every
-        // other authenticated GET on ServiceController. The master half needs no such helper:
-        // no other route under MASTER_AVAILABILITY_PATH_PREFIX ends in "/services".
+        // prefix+suffix check, because the THIRD route living at this prefix+suffix —
+        // GET /api/v1/salons/{salonId}/masters/{masterId}/services (Phase 309/310's salon-management
+        // read, TWO path variables not one) — is matched by its own named helper below. The master
+        // half needs no such helper: no other route under MASTER_AVAILABILITY_PATH_PREFIX ends in
+        // "/services".
+        //
+        // 2026-09-13 audit (P5/S3): the management read
+        // GET /api/v1/salons/{salonId}/masters/{masterId}/services is no longer the "accepted
+        // risk" exception it was documented as on RateLimitConfig#serviceWriteCapacity — but it is
+        // NOT throttled here. Cycle 1 routed it into catalogueBrowseBuckets, an ANONYMOUS per-IP
+        // bucket; under carrier-grade NAT (the norm on Ukrainian mobile networks) the aggregate
+        // anonymous browse traffic leaving one egress IP would then 429 a salon owner's management
+        // UI (cycle-2 audit, B8). It is an AUTHENTICATED route, so it belongs on a per-PRINCIPAL
+        // bucket, and this filter runs BEFORE JwtAuthenticationFilter — the principal does not
+        // exist yet here. It is therefore throttled by BookingRateLimitFilter, which runs AFTER
+        // the JWT filter and is the app's only per-authenticated-user Bucket4j mechanism (the same
+        // reason DELETE /api/v1/users/me lives there), against its own salonMasterServicesRead
+        // bucket at the same 60/min capacity.
         if (HttpMethod.GET.matches(method)
                 && (isSalonCatalogueServicesPath(path)
                         || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
@@ -1066,6 +1077,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 path.length() - SALON_SINGLE_SERVICE_SUFFIX.length());
         return !middle.isEmpty() && middle.indexOf('/') < 0;
     }
+
 
     private void applyRateLimit(HttpServletRequest request,
                                 HttpServletResponse response,

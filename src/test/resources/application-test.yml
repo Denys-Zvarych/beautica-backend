@@ -34,6 +34,10 @@ app:
     # rate-limited — production default stays the tight 60/60s in RateLimitConfig. Mirrors
     # service-write-capacity's reasoning exactly (same "60-second-long PASS masking a 429" trap).
     catalogue-browse-capacity: 100000
+    # Same reasoning, for the AUTHENTICATED salon-management read now keyed on the principal
+    # (cycle-2 audit, B8): ITs drive many real GETs as one owner token, which would otherwise
+    # exhaust that user's 60/min bucket.
+    salon-master-services-read-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000

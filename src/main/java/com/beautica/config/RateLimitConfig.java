@@ -58,10 +58,13 @@ public class RateLimitConfig {
      * (Phase 309's authenticated salon-management read) — that route stays the documented
      * ACCEPTED RISK on {@link #serviceWriteCapacity}'s javadoc, unthrottled like every other
      * authenticated GET in this class. It is a different route (4 path segments after
-     * {@code /salons/}, not 2) reachable only by an already-authorized SALON_OWNER/SALON_ADMIN
-     * for their own salon, not the anonymous catalogue read this bucket protects — see
+     * {@code /salons/}, not 2) reachable only by an already-authorized SALON_OWNER/SALON_ADMIN/
+     * self-SALON_MASTER, not the anonymous catalogue read this bucket protects — see
      * {@code AuthRateLimitFilter#isSalonCatalogueServicesPath} for how the matcher tells the two
-     * apart despite both ending in the literal {@code "/services"}.
+     * apart despite both ending in the literal {@code "/services"}. It has its OWN per-principal
+     * bucket, {@link #salonMasterServicesReadCapacity}, and must never rejoin this one: a per-IP
+     * budget shared with anonymous traffic starves authenticated tenants behind a CGNAT egress
+     * (cycle-2 audit, B8).
      *
      * <p><b>Sizing (60/min, same as {@link #slotsCapacity}).</b> Both target reads are
      * ONE-PER-PAGE-VIEW on the mobile client: opening a salon's detail page fetches its service
@@ -85,6 +88,26 @@ public class RateLimitConfig {
      */
     @Value("${app.rate-limit.catalogue-browse-capacity:60}")
     private long catalogueBrowseCapacity;
+
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) for
+     * {@code GET /api/v1/salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services} — Phase
+     * 309/310's salon-management read, consumed by {@link BookingRateLimitFilter}.
+     *
+     * <p><b>Why not {@link #catalogueBrowseCapacity} (2026-09-13 cycle-2 audit, B8).</b> Cycle 1
+     * gave this route its first bucket by pointing it at {@code catalogueBrowseBuckets}, which is
+     * keyed on the client IP and shared with two {@code permitAll} anonymous reads. Under
+     * carrier-grade NAT — the norm on Ukrainian mobile networks — every subscriber behind one
+     * egress IP draws from the same 60/min budget, so ordinary anonymous browsing could 429 a
+     * salon owner's management UI that happened to share that IP. This route is authenticated, so
+     * it is keyed on the principal instead and one tenant's traffic can no longer starve another's.
+     *
+     * <p><b>Sizing: 60/min, identical to {@code catalogueBrowseCapacity}</b> — the unit of work is
+     * unchanged (one authorization traversal plus one graph fetch of a master's active menu), only
+     * the key is. A salon owner opening a dozen staff menus in a minute uses a fifth of it.
+     */
+    @Value("${app.rate-limit.salon-master-services-read-capacity:60}")
+    private long salonMasterServicesReadCapacity;
 
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
@@ -202,36 +225,36 @@ public class RateLimitConfig {
     // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
     // management read) at this same path+suffix, but it is a read — AuthRateLimitFilter's
     // method-gated match on this prefix+suffix rule is POST-only, so the GET does NOT share
-    // this bucket and carries no rate limit of its own.
+    // this bucket.
     //
-    // ACCEPTED RISK, not an oversight (2026-09-10, Phase 309 audit-fix cycle 1, LOW-2). This GET
-    // is deliberately left unthrottled, consistent with EVERY other authenticated GET on
-    // ServiceController and across the codebase generally. Despite this class's name,
-    // AuthRateLimitFilter's buckets are an enumerated allow-list of specific mutation
-    // endpoints (POST/PATCH/DELETE, identified above by path+method) plus a handful of
-    // named authenticated READS with a documented abuse story of their own (e.g. slotsBuckets
-    // for /working-days + /slots) — it is NOT a blanket limiter for all authenticated traffic,
-    // and there is no general per-IP or per-principal limiter that authenticated GETs fall
-    // back to by default. Adding a one-off bucket to only this route would be inconsistent
-    // with that convention and is a broader "should authenticated reads be throttled at all"
-    // decision than this phase owns.
+    // IT IS NO LONGER UNTHROTTLED (2026-09-13 audit, P5/S3). It used to be carried here as an
+    // ACCEPTED RISK (2026-09-10, Phase 309 audit-fix cycle 1, LOW-2) on two stated grounds, and
+    // BOTH have since become false:
     //
-    // Trusted callers: only SALON_OWNER or SALON_ADMIN for the target salonId — both gated by
-    // @PreAuthorize's role check + @authz.canManageSalon, so an unauthenticated or
-    // wrong-salon caller never reaches the read regardless of rate.
+    //   (a) "Trusted callers: only SALON_OWNER or SALON_ADMIN for the target salonId — both gated
+    //       by @PreAuthorize's role check + @authz.canManageSalon." Factually wrong since Phase
+    //       310: the gate is @authz.canReadSalonMasterServices, not canManageSalon, and it
+    //       deliberately admits the SALON_MASTER whose own masters row is {masterId}.
+    //   (b) "What would flip this decision: ... this route (or its authorization predicate) ever
+    //       opening to a less-trusted role than SALON_OWNER/SALON_ADMIN, e.g. exposing it to
+    //       SALON_MASTER." That is precisely what (a) describes, so the acceptance's own
+    //       flip-condition had already fired and the acceptance had lapsed.
     //
-    // What would flip this decision: (a) observed abuse/scraping against this route in
-    // production logs or an incident, or (b) this route (or its authorization predicate) ever
-    // opening to a less-trusted role than SALON_OWNER/SALON_ADMIN, e.g. exposing it to
-    // SALON_MASTER or removing the canManageSalon check. Either should reopen this as a
-    // dedicated finding, not be silently patched in here.
+    // The route therefore now consumes salonMasterServicesReadBuckets (see
+    // salonMasterServicesReadCapacity), matched in BookingRateLimitFilter — NOT here, and NOT in
+    // catalogueBrowseBuckets. Cycle 1 of the audit-fix put it in catalogueBrowseBuckets, which is
+    // keyed on the client IP and shared with two permitAll anonymous reads; under carrier-grade NAT
+    // (the norm on Ukrainian mobile networks) anonymous browse traffic from one egress IP could
+    // exhaust that budget and 429 a salon owner's management UI behind the same address (cycle-2
+    // audit, B8). The route is authenticated, so it is keyed on the PRINCIPAL, at the same 60/min
+    // capacity; AuthRateLimitFilter runs before JwtAuthenticationFilter and has no principal to key
+    // on, which is why the bucket lives in the per-user filter alongside DELETE /api/v1/users/me.
     //
     // Listed here only so this inventory stays truthful about every route living at this path.
     //
     // Phase 314 audit added catalogueBrowseCapacity (see that field's javadoc) for the SIBLING
-    // public reads GET /api/v1/salons/{salonId}/services and GET /api/v1/masters/{masterId}/services
-    // — deliberately NOT this route. Nothing above changes: this GET is still the accepted-risk
-    // exception it always was.
+    // public reads GET /api/v1/salons/{salonId}/services and GET /api/v1/masters/{masterId}/services;
+    // the management read above joined them in the 2026-09-13 audit-fix cycle.
     //
     // Every one of these fell through to the unmatched else/non-POST branch of
     // AuthRateLimitFilter with NO bucket at all, which undercut bulkServiceSetupCapacity's own
@@ -564,6 +587,16 @@ public class RateLimitConfig {
     @Bean
     public LoadingCache<String, Bucket> catalogueBrowseBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, catalogueBrowseCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-user bucket (see {@link #salonMasterServicesReadCapacity}) for the authenticated
+     * salon-master-services management read, consumed by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> salonMasterServicesReadBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, salonMasterServicesReadCapacity, ONE_MINUTE);
     }
 
     @Bean
@@ -973,7 +1006,8 @@ public class RateLimitConfig {
         // singletons — unambiguous by construction.
         return new BookingRateLimitFilter(
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
-                staffBookingSmsBuckets(), selfDeleteBuckets(), objectMapper);
+                staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
+                objectMapper);
     }
 
     /**

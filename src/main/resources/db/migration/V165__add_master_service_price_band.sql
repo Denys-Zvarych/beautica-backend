@@ -22,6 +22,16 @@
 -- statement has no separate "production" run to special-case, so it is written correctly the one
 -- time it runs.
 
+-- Same fail-fast pair as V164/V121/V137/V138/V141/V157, for the same reason: this migration gates
+-- application startup on Railway and touches master_services, one of the hottest tables in the
+-- schema. It takes AccessExclusiveLock TWICE (two ADD COLUMN) and then runs two VALIDATE
+-- CONSTRAINT scans over the same table, so an unbounded lock wait here stalls the deploy behind
+-- any long-running reader. lock_timeout bounds the WAIT for a lock (5s, then Flyway rolls back and
+-- the next deploy retries); statement_timeout bounds EXECUTION once a lock is granted (1min per
+-- statement — the backfill touches 48 rows locally and each VALIDATE is a single seq scan).
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '1min';
+
 -- Fail fast (mirrors V67 MEDIUM-1): abort loudly if the backfill below would leave a row that
 -- fails chk_master_service_price_mode, rather than letting VALIDATE CONSTRAINT fail with a bare
 -- constraint name and no indication of which rows or why.

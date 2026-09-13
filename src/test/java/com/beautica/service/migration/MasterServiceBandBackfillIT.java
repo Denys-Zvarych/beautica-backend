@@ -54,11 +54,6 @@ class MasterServiceBandBackfillIT {
     private static UUID rangeAssignmentId;
     private static UUID noOverrideAssignmentId;
 
-    /** Distinct service types for the illegal-band tests' throwaway definitions — see {@link #insertIllegalBand}. */
-    private static List<UUID> illegalBandTypeIds;
-    private static final java.util.concurrent.atomic.AtomicInteger ILLEGAL_BAND_TYPE_INDEX =
-            new java.util.concurrent.atomic.AtomicInteger(0);
-
     @BeforeAll
     static void migrateToV164SeedLegacyRowsThenMigrateToHead() {
         postgres = new PostgreSQLContainer<>("postgres:16-alpine");
@@ -79,8 +74,10 @@ class MasterServiceBandBackfillIT {
 
         UUID salonId = insertSalonWithOwner();
         UUID masterId = insertSalonMaster(salonId);
-        List<UUID> typeIds = resolveServiceTypeIds(10);
-        illegalBandTypeIds = typeIds.subList(3, 10);
+        // Only THREE types are reserved by name here (the three base fixtures below). The
+        // throwaway definitions insertBand() creates resolve their own unused type per call —
+        // see resolveUnusedServiceTypeId.
+        List<UUID> typeIds = resolveServiceTypeIds(3);
 
         // Case 26 fixture — a bare price_override against a FIXED definition (the ENTIRE local
         // backfill population's actual shape, 48/48 rows).
@@ -211,6 +208,72 @@ class MasterServiceBandBackfillIT {
                 .hasMessageContaining("chk_master_service_price_mode");
     }
 
+    // ── Case 31 (Q7, 2026-09-13 audit) — the documented >=(DB) / >(Java) ASYMMETRY ──────────────
+    //
+    // MasterServiceBand#isLegal uses STRICT > for a RANGE floor/ceiling; V165's
+    // chk_master_service_price_mode deliberately uses >=, mirroring chk_service_def_price_mode
+    // (V67), so the DB is the tolerant outer backstop and the application layer is strict. That
+    // asymmetry is documented in three places and was pinned by NOTHING: cases 29a/b/c cover
+    // NULL-ceiling, FIXED-with-ceiling and ceiling<floor, but no case proved the CHECK ACCEPTS a
+    // degenerate RANGE x-x row. An edit "aligning" the constraint to > would have gone green here
+    // while silently changing what the database will store.
+    //
+    // A CHECK constraint cannot be proven by a test suite — only by raw SQL, in BOTH directions.
+
+    @Test
+    @DisplayName("Case 31a (Q7): chk_master_service_price_mode ACCEPTS a degenerate RANGE x-x row "
+            + "— the DB comparison is >=, NOT the application layer's strict >")
+    void should_acceptDegenerateRangeBand_provingTheDbComparisonIsGreaterOrEqual() {
+        UUID rowId = insertBand("RANGE", new BigDecimal("500.00"), new BigDecimal("500.00"));
+
+        Map<String, Object> row = assignmentRow(rowId);
+        assertThat(row.get("price_type_override")).isEqualTo("RANGE");
+        assertThat((BigDecimal) row.get("price_override")).isEqualByComparingTo("500.00");
+        assertThat((BigDecimal) row.get("price_max_override"))
+                .as("Q7 — the row is STORABLE. No API write path produces it (Phase 312 D8 keeps "
+                        + "Java strict), but the DB must keep accepting it: tightening the CHECK to "
+                        + "> is a schema change that would reject pre-existing rows, and this test "
+                        + "is what turns that into a visible decision instead of a silent one.")
+                .isEqualByComparingTo("500.00");
+    }
+
+    @Test
+    @DisplayName("Case 31b (Q7): chk_master_service_price_type rejects a price_type_override "
+            + "literal outside {FIXED, RANGE}")
+    void should_rejectUnknownPriceTypeLiteral() {
+        Throwable thrown = catchThrowable(() ->
+                insertBand("PREMIUM", new BigDecimal("500.00"), null));
+
+        assertThat(thrown).isInstanceOf(RuntimeException.class).hasCauseInstanceOf(SQLException.class);
+        // Postgres may report EITHER constraint: chk_master_service_price_mode is a strict SUPERSET
+        // of chk_master_service_price_type — for any non-NULL price_type_override, mode already
+        // requires the literal to be 'FIXED' or 'RANGE', so no row can violate the type constraint
+        // alone. That subsumption is itself worth recording: chk_master_service_price_type is a
+        // readable, self-documenting guard rather than an independently reachable one, and this
+        // test pins that 'PREMIUM' is REFUSED by the database (which is the security property) and
+        // that it is refused by one of the two NAMED band constraints — never by a masking
+        // NOT NULL or UNIQUE violation on some other column, which is how case 30 used to pass for
+        // the wrong reason.
+        assertThat(thrown.getCause().getMessage())
+                .as("a VARCHAR(10) column accepts 'PREMIUM' happily; only a CHECK refuses it, and "
+                        + "the refusal must come from a band constraint by name")
+                .satisfiesAnyOf(
+                        m -> assertThat(m).contains("chk_master_service_price_type"),
+                        m -> assertThat(m).contains("chk_master_service_price_mode"));
+    }
+
+    @Test
+    @DisplayName("Case 31c (Q7): chk_master_service_price_type ACCEPTS a NULL price_type_override "
+            + "— non-vacuity for 31b, and the Inherited majority must stay insertable")
+    void should_acceptNullPriceTypeOverride() {
+        UUID rowId = insertBand(null, null, null);
+
+        assertThat(assignmentRow(rowId).get("price_type_override"))
+                .as("an Inherited row is the 14 260-row majority; the literal guard must not "
+                        + "reject it, or 31b would be passing because ALL values are rejected")
+                .isNull();
+    }
+
     // ── fixture helpers ──────────────────────────────────────────────────────────────────────────
 
     private static UUID insertSalonWithOwner() {
@@ -251,6 +314,32 @@ class MasterServiceBandBackfillIT {
                 UUID.class, n);
     }
 
+    /**
+     * The first active, selectable {@code service_types} row this salon has NO
+     * {@code service_definitions} row for yet — so every throwaway definition {@link #insertBand}
+     * creates lands on a distinct type and {@code UNIQUE (owner, service_type_id)} can never mask a
+     * CHECK-constraint outcome.
+     *
+     * <p><b>Replaces an order-coupled counter (2026-09-13 cycle-2 audit, B12).</b> This used to be
+     * {@code illegalBandTypeIds.get(ILLEGAL_BAND_TYPE_INDEX.getAndIncrement())} — a static
+     * {@code AtomicInteger} indexing an 11-slot pre-sliced list. That is shared mutable state across
+     * test methods: it silently couples the fixture to how many times the helper happens to be
+     * called and in what order, and adding a twelfth case would have run off the end of the slice
+     * with an {@code IndexOutOfBoundsException} in an unrelated-looking test. Deriving the type from
+     * the DATABASE's own state is order-independent, needs no budget, and says what it means.
+     */
+    private static UUID resolveUnusedServiceTypeId(UUID salonId) {
+        return jdbc.queryForObject(
+                "SELECT st.id FROM service_types st "
+                        + "JOIN platform_categories pc ON pc.name = st.platform_category_name "
+                        + "WHERE st.is_active = TRUE AND pc.active = TRUE AND pc.status = 'APPROVED' "
+                        + "  AND NOT EXISTS (SELECT 1 FROM service_definitions sd "
+                        + "                  WHERE sd.owner_type = 'SALON' AND sd.owner_id = ? "
+                        + "                    AND sd.service_type_id = st.id) "
+                        + "ORDER BY st.name_uk LIMIT 1",
+                UUID.class, salonId);
+    }
+
     private static UUID insertServiceDefinition(
             UUID salonId, UUID serviceTypeId, String priceType, BigDecimal basePrice, BigDecimal priceMax) {
         UUID id = UUID.randomUUID();
@@ -281,16 +370,31 @@ class MasterServiceBandBackfillIT {
      * exists to prove.
      */
     private static void insertIllegalBand(String priceTypeOverride, BigDecimal priceOverride, BigDecimal priceMaxOverride) {
+        insertBand(priceTypeOverride, priceOverride, priceMaxOverride);
+    }
+
+    /**
+     * Inserts ONE {@code master_services} row with the given band, against a FRESH
+     * {@code service_definitions} row so {@code UNIQUE (master_id, service_def_id)} can never mask
+     * (or fake) a CHECK-constraint outcome. Returns the new row's id; throws whatever the driver
+     * throws when a constraint refuses it.
+     *
+     * <p>Used by both the rejection cases and, since the 2026-09-13 audit (Q7), the ACCEPTANCE
+     * cases — a CHECK constraint can only be proven by raw SQL, in both directions.
+     */
+    private static UUID insertBand(String priceTypeOverride, BigDecimal priceOverride, BigDecimal priceMaxOverride) {
         UUID masterId = jdbc.queryForObject(
                 "SELECT master_id FROM master_services WHERE id = ?", UUID.class, fixedAssignmentId);
         UUID salonId = jdbc.queryForObject(
                 "SELECT owner_id FROM service_definitions WHERE id = ?", UUID.class, fixedDefId);
-        UUID freshTypeId = illegalBandTypeIds.get(ILLEGAL_BAND_TYPE_INDEX.getAndIncrement());
+        UUID freshTypeId = resolveUnusedServiceTypeId(salonId);
         UUID freshDefId = insertServiceDefinition(salonId, freshTypeId, "FIXED", new BigDecimal("100.00"), null);
+        UUID rowId = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, price_type_override, "
                         + "price_override, price_max_override, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, true, now(), now())",
-                UUID.randomUUID(), masterId, freshDefId, priceTypeOverride, priceOverride, priceMaxOverride);
+                rowId, masterId, freshDefId, priceTypeOverride, priceOverride, priceMaxOverride);
+        return rowId;
     }
 }

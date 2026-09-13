@@ -11,6 +11,10 @@ import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
+import org.springframework.beans.factory.annotation.Qualifier;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Parameter;
 import java.time.Duration;
 import java.util.UUID;
 
@@ -75,19 +79,58 @@ class CatalogueBrowseGetRateLimitRegressionTest {
     }
 
     /**
-     * 22 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
-     * the 22nd (catalogue-browse, LAST) is constrained; every other bucket — including the 20th
-     * (invite-validate) and the 21st (invite-accept) — is permissive, so a 429 here can only have
-     * come from the branch under test.
+     * Builds the production filter with EVERY bucket permissive except {@code catalogueBrowseBuckets},
+     * which gets the tiny cache under test — so a 429 anywhere below can only have come from the
+     * branch this file exists to pin.
+     *
+     * <p><b>Resolved by {@code @Qualifier} NAME, never by a hard-coded position (2026-09-13 audit,
+     * Q12).</b> This used to be 22 positional {@code permissive()} arguments with the constrained
+     * cache typed in last. Inserting a new bucket qualifier anywhere but at the end silently shifted
+     * which bucket was constrained, and every test in this file stayed GREEN while measuring the
+     * wrong thing — a wiring bug with no failing test, the exact shape the file is supposed to
+     * catch. The reflection below reads each constructor parameter's {@code @Qualifier} value and
+     * places the tiny cache at whatever index actually carries {@code "catalogueBrowseBuckets"},
+     * failing loudly if that qualifier is absent or ambiguous.
      */
     private AuthRateLimitFilter filterWithTinyCatalogueBrowseBucket() {
-        return new AuthRateLimitFilter(
-                permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(),
-                permissive(), permissive(), tinyCatalogueBrowseCache());
+        return filterWithTinyBucketFor("catalogueBrowseBuckets");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static AuthRateLimitFilter filterWithTinyBucketFor(String qualifier) {
+        Constructor<?>[] constructors = AuthRateLimitFilter.class.getConstructors();
+        assertThat(constructors)
+                .as("AuthRateLimitFilter must expose exactly one public constructor for this "
+                        + "qualifier-indexed wiring to be unambiguous")
+                .hasSize(1);
+        Constructor<AuthRateLimitFilter> ctor = (Constructor<AuthRateLimitFilter>) constructors[0];
+
+        Parameter[] params = ctor.getParameters();
+        int target = -1;
+        for (int i = 0; i < params.length; i++) {
+            Qualifier q = params[i].getAnnotation(Qualifier.class);
+            if (q != null && qualifier.equals(q.value())) {
+                assertThat(target)
+                        .as("@Qualifier(\"%s\") must appear on exactly ONE constructor parameter", qualifier)
+                        .isEqualTo(-1);
+                target = i;
+            }
+        }
+        assertThat(target)
+                .as("no constructor parameter carries @Qualifier(\"%s\") — the bucket this file "
+                        + "pins was renamed or removed, so the coverage is gone, not merely moved",
+                        qualifier)
+                .isNotEqualTo(-1);
+
+        Object[] args = new Object[params.length];
+        for (int i = 0; i < args.length; i++) {
+            args[i] = i == target ? tinyCatalogueBrowseCache() : permissive();
+        }
+        try {
+            return ctor.newInstance(args);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("could not construct AuthRateLimitFilter", e);
+        }
     }
 
     private static MockHttpServletRequest get(String path, String remoteAddr) {
@@ -105,7 +148,8 @@ class CatalogueBrowseGetRateLimitRegressionTest {
     }
 
     @Test
-    @DisplayName("should_return429_when_salonCatalogueServicesFloodedFromOneIp")
+    @DisplayName("a burst of salon-catalogue GETs from one IP is throttled with 429 + Retry-After "
+            + "once the per-IP budget is spent, and the request never reaches the read")
     void should_return429_when_salonCatalogueServicesFloodedFromOneIp() throws Exception {
         AuthRateLimitFilter filter = filterWithTinyCatalogueBrowseBucket();
         String path = salonServicesPath();
@@ -145,7 +189,8 @@ class CatalogueBrowseGetRateLimitRegressionTest {
     }
 
     @Test
-    @DisplayName("should_return429_when_masterCatalogueServicesFloodedFromOneIp (shares the same bucket)")
+    @DisplayName("the master-catalogue GET draws on the SAME bucket as the salon one — flooding it "
+            + "alone still 429s at the same cap")
     void should_return429_when_masterCatalogueServicesFloodedFromOneIp() throws Exception {
         AuthRateLimitFilter filter = filterWithTinyCatalogueBrowseBucket();
         String path = masterServicesPath();
@@ -174,7 +219,8 @@ class CatalogueBrowseGetRateLimitRegressionTest {
     }
 
     @Test
-    @DisplayName("should_notThrottle_when_requestsStayUnderTheCap")
+    @DisplayName("traffic under the cap sails through untouched — the non-vacuity pin for the two "
+            + "flood tests above")
     void should_notThrottle_when_requestsStayUnderTheCap() throws Exception {
         // Non-vacuity for the flood tests above: legitimate traffic under the cap must sail
         // through untouched.
@@ -197,7 +243,8 @@ class CatalogueBrowseGetRateLimitRegressionTest {
     }
 
     @Test
-    @DisplayName("should_throttlePerIp_when_oneSourceIsAlreadyExhausted")
+    @DisplayName("one exhausted IP does not spend another IP's budget — the bucket is keyed per "
+            + "source address, not globally")
     void should_throttlePerIp_when_oneSourceIsAlreadyExhausted() throws Exception {
         AuthRateLimitFilter filter = filterWithTinyCatalogueBrowseBucket();
         String path = salonServicesPath();
@@ -220,39 +267,55 @@ class CatalogueBrowseGetRateLimitRegressionTest {
     }
 
     /**
-     * <b>The disambiguation pin.</b> {@code GET /api/v1/salons/{salonId}/masters/{masterId}/services}
-     * (Phase 309's authenticated salon-management read) shares the exact same
-     * {@code "/api/v1/salons/"} prefix and {@code "/services"} suffix as the public catalogue read
-     * under test, but has TWO path variables, not one. It must stay the documented accepted-risk
-     * exception on {@code RateLimitConfig#serviceWriteCapacity} — unthrottled, like every other
-     * authenticated GET on {@code ServiceController} — even once the tiny catalogue-browse bucket
-     * above is fully exhausted. A regression that widened {@code isSalonCatalogueServicesPath} (or
-     * reverted to a bare prefix+suffix check) would fail this test with a 429.
+     * <b>The Phase 309/310 salon-management read is NOT in this bucket (2026-09-13 cycle-2 audit,
+     * B8).</b>
+     *
+     * <p>Cycle 1 matched {@code GET /api/v1/salons/{salonId}/masters/{masterId}/services} here,
+     * against {@code catalogueBrowseBuckets}. That bucket is keyed on the client IP and shared with
+     * two {@code permitAll} anonymous reads, so under carrier-grade NAT — the norm on Ukrainian
+     * mobile networks — the aggregate anonymous browse traffic leaving one egress IP could exhaust
+     * the budget and 429 a salon owner's management UI behind the same IP. The route is
+     * AUTHENTICATED, so it belongs on a per-principal bucket; {@code AuthRateLimitFilter} runs
+     * BEFORE {@code JwtAuthenticationFilter} and has no principal to key on, so the route moved to
+     * {@code BookingRateLimitFilter#salonMasterServicesReadBuckets} (see
+     * {@code BookingRateLimitFilterTest}'s B8 cases for its throttle coverage).
+     *
+     * <p>Exhausting the bucket via the PUBLIC route first is deliberate: it proves the management
+     * read draws NOTHING from the anonymous per-IP budget, which a test that merely fired the
+     * management path once would not.
      */
     @Test
-    @DisplayName("should_notThrottle_when_salonManagementReadRequested (Phase 309 route stays untouched)")
-    void should_notThrottle_when_salonManagementReadRequested() throws Exception {
+    @DisplayName("B8: a salon owner's management read is NOT throttled by an anonymous per-IP "
+            + "catalogue budget already exhausted from the same (CGNAT) address")
+    void should_notThrottle_when_salonManagementReadFollowsAnExhaustedCatalogueBudget() throws Exception {
         AuthRateLimitFilter filter = filterWithTinyCatalogueBrowseBucket();
-        String catalogueSalonId = UUID.randomUUID().toString();
-        String managementPath = "/api/v1/salons/" + catalogueSalonId + "/masters/" + UUID.randomUUID()
+        String managementPath = "/api/v1/salons/" + UUID.randomUUID() + "/masters/" + UUID.randomUUID()
                 + "/services";
 
-        // Exhaust the tiny catalogue-browse bucket for this IP via the PUBLIC catalogue route.
+        // Exhaust the tiny catalogue-browse bucket for this IP via the ANONYMOUS master-catalogue
+        // route — i.e. other subscribers behind the same CGNAT egress address.
+        String anonymousPath = masterServicesPath();
         for (int i = 0; i < TEST_CATALOGUE_BROWSE_CAPACITY + 5; i++) {
-            filter.doFilterInternal(get("/api/v1/salons/" + catalogueSalonId + "/services", REMOTE_ADDR),
+            filter.doFilterInternal(get(anonymousPath, REMOTE_ADDR),
                     new MockHttpServletResponse(), new MockFilterChain());
         }
+        var exhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(get(anonymousPath, REMOTE_ADDR), exhausted, new MockFilterChain());
+        assertThat(exhausted.getStatus())
+                .as("arrange check — the anonymous per-IP budget for this address really is spent")
+                .isEqualTo(429);
 
         var response = new MockHttpServletResponse();
         var chain = new MockFilterChain();
         filter.doFilterInternal(get(managementPath, REMOTE_ADDR), response, chain);
 
         assertThat(response.getStatus())
-                .as("the Phase 309 salon-management read must NOT be throttled by the catalogue-"
-                        + "browse bucket, even after that bucket is exhausted for the same IP")
+                .as("B8 — the authenticated management read must not be starved by anonymous "
+                        + "browse traffic sharing its egress IP; it is throttled per PRINCIPAL in "
+                        + "BookingRateLimitFilter instead")
                 .isNotEqualTo(429);
         assertThat(chain.getRequest())
-                .as("the salon-management read must be forwarded")
+                .as("the management read must be forwarded down the chain from this filter")
                 .isNotNull();
     }
 
@@ -266,7 +329,8 @@ class CatalogueBrowseGetRateLimitRegressionTest {
      * this test with a 429.
      */
     @Test
-    @DisplayName("should_notThrottle_when_unrelatedGetPathRequestedManyTimes")
+    @DisplayName("an unrelated, un-bucketed GET is never throttled however many times it is fired — "
+            + "the catalogue-browse match must not have widened into a blanket GET rule")
     void should_notThrottle_when_unrelatedGetPathRequestedManyTimes() throws Exception {
         AuthRateLimitFilter filter = filterWithTinyCatalogueBrowseBucket();
         String unrelatedPath = "/api/v1/masters/" + UUID.randomUUID() + "/reviews";

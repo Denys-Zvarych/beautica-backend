@@ -88,6 +88,9 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
     @Autowired
     private CacheManager cacheManager;
 
+    @Autowired
+    private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
+
     private ServiceTestFixtures fixtures;
 
     @BeforeEach
@@ -275,6 +278,37 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = unassign(ownerToken, salonId, masterId, assignment.definitionId());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        // Q14 (2026-09-13 audit): the 409 message interpolates the future-booking COUNT, and until
+        // now nothing asserted that number was right — a count scoped to the master rather than to
+        // this assignment (case 7's inverse), or an off-by-one, produced a wrong but plausible
+        // message with every test green.
+        //
+        // The count is NOT assertable from the HTTP body: GlobalExceptionHandler genericises every
+        // BusinessException(CONFLICT) to "Request could not be completed due to a conflict" (§I —
+        // exception text is never echoed to clients). It is asserted where it actually exists, on
+        // the exception the service throws, by driving the same bean directly. A second CONFIRMED
+        // booking is seeded first so the expected value is 2, not the 1 an assignment-blind or
+        // constant-returning implementation would most plausibly produce.
+        insertBooking(salonId, masterId, assignment.assignmentId(), clientId,
+                "CONFIRMED", "+3 days", new BigDecimal("350.00"));
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        var authToken = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                ownerUserId, null,
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority(
+                        "ROLE_SALON_OWNER")));
+        authToken.setDetails(ownerUserId);
+        org.springframework.security.core.context.SecurityContextHolder.getContext()
+                .setAuthentication(authToken);
+        try {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> serviceCatalogService
+                    .unassignServiceFromMaster(ownerUserId, salonId, masterId, assignment.definitionId()))
+                    .isInstanceOf(com.beautica.common.exception.BusinessException.class)
+                    .hasMessageContaining("2 future confirmed booking(s)");
+        } finally {
+            org.springframework.security.core.context.SecurityContextHolder.clearContext();
+        }
+
         Boolean stillActive = jdbcTemplate.queryForObject(
                 "SELECT is_active FROM master_services WHERE id = ?", Boolean.class, assignment.assignmentId());
         assertThat(stillActive).as("D4 — nothing written on refusal").isTrue();
@@ -425,6 +459,25 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = unassign(otherOwnerToken, salonId, masterId, assignment.definitionId());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        // Q15 (2026-09-13 audit): a 403 status alone does not prove NOTHING WAS WRITTEN — a
+        // regression that soft-unassigned first and threw afterwards would still return 403. Cases
+        // 6 and 11 re-query is_active for exactly this reason; cases 12/13/15 did not.
+        assertRowStillActive(assignment);
+    }
+
+    /**
+     * Q15 (2026-09-13 audit) — re-reads {@code master_services.is_active} straight from the DB and
+     * asserts the row was NOT soft-unassigned. A denial test that asserts only the HTTP status
+     * cannot tell "refused before the write" from "wrote, then threw"; this is the assertion cases
+     * 6 and 11 already made and cases 12/13/15 were missing.
+     */
+    private void assertRowStillActive(Assignment assignment) {
+        Boolean stillActive = jdbcTemplate.queryForObject(
+                "SELECT is_active FROM master_services WHERE id = ?",
+                Boolean.class, assignment.assignmentId());
+        assertThat(stillActive)
+                .as("a denied unassign must write nothing — the assignment row stays active")
+                .isTrue();
     }
 
     // ── Case 13 — masterId belongs to another salon: 403/404, indistinguishable from nonexistent ──
@@ -451,6 +504,8 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
         assertThat(resp.getStatusCode())
                 .as("D5 — a master from another salon must be denied, whichever status is chosen")
                 .isIn(HttpStatus.FORBIDDEN, HttpStatus.NOT_FOUND);
+        // Q15 — the SALON A assignment named in the path must be untouched by the denial.
+        assertRowStillActive(assignment);
     }
 
     // ── Case 14 — idempotent by row state: a second DELETE is 404, no write (D7) ────────────────
@@ -491,6 +546,7 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = unassign(clientToken, salonId, masterId, assignment.definitionId());
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertRowStillActive(assignment);
     }
 
     // ── Case 16 — afterCommit eviction: the very next catalogue read reflects the unassign ──────
@@ -701,5 +757,103 @@ class MasterServiceUnassignIT extends AbstractIntegrationTest {
                 .flatMap(group -> group.services().stream())
                 .map(ServiceDefinitionResponse::id)
                 .toList();
+    }
+
+    // ── S1 (2026-09-13 audit): the ACTOR is validated at the SERVICE layer, not only in SpEL ────
+
+    /**
+     * {@code unassignServiceFromMaster} used to take no {@code actorId} and call no
+     * {@code authz.enforce*}: it re-validated the OBJECT (master -> salon, definition -> salon) but
+     * never the SUBJECT. Over HTTP the {@code @PreAuthorize} gate covered it, so nothing was
+     * exploitable — this is the defense-in-depth asymmetry with its siblings
+     * ({@code updateMasterServiceBand}, {@code deactivateServiceDefinition},
+     * {@code getSalonMasterServices}) that the fix closes.
+     *
+     * <p>Driving the BEAN directly is the whole point: it is the exact call shape a future
+     * non-HTTP caller (a scheduled job, an admin console, an event handler) would use, and the one
+     * the SpEL gate cannot protect. Before the fix this call returned 204-equivalent success and
+     * soft-unassigned another salon's row; it now throws {@link com.beautica.common.exception.ForbiddenException}
+     * before touching anything.
+     */
+    @Test
+    @DisplayName("S1: a DIRECT service-layer unassign by a FOREIGN salon's owner is refused with "
+            + "ForbiddenException and writes nothing — the SpEL gate is not the only actor check")
+    void should_throwForbidden_when_foreignOwnerCallsUnassignServiceDirectly() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-307-s1-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 307 S1 Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+        UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
+        Assignment assignment = bulkCreateOneService(ownerToken, salonId, masterId, typeId);
+
+        String foreignOwnerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-307-s1-foreign-" + System.nanoTime() + "@beautica.test");
+        UUID foreignSalonId = fixtures.createSalon(foreignOwnerToken, "Phase 307 S1 Foreign Salon");
+        UUID foreignOwnerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, foreignSalonId);
+
+        // Mirror JwtAuthenticationFilter's contract: user id in the token details, role as a single
+        // ROLE_* authority. hasManagementAccess reads the role from here.
+        var token = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                foreignOwnerUserId, null,
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority(
+                        "ROLE_SALON_OWNER")));
+        token.setDetails(foreignOwnerUserId);
+        org.springframework.security.core.context.SecurityContextHolder.getContext()
+                .setAuthentication(token);
+        try {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> serviceCatalogService
+                    .unassignServiceFromMaster(foreignOwnerUserId, salonId, masterId,
+                            assignment.definitionId()))
+                    .as("the foreign owner genuinely owns A salon — what must refuse them is that "
+                            + "it is not THIS one, proven at the service layer")
+                    .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+        } finally {
+            org.springframework.security.core.context.SecurityContextHolder.clearContext();
+        }
+
+        assertRowStillActive(assignment);
+    }
+
+    /**
+     * Non-vacuity for the test above: the SAME direct, non-HTTP call shape SUCCEEDS for the salon's
+     * REAL owner. Without this, the ForbiddenException above could equally be explained by the
+     * service-layer call being broken for everyone (e.g. a missing security context).
+     */
+    @Test
+    @DisplayName("S1 non-vacuity: the same DIRECT service-layer unassign SUCCEEDS for the salon's "
+            + "own owner — the guard rejects the actor, not the call shape")
+    void should_succeed_when_realOwnerCallsUnassignServiceDirectly() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-307-s1ok-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 307 S1 OK Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+        UUID typeId = fixtures.activeSelectableServiceTypes(1).get(0).id();
+        Assignment assignment = bulkCreateOneService(ownerToken, salonId, masterId, typeId);
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+
+        var token = new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                ownerUserId, null,
+                List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority(
+                        "ROLE_SALON_OWNER")));
+        token.setDetails(ownerUserId);
+        org.springframework.security.core.context.SecurityContextHolder.getContext()
+                .setAuthentication(token);
+        try {
+            serviceCatalogService.unassignServiceFromMaster(
+                    ownerUserId, salonId, masterId, assignment.definitionId());
+        } finally {
+            org.springframework.security.core.context.SecurityContextHolder.clearContext();
+        }
+
+        Boolean stillActive = jdbcTemplate.queryForObject(
+                "SELECT is_active FROM master_services WHERE id = ?",
+                Boolean.class, assignment.assignmentId());
+        assertThat(stillActive)
+                .as("the authorized direct call must actually soft-unassign the row")
+                .isFalse();
     }
 }

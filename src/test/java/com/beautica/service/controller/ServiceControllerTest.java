@@ -51,6 +51,7 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -686,7 +687,7 @@ class ServiceControllerTest {
                         .with(csrf()))
                 .andExpect(status().isNoContent());
 
-        verify(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+        verify(serviceCatalogService).unassignServiceFromMaster(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId));
     }
 
     @Test
@@ -707,7 +708,8 @@ class ServiceControllerTest {
                         .with(csrf()))
                 .andExpect(status().isNoContent());
 
-        verify(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+        verify(serviceCatalogService).unassignServiceFromMaster(
+                eq(adminUserId), eq(salonId), eq(masterId), eq(serviceDefId));
     }
 
     @Test
@@ -729,7 +731,7 @@ class ServiceControllerTest {
                         .with(csrf()))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any(), any());
     }
 
     @Test
@@ -746,7 +748,7 @@ class ServiceControllerTest {
                         .with(csrf()))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any(), any());
     }
 
     @Test
@@ -763,7 +765,7 @@ class ServiceControllerTest {
                         .with(csrf()))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any());
+        verify(serviceCatalogService, never()).unassignServiceFromMaster(any(), any(), any(), any());
     }
 
     @Test
@@ -777,7 +779,7 @@ class ServiceControllerTest {
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
         doThrow(new BusinessException(HttpStatus.CONFLICT, "Master has 1 future confirmed booking(s) for this service"))
-                .when(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+                .when(serviceCatalogService).unassignServiceFromMaster(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId));
 
         log.debug("Act: DELETE with a future CONFIRMED booking in the way — must return 409");
         mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
@@ -798,7 +800,7 @@ class ServiceControllerTest {
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
         doThrow(new com.beautica.common.exception.NotFoundException("No active assignment for master " + masterId
                 + " and service " + serviceDefId))
-                .when(serviceCatalogService).unassignServiceFromMaster(salonId, masterId, serviceDefId);
+                .when(serviceCatalogService).unassignServiceFromMaster(eq(userId), eq(salonId), eq(masterId), eq(serviceDefId));
 
         log.debug("Act: DELETE an already-inactive pair — must return 404 (D7 idempotency-by-row-state)");
         mockMvc.perform(delete("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/" + serviceDefId)
@@ -833,7 +835,7 @@ class ServiceControllerTest {
         var stub = List.of(stubMasterServiceResponseWithOverride(
                 rowId, masterId, "Gel Nails", new BigDecimal("300.00")));
         when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId))).thenReturn(true);
-        when(serviceCatalogService.getSalonMasterServices(userId, salonId, masterId)).thenReturn(stub);
+        when(serviceCatalogService.getSalonMasterServices(eq(userId), eq(salonId), eq(masterId), any())).thenReturn(stub);
 
         log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as OWNER", salonId, masterId);
         mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
@@ -853,7 +855,7 @@ class ServiceControllerTest {
         var masterId = UUID.randomUUID();
         var stub = List.of(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Gel Nails"));
         when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId))).thenReturn(true);
-        when(serviceCatalogService.getSalonMasterServices(adminUserId, salonId, masterId)).thenReturn(stub);
+        when(serviceCatalogService.getSalonMasterServices(eq(adminUserId), eq(salonId), eq(masterId), any())).thenReturn(stub);
 
         log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as SALON_ADMIN", salonId, masterId);
         mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
@@ -873,7 +875,7 @@ class ServiceControllerTest {
         var masterInOtherSalonId = UUID.randomUUID();
         when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterInOtherSalonId)))
                 .thenReturn(true);
-        when(serviceCatalogService.getSalonMasterServices(userId, salonId, masterInOtherSalonId))
+        when(serviceCatalogService.getSalonMasterServices(eq(userId), eq(salonId), eq(masterInOtherSalonId), any()))
                 .thenThrow(new com.beautica.common.exception.NotFoundException(
                         "Master not found: " + masterInOtherSalonId));
 
@@ -893,7 +895,7 @@ class ServiceControllerTest {
         var someUserId = UUID.randomUUID();
         when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(someUserId)))
                 .thenReturn(true);
-        when(serviceCatalogService.getSalonMasterServices(userId, salonId, someUserId))
+        when(serviceCatalogService.getSalonMasterServices(eq(userId), eq(salonId), eq(someUserId), any()))
                 .thenThrow(new com.beautica.common.exception.NotFoundException(
                         "Master not found: " + someUserId));
 
@@ -918,7 +920,7 @@ class ServiceControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any(), any());
     }
 
     @Test
@@ -935,7 +937,7 @@ class ServiceControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any(), any());
     }
 
     @Test
@@ -967,7 +969,7 @@ class ServiceControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any(), any());
     }
 
     // ── GET /api/v1/salons/{salonId}/masters/{masterId}/services — Phase 310 own-row widening ──
@@ -985,7 +987,7 @@ class ServiceControllerTest {
                 UUID.randomUUID(), masterId, "Gel Nails", new BigDecimal("300.00")));
         when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId)))
                 .thenReturn(true);
-        when(serviceCatalogService.getSalonMasterServices(masterUserId, salonId, masterId)).thenReturn(stub);
+        when(serviceCatalogService.getSalonMasterServices(eq(masterUserId), eq(salonId), eq(masterId), any())).thenReturn(stub);
 
         log.debug("Act: GET /api/v1/salons/{}/masters/{}/services as the master's OWN SALON_MASTER "
                 + "account", salonId, masterId);
@@ -1013,7 +1015,7 @@ class ServiceControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isForbidden());
 
-        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any());
+        verify(serviceCatalogService, never()).getSalonMasterServices(any(), any(), any(), any());
     }
 
     // ── GET /api/v1/masters/{masterId}/services — public ──────────────────────
@@ -1426,7 +1428,266 @@ class ServiceControllerTest {
         verify(serviceCatalogService).deactivateServiceDefinition(userId, serviceDefId);
     }
 
+    // ── P7 (2026-09-13 audit): the salon-master read's ADDITIVE pagination ──────────────────────
+
+    @Test
+    @DisplayName("P7: GET .../masters/{masterId}/services with NO page params keeps today's exact "
+            + "behaviour — page 0, size 200, the literal the service used to hard-code")
+    void should_useTheHistoricPageCap_when_noPageableParamsAreSent() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId)))
+                .thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(eq(userId), eq(salonId), eq(masterId), any()))
+                .thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER)))
+                .andExpect(status().isOk());
+
+        var captor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        verify(serviceCatalogService)
+                .getSalonMasterServices(eq(userId), eq(salonId), eq(masterId), captor.capture());
+        assertThat(captor.getValue().getPageNumber())
+                .as("adding Pageable must not move any existing caller off page 0")
+                .isZero();
+        assertThat(captor.getValue().getPageSize())
+                .as("the @PageableDefault must be the SAME 200 the service hard-coded, or this "
+                        + "'additive' change silently truncates every mobile client")
+                .isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("P7: a caller-supplied ?page/?size is honoured — a caller who hits the cap can "
+            + "now page PAST it, which is the whole point of the fix")
+    void should_honourCallerPaging_when_pageParamsAreSent() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId)))
+                .thenReturn(true);
+        when(serviceCatalogService.getSalonMasterServices(eq(userId), eq(salonId), eq(masterId), any()))
+                .thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .param("page", "2")
+                        .param("size", "50")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER)))
+                .andExpect(status().isOk());
+
+        var captor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        verify(serviceCatalogService)
+                .getSalonMasterServices(eq(userId), eq(salonId), eq(masterId), captor.capture());
+        assertThat(captor.getValue().getPageNumber()).isEqualTo(2);
+        assertThat(captor.getValue().getPageSize()).isEqualTo(50);
+    }
+
+    @Test
+    @DisplayName("P7: an oversized ?size is REFUSED (400), never silently clamped — a client asking "
+            + "for 10 000 rows is told it was wrong instead of quietly getting a different page")
+    void should_return400_when_callerRequestsAnOversizedPage() throws Exception {
+        var userId = UUID.randomUUID();
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canReadSalonMasterServices(any(), eq(salonId), eq(masterId)))
+                .thenReturn(true);
+
+        mockMvc.perform(get("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .param("size", "10000")
+                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER)))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never())
+                .getSalonMasterServices(any(), any(), any(), any());
+    }
+
     // ── Validation boundary tests ─────────────────────────────────────────────
+
+    // ── Master-band boundary ledger (2026-09-13 audit, Q1 + Q2) ──────────────────────────────
+    //
+    // Until this cycle NOTHING exercised @DecimalMin(0.01) / @DecimalMax / @Digits(8,2) /
+    // @Min(1) / @Max(480) on UpdateMasterServiceBandRequest or AssignServiceToMasterRequest — not
+    // at the value, not at ±1 — even though the sibling CreateServiceDefinitionRequest gets exactly
+    // this treatment a few methods below. Q1 also found the master-band cap was 99999.99 while every
+    // definition-side DTO (and the NUMERIC(10,2) column) allows 99999999.99, so a definition priced
+    // above 99 999.99 could never carry a matching master band; the cap is now aligned and both
+    // sides of the new boundary are pinned here.
+
+    /** Body factory for the band PATCH — only the fields under test vary. */
+    private static String bandPatchBody(String priceType, String price, String priceMax,
+                                        String durationOverrideMinutes) {
+        StringBuilder sb = new StringBuilder("{");
+        if (priceType != null) sb.append("\"priceType\":\"").append(priceType).append("\",");
+        if (price != null) sb.append("\"price\":").append(price).append(',');
+        if (priceMax != null) sb.append("\"priceMax\":").append(priceMax).append(',');
+        if (durationOverrideMinutes != null) {
+            sb.append("\"durationOverrideMinutes\":").append(durationOverrideMinutes).append(',');
+        }
+        if (sb.charAt(sb.length() - 1) == ',') sb.setLength(sb.length() - 1);
+        return sb.append('}').toString();
+    }
+
+    private org.springframework.test.web.servlet.ResultActions patchBand(UUID salonId, UUID masterId,
+                                                                        UUID serviceDefId, String body)
+            throws Exception {
+        when(authorizationService.canEditMasterServiceBand(any(), eq(salonId), eq(masterId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+        return mockMvc.perform(patch("/api/v1/salons/" + salonId + "/masters/" + masterId
+                        + "/services/" + serviceDefId)
+                .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(body));
+    }
+
+    @Test
+    @DisplayName("PATCH band — 400 when price is 0.00, ONE step below @DecimalMin(0.01)")
+    void should_return400_when_bandPriceIsBelowDecimalMin() throws Exception {
+        patchBand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                bandPatchBody("FIXED", "0.00", null, null))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 200 when price is exactly 0.01, the @DecimalMin boundary VALUE "
+            + "(non-vacuity for the 0.00 rejection above)")
+    void should_return200_when_bandPriceIsExactlyDecimalMin() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        var serviceDefId = UUID.randomUUID();
+        when(serviceCatalogService.updateMasterServiceBand(any(), any(), any(), any(), any()))
+                .thenReturn(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Manicure"));
+
+        patchBand(salonId, masterId, serviceDefId, bandPatchBody("FIXED", "0.01", null, null))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 200 at price 99999999.99, the aligned @DecimalMax boundary VALUE "
+            + "(Q1: this was a 400 while the cap was 99999.99, so a definition priced above that "
+            + "could never carry a matching master band)")
+    void should_return200_when_bandPriceIsExactlyDecimalMax() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(serviceCatalogService.updateMasterServiceBand(any(), any(), any(), any(), any()))
+                .thenReturn(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Manicure"));
+
+        patchBand(salonId, masterId, UUID.randomUUID(),
+                bandPatchBody("FIXED", "99999999.99", null, null))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 400 at price 100000000.00, ONE step past the aligned @DecimalMax")
+    void should_return400_when_bandPriceExceedsDecimalMax() throws Exception {
+        patchBand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                bandPatchBody("FIXED", "100000000.00", null, null))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 400 when price carries 3 decimal places (@Digits(fraction = 2))")
+    void should_return400_when_bandPriceHasThreeDecimalPlaces() throws Exception {
+        patchBand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                bandPatchBody("FIXED", "123.456", null, null))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 400 when the RANGE CEILING exceeds @DecimalMax, proving priceMax "
+            + "carries its own constraints and is not validated only through price")
+    void should_return400_when_bandPriceMaxExceedsDecimalMax() throws Exception {
+        patchBand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                bandPatchBody("RANGE", "500.00", "100000000.00", null))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 400 when durationOverrideMinutes is 0, ONE below @Min(1)")
+    void should_return400_when_bandDurationOverrideIsZero() throws Exception {
+        patchBand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                bandPatchBody(null, null, null, "0"))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 400 when durationOverrideMinutes is 481, ONE above @Max(480)")
+    void should_return400_when_bandDurationOverrideExceedsMax() throws Exception {
+        patchBand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                bandPatchBody(null, null, null, "481"))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).updateMasterServiceBand(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("PATCH band — 200 when durationOverrideMinutes is exactly 480, the @Max boundary "
+            + "VALUE (non-vacuity for the 481 rejection above)")
+    void should_return200_when_bandDurationOverrideIsExactlyMax() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(serviceCatalogService.updateMasterServiceBand(any(), any(), any(), any(), any()))
+                .thenReturn(stubMasterServiceResponse(UUID.randomUUID(), masterId, "Manicure"));
+
+        patchBand(salonId, masterId, UUID.randomUUID(), bandPatchBody(null, null, null, "480"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    @DisplayName("POST .../masters/{masterId}/services — 400 when priceOverride exceeds the aligned "
+            + "@DecimalMax (the single-assign twin of the PATCH ledger above)")
+    void should_return400_when_assignPriceOverrideExceedsDecimalMax() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+
+        String body = "{\"serviceDefId\":\"" + UUID.randomUUID()
+                + "\",\"priceType\":\"FIXED\",\"priceOverride\":100000000.00}";
+
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("POST .../masters/{masterId}/services — 400 when durationOverrideMinutes is 481, "
+            + "ONE above @Max(480)")
+    void should_return400_when_assignDurationOverrideExceedsMax() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+
+        String body = "{\"serviceDefId\":\"" + UUID.randomUUID()
+                + "\",\"durationOverrideMinutes\":481}";
+
+        mockMvc.perform(post("/api/v1/salons/" + salonId + "/masters/" + masterId + "/services")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest());
+
+        verify(serviceCatalogService, never()).assignServiceToMaster(any(), any(), any());
+    }
+
 
     @Test
     @DisplayName("POST /salons/{id}/services — 400 when baseDurationMinutes exceeds 480")
@@ -2305,7 +2566,7 @@ class ServiceControllerTest {
 
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.bulkCreateSalonMasterServices(eq(salonId), eq(masterId), any()))
+        when(serviceCatalogService.bulkCreateSalonMasterServices(any(), eq(salonId), eq(masterId), any()))
                 .thenReturn(created);
 
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_OWNER", salonId, masterId);
@@ -2333,7 +2594,7 @@ class ServiceControllerTest {
         // which the contract intentionally grants to SALON_ADMIN as well as SALON_OWNER.
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
         when(authorizationService.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
-        when(serviceCatalogService.bulkCreateSalonMasterServices(eq(salonId), eq(masterId), any()))
+        when(serviceCatalogService.bulkCreateSalonMasterServices(any(), eq(salonId), eq(masterId), any()))
                 .thenReturn(created);
 
         log.debug("Act: POST /api/v1/salons/{}/masters/{}/services/bulk as SALON_ADMIN — must be allowed on-behalf", salonId, masterId);
@@ -2369,7 +2630,7 @@ class ServiceControllerTest {
                 .andExpect(status().isForbidden());
 
         org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
-                .bulkCreateSalonMasterServices(any(), any(), any());
+                .bulkCreateSalonMasterServices(any(), any(), any(), any());
     }
 
     @Test
@@ -2393,7 +2654,7 @@ class ServiceControllerTest {
                 .andExpect(status().isForbidden());
 
         org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
-                .bulkCreateSalonMasterServices(any(), any(), any());
+                .bulkCreateSalonMasterServices(any(), any(), any(), any());
     }
 
     @Test
@@ -2416,7 +2677,7 @@ class ServiceControllerTest {
                 .andExpect(status().isForbidden());
 
         org.mockito.Mockito.verify(serviceCatalogService, org.mockito.Mockito.never())
-                .bulkCreateSalonMasterServices(any(), any(), any());
+                .bulkCreateSalonMasterServices(any(), any(), any(), any());
     }
 
     // ── DUPLICATE_SERVICE 409 — the HTTP/JSON contract the mobile client branches on ────

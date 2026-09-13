@@ -50,14 +50,14 @@ public record AssignServiceToMasterRequest(
         PriceType priceType,
 
         @DecimalMin(value = "0.01", message = "Price override must be positive")
-        @DecimalMax(value = "99999.99", message = "Price override exceeds maximum")
-        @Digits(integer = 7, fraction = 2, message = "Price override must have at most 7 integer digits and 2 decimal places")
+        @DecimalMax(value = "99999999.99", message = "Price override exceeds maximum")
+        @Digits(integer = 8, fraction = 2, message = "Price override must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceOverride,
 
         /** RANGE ceiling — required (and only legal) when {@code priceType == RANGE}. */
         @DecimalMin(value = "0.01", message = "Price ceiling must be positive")
-        @DecimalMax(value = "99999.99", message = "Price ceiling exceeds maximum")
-        @Digits(integer = 7, fraction = 2, message = "Price ceiling must have at most 7 integer digits and 2 decimal places")
+        @DecimalMax(value = "99999999.99", message = "Price ceiling exceeds maximum")
+        @Digits(integer = 8, fraction = 2, message = "Price ceiling must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceMax,
 
         @Min(value = 1, message = "Duration override must be at least 1 minute")

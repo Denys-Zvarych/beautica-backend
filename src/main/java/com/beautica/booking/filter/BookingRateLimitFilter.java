@@ -179,6 +179,26 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      * unbucketed rather than inheriting this one.
      */
     private static final String BOOKINGS_SUFFIX = "/bookings";
+    /**
+     * Prefix/suffix pair of {@code GET /api/v1/salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services}
+     * — Phase 309/310's AUTHENTICATED salon-management read (cycle-2 audit, B8).
+     *
+     * <p><b>Why a read, and why here.</b> Cycle 1 gave this route its first bucket by matching it
+     * in {@code AuthRateLimitFilter} against {@code catalogueBrowseBuckets} — an ANONYMOUS per-IP
+     * bucket shared with the two {@code permitAll} catalogue GETs. Under carrier-grade NAT (the
+     * norm on Ukrainian mobile networks) the aggregate anonymous browse traffic from one egress IP
+     * can exhaust that 60/min budget and 429 a salon owner's management UI sharing the same IP.
+     * The route is authenticated, so the correct key is the PRINCIPAL, not the IP — and
+     * {@code AuthRateLimitFilter} runs BEFORE {@code JwtAuthenticationFilter}, so no principal
+     * exists there. This filter runs after it, and is the app's only per-authenticated-user
+     * Bucket4j mechanism, exactly as for {@link #USERS_ME_PATH}.
+     *
+     * <p>Matched by prefix + suffix + a middle segment of {@code {salonId}/masters/{masterId}}, so
+     * it can never swallow the sibling public read {@code GET /api/v1/salons/{salonId}/services}
+     * (which keeps its IP bucket in {@code AuthRateLimitFilter}).
+     */
+    private static final String SALON_MASTER_SERVICES_PREFIX = "/api/v1/salons/";
+    private static final String SALON_MASTER_SERVICES_SUFFIX = "/services";
     private static final String RESCHEDULE_SUFFIX = "/reschedule";
     private static final String CANCEL_SUFFIX = "/cancel";
     private static final String COMPLETE_SUFFIX = "/complete";
@@ -217,6 +237,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** {@code Retry-After} for the staff walk-in SMS-spend bucket — matches its 60s refill window. */
     private static final int STAFF_BOOKING_SMS_RETRY_AFTER_SECONDS = 60;
 
+    /** {@code Retry-After} for the salon-master-services management read — matches its 60s window. */
+    private static final int SALON_MASTER_SERVICES_READ_RETRY_AFTER_SECONDS = 60;
+
     /**
      * {@code Retry-After} for the CLIENT self-delete bucket — matches its 60-minute refill window
      * (see {@code RateLimitConfig#selfDeleteCapacity}'s javadoc for the sizing rationale).
@@ -228,6 +251,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> scheduleOverrideWriteBuckets;
     private final LoadingCache<String, Bucket> staffBookingSmsBuckets;
     private final LoadingCache<String, Bucket> selfDeleteBuckets;
+    private final LoadingCache<String, Bucket> salonMasterServicesReadBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -236,12 +260,14 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> scheduleOverrideWriteBuckets,
             LoadingCache<String, Bucket> staffBookingSmsBuckets,
             LoadingCache<String, Bucket> selfDeleteBuckets,
+            LoadingCache<String, Bucket> salonMasterServicesReadBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
         this.scheduleOverrideWriteBuckets = scheduleOverrideWriteBuckets;
         this.staffBookingSmsBuckets = staffBookingSmsBuckets;
         this.selfDeleteBuckets = selfDeleteBuckets;
+        this.salonMasterServicesReadBuckets = salonMasterServicesReadBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -317,6 +343,13 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         // See USERS_ME_PATH's javadoc for why this unrelated route lives in the booking filter.
         if (HttpMethod.DELETE.matches(method) && USERS_ME_PATH.equals(path)) {
             return new BucketRoute(selfDeleteBuckets, SELF_DELETE_RETRY_AFTER_SECONDS);
+        }
+        // GET /api/v1/salons/{salonId}/masters/{masterId}/services — the authenticated management
+        // read (cycle-2 audit, B8). See SALON_MASTER_SERVICES_PREFIX for why a GET is throttled
+        // here on the PRINCIPAL rather than in AuthRateLimitFilter on the IP.
+        if (HttpMethod.GET.matches(method) && isSalonMasterServicesReadPath(path)) {
+            return new BucketRoute(
+                    salonMasterServicesReadBuckets, SALON_MASTER_SERVICES_READ_RETRY_AFTER_SECONDS);
         }
         // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
         // create) share the bookingWriteBuckets budget: both take the per-client advisory lock, so a
@@ -403,6 +436,29 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             return new BucketRoute(bookingWriteBuckets, CREATE_RESCHEDULE_RETRY_AFTER_SECONDS);
         }
         return null;
+    }
+
+    /**
+     * True only for {@code /api/v1/salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services}
+     * — the exact complement, within the shared prefix/suffix pair, of the public
+     * {@code /api/v1/salons/&#123;salonId&#125;/services} catalogue read that keeps its per-IP
+     * bucket in {@code AuthRateLimitFilter#isSalonCatalogueServicesPath}. The middle segment must
+     * be {@code &#123;salonId&#125;/masters/&#123;masterId&#125;}: two ids around the literal
+     * {@code masters}, and nothing deeper.
+     */
+    private static boolean isSalonMasterServicesReadPath(String path) {
+        if (!path.startsWith(SALON_MASTER_SERVICES_PREFIX)
+                || !path.endsWith(SALON_MASTER_SERVICES_SUFFIX)) {
+            return false;
+        }
+        String middle = path.substring(
+                SALON_MASTER_SERVICES_PREFIX.length(),
+                path.length() - SALON_MASTER_SERVICES_SUFFIX.length());
+        String[] segments = middle.split("/", -1);
+        return segments.length == 3
+                && !segments[0].isEmpty()
+                && "masters".equals(segments[1])
+                && !segments[2].isEmpty();
     }
 
     /** Pairs the bucket cache a request must consume from with its bucket-specific Retry-After. */

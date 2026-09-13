@@ -1515,10 +1515,44 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     }
 
     /**
+     * Gives a salon master a currently-valid weekly template.
+     *
+     * <p><b>Required since the 2026-09-13 audit (H4).</b> {@code SalonSearchSql}'s {@code pr}
+     * price-band lateral now requires a master to have a non-expired {@code weekly_schedules} row
+     * before their band can price the salon — the structural half of the bookability gate the
+     * salon CATALOGUE has always applied (Phase 305 D1). A salon master with no schedule at all is
+     * not bookable, so search must not advertise their price either; before the fix, search and
+     * the catalogue disagreed about exactly that master. See {@code SalonSearchPriceBandIT} cases
+     * 21-23 for the pins.
+     *
+     * <p>Every salon-master seeder in this file calls it, so the salons here keep the price bands
+     * their assertions were written against — the behaviour change is about UNSCHEDULED masters,
+     * which this file never intended to exercise.
+     */
+    private void seedUsableScheduleFor(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, NULL, NOW(), NOW())",
+                scheduleId, masterId, java.time.LocalDate.now(java.time.ZoneId.of("Europe/Kyiv")).minusDays(1));
+        for (int isoDow = 1; isoDow <= 7; isoDow++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) " +
+                            "VALUES (?, ?, ?, ?, ?)",
+                    UUID.randomUUID(), scheduleId, isoDow,
+                    java.time.LocalTime.of(9, 0), java.time.LocalTime.of(17, 0));
+        }
+    }
+
+    /**
      * Seeds an employed SALON_MASTER (+ masters row) attached to an existing
      * {@code salonId} in the given city. Used by the salon-price-range tests:
      * the salon aggregation joins the master's active services via
      * {@code mm.salon.id = s.id}, so the master must carry {@code salon_id}.
+     *
+     * <p>Also gives the master a usable weekly template via
+     * {@link #seedUsableScheduleFor} — required since the 2026-09-13 audit (H4); see that
+     * method's javadoc for why.
      */
     private UUID seedSalonMasterFor(UUID salonId, String city, String avgRating) {
         UUID masterUserId = UUID.randomUUID();
@@ -1533,6 +1567,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, masterUserId, salonId, avgRating);
+        seedUsableScheduleFor(masterId);
         return masterId;
     }
 
@@ -4618,6 +4653,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, 'SALON_MASTER', 4.0::numeric, 1, ?, NOW(), NOW())",
                 masterId, masterUserId, salonId, masterActive);
+        seedUsableScheduleFor(masterId);
 
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4683,6 +4719,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, adminUserId, salonId, avgRating);
+        seedUsableScheduleFor(masterId);
         return masterId;
     }
 
@@ -4721,6 +4758,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, masterUserId, salonId, avgRating);
+        seedUsableScheduleFor(masterId);
         return masterId;
     }
 
@@ -4882,6 +4920,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) " +
                         "VALUES (?, ?, ?, 'SALON_MASTER', ?::numeric, 1, true, NOW(), NOW())",
                 masterId, masterUserId, salonId, avgRating);
+        seedUsableScheduleFor(masterId);
 
         return masterId;
     }

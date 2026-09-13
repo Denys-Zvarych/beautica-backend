@@ -19,6 +19,7 @@ import jakarta.persistence.EntityManagerFactory;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -33,6 +34,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -87,6 +91,37 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
     @Autowired private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Authenticates the current thread as the SALON_OWNER of {@code salonId} and returns their
+     * user id, for the handful of cases below that drive {@code ServiceCatalogService} DIRECTLY
+     * rather than over HTTP.
+     *
+     * <p>Needed since the 2026-09-13 audit (S1): {@code bulkCreateSalonMasterServices} now takes an
+     * {@code actorId} and re-proves {@code @authz.canManageSalon} at the service layer, and that
+     * guard reads the caller's ROLE from the {@code SecurityContextHolder} (the same place the JWT
+     * filter puts it in production). A direct call with no security context is a
+     * {@code ForbiddenException}, which is the point of the fix.
+     *
+     * <p>Mirrors the {@code JwtAuthenticationFilter} contract exactly: the user id lives in the
+     * token's {@code details} (read by {@code AuthenticationUtils#userId}) and the role is a single
+     * {@code ROLE_*} authority. Cleared in {@link #clearSecurityContext()}.
+     */
+    private UUID authenticateAsOwnerOf(UUID salonId) {
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        var token = new UsernamePasswordAuthenticationToken(
+                ownerUserId, null, List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails(ownerUserId);
+        SecurityContextHolder.getContext().setAuthentication(token);
+        return ownerUserId;
+    }
+
+    @AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
+
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private org.springframework.cache.CacheManager cacheManager;
@@ -1788,17 +1823,19 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         var largeBatch = new BulkCreateServicesRequest(types.subList(2, 22).stream()
                 .map(t -> fixed(t.id(), 60, "350.00")).toList());
 
+        UUID actorId = authenticateAsOwnerOf(salonId);
+
         Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
         statistics.setStatisticsEnabled(true);
 
         statistics.clear();
         log.debug("Act: salon bulk-create of a 2-item batch, counting prepared statements");
-        serviceCatalogService.bulkCreateSalonMasterServices(salonId, smallBatchMaster, smallBatch);
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, smallBatchMaster, smallBatch);
         long twoItemStatements = statistics.getPrepareStatementCount();
 
         statistics.clear();
         log.debug("Act: salon bulk-create of a 20-item batch for a second master in the same salon");
-        serviceCatalogService.bulkCreateSalonMasterServices(salonId, largeBatchMaster, largeBatch);
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, largeBatchMaster, largeBatch);
         long twentyItemStatements = statistics.getPrepareStatementCount();
 
         log.debug("Observed prepareStatementCount: n=2 -> {}, n=20 -> {}",
@@ -1819,6 +1856,85 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         assertThat(countActiveDefinitionsForOwner("SALON", salonId))
                 .as("and 22 SALON-owned definitions exist across both batches")
                 .isEqualTo(22L);
+    }
+
+    /**
+     * P1 (2026-09-13 audit) — the REACTIVATION arm's statement count must also be flat in batch
+     * size.
+     *
+     * <p>The sibling gate above measures the CREATE arm. The reuse/reactivation arm was a separate
+     * hazard it could not see: {@code createSingleFromBulkItem} called
+     * {@code masterServiceRepository.findById(reactivateAssignmentId)} PER ITEM — up to 100
+     * serialized SELECTs, every one of them inside the SALON-keyed advisory lock, for row ids the
+     * caller had already projected out of {@code findSalonBulkSetupCandidates}. Because the lock is
+     * salon-wide (audit HIGH-2), that cost multiplied across every concurrent master setup in the
+     * salon, which is the P4 half of the same finding.
+     *
+     * <p>Shape: seed a master with K services, unassign ALL of them, then bulk re-add the same K.
+     * Every item then takes the reactivation sub-branch. K = 2 and K = 12 must cost the SAME number
+     * of statements; a per-item {@code findById} shows up as a difference of 10.
+     */
+    @Test
+    @DisplayName("salon bulk-create issues the SAME statement count re-adding 12 previously "
+            + "unassigned services as 2 — the reactivation lookup is batched, not per-item (P1)")
+    void should_keepStatementCountConstant_when_bulkReactivationBatchSizeGrows() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-p1-reactivate-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P1 Reactivation Statement Gate Salon");
+        UUID actorId = authenticateAsOwnerOf(salonId);
+
+        List<ServiceTestFixtures.SeededServiceType> types = fixtures.activeSelectableServiceTypes(14);
+        assertThat(types).hasSize(14);
+
+        long smallCount = reactivationStatementCount(
+                ownerToken, actorId, salonId, types.subList(0, 2));
+        long largeCount = reactivationStatementCount(
+                ownerToken, actorId, salonId, types.subList(2, 14));
+
+        log.debug("Observed reactivation prepareStatementCount: n=2 -> {}, n=12 -> {}",
+                smallCount, largeCount);
+
+        assertThat(largeCount)
+                .as("O(1) in batch size on the REACTIVATION arm too: 12 items cost %s statements "
+                        + "against %s for 2. A rise of ~N means the per-item findById is back "
+                        + "inside the salon-keyed advisory lock.", largeCount, smallCount)
+                .isEqualTo(smallCount);
+    }
+
+    /**
+     * Seeds one master with a service per type, unassigns every one of them, then MEASURES the bulk
+     * re-add. Returns the prepared-statement count of the measured call alone.
+     */
+    private long reactivationStatementCount(String ownerToken, UUID actorId, UUID salonId,
+                                            List<ServiceTestFixtures.SeededServiceType> types)
+            throws Exception {
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        var batch = new BulkCreateServicesRequest(
+                types.stream().map(t -> fixed(t.id(), 60, "350.00")).toList());
+
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, masterId, batch);
+
+        // Unassign every one of them, so the re-add below takes the reactivation sub-branch for
+        // EVERY item rather than inserting fresh assignments.
+        for (UUID definitionId : fixtures.activeDefinitionIdsAssignedToMaster(masterId)) {
+            serviceCatalogService.unassignServiceFromMaster(actorId, salonId, masterId, definitionId);
+        }
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("arrange — every assignment must be inactive before the measured re-add, or "
+                        + "the measured call takes the CREATE arm the sibling gate already covers")
+                .isEmpty();
+
+        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+        statistics.setStatisticsEnabled(true);
+        statistics.clear();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, masterId, batch);
+        long measured = statistics.getPrepareStatementCount();
+
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("a batch that wrote nothing would trivially satisfy the gate")
+                .hasSize(types.size());
+        return measured;
     }
 
     /**
@@ -1994,6 +2110,81 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(firstMenu);
     }
 
+    // ── B7 (2026-09-13 cycle-2 audit): the bulk path's service-layer ACTOR gate, negatively ─────
+
+    /**
+     * {@code bulkCreateSalonMasterServices}'s {@code authz.enforceCanManageSalon} line (added by
+     * cycle 1's S1 fix) had only happy-path coverage: every existing direct call authenticates as
+     * the salon's REAL owner, so deleting the guard left the whole suite green. Its unassign
+     * sibling got both a foreign-actor case and a non-vacuity twin
+     * ({@code MasterServiceUnassignIT#should_throwForbidden_when_foreignOwnerCallsUnassignServiceDirectly});
+     * this is the missing mirror.
+     *
+     * <p>Driving the BEAN directly is the whole point: it is the exact call shape a future non-HTTP
+     * caller would use, and the one the controller's {@code @PreAuthorize} cannot protect.
+     */
+    @Test
+    @DisplayName("B7: a DIRECT service-layer bulk-create by a FOREIGN salon's owner is refused "
+            + "with ForbiddenException and writes nothing")
+    void should_throwForbidden_when_foreignOwnerCallsBulkCreateDirectly() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-b7-victim-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "B7 Victim Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        String foreignOwnerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-b7-foreign-" + System.nanoTime() + "@beautica.test");
+        UUID foreignSalonId = fixtures.createSalon(foreignOwnerToken, "B7 Foreign Salon");
+
+        long rowsBefore = masterServiceRowCount();
+        UUID foreignOwnerId = authenticateAsOwnerOf(foreignSalonId);
+        var batch = new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "500.00")));
+
+        Throwable thrown = catchThrowable(() -> serviceCatalogService
+                .bulkCreateSalonMasterServices(foreignOwnerId, salonId, masterId, batch));
+
+        assertThat(thrown)
+                .as("the foreign owner genuinely owns A salon — what must refuse them is that it "
+                        + "is not THIS one, proven at the service layer")
+                .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+        assertThat(masterServiceRowCount())
+                .as("nothing may be written before the guard refuses")
+                .isEqualTo(rowsBefore);
+    }
+
+    /**
+     * Non-vacuity for the test above: the SAME direct, non-HTTP call shape SUCCEEDS for the salon's
+     * REAL owner. Without it, the ForbiddenException could equally be explained by the direct call
+     * shape being broken for everyone.
+     */
+    @Test
+    @DisplayName("B7 non-vacuity: the same DIRECT bulk-create SUCCEEDS for the salon's own owner — "
+            + "the guard rejects the actor, not the call shape")
+    void should_succeed_when_realOwnerCallsBulkCreateDirectly() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-b7-ok-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "B7 OK Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        UUID ownerId = authenticateAsOwnerOf(salonId);
+        var batch = new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "500.00")));
+
+        List<MasterServiceResponse> created =
+                serviceCatalogService.bulkCreateSalonMasterServices(ownerId, salonId, masterId, batch);
+
+        assertThat(created).hasSize(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ? AND is_active = true",
+                Integer.class, masterId))
+                .as("the authorized direct call must actually persist the batch")
+                .isEqualTo(1);
+    }
+
+    private long masterServiceRowCount() {
+        Long count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM master_services", Long.class);
+        return count == null ? 0L : count;
+    }
+
     /**
      * Runs one salon on-behalf bulk attempt after meeting the other thread at the barrier.
      * Mirrors {@link #attemptBulk}: returns the thrown exception (or {@code null}) rather than
@@ -2004,7 +2195,11 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                                        AtomicInteger successCount, AtomicInteger conflictCount) {
         try {
             startLine.await(10, TimeUnit.SECONDS); // both threads cross together — no sleep
-            serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+            // Each racing thread carries its OWN security context (SecurityContextHolder is
+            // thread-local), so the service-layer canManageSalon guard added by the 2026-09-13
+            // audit (S1) resolves on both — the race under test is the advisory lock, not authz.
+            UUID actorId = authenticateAsOwnerOf(salonId);
+            serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, masterId, request);
             successCount.incrementAndGet();
             return null;
         } catch (BusinessException e) {

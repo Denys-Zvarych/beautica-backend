@@ -53,6 +53,29 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — catalog methods unit")
 class ServiceCatalogServiceCatalogTest {
 
+    // ── Constructor-wiring collaborators (2026-09-13 audit Q19, corrected in cycle 2 by B11) ────
+    //
+    // THIS class does NOT use @InjectMocks: setUp() below calls `new ServiceCatalogService(...)`
+    // explicitly, listing all seventeen collaborators positionally. The rationale originally pasted
+    // here — "a missing @Mock makes Mockito inject NULL" — is a property of @InjectMocks and is
+    // simply FALSE for this file: deleting a @Mock field here is a COMPILE ERROR at the constructor
+    // call, never a silent null, so the sibling files' hazard does not exist. (It is accurate where
+    // it still stands: ServiceCatalogServiceTest and ServiceCatalogServiceBulkCreateTest do use
+    // @InjectMocks, and ServiceCatalogServiceCacheTest is a @SpringBootTest whose context fails to
+    // start on a missing @MockBean.)
+    //
+    // What keeps the unused mocks here is therefore a different, weaker reason: the constructor
+    // demands a value for every parameter, and an inert mock (which returns a default) is strictly
+    // safer than a `null` that NPEs the moment a future test in this file reaches the collaborator.
+    //
+    // Q19 sweep, completed (B11) — the mocks referenced ONLY by the constructor call in this file,
+    // i.e. never stubbed and never verified, are: serviceRepository, salonRepository,
+    // masterRepository, cacheManager, salonCatalogCacheEvictor and bookingRepository. They are kept
+    // deliberately, for the reason above; the list is recorded so the next reader does not have to
+    // re-derive it, and so that a future test which DOES stub one is visibly narrowing this set.
+    // The only genuinely removable case the sweep found remains MasterCachePrefixEvictor: it was a
+    // never-read field on the PRODUCTION class too, so the fix was deleting the constructor
+    // parameter, not the mock.
     @Mock private ServiceRepository serviceRepository;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private SalonRepository salonRepository;
@@ -92,9 +115,6 @@ class ServiceCatalogServiceCatalogTest {
                 serviceTypeSearchService,
                 serviceTypeRepository,
                 cacheManager,
-                // A REAL evictor over the mocked CacheManager, never a mock: the key-shape predicate it
-                // owns is the thing that silently no-opped for months, so it must actually execute here.
-                new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 authz,
                 slotCalculationService,
                 salonCatalogCacheEvictor,
@@ -663,6 +683,83 @@ class ServiceCatalogServiceCatalogTest {
 
         assertThat(row.priceMin()).isNull();
         assertThat(row.priceDisplay()).isNull();
+    }
+
+    // ── Q8 (2026-09-13 audit): getSalonServiceCatalog's TWO empty-return branches ───────────────
+    //
+    // Both were reached by existing cache tests, but NONE of them asserted the returned value —
+    // they only counted cache calls — and neither had a never-verification. A mutant returning
+    // `null`, or one that fell through to the category lookup with an empty map, survived both.
+
+    @Test
+    @DisplayName("Q8: no candidate assignments at all returns an EMPTY catalogue and never runs the "
+            + "free-slot gate — the cheapest possible miss")
+    void should_returnEmptyCatalogueWithoutGating_when_salonHasNoCandidateAssignments() {
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        SalonServiceCatalogResponse response = service.getSalonServiceCatalog(salonId);
+
+        assertThat(response).isNotNull();
+        assertThat(response.categories())
+                .as("an empty catalogue is an empty category LIST, never null")
+                .isEmpty();
+        verify(slotCalculationService, never()).filterBookableAssignmentsBatch(any());
+        verifyNoInteractions(platformCategoryOrderLookup);
+    }
+
+    @Test
+    @DisplayName("Q8: candidates exist but the free-slot gate filters ALL of them out — still an "
+                + "empty catalogue, and the category-order lookup is never consulted")
+    void should_returnEmptyCatalogue_when_everyCandidateIsFilteredOutByTheBookabilityGate() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        MasterServiceAssignment candidate = assignment(master, sd, null, null, null);
+
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(candidate));
+        // Non-empty candidates, zero survivors — the branch no test reached at all.
+        when(slotCalculationService.filterBookableAssignmentsBatch(any()))
+                .thenReturn(Map.of(masterId, List.of()));
+
+        SalonServiceCatalogResponse response = service.getSalonServiceCatalog(salonId);
+
+        assertThat(response.categories()).isEmpty();
+        verify(slotCalculationService).filterBookableAssignmentsBatch(any());
+        verifyNoInteractions(platformCategoryOrderLookup);
+    }
+
+    // ── Q9 (2026-09-13 audit): the null-floor contributor SKIP, in a MIXED list ─────────────────
+
+    @Test
+    @DisplayName("Q9: one contributor resolving to a null floor is SKIPPED while a valid sibling "
+            + "still prices the row — the branch's actual purpose, which the all-null degenerate "
+            + "case cannot exercise")
+    void should_skipNullFloorContributorAndPriceFromTheRest_when_theListIsMixed() {
+        UUID salonId = UUID.randomUUID();
+        UUID nullFloorMasterId = UUID.randomUUID();
+        UUID pricedMasterId = UUID.randomUUID();
+
+        // A legacy definition with NO base_price: an Inherited assignment against it resolves to a
+        // null floor. The second master carries an own band, so the hull is theirs alone.
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, null, null);
+        MasterServiceAssignment nullFloor = assignment(master(nullFloorMasterId), sd, null, null, null);
+        MasterServiceAssignment priced = assignment(
+                master(pricedMasterId), sd, PriceType.RANGE, new BigDecimal("600.00"), new BigDecimal("950.00"));
+
+        stubBookable(salonId, List.of(nullFloor, priced),
+                Map.of(nullFloorMasterId, List.of(nullFloor), pricedMasterId, List.of(priced)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceMin())
+                .as("the null-floor contributor must neither corrupt the hull nor trigger the "
+                        + "all-null fallback — the priced master alone sets the band")
+                .isEqualByComparingTo("600.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("950.00");
+        assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
     }
 
     /**

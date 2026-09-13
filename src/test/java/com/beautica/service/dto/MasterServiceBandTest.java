@@ -88,4 +88,97 @@ class MasterServiceBandTest {
     void should_returnFalse_when_priceSetWithNoPriceType() {
         assertThat(MasterServiceBand.isLegal(null, new BigDecimal("500"), null)).isFalse();
     }
+
+    @Test
+    @DisplayName("(null, null, 900) — a CEILING with no priceType — is illegal (the mirror-image "
+            + "partial band the floor case above does not cover)")
+    void should_returnFalse_when_priceMaxSetWithNoPriceType() {
+        assertThat(MasterServiceBand.isLegal(null, null, new BigDecimal("900"))).isFalse();
+    }
+
+    // ── Missing-floor arms: `price != null` on both switch branches (2026-09-13 audit, Q10) ──
+
+    @Test
+    @DisplayName("FIXED with a null floor is illegal — a shape with nothing to charge is not a band")
+    void should_returnFalse_when_fixedHasNullPrice() {
+        assertThat(MasterServiceBand.isLegal(PriceType.FIXED, null, null)).isFalse();
+    }
+
+    @Test
+    @DisplayName("RANGE with a null floor but a present ceiling is illegal")
+    void should_returnFalse_when_rangeHasNullFloor() {
+        assertThat(MasterServiceBand.isLegal(PriceType.RANGE, null, new BigDecimal("900"))).isFalse();
+    }
+
+    @Test
+    @DisplayName("RANGE with a floor but no ceiling is illegal — RANGE requires both")
+    void should_returnFalse_when_rangeHasNullCeiling() {
+        assertThat(MasterServiceBand.isLegal(PriceType.RANGE, new BigDecimal("500"), null)).isFalse();
+    }
+
+    // ── Positivity arms: `price.compareTo(ZERO) > 0` (2026-09-13 audit, Q10) ─────────────────────
+    //
+    // Untested until now on BOTH branches. A mutant weakening either to >= would have survived the
+    // whole original ledger, and a zero-priced band is not merely odd — it is a free service the
+    // DB CHECK does not refuse either (chk_master_service_price_mode says nothing about sign).
+
+    @Test
+    @DisplayName("FIXED 0 is illegal — the floor must be strictly positive")
+    void should_returnFalse_when_fixedPriceIsZero() {
+        assertThat(MasterServiceBand.isLegal(PriceType.FIXED, BigDecimal.ZERO, null)).isFalse();
+    }
+
+    @Test
+    @DisplayName("FIXED with a NEGATIVE floor is illegal")
+    void should_returnFalse_when_fixedPriceIsNegative() {
+        assertThat(MasterServiceBand.isLegal(PriceType.FIXED, new BigDecimal("-1"), null)).isFalse();
+    }
+
+    @Test
+    @DisplayName("RANGE 0/500 is illegal — a zero floor fails positivity even though the ceiling "
+            + "is strictly above it, so the D8 comparison alone cannot be what rejects it")
+    void should_returnFalse_when_rangeFloorIsZero() {
+        assertThat(MasterServiceBand.isLegal(
+                PriceType.RANGE, BigDecimal.ZERO, new BigDecimal("500")))
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("RANGE -100/-1 is illegal — both ends non-positive, pinning the ceiling's own "
+            + "positivity arm, which a positive-floor case can never reach")
+    void should_returnFalse_when_rangeCeilingIsNegative() {
+        assertThat(MasterServiceBand.isLegal(
+                PriceType.RANGE, new BigDecimal("-100"), new BigDecimal("-1")))
+                .isFalse();
+    }
+
+    // ── isAbsent — the PATCH's "band present?" discriminator (2026-09-13 audit, Q10) ─────────────
+    //
+    // Zero direct tests until now, despite being what UpdateMasterServiceBandRequest's @AssertTrue
+    // rules use to tell "leave the band unchanged" (D4) from "band present, must be legal".
+
+    @Test
+    @DisplayName("isAbsent is true only for the all-null triple")
+    void should_returnTrue_when_noBandFieldWasSent() {
+        assertThat(MasterServiceBand.isAbsent(null, null, null)).isTrue();
+    }
+
+    @Test
+    @DisplayName("isAbsent is false when ONLY priceType was sent — a partial band is present, not "
+            + "absent, so the PATCH must validate it rather than treat it as 'leave unchanged'")
+    void should_returnFalse_when_onlyPriceTypeWasSent() {
+        assertThat(MasterServiceBand.isAbsent(PriceType.FIXED, null, null)).isFalse();
+    }
+
+    @Test
+    @DisplayName("isAbsent is false when ONLY price was sent")
+    void should_returnFalse_when_onlyPriceWasSent() {
+        assertThat(MasterServiceBand.isAbsent(null, new BigDecimal("500"), null)).isFalse();
+    }
+
+    @Test
+    @DisplayName("isAbsent is false when ONLY priceMax was sent")
+    void should_returnFalse_when_onlyPriceMaxWasSent() {
+        assertThat(MasterServiceBand.isAbsent(null, null, new BigDecimal("900"))).isFalse();
+    }
 }

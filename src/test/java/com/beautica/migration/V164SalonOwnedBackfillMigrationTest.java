@@ -828,6 +828,162 @@ class V164SalonOwnedBackfillMigrationTest {
     }
 
     // =========================================================================
+    // Q16 (2026-09-13 audit) — the two SKIPS V164 makes, pinned as INTENTIONAL
+    // =========================================================================
+    //
+    // V164:54's `sd.is_active = true` and step 4's `NOT EXISTS` are both deliberate narrowings that
+    // no case pinned. A documented intentional skip still needs a test: without one, widening the
+    // predicate (or losing the NOT EXISTS) is a silent behaviour change, and so is keeping it after
+    // someone decides it was wrong.
+
+    @Test
+    @DisplayName("Q16a: an INACTIVE master-owned definition on a salon-bound master is NEVER "
+            + "promoted — V164:54 filters the candidates CTE on sd.is_active = true, and that skip "
+            + "is intentional: a deactivated service is not part of the salon's catalogue")
+    void should_leaveInactiveMasterOwnedDefinitionUntouched() {
+        UUID owner = insertUser("SALON_OWNER");
+        UUID salonId = insertSalon(owner);
+        UUID masterId = insertSalonMaster(salonId);
+        UUID typeId = resolveServiceTypeIds(1).get(0);
+
+        UUID inactiveDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterId, typeId,
+                new BigDecimal("300.00"), 60, false, OffsetDateTime.now(ZoneOffset.UTC).minusDays(30));
+
+        applyV164();
+
+        assertThat(definitionRow(inactiveDefId))
+                .as("Q16a — an inactive definition keeps its INDEPENDENT_MASTER ownership; "
+                        + "promoting it would resurrect a service the salon deliberately retired, "
+                        + "and would collide with V121's partial unique index the moment it were "
+                        + "reactivated alongside an active SALON row for the same type")
+                .containsEntry("owner_type", "INDEPENDENT_MASTER")
+                .containsEntry("owner_id", masterId)
+                .containsEntry("is_active", false);
+    }
+
+    @Test
+    @DisplayName("Q16a non-vacuity: the SAME fixture with is_active = true IS promoted — the skip "
+            + "above is driven by the flag, not by anything else in the fixture")
+    void should_promoteTheSameDefinition_when_itIsActive() {
+        UUID owner = insertUser("SALON_OWNER");
+        UUID salonId = insertSalon(owner);
+        UUID masterId = insertSalonMaster(salonId);
+        UUID typeId = resolveServiceTypeIds(1).get(0);
+
+        UUID activeDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterId, typeId,
+                new BigDecimal("300.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(30));
+
+        applyV164();
+
+        assertThat(definitionRow(activeDefId))
+                .containsEntry("owner_type", "SALON")
+                .containsEntry("owner_id", salonId);
+    }
+
+    @Test
+    @DisplayName("Q16b: an INACTIVE master_services row on a merged LOSER IS repointed at the "
+            + "survivor and STAYS inactive — step 4 is is_active-blind by design, so unassign "
+            + "state survives the merge without the row being stranded on a dead definition")
+    void should_repointInactiveAssignmentOntoSurvivor_keepingItInactive() {
+        UUID owner = insertUser("SALON_OWNER");
+        UUID salonId = insertSalon(owner);
+        UUID masterA = insertSalonMaster(salonId);
+        UUID masterB = insertSalonMaster(salonId);
+        UUID typeId = resolveServiceTypeIds(1).get(0);
+
+        // masterA's definition is older, so it wins the group.
+        UUID survivorDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterA, typeId,
+                new BigDecimal("300.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(30));
+        insertMasterService(masterA, survivorDefId, null, null, true);
+
+        UUID loserDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterB, typeId,
+                new BigDecimal("350.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(10));
+        // masterB previously UNASSIGNED this service — an is_active = false row.
+        UUID inactiveAssignmentId = insertMasterService(masterB, loserDefId, null, null, false);
+
+        applyV164();
+
+        assertThat(definitionRow(loserDefId))
+                .as("arrange check — the loser definition really was merged away")
+                .containsEntry("is_active", false);
+        assertThat(assignmentRow(inactiveAssignmentId))
+                .as("Q16b — step 4's NOT EXISTS excludes only a master who ALREADY holds a row "
+                        + "against the survivor; it does NOT filter on is_active. So an unassigned "
+                        + "row is repointed like any other. That is the right outcome: leaving it "
+                        + "on a now-INACTIVE definition would strand it, and re-assigning later "
+                        + "(ServiceCatalogService's D6 reactivation path, which looks the row up "
+                        + "by (master, service_def_id)) would then miss it and insert a duplicate "
+                        + "against the non-partial UNIQUE key.")
+                .containsEntry("service_def_id", survivorDefId)
+                .containsEntry("is_active", false);
+        assertThat((BigDecimal) assignmentRow(inactiveAssignmentId).get("price_override"))
+                .as("and the loser's diverging 350 price is carried into the override (D5) exactly "
+                        + "as it is for an active row — the merge preserves what this master "
+                        + "charged, ready for whenever the service is re-assigned")
+                .isEqualByComparingTo("350.00");
+    }
+
+    @Test
+    @DisplayName("Q16c: step 4's NOT EXISTS — a master holding rows against BOTH the loser and the "
+            + "survivor keeps the loser-pointed row ON the loser, never repointed into a "
+            + "UNIQUE(master_id, service_def_id) collision")
+    void should_leaveLoserPointedRowInPlace_when_theMasterAlreadyHoldsTheSurvivor() {
+        UUID owner = insertUser("SALON_OWNER");
+        UUID salonId = insertSalon(owner);
+        UUID masterA = insertSalonMaster(salonId);
+        UUID masterB = insertSalonMaster(salonId);
+        UUID typeId = resolveServiceTypeIds(1).get(0);
+
+        UUID survivorDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterA, typeId,
+                new BigDecimal("300.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(30));
+        insertMasterService(masterA, survivorDefId, null, null, true);
+
+        UUID loserDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterB, typeId,
+                new BigDecimal("350.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(10));
+        // masterB performs BOTH definitions — the collision step 4's NOT EXISTS exists to avoid.
+        UUID onSurvivorId = insertMasterService(masterB, survivorDefId, null, null, true);
+        UUID onLoserId = insertMasterService(masterB, loserDefId, null, null, true);
+
+        applyV164();
+
+        assertThat(assignmentRow(onLoserId))
+                .as("Q16c — repointing this row would duplicate (masterB, survivor). Step 3 "
+                        + "deactivates it instead and step 4 skips it, so it stays on the loser.")
+                .containsEntry("service_def_id", loserDefId)
+                .containsEntry("is_active", false);
+        assertThat(assignmentRow(onSurvivorId))
+                .as("the master's pre-existing survivor row is the one that survives, untouched")
+                .containsEntry("service_def_id", survivorDefId)
+                .containsEntry("is_active", true);
+    }
+
+    @Test
+    @DisplayName("Q16b non-vacuity: an ACTIVE assignment on the same merged loser is repointed at "
+            + "the survivor TOO — step 4 is is_active-BLIND, so the inactive row above is "
+            + "repointed for the same reason, not skipped (B13: there is no skip)")
+    void should_repointActiveAssignmentOnTheLoser_whenItsDefinitionIsMerged() {
+        UUID owner = insertUser("SALON_OWNER");
+        UUID salonId = insertSalon(owner);
+        UUID masterA = insertSalonMaster(salonId);
+        UUID masterB = insertSalonMaster(salonId);
+        UUID typeId = resolveServiceTypeIds(1).get(0);
+
+        UUID survivorDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterA, typeId,
+                new BigDecimal("300.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(30));
+        insertMasterService(masterA, survivorDefId, null, null, true);
+
+        UUID loserDefId = insertServiceDefinition("INDEPENDENT_MASTER", masterB, typeId,
+                new BigDecimal("350.00"), 60, true, OffsetDateTime.now(ZoneOffset.UTC).minusDays(10));
+        UUID activeAssignmentId = insertMasterService(masterB, loserDefId, null, null, true);
+
+        applyV164();
+
+        assertThat(assignmentRow(activeAssignmentId))
+                .containsEntry("service_def_id", survivorDefId)
+                .containsEntry("is_active", true);
+    }
+
+    // =========================================================================
     // Flyway history
     // =========================================================================
 

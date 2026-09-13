@@ -20,9 +20,13 @@ import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -31,6 +35,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -39,7 +44,29 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1")
 @RequiredArgsConstructor
+// @Validated activates the @Min/@Max on the loose @RequestParam pagination arguments of
+// getSalonMasterServices (2026-09-13 audit, P7). Bean Validation on a bare method parameter — as
+// opposed to a @Valid @RequestBody — only runs through the method-validation proxy this enables.
+@org.springframework.validation.annotation.Validated
 public class ServiceController {
+
+    /**
+     * Default page size for {@code GET /salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services}
+     * — the exact cap {@code ServiceCatalogService#getSalonMasterServices} used to hard-code, kept
+     * verbatim so adding {@link org.springframework.data.domain.Pageable} changed no existing
+     * caller's result (2026-09-13 audit, P7).
+     */
+    private static final int SALON_MASTER_SERVICES_DEFAULT_PAGE_SIZE = 200;
+
+    /**
+     * Hard ceiling on a CALLER-SUPPLIED {@code size} for the same route. The server-chosen default
+     * above is allowed to exceed it because it is not caller input; anything a client asks for is
+     * bounded here, which is the memory-exhaustion guard §J's global
+     * {@code spring.data.web.pageable.max-page-size} provides for {@code Pageable}-resolved
+     * endpoints. Enforced by {@code @Max} (a 400, not a silent clamp) so a client asking for 10 000
+     * is told it was wrong instead of quietly getting a different page than it requested.
+     */
+    private static final int SALON_MASTER_SERVICES_MAX_PAGE_SIZE = 200;
 
     /**
      * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on every write
@@ -259,7 +286,7 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PatchMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
-    @PreAuthorize("@authz.canEditMasterServiceBand(authentication, #salonId, #masterId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    @PreAuthorize("@authz.canEditMasterServiceBand(authentication, #salonId, #masterId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> updateMasterServiceBand(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
@@ -309,24 +336,28 @@ public class ServiceController {
     public ResponseEntity<Void> unassignServiceFromMaster(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
-            @PathVariable UUID serviceDefId
+            @PathVariable UUID serviceDefId,
+            Authentication authentication
     ) {
-        serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId);
+        serviceCatalogService.unassignServiceFromMaster(
+                AuthenticationUtils.userId(authentication), salonId, masterId, serviceDefId);
         return ResponseEntity.noContent().build();
     }
 
     /**
-     * Returns the FULL service list of one master in {@code salonId}, {@code priceOverride}
-     * unmasked — the management read for the salon's OWNER/ADMIN (Phase 309), widened by Phase
-     * 310 to also admit the master's OWN {@code SALON_MASTER} reading their own row.
+     * Returns the full service list of one master in {@code salonId} — the management read for the
+     * salon's OWNER/ADMIN (Phase 309), widened by Phase 310 to also admit the master's OWN
+     * {@code SALON_MASTER} reading their own row.
      *
-     * <p><strong>Not a substitute route for {@link #getMasterServices}.</strong> That public
-     * browse masks {@code priceOverride} via {@code MasterServiceResponse.fromPublic} and is
-     * cached with the masked shape; this endpoint returns {@code MasterServiceResponse::from}
-     * straight, unmasked, because a salon owner MANAGING a master's menu — or that master reading
-     * their own catalogue (Phase 310) — needs the exact field an anonymous browser must not see
-     * (Phase 309 D1, Phase 310 D4). The public route was deliberately rejected as the SALON_MASTER
-     * path for this reason (Phase 310 background).
+     * <p><strong>Not a substitute route for {@link #getMasterServices}.</strong> That route is
+     * {@code permitAll} and cached per {@code masterId} across every caller including anonymous
+     * ones; this one is authorization-gated and uncached. The DTO shape is now identical on both
+     * (2026-09-13 audit, S5 retired {@code MasterServiceResponse.fromPublic}, whose
+     * {@code priceOverride} mask was recoverable by subtraction from {@code effectivePrice} and the
+     * nested definition's {@code priceMin}); what separates the two routes is the AUDIENCE and the
+     * cache, not a masked field. The public route was still deliberately rejected as the
+     * SALON_MASTER path (Phase 310 background) — a cache shared with anonymous callers is the wrong
+     * place for a provider's management read.
      *
      * <p><strong>Who is admitted (Phase 310 D2).</strong> {@code @authz.canReadSalonMasterServices}
      * grants: (1) {@code SALON_OWNER} / {@code SALON_ADMIN} managing {@code salonId} — Phase 309's
@@ -379,10 +410,31 @@ public class ServiceController {
     public ApiResponse<List<MasterServiceResponse>> getSalonMasterServices(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            // ADDITIVE pagination (2026-09-13 audit, P7). The service used to hard-code
+            // PageRequest.of(0, 200) and only log.warn on exact-cap: truncation was DETECTED, never
+            // escapable. Omitting both params reproduces that byte-identically, so the mobile
+            // client — which sends neither — is unaffected; a caller that DOES hit the cap can now
+            // page past it. The response stays List<MasterServiceResponse>, not PageResponse:
+            // switching the wire shape would be a coordinated mobile change, which this is not.
+            //
+            // NOT @PageableDefault, deliberately. Spring's PageableHandlerMethodArgumentResolver
+            // clamps the resolved size to spring.data.web.pageable.max-page-size (100, §J) — the
+            // ANNOTATION DEFAULT included, not just caller input. @PageableDefault(size = 200)
+            // therefore silently resolves to 100 and HALVES the historic cap for every existing
+            // caller, which is precisely the non-additive change this finding forbids (proven by
+            // ServiceControllerTest#should_useTheHistoricPageCap_when_noPageableParamsAreSent).
+            // Two explicit optional params keep the 200 server-chosen default while still bounding
+            // caller input — see SALON_MASTER_SERVICES_MAX_PAGE_SIZE.
+            @RequestParam(required = false) @Min(0) Integer page,
+            @RequestParam(required = false) @Min(1) @Max(SALON_MASTER_SERVICES_MAX_PAGE_SIZE) Integer size,
             Authentication authentication
     ) {
         UUID actorId = AuthenticationUtils.userId(authentication);
-        return ApiResponse.ok(serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId));
+        Pageable pageable = PageRequest.of(
+                page != null ? page : 0,
+                size != null ? size : SALON_MASTER_SERVICES_DEFAULT_PAGE_SIZE);
+        return ApiResponse.ok(
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, pageable));
     }
 
     /**
@@ -587,10 +639,11 @@ public class ServiceController {
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMasterServices(
             @PathVariable UUID salonId,
             @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
-            @Valid @RequestBody BulkCreateServicesRequest request
+            @Valid @RequestBody BulkCreateServicesRequest request,
+            Authentication authentication
     ) {
-        List<MasterServiceResponse> response =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+        List<MasterServiceResponse> response = serviceCatalogService.bulkCreateSalonMasterServices(
+                AuthenticationUtils.userId(authentication), salonId, masterId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 

@@ -48,6 +48,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -61,6 +64,26 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — @Cacheable/@CacheEvict behaviour")
 class ServiceCatalogServiceCacheTest {
 
+    /**
+     * The authenticated actor id every service call under test is invoked with.
+     * {@code authz} is a mock, so its {@code enforce*} guards are no-ops here — the point
+     * of a named constant is that the VERIFICATIONS below can assert the exact actor the
+     * production code passed to the authorization service (2026-09-13 audit, Q17).
+     */
+    private static final UUID ACTOR_ID = UUID.fromString("0000ac70-0000-4000-8000-000000000001");
+
+    // ── Constructor-wiring collaborators (2026-09-13 audit, Q19) ────────────────────────────────
+    //
+    // Some of the mocks below are never stubbed and never verified by this file. That is NOT dead
+    // weight and they must NOT be deleted: ServiceCatalogService is @RequiredArgsConstructor, so a
+    // missing @Mock makes Mockito inject NULL for that parameter (and a missing @MockBean makes the
+    // Spring context fail to start). An inert mock returns a default; a null NPEs the moment any
+    // future test reaches the collaborator. The audit's own S1 fix proved this the hard way — adding
+    // the AuthorizationService guard to the bulk path NPE'd every salon-branch test in
+    // ServiceCatalogServiceBulkCreateTest because that file had no authz mock at all.
+    //
+    // The ONE genuinely removable case was MasterCachePrefixEvictor: it was a never-read field on
+    // the PRODUCTION class too, so the fix was deleting the constructor parameter, not the mock.
     @MockBean ServiceRepository serviceRepository;
     @MockBean MasterServiceRepository masterServiceRepository;
     @MockBean SalonRepository salonRepository;
@@ -430,7 +453,13 @@ class ServiceCatalogServiceCacheTest {
 
         // Act — no active Spring transaction here; the (stubbed, delegating) off-thread sweep runs
         // immediately in unassignServiceFromMaster's else-branch.
-        serviceCatalogService.unassignServiceFromMaster(salonId, masterId, serviceDefId);
+        serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId);
+
+        // Q17 (2026-09-13 audit): authz is a @MockBean whose void enforce* guards default to a
+        // no-op, so WITHOUT this verification every write in this file would sail through
+        // authorization regardless of whether the production code called it at all. Assert the
+        // exact actor and salon the service passed, not merely that something was called.
+        verify(authz).enforceCanManageSalon(ACTOR_ID, salonId);
 
         // Assert — eventually evicted (behaviourally, via CacheManager), not synchronously: after
         // MEDIUM-3 the off-thread sweep is the ONLY path that evicts available-slots here.
@@ -438,6 +467,47 @@ class ServiceCatalogServiceCacheTest {
                 .as("available-slots must still be evicted for the master after MEDIUM-3 removed "
                         + "the redundant direct call")
                 .isNull();
+    }
+
+    // ── Q17 (2026-09-13 audit): authorization is genuinely consulted, not mock-defaulted ───────
+
+    @Test
+    @DisplayName("Q17: a ForbiddenException from AuthorizationService aborts the unassign before "
+            + "any cache eviction — proving this file's authz mock is a gate, not scenery")
+    void should_abortAndEvictNothing_when_authorizationRefusesTheUnassign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        doThrow(new com.beautica.common.exception.ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageSalon(ACTOR_ID, salonId);
+
+        assertThatThrownBy(() -> serviceCatalogService
+                .unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
+                .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+
+        // salonCatalogCacheEvictor is a REAL bean in this slice (it is on the @SpringBootTest
+        // classes list so its @CacheEvict fires through the AOP proxy), so it cannot be verified —
+        // the repository mock is what proves nothing downstream of the guard ran.
+        verifyNoInteractions(masterServiceRepository);
+    }
+
+    @Test
+    @DisplayName("Q17: a ForbiddenException from AuthorizationService aborts the salon bulk create "
+            + "before the master is even resolved")
+    void should_abortBeforeResolvingMaster_when_authorizationRefusesTheBulkCreate() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        doThrow(new com.beautica.common.exception.ForbiddenException("Access denied"))
+                .when(authz).enforceCanManageSalon(ACTOR_ID, salonId);
+
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateSalonMasterServices(
+                ACTOR_ID, salonId, masterId, oneItemBulkRequest(UUID.randomUUID())))
+                .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+
+        verifyNoInteractions(masterRepository);
+        verifyNoInteractions(serviceTypeRepository);
     }
 
     // ── Phase 311 D11 — updateMasterServiceBand's CONDITIONAL eviction ─────────
@@ -684,22 +754,24 @@ class ServiceCatalogServiceCacheTest {
         verify(masterServiceRepository, times(1)).findBookableAssignmentsBySalon(salonB);
     }
 
-    // ── masterServices cache SHAPE (QA gap G6, Q7) ──────────────────────────────
+    // ── masterServices cache SHAPE (QA gap G6, Q7; rewritten 2026-09-13 audit, S5) ─────────────
     //
-    // getMasterServices' javadoc makes a load-bearing safety claim: masking (fromPublic,
-    // dropping priceOverride) happens INSIDE the @Cacheable method, so the "masterServices"
-    // cache entry itself is already masked — not just the value handed back to this call's
-    // caller. Prior tests above only pin call counts (cache hit/miss), which would stay green
-    // even if masking moved OUT of the cached method (e.g. into the controller) and the cache
-    // started holding the unmasked shape — a priceOverride leak to anonymous callers. These two
-    // tests read the actual stored cache entry via the injected real CacheManager (this class's
-    // Spring context has CacheConfig on the @SpringBootTest classes list, so @Cacheable's AOP
-    // proxy is genuinely active here — this is NOT a plain-Mockito unit test) to pin the shape
-    // claim behaviourally.
+    // These two tests used to pin a MASK: getMasterServices ran MasterServiceResponse.fromPublic
+    // inside the @Cacheable method, so the stored entry carried a null priceOverride. S5 found the
+    // mask controlled nothing — the same row still carries effectivePrice = COALESCE(override,
+    // base_price) and the nested definition's priceMin = base_price, so the "hidden" number was one
+    // subtraction away — and retired it rather than keep a confidentiality claim that does not hold.
+    //
+    // The tests are kept, not deleted, and re-pointed at what is still load-bearing: the cache must
+    // hold EXACTLY what the method returns, byte for byte, and the provider's own uncached read
+    // must never be served from this shared, anonymous-visible entry. Both read the actual stored
+    // value through the real CacheManager (CacheConfig is on the @SpringBootTest classes list, so
+    // @Cacheable's AOP proxy is genuinely active here — this is NOT a plain-Mockito unit test).
 
     @Test
-    @DisplayName("public getMasterServices call caches the already-masked shape (priceOverride null in the stored entry, effectivePrice still derived from the override)")
-    void should_cacheTheAlreadyMaskedShape_when_publicPathPopulatesMasterServices() {
+    @DisplayName("public getMasterServices caches exactly what it returns — priceOverride included "
+            + "(S5: the mask that used to null it here is retired, prices on this route are public)")
+    void should_cacheTheReturnedShapeVerbatim_when_publicPathPopulatesMasterServices() {
         UUID masterId = UUID.randomUUID();
         BigDecimal override = new BigDecimal("123.45");
 
@@ -728,24 +800,33 @@ class ServiceCatalogServiceCacheTest {
 
         List<MasterServiceResponse> returned = serviceCatalogService.getMasterServices(masterId);
 
-        // The returned value is masked, and the mask is a projection: effectivePrice still
-        // reflects the override that priceOverride itself no longer discloses.
         assertThat(returned).hasSize(1);
-        assertThat(returned.get(0).priceOverride()).isNull();
+        assertThat(returned.get(0).priceOverride())
+                .as("S5 — served, not masked")
+                .isEqualByComparingTo(override);
         assertThat(returned.get(0).effectivePrice()).isEqualByComparingTo(override);
 
-        // The whole point of this test: assert the STORED cache value, not just the return
-        // value — this is what distinguishes "masked on the way out" from "masked before storing".
+        // The whole point of this test: assert the STORED cache value, not just the return value.
+        // isFavorite is the one field that must still be null in the cache (Phase 32.1 D1/D4) —
+        // that claim is unaffected by S5 and is asserted here so this file keeps a cache-SHAPE
+        // assertion after the priceOverride one was retired.
         List<?> cachedRaw = cacheManager.getCache("masterServices").get(masterId, List.class);
         assertThat(cachedRaw).isNotNull().hasSize(1);
         MasterServiceResponse cachedEntry = (MasterServiceResponse) cachedRaw.get(0);
-        assertThat(cachedEntry.priceOverride()).isNull();
-        assertThat(cachedEntry.effectivePrice()).isEqualByComparingTo(override);
+        assertThat(cachedEntry)
+                .as("the cache must hold exactly the value the method returned")
+                .usingRecursiveComparison()
+                .isEqualTo(returned.get(0));
+        assertThat(cachedEntry.isFavorite())
+                .as("this cache is shared across every caller including anonymous guests, so a "
+                        + "client-specific flag must never be stored in it (Phase 32.1 D1/D4)")
+                .isNull();
     }
 
     @Test
-    @DisplayName("provider's own getMyServices call after the public path has cached the master does not pick up the masked entry — priceOverride comes back unmasked")
-    void should_returnUnmaskedPriceOverride_when_providerReadsOwnServicesAfterPublicPathCached() {
+    @DisplayName("provider's own getMyServices call never reads the shared public cache entry — it "
+            + "re-queries the repository, even after the public path has populated that key")
+    void should_requeryRepository_when_providerReadsOwnServicesAfterPublicPathCached() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         BigDecimal override = new BigDecimal("77.00");
@@ -777,12 +858,16 @@ class ServiceCatalogServiceCacheTest {
         // Populate the "masterServices" cache with the masked shape via the public path first.
         serviceCatalogService.getMasterServices(masterId);
 
-        // getMyServices is uncached (no @Cacheable) and must not read the masked cache entry —
-        // it re-queries the repository directly and returns the full, unmasked variant.
+        // getMyServices is uncached (no @Cacheable). The DTO shapes are identical since S5, so the
+        // separation can no longer be shown by a masked field — it is shown by the REPOSITORY being
+        // hit a second time. If getMyServices ever started reading "masterServices", this count
+        // would drop to 1.
         List<MasterServiceResponse> own = serviceCatalogService.getMyServices(userId);
 
         assertThat(own).hasSize(1);
         assertThat(own.get(0).priceOverride()).isEqualByComparingTo(override);
+        verify(masterServiceRepository, times(2))
+                .findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class));
     }
 
     // ── Phase 304 — bulkCreateSalonMasterServices salon-catalogue eviction (cases 5-8) ─────────
@@ -839,7 +924,7 @@ class ServiceCatalogServiceCacheTest {
         serviceCatalogService.getSalonServiceCatalog(salonB);
 
         // Act — no active Spring transaction here; the eviction runs immediately (else-branch).
-        serviceCatalogService.bulkCreateSalonMasterServices(salonA, masterId, oneItemBulkRequest(serviceTypeId));
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonA, masterId, oneItemBulkRequest(serviceTypeId));
 
         // Salon A recomputes (evicted); salon B stays cached (per-key, not allEntries).
         serviceCatalogService.getSalonServiceCatalog(salonA);
@@ -865,7 +950,7 @@ class ServiceCatalogServiceCacheTest {
         TransactionSynchronizationManager.initSynchronization();
         try {
             serviceCatalogService.bulkCreateSalonMasterServices(
-                    salonId, masterId, oneItemBulkRequest(serviceTypeId));
+                    ACTOR_ID, salonId, masterId, oneItemBulkRequest(serviceTypeId));
 
             // MUTATION-RED for "move the eviction inline": an inline eviction would already have
             // cleared this entry here, before commit — a parallel reader would then repopulate the
@@ -903,7 +988,7 @@ class ServiceCatalogServiceCacheTest {
         TransactionSynchronizationManager.initSynchronization();
         try {
             serviceCatalogService.bulkCreateSalonMasterServices(
-                    salonId, masterId, oneItemBulkRequest(serviceTypeId));
+                    ACTOR_ID, salonId, masterId, oneItemBulkRequest(serviceTypeId));
 
             List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
             assertThat(syncs)
@@ -958,7 +1043,7 @@ class ServiceCatalogServiceCacheTest {
         serviceCatalogService.getMasterServices(masterId);
         serviceCatalogService.getSalonServiceCatalog(salonId);
 
-        serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, oneItemBulkRequest(serviceTypeId));
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, oneItemBulkRequest(serviceTypeId));
 
         // Both must recompute on the very next read.
         serviceCatalogService.getMasterServices(masterId);

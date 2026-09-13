@@ -41,6 +41,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -86,6 +87,26 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — additive bulk service create")
 class ServiceCatalogServiceBulkCreateTest {
 
+    /**
+     * The authenticated actor id every service call under test is invoked with.
+     * {@code authz} is a mock, so its {@code enforce*} guards are no-ops here — the point
+     * of a named constant is that the VERIFICATIONS below can assert the exact actor the
+     * production code passed to the authorization service (2026-09-13 audit, Q17).
+     */
+    private static final UUID ACTOR_ID = UUID.fromString("0000ac70-0000-4000-8000-000000000001");
+
+    // ── Constructor-wiring collaborators (2026-09-13 audit, Q19) ────────────────────────────────
+    //
+    // Some of the mocks below are never stubbed and never verified by this file. That is NOT dead
+    // weight and they must NOT be deleted: ServiceCatalogService is @RequiredArgsConstructor, so a
+    // missing @Mock makes Mockito inject NULL for that parameter (and a missing @MockBean makes the
+    // Spring context fail to start). An inert mock returns a default; a null NPEs the moment any
+    // future test reaches the collaborator. The audit's own S1 fix proved this the hard way — adding
+    // the AuthorizationService guard to the bulk path NPE'd every salon-branch test in
+    // ServiceCatalogServiceBulkCreateTest because that file had no authz mock at all.
+    //
+    // The ONE genuinely removable case was MasterCachePrefixEvictor: it was a never-read field on
+    // the PRODUCTION class too, so the fix was deleting the constructor parameter, not the mock.
     @Mock private ServiceRepository serviceRepository;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private SalonRepository salonRepository;
@@ -101,6 +122,12 @@ class ServiceCatalogServiceBulkCreateTest {
     // this collaborator (evictSalonCatalogAfterCommit -> salonCatalogCacheEvictor.evict). Mocked
     // (rather than left null) so that call is a no-op default-Mockito-stub instead of an NPE.
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // 2026-09-13 audit (S1): bulkCreateSalonMasterServices now re-proves the controller's
+    // canManageSalon gate at the service layer. Without this mock @InjectMocks injects NULL for the
+    // parameter and EVERY salon-branch test below NPEs before reaching its own assertion — which is
+    // also the concrete proof that "an unstubbed @Mock is dead weight" is false for a
+    // constructor-injected collaborator (audit Q19).
+    @Mock private com.beautica.common.security.AuthorizationService authz;
 
     @InjectMocks private ServiceCatalogService serviceCatalogService;
 
@@ -274,7 +301,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubSaveEchoesEntities();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         ArgumentCaptor<ServiceDefinition> defCaptor = ArgumentCaptor.forClass(ServiceDefinition.class);
         verify(serviceRepository).save(defCaptor.capture());
@@ -376,7 +403,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubSaveEchoesEntities();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).as("all three items persisted").hasSize(3);
         verify(serviceRepository, times(3)).save(any(ServiceDefinition.class));
@@ -415,7 +442,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubSaveEchoesEntities();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).hasSize(1);
         verify(masterServiceRepository, never()).existsActiveServiceForMaster(any());
@@ -523,7 +550,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
 
@@ -585,15 +612,20 @@ class ServiceCatalogServiceBulkCreateTest {
         // active=true conflict row already covered elsewhere in this class.
         stubSalonCandidates(salonId, masterId,
                 new SalonBulkSetupCandidate(typeId, existing, inactiveAssignmentId, false));
-        when(masterServiceRepository.findById(inactiveAssignmentId)).thenReturn(Optional.of(inactiveAssignment));
+        // 2026-09-13 audit (P1): reactivation targets are now resolved in ONE batched findAllById
+        // before the per-item walk, never findById per item inside the salon-wide advisory lock.
+        when(masterServiceRepository.findAllById(any())).thenReturn(List.of(inactiveAssignment));
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         verify(serviceRepository, never()).save(any(ServiceDefinition.class));
         verify(masterServiceRepository, never())
                 .save(any(MasterServiceAssignment.class));
-        verify(masterServiceRepository).findById(inactiveAssignmentId);
+        verify(masterServiceRepository, never()).findById(any());
+        verify(masterServiceRepository).findAllById(argThat(
+                ids -> java.util.stream.StreamSupport.stream(ids.spliterator(), false)
+                        .toList().equals(List.of(inactiveAssignmentId))));
 
         assertThat(inactiveAssignment.isActive())
                 .as("D6 — the existing row is reactivated in place, not left inactive")
@@ -631,7 +663,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
-        serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(existing.getBasePrice())
                 .as("the shared definition's base price is a salon-level fact — untouched by reuse")
@@ -653,8 +685,10 @@ class ServiceCatalogServiceBulkCreateTest {
 
     /**
      * D3's other half: an item that MATCHES the reused definition must not manufacture an
-     * override row. A spurious override would make the master look like a price outlier to
-     * {@code fromPublic}'s masking rule and to every "does this master deviate" read.
+     * override row. A spurious override would make the master look like a price outlier to every
+     * "does this master deviate from the salon's list price" read. (It used to also trip
+     * {@code MasterServiceResponse.fromPublic}'s masking rule; that mask was retired by the
+     * 2026-09-13 audit, S5 — the outlier concern is what survives.)
      */
     @Test
     @DisplayName("salon on-behalf — reuse with matching price/duration writes NO overrides (D3)")
@@ -678,7 +712,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubSalonCandidates(salonId, masterId, new SalonBulkSetupCandidate(typeId, existing, null, null));
         stubAssignmentSaveEchoesEntity();
 
-        serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+        serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         ArgumentCaptor<MasterServiceAssignment> msaCaptor =
                 ArgumentCaptor.forClass(MasterServiceAssignment.class);
@@ -717,7 +751,7 @@ class ServiceCatalogServiceBulkCreateTest {
                 UUID.randomUUID(), true));
 
         assertThatThrownBy(() ->
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request))
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request))
                 .isInstanceOf(DuplicateServiceException.class)
                 .satisfies(ex -> {
                     DuplicateServiceException dup = (DuplicateServiceException) ex;
@@ -769,7 +803,7 @@ class ServiceCatalogServiceBulkCreateTest {
                         UUID.randomUUID(), true));
 
         assertThatThrownBy(() ->
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request))
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request))
                 .isInstanceOf(DuplicateServiceException.class)
                 .satisfies(ex -> assertThat(((DuplicateServiceException) ex).getServiceName())
                         .as("the FIRST item in request order is blamed, regardless of row order")
@@ -866,7 +900,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result)
                 .as("a band the assignment can now store must be accepted, not rejected")
@@ -914,7 +948,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).hasSize(1);
 
@@ -959,7 +993,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).hasSize(1);
 
@@ -1016,7 +1050,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result).hasSize(1);
 
@@ -1072,7 +1106,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         ArgumentCaptor<MasterServiceAssignment> msaCaptor =
                 ArgumentCaptor.forClass(MasterServiceAssignment.class);
@@ -1137,7 +1171,7 @@ class ServiceCatalogServiceBulkCreateTest {
         stubAssignmentSaveEchoesEntity();
 
         List<MasterServiceResponse> result =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+                serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, masterId, request);
 
         assertThat(result)
                 .as("1500 and 1500.00 are the same band — must not be misread as diverging")
@@ -1632,7 +1666,7 @@ class ServiceCatalogServiceBulkCreateTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(masterInSalonB));
 
         // Owner of salon A tries to bulk-create for a master that lives in salon B.
-        assertThatThrownBy(() -> serviceCatalogService.bulkCreateSalonMasterServices(salonAId, masterId, request))
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonAId, masterId, request))
                 .isInstanceOf(ForbiddenException.class)
                 .hasMessageContaining("Access denied");
 
@@ -1651,7 +1685,7 @@ class ServiceCatalogServiceBulkCreateTest {
 
         when(masterRepository.findById(missingMasterId)).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> serviceCatalogService.bulkCreateSalonMasterServices(salonId, missingMasterId, request))
+        assertThatThrownBy(() -> serviceCatalogService.bulkCreateSalonMasterServices(ACTOR_ID, salonId, missingMasterId, request))
                 .isInstanceOf(NotFoundException.class)
                 .hasMessageContaining("Master not found");
 

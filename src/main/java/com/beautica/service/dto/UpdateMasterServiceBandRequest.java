@@ -70,13 +70,13 @@ public record UpdateMasterServiceBandRequest(
         PriceType priceType,
 
         @DecimalMin(value = "0.01", message = "Price must be positive")
-        @DecimalMax(value = "99999.99", message = "Price exceeds maximum")
-        @Digits(integer = 7, fraction = 2, message = "Price must have at most 7 integer digits and 2 decimal places")
+        @DecimalMax(value = "99999999.99", message = "Price exceeds maximum")
+        @Digits(integer = 8, fraction = 2, message = "Price must have at most 8 integer digits and 2 decimal places")
         BigDecimal price,
 
         @DecimalMin(value = "0.01", message = "Price ceiling must be positive")
-        @DecimalMax(value = "99999.99", message = "Price ceiling exceeds maximum")
-        @Digits(integer = 7, fraction = 2, message = "Price ceiling must have at most 7 integer digits and 2 decimal places")
+        @DecimalMax(value = "99999999.99", message = "Price ceiling exceeds maximum")
+        @Digits(integer = 8, fraction = 2, message = "Price ceiling must have at most 8 integer digits and 2 decimal places")
         BigDecimal priceMax,
 
         @Min(value = 1, message = "Duration override must be at least 1 minute")

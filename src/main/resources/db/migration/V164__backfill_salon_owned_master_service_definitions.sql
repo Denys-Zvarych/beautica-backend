@@ -90,6 +90,13 @@ SELECT salon_id,
 FROM ranked
 WHERE rn = 1;
 
+-- CREATE TABLE AS populates NO statistics, so every planner estimate for a join against this temp
+-- table falls back to a hardcoded default row count. The three UPDATE ... FROM v164_loser_map
+-- statements below join it against master_services / service_definitions; a bad nested-loop choice
+-- there would blow the 1min statement_timeout above and abort the migration, blocking startup.
+-- ANALYZE is cheap on a table this small and makes the plans deterministic.
+ANALYZE v164_group_survivor;
+
 -- Step 2 — map every candidate (loser AND the survivor itself, harmlessly, when survivor_id =
 -- loser_id) to its group's survivor. Recomputed fresh from service_definitions/masters rather than
 -- reused from step 1's candidates CTE, so it reflects the same pre-mutation snapshot deterministically.
@@ -114,6 +121,10 @@ FROM (
      ) c
          JOIN v164_group_survivor gs
               ON gs.salon_id = c.salon_id AND gs.service_type_id = c.service_type_id;
+
+-- Same reason as ANALYZE v164_group_survivor above: this temp table is the driving side of every
+-- UPDATE ... FROM below, and CREATE TABLE AS leaves it with no statistics at all.
+ANALYZE v164_loser_map;
 
 -- Step 3 — D4 dedupe BEFORE repointing. master_services carries a FULL (not partial)
 -- UNIQUE(master_id, service_def_id) (V7:15), so if a master already holds ANY row — active or not —
