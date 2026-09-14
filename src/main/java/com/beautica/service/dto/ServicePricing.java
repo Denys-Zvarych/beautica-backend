@@ -17,29 +17,40 @@ import java.math.BigDecimal;
  * same service. Re-implementing the COALESCE chain in a second place is how they diverge, so
  * the chain lives here and both DTOs call it.
  *
- * <h2>The non-obvious part: there is no {@code priceMaxOverride}</h2>
- * {@link MasterServiceAssignment#getPriceOverride()} overrides {@code base_price} but nothing
- * overrides {@code price_max}. Deriving the two independently — {@code priceMin =
- * COALESCE(override, base_price)} against a raw {@code priceMax} — can therefore produce
- * {@code priceMin > priceMax} for a RANGE service whose master set a higher override.
+ * <h2>Phase 311 D9 — the resolved band now reads the assignment's OWN band when it has one</h2>
+ * Before Phase 311, {@code master_services} carried only a bare floor override
+ * ({@link MasterServiceAssignment#getPriceOverride()}); there was no per-master ceiling or shape,
+ * so the display band ({@code priceType}/{@code priceMin}/{@code priceMax}/{@code priceDisplay})
+ * came wholly from the {@link ServiceDefinition} and only {@code effectivePrice} was
+ * override-aware. {@code V165} added {@code price_type_override} / {@code price_max_override},
+ * making a master's own band representable — D2's all-or-nothing invariant guarantees an
+ * assignment is either fully Inherited (all three columns NULL, tracking the definition) or fully
+ * own-band (all three set, immune to later definition edits). The resolution rule, applied
+ * component-wise:
+ * <pre>
+ *   shape(msa)   = COALESCE(msa.priceTypeOverride, sd.priceType)
+ *   floor(msa)   = COALESCE(msa.priceOverride,     sd.basePrice)
+ *   ceiling(msa) = shape == RANGE ? COALESCE(msa.priceMaxOverride, sd.priceMax) : null
+ * </pre>
+ * D2's invariant makes these {@code COALESCE}s degenerate in practice — an assignment overrides
+ * all three or none — but they are written component-wise so the expression stays correct for a
+ * row written before {@code V165}'s constraint existed (none exist locally, but the formula must
+ * not assume it).
  *
- * <p>This class avoids that by keeping the two concerns separate, exactly as
- * {@link MasterServiceResponse} has always done:
- * <ul>
- *   <li><b>The display band</b> ({@code priceType} / {@code priceMin} / {@code priceMax} /
- *       {@code priceDisplay}) comes wholly from the {@link ServiceDefinition} — it is the
- *       service's advertised band, internally consistent by the DB CHECK
- *       {@code price_max >= base_price}. {@code priceMin} is {@code base_price}, the canonical
- *       floor for both FIXED and RANGE.</li>
- *   <li><b>The booking floor</b> ({@code effectivePrice}) is the override-aware
- *       {@code COALESCE(priceOverride, base_price)} — the same formula as
- *       {@code masters.min_effective_price} (V58) and {@code bookings.price_at_booking}.</li>
- * </ul>
- * Mixing the two into one "effective band" is the bug, not the feature.
+ * <p><b>{@code effectivePrice} equals {@code priceMin} now, by construction.</b> Both are
+ * {@code floor(msa)} above. They were kept as two separately-named fields before this phase
+ * because deriving them independently — band from the definition, floor from the override — could
+ * produce {@code priceMin > priceMax} for a RANGE service whose master overrode only the floor.
+ * That hazard is gone: the floor and the band it belongs to are now resolved from the SAME source
+ * (either both Inherited or both the master's own), so {@code priceMin <= priceMax} is guaranteed
+ * by {@code chk_master_service_price_mode} exactly as {@code chk_service_def_price_mode} already
+ * guarantees it for a bare definition. The two fields are kept distinct on this record only for
+ * backward wire compatibility with {@link MasterServiceResponse} and
+ * {@link com.beautica.favorite.dto.FavoriteServiceResponse}, which have always shipped both names.
  *
- * <p>{@code priceDisplay} is {@code null} when the definition has no {@code priceType} or no
- * {@code base_price} (no {@code @NotNull} on the entity field; API-created definitions always
- * have both, but legacy rows must not blow up a list read).
+ * <p>{@code priceDisplay} is {@code null} when the resolved {@code priceType} or {@code priceMin}
+ * is absent (no {@code @NotNull} on the entity field; API-created definitions always have both,
+ * but legacy rows must not blow up a list read).
  */
 public record ServicePricing(
         PriceType priceType,
@@ -60,16 +71,20 @@ public record ServicePricing(
      * {@code effectivePrice == priceMin} and {@code effectiveDurationMinutes == baseDurationMinutes}.
      */
     public static ServicePricing ofDefinition(ServiceDefinition sd) {
-        return derive(sd, null, null);
+        return derive(sd, null, null, null, null);
     }
 
     /**
-     * Derivation for a master's assignment: the definition's display band plus this master's
-     * override-aware price floor and duration.
+     * Derivation for a master's assignment (Phase 311 D9): the RESOLVED band — the assignment's
+     * own {@code priceTypeOverride}/{@code priceOverride}/{@code priceMaxOverride} when it holds
+     * one, else the definition's — plus this master's override-aware duration. See the class
+     * javadoc for the full resolution rule.
      */
     public static ServicePricing ofAssignment(MasterServiceAssignment msa) {
         return derive(msa.getServiceDefinition(),
+                msa.getPriceTypeOverride(),
                 msa.getPriceOverride(),
+                msa.getPriceMaxOverride(),
                 msa.getDurationOverrideMinutes());
     }
 
@@ -91,20 +106,23 @@ public record ServicePricing(
     }
 
     /**
-     * The override-aware duration ALONE —
-     * {@code COALESCE(durationOverrideMinutes, baseDurationMinutes)}. Companion to
-     * {@link #effectivePriceOf}; see its javadoc for why the band-free variant exists.
+     * The one implementation of Phase 311 D9's resolution rule. {@code priceTypeOverride == null}
+     * (a bare definition via {@link #ofDefinition}, or an Inherited assignment) resolves every
+     * component from {@code sd}; a non-null override resolves {@code priceType} and
+     * {@code priceMin} from the override and gates {@code priceMax} on the RESOLVED (not the
+     * definition's) shape — a master with an own FIXED band against a RANGE definition must not
+     * inherit the definition's ceiling.
      */
-    public static int effectiveDurationMinutesOf(MasterServiceAssignment msa) {
-        return effectiveDurationMinutes(msa.getServiceDefinition(), msa.getDurationOverrideMinutes());
-    }
-
     private static ServicePricing derive(ServiceDefinition sd,
+                                         PriceType priceTypeOverride,
                                          BigDecimal priceOverride,
+                                         BigDecimal priceMaxOverride,
                                          Integer durationOverrideMinutes) {
-        BigDecimal priceMin = sd.getBasePrice();
-        BigDecimal priceMax = sd.getPriceMax();
-        PriceType priceType = sd.getPriceType();
+        PriceType priceType = priceTypeOverride != null ? priceTypeOverride : sd.getPriceType();
+        BigDecimal priceMin = priceOverride != null ? priceOverride : sd.getBasePrice();
+        BigDecimal priceMax = priceType == PriceType.RANGE
+                ? (priceTypeOverride != null ? priceMaxOverride : sd.getPriceMax())
+                : null;
 
         String priceDisplay = (priceType != null && priceMin != null)
                 ? PriceDisplayFormatter.format(priceType, priceMin, priceMax)

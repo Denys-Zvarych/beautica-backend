@@ -35,11 +35,13 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -50,6 +52,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -57,6 +60,29 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — unit")
 class ServiceCatalogServiceTest {
 
+    /**
+     * The authenticated actor id every service call under test is invoked with.
+     * {@code authz} is a mock, so its {@code enforce*} guards are no-ops here — the point
+     * of a named constant is that the VERIFICATIONS below can assert the exact actor the
+     * production code passed to the authorization service (2026-09-13 audit, Q17).
+     */
+    private static final UUID ACTOR_ID = UUID.fromString("0000ac70-0000-4000-8000-000000000001");
+
+    /** The page the controller supplies by default (@PageableDefault(size = 200)) — P7. */
+    private static final Pageable DEFAULT_PAGE = PageRequest.of(0, 200);
+
+    // ── Constructor-wiring collaborators (2026-09-13 audit, Q19) ────────────────────────────────
+    //
+    // Some of the mocks below are never stubbed and never verified by this file. That is NOT dead
+    // weight and they must NOT be deleted: ServiceCatalogService is @RequiredArgsConstructor, so a
+    // missing @Mock makes Mockito inject NULL for that parameter (and a missing @MockBean makes the
+    // Spring context fail to start). An inert mock returns a default; a null NPEs the moment any
+    // future test reaches the collaborator. The audit's own S1 fix proved this the hard way — adding
+    // the AuthorizationService guard to the bulk path NPE'd every salon-branch test in
+    // ServiceCatalogServiceBulkCreateTest because that file had no authz mock at all.
+    //
+    // The ONE genuinely removable case was MasterCachePrefixEvictor: it was a never-read field on
+    // the PRODUCTION class too, so the fix was deleting the constructor parameter, not the mock.
     @Mock
     private ServiceRepository serviceRepository;
 
@@ -99,15 +125,38 @@ class ServiceCatalogServiceTest {
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
-    // Prefix-eviction fix: doEvictAvailableSlots now delegates to the shared evictor, so @InjectMocks
-    // must have one to wire or deactivateServiceDefinition NPEs. A mock is right at this tier — it
-    // asserts the write path REQUESTS eviction; that the request matches a real cache key is proven
-    // against the live @Cacheable proxy in CachePrefixEvictionKeyShapeTest.
+    // Phase 307 D4 — unassignServiceFromMaster's per-assignment future-CONFIRMED-booking guard.
+    // Only the unassign tests below stub these; every other test in this class throws (or
+    // succeeds) before that guard is reached, so they never touch either mock.
     @Mock
-    private com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    private com.beautica.booking.repository.BookingRepository bookingRepository;
+
+    @Mock
+    private java.time.Clock clock;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
+
+    // Logback ListAppender — attached to ServiceCatalogService's logger only for the
+    // getSalonMasterServices page-cap boundary tests below (Phase 309 audit-fix LOW-1).
+    private ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> logAppender;
+
+    @org.junit.jupiter.api.BeforeEach
+    void attachLogAppender() {
+        ch.qos.logback.classic.Logger serviceCatalogServiceLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ServiceCatalogService.class);
+        logAppender = new ch.qos.logback.core.read.ListAppender<>();
+        logAppender.start();
+        serviceCatalogServiceLogger.addAppender(logAppender);
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void detachLogAppender() {
+        ch.qos.logback.classic.Logger serviceCatalogServiceLogger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ServiceCatalogService.class);
+        serviceCatalogServiceLogger.detachAppender(logAppender);
+        logAppender.stop();
+    }
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -462,6 +511,9 @@ class ServiceCatalogServiceTest {
         when(serviceDef.getOwnerId()).thenReturn(salonId);
         when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
         when(serviceDef.getBaseDurationMinutes()).thenReturn(60);
+        // Phase 313 D1 — assignServiceToMaster now guards on this; every test that expects the
+        // method to proceed past the ownership check must stub it true.
+        when(serviceDef.isActive()).thenReturn(true);
 
         MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
         when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
@@ -471,11 +523,11 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
-        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
-                .thenReturn(false);
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
                 salonId, masterId, request);
@@ -529,6 +581,8 @@ class ServiceCatalogServiceTest {
         when(serviceDef.getBasePrice()).thenReturn(new BigDecimal("350.00"));
         when(serviceDef.getBaseDurationMinutes()).thenReturn(60);
         when(serviceDef.getServiceType()).thenReturn(serviceType);
+        // Phase 313 D1 — must proceed past the guard for this test to reach the assignment save.
+        when(serviceDef.isActive()).thenReturn(true);
 
         MasterServiceAssignment savedAssignment = mock(MasterServiceAssignment.class);
         when(savedAssignment.getId()).thenReturn(UUID.randomUUID());
@@ -538,11 +592,11 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
-        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
-                .thenReturn(false);
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
         when(masterServiceRepository.save(any(MasterServiceAssignment.class))).thenReturn(savedAssignment);
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         MasterServiceResponse result = serviceCatalogService.assignServiceToMaster(
                 salonId, masterId, request);
@@ -578,7 +632,7 @@ class ServiceCatalogServiceTest {
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -609,7 +663,7 @@ class ServiceCatalogServiceTest {
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
@@ -620,8 +674,58 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
-    @DisplayName("throws BusinessException with 409 when service already assigned to master")
-    void should_throw409_when_serviceAlreadyAssignedToMaster() {
+    @DisplayName("Phase 313 D2: throws the TYPED DuplicateServiceException (not a bare "
+            + "BusinessException) carrying serviceName + existingServiceDefId when service already "
+            + "assigned to master")
+    void should_throwTypedDuplicateServiceException_when_serviceAlreadyAssignedToMaster() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getId()).thenReturn(serviceDefId);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.getName()).thenReturn("Манікюр");
+        when(serviceDef.isActive()).thenReturn(true);
+
+        MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
+        when(activeAssignment.isActive()).thenReturn(true);
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(activeAssignment));
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                .isInstanceOf(DuplicateServiceException.class)
+                .satisfies(ex -> {
+                    DuplicateServiceException dup = (DuplicateServiceException) ex;
+                    assertThat(dup.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+                    assertThat(dup.getServiceName())
+                            .as("D2 — serviceName is the definition's OWN name, not the type's")
+                            .isEqualTo("Манікюр");
+                    assertThat(dup.getExistingServiceDefId())
+                            .as("D2 — existingServiceDefId is the definition the caller just named")
+                            .isEqualTo(serviceDefId);
+                });
+
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Phase 313 D1: throws NotFoundException (not 201) when the service definition is "
+            + "deactivated (is_active = false), even though ownership and everything else is valid")
+    void should_throwNotFound_when_serviceDefinitionIsDeactivated() {
         UUID salonId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
@@ -635,21 +739,249 @@ class ServiceCatalogServiceTest {
         ServiceDefinition serviceDef = mock(ServiceDefinition.class);
         when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
         when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.isActive()).thenReturn(false);
 
         when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
         when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
-        when(masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
-                .thenReturn(true);
 
-        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         assertThatThrownBy(() ->
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
-                        .isEqualTo(HttpStatus.CONFLICT));
+                .isInstanceOf(NotFoundException.class);
+
+        // D1 must fire before the assignment lookup is ever consulted — no reactivation branch
+        // (D3) can run for a definition that is gone.
+        verify(masterServiceRepository, never()).findByMasterIdAndServiceDefinitionId(any(), any());
+        verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Phase 313 D1 (QA addition): throws NotFoundException, not DuplicateServiceException, "
+            + "when the master ALREADY ACTIVELY offers the now-deactivated definition — D1 must win "
+            + "over D2's duplicate branch too, not merely over D3's reactivation branch (case 8 covers "
+            + "only the inactive-assignment side of that boundary)")
+    void should_throwNotFound_notDuplicate_when_definitionDeactivatedWhileAssignmentStaysActive() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+        when(serviceDef.isActive()).thenReturn(false);
+
+        // An ACTIVE existing assignment for this exact pair — deliberately lenient: under the
+        // CORRECT implementation D1 fires before this repository call is ever made, so the stub
+        // must not trip Mockito's strict-stubs UnnecessaryStubbingException. If a future
+        // regression moves D1's guard so it only runs in the "no assignment" / "inactive
+        // assignment" branches (exactly the two states cases 1 and 8 exercise), this stub IS
+        // consulted, the duplicate branch fires, and the assertion below goes red.
+        MasterServiceAssignment activeAssignment = mock(MasterServiceAssignment.class);
+        org.mockito.Mockito.lenient().when(activeAssignment.isActive()).thenReturn(true);
+        org.mockito.Mockito.lenient()
+                .when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(activeAssignment));
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(serviceDef));
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                .as("an existing ACTIVE assignment must not route this into D2's duplicate branch "
+                        + "once the definition itself is deactivated")
+                .isInstanceOf(NotFoundException.class)
+                .isNotInstanceOf(DuplicateServiceException.class);
 
         verify(masterServiceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Phase 313 D1 ordering: a foreign salon's deactivated definition still throws "
+            + "ForbiddenException, not NotFoundException — the ownership check runs first")
+    void should_throwForbidden_notNotFound_when_deactivatedServiceDefBelongsToDifferentSalon() {
+        UUID salonId = UUID.randomUUID();
+        UUID attackerSalonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition foreignServiceDef = mock(ServiceDefinition.class);
+        when(foreignServiceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(foreignServiceDef.getOwnerId()).thenReturn(attackerSalonId);
+        // Deliberately NOT stubbing isActive(): the 403 must fire from the ownership mismatch
+        // alone, without D1's isActive() guard ever being consulted — asserting that would be an
+        // unnecessary stubbing under Mockito's strict stubs, which is itself the proof that D1's
+        // check is unreached here.
+
+        when(masterRepository.findById(masterId)).thenReturn(Optional.of(master));
+        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(foreignServiceDef));
+
+        AssignServiceToMasterRequest request = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.assignServiceToMaster(salonId, masterId, request))
+                .as("a caller probing another salon's id must get 403, not a 404 that would "
+                        + "confirm the id exists")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("does not belong to this salon");
+
+        verify(masterServiceRepository, never()).save(any());
+        verify(foreignServiceDef, never())
+                .isActive();
+    }
+
+    // ── unassignServiceFromMaster (Phase 307 perf audit MEDIUM-1/2, LOW-6) ──────
+
+    /**
+     * Phase-307 perf audit LOW-6 — no test previously asserted that the two 404s
+     * {@code unassignServiceFromMaster} can throw carry DISTINCT internal messages.
+     * {@code GlobalExceptionHandler} deliberately genericises every {@code NotFoundException} to
+     * {@code "Resource not found"} at the HTTP boundary (never echo internal messages — anti-bug
+     * §I/§N), so the only place the distinction is observable at all is here, against the raw
+     * exception the service throws — which is exactly the layer MEDIUM-1/2's cold-path
+     * {@code notFoundForUnassign} fallback could silently collapse.
+     */
+    @Test
+    @DisplayName("unassignServiceFromMaster throws NotFoundException naming the MASTER when the "
+            + "master row itself does not exist (Phase 307 LOW-6)")
+    void should_throwNotFoundNamingMaster_when_masterDoesNotExistForUnassign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
+        when(masterRepository.existsById(masterId)).thenReturn(false);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("Master not found")
+                .hasMessageContaining(masterId.toString());
+    }
+
+    @Test
+    @DisplayName("unassignServiceFromMaster throws NotFoundException naming the ASSIGNMENT when the "
+            + "master exists but has no active assignment for the pair (Phase 307 LOW-6)")
+    void should_throwNotFoundNamingAssignment_when_masterExistsWithNoActiveAssignment() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.empty());
+        when(masterRepository.existsById(masterId)).thenReturn(true);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining("No active assignment")
+                .satisfies(ex -> assertThat(ex.getMessage())
+                        .as("must NOT be collapsed to the master-not-found message")
+                        .doesNotContain("Master not found"));
+    }
+
+    /**
+     * Phase-307 audit "judgement call" item — {@code MasterServiceUnassignIT} case 17 documents
+     * that the definition-ownerId re-check added alongside the security audit is unreachable via
+     * the public API today: the write-path invariant means a {@code master_services} row can only
+     * ever link a master to a same-salon definition, so no request can construct an assignment
+     * whose {@code serviceDefinition} is owned by a DIFFERENT salon than the one on the path.
+     *
+     * <p>Chosen resolution: pin the branch directly at THIS unit level with a mocked repository
+     * returning exactly that unconstructable shape — the honest way to test a guard that is
+     * unreachable by construction end-to-end, rather than leaving it completely unexercised.
+     */
+    @Test
+    @DisplayName("unassignServiceFromMaster throws ForbiddenException when the resolved assignment's "
+            + "service definition is owned by a DIFFERENT salon (defense-in-depth guard, "
+            + "unreachable end-to-end by the master_services write-path invariant — see "
+            + "MasterServiceUnassignIT case 17)")
+    void should_throwForbidden_when_assignmentServiceDefinitionOwnedByAnotherSalon() {
+        UUID salonId = UUID.randomUUID();
+        UUID otherSalonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        // Unconstructable in production (write-path invariant) but exactly what the ownerId
+        // re-check exists to defend against if that invariant were ever broken.
+        ServiceDefinition foreignServiceDef = mock(ServiceDefinition.class);
+        when(foreignServiceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(foreignServiceDef.getOwnerId()).thenReturn(otherSalonId);
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(foreignServiceDef);
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId))
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessageContaining("does not belong to this salon");
+    }
+
+    @Test
+    @DisplayName("unassignServiceFromMaster resolves master + assignment in ONE finder call on the "
+            + "happy path — never a separate masterRepository.findById (Phase 307 MEDIUM-1/2)")
+    void should_resolveInOneQuery_when_activeAssignmentExistsForUnassign() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        UUID assignmentId = UUID.randomUUID();
+
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(salonId);
+
+        Master master = mock(Master.class);
+        when(master.getSalon()).thenReturn(salon);
+
+        ServiceDefinition serviceDef = mock(ServiceDefinition.class);
+        when(serviceDef.getOwnerType()).thenReturn(OwnerType.SALON);
+        when(serviceDef.getOwnerId()).thenReturn(salonId);
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(assignmentId);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+
+        when(masterServiceRepository.findByMasterIdAndServiceDefinitionId(masterId, serviceDefId))
+                .thenReturn(Optional.of(assignment));
+        when(clock.instant()).thenReturn(java.time.Instant.parse("2026-06-01T00:00:00Z"));
+        when(clock.getZone()).thenReturn(java.time.ZoneOffset.UTC);
+        when(bookingRepository.countConfirmedFutureByMasterServiceId(
+                eq(masterId), eq(assignmentId), any())).thenReturn(0L);
+
+        serviceCatalogService.unassignServiceFromMaster(ACTOR_ID, salonId, masterId, serviceDefId);
+
+        verify(masterServiceRepository, times(1))
+                .findByMasterIdAndServiceDefinitionId(masterId, serviceDefId);
+        verify(masterRepository, never()).findById(any());
+        verify(assignment).setActive(false);
+        verify(masterRepository).refreshMinEffectivePrice(masterId);
     }
 
     // ── addIndependentMasterService ────────────────────────────────────────────
@@ -794,9 +1126,9 @@ class ServiceCatalogServiceTest {
      * changing the price the client is quoted.
      */
     @Test
-    @DisplayName("getMasterServices masks priceOverride for the public browse route while "
-            + "getMyServices keeps it — and the masked row still quotes the overridden price")
-    void should_maskPriceOverrideOnPublicPathOnly_when_masterHasAnOverride() {
+    @DisplayName("getMasterServices serves priceOverride UNMASKED on the public browse route, "
+            + "identically to getMyServices — S5 retired the mask that did not mask")
+    void should_servePriceOverrideUnmasked_when_masterHasAnOverride() {
         UUID userId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
         BigDecimal override = new BigDecimal("700.00");
@@ -829,88 +1161,27 @@ class ServiceCatalogServiceTest {
         MasterServiceResponse publicRow = serviceCatalogService.getMasterServices(masterId).get(0);
         MasterServiceResponse ownRow = serviceCatalogService.getMyServices(userId).get(0);
 
+        // S5 (2026-09-13 audit). The mask that used to null this field was recoverable by
+        // subtraction — the SAME response still carries effectivePrice (700) and the nested
+        // definition's priceMin (= base_price, 500), so "does this master deviate, and by how
+        // much" was answerable from the masked payload. The assertions below pin the RESOLUTION:
+        // the ineffective control is gone and the field is served, because catalogue prices on
+        // this route are public by product design.
         assertThat(publicRow.priceOverride())
-                .as("an anonymous caller must not learn that this master deviates from the salon's "
-                        + "definition price")
-                .isNull();
+                .as("S5 — the public browse no longer pretends to mask a field that was derivable "
+                        + "from effectivePrice minus the nested definition's priceMin")
+                .isEqualByComparingTo(override);
         assertThat(publicRow.effectivePrice())
-                .as("masking must not change what the client is quoted — the override is still "
-                        + "APPLIED, it is merely not itemised")
+                .as("the override is APPLIED, exactly as before — this never depended on the mask")
                 .isEqualByComparingTo(override);
+        assertThat(publicRow.serviceDefinition().priceMin())
+                .as("the non-vacuity of this test: base_price is ALSO on the public row, which is "
+                        + "precisely why masking priceOverride alone controlled nothing")
+                .isEqualByComparingTo(new BigDecimal("500.00"));
         assertThat(ownRow.priceOverride())
-                .as("the master's own authenticated view keeps the field")
+                .as("the master's own authenticated view is unchanged — and now identical to the "
+                        + "public one for this field")
                 .isEqualByComparingTo(override);
-    }
-
-    /**
-     * {@code fromPublic} is a 15-argument POSITIONAL copy constructor: it must null out
-     * {@code priceOverride} and copy the other 14 fields VERBATIM. That shape is exactly where a
-     * transposition of two adjacent same-typed arguments (e.g. swapping {@code priceMin} and
-     * {@code priceMax}, or {@code serviceTypeNameUk} and {@code serviceTypeSlug}) compiles cleanly
-     * and passes any assertion that reuses the same value across fields — it is only caught by
-     * asserting every field with a value distinct from its siblings.
-     *
-     * <p>We use AssertJ's recursive comparison instead of 14 {@code extracting(...)} calls for two
-     * reasons: (1) it is future-proof — a 16th field added to the record is covered automatically,
-     * with no test change required, and (2) it directly detects a transposition, because two
-     * same-typed adjacent fields holding swapped (but otherwise valid-looking) values will fail the
-     * per-field equality check that field-by-field extraction could be written to miss if the
-     * assertions were copy-pasted with the wrong accessor.
-     */
-    @Test
-    @DisplayName("fromPublic preserves every field verbatim except priceOverride, which is masked to null")
-    void should_preserveEveryFieldExceptPriceOverride_when_fromPublicIsApplied() {
-        ServiceDefinitionResponse nestedServiceDefinition = new ServiceDefinitionResponse(
-                UUID.randomUUID(),
-                "Класичний манікюр",
-                "Аппаратний манікюр з покриттям гель-лак",
-                "NAILS",
-                45,
-                10,
-                true,
-                UUID.randomUUID(),
-                "Манікюр класичний",
-                "manicure-classic",
-                "https://cdn.beautica.example/photos/manicure-classic.jpg",
-                PriceType.FIXED,
-                new BigDecimal("500.00"),
-                new BigDecimal("600.00"),
-                "500.00 ₴",
-                null
-        );
-
-        MasterServiceResponse full = new MasterServiceResponse(
-                UUID.randomUUID(),
-                UUID.randomUUID(),
-                nestedServiceDefinition,
-                new BigDecimal("111.11"),
-                15,
-                new BigDecimal("222.22"),
-                30,
-                true,
-                PriceType.RANGE,
-                new BigDecimal("333.33"),
-                new BigDecimal("444.44"),
-                "від 333.33 до 444.44 ₴",
-                UUID.randomUUID(),
-                "Манікюр",
-                "manicure",
-                null
-        );
-
-        MasterServiceResponse masked = MasterServiceResponse.fromPublic(full);
-
-        assertThat(masked)
-                .as("every field other than priceOverride must survive fromPublic unchanged — "
-                        + "a recursive comparison catches both dropped fields and transposed "
-                        + "same-typed arguments that a partial field-by-field assertion could miss")
-                .usingRecursiveComparison()
-                .ignoringFields("priceOverride")
-                .isEqualTo(full);
-        assertThat(masked.priceOverride())
-                .as("priceOverride is provider-internal bookkeeping and must be masked to null on "
-                        + "the anonymous browse route regardless of every other field surviving intact")
-                .isNull();
     }
 
     // ── getMyServices ───────────────────────────────────────────────────────────
@@ -969,6 +1240,302 @@ class ServiceCatalogServiceTest {
                 .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
     }
 
+    // ── getSalonMasterServices (Phase 309, own-row branch added Phase 310) ────────
+    //
+    // QA audit gap-fill: the IT suite (SalonMasterServicesReadIT) exercises this method only
+    // through the real @PreAuthorize AOP proxy, which independently re-checks
+    // `@authz.canReadSalonMasterServices`. A mutation removing the service-layer
+    // `authz.hasManagementAccess(...)` re-check below (Phase 309 D2's defense-in-depth claim,
+    // "a future non-HTTP caller cannot bypass the SpEL gate") left the ENTIRE IT + slice suite
+    // green — confirmed by deliberately deleting that check and re-running
+    // ServiceControllerTest + SalonMasterServicesReadIT (109/109 still passed). These three
+    // tests call the plain Java method directly, bypassing the Spring Security proxy entirely,
+    // so they are the only tests that can catch that specific regression.
+    //
+    // Phase 310 added an own-row branch below the hasManagementAccess check — the identical
+    // defense-in-depth idiom for the SALON_MASTER-reads-their-OWN-row grant the SpEL gate now
+    // proves. It only runs once hasManagementAccess has already failed, so it costs the
+    // owner/admin fast path nothing.
+
+    @Test
+    @DisplayName("getSalonMasterServices returns the FULL, unmasked service list when the actor "
+            + "manages the salon and the master belongs to it")
+    void should_returnUnmaskedServices_when_actorManagesSalonAndMasterBelongsToIt() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        BigDecimal override = new BigDecimal("300.00");
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .name("Gel Nails")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(UUID.randomUUID());
+        when(assignment.getMaster()).thenReturn(master);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(override);
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).priceOverride())
+                .as("D1 — the management read must return priceOverride unmasked, unlike fromPublic")
+                .isEqualByComparingTo(override);
+        // Phase 311 D9 changed priceMin's resolution to COALESCE(override, base_price), so for a
+        // FIXED own band priceMin now legitimately EQUALS priceOverride — comparing against
+        // priceMin no longer proves anything about masking. Compare against the DEFINITION's own
+        // base_price directly instead.
+        assertThat(result.get(0).priceOverride())
+                .as("override must differ from the definition's own base_price so masking could "
+                        + "not pass unnoticed")
+                .isNotEqualByComparingTo(serviceDef.getBasePrice());
+        verify(authz).hasManagementAccess(salonId, actorId);
+        verify(masterRepository).existsByIdAndSalonId(masterId, salonId);
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices throws ForbiddenException and never queries services when "
+            + "the actor does not manage the salon AND does not own masterId either (D2/Phase 310 "
+            + "defense-in-depth — regression net for the service-layer re-check the @PreAuthorize "
+            + "SpEL duplicates)")
+    void should_throwForbiddenAndSkipMasterLookup_when_actorCannotManageSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(false);
+        // Own-row check (Phase 310): masterId resolves to nobody in particular here, so the
+        // Mockito default Optional.empty() correctly represents "not the actor's own row".
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(masterRepository).findByIdWithUserAndSalon(masterId);
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices returns the FULL, unmasked service list when a SALON_MASTER "
+            + "reads their OWN row (Phase 310 D2), even though they never satisfy hasManagementAccess")
+    void should_returnUnmaskedServices_when_salonMasterOwnsTheirOwnRow() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(false);
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+        Master ownRowMaster = mock(Master.class);
+        when(ownRowMaster.getUser()).thenReturn(masterUser);
+        when(ownRowMaster.getId()).thenReturn(masterId);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownRowMaster));
+        when(authz.masterBelongsToSalon(masterId, salonId)).thenReturn(true);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(serviceDefId)
+                .ownerType(OwnerType.SALON)
+                .ownerId(salonId)
+                .name("Gel Nails")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+        when(assignment.getId()).thenReturn(UUID.randomUUID());
+        when(assignment.getMaster()).thenReturn(ownRowMaster);
+        when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+        when(assignment.isActive()).thenReturn(true);
+        when(assignment.getPriceOverride()).thenReturn(new BigDecimal("300.00"));
+        when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(List.of(assignment));
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
+
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).priceOverride())
+                .as("D4 — the master's own read must return priceOverride unmasked")
+                .isEqualByComparingTo("300.00");
+        // Perf MEDIUM (2026-09-11): D3 must reuse the own-row masterBelongsToSalon result, never
+        // re-query the identical existsByIdAndSalonId(masterId, salonId) predicate a second time.
+        verify(masterRepository, never()).existsByIdAndSalonId(any(), any());
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices throws ForbiddenException when a SALON_MASTER owns "
+            + "masterId but the path's salonId does NOT (D2.4 defense-in-depth)")
+    void should_throwForbidden_when_salonMasterOwnRowButMasterBelongsToAnotherSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID foreignSalonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(foreignSalonId, actorId)).thenReturn(false);
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorId);
+        Master ownRowMaster = mock(Master.class);
+        when(ownRowMaster.getUser()).thenReturn(masterUser);
+        when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownRowMaster));
+        when(authz.masterBelongsToSalon(masterId, foreignSalonId)).thenReturn(false);
+
+        assertThatThrownBy(() ->
+                serviceCatalogService.getSalonMasterServices(actorId, foreignSalonId, masterId, DEFAULT_PAGE))
+                .isInstanceOf(ForbiddenException.class);
+
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices throws NotFoundException and never queries services when "
+            + "masterId does not belong to salonId (D2 — cross-salon and nonexistent masters must "
+            + "be indistinguishable)")
+    void should_throwNotFoundAndSkipServicesLookup_when_masterDoesNotBelongToSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        // Only existsByIdAndSalonId may gate this check — a bare existsById(masterId) would
+        // return the Mockito default `false` here too, so this alone would not distinguish
+        // "calls existsByIdAndSalonId" from "calls existsById"; the mutation-testing pass in
+        // the QA audit exercised that distinction directly against the real repository instead
+        // (mutating existsByIdAndSalonId -> existsById turned SalonMasterServicesReadIT's Case 3
+        // red). This test still pins the NotFoundException contract and the short-circuit below.
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(false);
+
+        assertThatThrownBy(() -> serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE))
+                .isInstanceOf(NotFoundException.class)
+                .hasMessageContaining(masterId.toString());
+
+        verify(masterServiceRepository, never())
+                .findByMasterIdAndIsActiveTrueWithGraph(any(), any(Pageable.class));
+    }
+
+    /**
+     * Builds {@code count} mocked, minimally-stubbed {@link MasterServiceAssignment} rows for the
+     * page-cap boundary tests below. A Mockito mock per row is cheap and does not require
+     * building real {@code ServiceDefinition}/{@code Master} fixtures or a DB — the boundary
+     * check only cares about the SIZE of the list {@code getSalonMasterServices} maps, not the
+     * content of each row, so this stays a realistic unit-test fixture rather than an invented
+     * 200-row DB scenario.
+     */
+    private List<MasterServiceAssignment> buildAssignments(int count, UUID masterId) {
+        Master master = mock(Master.class);
+        when(master.getId()).thenReturn(masterId);
+
+        ServiceDefinition serviceDef = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Gel Nails")
+                .baseDurationMinutes(60)
+                .basePrice(new BigDecimal("500.00"))
+                .bufferMinutesAfter(0)
+                .isActive(true)
+                .build();
+
+        List<MasterServiceAssignment> assignments = new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            MasterServiceAssignment assignment = mock(MasterServiceAssignment.class);
+            when(assignment.getId()).thenReturn(UUID.randomUUID());
+            when(assignment.getMaster()).thenReturn(master);
+            when(assignment.getServiceDefinition()).thenReturn(serviceDef);
+            when(assignment.isActive()).thenReturn(true);
+            when(assignment.getPriceOverride()).thenReturn(null);
+            when(assignment.getDurationOverrideMinutes()).thenReturn(null);
+            assignments.add(assignment);
+        }
+        return assignments;
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices logs a WARN naming salonId/masterId/cap when the result "
+            + "hits exactly the 200-row page cap (Phase 309 audit-fix LOW-1 — the cap is silent "
+            + "otherwise)")
+    void should_logWarnNamingSalonAndMasterAndCap_when_resultHitsThe200RowCap() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+        // Built BEFORE the when(...).thenReturn(...) call below — nesting a second when(...) call
+        // (buildAssignments mocks its own Master) as an argument expression inside an outer
+        // ongoing when(...).thenReturn(...) trips Mockito's UnfinishedStubbingException.
+        List<MasterServiceAssignment> capacityAssignments = buildAssignments(200, masterId);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(capacityAssignments);
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
+
+        assertThat(result).hasSize(200);
+
+        List<ch.qos.logback.classic.spi.ILoggingEvent> warnings = logAppender.list.stream()
+                .filter(event -> event.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .toList();
+        assertThat(warnings).hasSize(1);
+        assertThat(warnings.get(0).getFormattedMessage())
+                .contains(salonId.toString())
+                .contains(masterId.toString())
+                .contains("200");
+    }
+
+    @Test
+    @DisplayName("getSalonMasterServices logs nothing when the result is one row below the "
+            + "200-row page cap")
+    void should_notLogWarn_when_resultIsOneRowBelowThe200RowCap() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        when(authz.hasManagementAccess(salonId, actorId)).thenReturn(true);
+        when(masterRepository.existsByIdAndSalonId(masterId, salonId)).thenReturn(true);
+        // Built BEFORE the when(...).thenReturn(...) call below — see the sibling cap test for why.
+        List<MasterServiceAssignment> belowCapAssignments = buildAssignments(199, masterId);
+        when(masterServiceRepository.findByMasterIdAndIsActiveTrueWithGraph(eq(masterId), any(Pageable.class)))
+                .thenReturn(belowCapAssignments);
+
+        List<MasterServiceResponse> result =
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, DEFAULT_PAGE);
+
+        assertThat(result).hasSize(199);
+
+        List<ch.qos.logback.classic.spi.ILoggingEvent> warnings = logAppender.list.stream()
+                .filter(event -> event.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .toList();
+        assertThat(warnings).isEmpty();
+    }
+
     // ── deactivateServiceDefinition ────────────────────────────────────────────
 
     @Test
@@ -1021,6 +1588,25 @@ class ServiceCatalogServiceTest {
 
         verify(serviceRepository).deactivateById(serviceDefId);
         verify(serviceRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Q20: a definition no master performs SKIPS the bulk min_effective_price refresh "
+            + "entirely — the affectedMasterIds.isEmpty() guard had no never-verification")
+    void should_skipMinEffectivePriceRefresh_when_noMasterPerformsTheDefinition() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+
+        // No master performs it — the branch the guard exists for.
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
+                .thenReturn(List.of());
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
+
+        verify(serviceRepository).deactivateById(serviceDefId);
+        verify(masterRepository, never()).refreshMinEffectivePriceForAll(any());
+        verify(masterRepository, never()).refreshMinEffectivePrice(any());
     }
 
     @Test
@@ -1533,10 +2119,11 @@ class ServiceCatalogServiceTest {
 
     /**
      * Wraps a catalog {@link ServiceDefinition} in a bookable {@link MasterServiceAssignment} performed
-     * by a fresh master. Phase 23.x: the catalogue now loads candidate ASSIGNMENTS
-     * ({@code findBookableAssignmentsBySalon}) and runs the free-slot gate
-     * ({@code slotCalculationService.filterBookableAssignments}) per master, so each catalog fixture is
-     * an assignment rather than a bare definition.
+     * by a fresh master. Phase 23.x: the catalogue loads candidate ASSIGNMENTS
+     * ({@code findBookableAssignmentsBySalon}) and runs them through the free-slot gate
+     * ({@code slotCalculationService.filterBookableAssignmentsBatch} since Phase 315, batched once
+     * across the whole salon rather than per master), so each catalog fixture is an assignment rather
+     * than a bare definition.
      */
     private MasterServiceAssignment assignmentFor(ServiceDefinition def) {
         Master master = Master.builder().id(UUID.randomUUID()).isActive(true).build();
@@ -1549,14 +2136,17 @@ class ServiceCatalogServiceTest {
     }
 
     /**
-     * Stubs the batched free-slot gate as a pass-through: every candidate assignment is bookable.
-     * Exclusion/booked-out behaviour is exercised end-to-end in the Testcontainers catalogue ITs;
-     * here the unit tests focus on grouping/ordering/dedup over the bookable set.
+     * Stubs the batched free-slot gate (Phase 315) as a pass-through: every candidate assignment is
+     * bookable, for every master. Exclusion/booked-out behaviour is exercised end-to-end in the
+     * Testcontainers catalogue ITs; here the unit tests focus on grouping/ordering/dedup over the
+     * bookable set. The stub echoes back exactly the map it was called with — the batch method's
+     * contract (D3) is "one entry per requested master, in the same shape it was asked about" for a
+     * pass-through gate, so the identity answer is the correct fake, not a simplification of it.
      */
     private void stubAllAssignmentsBookable() {
-        org.mockito.Mockito.lenient().when(slotCalculationService.filterBookableAssignments(
-                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
-                .thenAnswer(inv -> inv.getArgument(1));
+        org.mockito.Mockito.lenient().when(slotCalculationService.filterBookableAssignmentsBatch(
+                        org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(inv -> inv.getArgument(0));
     }
 
     private com.beautica.service.entity.PlatformCategory approvedCategory(String name) {
@@ -1726,9 +2316,9 @@ class ServiceCatalogServiceTest {
         // free-slot gate the Testcontainers catalogue ITs prove end-to-end.
         when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
                 .thenReturn(List.of(assignmentFor(manicure)));
-        when(slotCalculationService.filterBookableAssignments(
-                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
-                .thenReturn(List.of());
+        when(slotCalculationService.filterBookableAssignmentsBatch(
+                org.mockito.ArgumentMatchers.any()))
+                .thenReturn(Map.of());
 
         var result = serviceCatalogService.getSalonServiceCatalog(salonId);
 

@@ -40,7 +40,9 @@ import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Stream;
@@ -54,6 +56,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -1628,6 +1631,157 @@ class SlotCalculationServiceTest {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    // ── filterBookableAssignmentsBatch — the batched catalogue gate, exercised DIRECTLY ────────
+    //
+    // Phase-302 re-audit LOW-3: every other reference to this method across src/test is a Mockito
+    // STUB, so nothing invoked the real body. That made the HashMap<Duration,Boolean> memoisation
+    // added last round unpinned: it is provably neutral TODAY only because hasFreeFutureSlot's
+    // verdict is a pure function of effectiveDuration, and nothing asserted that. A future edit
+    // giving hasFreeFutureSlot or effectiveDuration a per-assignment dependency beyond Duration
+    // would make the memo serve a WRONG bookability verdict — advertising an unbookable service
+    // in the salon catalogue — while every suite stayed green.
+    //
+    // Phase 315: this method is now genuinely the batched gate its name always claimed to be — it
+    // resolves every master in ONE resolveEffectiveRangeBatch call and ONE
+    // findActiveTimeRangesByMasterIdsInRange call, not one master-scoped call per invocation as the
+    // pre-315 filterBookableAssignments(UUID, List) did (which this section comment used to describe
+    // inaccurately).
+
+    /** The whole booking horizon the method computes internally: today(Kyiv) … today + 180. */
+    private static final LocalDate FILTER_TODAY = LocalDate.of(2026, 5, 7);
+    private static final LocalDate FILTER_HORIZON = FILTER_TODAY.plusDays(180);
+
+    /**
+     * Active assignment carrying a per-master {@code durationOverrideMinutes}, the OTHER route to
+     * an effective duration ({@link SlotCalculationService#effectiveDuration} prefers it over the
+     * definition's {@code baseDurationMinutes}).
+     */
+    private static MasterServiceAssignment overriddenAssignment(
+            UUID masterId, int baseMinutes, int overrideMinutes, int bufferMinutes) {
+        Master master = Master.builder().id(masterId).isActive(true).build();
+        ServiceDefinition sd = ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .baseDurationMinutes(baseMinutes)
+                .bufferMinutesAfter(bufferMinutes)
+                .isActive(true)
+                .build();
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .serviceDefinition(sd)
+                .master(master)
+                .durationOverrideMinutes(overrideMinutes)
+                .isActive(true)
+                .build();
+    }
+
+    /**
+     * One working day, no bookings, and a calculator that answers the REAL question — does this
+     * duration fit the window — so the filter's verdict is driven by duration and nothing else.
+     * Stubs the BATCHED loaders with a singleton {@code masterId} list, mirroring exactly what
+     * {@code filterBookableAssignmentsBatch} issues for a call carrying only this one loaded master.
+     */
+    private void stubFilterEnvironment(UUID masterId, LocalDate workingDay, long fittingMinutes) {
+        when(masterScheduleService.resolveEffectiveRangeBatch(List.of(masterId), FILTER_TODAY, FILTER_HORIZON))
+                .thenReturn(Map.of(masterId,
+                        List.of(templateDay(workingDay, LocalTime.of(9, 0), LocalTime.of(17, 0)))));
+        when(bookingRepository.findActiveTimeRangesByMasterIdsInRange(eq(List.of(masterId)), any(), any()))
+                .thenReturn(List.of());
+        when(timeSlotCalculator.hasAvailableSlot(any(), any(), any(), any(), any(), any(), any()))
+                .thenAnswer(inv -> ((Duration) inv.getArgument(3)).toMinutes() <= fittingMinutes);
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignmentsBatch drops the assignment whose duration finds no slot and keeps the one that fits")
+    void should_dropOnlyTheUnbookableDuration_when_filteringAssignments() {
+        UUID masterId = UUID.randomUUID();
+        MasterServiceAssignment fits = activeAssignment(masterId, 30, 0);
+        MasterServiceAssignment tooLong = activeAssignment(masterId, 300, 0);
+        // The day is 9:00–17:00, so 30 minutes fits and 300 does not.
+        stubFilterEnvironment(masterId, FILTER_TODAY.plusDays(1), 120);
+
+        Map<UUID, List<MasterServiceAssignment>> bookable = slotCalculationService
+                .filterBookableAssignmentsBatch(Map.of(masterId, List.of(tooLong, fits)));
+
+        assertThat(bookable.get(masterId))
+                .as("only the assignment whose effective duration fits the day survives the gate, "
+                        + "and the survivor keeps the caller's ordering")
+                .containsExactly(fits);
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignmentsBatch gives the SAME verdict to two assignments reaching one effective duration by different routes")
+    void should_giveSameVerdict_when_twoAssignmentsShareAnEffectiveDurationByDifferentRoutes() {
+        UUID masterId = UUID.randomUUID();
+        // 60 minutes via a per-master override on a 15-minute definition…
+        MasterServiceAssignment viaOverride = overriddenAssignment(masterId, 15, 60, 0);
+        // …and 60 minutes via the definition's own base duration, no override.
+        MasterServiceAssignment viaBaseDuration = activeAssignment(masterId, 60, 0);
+        stubFilterEnvironment(masterId, FILTER_TODAY.plusDays(1), 120);
+
+        Map<UUID, List<MasterServiceAssignment>> bookable = slotCalculationService
+                .filterBookableAssignmentsBatch(Map.of(masterId, List.of(viaOverride, viaBaseDuration)));
+
+        assertThat(bookable.get(masterId))
+                .as("the memo keys on Duration alone, so the two routes to 60 minutes MUST agree — "
+                        + "a per-assignment dependency sneaking into effectiveDuration or "
+                        + "hasFreeFutureSlot would make one of these verdicts a lie")
+                .containsExactly(viaOverride, viaBaseDuration);
+
+        ArgumentCaptor<Duration> durationCaptor = ArgumentCaptor.forClass(Duration.class);
+        verify(timeSlotCalculator, org.mockito.Mockito.times(1))
+                .hasAvailableSlot(any(), any(), any(), durationCaptor.capture(), any(), any(), any());
+        assertThat(durationCaptor.getValue())
+                .as("ONE walk per distinct effective duration — the memoisation invariant itself")
+                .isEqualTo(Duration.ofMinutes(60));
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignmentsBatch short-circuits on an empty candidate list without touching the schedule or bookings")
+    void should_returnEmptyWithoutLoading_when_noCandidateAssignments() {
+        UUID masterId = UUID.randomUUID();
+
+        Map<UUID, List<MasterServiceAssignment>> bookable =
+                slotCalculationService.filterBookableAssignmentsBatch(Map.of(masterId, List.of()));
+
+        assertThat(bookable.get(masterId)).isEmpty();
+        verifyNoInteractions(masterScheduleService, bookingRepository, timeSlotCalculator);
+    }
+
+    @Test
+    @DisplayName("filterBookableAssignmentsBatch (Phase 315 D3.3, widened): an empty-assignment master "
+            + "costs ZERO loader calls while a sibling master in the SAME batch call DOES load")
+    void should_costZeroLoaderCalls_when_oneMasterHasNoCandidateAssignmentsButSiblingsLoad() {
+        UUID emptyMasterId = UUID.randomUUID();
+        UUID loadedMasterId = UUID.randomUUID();
+        MasterServiceAssignment loadedAssignment = activeAssignment(loadedMasterId, 30, 0);
+        stubFilterEnvironment(loadedMasterId, FILTER_TODAY.plusDays(1), 120);
+
+        Map<UUID, List<MasterServiceAssignment>> input = new LinkedHashMap<>();
+        input.put(emptyMasterId, List.of());
+        input.put(loadedMasterId, List.of(loadedAssignment));
+
+        Map<UUID, List<MasterServiceAssignment>> bookable =
+                slotCalculationService.filterBookableAssignmentsBatch(input);
+
+        assertThat(bookable.get(emptyMasterId))
+                .as("D3 — every requested master gets an entry, even one that never loaded")
+                .isEmpty();
+        assertThat(bookable.get(loadedMasterId))
+                .as("the sibling master's real assignment must still be evaluated in the SAME call")
+                .containsExactly(loadedAssignment);
+
+        // The single-master filterBookableAssignments(UUID, List) short-circuit could only prove
+        // "zero interactions for THIS master" because it was the only master in the call. The batch
+        // signature makes the SHARPER claim expressible for the first time: the empty master costs
+        // zero loader calls while another master in the SAME invocation genuinely loads — pinned by
+        // asserting the masterIds argument to both batched loaders excludes emptyMasterId entirely.
+        verify(masterScheduleService).resolveEffectiveRangeBatch(
+                eq(List.of(loadedMasterId)), eq(FILTER_TODAY), eq(FILTER_HORIZON));
+        verify(bookingRepository).findActiveTimeRangesByMasterIdsInRange(
+                eq(List.of(loadedMasterId)), any(), any());
+        verifyNoMoreInteractions(masterScheduleService, bookingRepository, timeSlotCalculator);
     }
 
     /** Active assignment with a caller-chosen id, so multiple chained ids can be stubbed distinctly. */

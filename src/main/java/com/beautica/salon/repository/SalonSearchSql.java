@@ -375,6 +375,93 @@ public final class SalonSearchSql {
      * {@code pmin}/{@code pmax} feed the price {@code WHERE} and the {@code ORDER BY}.
      * The two name laterals do not, so they are attached outside — see
      * {@link #STATIC_NAME_PREVIEW_LATERAL}.</p>
+     *
+     * <h2>The {@code pr} lateral's schedule gate (2026-09-13 audit, H4)</h2>
+     * <p>The salon catalogue ({@code ServiceCatalogService#getSalonServiceCatalog}) prices a salon
+     * from the hull of its <em>bookable</em> masters' bands: a master whose schedule resolves no
+     * effective working day is dropped entirely by
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch}, so NONE of their services
+     * reach the catalogue (Phase 305 D1, pinned by
+     * {@code SalonCatalogueVisibilityIT#should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate}).
+     * This lateral had no gate at all, so exactly that master still set the salon's advertised
+     * search band — a salon could be found at a price nothing in its catalogue offers.</p>
+     *
+     * <p>The two-armed {@code EXISTS} narrows the STRUCTURAL half of that divergence — it does not
+     * close it, and it is not the only thing SQL could express (see the occupancy paragraph below
+     * for what is deliberately left out). A master contributes only if the catalogue's own
+     * <em>window</em> predicate could resolve them a working day, and that predicate is
+     * <b>override beats template beats gap</b> ({@code MasterScheduleService#foldDates}), so BOTH
+     * sources must be represented:</p>
+     * <ul>
+     *   <li><b>Template arm</b> — mirrors the <em>range</em> half of {@code WeeklyScheduleRepository
+     *       #findOverlappingRangeWithIntervalsByMasterIds}: {@code validFrom <= to AND
+     *       (validTo IS NULL OR validTo >= from)}, with {@code from = today} and {@code to = today
+     *       + }{@code BookingWindow#MAX_DAYS_AHEAD} (180) — the range
+     *       {@code SlotCalculationService#filterBookableAssignmentsBatch} folds over. The
+     *       {@code valid_from} upper bound is load-bearing, not decoration:
+     *       {@code WeeklyScheduleRequest#validFrom} is only {@code @FutureOrPresent}, so a template
+     *       starting in 2030 is reachable over the public API and the catalogue drops it.
+     *       <p><b>It mirrors the RANGE only, not the fold's working-day outcome — and that
+     *       remaining gap is deliberate (2026-09-13 cycle-3 audit, A6).</b>
+     *       {@code WeeklyScheduleRequest#days} carries only {@code @Size(max = 7)} with no
+     *       {@code min}, so {@code {"days":[]}} is reachable over the public API and persists a
+     *       {@code weekly_schedules} row with zero {@code working_intervals} and zero
+     *       {@code working_interval_times}. Such a master satisfies this {@code EXISTS} but the
+     *       catalogue's fold drops them, so they can still set a band the catalogue will not show.
+     *       Tightening the arm CORRECTLY would need {@code EXISTS working_intervals OR EXISTS
+     *       working_interval_times} correlated to {@code ws.id} — both, because an
+     *       {@code EXPLICIT_TIMES} weekday (V84) is bookable with zero {@code working_intervals}
+     *       rows, and probing only the former would drop a genuinely bookable master to a NULL
+     *       band, i.e. out of every price-bounded search: strictly worse than the gap, and the same
+     *       over-narrowing cycle 2 corrected as B1. That is two more correlated probes per
+     *       candidate row inside a paginated Top-N on the hottest public query, to remove a
+     *       band-too-wide case an empty template already makes degenerate. So the gap is accepted
+     *       and pinned rather than closed:
+     *       {@code SalonSearchPriceBandIT#should_keepTheSearchBand_when_theOnlyMasterTemplateHasNoWorkingIntervals_pinningTheEmptyTemplateGapAsDeliberate}
+     *       seeds exactly that master and asserts BOTH halves — the catalogue is empty, the search
+     *       band is not — so tightening the arm turns a test RED instead of silently passing.</p></li>
+     *   <li><b>Exception arm</b> — a master with ZERO {@code weekly_schedules} rows but a future
+     *       working {@code schedule_exceptions} row (a {@code CUSTOM_HOURS} override) IS bookable
+     *       and DOES reach the catalogue, because the override branch of the fold never consults a
+     *       template. Without this arm such a master would be dropped from {@code pr}; if they were
+     *       the salon's only master, {@code pr.pmin}/{@code pr.pmax} would go NULL and
+     *       {@link #STATIC_PRICE_PREDICATE} would then filter the salon out of EVERY price-bounded
+     *       search on NULL semantics — a silent omission strictly worse than the divergence this
+     *       gate set out to narrow. {@code idx_schedule_exceptions_master (master_id, date)} (V4)
+     *       covers it.
+     *       <p><b>Matched POSITIVELY on {@code CUSTOM_HOURS}, never negatively on
+     *       {@code <> 'DAY_OFF'} (2026-09-13 cycle-3 audit, A3).</b> The negative form was
+     *       fail-OPEN on the enum: today {@code ScheduleExceptionKind} has exactly two constants
+     *       and V71's {@code chk_exc_kind} pins the column to the same pair, so the two forms are
+     *       equivalent — but the instant a third, NON-working kind is added (vacation, sick leave,
+     *       a closure), every master holding one would silently re-enter the price hull and could
+     *       set a salon's advertised band from a master nobody can book. The positive form admits
+     *       only the kind that is actually bookable, so a new kind is inert here until someone
+     *       deliberately adds it. {@code ScheduleExceptionKindLedgerTest} pins the enum's exact
+     *       constant set so a third kind turns RED and forces this predicate to be revisited.</p></li>
+     * </ul>
+     * <p>The {@code OR} between the two arms blocks sublink pull-up, so Postgres evaluates them as
+     * per-row subplans rather than one hashed semi-join; the recorded {@code EXPLAIN (ANALYZE,
+     * BUFFERS)} plans for this lateral live in {@code docs/backend-phases/} (Phase 315 perf
+     * appendix).</p>
+     *
+     * <p><b>The OCCUPANCY half is deliberately NOT replicated, and that residual divergence is
+     * intentional.</b> The catalogue's gate also walks the free-slot calendar — day-off overrides,
+     * CONFIRMED bookings filling a day, {@code EXPLICIT_TIMES} whose declared times have all
+     * elapsed — over a 180-day window, per master, in Java. That walk is not expressible here
+     * without either a per-row function call inside a paginated Top-N over every salon in the
+     * result set, or duplicating the slot calculator in SQL, which is the fork
+     * {@code ServicePricing}/{@code SlotCalculationService} exist to prevent. Search answers "what
+     * price range might I find at this salon", a discovery band; the catalogue answers "what can I
+     * book here right now". A salon whose masters all happen to be fully booked for the next six
+     * months keeps its search band and shows an empty catalogue — that is the accepted, documented
+     * shape. It is no longer documented ONLY here:
+     * {@code SalonSearchPriceBandIT#should_keepTheSearchBand_when_theCatalogueIsEmptyForAFullyOccupiedMaster_pinningTheOccupancyDivergenceAsDeliberate}
+     * seeds exactly that salon and asserts the asymmetry, so closing it in SQL turns a test RED
+     * instead of silently passing — the same convention
+     * {@code SalonCatalogueVisibilityIT#should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate}
+     * uses for its own deliberate rule. The structural half is pinned by that class's
+     * reconciliation cases.</p>
      */
     public static final String STATIC_PROJECTION_HEAD = """
             SELECT t.id           AS id,
@@ -405,15 +492,24 @@ public final class SalonSearchSql {
                 FROM salons s
                 LEFT JOIN LATERAL (
                     SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
-                           MAX(COALESCE(ms.price_override,
-                                        CASE WHEN sd.price_type = 'RANGE'
-                                             THEN sd.price_max ELSE sd.base_price END)) AS pmax
+                           MAX(CASE WHEN COALESCE(ms.price_type_override, sd.price_type) = 'RANGE'
+                                    THEN COALESCE(ms.price_max_override, sd.price_max)
+                                    ELSE COALESCE(ms.price_override, sd.base_price) END) AS pmax
                     FROM master_services ms
                     JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
                     JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
                     WHERE sd.owner_type = 'SALON'
                       AND sd.owner_id = s.id
                       AND ms.is_active = true
+                      AND (EXISTS (SELECT 1 FROM weekly_schedules ws
+                                    WHERE ws.master_id = mad.id
+                                      AND ws.valid_from <= CURRENT_DATE + 180
+                                      AND (ws.valid_to IS NULL OR ws.valid_to >= CURRENT_DATE))
+                           OR EXISTS (SELECT 1 FROM schedule_exceptions se
+                                       WHERE se.master_id = mad.id
+                                         AND se.date >= CURRENT_DATE
+                                         AND se.date <= CURRENT_DATE + 180
+                                         AND se.kind = 'CUSTOM_HOURS'))
                       AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
                 ) pr ON true
                 WHERE s.is_active = true
@@ -448,9 +544,40 @@ public final class SalonSearchSql {
     public static final String STATIC_CITY_PREDICATE = "      AND s.city_id = :cityId\n";
 
     /**
-     * Category-membership gate: the salon owns at least one <em>bookable</em>
+     * Category-membership gate: the salon owns at least one <em>assignable</em>
      * service in the searched category. TRUE (and never evaluated) when
      * {@code :category} is null.
+     *
+     * <h4>Three definitions of "bookable" coexist in this query, deliberately (2026-09-13 cycle-3
+     * audit, A5)</h4>
+     * <p>Since the {@code pr} lateral gained its two-armed schedule gate
+     * ({@link #STATIC_PROJECTION_HEAD}), this query carries <b>three</b> different membership
+     * predicates and they are NOT the same predicate:</p>
+     * <ul>
+     *   <li><b>{@code pr} price lateral</b> — active service + active assignment + active master
+     *       <em>AND</em> the master's schedule could resolve a working day in the next 180 days.</li>
+     *   <li><b>This category gate</b> — active service + active assignment + active master. No
+     *       schedule probe.</li>
+     *   <li><b>{@link #STATIC_NAME_PREVIEW_LATERAL}</b> — same as this gate. No schedule probe.</li>
+     * </ul>
+     * <p><b>The observable consequence:</b> a salon whose only master has no resolvable schedule
+     * still PASSES this category gate and still renders its service names on the card, but its
+     * {@code pr.pmin}/{@code pr.pmax} are NULL — so it sorts NULLS-LAST in both price directions
+     * and {@link #STATIC_PRICE_PREDICATE} excludes it from every price-bounded search. It appears
+     * in an unbounded category browse and vanishes the moment a price filter is applied.</p>
+     *
+     * <p><b>Why this is accepted rather than closed.</b> Copying the two-armed {@code EXISTS} into
+     * this gate and into the name lateral would TRIPLE the schedule probe on the hottest public
+     * query — three correlated subplans per candidate salon inside a paginated Top-N — to buy a
+     * cosmetic consistency (a card that would otherwise show names with no price). The honest
+     * alternative, a denormalised "has a bookable master" column maintained on every schedule
+     * write, is a write-path and migration change out of this batch's scope. Search is a discovery
+     * surface: showing a salon in a category browse and declining to price it is the conservative
+     * failure, and the catalogue — the "what can I book right now" surface — is already correct
+     * (Phase 305 D1). Pinned, not merely asserted here, by
+     * {@code SalonSearchPriceBandIT#should_stillPassTheCategoryGateAndPreviewNames_whenTheOnlyMasterHasNoResolvableSchedule_pinningTheThreeGateAsymmetryAsDeliberate}
+     * — the same convention the occupancy divergence uses (case 26): narrowing this gate in SQL
+     * turns a test RED rather than silently passing.</p>
      */
     public static final String STATIC_CATEGORY_GATE = """
                   AND (CAST(:category AS text) IS NULL OR EXISTS (

@@ -879,13 +879,17 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
 
     /**
      * The occupied {@code [startsAt, endsAt)} intervals of a master's CONFIRMED bookings
-     * overlapping {@code [windowStart, windowEnd)}, ordered by start. <b>THE single booking read behind the
-     * whole availability computation</b> — the per-day slot list ({@code SlotCalculationService
-     * #getAvailableSlots}, one target day), the calendar day projection ({@code
-     * SlotCalculationService#getBookableWorkingDays}), the free-slot bookability gate ({@code
-     * hasBookableFutureSlot}) and the batched catalogue filter ({@code filterBookableAssignments}); the
-     * three range consumers load their whole window ONCE per master and slice it per-day in memory
-     * ({@code SlotCalculationService#loadOccupiedByDay}) rather than issuing one query per day.
+     * overlapping {@code [windowStart, windowEnd)}, ordered by start. <b>THE single-master booking read
+     * behind the per-master availability computation</b> — the per-day slot list ({@code
+     * SlotCalculationService#getAvailableSlots}, one target day), the calendar day projection ({@code
+     * SlotCalculationService#getBookableWorkingDays}) and the free-slot bookability gate ({@code
+     * hasBookableFutureSlot}); the range consumers load their whole window ONCE per master and slice it
+     * per-day in memory ({@code SlotCalculationService#loadOccupiedByDay}) rather than issuing one query
+     * per day. <b>Phase 315:</b> the salon catalogue's bookability gate
+     * ({@code SlotCalculationService#filterBookableAssignmentsBatch}) no longer calls this per master —
+     * it calls {@link #findActiveTimeRangesByMasterIdsInRange} ONCE for every master in the salon. This
+     * method's javadoc previously called that gate "batched" while it still looped this finder once per
+     * master; that was false when written and is corrected here.
      *
      * <p><b>Projection, not entities (Perf MEDIUM-1; extended to the day path 2026-08-11).</b> Returns
      * {@link BookingTimeRange} — the only two columns any consumer reads. This replaced a {@code SELECT *}
@@ -911,6 +915,42 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<BookingTimeRange> findActiveTimeRangesByMasterInRange(
             @Param("masterId") UUID masterId,
+            @Param("windowStart") OffsetDateTime windowStart,
+            @Param("windowEnd") OffsetDateTime windowEnd
+    );
+
+    /**
+     * Phase 315 (D1/D4) — the multi-master sibling of {@link #findActiveTimeRangesByMasterInRange},
+     * used ONLY by the salon catalogue's batched bookability gate
+     * ({@code SlotCalculationService#filterBookableAssignmentsBatch}), which resolves every distinct
+     * master in a salon in ONE statement instead of one per master (the N+1 this phase kills).
+     *
+     * <p>Same predicate, same index ({@code idx_bookings_master_slot_overlap}), same
+     * {@code [windowStart, windowEnd)} semantics as the single-master finder — only the {@code =} became
+     * an {@code IN}, and the projection widened to {@link BookingMasterTimeRange} so the batched result
+     * can be regrouped by master in memory (a batched result set has no per-row caller-side anchor the
+     * way a single-master call does). {@link BookingTimeRange} and the single-master finder are
+     * UNTOUCHED — every existing consumer keeps its exact query and shape.
+     *
+     * <p><b>{@code ORDER BY b.master.id, b.startsAt ASC} (D4).</b> The {@code startsAt ASC} tail
+     * preserves the ordering the single-master query has always returned within one master; the
+     * leading {@code master.id} groups each master's rows contiguously so the caller's regroup is a
+     * single linear pass, not a second sort.
+     *
+     * <p>No {@code IN}-list chunking (D11): Postgres' bind-parameter ceiling is 65535, two orders of
+     * magnitude above the largest conceivable salon's master count.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.BookingMasterTimeRange(b.master.id, b.startsAt, b.endsAt)
+            FROM Booking b
+            WHERE b.master.id IN :masterIds
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt < :windowEnd
+              AND b.endsAt   > :windowStart
+            ORDER BY b.master.id, b.startsAt ASC
+            """)
+    List<BookingMasterTimeRange> findActiveTimeRangesByMasterIdsInRange(
+            @Param("masterIds") Collection<UUID> masterIds,
             @Param("windowStart") OffsetDateTime windowStart,
             @Param("windowEnd") OffsetDateTime windowEnd
     );
@@ -1438,6 +1478,41 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<SalonClosureBookingCandidate> findConfirmedFutureByMasterId(
             @Param("masterId") UUID masterId, @Param("now") OffsetDateTime now);
+
+    // ── Per-master-service unassign guard (Phase 307 D4) ──────────────────────
+
+    /**
+     * Assignment-scoped sibling of {@link #findConfirmedFutureByMasterId} for
+     * {@code ServiceCatalogService#unassignServiceFromMaster}: a COUNT, not a candidate list,
+     * because this phase does not cascade (no cancel, no notification) — it only needs to know
+     * whether to refuse the unassign with {@code 409}.
+     *
+     * <p><b>Scoped to {@code master_service_id}, deliberately narrower than the master-wide
+     * sibling.</b> Unassigning ONE service must not be blocked by a future booking for a
+     * DIFFERENT service the same master performs — the count would otherwise leak across
+     * assignments and over-refuse (phase doc test case 7).
+     *
+     * <p>{@code masterId} is redundant with {@code masterServiceId} (an assignment belongs to
+     * exactly one master) and kept anyway, exactly for the reason
+     * {@code findSalonBulkSetupCandidates}' equally-redundant {@code sd.ownerId IN :salonIds} term
+     * is kept: it is the LEADING column of {@code idx_bookings_master_service_starts_at
+     * (master_id, master_service_id, starts_at)} (Phase 26.4), so the composite index only serves
+     * this as a direct index-range seek when the leading column is actually present in the
+     * predicate — dropping it would leave {@code master_service_id} as a mid-index probe the
+     * planner cannot seek on directly.
+     */
+    @Query("""
+            SELECT COUNT(b)
+            FROM Booking b
+            WHERE b.master.id = :masterId
+              AND b.masterService.id = :masterServiceId
+              AND b.status = com.beautica.booking.enums.BookingStatus.CONFIRMED
+              AND b.startsAt > :now
+            """)
+    long countConfirmedFutureByMasterServiceId(
+            @Param("masterId") UUID masterId,
+            @Param("masterServiceId") UUID masterServiceId,
+            @Param("now") OffsetDateTime now);
 
     // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
 

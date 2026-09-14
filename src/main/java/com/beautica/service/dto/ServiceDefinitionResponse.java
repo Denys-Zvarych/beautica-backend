@@ -2,7 +2,9 @@ package com.beautica.service.dto;
 
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.util.PriceDisplayFormatter;
 import io.swagger.v3.oas.annotations.media.Schema;
+import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -12,9 +14,16 @@ import java.util.UUID;
  *
  * <h2>Pricing fields</h2>
  * <ul>
- *   <li>{@code priceType} — the pricing mode ({@code FIXED} or {@code RANGE}).</li>
- *   <li>{@code priceMin} — the canonical floor ({@code base_price}) for both modes.</li>
- *   <li>{@code priceMax} — the ceiling for RANGE; {@code null} for FIXED.</li>
+ *   <li>{@code priceType} — the pricing mode ({@code FIXED} or {@code RANGE}). On every
+ *       provider-side response ({@link #from}) this is the definition's own shape. On
+ *       {@code GET /salons/{salonId}/services} ({@link #fromSalonAggregate}, Phase 314) it is
+ *       instead a COMPUTED display shape — the union hull across the salon's bookable masters —
+ *       and is not read from {@code service_definitions.price_type}.</li>
+ *   <li>{@code priceMin} — the canonical floor ({@code base_price}) for both modes on
+ *       {@link #from}; the lowest floor across bookable masters on {@link #fromSalonAggregate}.</li>
+ *   <li>{@code priceMax} — the ceiling for RANGE, {@code null} for FIXED, on {@link #from}; the
+ *       highest ceiling across bookable masters on {@link #fromSalonAggregate}, {@code null} when
+ *       every bookable master's floor and ceiling coincide.</li>
  *   <li>{@code priceDisplay} — pre-formatted display string, e.g. {@code "500 ₴"} or
  *       {@code "від 500 до 800 ₴"}. {@code null} when {@code priceMin} is {@code null}.</li>
  * </ul>
@@ -75,6 +84,33 @@ public record ServiceDefinitionResponse(
         // for the same service. Behaviour is identical to the previous inline derivation.
         ServicePricing pricing = ServicePricing.ofDefinition(sd);
 
+        return build(sd, pricing.priceType(), pricing.priceMin(), pricing.priceMax(), pricing.priceDisplay());
+    }
+
+    /**
+     * Phase 314 — the salon-catalogue projection: the band is the union hull across the salon's
+     * bookable masters (see {@code ServiceCatalogService#getSalonServiceCatalog}), never the
+     * {@link ServiceDefinition}'s own band. Used ONLY by that call; {@link #from} keeps serving
+     * every provider-side response ({@code POST}/{@code PATCH /services/...}), where the price
+     * fields must keep meaning the definition's own band — that is what an owner is editing.
+     *
+     * <p>{@code max == null} means the hull collapsed to a single price (every contributing
+     * master resolves to the same floor and ceiling) and renders {@link PriceType#FIXED} — the
+     * COMMON case, not a degenerate range. A non-null, strictly greater {@code max} renders
+     * {@link PriceType#RANGE}. The caller (D1/D2/D3) computes {@code min}/{@code max}; this
+     * factory only decides the resulting {@code priceType} and formats the display string — it
+     * never reads {@code sd.getPriceType()}/{@code sd.getBasePrice()}/{@code sd.getPriceMax()}.
+     */
+    public static ServiceDefinitionResponse fromSalonAggregate(
+            ServiceDefinition sd, BigDecimal min, @Nullable BigDecimal max) {
+        PriceType priceType = max == null ? PriceType.FIXED : PriceType.RANGE;
+        String priceDisplay = PriceDisplayFormatter.format(priceType, min, max);
+
+        return build(sd, priceType, min, max, priceDisplay);
+    }
+
+    private static ServiceDefinitionResponse build(ServiceDefinition sd, PriceType priceType,
+            BigDecimal priceMin, BigDecimal priceMax, String priceDisplay) {
         return new ServiceDefinitionResponse(
                 sd.getId(),
                 sd.getName(),
@@ -87,10 +123,10 @@ public record ServiceDefinitionResponse(
                 sd.getServiceType() != null ? sd.getServiceType().getNameUk() : null,
                 sd.getServiceType() != null ? sd.getServiceType().getSlug() : null,
                 sd.getPhotoUrl(),
-                pricing.priceType(),
-                pricing.priceMin(),
-                pricing.priceMax(),
-                pricing.priceDisplay(),
+                priceType,
+                priceMin,
+                priceMax,
+                priceDisplay,
                 null    // isFavorite — decorated per-request, outside this factory (salon-service-favourites track)
         );
     }

@@ -245,7 +245,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * <p>Must be called inside an existing {@code @Transactional} context — callers
      * in {@link com.beautica.service.service.ServiceCatalogService} satisfy this.
      */
-    @Modifying(clearAutomatically = true)
+    // flushAutomatically = true (2026-09-13 perf audit, LOW): callers mutate the managed
+    // MasterServiceAssignment (band/duration) and then call this in the SAME transaction, and
+    // clearAutomatically detaches that entity immediately afterwards. Whether the pending dirty
+    // row would otherwise be flushed depends on Hibernate's auto-flush query-space computation
+    // for a bulk HQL UPDATE Master whose subquery reads master_services — do not rely on it.
+    // Flushing first makes the subquery read the caller's own write and makes the detach safe.
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE Master m
             SET m.minEffectivePrice = (
@@ -271,7 +277,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * {@code clearAutomatically = true} ensures the first-level cache is invalidated
      * after the bulk UPDATE so subsequent reads see the refreshed price.
      */
-    @Modifying(clearAutomatically = true)
+    // flushAutomatically = true (2026-09-13 perf audit, LOW): callers mutate the managed
+    // MasterServiceAssignment (band/duration) and then call this in the SAME transaction, and
+    // clearAutomatically detaches that entity immediately afterwards. Whether the pending dirty
+    // row would otherwise be flushed depends on Hibernate's auto-flush query-space computation
+    // for a bulk HQL UPDATE Master whose subquery reads master_services — do not rely on it.
+    // Flushing first makes the subquery read the caller's own write and makes the detach safe.
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE Master m
             SET m.minEffectivePrice = (

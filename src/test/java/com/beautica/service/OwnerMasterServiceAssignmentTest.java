@@ -88,7 +88,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterId = enableOwnerMaster(ownerToken, salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Haircut");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // Act
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -133,7 +133,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterIdInSalonB = enableOwnerMaster(ownerBToken, salonBId);
         UUID serviceDefInSalonB = fixtures.createServiceDefinition(ownerBToken, salonBId, "Pedicure");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null, null, null);
 
         // Act — owner A tries to assign into salon B's master (which owner A does not own)
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -158,7 +158,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterId = enableOwnerMaster(ownerToken, salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Threading");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         ResponseEntity<String> assignResp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services",
                 HttpMethod.POST,
@@ -196,7 +196,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterId = enableOwnerMaster(ownerToken, salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Waxing");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // First assignment — must succeed
         ResponseEntity<String> firstResp = restTemplate.exchange(
@@ -237,7 +237,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID serviceDefInSalonB = fixtures.createServiceDefinition(ownerBToken, salonBId, "BotoxInject");
 
         // Act — owner A uses their own valid salonAId + masterAId but injects salonB's serviceDefId
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonAId + "/masters/" + masterAId + "/services",
                 HttpMethod.POST,

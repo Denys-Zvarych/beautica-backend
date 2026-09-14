@@ -14,6 +14,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.salon.dto.SalonDeletionBlockedResponse;
+import com.beautica.service.dto.ServicePriceShapeMismatchResponse;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
@@ -988,6 +989,49 @@ class GlobalExceptionHandlerTest {
         assertThat(debugEvents.get(0).getFormattedMessage())
                 .as("DEBUG log must contain the non-PII exception class marker")
                 .contains("ClientBookingConflictException");
+    }
+
+    // ── handleServicePriceShapeMismatch (Phase 302 re-audit MEDIUM-1) ───────────
+    // The typed 400 must NOT fall through to handleBusiness, which genericises every BAD_REQUEST
+    // to a payload-less "Invalid request" — that body would give the mobile setup screen nothing
+    // to branch on and nothing to tell the owner. Spring dispatches by exception-hierarchy depth,
+    // so this handler wins over handleBusiness for the subclass; §N requires the mapping itself
+    // be pinned here rather than only through the endpoint.
+
+    @Test
+    @DisplayName("Should return 400 with SERVICE_PRICE_SHAPE_MISMATCH code and the salon's "
+            + "governing shape when ServicePriceShapeMismatchException is thrown")
+    void should_return400WithServicePriceShapeMismatchCode_when_servicePriceShapeMismatchThrown() {
+        // Arrange
+        UUID defId = UUID.randomUUID();
+        var ex = new ServicePriceShapeMismatchException(
+                "Манікюр", defId, PriceType.RANGE, new BigDecimal("400.00"), new BigDecimal("900.00"));
+
+        // Act
+        ResponseEntity<ApiResponse<ServicePriceShapeMismatchResponse>> response =
+                handler.handleServicePriceShapeMismatch(ex);
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("an unrepresentable price shape is a payload problem — 400, not the 409 this "
+                        + "endpoint reserves for DUPLICATE_SERVICE")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody().success()).isFalse();
+
+        // Reference the constant — a rename must fail this test, not silently break the mobile
+        // client's branch on data.code.
+        assertThat(response.getBody().data().code())
+                .isEqualTo(ServicePriceShapeMismatchException.ERROR_CODE);
+        assertThat(response.getBody().data().salonPriceType()).isEqualTo(PriceType.RANGE);
+        assertThat(response.getBody().data().salonPriceMin()).isEqualByComparingTo("400.00");
+        assertThat(response.getBody().data().salonPriceMax()).isEqualByComparingTo("900.00");
+        assertThat(response.getBody().data().existingServiceDefId()).isEqualTo(defId);
+        assertThat(response.getBody().data().serviceName()).isEqualTo("Манікюр");
+
+        assertThat(response.getBody().message())
+                .as("the top-level message is hardcoded by the handler, never ex.getMessage() — "
+                        + "the same discipline handleBusiness applies to every other BAD_REQUEST")
+                .isEqualTo("Service price does not match the salon's existing service");
     }
 
     // ── handleSalonDeletionBlocked (Phase 290) ──────────────────────────────────

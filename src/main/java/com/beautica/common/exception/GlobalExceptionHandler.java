@@ -8,6 +8,7 @@ import com.beautica.booking.dto.ClientBookingConflictResponse;
 import com.beautica.common.ApiResponse;
 import com.beautica.salon.dto.SalonDeletionBlockedResponse;
 import com.beautica.service.dto.DuplicateServiceResponse;
+import com.beautica.service.dto.ServicePriceShapeMismatchResponse;
 import com.fasterxml.jackson.databind.exc.InvalidFormatException;
 import io.jsonwebtoken.JwtException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -191,6 +192,43 @@ public class GlobalExceptionHandler {
                 .body(new ApiResponse<>(false,
                         DuplicateServiceResponse.from(ex),
                         "This service already exists"));
+    }
+
+    /**
+     * Distinct 400 for a Phase 302 bulk item whose price SHAPE cannot be represented against the
+     * salon definition it would reuse — {@code master_services} carries a {@code price_override}
+     * floor but no per-master ceiling and no per-master price type (see
+     * {@link ServicePriceShapeMismatchException}).
+     *
+     * <p>Must be declared alongside (Spring dispatches by exception-hierarchy depth, not
+     * declaration order) {@link #handleBusiness} so the structured
+     * {@link ServicePriceShapeMismatchResponse} body — carrying the
+     * {@code SERVICE_PRICE_SHAPE_MISMATCH} code plus the salon's governing shape — is emitted
+     * instead of {@code handleBusiness}'s genericised, payload-less "Invalid request". The setup
+     * screen branches on {@code data.code} to show the owner what band the salon actually offers.
+     *
+     * <p><b>The client-facing message is hardcoded here, never {@code ex.getMessage()}</b> — the
+     * same discipline {@link #handleInviteToken} applies, and the same one
+     * {@link #handleBusiness} applies to every other {@code BAD_REQUEST}. The salon's numbers
+     * travel in the typed payload, where they are structured data the client formats, not prose
+     * that a future throw site could accidentally widen.
+     *
+     * @deprecated Retired by Phase 312 D3 — {@link ServicePriceShapeMismatchException}'s only
+     *     throw site is gone (Phase 311's V165 makes every batch item's shape representable), so
+     *     this arm is UNREACHABLE in production. Kept wired, not deleted, because Phase 312 Step 0
+     *     found a live mobile consumer of the wire contract (D4); delete alongside the exception
+     *     and its DTOs in the mobile follow-up phase that removes that client branch.
+     */
+    @Deprecated
+    @ExceptionHandler(ServicePriceShapeMismatchException.class)
+    public ResponseEntity<ApiResponse<ServicePriceShapeMismatchResponse>> handleServicePriceShapeMismatch(
+            ServicePriceShapeMismatchException ex) {
+        log.debug("Service price shape mismatch rejected: {}", ex.getClass().getSimpleName());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(new ApiResponse<>(false,
+                        ServicePriceShapeMismatchResponse.from(ex),
+                        "Service price does not match the salon's existing service"));
     }
 
     /**

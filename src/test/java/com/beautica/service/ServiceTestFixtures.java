@@ -4,6 +4,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.auth.dto.RegisterIndependentMasterRequest;
 import com.beautica.common.ApiResponse;
+import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
@@ -11,6 +12,7 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -20,7 +22,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
+import java.io.InputStream;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -199,6 +203,92 @@ class ServiceTestFixtures {
         return body.data().accessToken();
     }
 
+    /**
+     * Creates a SALON_MASTER user assigned to {@code salonId} (users.salon_id) and returns a
+     * bearer token. Phase 306 D2/D6 role fast-path rejects SALON_MASTER before any master-row or
+     * salon lookup, so no {@code masters} row is required for the read-only-role rejection tests
+     * this backs.
+     */
+    String createSalonMasterAndGetToken(UUID salonId, String email) throws Exception {
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, true, true)",
+                UUID.randomUUID(), email, hash, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    /**
+     * A {@code masters} row id paired with the login token of the SALON_MASTER who owns it — the
+     * shape Phase 310's own-row read tests need, since {@link #createSalonMasterAndGetToken}
+     * deliberately creates NO {@code masters} row (see its javadoc).
+     */
+    record SalonMasterFixture(UUID masterId, String token) {}
+
+    /**
+     * Creates a SALON_MASTER user assigned to {@code salonId} WITH a corresponding {@code
+     * masters} row — unlike {@link #createSalonMasterAndGetToken}, which deliberately omits one
+     * for the role-fast-path rejection tests it backs. Phase 310's own-row read predicate
+     * resolves the actor through {@code masterRepository.findByIdWithUserAndSalon(masterId)} and
+     * compares {@code masters.user_id} to the actor, so a genuine own-row test needs this row to
+     * exist and to be linked to the returned token's user.
+     */
+    SalonMasterFixture createSalonMasterWithRowAndGetToken(UUID salonId, String email) throws Exception {
+        UUID masterUserId = UUID.randomUUID();
+        String hash = passwordEncoder.encode(TEST_PASSWORD);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, salon_id, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', ?, true, true)",
+                masterUserId, email, hash, salonId);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                masterId, masterUserId, salonId);
+
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return new SalonMasterFixture(masterId, body.data().accessToken());
+    }
+
+    /** Seeds an email-verified CLIENT and logs in, returning a fresh access token. */
+    String createClientAndGetToken(String email) throws Exception {
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
+                        + "VALUES (?, ?, ?, 'CLIENT', true, true)",
+                UUID.randomUUID(), email, passwordEncoder.encode(TEST_PASSWORD));
+        ResponseEntity<String> resp = restTemplate.postForEntity(
+                "/api/v1/auth/login", new LoginRequest(email, TEST_PASSWORD), String.class);
+        assertThat(resp.getStatusCode())
+                .as("seeded CLIENT must log in, body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.OK);
+        var body = objectMapper.readValue(resp.getBody(), new TypeReference<ApiResponse<AuthResponse>>() {});
+        return body.data().accessToken();
+    }
+
+    /**
+     * Materialises the owner-operated {@code masters} row (the Phase 12.4
+     * {@code POST /salons/{salonId}/master} endpoint) and returns its {@code masters.id}. That
+     * row's {@code salon_id} is the owner's own salon, so it takes the salon bulk-create branch
+     * with no special-casing (Phase 302 D5).
+     */
+    UUID enableOwnerAsMaster(String ownerToken, UUID salonId) throws Exception {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
+                new HttpEntity<>(bearerHeaders(ownerToken)), String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readValue(
+                resp.getBody(), new TypeReference<ApiResponse<MasterDetailResponse>>() {})
+                .data().masterId();
+    }
+
     /** Resolves the master row id created when an independent master registers (1:1 with the user). */
     UUID resolveMasterIdForUserEmail(String email) {
         return jdbcTemplate.queryForObject(
@@ -233,6 +323,62 @@ class ServiceTestFixtures {
     }
 
     /**
+     * Counts {@code service_definitions} rows for an explicit {@code (owner_type, owner_id)} pair.
+     *
+     * <p>Needed since Phase 302: a salon master's definitions are {@code SALON}-owned, so
+     * {@link #countServiceDefinitionsForMaster} — which keys on the master row id — legitimately
+     * reports zero for them. Assertions about a salon's catalogue must name the salon.
+     */
+    long countServiceDefinitionsForOwner(String ownerType, UUID ownerId) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions WHERE owner_type = ? AND owner_id = ?",
+                Long.class, ownerType, ownerId);
+        return count == null ? 0L : count;
+    }
+
+    /**
+     * The ACTIVE {@code service_definitions} a master actually performs, resolved through
+     * {@code master_services} rather than through {@code owner_id}.
+     *
+     * <p>This is the ownership-agnostic notion of "this master's menu", and the one that stayed
+     * true across Phase 302: the assignment row is what says <em>this master performs this
+     * service</em>, whether the definition is owned by the master (independent) or by the salon.
+     */
+    java.util.List<UUID> activeDefinitionIdsAssignedToMaster(UUID masterId) {
+        return jdbcTemplate.queryForList(
+                "SELECT sd.id FROM service_definitions sd "
+                        + "JOIN master_services ms ON ms.service_def_id = sd.id "
+                        + "WHERE ms.master_id = ? AND ms.is_active = TRUE AND sd.is_active = TRUE "
+                        + "ORDER BY sd.created_at",
+                UUID.class, masterId);
+    }
+
+    /**
+     * Gives {@code masterId} an open-ended weekly template with a 09:00–17:00 interval on EVERY
+     * ISO weekday, so the master always has free future slots.
+     *
+     * <p>Required by any assertion against {@code GET /salons/&#123;salonId&#125;/services}: that
+     * catalogue applies the Phase 23.x free-slot bookability gate, so a schedule-less master's
+     * services are invisible there by deliberate contract (Phase 305 D1) — an empty catalogue
+     * would otherwise be mistaken for an ownership bug. Every weekday is seeded rather than just
+     * today's so the fixture cannot go stale when the suite runs after 17:00 local.
+     */
+    void seedUsableSchedule(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
+                scheduleId, masterId, java.time.LocalDate.now(java.time.ZoneId.of("Europe/Kyiv")));
+        for (int isoDow = 1; isoDow <= 7; isoDow++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    UUID.randomUUID(), scheduleId, isoDow,
+                    java.time.LocalTime.of(9, 0), java.time.LocalTime.of(17, 0));
+        }
+    }
+
+    /**
      * Reads the denormalised {@code masters.min_effective_price} (V58) straight from the DB —
      * never through an API projection, so the assertion pins the persisted column that the
      * search/browse ordering actually reads, not a value recomputed on the way out.
@@ -246,6 +392,63 @@ class ServiceTestFixtures {
     }
 
     record SeededServiceType(UUID id, String nameUk, String platformCategoryName) {
+    }
+
+    /**
+     * Inserts an ACTIVE {@code service_definitions} row owned by {@code masterId} with NO
+     * {@code master_services} assignment, via JDBC.
+     *
+     * <p>Direct SQL is required, not a bug: no endpoint can produce this state in one call, because
+     * every create path writes the definition and its assignment together. It arises in production
+     * over time — an assignment deactivated while its definition stays active.
+     *
+     * <p>{@code owner_type = 'INDEPENDENT_MASTER'} with {@code owner_id = masters.id} is also the
+     * pre-Phase-302 legacy shape {@code V164__backfill_salon_owned_master_service_definitions.sql}
+     * promotes to {@code SALON} ownership — see {@link #applyV164Backfill()}. Promoted here
+     * (originally {@code BulkServiceSetupIntegrationTest}-private) so
+     * {@code SalonCatalogueVisibilityIT}'s Phase 303 case 12 reuses the exact same legacy row
+     * shape instead of re-deriving it (REUSE-FIRST).
+     */
+    UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
+        UUID defId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
+                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
+                        + "is_active, created_at, updated_at) "
+                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
+                        + "'FIXED', 400.00, 0, true, NOW(), NOW())",
+                defId, masterId, serviceTypeId);
+        return defId;
+    }
+
+    private String v164MigrationSql;
+
+    private String v164Sql() throws Exception {
+        if (v164MigrationSql == null) {
+            try (InputStream in = new ClassPathResource(
+                    "db/migration/V164__backfill_salon_owned_master_service_definitions.sql")
+                    .getInputStream()) {
+                v164MigrationSql = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        }
+        return v164MigrationSql;
+    }
+
+    /**
+     * Re-applies V164's SQL body directly against this Spring-managed dataSource — Testcontainers
+     * already ran V164 once at boot, on an empty schema, where it was the documented no-op, so it
+     * will not re-run through Flyway. Re-executing its body is the same technique
+     * {@code V164SalonOwnedBackfillMigrationTest} uses to exercise the migration against
+     * legacy-shaped data seeded mid-test.
+     *
+     * <p>One simple-query {@code Statement.execute} call — the whole script must be sent as a
+     * single call.
+     */
+    void applyV164Backfill() throws Exception {
+        try (var conn = jdbcTemplate.getDataSource().getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.execute(v164Sql());
+        }
     }
 
     HttpHeaders bearerHeaders(String token) {

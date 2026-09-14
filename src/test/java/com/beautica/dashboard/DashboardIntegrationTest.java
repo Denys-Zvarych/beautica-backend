@@ -356,9 +356,13 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
                 "UPDATE service_definitions SET base_price = 999.00 WHERE id = ?",
                 fixture.serviceDefId());
 
-        // Also update master_services price_override if it exists (belt-and-suspenders)
+        // Also update master_services price_override if it exists (belt-and-suspenders).
+        // Phase 311 V165's chk_master_service_price_mode forbids a partial band, so
+        // price_type_override must be set alongside a non-null price_override — FIXED, matching
+        // "the master fixed their own price" (mirrors BookingPriceRangeContractIT#createRangeService).
         jdbcTemplate.update(
-                "UPDATE master_services SET price_override = 999.00 WHERE id = ?",
+                "UPDATE master_services SET price_override = 999.00, price_type_override = 'FIXED' "
+                        + "WHERE id = ?",
                 fixture.masterServiceId());
 
         log.debug("Act: GET {} as SALON_OWNER after price update — estimatedRevenue must be 100.00 (snapshot)", REVENUE_URL);

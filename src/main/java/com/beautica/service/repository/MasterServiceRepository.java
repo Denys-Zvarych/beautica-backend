@@ -111,6 +111,55 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     boolean existsByMasterIdAndServiceDefinitionId(UUID masterId, UUID serviceDefinitionId);
 
     /**
+     * ACTIVE-agnostic sibling of {@link #existsByMasterIdAndServiceDefinitionId}, returning the
+     * row itself rather than a boolean — backs both add-path D6 amendments (Phase 307):
+     * {@code ServiceCatalogService#assignServiceToMaster} reactivates an existing {@code is_active
+     * = false} row instead of inserting a second one ({@code master_services}' {@code UNIQUE
+     * (master_id, service_def_id)} is NOT partial, so a plain insert over an inactive row would
+     * trip it at flush), and {@code ServiceCatalogService#unassignServiceFromMaster} loads the
+     * assignment it is about to deactivate. Not filtered on {@code is_active} — the caller decides
+     * what an active vs. inactive result means for its own path.
+     *
+     * <p><b>JOIN FETCHes {@code master} and {@code serviceDefinition} (Phase-307 perf audit
+     * MEDIUM-1/2).</b> {@code unassignServiceFromMaster} used to follow this call with a forced
+     * lazy-proxy init the instant its ownership re-check called {@code getOwnerType()}/
+     * {@code getOwnerId()} on the returned assignment's {@code serviceDefinition} — unlike
+     * {@code getId()}, those columns are not answerable from the uninitialized proxy's FK alone,
+     * so that was a second SELECT on every call. Fetching both associations here collapses the
+     * caller's happy path to ONE query; {@code master} is {@code JOIN FETCH} (an assignment always
+     * has one), {@code serviceDefinition} is {@code LEFT JOIN FETCH} for symmetry with the other
+     * fetch queries in this file. {@code assignServiceToMaster} calls this finder too — the fetched
+     * {@code serviceDefinition} is the same managed instance it already loaded via
+     * {@code ServiceRepository#findByIdWithServiceType}, so Hibernate's first-level cache dedupes
+     * it and no duplicate SQL results.
+     *
+     * <p><b>{@code LEFT JOIN FETCH sd.serviceType} (Phase 311).</b> {@code
+     * ServiceCatalogService#updateMasterServiceBand} is a THIRD caller of this finder, and unlike
+     * the first two it builds a {@code MasterServiceResponse} (via {@code
+     * ServiceDefinitionResponse.from}, which reads {@code serviceType.getNameUk()}/{@code
+     * getSlug()}) WITHOUT first pre-warming the definition through {@code
+     * ServiceRepository#findByIdWithServiceType} the way {@code assignServiceToMaster} does. Without
+     * this fetch, {@code serviceType} stays an uninitialized proxy and throws {@code
+     * LazyInitializationException} the moment the response is built — mirrors {@link
+     * #findByMasterIdAndIsActiveTrueWithGraph}'s identical fetch, for the identical reason.
+     */
+    @Query("""
+            SELECT ms FROM MasterServiceAssignment ms
+            JOIN FETCH ms.master m
+            LEFT JOIN FETCH ms.serviceDefinition sd
+            LEFT JOIN FETCH sd.serviceType
+            WHERE m.id = :masterId AND sd.id = :serviceDefinitionId
+            """)
+    Optional<MasterServiceAssignment> findByMasterIdAndServiceDefinitionId(
+            @Param("masterId") UUID masterId, @Param("serviceDefinitionId") UUID serviceDefinitionId);
+
+    // Phase 302 D4's per-master conflict finder (findActiveAssignedServiceTypeIds) lived here and
+    // was DELETED by the phase-302 audit. It filtered on master_id alone, which made it blind to
+    // the rotated-master leak (audit HIGH-1), and it was one of three round-trips the salon-keyed
+    // advisory lock now serializes (audit LOW-3). Both the conflict and the reuse question are
+    // answered together, salon-scoped, by ServiceRepository#findSalonBulkSetupCandidates.
+
+    /**
      * Returns true if any active master service assignment uses the given service definition
      * and belongs to a master in one of the provided salons.
      *
@@ -239,16 +288,38 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     boolean existsActiveServiceForMaster(@Param("masterId") UUID masterId);
 
     /**
-     * Acquires a transaction-scoped Postgres advisory lock keyed by the master id so that
-     * concurrent bulk service-create calls for the same master serialize.
+     * Acquires a transaction-scoped Postgres advisory lock keyed by the caller-supplied
+     * {@code lockKey} so that concurrent bulk service-create calls contending for the SAME
+     * definition key space serialize.
      *
-     * <p>Phase 16.x (TOCTOU): the bulk path's per-item duplicate guard
-     * ({@code ServiceCatalogService#assertNoActiveDuplicatesInBatch}) reads the owner's
-     * already-taken service types and then inserts, so two concurrent bulk POSTs for the same
-     * master could both read "this type is free" and race. Taking this lock at the top of the
-     * bulk transaction forces the second caller to wait for the first to commit, after which
-     * its guard sees the committed rows and returns the clean, item-naming 409
-     * {@code DUPLICATE_SERVICE} rather than tripping the V121 unique index at flush.
+     * <p><b>The key is the contended RESOURCE, not always the master (Phase 302, audit HIGH-2).</b>
+     * {@code ServiceCatalogService#bulkCreateForMaster} passes:
+     * <ul>
+     *   <li>the SALON id on the SALON branch — under Phase 302 D1 the contended resource is the
+     *       salon's one ACTIVE definition per service type, enforced by V121's
+     *       {@code ux_service_def_owner_service_type_active}, and that key space is shared by
+     *       every master in the salon. Keying on the master instead let two DIFFERENT masters of
+     *       one salon take two DIFFERENT locks, both miss the reuse lookup, and both INSERT
+     *       {@code (SALON, salonId, typeId)} — the loser then tripping V121 at flush, where only a
+     *       constraint name is available, so the client got a {@code DUPLICATE_SERVICE} 409 whose
+     *       {@code serviceName} and {@code existingServiceDefId} were BOTH null. Salon-keying is
+     *       strictly stronger than master-keying here: two batches for the same master are also
+     *       two batches for the same salon, so same-master serialization is preserved.</li>
+     *   <li>the MASTER id on the INDEPENDENT_MASTER branch — those definitions are
+     *       {@code (INDEPENDENT_MASTER, master.id)}, so the master row IS the key space, and the
+     *       master has no salon to key on ({@code salon_id IS NULL}).</li>
+     * </ul>
+     * Exactly ONE key is taken per transaction, so no ordering discipline is required (see
+     * "Deadlock freedom" below).
+     *
+     * <p>Phase 16.x (TOCTOU): the bulk path's duplicate guard reads the key space's already-taken
+     * service types and then inserts, so two concurrent bulk POSTs against the same key space
+     * could both read "this type is free" and race. Taking this lock at the top of the bulk
+     * transaction forces the second caller to wait for the first to commit, after which its guard
+     * sees the committed rows and either REUSES the winner's definition (SALON branch) or returns
+     * the clean, item-naming 409 {@code DUPLICATE_SERVICE} (a genuine per-master conflict, or the
+     * INDEPENDENT_MASTER branch's owner-level collision) rather than tripping the V121 unique
+     * index at flush.
      *
      * <p>The lock is held until the surrounding transaction commits or rolls back
      * ({@code pg_advisory_xact_lock} — no manual unlock needed). Mirrors the SHAPE of the booking
@@ -271,14 +342,15 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      *
      * <p>Why it is required: bulk create became ADDITIVE (the "first-time only" precondition was
      * removed), so every add now contends on this lock instead of short-circuiting on a trivial
-     * {@code EXISTS}. Unbounded, a caller firing their full rate-limit burst at one masterId with
+     * {@code EXISTS}. Unbounded, a caller firing their full rate-limit burst at one key space with
      * DISJOINT service-type sets (nothing 409s them early) would run N full batches strictly in
      * series, each parking one of only 10 Hikari connections for the full 20s connection-timeout
      * and starving the pool app-wide. A wait exceeding 3s now aborts with Postgres
      * {@code 55P03 lock_not_available} instead.
      *
-     * <p>Ordinary contention is unaffected: the loser waits (well under 3s), acquires, re-runs its
-     * duplicate guard against the winner's COMMITTED rows and returns the clean 409
+     * <p>Ordinary contention is unaffected: the loser waits (well under 3s), acquires, and re-runs
+     * its guard against the winner's COMMITTED rows — reusing the winner's freshly created salon
+     * definition, or, when it really is a conflict, returning the clean 409
      * {@code DUPLICATE_SERVICE} carrying a populated {@code existingServiceDefId} — the contract
      * {@code BulkServiceSetupIntegrationTest} pins and the mobile screen deep-links on. This is
      * precisely why a bounded wait was chosen over {@code pg_try_advisory_xact_lock}, which would
@@ -309,11 +381,15 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * booking path's own 3s timeout. A dedicated salt removes the cross-feature coupling outright.
      *
      * <p><b>Deadlock freedom (ADVISORY locks).</b> Trivially preserved: a bulk-setup transaction
-     * takes the salt-2 lock and NO other advisory lock, and no other code path takes salt
-     * {@code 2} at all — so no session can hold a salt-2 lock while waiting on salt 0/1, nor the
-     * reverse, and the two-lock cycle precondition never arises among advisory locks. (It also
-     * held before this change, because bulk took only salt 0 while booking always acquires
-     * client-then-master; the argument no longer depends on booking's internal ordering.)
+     * takes EXACTLY ONE salt-2 lock — a salon id or a master id, never both, never two — and NO
+     * other advisory lock, and no other code path takes salt {@code 2} at all. So no session can
+     * hold a salt-2 lock while waiting on salt 0/1, nor the reverse, and the two-lock cycle
+     * precondition never arises among advisory locks. Phase 302's re-key (master → salon on the
+     * SALON branch) does not weaken this precisely because it swapped the key rather than adding a
+     * second one; were a future change to take both keys, they would have to be ordered globally
+     * (salon before master) to keep this argument. (It also held before salt 2 existed, because
+     * bulk took only salt 0 while booking always acquires client-then-master; the argument no
+     * longer depends on booking's internal ordering.)
      *
      * <p><b>Deadlock freedom (ROW locks) — why the advisory argument above is not the whole
      * story.</b> Verified separately, because a cycle needs only ONE advisory edge and one row-lock
@@ -327,17 +403,21 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
      * not block each other, so no wait edge forms in either direction.
      *
      * <p>Hash collision risk WITHIN salt {@code 2}: {@code hashtextextended} produces a 64-bit hash
-     * of the UUID text. Birthday-paradox probability is negligible for current master counts, and a
-     * genuine collision would only cause two unrelated masters' bulk setups to serialize, never a
-     * correctness bug.
+     * of the UUID text. Birthday-paradox probability is negligible for current salon + master
+     * counts, and a genuine collision would only cause two unrelated key spaces' bulk setups to
+     * serialize, never a correctness bug. Salon ids and master ids share the salt but are distinct
+     * random UUIDs, so mixing the two kinds of key in one space adds no new hazard.
+     *
+     * @param lockKey the contended key space: the SALON id on the salon branch, the MASTER id on
+     *                the independent-master branch — see the keying section above
      */
     @Query(value = """
             SELECT 1 FROM (
                 SELECT set_config('lock_timeout', '3s', true),
-                       pg_advisory_xact_lock(hashtextextended(CAST(:masterId AS text), 2))
+                       pg_advisory_xact_lock(hashtextextended(CAST(:lockKey AS text), 2))
             ) sub
             """, nativeQuery = true)
-    Integer acquireBulkSetupLockWithTimeout(@Param("masterId") UUID masterId);
+    Integer acquireBulkSetupLockWithTimeout(@Param("lockKey") UUID lockKey);
 
     /**
      * Booking-selection candidates (Phase 23.x): the active {@link MasterServiceAssignment}s for

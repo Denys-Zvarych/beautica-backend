@@ -9,11 +9,17 @@ import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.DuplicateServiceResponse;
 import com.beautica.service.dto.MasterServiceResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.persistence.EntityManagerFactory;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.hibernate.SessionFactory;
+import org.hibernate.stat.Statistics;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,6 +34,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -82,9 +91,42 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
     @Autowired private TestRestTemplate restTemplate;
     @Autowired private ObjectMapper objectMapper;
     @Autowired private JdbcTemplate jdbcTemplate;
+
+    /**
+     * Authenticates the current thread as the SALON_OWNER of {@code salonId} and returns their
+     * user id, for the handful of cases below that drive {@code ServiceCatalogService} DIRECTLY
+     * rather than over HTTP.
+     *
+     * <p>Needed since the 2026-09-13 audit (S1): {@code bulkCreateSalonMasterServices} now takes an
+     * {@code actorId} and re-proves {@code @authz.canManageSalon} at the service layer, and that
+     * guard reads the caller's ROLE from the {@code SecurityContextHolder} (the same place the JWT
+     * filter puts it in production). A direct call with no security context is a
+     * {@code ForbiddenException}, which is the point of the fix.
+     *
+     * <p>Mirrors the {@code JwtAuthenticationFilter} contract exactly: the user id lives in the
+     * token's {@code details} (read by {@code AuthenticationUtils#userId}) and the role is a single
+     * {@code ROLE_*} authority. Cleared in {@link #clearSecurityContext()}.
+     */
+    private UUID authenticateAsOwnerOf(UUID salonId) {
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT owner_id FROM salons WHERE id = ?", UUID.class, salonId);
+        var token = new UsernamePasswordAuthenticationToken(
+                ownerUserId, null, List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        token.setDetails(ownerUserId);
+        SecurityContextHolder.getContext().setAuthentication(token);
+        return ownerUserId;
+    }
+
+    @AfterEach
+    void clearSecurityContext() {
+        SecurityContextHolder.clearContext();
+    }
+
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private ServiceCatalogService serviceCatalogService;
     @Autowired private org.springframework.cache.CacheManager cacheManager;
+    /** Source of the Hibernate {@link Statistics} the batch-size statement gate counts on. */
+    @Autowired private EntityManagerFactory emf;
 
     private ServiceTestFixtures fixtures;
     private List<ServiceTestFixtures.SeededServiceType> seededTypes;
@@ -500,8 +542,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.CREATED);
         UUID appendedDefId = createdFrom(second).get(0).serviceDefinition().id();
 
-        assertThat(activeDefinitionIdsForMaster(masterId))
-                .as("the salon master's menu keeps both batches")
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("the salon master's menu keeps both batches — resolved through master_services, "
+                        + "because since Phase 302 the definitions are SALON-owned, not master-owned")
                 .containsExactlyInAnyOrder(originalDefId, appendedDefId);
         assertThat(fixtures.minEffectivePriceForMaster(masterId))
                 .as("the shared post-write bookkeeping runs on the on-behalf path too — the "
@@ -536,6 +579,28 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
     // ── Salon on-behalf: SALON_ADMIN allowed within own salon ──────────────────
 
+    /**
+     * Pins the SALON_ADMIN boundary on the bulk endpoint as a DECIDED contract, not an accident
+     * (phase-302 audit MEDIUM-5).
+     *
+     * <p><b>Why it needs pinning.</b> {@code ServiceController#bulkCreateMasterServices} gates on
+     * {@code @authz.canManageSalon}, which admits SALON_ADMIN, while the sibling
+     * {@code POST /salons/&#123;salonId&#125;/services} gates on {@code hasRole('SALON_OWNER')}.
+     * Since Phase 302 D1 the bulk endpoint writes exactly the {@code (SALON, salonId)} rows the
+     * sibling restricts, so an admin can now create salon-owned, publicly visible catalogue
+     * definitions. Read cold, that looks like an authorization widening smuggled in by a data
+     * -ownership change.
+     *
+     * <p><b>It is intended.</b> The locked product requirement is "the salon owner/admin only can
+     * set the services", and on <b>2026-09-08</b> the user explicitly chose FULL owner/admin parity
+     * for service management — recorded in the resolved-decision block of
+     * {@code docs/backend-phases/phase-306-salon-admin-parity-on-service-management.md}. Phase 306
+     * aligns the sibling endpoints ({@code PATCH}/{@code DELETE}/single-assign); it is not this
+     * phase's job, and this test must NOT be "fixed" by tightening the guard.
+     *
+     * <p>Parity is per SALON, never global: the sibling test below proves an admin of a DIFFERENT
+     * salon is still refused, so what phase 306 widens is the role, not the tenancy boundary.
+     */
     @Test
     @DisplayName("SALON_ADMIN bulk-creates on behalf of a salon master in their own salon — 201")
     void should_allowSalonAdminOnBehalf_when_masterInSameSalon() throws Exception {
@@ -554,9 +619,57 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         ResponseEntity<String> resp = postSalonBulk(adminToken, salonId, masterId, request);
 
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        assertThat(fixtures.countServiceDefinitionsForMaster(masterId))
-                .as("the on-behalf batch is persisted, owned by the master row")
+        assertThat(fixtures.countServiceDefinitionsForOwner("SALON", salonId))
+                .as("the on-behalf batch is persisted SALON-owned (Phase 302 D1)")
                 .isEqualTo(1L);
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("and the master performs it via a master_services assignment")
+                .hasSize(1);
+    }
+
+    /**
+     * The tenancy half of the SALON_ADMIN decision pinned above (phase-302 audit MEDIUM-5): the
+     * 2026-09-08 owner/admin parity decision widens the ROLE, never the salon boundary.
+     *
+     * <p>An admin of salon B addressing salon A's bulk path must be refused by
+     * {@code canManageSalon(auth, salonAId)} before {@code masterBelongsToSalon} is even reached —
+     * so an admin cannot mint {@code (SALON, salonAId)} catalogue rows in a salon they do not
+     * administer. Without this, "SALON_ADMIN may bulk-create" would be pinned as an unqualified
+     * capability, and a future SpEL edit that dropped the salon argument would keep the sibling
+     * allow-test green.
+     */
+    @Test
+    @DisplayName("SALON_ADMIN of ANOTHER salon cannot bulk-create in this salon — 403, nothing persisted")
+    void should_denySalonAdminOnBehalf_when_adminBelongsToADifferentSalon() throws Exception {
+        String ownerAToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-adminidor-" + System.nanoTime() + "@beautica.test");
+        UUID salonAId = fixtures.createSalon(ownerAToken, "Phase 302 Admin IDOR Target");
+        UUID masterInSalonA = fixtures.createSalonMaster(salonAId);
+
+        String ownerBToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-adminidor-b-" + System.nanoTime() + "@beautica.test");
+        UUID salonBId = fixtures.createSalon(ownerBToken, "Phase 302 Admin IDOR Home");
+        String foreignAdminToken = fixtures.createSalonAdminAndGetToken(
+                salonBId, "admin-302-idor-" + System.nanoTime() + "@beautica.test");
+
+        var request = new BulkCreateServicesRequest(List.of(
+                fixed(seededTypes.get(0).id(), 60, "350.00")));
+
+        log.debug("Act: SALON_ADMIN of salon {} POSTs the bulk path of salon {} — must be 403",
+                salonBId, salonAId);
+        ResponseEntity<String> resp = postSalonBulk(foreignAdminToken, salonAId, masterInSalonA, request);
+
+        assertThat(resp.getStatusCode())
+                .as("owner/admin parity (user decision 2026-09-08, phase 306) is scoped to the "
+                        + "admin's OWN salon — canManageSalon(auth, salonA) is false here. Body: %s",
+                        resp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(countActiveDefinitionsForOwner("SALON", salonAId))
+                .as("the denied request must not create a salon-A catalogue definition")
+                .isZero();
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterInSalonA))
+                .as("nor an assignment for salon A's master")
+                .isEmpty();
     }
 
     // ── Salon on-behalf: cross-salon IDOR denied ───────────────────────────────
@@ -635,7 +748,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // An ACTIVE definition with NO master_services row at all: nothing shows in the master's
         // menu, yet the definition-level V121 index would still reject an insert for this type.
-        UUID orphanDefId = insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        UUID orphanDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixed(seededTypes.get(0).id(), 60, "350.00")));
@@ -685,7 +798,7 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
 
         // Assignmentless again, mirroring the test above; the property under test here is the
         // ROLLBACK, not the route into the duplicate check.
-        UUID existingDefId = insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
+        UUID existingDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, types.get(2).id());
 
         var request = new BulkCreateServicesRequest(List.of(
                 fixed(types.get(0).id(), 60, "350.00"),
@@ -719,31 +832,9 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
                 .isEqualTo(0L);
     }
 
-    /**
-     * Inserts an ACTIVE {@code service_definitions} row owned by {@code masterId} with NO
-     * {@code master_services} assignment, via JDBC.
-     *
-     * <p>Direct SQL is required, not a bug: no endpoint can produce this state in one call, because
-     * every create path writes the definition and its assignment together. It arises in production
-     * over time — an assignment deactivated while its definition stays active — and it is precisely
-     * the state where a master's visible menu disagrees with the definition-level V121 index.
-     *
-     * <p>{@code owner_type = 'INDEPENDENT_MASTER'} with {@code owner_id = masters.id} mirrors what
-     * {@code bulkCreateForMaster} itself persists for BOTH entry points ("services are owned by the
-     * master row regardless of how the master was created"), so the seeded row lands in the same
-     * V121 key space the batch is about to insert into.
-     */
-    private UUID insertActiveDefinitionWithoutAssignment(UUID masterId, UUID serviceTypeId) {
-        UUID defId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "
-                        + "base_duration_minutes, price_type, base_price, buffer_minutes_after, "
-                        + "is_active, created_at, updated_at) "
-                        + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Orphaned Active Service', ?, 60, "
-                        + "'FIXED', 400.00, 0, true, NOW(), NOW())",
-                defId, masterId, serviceTypeId);
-        return defId;
-    }
+    // insertActiveDefinitionWithoutAssignment was promoted to ServiceTestFixtures (Phase 305
+    // REUSE-FIRST) so SalonCatalogueVisibilityIT's case 12 reuses the exact same legacy-row
+    // recipe instead of re-deriving it; call sites here now read fixtures.insertActiveDefinition...
 
     // ── TOCTOU concurrency regression (Step 2.7 Rule 3) ────────────────────────
 
@@ -851,6 +942,1264 @@ class BulkServiceSetupIntegrationTest extends AbstractIntegrationTest {
         try {
             startLine.await(10, TimeUnit.SECONDS); // both threads cross together — no sleep
             serviceCatalogService.bulkCreateIndependentMasterServices(userId, request);
+            successCount.incrementAndGet();
+            return null;
+        } catch (BusinessException e) {
+            if (e.getStatus() == HttpStatus.CONFLICT) {
+                conflictCount.incrementAndGet();
+            }
+            return e;
+        } catch (Throwable t) {
+            return t;
+        }
+    }
+
+    // ══ Phase 302 — a salon master's services are SALON-owned and REUSE the salon's definition ══
+    //
+    // The defect these pin: bulkCreateSalonMasterServices used to persist
+    // (INDEPENDENT_MASTER, master.id), while findBookableAssignmentsBySalon admits only
+    // (SALON, salonId). Every service created through this endpoint was therefore permanently
+    // invisible in GET /salons/{salonId}/services. Reuse is not tidiness either — V121's
+    // ux_service_def_owner_service_type_active makes a per-master duplicate physically impossible
+    // once the owner is the salon.
+    //
+    // Salon-catalogue cache eviction on these write paths is Phase 304, NOT this phase, so every
+    // catalogue read below explicitly clears the 60s salon-service-catalog entry first. That is a
+    // documented gap being worked around, not an assertion crutch.
+
+    private static final String SALON_CATALOG_CACHE = "salon-service-catalog";
+
+    /** Drops the 60s salon-catalogue cache entry — see the Phase 304 note above. */
+    private void evictSalonCatalogue(UUID salonId) {
+        var cache = cacheManager.getCache(SALON_CATALOG_CACHE);
+        if (cache != null) {
+            cache.evict(salonId);
+        }
+    }
+
+    /** GETs the public salon catalogue, bypassing the Phase 304 cache gap. */
+    private SalonServiceCatalogResponse getSalonCatalogue(UUID salonId) throws Exception {
+        evictSalonCatalogue(salonId);
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                "/api/v1/salons/" + salonId + "/services", String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readValue(
+                resp.getBody(),
+                new TypeReference<ApiResponse<SalonServiceCatalogResponse>>() {}).data();
+    }
+
+    private List<UUID> catalogueServiceIds(UUID salonId) throws Exception {
+        return getSalonCatalogue(salonId).categories().stream()
+                .flatMap(group -> group.services().stream())
+                .map(com.beautica.service.dto.ServiceDefinitionResponse::id)
+                .toList();
+    }
+
+    /** One row of {@code service_definitions}, read raw so assertions pin the table, not a DTO. */
+    private java.util.Map<String, Object> definitionRow(UUID defId) {
+        return jdbcTemplate.queryForMap(
+                "SELECT owner_type, owner_id, name, base_price, base_duration_minutes, price_type "
+                        + "FROM service_definitions WHERE id = ?", defId);
+    }
+
+    /**
+     * Phase 312 — one {@code master_services} row's full price band, read raw so assertions pin
+     * the table (and V165's {@code chk_master_service_price_mode} coherence) directly, not a DTO.
+     */
+    private java.util.Map<String, Object> assignmentBandRow(UUID masterId, UUID defId) {
+        return jdbcTemplate.queryForMap(
+                "SELECT price_type_override, price_override, price_max_override "
+                        + "FROM master_services WHERE master_id = ? AND service_def_id = ?",
+                masterId, defId);
+    }
+
+    /**
+     * The master's PUBLIC menu, read over the wire from {@code GET /masters/{id}/services} — the
+     * surface a client actually renders a price from.
+     *
+     * <p>Re-audit cycle 2: the shape-mismatch guard exists because a reshaped reuse shipped a wrong
+     * CLIENT-FACING price ({@code FIXED 600} reusing a {@code RANGE 400–900} definition rendered
+     * {@code 600–900}). Every other assertion on that path pins an HTTP status, a
+     * {@code master_services} column or the create-response — none of which is the band a client
+     * sees. {@code priceType}/{@code priceMin}/{@code priceMax} come off the SHARED definition
+     * while {@code effectivePrice} comes off the per-master override, so the rendered band is a
+     * COMBINATION of the two rows and can be wrong even when both rows are individually correct.
+     * That combination is only observable here.
+     */
+    private List<MasterServiceResponse> publicMenuOf(UUID masterId) throws Exception {
+        ResponseEntity<String> resp = restTemplate.getForEntity(
+                "/api/v1/masters/" + masterId + "/services", String.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readValue(
+                resp.getBody(),
+                new TypeReference<ApiResponse<List<MasterServiceResponse>>>() {}).data();
+    }
+
+    private long countActiveDefinitionsForOwner(String ownerType, UUID ownerId) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM service_definitions "
+                        + "WHERE owner_type = ? AND owner_id = ? AND is_active = TRUE",
+                Long.class, ownerType, ownerId);
+        return count == null ? 0L : count;
+    }
+
+    /** Case 1 + 2 — the whole point of the phase. */
+    @Test
+    @DisplayName("salon master's bulk-created services appear in GET /salons/{salonId}/services, "
+            + "persisted owner_type='SALON' + owner_id=salonId (D1)")
+    void should_appearInSalonCatalogueAsSalonOwned_when_ownerBulkCreatesForSalonMaster() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-visible-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Visible Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        // Without a schedule the free-slot gate hides everything — deliberate contract (Phase 305 D1).
+        fixtures.seedUsableSchedule(masterId);
+
+        log.debug("Act: owner bulk-creates two services for a salon master");
+        ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(
+                        fixed(seededTypes.get(0).id(), 60, "350.00"),
+                        range(seededTypes.get(1).id(), 90, "800.00", "1500.00"))));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        List<UUID> createdDefIds = createdFrom(resp).stream()
+                .map(r -> r.serviceDefinition().id()).toList();
+        assertThat(createdDefIds).hasSize(2);
+
+        // Case 1 FIRST, deliberately. This is the product claim, and reverting D1 must report it
+        // as the symptom a user would see — an EMPTY catalogue, not a 500 and not the
+        // implementation-level ownership assertion below, which would otherwise shadow it.
+        assertThat(catalogueServiceIds(salonId))
+                .as("both bulk-created services are visible in the salon's public catalogue")
+                .containsExactlyInAnyOrderElementsOf(createdDefIds);
+
+        // Case 2 — assert the ROW, not the response: ownership is what the catalogue query joins on.
+        for (UUID defId : createdDefIds) {
+            assertThat(definitionRow(defId))
+                    .as("a salon-bound master's definition is SALON-owned, keyed on the salon id")
+                    .containsEntry("owner_type", "SALON")
+                    .containsEntry("owner_id", salonId);
+        }
+    }
+
+    /** Cases 3, 4 and 5 — reuse, no duplicate row, no mutation of the shared definition. */
+    @Test
+    @DisplayName("a second master in the same salon offering the SAME type reuses the one definition — "
+            + "no new row, catalogue lists it once, the shared row is unchanged (D2/D3)")
+    void should_reuseOneDefinition_when_twoMastersInASalonOfferTheSameServiceType() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-reuse-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Reuse Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(firstMasterId);
+        fixtures.seedUsableSchedule(secondMasterId);
+
+        UUID typeId = seededTypes.get(0).id();
+
+        ResponseEntity<String> first = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "350.00"))));
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID sharedDefId = createdFrom(first).get(0).serviceDefinition().id();
+
+        // Case 5's "before" snapshot, taken from the table.
+        java.util.Map<String, Object> before = definitionRow(sharedDefId);
+
+        // The second master deliberately names a DIFFERENT price. A reuse path that copied the
+        // batch item onto the found definition would look correct on ids and counts while silently
+        // repricing the first master's service — the multi-master data loss D3 exists to prevent —
+        // so case 5's byte-identical row assertion below is what catches it.
+        log.debug("Act: a SECOND master in the same salon bulk-creates the SAME service type — "
+                + "must reuse, because V121 forbids a second active (SALON, salonId, type) row");
+        ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "420.00"))));
+
+        assertThat(second.getStatusCode())
+                .as("the salon already offering the type is the REUSE path, not a 409 (D4)")
+                .isEqualTo(HttpStatus.CREATED);
+        assertThat(createdFrom(second).get(0).serviceDefinition().id())
+                .as("the second master's assignment points at the SAME definition")
+                .isEqualTo(sharedDefId);
+
+        // Case 3 — service_definitions gained no row.
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId))
+                .as("one definition, two masters — a second row would have violated "
+                        + "ux_service_def_owner_service_type_active")
+                .isEqualTo(1L);
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(firstMasterId))
+                .containsExactly(sharedDefId);
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(secondMasterId))
+                .containsExactly(sharedDefId);
+
+        // Case 4 — the catalogue lists it once, not twice.
+        assertThat(catalogueServiceIds(salonId))
+                .as("the catalogue is keyed by definition, so two performing masters list it ONCE")
+                .containsExactly(sharedDefId);
+
+        // Case 5 — the shared row is byte-identical.
+        assertThat(definitionRow(sharedDefId))
+                .as("reuse must never rewrite the salon's shared definition")
+                .isEqualTo(before);
+    }
+
+    // ══ Phase 303 QA gap 1 (security INFO, closed here) — the ownership flip must be provable over
+    // HTTP, not just at the DB-row level. Phase 302 D7: BEFORE V164 runs, a legacy
+    // INDEPENDENT_MASTER-owned definition belonging to a salon-bound master is unreachable by EVERY
+    // role — AuthorizationService.canManageServiceDefinition resolves the owner user id off
+    // ServiceRepository.findOwnerUserId's INDEPENDENT_MASTER branch (the MASTER's own user, never
+    // the salon owner), and the salon master's real role is SALON_MASTER, which fails
+    // canManageServiceDefinition's role gate before any DB lookup runs at all. V164's whole
+    // user-visible point is that the salon owner regains PATCH/DELETE on these rows — this test
+    // proves it end-to-end through the real endpoints, both BEFORE (403) and AFTER (200/204) V164.
+    @Test
+    @DisplayName("Phase 303 gap 1: PATCH/DELETE on a legacy definition is 403 for the salon owner "
+            + "BEFORE V164, and succeeds AFTER V164 promotes it to SALON ownership")
+    void should_letSalonOwnerPatchAndDeleteBackfilledDefinition_onlyAfterV164Promotion() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-303-http-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 303 HTTP Reachability Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        fixtures.seedUsableSchedule(masterId);
+
+        log.debug("Arrange: the exact pre-302 legacy shape — INDEPENDENT_MASTER-owned, salon-bound "
+                + "master, with an active assignment");
+        UUID legacyDefId = fixtures.insertActiveDefinitionWithoutAssignment(masterId, seededTypes.get(0).id());
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                UUID.randomUUID(), masterId, legacyDefId);
+
+        var rename = new UpdateServiceDefinitionRequest(
+                "Renamed After Backfill", null, null, null, null, null, null, null, null, null);
+
+        log.debug("Act: salon owner attempts PATCH on the legacy row BEFORE V164 runs");
+        ResponseEntity<String> patchBefore = restTemplate.exchange(
+                "/api/v1/services/" + legacyDefId, HttpMethod.PATCH,
+                new HttpEntity<>(rename, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(patchBefore.getStatusCode())
+                .as("precondition reproducing Phase 302 D7: a pre-302 row is unreachable by EVERY "
+                        + "role, including the salon owner who nominally manages this master's salon")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+
+        log.debug("Act: apply V164 to promote the legacy row to SALON ownership");
+        fixtures.applyV164Backfill();
+
+        log.debug("Act: salon owner PATCHes the NOW-backfilled row");
+        ResponseEntity<String> patchAfter = restTemplate.exchange(
+                "/api/v1/services/" + legacyDefId, HttpMethod.PATCH,
+                new HttpEntity<>(rename, fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(patchAfter.getStatusCode())
+                .as("the whole point of gap 1: V164's ownership flip must be reachable through the "
+                        + "real PATCH endpoint, not merely visible as owner_type='SALON' in the DB")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(definitionRow(legacyDefId)).containsEntry("name", "Renamed After Backfill");
+
+        log.debug("Act: salon owner DELETEs (deactivates) the backfilled row");
+        ResponseEntity<Void> deleteAfter = restTemplate.exchange(
+                "/api/v1/services/" + legacyDefId, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), Void.class);
+        assertThat(deleteAfter.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        Boolean isActive = jdbcTemplate.queryForObject(
+                "SELECT is_active FROM service_definitions WHERE id = ?", Boolean.class, legacyDefId);
+        assertThat(isActive)
+                .as("DELETE on a backfilled definition must reach the real deactivation path too — "
+                        + "V164's repair covers BOTH PATCH and DELETE, not just GET/catalogue visibility")
+                .isFalse();
+    }
+
+    /** Case 6 — divergence lands on the assignment, never on the shared definition. */
+    @Test
+    @DisplayName("reuse with a DIFFERENT price writes master_services.price_override and leaves the "
+            + "shared definition untouched (D3)")
+    void should_writePriceOverride_when_reusingMasterPricesDifferently() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-override-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Override Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+
+        UUID typeId = seededTypes.get(0).id();
+
+        ResponseEntity<String> first = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "350.00"))));
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID sharedDefId = createdFrom(first).get(0).serviceDefinition().id();
+        java.util.Map<String, Object> before = definitionRow(sharedDefId);
+
+        log.debug("Act: the second master takes the same type at a different price and duration");
+        ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 90, "420.00"))));
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        java.util.Map<String, Object> assignment = jdbcTemplate.queryForMap(
+                "SELECT price_override, duration_override_minutes FROM master_services "
+                        + "WHERE master_id = ? AND service_def_id = ?", secondMasterId, sharedDefId);
+        assertThat((BigDecimal) assignment.get("price_override"))
+                .as("the diverging price is a PER-MASTER fact — master_services.price_override")
+                .isEqualByComparingTo("420.00");
+        assertThat(assignment.get("duration_override_minutes"))
+                .as("and so is the diverging duration")
+                .isEqualTo(90);
+
+        assertThat(definitionRow(sharedDefId))
+                .as("the shared definition keeps the salon's own price and duration — rewriting "
+                        + "them would change what the FIRST master offers")
+                .isEqualTo(before);
+
+        java.util.Map<String, Object> firstAssignment = jdbcTemplate.queryForMap(
+                "SELECT price_override, duration_override_minutes FROM master_services "
+                        + "WHERE master_id = ? AND service_def_id = ?", firstMasterId, sharedDefId);
+        assertThat(firstAssignment.get("price_override"))
+                .as("the creating master matched the definition, so it carries no override")
+                .isNull();
+        assertThat(firstAssignment.get("duration_override_minutes")).isNull();
+    }
+
+    /**
+     * ── Phase 312 D3 — the reuse branch STORES a differing price shape instead of rejecting it ──
+     *
+     * <p>Before Phase 311's V165, {@code master_services} carried only a {@code price_override}
+     * (a FLOOR) and a {@code duration_override_minutes} — no per-master price type and no
+     * per-master ceiling — so a batch item whose price shape disagreed with the reused salon
+     * definition had nowhere faithful to land, and the Phase 302 re-audit MEDIUM-1 guard rejected
+     * it with {@code 400 SERVICE_PRICE_SHAPE_MISMATCH}.
+     *
+     * <p>V165 gives {@code master_services} its own {@code price_type_override} and
+     * {@code price_max_override}, so every shape is now representable — Phase 312 retires the
+     * guard and this branch STORES the master's own band instead. This is the INVERTED
+     * {@code should_return400_when_reusingItemPriceShapeDiffersFromSalonDefinition} — same three
+     * rows, opposite outcome, kept as the same test (not deleted) per Phase 312's mandate.
+     */
+    @Test
+    @DisplayName("a reused item whose price SHAPE differs from the salon definition → 201, the "
+            + "item's OWN band is stored (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnBand_when_reusingItemPriceShapeDiffersFromSalonDefinition() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-shape-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Shape Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+
+        UUID fixedTypeId = seededTypes.get(0).id();
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        // The first master mints the salon's governing definitions: one FIXED 500, one RANGE 400–900.
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(
+                        fixed(fixedTypeId, 60, "500.00"),
+                        range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        List<MasterServiceResponse> seeded = createdFrom(seed);
+        UUID fixedDefId = seeded.get(0).serviceDefinition().id();
+        UUID rangeDefId = seeded.get(1).serviceDefinition().id();
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isEqualTo(2L);
+
+        log.debug("Act row 1: RANGE 400–900 item against the salon's FIXED 500 definition");
+        ResponseEntity<String> rangeOverFixed = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(fixedTypeId, 60, "400.00", "900.00"))));
+        assertThat(rangeOverFixed.getStatusCode())
+                .as("V165 makes every shape representable — store the master's own band, don't reject it")
+                .isEqualTo(HttpStatus.CREATED);
+        java.util.Map<String, Object> row1 = assignmentBandRow(secondMasterId, fixedDefId);
+        assertThat(row1.get("price_type_override")).isEqualTo("RANGE");
+        assertThat((BigDecimal) row1.get("price_override")).isEqualByComparingTo("400.00");
+        assertThat((BigDecimal) row1.get("price_max_override")).isEqualByComparingTo("900.00");
+
+        log.debug("Act row 2: FIXED 600 item against the salon's RANGE 400–900 definition");
+        // A DIFFERENT service type than row 1, so this does not collide with the assignment just
+        // made above — both land on the SAME second master, proving neither write disturbs the other.
+        ResponseEntity<String> fixedOverRange = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(fixed(rangeTypeId, 60, "600.00"))));
+        assertThat(fixedOverRange.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        java.util.Map<String, Object> row2 = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(row2.get("price_type_override")).isEqualTo("FIXED");
+        assertThat((BigDecimal) row2.get("price_override")).isEqualByComparingTo("600.00");
+        assertThat(row2.get("price_max_override"))
+                .as("FIXED has no ceiling — must not inherit the salon's 900")
+                .isNull();
+
+        // ── the shared definitions are byte-for-byte unchanged by either reuse ──
+        assertThat(definitionRow(fixedDefId).get("price_type")).isEqualTo("FIXED");
+        assertThat(definitionRow(rangeDefId).get("price_type")).isEqualTo("RANGE");
+        assertThat((BigDecimal) definitionRow(rangeDefId).get("base_price")).isEqualByComparingTo("400.00");
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId))
+                .as("reuse mints no definition")
+                .isEqualTo(2L);
+
+        // ── and the PUBLISHED band matches what was submitted, not a reshaped combination ──
+        List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
+        MasterServiceResponse renderedRangeOverFixed = menu.stream()
+                .filter(row -> row.serviceDefinition().id().equals(fixedDefId)).findFirst().orElseThrow();
+        assertThat(renderedRangeOverFixed.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(renderedRangeOverFixed.priceMax()).isEqualByComparingTo("900.00");
+        assertThat(renderedRangeOverFixed.effectivePrice()).isEqualByComparingTo("400.00");
+
+        MasterServiceResponse renderedFixedOverRange = menu.stream()
+                .filter(row -> row.serviceDefinition().id().equals(rangeDefId)).findFirst().orElseThrow();
+        assertThat(renderedFixedOverRange.priceType())
+                .as("600 renders as a SINGLE price, never 600–900 — the exact defect the retired "
+                        + "guard existed to prevent, now solved by storing the master's own shape")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(renderedFixedOverRange.priceMax()).isNull();
+        assertThat(renderedFixedOverRange.effectivePrice()).isEqualByComparingTo("600.00");
+    }
+
+    /**
+     * A diverging RANGE ceiling (only the ceiling differs, floor is representable either way) —
+     * also now STORED as the master's own, not silently dropped in favour of the salon's.
+     */
+    @Test
+    @DisplayName("a reused RANGE item whose ceiling differs from the salon band → 201, the item's "
+            + "OWN ceiling is stored, not the salon's (Phase 312 D3, inverts the retired 400)")
+    void should_storeOwnCeiling_when_reusedRangeItemCeilingDiffersFromTheSalonBand() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-ceiling-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Ceiling Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID rangeDefId = createdFrom(seed).get(0).serviceDefinition().id();
+
+        log.debug("Act: RANGE 500–800 — only the ceiling differs from the salon's 400–900");
+        ResponseEntity<String> narrowerBand = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "500.00", "800.00"))));
+        assertThat(narrowerBand.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        java.util.Map<String, Object> row = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(row.get("price_type_override")).isEqualTo("RANGE");
+        assertThat((BigDecimal) row.get("price_override")).isEqualByComparingTo("500.00");
+        assertThat((BigDecimal) row.get("price_max_override"))
+                .as("the SUBMITTED ceiling is kept — the salon's 900 must not silently win")
+                .isEqualByComparingTo("800.00");
+        assertThat((BigDecimal) definitionRow(rangeDefId).get("base_price"))
+                .as("the shared definition's own floor is untouched")
+                .isEqualByComparingTo("400.00");
+
+        List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
+        MasterServiceResponse rendered = menu.get(0);
+        assertThat(rendered.priceMax())
+                .as("the rendered ceiling is the master's OWN 800, not the salon's 900")
+                .isEqualByComparingTo("800.00");
+        assertThat(rendered.effectivePrice()).isEqualByComparingTo("500.00");
+    }
+
+    /**
+     * The accept side of the same resolution, so it cannot over-write: a FIXED item at any amount
+     * against a FIXED definition, and a RANGE item whose ceiling MATCHES the salon band — both
+     * representable pre-312 too, both still accepted, and both still an OWN band (not Inherited)
+     * because their FLOOR diverges from the salon's (Phase 311 D2 all-or-nothing: any divergence
+     * in the triple writes the whole triple).
+     */
+    @Test
+    @DisplayName("a reused item whose price shape MATCHES the salon definition's shape is accepted "
+            + "— its own floor (and, for RANGE, its own ceiling) are stored as a full own band")
+    void should_storeOwnBand_when_reusedItemPriceShapeMatchesSalonDefinition() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-shape-ok-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Shape OK Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+
+        UUID fixedTypeId = seededTypes.get(0).id();
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(
+                        fixed(fixedTypeId, 60, "500.00"),
+                        range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        List<MasterServiceResponse> seeded = createdFrom(seed);
+        UUID fixedDefId = seeded.get(0).serviceDefinition().id();
+        UUID rangeDefId = seeded.get(1).serviceDefinition().id();
+        java.util.Map<String, Object> fixedBefore = definitionRow(fixedDefId);
+        java.util.Map<String, Object> rangeBefore = definitionRow(rangeDefId);
+
+        log.debug("Act: FIXED 600 over FIXED 500, and RANGE 500–900 over RANGE 400–900 — both "
+                + "representable, and both stored as this master's own band");
+        ResponseEntity<String> accepted = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(
+                        fixed(fixedTypeId, 60, "600.00"),
+                        range(rangeTypeId, 60, "500.00", "900.00"))));
+
+        assertThat(accepted.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        java.util.Map<String, Object> fixedRow = assignmentBandRow(secondMasterId, fixedDefId);
+        assertThat(fixedRow.get("price_type_override")).isEqualTo("FIXED");
+        assertThat((BigDecimal) fixedRow.get("price_override")).isEqualByComparingTo("600.00");
+        assertThat(fixedRow.get("price_max_override")).isNull();
+
+        java.util.Map<String, Object> rangeRow = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(rangeRow.get("price_type_override"))
+                .as("floor diverges (500 vs 400), so D2's all-or-nothing rule writes the WHOLE "
+                        + "triple even though the ceiling matches")
+                .isEqualTo("RANGE");
+        assertThat((BigDecimal) rangeRow.get("price_override")).isEqualByComparingTo("500.00");
+        assertThat((BigDecimal) rangeRow.get("price_max_override")).isEqualByComparingTo("900.00");
+
+        assertThat(definitionRow(fixedDefId))
+                .as("neither shared definition is rewritten by the accepted reuse")
+                .isEqualTo(fixedBefore);
+        assertThat(definitionRow(rangeDefId)).isEqualTo(rangeBefore);
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId))
+                .as("reuse mints no definition")
+                .isEqualTo(2L);
+
+        List<MasterServiceResponse> menu = publicMenuOf(secondMasterId);
+        assertThat(menu).hasSize(2);
+        MasterServiceResponse renderedFixed = menu.stream()
+                .filter(row -> row.serviceDefinition().id().equals(fixedDefId))
+                .findFirst().orElseThrow();
+        MasterServiceResponse renderedRange = menu.stream()
+                .filter(row -> row.serviceDefinition().id().equals(rangeDefId))
+                .findFirst().orElseThrow();
+
+        assertThat(renderedFixed)
+                .extracting(MasterServiceResponse::priceType, MasterServiceResponse::priceMax)
+                .containsExactly(PriceType.FIXED, null);
+        assertThat(renderedFixed.effectivePrice()).isEqualByComparingTo("600.00");
+
+        assertThat(renderedRange.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(renderedRange.priceMax()).isEqualByComparingTo("900.00");
+        assertThat(renderedRange.effectivePrice()).isEqualByComparingTo("500.00");
+    }
+
+    /**
+     * A reused item whose FULL band matches the salon's exactly stays Inherited — no override row
+     * at all — rather than freezing a redundant copy (Phase 311 D2). Regression coverage for the
+     * decision {@link #should_storeOwnBand_when_reusedItemPriceShapeMatchesSalonDefinition} cannot
+     * exercise, since both its rows diverge on the floor.
+     */
+    @Test
+    @DisplayName("a reused item whose FULL band matches the salon definition's exactly stays "
+            + "Inherited — no override columns are written at all")
+    void should_stayInherited_when_reusedItemFullyMatchesSalonDefinition() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-inherited-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Inherited Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID rangeDefId = createdFrom(seed).get(0).serviceDefinition().id();
+
+        ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        java.util.Map<String, Object> row = assignmentBandRow(secondMasterId, rangeDefId);
+        assertThat(row.get("price_type_override")).isNull();
+        assertThat(row.get("price_override")).isNull();
+        assertThat(row.get("price_max_override")).isNull();
+    }
+
+    /**
+     * Phase 312 test case 15 — an item with an internally incoherent band (RANGE, no ceiling)
+     * still 400s and the whole batch is rejected with nothing written, even in the post-retirement
+     * world: {@link BulkServiceItemRequest}'s own {@code @ServicePriceValid} guards this
+     * independently of the retired shape guard, and Phase 312's explicit
+     * {@code ServiceCatalogService#resolveBulkReuseBand} defense-in-depth call backs it up for the
+     * write itself. Mixed with a second, otherwise-valid item to prove the ALL-OR-NOTHING batch
+     * property survives the retirement.
+     */
+    @Test
+    @DisplayName("a batch with one internally-incoherent item (RANGE, no ceiling) → 400, the WHOLE "
+            + "batch is rejected — nothing written, not even the other valid item")
+    void should_return400AndWriteNothing_when_oneBulkItemHasAnIncoherentBand() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-incoherent-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Incoherent Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        UUID fixedTypeId = seededTypes.get(0).id();
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        // A hand-built raw JSON body: a valid FIXED item plus a RANGE item missing priceMax —
+        // bean validation must still reject it even though no shape-vs-definition guard exists.
+        String body = "{\"items\":["
+                + "{\"serviceTypeId\":\"" + fixedTypeId + "\",\"durationMinutes\":60,"
+                + "\"priceType\":\"FIXED\",\"price\":500.00},"
+                + "{\"serviceTypeId\":\"" + rangeTypeId + "\",\"durationMinutes\":60,"
+                + "\"priceType\":\"RANGE\",\"priceMin\":400.00}"
+                + "]}";
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services/bulk",
+                HttpMethod.POST,
+                new HttpEntity<>(body, fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("priceMax is required for RANGE — @ServicePriceValid still guards this "
+                        + "independently of the retired shape-vs-definition guard")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(activeAssignmentCountForMaster(masterId))
+                .as("all-or-nothing: the batch's other, individually-valid item must not persist")
+                .isZero();
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isZero();
+    }
+
+    /**
+     * QA audit (2026-09-12), Risk 3 of the 311+312 merge unit — originally filed as a documented
+     * DRIFT, now an AGREEMENT pin after Phase 312 D8.
+     *
+     * <p>At the time this test was written, {@code MasterServiceBand.isLegal} used {@code >=} —
+     * deliberately mirroring {@code chk_master_service_price_mode} (V165) exactly — so a
+     * degenerate RANGE band (floor == ceiling) was legal via {@code PATCH} and single-assign, but
+     * this bulk path rejected the identical band, because a bulk item is gated by the
+     * pre-existing {@code @ServicePriceValid} /
+     * {@link com.beautica.service.validation.ServicePriceValidator}, which has always required
+     * priceMax STRICTLY greater than priceMin for RANGE. That was a real, surprising three-way
+     * asymmetry, and this test existed to pin it so nobody "fixed" one side without the other
+     * noticing.
+     *
+     * <p>Phase 312 D8 resolved the asymmetry by tightening {@code MasterServiceBand.isLegal} from
+     * {@code >=} to strict {@code >}, converging it onto {@code ServicePriceValidator}'s
+     * already-strict rule ({@code MasterServiceBandCreateIT} Case 10 is now the reversed twin of
+     * this test — the POST and PATCH degenerate bodies are rejected too). The {@code 400} this
+     * test asserts is therefore now the SAME answer bulk, PATCH and single-assign all give, not a
+     * drift — this is the bulk arm of the cross-path agreement pin, paired with
+     * {@code MasterServiceBandCreateIT} Case 10. That this QA-authored test needed no assertion
+     * change at all to remain correct is itself evidence D8 is the convergent direction. If any
+     * path's degenerate boundary is ever loosened again, this test must be updated alongside
+     * Case 10, not deleted.
+     */
+    @Test
+    @DisplayName("a bulk item reusing a salon definition with a degenerate RANGE own band "
+            + "(floor == ceiling) → 400, AS PATCH and single-assign now do too (D8 agreement)")
+    void should_return400_when_bulkItemAttemptsADegenerateRangeBand_asPatchAndSingleAssignNowDoToo() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-312-degenerate-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 312 Degenerate Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+        UUID rangeTypeId = seededTypes.get(1).id();
+
+        ResponseEntity<String> seed = postSalonBulk(ownerToken, salonId, firstMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "400.00", "900.00"))));
+        assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        log.debug("Act: second master reuses the same type with a RANGE 600-600 own band — "
+                + "degenerate floor==ceiling, now rejected everywhere after Phase 312 D8");
+        ResponseEntity<String> degenerate = postSalonBulk(ownerToken, salonId, secondMasterId,
+                new BulkCreateServicesRequest(List.of(range(rangeTypeId, 60, "600.00", "600.00"))));
+
+        assertThat(degenerate.getStatusCode())
+                .as("bulk's @ServicePriceValid rejects priceMax == priceMin for RANGE, and after "
+                        + "Phase 312 D8 MasterServiceBand.isLegal agrees (strict >, not >=) — all "
+                        + "three write paths now reject this band identically")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(activeAssignmentCountForMaster(secondMasterId))
+                .as("nothing written for the rejected second master")
+                .isZero();
+    }
+
+    /** Case 7 — the 409 that survives, re-scoped to the master. */
+    @Test
+    @DisplayName("the SAME master re-submitting a service type they already offer → 409 DUPLICATE_SERVICE (D4)")
+    void should_return409_when_salonMasterResubmitsAServiceTypeTheyAlreadyOffer() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-dup-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Duplicate Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        UUID typeId = seededTypes.get(0).id();
+
+        ResponseEntity<String> first = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "350.00"))));
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID defId = createdFrom(first).get(0).serviceDefinition().id();
+
+        log.debug("Act: the SAME master re-submits the same service type — expect 409, not a reuse");
+        ResponseEntity<String> second = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 45, "400.00"))));
+
+        assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(duplicateBodyFrom(second))
+                .extracting(DuplicateServiceResponse::code, DuplicateServiceResponse::existingServiceDefId)
+                .as("the per-master conflict still carries a branchable code and a deep-linkable id")
+                .containsExactly("DUPLICATE_SERVICE", defId);
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ?", Long.class, masterId))
+                .as("no second assignment leaks from the rejected batch")
+                .isEqualTo(1L);
+    }
+
+    /** Case 8 — the retained INDEPENDENT_MASTER branch is byte-identical. */
+    @Test
+    @DisplayName("independent-master bulk create still persists owner_type='INDEPENDENT_MASTER' "
+            + "with owner_id=master.id — regression (D1's retained branch)")
+    void should_stayMasterOwned_when_independentMasterBulkCreates() throws Exception {
+        String email = "indep-302-regression-" + System.nanoTime() + "@beautica.test";
+        String token = fixtures.createIndependentMasterAndGetToken(email);
+        UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+
+        log.debug("Act: independent master bulk-creates on their own behalf");
+        ResponseEntity<String> resp = postSelfBulk(token,
+                new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "350.00"))));
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID defId = createdFrom(resp).get(0).serviceDefinition().id();
+
+        assertThat(definitionRow(defId))
+                .as("an independent master has salon_id IS NULL — nothing about their ownership moves")
+                .containsEntry("owner_type", "INDEPENDENT_MASTER")
+                .containsEntry("owner_id", masterId);
+    }
+
+    /** Case 9 — owner-as-master takes the salon branch with no special-casing (D5). */
+    @Test
+    @DisplayName("an owner-as-master row's bulk-created services appear in that owner's OWN salon catalogue (D5)")
+    void should_appearInOwnCatalogue_when_ownerAsMasterBulkCreates() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-selfmaster-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Owner-Master Salon");
+
+        // The Phase 12.4 endpoint that materialises the owner-operated master row. Its salon_id is
+        // the owner's own salon, so master.getSalon() != null and the salon branch applies.
+        ResponseEntity<String> enable = restTemplate.exchange(
+                "/api/v1/salons/" + salonId + "/master", HttpMethod.POST,
+                new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
+        assertThat(enable.getStatusCode()).isEqualTo(HttpStatus.OK);
+        UUID ownerMasterId = objectMapper.readValue(enable.getBody(),
+                new TypeReference<ApiResponse<com.beautica.master.dto.MasterDetailResponse>>() {})
+                .data().masterId();
+        fixtures.seedUsableSchedule(ownerMasterId);
+
+        log.debug("Act: owner bulk-creates for their OWN master row");
+        ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, ownerMasterId,
+                new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "350.00"))));
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID defId = createdFrom(resp).get(0).serviceDefinition().id();
+
+        assertThat(definitionRow(defId))
+                .as("an owner-operated master row is salon-bound, so its services are SALON-owned too")
+                .containsEntry("owner_type", "SALON")
+                .containsEntry("owner_id", salonId);
+        assertThat(catalogueServiceIds(salonId))
+                .as("an owner who performs services has them in their own salon's catalogue")
+                .containsExactly(defId);
+    }
+
+    /** Case 10 — in-batch duplicate rejection is unchanged. */
+    @Test
+    @DisplayName("a salon batch with two identical serviceTypeIds → 400, nothing written (unchanged)")
+    void should_return400AndWriteNothing_when_salonBatchRepeatsAServiceTypeId() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-inbatch-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 In-Batch Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        UUID typeId = seededTypes.get(0).id();
+
+        log.debug("Act: one batch toggles the same serviceTypeId twice");
+        ResponseEntity<String> resp = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(
+                        fixed(typeId, 60, "350.00"),
+                        fixed(typeId, 90, "450.00"))));
+
+        assertThat(resp.getStatusCode())
+                .as("a self-inconsistent PAYLOAD is a 400, never the state-conflict 409")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId)).isEqualTo(0L);
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId)).isEmpty();
+    }
+
+    /**
+     * Cases 11 + 12 — D7's side-effect repair, and the boundary Phase 306 moved.
+     *
+     * <p>The second half of this test PINNED the pre-Phase-306 403 for a SALON_ADMIN
+     * ({@code "canManageServiceDefinition's role gate still excludes SALON_ADMIN"}) with an
+     * explicit note that Phase 306 owns this boundary. Phase 306 D1-D3 replaced the stale
+     * {@code ownerUserId.equals(actorId)} identity check with a salon-management check, so an
+     * admin of the definition's salon now passes. INVERTED here rather than left green-by-luck.
+     */
+    @Test
+    @DisplayName("the salon owner can PATCH a definition created for their salon master (200), "
+            + "and since Phase 306 a SALON_ADMIN of the same salon can too (200)")
+    void should_allowOwnerAndAdminPatch_when_definitionWasCreatedForASalonMaster() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-patch-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Patch Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        ResponseEntity<String> created = postSalonBulk(ownerToken, salonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "350.00"))));
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID defId = createdFrom(created).get(0).serviceDefinition().id();
+
+        // findOwnerUserId resolves s.owner.id for a SALON definition, which the owner's actor id
+        // matches. Before Phase 302 it resolved the salon MASTER's user id and every role got 403.
+        log.debug("Act: owner PATCHes the definition created for their salon master");
+        ResponseEntity<String> ownerPatch = restTemplate.exchange(
+                "/api/v1/services/" + defId, HttpMethod.PATCH,
+                new HttpEntity<>(java.util.Map.of("name", "Перейменовано"),
+                        fixtures.bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(ownerPatch.getStatusCode())
+                .as("403-pre-302 becomes 200: the definition is no longer orphaned on creation (D7)")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(definitionRow(defId)).containsEntry("name", "Перейменовано");
+
+        String adminToken = fixtures.createSalonAdminAndGetToken(
+                salonId, "admin-302-patch-" + System.nanoTime() + "@beautica.test");
+
+        log.debug("Act: SALON_ADMIN of the SAME salon PATCHes the same definition — Phase 306 D1-D3 now allows it");
+        ResponseEntity<String> adminPatch = restTemplate.exchange(
+                "/api/v1/services/" + defId, HttpMethod.PATCH,
+                new HttpEntity<>(java.util.Map.of("name", "Адмін"),
+                        fixtures.bearerHeaders(adminToken)),
+                String.class);
+
+        assertThat(adminPatch.getStatusCode())
+                .as("Phase 306 D3: canManageServiceDefinition resolves a SALON_ADMIN of the owning "
+                        + "salon through hasManagementAccess, not the stale identity check")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(definitionRow(defId))
+                .as("the allowed admin PATCH must have applied")
+                .containsEntry("name", "Адмін");
+    }
+
+    // ══ Phase 302 QA — gaps the implementation batch's own tests do not reach ══════════════════
+
+    /**
+     * QA/perf gate — the D2/D4 guards must cost the SAME number of JDBC statements at batch size
+     * 20 as at batch size 2.
+     *
+     * <p><b>What it protects.</b> The phase's central performance claim is that both salon-branch
+     * guards are BATCHED: {@code assertMasterDoesNotAlreadyOffer} is one
+     * {@code findActiveAssignedServiceTypeIds} for the whole batch and
+     * {@code findReusableSalonDefinitions} is one {@code findActiveDuplicateTypeIds} for the whole
+     * batch. Nothing else pinned that. A refactor back to a per-item {@code existsActive} /
+     * {@code findActiveDuplicateId} loop — the shape this endpoint carried before the batching
+     * work — keeps every behavioural test in this class green while issuing N extra serialized
+     * SELECTs, each forcing a Hibernate AUTO flush that also destroys JDBC insert batching. The
+     * bulk endpoint accepts up to 100 items, so that is a 100× round-trip regression that no
+     * assertion in this repository would notice.
+     *
+     * <p><b>Why equality and not a bound.</b> {@code hibernate.jdbc.batch_size=50} +
+     * {@code order_inserts=true} (application.yml) mean 2 and 20 definitions flush through the
+     * SAME number of prepared statements — one per entity type per flush. So every non-constant
+     * term is zero and the two counts must be IDENTICAL. The absolute value is deliberately NOT
+     * pinned: it is derived from the run and only its INVARIANCE is asserted, so an unrelated new
+     * query on the path is a matter for {@code ServicesIntegrationTest}'s absolute gate, not a
+     * false failure here.
+     *
+     * <p>Both batches are fresh types for a fresh master in the same salon, so both take the
+     * CREATE arm — comparing create-to-create keeps the insert count the only variable, and it is
+     * exactly the term batching flattens.
+     *
+     * <p>Driven through the service bean, not HTTP: an HTTP request folds in the JWT filter's
+     * user lookup and the authz guard's ownership query, neither of which is part of the claim.
+     */
+    @Test
+    @DisplayName("salon bulk-create issues the SAME statement count at batch size 20 as at 2 — "
+            + "the D2/D4 guards are batched, not per-item")
+    void should_keepStatementCountConstant_when_salonBulkCreateBatchSizeGrows() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-stmtgate-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Statement Gate Salon");
+
+        List<ServiceTestFixtures.SeededServiceType> types = fixtures.activeSelectableServiceTypes(22);
+        assertThat(types)
+                .as("the statement gate needs 22 distinct selectable service types to build a "
+                        + "2-item and a disjoint 20-item batch")
+                .hasSize(22);
+
+        UUID smallBatchMaster = fixtures.createSalonMaster(salonId);
+        UUID largeBatchMaster = fixtures.createSalonMaster(salonId);
+
+        var smallBatch = new BulkCreateServicesRequest(types.subList(0, 2).stream()
+                .map(t -> fixed(t.id(), 60, "350.00")).toList());
+        // Disjoint types, so this master also takes the CREATE arm — never the reuse arm — and the
+        // only thing that differs between the two measurements is the number of rows inserted.
+        var largeBatch = new BulkCreateServicesRequest(types.subList(2, 22).stream()
+                .map(t -> fixed(t.id(), 60, "350.00")).toList());
+
+        UUID actorId = authenticateAsOwnerOf(salonId);
+
+        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+        statistics.setStatisticsEnabled(true);
+
+        statistics.clear();
+        log.debug("Act: salon bulk-create of a 2-item batch, counting prepared statements");
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, smallBatchMaster, smallBatch);
+        long twoItemStatements = statistics.getPrepareStatementCount();
+
+        statistics.clear();
+        log.debug("Act: salon bulk-create of a 20-item batch for a second master in the same salon");
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, largeBatchMaster, largeBatch);
+        long twentyItemStatements = statistics.getPrepareStatementCount();
+
+        log.debug("Observed prepareStatementCount: n=2 -> {}, n=20 -> {}",
+                twoItemStatements, twentyItemStatements);
+
+        assertThat(twentyItemStatements)
+                .as("O(1) in batch size. A rise of ~N means a guard went per-item: 20 items cost "
+                        + "%s statements against %s for 2. Both guards and the reuse lookup must "
+                        + "stay one query each for the WHOLE batch, and the inserts must stay "
+                        + "batched. Re-derive, never bump.",
+                        twentyItemStatements, twoItemStatements)
+                .isEqualTo(twoItemStatements);
+
+        // A batch that wrote nothing would trivially satisfy the gate above.
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(largeBatchMaster))
+                .as("the measured 20-item batch actually persisted 20 assignments")
+                .hasSize(20);
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId))
+                .as("and 22 SALON-owned definitions exist across both batches")
+                .isEqualTo(22L);
+    }
+
+    /**
+     * P1 (2026-09-13 audit) — the REACTIVATION arm's statement count must also be flat in batch
+     * size.
+     *
+     * <p>The sibling gate above measures the CREATE arm. The reuse/reactivation arm was a separate
+     * hazard it could not see: {@code createSingleFromBulkItem} called
+     * {@code masterServiceRepository.findById(reactivateAssignmentId)} PER ITEM — up to 100
+     * serialized SELECTs, every one of them inside the SALON-keyed advisory lock, for row ids the
+     * caller had already projected out of {@code findSalonBulkSetupCandidates}. Because the lock is
+     * salon-wide (audit HIGH-2), that cost multiplied across every concurrent master setup in the
+     * salon, which is the P4 half of the same finding.
+     *
+     * <p>Shape: seed a master with K services, unassign ALL of them, then bulk re-add the same K.
+     * Every item then takes the reactivation sub-branch. K = 2 and K = 12 must cost the SAME number
+     * of statements; a per-item {@code findById} shows up as a difference of 10.
+     */
+    @Test
+    @DisplayName("salon bulk-create issues the SAME statement count re-adding 12 previously "
+            + "unassigned services as 2 — the reactivation lookup is batched, not per-item (P1)")
+    void should_keepStatementCountConstant_when_bulkReactivationBatchSizeGrows() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-p1-reactivate-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "P1 Reactivation Statement Gate Salon");
+        UUID actorId = authenticateAsOwnerOf(salonId);
+
+        List<ServiceTestFixtures.SeededServiceType> types = fixtures.activeSelectableServiceTypes(14);
+        assertThat(types).hasSize(14);
+
+        long smallCount = reactivationStatementCount(
+                ownerToken, actorId, salonId, types.subList(0, 2));
+        long largeCount = reactivationStatementCount(
+                ownerToken, actorId, salonId, types.subList(2, 14));
+
+        log.debug("Observed reactivation prepareStatementCount: n=2 -> {}, n=12 -> {}",
+                smallCount, largeCount);
+
+        assertThat(largeCount)
+                .as("O(1) in batch size on the REACTIVATION arm too: 12 items cost %s statements "
+                        + "against %s for 2. A rise of ~N means the per-item findById is back "
+                        + "inside the salon-keyed advisory lock.", largeCount, smallCount)
+                .isEqualTo(smallCount);
+    }
+
+    /**
+     * Seeds one master with a service per type, unassigns every one of them, then MEASURES the bulk
+     * re-add. Returns the prepared-statement count of the measured call alone.
+     */
+    private long reactivationStatementCount(String ownerToken, UUID actorId, UUID salonId,
+                                            List<ServiceTestFixtures.SeededServiceType> types)
+            throws Exception {
+        UUID masterId = fixtures.createSalonMaster(salonId);
+        var batch = new BulkCreateServicesRequest(
+                types.stream().map(t -> fixed(t.id(), 60, "350.00")).toList());
+
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, masterId, batch);
+
+        // Unassign every one of them, so the re-add below takes the reactivation sub-branch for
+        // EVERY item rather than inserting fresh assignments.
+        for (UUID definitionId : fixtures.activeDefinitionIdsAssignedToMaster(masterId)) {
+            serviceCatalogService.unassignServiceFromMaster(actorId, salonId, masterId, definitionId);
+        }
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("arrange — every assignment must be inactive before the measured re-add, or "
+                        + "the measured call takes the CREATE arm the sibling gate already covers")
+                .isEmpty();
+
+        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+        statistics.setStatisticsEnabled(true);
+        statistics.clear();
+
+        serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, masterId, batch);
+        long measured = statistics.getPrepareStatementCount();
+
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("a batch that wrote nothing would trivially satisfy the gate")
+                .hasSize(types.size());
+        return measured;
+    }
+
+    /**
+     * QA/security gate — a master ROTATED between two of one owner's salons must be able to
+     * bulk-create, in the DESTINATION salon, a service type they already perform in the SOURCE
+     * salon.
+     *
+     * <p><b>The defect.</b> {@code MasterService.rotateMasterToSalon} moves {@code masters.salon_id}
+     * and never touches {@code master_services}, so a rotated master keeps ACTIVE assignments to the
+     * SOURCE salon's definitions. Phase 302's new per-master conflict finder,
+     * {@code MasterServiceRepository.findActiveAssignedServiceTypeIds}, is scoped by master id
+     * ALONE — it cannot see which salon owns the definition it matched. So the destination salon's
+     * first bulk-create for that type is rejected {@code 409 DUPLICATE_SERVICE} carrying
+     * {@code existingServiceDefId} = a definition belonging to a DIFFERENT salon: both a wrong
+     * answer (the master offers nothing in this salon yet) and a cross-salon id disclosure to an
+     * actor who is only authorised for the destination.
+     *
+     * <p><b>The contract pinned here.</b> The conflict is per-master <em>within this salon</em>:
+     * the destination bulk-create returns {@code 201}, mints the destination salon's own
+     * {@code (SALON, destinationSalonId, typeId)} definition, and no source-salon id is returned.
+     *
+     * <p>Same owner for both salons because rotation is legal only inside one owner's portfolio
+     * ({@code AuthorizationService.salonsShareOwner}) — an actor who could not reach the source
+     * salon at all cannot even reach this state.
+     */
+    @Test
+    @DisplayName("a rotated master bulk-creating in the DESTINATION salon gets 201 with that "
+            + "salon's own definition — never a 409 leaking the SOURCE salon's definition id")
+    void should_return201AndNotLeakSourceSalonDefId_when_rotatedMasterBulkCreatesInDestinationSalon()
+            throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-rotate-" + System.nanoTime() + "@beautica.test");
+        UUID sourceSalonId = fixtures.createSalon(ownerToken, "Phase 302 Rotation Source");
+        UUID destinationSalonId = fixtures.createSalon(ownerToken, "Phase 302 Rotation Destination");
+        UUID masterId = fixtures.createSalonMaster(sourceSalonId);
+
+        UUID typeId = seededTypes.get(0).id();
+
+        ResponseEntity<String> inSource = postSalonBulk(ownerToken, sourceSalonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "350.00"))));
+        assertThat(inSource.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID sourceDefId = createdFrom(inSource).get(0).serviceDefinition().id();
+
+        log.debug("Act: rotate the master from the source salon to the sibling destination salon");
+        ResponseEntity<String> rotation = restTemplate.exchange(
+                "/api/v1/masters/" + masterId + "/salon", HttpMethod.PATCH,
+                new HttpEntity<>(java.util.Map.of("destinationSalonId", destinationSalonId),
+                        fixtures.bearerHeaders(ownerToken)),
+                String.class);
+        assertThat(rotation.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // The precondition the defect rests on — stated as an assertion so the test cannot quietly
+        // stop exercising the hazard if rotation ever starts cascading to master_services.
+        assertThat(fixtures.activeDefinitionIdsAssignedToMaster(masterId))
+                .as("rotation does not touch master_services, so the stale SOURCE-salon assignment "
+                        + "survives — this is what the per-master conflict finder can see")
+                .containsExactly(sourceDefId);
+
+        log.debug("Act: the owner bulk-creates the SAME service type for the master in the "
+                + "DESTINATION salon, where the master offers nothing yet");
+        ResponseEntity<String> inDestination = postSalonBulk(ownerToken, destinationSalonId, masterId,
+                new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "350.00"))));
+
+        assertThat(inDestination.getStatusCode())
+                .as("the master offers nothing in the DESTINATION salon; a stale assignment to "
+                        + "ANOTHER salon's definition must not read as a per-master conflict here. "
+                        + "Body: %s", inDestination.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+
+        UUID destinationDefId = createdFrom(inDestination).get(0).serviceDefinition().id();
+        assertThat(destinationDefId)
+                .as("the destination salon gets its OWN definition — the source salon's row is "
+                        + "neither reused nor disclosed")
+                .isNotEqualTo(sourceDefId);
+        assertThat(definitionRow(destinationDefId))
+                .containsEntry("owner_type", "SALON")
+                .containsEntry("owner_id", destinationSalonId);
+        assertThat(countActiveDefinitionsForOwner("SALON", destinationSalonId))
+                .as("exactly one definition in the destination salon")
+                .isEqualTo(1L);
+        assertThat(countActiveDefinitionsForOwner("SALON", sourceSalonId))
+                .as("and the source salon's catalogue is untouched by the destination write")
+                .isEqualTo(1L);
+    }
+
+    /**
+     * QA/security gate — TRUE concurrency for the reuse path's read-then-write window.
+     *
+     * <p><b>The defect.</b> {@code acquireBulkSetupLockWithTimeout} keys the advisory lock on the
+     * MASTER id. Under Phase 302 the contended resource is no longer per-master: it is the SALON's
+     * one active definition per service type, enforced by V121's
+     * {@code ux_service_def_owner_service_type_active}. Two DIFFERENT masters in one salon
+     * therefore take two DIFFERENT locks, both run {@code findReusableSalonDefinitions} before
+     * either commits, both miss, and both INSERT {@code (SALON, salonId, typeId)}. The loser trips
+     * the index at flush, where {@code flushBulkBatch} can only translate a constraint name — so
+     * the client gets a {@code 409 DUPLICATE_SERVICE} whose {@code serviceName} and
+     * {@code existingServiceDefId} are BOTH null: an error the setup screen cannot act on, for a
+     * request that should simply have reused.
+     *
+     * <p><b>The contract pinned here.</b> Concurrency is invisible: both callers get their
+     * assignment, the salon holds ONE definition, and both assignments point at it. This is the
+     * ordinary two-masters-same-type outcome the sequential test already pins — the point is that
+     * interleaving must not change it.
+     *
+     * <p>Deliberately the SAME service type and the same salon: disjoint types would take
+     * disjoint V121 keys and could never race. Threads are released together by a
+     * {@link CyclicBarrier} (never {@code Thread.sleep}) and call the Spring proxy so each gets
+     * its own {@code @Transactional} and its own transaction-scoped advisory lock.
+     */
+    @Test
+    @DisplayName("two masters in ONE salon bulk-creating the same NEW type concurrently both "
+            + "succeed and share one definition — never a null-bodied V121 409")
+    void should_reuseNotConflict_when_twoMastersInOneSalonBulkCreateSameTypeConcurrently()
+            throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-302-race-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "Phase 302 Race Salon");
+        UUID firstMasterId = fixtures.createSalonMaster(salonId);
+        UUID secondMasterId = fixtures.createSalonMaster(salonId);
+
+        UUID typeId = seededTypes.get(0).id();
+        // Different prices so the surviving definition's provenance stays readable, and so a
+        // last-writer-wins mutation of the shared row would also be visible.
+        var firstBatch = new BulkCreateServicesRequest(List.of(fixed(typeId, 60, "350.00")));
+        var secondBatch = new BulkCreateServicesRequest(List.of(fixed(typeId, 90, "420.00")));
+
+        CyclicBarrier startLine = new CyclicBarrier(2);
+        AtomicInteger successCount = new AtomicInteger();
+        AtomicInteger conflictCount = new AtomicInteger();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        Throwable firstError;
+        Throwable secondError;
+        try {
+            log.debug("Act: two masters of ONE salon call bulkCreateSalonMasterServices for the "
+                    + "SAME service type, released together by a barrier");
+            Future<Throwable> first = pool.submit(() -> attemptSalonBulk(
+                    startLine, salonId, firstMasterId, firstBatch, successCount, conflictCount));
+            Future<Throwable> second = pool.submit(() -> attemptSalonBulk(
+                    startLine, salonId, secondMasterId, secondBatch, successCount, conflictCount));
+
+            firstError = first.get(30, TimeUnit.SECONDS);
+            secondError = second.get(30, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(List.of(java.util.Optional.ofNullable(firstError),
+                        java.util.Optional.ofNullable(secondError)))
+                .filteredOn(java.util.Optional::isPresent)
+                .extracting(java.util.Optional::get)
+                .as("neither concurrent caller may fail: the salon already offering the type is "
+                        + "the REUSE path (D2/D4), and interleaving must not turn it into a "
+                        + "conflict. A DuplicateServiceException with a null existingServiceDefId "
+                        + "here is the V121 index reporting a constraint the reuse lookup should "
+                        + "have prevented. Got %s / %s", firstError, secondError)
+                .isEmpty();
+
+        assertThat(successCount.get())
+                .as("both masters take the service; only one of them creates the definition")
+                .isEqualTo(2);
+        assertThat(conflictCount.get()).isZero();
+
+        assertThat(countActiveDefinitionsForOwner("SALON", salonId))
+                .as("ONE definition survives — the whole point of D2 under contention")
+                .isEqualTo(1L);
+
+        List<UUID> firstMenu = fixtures.activeDefinitionIdsAssignedToMaster(firstMasterId);
+        List<UUID> secondMenu = fixtures.activeDefinitionIdsAssignedToMaster(secondMasterId);
+        assertThat(firstMenu).hasSize(1);
+        assertThat(secondMenu)
+                .as("both masters perform the ONE shared definition")
+                .isEqualTo(firstMenu);
+    }
+
+    // ── B7 (2026-09-13 cycle-2 audit): the bulk path's service-layer ACTOR gate, negatively ─────
+
+    /**
+     * {@code bulkCreateSalonMasterServices}'s {@code authz.enforceCanManageSalon} line (added by
+     * cycle 1's S1 fix) had only happy-path coverage: every existing direct call authenticates as
+     * the salon's REAL owner, so deleting the guard left the whole suite green. Its unassign
+     * sibling got both a foreign-actor case and a non-vacuity twin
+     * ({@code MasterServiceUnassignIT#should_throwForbidden_when_foreignOwnerCallsUnassignServiceDirectly});
+     * this is the missing mirror.
+     *
+     * <p>Driving the BEAN directly is the whole point: it is the exact call shape a future non-HTTP
+     * caller would use, and the one the controller's {@code @PreAuthorize} cannot protect.
+     */
+    @Test
+    @DisplayName("B7: a DIRECT service-layer bulk-create by a FOREIGN salon's owner is refused "
+            + "with ForbiddenException and writes nothing")
+    void should_throwForbidden_when_foreignOwnerCallsBulkCreateDirectly() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-b7-victim-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "B7 Victim Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        String foreignOwnerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-b7-foreign-" + System.nanoTime() + "@beautica.test");
+        UUID foreignSalonId = fixtures.createSalon(foreignOwnerToken, "B7 Foreign Salon");
+
+        long rowsBefore = masterServiceRowCount();
+        UUID foreignOwnerId = authenticateAsOwnerOf(foreignSalonId);
+        var batch = new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "500.00")));
+
+        Throwable thrown = catchThrowable(() -> serviceCatalogService
+                .bulkCreateSalonMasterServices(foreignOwnerId, salonId, masterId, batch));
+
+        assertThat(thrown)
+                .as("the foreign owner genuinely owns A salon — what must refuse them is that it "
+                        + "is not THIS one, proven at the service layer")
+                .isInstanceOf(com.beautica.common.exception.ForbiddenException.class);
+        assertThat(masterServiceRowCount())
+                .as("nothing may be written before the guard refuses")
+                .isEqualTo(rowsBefore);
+    }
+
+    /**
+     * Non-vacuity for the test above: the SAME direct, non-HTTP call shape SUCCEEDS for the salon's
+     * REAL owner. Without it, the ForbiddenException could equally be explained by the direct call
+     * shape being broken for everyone.
+     */
+    @Test
+    @DisplayName("B7 non-vacuity: the same DIRECT bulk-create SUCCEEDS for the salon's own owner — "
+            + "the guard rejects the actor, not the call shape")
+    void should_succeed_when_realOwnerCallsBulkCreateDirectly() throws Exception {
+        String ownerToken = fixtures.createSalonOwnerAndGetToken(
+                "owner-b7-ok-" + System.nanoTime() + "@beautica.test");
+        UUID salonId = fixtures.createSalon(ownerToken, "B7 OK Salon");
+        UUID masterId = fixtures.createSalonMaster(salonId);
+
+        UUID ownerId = authenticateAsOwnerOf(salonId);
+        var batch = new BulkCreateServicesRequest(List.of(fixed(seededTypes.get(0).id(), 60, "500.00")));
+
+        List<MasterServiceResponse> created =
+                serviceCatalogService.bulkCreateSalonMasterServices(ownerId, salonId, masterId, batch);
+
+        assertThat(created).hasSize(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM master_services WHERE master_id = ? AND is_active = true",
+                Integer.class, masterId))
+                .as("the authorized direct call must actually persist the batch")
+                .isEqualTo(1);
+    }
+
+    private long masterServiceRowCount() {
+        Long count = jdbcTemplate.queryForObject("SELECT COUNT(*) FROM master_services", Long.class);
+        return count == null ? 0L : count;
+    }
+
+    /**
+     * Runs one salon on-behalf bulk attempt after meeting the other thread at the barrier.
+     * Mirrors {@link #attemptBulk}: returns the thrown exception (or {@code null}) rather than
+     * letting it escape, so the test thread can assert on BOTH outcomes deterministically.
+     */
+    private Throwable attemptSalonBulk(CyclicBarrier startLine, UUID salonId, UUID masterId,
+                                       BulkCreateServicesRequest request,
+                                       AtomicInteger successCount, AtomicInteger conflictCount) {
+        try {
+            startLine.await(10, TimeUnit.SECONDS); // both threads cross together — no sleep
+            // Each racing thread carries its OWN security context (SecurityContextHolder is
+            // thread-local), so the service-layer canManageSalon guard added by the 2026-09-13
+            // audit (S1) resolves on both — the race under test is the advisory lock, not authz.
+            UUID actorId = authenticateAsOwnerOf(salonId);
+            serviceCatalogService.bulkCreateSalonMasterServices(actorId, salonId, masterId, request);
             successCount.incrementAndGet();
             return null;
         } catch (BusinessException e) {

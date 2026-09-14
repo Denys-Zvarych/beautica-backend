@@ -38,7 +38,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -354,19 +356,117 @@ public class MasterScheduleService {
      * resolves every date in-memory. Returns each resolved day alongside the entity that produced it, so a
      * caller that wants the display-only window can decorate without re-querying, and a caller that does
      * not simply drops the entity — the difference is a {@code map}, never a second fold.
+     *
+     * <p><b>Phase 315 (D2).</b> The single-master case of {@link #loadRowsForMasters} — the loading half
+     * of this method now runs through the SAME batched loader {@link #resolveEffectiveRangeBatch} uses,
+     * called with a singleton {@code masterIds}. The {@code IN (:masterIds)} predicate with one element
+     * is planner-equivalent to the old {@code = :masterId} form, so this method's four existing
+     * consumers ({@link #resolveEffectiveRange}, {@link #resolveEffectiveRangeForDisplay} and their
+     * downstream callers) see no change in result or verdict — only the SQL text differs. The FOLDING
+     * half below ({@link #foldDates}) is untouched — one fold, one precedence rule, shared by both the
+     * single-master and batched paths.
      */
     private List<ResolvedDay> foldRange(UUID masterId, LocalDate from, LocalDate to) {
         // Read path: past dates are included (the calendar paints greyed history — Phase 15.5 Step 3),
         // so use the read-window guard rather than assertWithinBounds (which forbids a past start).
         dateMath.assertExpandable(from, to);
         List<LocalDate> dates = dateMath.expandInclusive(from, to);
+        BatchLoadedRows rows = loadRowsForMasters(List.of(masterId), from, to);
+        return foldDates(dates,
+                rows.overridesByMaster().getOrDefault(masterId, Map.of()),
+                rows.windowsByMaster().getOrDefault(masterId, List.of()));
+    }
 
-        Map<LocalDate, ScheduleException> overridesByDate = scheduleExceptionRepository
-                .findByMasterIdAndDateBetweenWithIntervals(masterId, from, to).stream()
-                .collect(Collectors.toMap(ScheduleException::getDate, e -> e, (a, b) -> a));
-        List<WeeklySchedule> windows =
-                weeklyScheduleRepository.findOverlappingRangeWithIntervals(masterId, from, to);
+    /**
+     * Batched counterpart of {@link #resolveEffectiveRange} — Phase 315 (D2), written to kill the
+     * salon catalogue's per-master N+1 ({@code SlotCalculationService#filterBookableAssignmentsBatch}
+     * is the one production caller). Resolves EVERY master in {@code masterIds} over the SAME
+     * {@code [from, to]} window in exactly two statements total (D1's {@code IN (:masterIds)} idiom,
+     * mirroring {@code MasterServiceRepository#findDistinctOfferedCategoriesByMasterIds}), then folds
+     * each master's rows in-memory via the exact same {@link #foldDates} core {@link #foldRange} uses —
+     * no second fold, no new precedence rule.
+     *
+     * <p><b>D3 — every requested master gets an entry; absent ≠ empty.</b> The loop below iterates
+     * {@code masterIds} (the caller's requested set), not the KEYS of whatever the batched queries
+     * happened to return — {@code Collectors.groupingBy} would silently drop a master with zero
+     * override/template rows. A master with NO schedule at all therefore still receives a full
+     * {@code dates.size()}-entry list of {@link EffectiveDaySource#NO_SCHEDULE} days, exactly as
+     * {@link #foldRange} would produce for that master called alone — never an empty list, which
+     * {@code SlotCalculationService#hasFreeFutureSlot} cannot distinguish from an all-{@code
+     * NO_SCHEDULE} list (a coincidence that would hide this bug behind the catalogue; see
+     * {@code MasterScheduleServiceIT}, which pins this directly on the returned map).
+     *
+     * <p>Returns {@link Map#of()} for an empty {@code masterIds} without issuing any statement.
+     *
+     * <p><b>No {@code IN}-list chunking (D11).</b> Postgres' bind-parameter ceiling is 65535; the
+     * largest conceivable salon is two orders of magnitude below it. For {@code masterIds.size()}
+     * masters over a 180-day window, the {@code LEFT JOIN FETCH intervals} cartesian on each batched
+     * query is bounded by {@code Σ(schedules × intervals)} across those masters — small, and the same
+     * per-master bound {@link #foldRange} has always carried; a 500-master salon would need chunking
+     * and is out of this phase's scope.
+     */
+    @Transactional(readOnly = true)
+    public Map<UUID, List<EffectiveDayResponse>> resolveEffectiveRangeBatch(
+            Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+        if (masterIds.isEmpty()) {
+            return Map.of();
+        }
+        dateMath.assertExpandable(from, to);
+        List<LocalDate> dates = dateMath.expandInclusive(from, to);
+        BatchLoadedRows rows = loadRowsForMasters(masterIds, from, to);
 
+        Map<UUID, List<EffectiveDayResponse>> result = new LinkedHashMap<>();
+        for (UUID masterId : masterIds) {
+            List<ResolvedDay> resolved = foldDates(dates,
+                    rows.overridesByMaster().getOrDefault(masterId, Map.of()),
+                    rows.windowsByMaster().getOrDefault(masterId, List.of()));
+            result.put(masterId, resolved.stream().map(ResolvedDay::day).toList());
+        }
+        return result;
+    }
+
+    /**
+     * The loading half shared by {@link #foldRange} (singleton {@code masterIds}) and
+     * {@link #resolveEffectiveRangeBatch} (the real batch) — Phase 315 (D2). Bulk-loads every
+     * requested master's overrides and overlapping templates over {@code [from, to]} in exactly TWO
+     * statements, REGARDLESS of {@code masterIds.size()}, and groups each result set by
+     * {@code master.id} so the per-master fold below can index in memory.
+     *
+     * <p>A master absent from {@code overridesByMaster} or {@code windowsByMaster} is a real,
+     * expected shape (no override / no schedule row in the window), not an error — every reader below
+     * uses {@code getOrDefault(masterId, <empty>)}, never a bare {@code get} (D3's #1 bug: absent ≠
+     * empty). {@code LinkedHashMap} downstream collectors keep each master's rows in the query's own
+     * {@code ORDER BY} order, which {@link #firstCovering} and the override {@code toMap} both depend
+     * on (D4).
+     */
+    private BatchLoadedRows loadRowsForMasters(Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+        Map<UUID, Map<LocalDate, ScheduleException>> overridesByMaster = scheduleExceptionRepository
+                .findByMasterIdsAndDateBetweenWithIntervals(masterIds, from, to).stream()
+                .collect(Collectors.groupingBy(
+                        se -> se.getMaster().getId(),
+                        LinkedHashMap::new,
+                        Collectors.toMap(ScheduleException::getDate, e -> e, (a, b) -> a, LinkedHashMap::new)));
+        Map<UUID, List<WeeklySchedule>> windowsByMaster = weeklyScheduleRepository
+                .findOverlappingRangeWithIntervalsByMasterIds(masterIds, from, to).stream()
+                .collect(Collectors.groupingBy(
+                        ws -> ws.getMaster().getId(), LinkedHashMap::new, Collectors.toList()));
+        return new BatchLoadedRows(overridesByMaster, windowsByMaster);
+    }
+
+    /** Two batched, master-grouped result sets — see {@link #loadRowsForMasters}. */
+    private record BatchLoadedRows(
+            Map<UUID, Map<LocalDate, ScheduleException>> overridesByMaster,
+            Map<UUID, List<WeeklySchedule>> windowsByMaster) {
+    }
+
+    /**
+     * The per-master fold, extracted verbatim from the pre-315 {@code foldRange} body — Phase 315
+     * (D1/D2). Identical precedence (override beats template beats gap) and identical helpers
+     * ({@link #resolveFromOverride}, {@link #resolveFromTemplate}, {@link #firstCovering}), whether
+     * called once (the single-master case) or once per master in a batch — one fold, never a second.
+     */
+    private List<ResolvedDay> foldDates(List<LocalDate> dates,
+            Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
         List<ResolvedDay> result = new ArrayList<>(dates.size());
         for (LocalDate date : dates) {
             ScheduleException override = overridesByDate.get(date);

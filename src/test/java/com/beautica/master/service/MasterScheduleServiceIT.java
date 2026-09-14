@@ -35,6 +35,7 @@ import java.time.LocalTime;
 import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -1639,6 +1640,84 @@ class MasterScheduleServiceIT extends AbstractIntegrationTest {
                     .as("the cache must be evicted after commit — must reflect the new CUSTOM_HOURS "
                             + "override, not the stale pre-write false result")
                     .isTrue();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // resolveEffectiveRangeBatch — Phase 315 D2/D3: every requested master gets an entry
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("resolveEffectiveRangeBatch — every requested master gets an entry (Phase 315 D3)")
+    class ResolveEffectiveRangeBatch {
+
+        @Test
+        @DisplayName("D3.2 — a schedule-less master's entry is the FULL NO_SCHEDULE list, "
+                + "never an empty or missing one; a scheduled sibling in the SAME call is unaffected")
+        void should_returnFullNoScheduleList_when_masterHasNoScheduleAtAll() {
+            SeededMaster scheduled = seedIndependentMaster();
+            SeededMaster scheduleLess = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(scheduled.actorId(), scheduled.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(FUTURE_FROM.getDayOfWeek().getValue(), iv(9, 17))));
+            LocalDate to = FUTURE_FROM.plusDays(9);
+
+            Map<UUID, List<EffectiveDayResponse>> result = scheduleService.resolveEffectiveRangeBatch(
+                    List.of(scheduled.masterId(), scheduleLess.masterId()), FUTURE_FROM, to);
+
+            assertThat(result)
+                    .as("EVERY requested master must be a key — absent != empty is the phase's #1 bug")
+                    .containsOnlyKeys(scheduled.masterId(), scheduleLess.masterId());
+
+            List<EffectiveDayResponse> scheduleLessDays = result.get(scheduleLess.masterId());
+            assertThat(scheduleLessDays)
+                    .as("a schedule-less master's entry has one row per requested date, never an "
+                            + "empty list (an empty list here is indistinguishable from an "
+                            + "all-NO_SCHEDULE list to the catalogue gate — see this class's javadoc "
+                            + "and the mutation check pinned on THIS assertion, not the catalogue)")
+                    .hasSize((int) (java.time.temporal.ChronoUnit.DAYS.between(FUTURE_FROM, to) + 1));
+            assertThat(scheduleLessDays)
+                    .as("every date must resolve NO_SCHEDULE with no intervals")
+                    .allSatisfy(day -> {
+                        assertThat(day.source()).isEqualTo(EffectiveDaySource.NO_SCHEDULE);
+                        assertThat(day.intervals()).isEmpty();
+                        assertThat(day.isWorkingDay()).isFalse();
+                    });
+
+            List<EffectiveDayResponse> scheduledDays = result.get(scheduled.masterId());
+            assertThat(byDate(scheduledDays, nextDateForDow(FUTURE_FROM, FUTURE_FROM.getDayOfWeek())).isWorkingDay())
+                    .as("the scheduled sibling in the SAME batch call must resolve its own template, "
+                            + "unaffected by the schedule-less master's shape")
+                    .isTrue();
+        }
+
+        @Test
+        @DisplayName("agrees with the single-master resolveEffectiveRange for every master in the batch")
+        void should_agreeWithSingleMasterResolver_forEveryMasterInBatch() {
+            SeededMaster a = seedIndependentMaster();
+            SeededMaster b = seedIndependentMaster();
+            scheduleService.upsertWeeklySchedule(a.actorId(), a.masterId(), null,
+                    weekly(FUTURE_FROM, null, day(FUTURE_FROM.getDayOfWeek().getValue(), iv(9, 17))));
+            scheduleService.upsertOverride(b.actorId(), b.masterId(),
+                    new ScheduleOverrideRequest(FUTURE_FROM.plusDays(1), ScheduleExceptionKind.DAY_OFF, null));
+            LocalDate to = FUTURE_FROM.plusDays(13);
+
+            Map<UUID, List<EffectiveDayResponse>> batched = scheduleService.resolveEffectiveRangeBatch(
+                    List.of(a.masterId(), b.masterId()), FUTURE_FROM, to);
+            List<EffectiveDayResponse> aSingle = scheduleService.resolveEffectiveRange(a.masterId(), FUTURE_FROM, to);
+            List<EffectiveDayResponse> bSingle = scheduleService.resolveEffectiveRange(b.masterId(), FUTURE_FROM, to);
+
+            assertThat(batched.get(a.masterId())).containsExactlyElementsOf(aSingle);
+            assertThat(batched.get(b.masterId())).containsExactlyElementsOf(bSingle);
+        }
+
+        @Test
+        @DisplayName("empty masterIds returns an empty map without issuing any statement")
+        void should_returnEmptyMap_when_masterIdsIsEmpty() {
+            Measured<Map<UUID, List<EffectiveDayResponse>>> measured =
+                    measure(() -> scheduleService.resolveEffectiveRangeBatch(List.of(), FUTURE_FROM, FUTURE_FROM.plusDays(5)));
+
+            assertThat(measured.result()).isEmpty();
+            assertThat(measured.queries()).isZero();
         }
     }
 

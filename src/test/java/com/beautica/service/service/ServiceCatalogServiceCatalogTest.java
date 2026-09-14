@@ -1,12 +1,19 @@
 package com.beautica.service.service;
 
+import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
+import com.beautica.service.dto.SalonServiceCatalogResponse;
+import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
 import com.beautica.service.entity.CatalogCategory;
+import com.beautica.service.entity.MasterServiceAssignment;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.PriceType;
+import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
@@ -20,7 +27,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cache.CacheManager;
 
+import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import com.beautica.common.exception.BusinessException;
@@ -31,6 +40,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -43,6 +53,29 @@ import static org.mockito.Mockito.when;
 @DisplayName("ServiceCatalogService — catalog methods unit")
 class ServiceCatalogServiceCatalogTest {
 
+    // ── Constructor-wiring collaborators (2026-09-13 audit Q19, corrected in cycle 2 by B11) ────
+    //
+    // THIS class does NOT use @InjectMocks: setUp() below calls `new ServiceCatalogService(...)`
+    // explicitly, listing all seventeen collaborators positionally. The rationale originally pasted
+    // here — "a missing @Mock makes Mockito inject NULL" — is a property of @InjectMocks and is
+    // simply FALSE for this file: deleting a @Mock field here is a COMPILE ERROR at the constructor
+    // call, never a silent null, so the sibling files' hazard does not exist. (It is accurate where
+    // it still stands: ServiceCatalogServiceTest and ServiceCatalogServiceBulkCreateTest do use
+    // @InjectMocks, and ServiceCatalogServiceCacheTest is a @SpringBootTest whose context fails to
+    // start on a missing @MockBean.)
+    //
+    // What keeps the unused mocks here is therefore a different, weaker reason: the constructor
+    // demands a value for every parameter, and an inert mock (which returns a default) is strictly
+    // safer than a `null` that NPEs the moment a future test in this file reaches the collaborator.
+    //
+    // Q19 sweep, completed (B11) — the mocks referenced ONLY by the constructor call in this file,
+    // i.e. never stubbed and never verified, are: serviceRepository, salonRepository,
+    // masterRepository, cacheManager, salonCatalogCacheEvictor and bookingRepository. They are kept
+    // deliberately, for the reason above; the list is recorded so the next reader does not have to
+    // re-derive it, and so that a future test which DOES stub one is visibly narrowing this set.
+    // The only genuinely removable case the sweep found remains MasterCachePrefixEvictor: it was a
+    // never-read field on the PRODUCTION class too, so the fix was deleting the constructor
+    // parameter, not the mock.
     @Mock private ServiceRepository serviceRepository;
     @Mock private MasterServiceRepository masterServiceRepository;
     @Mock private SalonRepository salonRepository;
@@ -58,6 +91,12 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private com.beautica.common.security.AuthorizationService authz;
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private com.beautica.booking.repository.BookingRepository bookingRepository;
+
+    // Fixed, not mocked — this test class never exercises the D4 future-booking guard, so a real
+    // pinned Clock is simpler than stubbing clock.instant() on every unrelated test.
+    private final java.time.Clock clock =
+            java.time.Clock.fixed(java.time.Instant.parse("2026-09-09T00:00:00Z"), java.time.ZoneOffset.UTC);
 
     private ServiceCatalogService service;
 
@@ -76,12 +115,11 @@ class ServiceCatalogServiceCatalogTest {
                 serviceTypeSearchService,
                 serviceTypeRepository,
                 cacheManager,
-                // A REAL evictor over the mocked CacheManager, never a mock: the key-shape predicate it
-                // owns is the thing that silently no-opped for months, so it must actually execute here.
-                new com.beautica.common.cache.MasterCachePrefixEvictor(cacheManager),
                 authz,
                 slotCalculationService,
-                salonCatalogCacheEvictor
+                salonCatalogCacheEvictor,
+                bookingRepository,
+                clock
         );
     }
 
@@ -511,5 +549,272 @@ class ServiceCatalogServiceCatalogTest {
 
         assertThat(result).isEmpty();
         verify(serviceTypeRepository).findActiveByPlatformCategoryName("NOPE");
+    }
+
+    // ── getSalonServiceCatalog — Phase 314 D3's rendering table (unit level) ─────────────────
+    //
+    // Every fixture below deliberately makes the aggregate DIVERGE from the definition's own
+    // band (per the phase doc's fixture rule) so a bug that reads sd.getBasePrice()/getPriceMax()
+    // instead of the resolved per-master band cannot hide behind a coincidental match.
+
+    @Test
+    @DisplayName("Case 21 (D3): min == max across bookable masters renders FIXED with priceMax null "
+            + "— the common case, not a degenerate range")
+    void should_renderFixed_when_aggregateMinEqualsMax() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        MasterServiceAssignment inherited = assignment(master, sd, null, null, null);
+
+        stubBookable(salonId, List.of(inherited), Map.of(masterId, List.of(inherited)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.FIXED);
+        assertThat(row.priceMin()).isEqualByComparingTo("700.00");
+        assertThat(row.priceMax()).isNull();
+        assertThat(row.priceDisplay()).isEqualTo("700 ₴");
+    }
+
+    @Test
+    @DisplayName("Case 22 (D3): min < max across bookable masters renders RANGE, with neither bound "
+            + "equal to the definition's own band — a coincidental match cannot defang this")
+    void should_renderRange_when_aggregateMinLessThanMax() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterAId = UUID.randomUUID();
+        UUID masterBId = UUID.randomUUID();
+        Master masterA = master(masterAId);
+        Master masterB = master(masterBId);
+        // Definition's own band (400 FIXED) matches NEITHER the aggregate floor (500) nor
+        // ceiling (800) — a fixture where they coincide would defang this assertion.
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "400.00", null);
+        MasterServiceAssignment a = assignment(masterA, sd, PriceType.FIXED, new BigDecimal("500.00"), null);
+        MasterServiceAssignment b = assignment(masterB, sd, PriceType.FIXED, new BigDecimal("800.00"), null);
+
+        stubBookable(salonId, List.of(a, b),
+                Map.of(masterAId, List.of(a), masterBId, List.of(b)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(row.priceMin()).isEqualByComparingTo("500.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("800.00");
+        assertThat(row.priceDisplay()).isEqualTo("від 500 до 800 ₴");
+    }
+
+    @Test
+    @DisplayName("Case 23a (D3): exactly one bookable FIXED-band master reproduces that master's "
+            + "own band exactly — case 21's path")
+    void should_reproduceSoleMastersOwnBand_when_onlyOneMasterContributesFixed() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.RANGE, "400.00", "900.00");
+        MasterServiceAssignment ownBand =
+                assignment(master, sd, PriceType.FIXED, new BigDecimal("650.00"), null);
+
+        stubBookable(salonId, List.of(ownBand), Map.of(masterId, List.of(ownBand)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.FIXED);
+        assertThat(row.priceMin()).isEqualByComparingTo("650.00");
+        assertThat(row.priceMax()).isNull();
+    }
+
+    @Test
+    @DisplayName("Case 23b (D3): exactly one bookable RANGE-band master reproduces that master's "
+            + "own band exactly — case 22's path")
+    void should_reproduceSoleMastersOwnBand_when_onlyOneMasterContributesRange() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        MasterServiceAssignment ownBand = assignment(
+                master, sd, PriceType.RANGE, new BigDecimal("500.00"), new BigDecimal("800.00"));
+
+        stubBookable(salonId, List.of(ownBand), Map.of(masterId, List.of(ownBand)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
+        assertThat(row.priceMin()).isEqualByComparingTo("500.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("800.00");
+    }
+
+    @Test
+    @DisplayName("D3/D1: a RANGE definition where every bookable master took the same FIXED band "
+            + "renders FIXED — the rendered shape is computed, never read from sd.getPriceType()")
+    void should_renderFixed_when_everyMasterTookTheSameFixedBandOnARangeDefinition() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterAId = UUID.randomUUID();
+        UUID masterBId = UUID.randomUUID();
+        Master masterA = master(masterAId);
+        Master masterB = master(masterBId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.RANGE, "400.00", "900.00");
+        MasterServiceAssignment a = assignment(masterA, sd, PriceType.FIXED, new BigDecimal("700.00"), null);
+        MasterServiceAssignment b = assignment(masterB, sd, PriceType.FIXED, new BigDecimal("700.00"), null);
+
+        stubBookable(salonId, List.of(a, b), Map.of(masterAId, List.of(a), masterBId, List.of(b)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceType())
+                .as("computed display shape, not sd.getPriceType() (which is RANGE here)")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(row.priceMin()).isEqualByComparingTo("700.00");
+        assertThat(row.priceMax()).isNull();
+    }
+
+    @Test
+    @DisplayName("D1: a null base_price whose masters are all Inherited falls back to the "
+            + "definition rendering rather than emitting a half-formed band")
+    void should_fallBackToDefinition_when_everyContributorResolvesToANullFloor() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, null, null);
+        MasterServiceAssignment inherited = assignment(master, sd, null, null, null);
+
+        stubBookable(salonId, List.of(inherited), Map.of(masterId, List.of(inherited)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceMin()).isNull();
+        assertThat(row.priceDisplay()).isNull();
+    }
+
+    // ── Q8 (2026-09-13 audit): getSalonServiceCatalog's TWO empty-return branches ───────────────
+    //
+    // Both were reached by existing cache tests, but NONE of them asserted the returned value —
+    // they only counted cache calls — and neither had a never-verification. A mutant returning
+    // `null`, or one that fell through to the category lookup with an empty map, survived both.
+
+    @Test
+    @DisplayName("Q8: no candidate assignments at all returns an EMPTY catalogue and never runs the "
+            + "free-slot gate — the cheapest possible miss")
+    void should_returnEmptyCatalogueWithoutGating_when_salonHasNoCandidateAssignments() {
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(List.of());
+
+        SalonServiceCatalogResponse response = service.getSalonServiceCatalog(salonId);
+
+        assertThat(response).isNotNull();
+        assertThat(response.categories())
+                .as("an empty catalogue is an empty category LIST, never null")
+                .isEmpty();
+        verify(slotCalculationService, never()).filterBookableAssignmentsBatch(any());
+        verifyNoInteractions(platformCategoryOrderLookup);
+    }
+
+    @Test
+    @DisplayName("Q8: candidates exist but the free-slot gate filters ALL of them out — still an "
+                + "empty catalogue, and the category-order lookup is never consulted")
+    void should_returnEmptyCatalogue_when_everyCandidateIsFilteredOutByTheBookabilityGate() {
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        Master master = master(masterId);
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, "700.00", null);
+        MasterServiceAssignment candidate = assignment(master, sd, null, null, null);
+
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId))
+                .thenReturn(List.of(candidate));
+        // Non-empty candidates, zero survivors — the branch no test reached at all.
+        when(slotCalculationService.filterBookableAssignmentsBatch(any()))
+                .thenReturn(Map.of(masterId, List.of()));
+
+        SalonServiceCatalogResponse response = service.getSalonServiceCatalog(salonId);
+
+        assertThat(response.categories()).isEmpty();
+        verify(slotCalculationService).filterBookableAssignmentsBatch(any());
+        verifyNoInteractions(platformCategoryOrderLookup);
+    }
+
+    // ── Q9 (2026-09-13 audit): the null-floor contributor SKIP, in a MIXED list ─────────────────
+
+    @Test
+    @DisplayName("Q9: one contributor resolving to a null floor is SKIPPED while a valid sibling "
+            + "still prices the row — the branch's actual purpose, which the all-null degenerate "
+            + "case cannot exercise")
+    void should_skipNullFloorContributorAndPriceFromTheRest_when_theListIsMixed() {
+        UUID salonId = UUID.randomUUID();
+        UUID nullFloorMasterId = UUID.randomUUID();
+        UUID pricedMasterId = UUID.randomUUID();
+
+        // A legacy definition with NO base_price: an Inherited assignment against it resolves to a
+        // null floor. The second master carries an own band, so the hull is theirs alone.
+        ServiceDefinition sd = serviceDefinition("MANICURE", PriceType.FIXED, null, null);
+        MasterServiceAssignment nullFloor = assignment(master(nullFloorMasterId), sd, null, null, null);
+        MasterServiceAssignment priced = assignment(
+                master(pricedMasterId), sd, PriceType.RANGE, new BigDecimal("600.00"), new BigDecimal("950.00"));
+
+        stubBookable(salonId, List.of(nullFloor, priced),
+                Map.of(nullFloorMasterId, List.of(nullFloor), pricedMasterId, List.of(priced)));
+
+        ServiceDefinitionResponse row = onlyRow(service.getSalonServiceCatalog(salonId));
+
+        assertThat(row.priceMin())
+                .as("the null-floor contributor must neither corrupt the hull nor trigger the "
+                        + "all-null fallback — the priced master alone sets the band")
+                .isEqualByComparingTo("600.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("950.00");
+        assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
+    }
+
+    /**
+     * Stubs {@code findBookableAssignmentsBySalon} + the batched free-slot gate (Phase 315). The
+     * mocked slice stubs the batch method's RESULT directly ({@code byMaster}, masterId -> its
+     * bookable subset) rather than re-deriving it from {@code candidates} — these unit tests exercise
+     * the pricing/grouping reshape downstream of the gate, not the gate itself (that is the
+     * Testcontainers {@code SalonCatalogueBatchLoadIT}'s job).
+     */
+    private void stubBookable(UUID salonId, List<MasterServiceAssignment> candidates,
+            Map<UUID, List<MasterServiceAssignment>> byMaster) {
+        when(platformCategoryOrderLookup.getApprovedActive()).thenReturn(List.of());
+        when(masterServiceRepository.findBookableAssignmentsBySalon(salonId)).thenReturn(candidates);
+        when(slotCalculationService.filterBookableAssignmentsBatch(any())).thenReturn(byMaster);
+    }
+
+    private ServiceDefinitionResponse onlyRow(SalonServiceCatalogResponse response) {
+        List<ServiceDefinitionResponse> rows = response.categories().stream()
+                .flatMap(g -> g.services().stream())
+                .toList();
+        assertThat(rows).as("expected exactly one aggregated catalogue row").hasSize(1);
+        return rows.get(0);
+    }
+
+    private Master master(UUID id) {
+        return Master.builder().id(id).build();
+    }
+
+    private ServiceDefinition serviceDefinition(
+            String category, PriceType priceType, String basePrice, String priceMax) {
+        return ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Манікюр")
+                .category(category)
+                .baseDurationMinutes(60)
+                .bufferMinutesAfter(0)
+                .priceType(priceType)
+                .basePrice(basePrice != null ? new BigDecimal(basePrice) : null)
+                .priceMax(priceMax != null ? new BigDecimal(priceMax) : null)
+                .isActive(true)
+                .build();
+    }
+
+    private MasterServiceAssignment assignment(Master master, ServiceDefinition sd,
+            PriceType typeOverride, BigDecimal priceOverride, BigDecimal maxOverride) {
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(master)
+                .serviceDefinition(sd)
+                .priceTypeOverride(typeOverride)
+                .priceOverride(priceOverride)
+                .priceMaxOverride(maxOverride)
+                .isActive(true)
+                .build();
     }
 }

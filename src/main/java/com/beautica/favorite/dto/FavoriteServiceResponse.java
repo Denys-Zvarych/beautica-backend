@@ -30,24 +30,36 @@ import java.util.UUID;
  * — the client must still pick a master, exactly as browsing the salon catalogue itself works.
  *
  * <h2>Price — FIXED vs RANGE</h2>
- * Derived from the SAME three {@code service_definitions} columns
- * ({@code price_type}/{@code base_price}/{@code price_max}) {@link ServicePricing#ofDefinition}
- * reads, for BOTH arms — so the wish list and the master's own menu (or the salon catalogue)
- * can never disagree about a price (Phase 31.4 D2, extended):
+ * The wire shape is the same for both arms:
  * <ul>
  *   <li><b>FIXED</b> — {@code priceMax == null}, {@code priceDisplay == "600 ₴"}.</li>
  *   <li><b>RANGE</b> — {@code priceMax} is the ceiling, {@code priceDisplay ==
  *       "від 600 до 900 ₴"}. The client renders {@code priceDisplay} verbatim and never
  *       re-derives a band from {@code priceMin}/{@code priceMax}.</li>
  * </ul>
- * {@code priceMin} is the definition's canonical floor ({@code base_price}) — the same value
- * {@code MasterServiceResponse.priceMin} carries, <b>not</b> the override-aware
- * {@code effectivePrice}. That is deliberate: there is no {@code priceMaxOverride}, so pairing
- * an override-aware floor with a raw ceiling can yield {@code priceMin > priceMax}. See
- * {@link ServicePricing} for the full reasoning. A SALON row has no assignment to override from
- * at all, so its band is simply the definition's own — identical to what
- * {@code GET /salons/{salonId}/services} prints for that same definition (anti-divergence: see
- * {@code FavoriteServiceListIT}).
+ *
+ * <h3>Where the numbers come from — and a KNOWN DIVERGENCE</h3>
+ * The live endpoint builds every row through {@link #fromRow}, off
+ * {@code FavoriteRepository.findFavoriteServiceRows}' merged native projection. That projection
+ * selects {@code price_type}/{@code base_price}/{@code price_max} straight off
+ * {@code service_definitions} for BOTH arms and <b>ignores</b> the assignment's
+ * {@code price_type_override} / {@code price_override} / {@code price_max_override}. So for a
+ * MASTER row whose assignment carries an own band (Phase 311 D9), this DTO prints the
+ * definition's advertised band while {@code MasterServiceResponse} — which resolves the same
+ * service through {@link ServicePricing#ofAssignment} — prints the master's own. The two CAN
+ * therefore disagree; the earlier "can never disagree" guarantee (Phase 31.4 D2) no longer holds
+ * post-311/314. This is a known gap pending a separate product decision on what a wish-list row
+ * should advertise; it is NOT fixed here.
+ *
+ * <p>The entity-backed {@link #from} factory is the exception: it goes through
+ * {@link ServicePricing#ofAssignment} and IS override-aware. It is retained for the unit tests
+ * that pin its output against {@code MasterServiceResponse}; no production read path calls it.
+ *
+ * <p>A SALON row has no assignment at all, so its band is simply the definition's own. Note this
+ * is no longer necessarily what {@code GET /salons/{salonId}/services} prints for that same
+ * definition: Phase 314 changed the salon catalogue's band to the cross-master hull over the
+ * masters who actually perform the service, which a single definition's own columns need not
+ * match.
  *
  * <h2>Sensitive data (§I)</h2>
  * No {@code priceOverride} (provider-internal bookkeeping — it discloses whether and by how
@@ -86,7 +98,10 @@ public record FavoriteServiceResponse(
          *  apply). */
         int durationMinutes,
         PriceType priceType,
-        /** Canonical floor ({@code base_price}) for both FIXED and RANGE. */
+        /** Band floor, for both FIXED and RANGE. On the live ({@link #fromRow}) path this is
+         *  the definition's {@code base_price}; via {@link #from} it is
+         *  {@code COALESCE(price_override, base_price)} — see the class javadoc's KNOWN
+         *  DIVERGENCE note. */
         BigDecimal priceMin,
         @Schema(types = {"number", "null"}, nullable = true,
                 description = "RANGE ceiling; null for FIXED.")

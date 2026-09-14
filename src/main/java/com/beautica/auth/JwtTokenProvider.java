@@ -32,10 +32,18 @@ public class JwtTokenProvider {
 
     public JwtTokenProvider(JwtConfig jwtConfig, Clock clock) {
         this.signingKey = Keys.hmacShaKeyFor(jwtConfig.secret().getBytes(StandardCharsets.UTF_8));
-        this.jwtParser = Jwts.parser().verifyWith(signingKey).build();
+        this.clock = clock;
+        // Drive JJWT's expiry/not-before checks off the same injected Clock as minting, so
+        // expiry is deterministic under a pinned test Clock (the parser otherwise reads the
+        // system wall clock, which would never match a Clock.fixed() in tests — §G). The
+        // io.jsonwebtoken.Clock lambda is re-read on every parse, so production behaviour is
+        // unchanged: ClockConfig.systemClock() is Clock.system(UTC).
+        this.jwtParser = Jwts.parser()
+                .verifyWith(signingKey)
+                .clock(() -> Date.from(clock.instant()))
+                .build();
         this.accessTokenExpirationMs = jwtConfig.accessTokenExpiration();
         this.refreshTokenExpirationMs = jwtConfig.refreshTokenExpiration();
-        this.clock = clock;
     }
 
     public String generateAccessToken(UUID userId, String email, Role role) {

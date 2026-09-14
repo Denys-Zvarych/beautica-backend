@@ -76,9 +76,10 @@ class ServiceWriteRateLimitRegressionTest {
     }
 
     /**
-     * 19 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
-     * the LAST (service-write) is constrained; every other bucket is permissive so a 429 here can
-     * only have come from the branch under test.
+     * 22 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
+     * the 19th (service-write) is constrained; every other bucket — including the 22nd
+     * (catalogue-browse) — is permissive so a 429 here can only have come from the branch under
+     * test.
      */
     private AuthRateLimitFilter filterWithTinyServiceWriteBucket() {
         return new AuthRateLimitFilter(
@@ -86,7 +87,8 @@ class ServiceWriteRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), tinyServiceWriteCache(), permissive(), permissive());
+                permissive(), permissive(), tinyServiceWriteCache(), permissive(), permissive(),
+                permissive());
     }
 
     private MockHttpServletRequest write(String method, String uri) {

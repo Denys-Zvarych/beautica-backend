@@ -1,5 +1,6 @@
 package com.beautica.service.service;
 
+import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
@@ -13,13 +14,16 @@ import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
 import com.beautica.service.dto.CatalogCategoryResponse;
 import com.beautica.service.dto.CreateServiceDefinitionRequest;
+import com.beautica.service.dto.MasterServiceBand;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.SalonServiceCategoryGroup;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.ServicePricing;
 import com.beautica.service.dto.PlatformServiceTypeResponse;
 import com.beautica.service.dto.ServiceTypeResponse;
 import com.beautica.service.dto.SuggestServiceTypeRequest;
+import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
@@ -30,6 +34,7 @@ import com.beautica.service.entity.ServiceType;
 import com.beautica.service.repository.ActiveDuplicateProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.PlatformCategoryRepository;
+import com.beautica.service.repository.SalonBulkSetupCandidate;
 import com.beautica.service.repository.ServiceRepository;
 import com.beautica.service.repository.ServiceTypeRepository;
 import lombok.RequiredArgsConstructor;
@@ -39,6 +44,7 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
@@ -47,14 +53,22 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 
+import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Service
@@ -81,10 +95,28 @@ public class ServiceCatalogService {
     private final ServiceTypeSearchService serviceTypeSearchService;
     private final ServiceTypeRepository serviceTypeRepository;
     private final CacheManager cacheManager;
-    private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
+    // NOTE (2026-09-13 audit, Q18/Q19): the MasterCachePrefixEvictor collaborator that used to sit
+    // here is GONE. Phase 307 MEDIUM-3 retired this class's only synchronous, direct-call use of it
+    // (evictAvailableSlotsCache / doEvictAvailableSlots) — the off-thread sweep behind
+    // evictBookableFutureSlotsCache already covers "available-slots" as a superset
+    // (SlotCalculationService#BOOKING_WRITE_CACHES) — after which the field was a never-read
+    // @RequiredArgsConstructor parameter kept only to avoid touching construction sites. It was
+    // also the ONE dead test mock that genuinely could not be deleted on its own (removing it under
+    // @InjectMocks injects null for the parameter), so deleting the parameter itself is what
+    // actually resolves it. Do not re-add it: an eviction this class needs goes through
+    // evictBookableFutureSlotsCache, not a second synchronous keyset scan on the committing thread.
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Phase 307 D4 — the per-assignment future-CONFIRMED-booking guard on unassignServiceFromMaster.
+    // Direct cross-feature repository injection, matching this class's existing MasterRepository/
+    // SalonRepository fields above rather than a new booking-service seam (REUSE-FIRST — no new
+    // booking-service method exists or is needed for a single COUNT read).
+    private final BookingRepository bookingRepository;
+    // Phase 307 D4 (anti-bug §G) — never Instant.now()/OffsetDateTime.now() directly; the "now"
+    // boundary for the future-booking scan must be pinned through the injected Clock so tests can
+    // control it.
+    private final Clock clock;
 
     @Transactional
     public ServiceDefinitionResponse addServiceToSalon(
@@ -148,19 +180,57 @@ public class ServiceCatalogService {
             throw new ForbiddenException("Service definition does not belong to this salon");
         }
 
-        if (masterServiceRepository.existsByMasterIdAndServiceDefinitionId(masterId, request.serviceDefId())) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Service already assigned to this master");
+        // Phase 313 D1 — a deactivated definition is 404, indistinguishable from a nonexistent
+        // one. MUST run after the ownership check above so a caller probing another salon's ids
+        // still gets 403, not a 404 that would confirm the id exists. This checks
+        // service_definitions.is_active — a different column, on a different table, from the
+        // master_services.is_active read a few lines below (Phase 307 D6's reactivation branch);
+        // conflating the two breaks MasterServiceUnassignIT case 8.
+        if (!serviceDef.isActive()) {
+            throw new NotFoundException("Service definition not found: " + request.serviceDefId());
         }
 
-        MasterServiceAssignment assignment = MasterServiceAssignment.builder()
-                .master(master)
-                .serviceDefinition(serviceDef)
-                .priceOverride(request.priceOverride())
-                .durationOverrideMinutes(request.durationOverrideMinutes())
-                .isActive(true)
-                .build();
+        // Phase 307 D6 — ACTIVE-agnostic lookup, not existsByMasterIdAndServiceDefinitionId:
+        // master_services' UNIQUE (master_id, service_def_id) is NOT partial, so an existing
+        // INACTIVE row (the master previously unassigned this exact service via
+        // unassignServiceFromMaster) must be REACTIVATED here, not treated as "already assigned"
+        // (wrong — the caller can plainly see it is not) nor left for a plain INSERT to hit at
+        // flush (a 500-flavoured opaque 409, not this endpoint's clean one).
+        Optional<MasterServiceAssignment> existingAssignment = masterServiceRepository
+                .findByMasterIdAndServiceDefinitionId(masterId, request.serviceDefId());
 
-        MasterServiceAssignment saved = masterServiceRepository.save(assignment);
+        MasterServiceAssignment saved;
+        if (existingAssignment.isPresent() && existingAssignment.get().isActive()) {
+            // Phase 313 D2 — typed, matching the bulk and independent-master paths: same
+            // constructor, same GlobalExceptionHandler arm, same 409 DuplicateServiceErrorResponse
+            // body, same data.code == DUPLICATE_SERVICE. No parallel mechanism.
+            throw new DuplicateServiceException(serviceDef.getName(), serviceDef.getId());
+        } else if (existingAssignment.isPresent()) {
+            // Phase 312 D1/D2 — the request's own @AssertTrue (MasterServiceBand.isLegal) has
+            // already refused a partial or incoherent band before this method runs; write the
+            // complete triple together so a reactivated row can never carry a bare
+            // price_override, which V165's chk_master_service_price_mode would refuse at flush
+            // (the 311/312 merge-unit hazard).
+            MasterServiceAssignment existing = existingAssignment.get();
+            existing.setActive(true);
+            existing.setPriceTypeOverride(request.priceType());
+            existing.setPriceOverride(request.priceOverride());
+            existing.setPriceMaxOverride(request.priceMax());
+            existing.setDurationOverrideMinutes(request.durationOverrideMinutes());
+            saved = existing;
+        } else {
+            MasterServiceAssignment assignment = MasterServiceAssignment.builder()
+                    .master(master)
+                    .serviceDefinition(serviceDef)
+                    .priceTypeOverride(request.priceType())
+                    .priceOverride(request.priceOverride())
+                    .priceMaxOverride(request.priceMax())
+                    .durationOverrideMinutes(request.durationOverrideMinutes())
+                    .isActive(true)
+                    .build();
+
+            saved = masterServiceRepository.save(assignment);
+        }
 
         // PERF-M2: keep the pre-computed min_effective_price in sync so the
         // search index reflects the new assignment immediately on next cache miss.
@@ -174,6 +244,270 @@ public class ServiceCatalogService {
         evictSalonCatalogAfterCommit(salonId);
 
         return MasterServiceResponse.from(saved);
+    }
+
+    /**
+     * Edits ONE master's OWN price band and/or duration override on ONE assignment (Phase 311) —
+     * the only {@code PATCH}/{@code PUT} anywhere on {@code master_services}. Mirrors the
+     * assign/unassign pair's URL and lookup: same natural key {@code (masterId, serviceDefId)},
+     * same {@link MasterServiceRepository#findByMasterIdAndServiceDefinitionId} finder, same
+     * ownership re-checks as {@link #assignServiceToMaster} (D1 — no new repository method).
+     *
+     * <p><b>D2 — all-or-nothing.</b> {@code request}'s bean validation (its {@code @AssertTrue}
+     * methods, calling {@link MasterServiceBand#isLegal}) has already refused a partial or
+     * incoherent band before this method runs; this method only decides WHICH of the three
+     * mutually-exclusive shapes the request represents:
+     * <ul>
+     *   <li>{@code clearBand = true} — reverts to Inherited: all three band columns NULL.</li>
+     *   <li>Any of {@code priceType}/{@code price}/{@code priceMax} present — the master's own,
+     *       already-validated band; all three columns are written together.</li>
+     *   <li>Neither — the band is left byte-for-byte untouched (D4's "null means unchanged").</li>
+     * </ul>
+     * {@code durationOverrideMinutes}/{@code clearDurationOverride} are resolved independently
+     * (D2 — duration carries no shape and no ceiling).
+     *
+     * <p><b>D5 — service-layer defense-in-depth.</b> {@link AuthorizationService
+     * #enforceCanEditMasterServiceBand} re-proves the controller's {@code @PreAuthorize} grant
+     * before anything is loaded, exactly as {@link #assignServiceToMaster}'s own
+     * {@code masterBelongsToSalon} re-check and {@link #deactivateServiceDefinition}'s
+     * {@code enforceCanManageServiceDefinition} never trust the SpEL gate alone.
+     *
+     * <p><b>D10 — bookings are never touched, and never block.</b> Unlike
+     * {@link #unassignServiceFromMaster}, there is no future-{@code CONFIRMED}-booking guard: a
+     * booking's frozen {@code priceAtBooking}/{@code priceMaxAtBooking} are snapshots the locked
+     * product decision forbids re-deriving, so an existing booking is simply irrelevant to this
+     * write.
+     *
+     * <p><b>D11 — eviction is conditional, not blanket.</b> {@code masterServices} and
+     * {@code salon-service-catalog} evict unconditionally (any band or duration change can move
+     * what those caches serve); {@code available-slots}/bookable-verdict evicts ONLY when the
+     * duration actually changed (a band-only edit does not feed slot maths); and
+     * {@code masters.min_effective_price} refreshes ONLY when the resolved floor actually changed
+     * (a RANGE ceiling moving alone does not). Both conditionals compare the RESOLVED value
+     * before/after, not merely "was a field present in the request" — a request that happens to
+     * restate the current value must not trigger a needless sweep.
+     *
+     * @throws NotFoundException  if no ACTIVE assignment exists for {@code (masterId, serviceDefId)}
+     * @throws ForbiddenException if the actor cannot manage {@code salonId} and is not the
+     *                            {@code SALON_MASTER} of {@code masterId}
+     */
+    @Transactional
+    public MasterServiceResponse updateMasterServiceBand(
+            UUID actorId,
+            UUID salonId,
+            UUID masterId,
+            UUID serviceDefId,
+            UpdateMasterServiceBandRequest request) {
+
+        // D5 defense-in-depth — re-prove the SpEL gate before loading anything (mirrors
+        // deactivateServiceDefinition's enforceCanManageServiceDefinition idiom; actorId is
+        // resolved by the controller via AuthenticationUtils.userId, same as that method).
+        authz.enforceCanEditMasterServiceBand(actorId, salonId, masterId);
+
+        MasterServiceAssignment assignment = masterServiceRepository
+                .findByMasterIdAndServiceDefinitionId(masterId, serviceDefId)
+                .filter(MasterServiceAssignment::isActive)
+                .orElseThrow(() -> new NotFoundException(
+                        "No active assignment for master " + masterId + " and service " + serviceDefId));
+
+        Master master = assignment.getMaster();
+        if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
+        ServiceDefinition serviceDef = assignment.getServiceDefinition();
+        if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
+            throw new ForbiddenException("Service definition does not belong to this salon");
+        }
+
+        // D11 — capture the RESOLVED floor/duration before mutating, so the eviction/refresh
+        // conditionals below compare actual values, not merely "was a field present".
+        BigDecimal floorBefore = ServicePricing.effectivePriceOf(assignment);
+        Integer durationBefore = assignment.getDurationOverrideMinutes();
+
+        boolean bandFieldsPresent = request.priceType() != null
+                || request.price() != null
+                || request.priceMax() != null;
+        if (Boolean.TRUE.equals(request.clearBand())) {
+            // D2 — revert to Inherited: all three columns NULL, tracking the definition again.
+            assignment.setPriceTypeOverride(null);
+            assignment.setPriceOverride(null);
+            assignment.setPriceMaxOverride(null);
+        } else if (bandFieldsPresent) {
+            // Already proven legal by the request's own bean validation (MasterServiceBand
+            // .isLegal, via its @AssertTrue methods) — write the complete, own band atomically.
+            assignment.setPriceTypeOverride(request.priceType());
+            assignment.setPriceOverride(request.price());
+            assignment.setPriceMaxOverride(request.priceMax());
+        }
+        // else: band untouched (D4 — null means "leave unchanged").
+
+        if (Boolean.TRUE.equals(request.clearDurationOverride())) {
+            assignment.setDurationOverrideMinutes(null);
+        } else if (request.durationOverrideMinutes() != null) {
+            assignment.setDurationOverrideMinutes(request.durationOverrideMinutes());
+        }
+        // else: duration untouched.
+
+        BigDecimal floorAfter = ServicePricing.effectivePriceOf(assignment);
+        Integer durationAfter = assignment.getDurationOverrideMinutes();
+
+        // S4 (2026-09-13 audit) — a SALON_MASTER may write this row (Phase 311 D5, deliberate), and
+        // the write immediately moves PUBLIC state: the salon-catalogue price hull and, when the
+        // floor moves, masters.min_effective_price (the search band). Without this line there is no
+        // record of WHICH actor moved a salon's advertised price. IDs and numbers only — this
+        // endpoint carries no free text and no PII, and none may be added here (§I).
+        log.info("master service band changed actor={} salon={} master={} serviceDef={} "
+                        + "floor {}->{} duration {}->{}",
+                actorId, salonId, masterId, serviceDefId,
+                floorBefore, floorAfter, durationBefore, durationAfter);
+
+        // D11 — always: the band or duration may have changed what these caches serve.
+        evictMasterServicesCache(List.of(masterId));
+        evictSalonCatalogAfterCommit(salonId);
+        // D11 — conditional: duration feeds slot maths, a band-only change does not.
+        if (!Objects.equals(durationBefore, durationAfter)) {
+            evictBookableFutureSlotsCache(List.of(masterId));
+        }
+        // D11 — conditional: min_effective_price is keyed off the floor alone; a RANGE ceiling
+        // moving without the floor moving does not require a refresh.
+        if (bigDecimalChanged(floorBefore, floorAfter)) {
+            masterRepository.refreshMinEffectivePrice(masterId);
+        }
+
+        return MasterServiceResponse.from(assignment);
+    }
+
+    /** Null-safe, scale-insensitive BigDecimal inequality — {@code compareTo}, never {@code equals}. */
+    private static boolean bigDecimalChanged(BigDecimal before, BigDecimal after) {
+        if (before == null || after == null) {
+            return !Objects.equals(before, after);
+        }
+        return before.compareTo(after) != 0;
+    }
+
+    /**
+     * Unassigns ONE master from ONE service — the surgical, per-master counterpart of
+     * {@link #deactivateServiceDefinition}, which removes a service from the WHOLE salon (every
+     * master performing it, at once). Different row, different blast radius; neither replaces the
+     * other (Phase 307).
+     *
+     * <p><b>Soft unassign only (D1).</b> {@code UPDATE master_services SET is_active = false},
+     * never a row delete: {@code bookings.master_service_id} has no {@code ON DELETE} clause, so a
+     * hard delete of a row carrying any booking — past or future — would abort with a foreign-key
+     * violation instead of silently losing booking history. Every past booking keeps resolving its
+     * service, provider and {@code price_at_booking} through the row exactly as before.
+     *
+     * <p><b>The shared {@link ServiceDefinition} is NEVER touched (D2).</b> Unassigning the last
+     * master leaves it active and salon-owned with zero active assignments; it falls out of the
+     * public catalogue on its own, by condition 3 of the Phase 305 D2 rule. Deactivating it here
+     * would be a hidden salon-wide mutation triggered by a per-master action — rejected.
+     *
+     * <p><b>Refuses with {@code 409} when a future {@code CONFIRMED} booking still runs through
+     * this exact assignment (D4) — nothing is written.</b> This is the shipping contract, not a
+     * placeholder: Phase 308, which would replace the refusal with a cancel-and-notify cascade,
+     * was deferred by the user on 2026-09-08. The count is scoped to THIS {@code master_services}
+     * row, never to the master as a whole — a future booking for a DIFFERENT service the same
+     * master performs must not block.
+     *
+     * <p>A second unassign of an already-inactive pair is a plain {@code 404} — idempotent by row
+     * state, no write (D7).
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId}, resolved
+     * the same way {@link #assignServiceToMaster} resolves it. The manual
+     * {@code masterBelongsToSalon} re-check below mirrors that method's own defense-in-depth
+     * idiom: the controller's {@code @PreAuthorize} SpEL gate is never trusted alone.
+     *
+     * <p>The resolved assignment's {@link ServiceDefinition} is also re-checked against
+     * {@code salonId} (same {@code ownerType}/{@code ownerId} check {@link #assignServiceToMaster}
+     * already performs). The write-path invariant means a {@code master_services} row can only ever
+     * link a master to a same-salon definition, so this branch is unreachable today — it exists so
+     * this method is not the one place in the class relying on that invariant with no check of its
+     * own.
+     *
+     * @throws NotFoundException  if the master does not exist, or no ACTIVE assignment exists for
+     *                             this (master, serviceDef) pair
+     * @throws ForbiddenException if the master does not belong to {@code salonId}
+     * @throws BusinessException  (409) if a future CONFIRMED booking exists for this assignment
+     */
+    @Transactional
+    public void unassignServiceFromMaster(UUID actorId, UUID salonId, UUID masterId, UUID serviceDefId) {
+
+        // Defense-in-depth (2026-09-13 audit, S1) — re-prove the controller's
+        // @PreAuthorize("@authz.canManageSalon(...)") gate from the caller-supplied actorId before
+        // loading anything, exactly as updateMasterServiceBand / deactivateServiceDefinition /
+        // getSalonMasterServices already do. The tenant re-checks below (master -> salon,
+        // definition -> salon) validate the OBJECT; this validates the ACTOR, and only the SpEL
+        // gate did that until now.
+        authz.enforceCanManageSalon(actorId, salonId);
+
+        // MEDIUM-1/2 (Phase-307 perf audit) — one JOIN-FETCH query resolves the assignment AND its
+        // master AND its service definition together, so the happy path costs ONE round trip
+        // instead of three (a separate masterRepository.findById, this finder, and the lazy-proxy
+        // init the ownership re-check below used to force on assignment.getServiceDefinition()).
+        // The 404 discriminator below only queries again on the cold not-found branch — see
+        // notFoundForUnassign — so the two distinct messages are preserved without the happy path
+        // ever paying for them.
+        MasterServiceAssignment assignment = masterServiceRepository
+                .findByMasterIdAndServiceDefinitionId(masterId, serviceDefId)
+                .filter(MasterServiceAssignment::isActive)
+                .orElseThrow(() -> notFoundForUnassign(masterId, serviceDefId));
+
+        Master master = assignment.getMaster();
+        if (master.getSalon() == null || !master.getSalon().getId().equals(salonId)) {
+            throw new ForbiddenException("Access denied");
+        }
+
+        ServiceDefinition serviceDef = assignment.getServiceDefinition();
+        if (serviceDef.getOwnerType() != OwnerType.SALON || !serviceDef.getOwnerId().equals(salonId)) {
+            throw new ForbiddenException("Service definition does not belong to this salon");
+        }
+
+        // D4 — refuse outright rather than write anything when a future CONFIRMED booking still
+        // runs through THIS assignment. Scoped to assignment.getId() (master_service_id), never to
+        // masterId alone, so a future booking for a different service this master performs does
+        // not block (case 7).
+        long futureConfirmedCount = bookingRepository.countConfirmedFutureByMasterServiceId(
+                masterId, assignment.getId(), OffsetDateTime.now(clock));
+        if (futureConfirmedCount > 0) {
+            throw new BusinessException(HttpStatus.CONFLICT,
+                    "Master has " + futureConfirmedCount + " future confirmed booking(s) for this "
+                            + "service; cancel or decline them first");
+        }
+
+        // Register every eviction BEFORE the write (mirrors deactivateServiceDefinition): each
+        // evictXAfterCommit call only REGISTERS an afterCommit synchronization, so a throw earlier
+        // in this method leaves them un-registered and a throw after this point still runs them
+        // only once the transaction actually commits (anti-bug §F rule 2).
+        //
+        // MEDIUM-3 (Phase-307 perf audit) — no direct evictAvailableSlotsCache call here. It scans
+        // the SAME "available-slots" cache, for the SAME masterId, SYNCHRONOUSLY on the committing
+        // thread — exactly what MasterCachePrefixEvictor's own javadoc says must not sit on the
+        // critical path. evictBookableFutureSlotsCache's off-thread sweep
+        // (SlotCalculationService#evictMasterAvailabilityCaches, BOOKING_WRITE_CACHES) already
+        // covers "available-slots" as a superset, so the synchronous call was pure duplicate work.
+        evictMasterServicesCache(List.of(masterId));
+        evictBookableFutureSlotsCache(List.of(masterId));
+        evictSalonCatalogAfterCommit(salonId);
+
+        // D1 — soft unassign: flip is_active, never delete the row.
+        assignment.setActive(false);
+
+        masterRepository.refreshMinEffectivePrice(masterId);
+    }
+
+    /**
+     * Cold-path 404 discriminator for {@link #unassignServiceFromMaster} — only reached when the
+     * combined JOIN-FETCH finder above found no active assignment for {@code (masterId,
+     * serviceDefId)}. One extra {@code existsById} distinguishes "the master row itself does not
+     * exist" from "the master exists but has no active assignment for this service", so the happy
+     * path never pays for the two distinct 404 messages.
+     */
+    private NotFoundException notFoundForUnassign(UUID masterId, UUID serviceDefId) {
+        if (!masterRepository.existsById(masterId)) {
+            return new NotFoundException("Master not found: " + masterId);
+        }
+        return new NotFoundException(
+                "No active assignment for master " + masterId + " and service " + serviceDefId);
     }
 
     @Transactional
@@ -286,20 +620,37 @@ public class ServiceCatalogService {
      *
      * <p>Salon-membership of the target master is verified here as the second half of the
      * controller's {@code @PreAuthorize} role gate (anti-bug §D split), mirroring
-     * {@link #assignServiceToMaster}. Services are owned by the master row, not the salon —
-     * no salon-level catalog entity is created.
+     * {@link #assignServiceToMaster}.
+     *
+     * <p><b>Phase 302 D1 — the definitions are SALON-owned.</b> A salon-bound master's services
+     * persist as {@code ownerType = SALON, ownerId = salonId}, not as master-owned rows. That is
+     * the ownership the salon catalogue query
+     * ({@code MasterServiceRepository#findBookableAssignmentsBySalon}) requires, so a service
+     * created here is actually visible in {@code GET /salons/&#123;salonId&#125;/services};
+     * master-owned rows never were. The per-master {@link MasterServiceAssignment} remains the
+     * thing that says <em>this master performs this service</em>.
+     *
+     * <p><b>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId}</b> — it
+     * is resolved by {@code masterRepository.findById} below. Passing a user id yields
+     * {@code 404 Master not found}, not {@code 403}.
      *
      * <p>Usable whether or not the master already has services — it backs both the initial
      * catalogue-setup screen and later "add more services" passes.
      *
      * @throws ForbiddenException        if the master does not belong to the given salon
-     * @throws DuplicateServiceException (409) if a batch item's service type is already offered
+     * @throws DuplicateServiceException (409) if <em>this master</em> already offers a batch
+     *                                   item's service type (Phase 302 D4 — the salon already
+     *                                   offering it is the reuse path, not a conflict)
      */
     @Transactional
     public List<MasterServiceResponse> bulkCreateSalonMasterServices(
+            UUID actorId,
             UUID salonId,
             UUID masterId,
             BulkCreateServicesRequest request) {
+
+        // Defense-in-depth (2026-09-13 audit, S1) — see unassignServiceFromMaster for the rationale.
+        authz.enforceCanManageSalon(actorId, salonId);
 
         Master master = masterRepository.findById(masterId)
                 .orElseThrow(() -> new NotFoundException("Master not found: " + masterId));
@@ -308,21 +659,59 @@ public class ServiceCatalogService {
             throw new ForbiddenException("Access denied");
         }
 
-        return bulkCreateForMaster(master, OwnerType.INDEPENDENT_MASTER, master.getId(), request);
+        return bulkCreateForMaster(master, OwnerType.SALON, salonId, request);
     }
 
     /**
      * Shared additive bulk-create core for a resolved master.
      *
-     * <p>Services in this platform are owned by the master row regardless of how the master
-     * was created (independent or salon-bound), so both entry points persist
-     * {@code ownerType = INDEPENDENT_MASTER, ownerId = master.id} and a per-definition
-     * {@link MasterServiceAssignment} — identical to {@link #addIndependentMasterService}.
+     * <p><b>Ownership is per entry point, not universal (Phase 302 D1).</b> The two callers pass
+     * different owners and that difference is load-bearing:
+     * <ul>
+     *   <li>{@link #bulkCreateIndependentMasterServices} — {@code (INDEPENDENT_MASTER, master.id)}.
+     *       Its master rows have {@code salon_id IS NULL}; there is no salon to own anything.</li>
+     *   <li>{@link #bulkCreateSalonMasterServices} — {@code (SALON, salonId)}. The salon catalogue
+     *       query admits only SALON-owned definitions, so anything else is created invisible.</li>
+     * </ul>
+     * An earlier revision of this javadoc claimed a single universal "owned by the master row"
+     * rule; that claim was false against the catalogue query and is retired.
      *
-     * <p>Additive by design: the batch is appended to whatever the master already offers, so the
-     * same endpoint serves both the empty-catalogue onboarding screen and a later "add more
-     * services" pass. The only conflict left is a per-service one — a batch item whose
-     * {@link ServiceType} the owner already offers is rejected 409 {@code DUPLICATE_SERVICE}.
+     * <p><b>Find-or-create on the SALON branch (D2).</b> A salon owner is shared by every master
+     * in the salon, and V121's partial unique index
+     * {@code ux_service_def_owner_service_type_active} makes one ACTIVE definition per
+     * {@code (owner_type, owner_id, service_type_id)} a hard database rule. Two masters in one
+     * salon who both perform «Манікюр» therefore cannot each mint a definition — the second insert
+     * would be refused. So the SALON branch REUSES the salon's existing active definition for a
+     * service type and only creates one when none exists, then inserts this master's assignment
+     * either way. The reuse lookup and the per-master conflict check are ONE salon-scoped query
+     * ({@link ServiceRepository#findSalonBulkSetupCandidates}) — the same collision projection
+     * shape the owner-level guard uses, with its outcome split into <em>reuse</em> (the salon's
+     * own definition) and <em>throw</em> (this master already performs it); no parallel lookup is
+     * written (REUSE-FIRST).
+     *
+     * <p><b>Reuse never mutates the shared definition (D3).</b> Name, base price, duration and
+     * category on a reused definition are salon-level facts shared by every master performing it;
+     * rewriting them from one master's batch item would silently change what the whole salon
+     * offers. Per-master divergence goes where it already belongs — the {@code master_services}
+     * band ({@code price_type_override} / {@code price_override} / {@code price_max_override},
+     * Phase 311) and {@code duration_override_minutes} — and is left {@code NULL} (Inherited)
+     * when the item's full band matches the definition's.
+     *
+     * <p><b>Shape divergence is STORED, not rejected (Phase 312 — supersedes the re-audit
+     * MEDIUM-1 guard this javadoc used to describe).</b> Before V165, {@code master_services} had
+     * only a floor and a duration — no per-master price TYPE and no per-master ceiling — so a
+     * batch item whose price type or RANGE ceiling disagreed with the reused definition had
+     * nowhere faithful to land and was rejected with {@code 400 SERVICE_PRICE_SHAPE_MISMATCH}.
+     * Phase 311's {@code price_type_override}/{@code price_max_override} columns make every
+     * shape representable, so Phase 312 retires that guard: see
+     * {@link #resolveBulkReuseBand}, which now stores the item's own band instead.
+     *
+     * <p><b>The conflict is per-MASTER on the SALON branch (D4).</b> "The salon already offers
+     * this type" is the reuse path, not a conflict; {@code 409 DUPLICATE_SERVICE} fires only when
+     * <em>this master</em> already has an active assignment for the type. The INDEPENDENT_MASTER
+     * branch keeps the owner-level definition guard verbatim — for it, owner and master are the
+     * same row, and the guard additionally catches an active definition carrying no assignment,
+     * which the assignment-level check cannot see.
      *
      * <p>Rejects duplicate {@code serviceTypeId}s within the batch, derives each service name +
      * category from the chosen {@link ServiceType}, reuses {@link #applyPriceMode} for the
@@ -349,15 +738,26 @@ public class ServiceCatalogService {
         Map<UUID, ServiceType> typesById = resolveBulkServiceTypes(request.items());
         validateBulkCategoriesActive(typesById.values());
 
-        // TOCTOU guard: serialize concurrent additive bulk adds for the same master.
-        // assertNoActiveDuplicatesInBatch below is a read-then-write check — it reads the
-        // owner's already-taken service types, then inserts. Two concurrent bulk POSTs for the
-        // same master could therefore both read "type X is free" and both proceed. The V121
-        // unique index is the correctness backstop (the loser 500s at flush and is translated to
-        // a 409), but taking a transaction-scoped advisory lock keyed by masterId makes the
-        // second caller wait for the first to commit, so its duplicate guard sees the committed
-        // rows and produces the clean, item-naming 409 instead of a raced constraint violation.
-        // Mirrors the booking overlap-guard advisory lock (anti-bug pattern).
+        // TOCTOU guard: serialize concurrent additive bulk adds against the same DEFINITION key
+        // space. The guard below is a read-then-write check — it reads which of the batch's
+        // service types are already taken, then inserts. Two concurrent bulk POSTs could
+        // therefore both read "type X is free" and both proceed. The V121 unique index is the
+        // correctness backstop (the loser 500s at flush and is translated to a 409), but taking a
+        // transaction-scoped advisory lock makes the second caller wait for the first to commit,
+        // so its guard sees the committed rows and either REUSES them or produces the clean,
+        // item-naming 409 instead of a raced constraint violation. Mirrors the booking
+        // overlap-guard advisory lock (anti-bug pattern).
+        //
+        // THE KEY IS THE OWNER, NOT THE MASTER (phase-302 audit HIGH-2). V121 keys on
+        // (owner_type, owner_id, service_type_id), so on the SALON branch the contended resource
+        // is the SALON's definition set, shared by every master in it. Keying on masterId let two
+        // DIFFERENT masters of one salon take two DIFFERENT locks, both miss
+        // findSalonBulkSetupCandidates' reuse arm, and both INSERT (SALON, salonId, typeId) — the
+        // loser then tripping V121 at flush, where flushBulkBatch can only translate a constraint
+        // NAME, so the client got a DUPLICATE_SERVICE 409 with serviceName AND existingServiceDefId
+        // both null. Locking the owner is strictly stronger than locking the master (two batches
+        // for one master are also two batches for its salon), and exactly ONE key is taken per
+        // transaction, so no lock-ordering discipline is needed.
         //
         // The serialized window is deliberately NARROW — it opens here and closes at commit,
         // covering exactly the read-then-write span: the duplicate guard, the inserts, the flush,
@@ -368,15 +768,56 @@ public class ServiceCatalogService {
         // only REGISTERS an afterCommit synchronization, so the actual evict runs after the
         // transaction commits and therefore after this lock is released (anti-bug §F rule 2 — an
         // inline evict would let a concurrent reader repopulate the cache from a pre-commit snapshot).
-        acquireBulkSetupLockWithTimeout(master.getId());
+        acquireBulkSetupLockWithTimeout(ownerId);
 
-        // PERF: and the V121 duplicate guard for the WHOLE batch in ONE query too, rather than
-        // one findActiveDuplicateId per item. See assertNoActiveDuplicatesInBatch.
-        assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
+        // PERF: and the duplicate guard for the WHOLE batch in ONE query, rather than one
+        // per item. Which guard applies depends on who owns the definitions (D4):
+        //
+        //   SALON  — the owner is shared by every master in the salon, so an owner-level
+        //            definition guard would reject the salon's SECOND master from ever offering
+        //            a type the first already offers. The conflict is per-MASTER, the salon-level
+        //            hit is the reuse path, and resolveSalonBulkCandidates answers BOTH from one
+        //            query (audit LOW-3 — three round-trips inside a now salon-wide serialized
+        //            window multiplied across every concurrent master setup in the salon).
+        //   INDEPENDENT_MASTER — owner and master are the same row, so the pre-existing
+        //            owner-level definition guard is kept verbatim. It is strictly stronger here:
+        //            it also catches an active definition carrying no active assignment, which
+        //            would still violate V121 at INSERT but is invisible to an assignment check.
+        //
+        // Both guards run INSIDE the advisory lock, exactly as before: each is a read-then-write
+        // check whose only race-proof backstop is the V121 index / the master_services unique key.
+        Map<UUID, ServiceDefinition> reusableByTypeId;
+        // Phase 307 D6 — type id -> the master's own INACTIVE master_services row for that
+        // reused definition, if any. When present, createSingleFromBulkItem must REACTIVATE this
+        // exact row instead of inserting a second one (master_services' UNIQUE (master_id,
+        // service_def_id) is NOT partial). Empty on the INDEPENDENT_MASTER branch, which never
+        // reuses a definition.
+        Map<UUID, UUID> reactivateAssignmentIdByTypeId;
+        if (ownerType == OwnerType.SALON) {
+            SalonBulkCandidateResolution resolution = resolveSalonBulkCandidates(
+                    master.getId(), ownerId, request.items(), typesById);
+            reusableByTypeId = resolution.reusableByTypeId();
+            reactivateAssignmentIdByTypeId = resolution.reactivateAssignmentIdByTypeId();
+        } else {
+            assertNoActiveDuplicatesInBatch(ownerType, ownerId, request.items(), typesById);
+            reusableByTypeId = Map.of();
+            reactivateAssignmentIdByTypeId = Map.of();
+        }
+
+        // PERF (2026-09-13 audit, P1/P4): resolve EVERY reactivation target in ONE findAllById
+        // before the per-item walk. createSingleFromBulkItem used to call
+        // masterServiceRepository.findById(reactivateAssignmentId) per item — up to 100 serialized
+        // SELECTs, all of them inside the salon-keyed advisory lock, for rows the caller already
+        // knew the ids of. The per-item walk is back to O(0) queries, which is what
+        // createSingleFromBulkItem's own javadoc has always claimed.
+        Map<UUID, MasterServiceAssignment> reactivateAssignmentByTypeId =
+                loadReactivationTargets(reactivateAssignmentIdByTypeId);
 
         List<MasterServiceResponse> created = request.items().stream()
                 .map(item -> createSingleFromBulkItem(
-                        master, ownerType, ownerId, item, typesById.get(item.serviceTypeId())))
+                        master, ownerType, ownerId, item, typesById.get(item.serviceTypeId()),
+                        reusableByTypeId.get(item.serviceTypeId()),
+                        reactivateAssignmentByTypeId.get(item.serviceTypeId())))
                 .toList();
 
         // Push the whole batch to the DB in one go, translating a V121 violation exactly as the
@@ -389,17 +830,32 @@ public class ServiceCatalogService {
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
         masterRepository.refreshMinEffectivePrice(master.getId());
         evictMasterServicesCache(List.of(master.getId()));
+        // Phase 304 D1: a SALON-branch batch persists SALON-owned definitions/assignments, which
+        // can change what GET /salons/{salonId}/services returns — evict that salon's catalogue
+        // after commit (REUSE-FIRST: the existing helper, called from one more place). The
+        // INDEPENDENT_MASTER branch's ownerId is the master's own row, not a salon id, so it stays
+        // a no-op here rather than mis-evicting a "salon" keyed by a master id.
+        if (ownerType == OwnerType.SALON) {
+            evictSalonCatalogAfterCommit(ownerId);
+        }
 
         return created;
     }
 
     /**
-     * Takes the transaction-scoped per-master advisory lock that serializes the additive
-     * bulk-create critical section, bounding the wait at the 3s {@code lock_timeout} the
-     * repository query fuses into the same round-trip. The lock lives in its own salt-{@code 2}
-     * key space, so it contends only with other bulk setups for the same master — never with the
-     * booking master/client locks (salts {@code 0}/{@code 1}); see
+     * Takes the transaction-scoped advisory lock that serializes the additive bulk-create critical
+     * section, bounding the wait at the 3s {@code lock_timeout} the repository query fuses into
+     * the same round-trip. The lock lives in its own salt-{@code 2} key space, so it contends only
+     * with other bulk setups for the same key — never with the booking master/client locks (salts
+     * {@code 0}/{@code 1}); see
      * {@link MasterServiceRepository#acquireBulkSetupLockWithTimeout(UUID)}.
+     *
+     * <p><b>{@code ownerId} — the V121 key space, not the master (audit HIGH-2).</b> The contended
+     * resource is one ACTIVE definition per {@code (owner_type, owner_id, service_type_id)}: the
+     * SALON on the salon branch, the master row on the independent branch (where owner and master
+     * are the same row). Keying on the master in a salon let two masters of one salon insert the
+     * same {@code (SALON, salonId, typeId)} and the loser trip V121 at flush, producing a 409 with
+     * a null {@code serviceName} AND a null {@code existingServiceDefId}.
      *
      * <p><b>Why a bounded wait rather than {@code pg_try_advisory_xact_lock}.</b> Under a
      * try-lock the loser of ORDINARY contention fails instantly, before it can re-check
@@ -413,14 +869,14 @@ public class ServiceCatalogService {
      *                           {@code 55P03 lock_not_available}, surfaced by Spring/Hibernate
      *                           exception translation as
      *                           {@link PessimisticLockingFailureException}) — a transient
-     *                           "master is busy, retry" condition, deliberately distinct from the
+     *                           "setup is busy, retry" condition, deliberately distinct from the
      *                           semantically loaded 409 this endpoint reserves for
      *                           {@code DUPLICATE_SERVICE}; 500 when the lock query returns no row
      */
-    private void acquireBulkSetupLockWithTimeout(UUID masterId) {
+    private void acquireBulkSetupLockWithTimeout(UUID ownerId) {
         Integer lockResult;
         try {
-            lockResult = masterServiceRepository.acquireBulkSetupLockWithTimeout(masterId);
+            lockResult = masterServiceRepository.acquireBulkSetupLockWithTimeout(ownerId);
         } catch (PessimisticLockingFailureException ex) {
             // Never echo SQL state, the timeout value or the driver cause to the caller (§I/§N);
             // only the exception's simple class name, at DEBUG, for server-side triage.
@@ -449,7 +905,7 @@ public class ServiceCatalogService {
                 .toList();
 
         Map<UUID, ServiceType> typesById = serviceTypeRepository.findAllById(ids).stream()
-                .collect(java.util.stream.Collectors.toMap(ServiceType::getId, java.util.function.Function.identity()));
+                .collect(Collectors.toMap(ServiceType::getId, Function.identity()));
 
         for (UUID id : ids) {
             ServiceType type = typesById.get(id);
@@ -471,11 +927,11 @@ public class ServiceCatalogService {
      * returned as APPROVED + active triggers the same 400 as
      * {@link #validateCategoryActive(String)}.
      */
-    private void validateBulkCategoriesActive(java.util.Collection<ServiceType> types) {
+    private void validateBulkCategoriesActive(Collection<ServiceType> types) {
         Set<String> requested = types.stream()
                 .map(ServiceType::getPlatformCategoryName)
                 .filter(Objects::nonNull)
-                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+                .collect(Collectors.toCollection(LinkedHashSet::new));
 
         if (requested.isEmpty()) {
             return;
@@ -500,13 +956,75 @@ public class ServiceCatalogService {
      * would need a query lives in {@link #bulkCreateForMaster} so the per-item cost stays
      * O(0) queries — see {@link #assertNoActiveDuplicatesInBatch}. Nothing is flushed here;
      * the caller flushes the batch once.
+     *
+     * <p><b>Reuse branch (Phase 302 D2/D3, band resolution Phase 312 D3/D9).</b> When
+     * {@code reusable} is non-null the salon already has an ACTIVE definition for this service
+     * type, so ONLY the assignment is inserted — creating a second definition would violate
+     * V121's {@code ux_service_def_owner_service_type_active}. The reused definition is left
+     * byte-identical; {@link #resolveBulkReuseBand} decides whether the item's band matches the
+     * reused definition's (Inherited — all three {@code master_services} band columns
+     * {@code NULL}) or must be stored as the master's own, fully-specified band. Duration follows
+     * its own, independent "override when it differs" rule via {@link #overrideDurationFor}
+     * (Phase 311 D2 — duration carries no shape and no ceiling).
+     *
+     * <p>Since V165 (Phase 311) every shape the item can express is representable on the
+     * assignment — the superseded Phase 302 guard that used to reject a differing shape
+     * ({@code assertReusableShapesAreRepresentable} / {@code isShapeRepresentableOnAssignment})
+     * is retired (Phase 312 D3); this branch now STORES a differing shape instead of 400ing it.
+     *
+     * <p><b>Reactivation sub-branch (Phase 307 D6).</b> When {@code reactivateAssignmentId} is
+     * ALSO non-null, the master holds an {@code is_active = false} row for the reused definition —
+     * a service unassigned earlier via {@code ServiceCatalogService#unassignServiceFromMaster}.
+     * {@code master_services}' {@code UNIQUE (master_id, service_def_id)} is NOT partial, so an
+     * INSERT here would trip it at flush; the existing row is reactivated and its overrides
+     * refreshed from this item instead.
+     *
+     * @param reusable               the salon's existing active definition for this service type,
+     *                               or {@code null} to create one (always {@code null} on the
+     *                               INDEPENDENT_MASTER branch)
+     * @param reactivateAssignment   the master's own INACTIVE {@code master_services} row for
+     *                               {@code reusable}, or {@code null} to insert a fresh assignment
+     *                               (always {@code null} when {@code reusable} is {@code null}).
+     *                               Pre-loaded in ONE batch by {@link #loadReactivationTargets};
+     *                               this method must do no I/O of its own (2026-09-13 audit, P1)
      */
     private MasterServiceResponse createSingleFromBulkItem(
             Master master,
             OwnerType ownerType,
             UUID ownerId,
             BulkServiceItemRequest item,
-            ServiceType serviceType) {
+            ServiceType serviceType,
+            @Nullable ServiceDefinition reusable,
+            @Nullable MasterServiceAssignment reactivateAssignment) {
+
+        if (reusable != null) {
+            if (reactivateAssignment != null) {
+                MasterServiceAssignment existing = reactivateAssignment;
+                // Avoid a lazy load of existing.serviceDefinition: reusable is the same row,
+                // already hydrated by findSalonBulkSetupCandidates in this transaction.
+                existing.setServiceDefinition(reusable);
+                existing.setActive(true);
+                ResolvedBand band = resolveBulkReuseBand(item, reusable);
+                existing.setPriceTypeOverride(band.priceType());
+                existing.setPriceOverride(band.price());
+                existing.setPriceMaxOverride(band.priceMax());
+                existing.setDurationOverrideMinutes(overrideDurationFor(item, reusable));
+                return MasterServiceResponse.from(existing);
+            }
+
+            ResolvedBand band = resolveBulkReuseBand(item, reusable);
+            MasterServiceAssignment reuseAssignment = MasterServiceAssignment.builder()
+                    .master(master)
+                    .serviceDefinition(reusable)
+                    .priceTypeOverride(band.priceType())
+                    .priceOverride(band.price())
+                    .priceMaxOverride(band.priceMax())
+                    .durationOverrideMinutes(overrideDurationFor(item, reusable))
+                    .isActive(true)
+                    .build();
+
+            return MasterServiceResponse.from(masterServiceRepository.save(reuseAssignment));
+        }
 
         String category = serviceType.getPlatformCategoryName();
 
@@ -586,18 +1104,18 @@ public class ServiceCatalogService {
         // redundant DB round-trip because the JOIN FETCH graph query already returns
         // nothing for a non-existent master.
         //
-        // fromPublic masks priceOverride: this method backs ONLY the permitAll browse route
-        // (ServiceController#getMasterServices), so an anonymous caller must not learn whether a
-        // master prices away from their salon's definition. Masking happens INSIDE the cached
-        // method on purpose — the "masterServices" cache is populated by, and read by, this public
-        // path alone, so the cache holds the already-masked shape and no authenticated path can
-        // pick up a masked entry. The provider's own view goes through getMyServices, which is
-        // uncached and keeps the full variant.
+        // No masking (2026-09-13 audit, S5). This method backs ONLY the permitAll browse route
+        // (ServiceController#getMasterServices) and used to run MasterServiceResponse.fromPublic to
+        // null priceOverride for an anonymous caller. That mask was ineffective and has been
+        // retired: the same row still carries effectivePrice = COALESCE(priceOverride, base_price)
+        // and the nested definition's priceMin = base_price, so the "hidden" value was recoverable
+        // by subtraction — see MasterServiceResponse's retirement note for why the resolution is to
+        // drop the claim rather than the fields the client consumes. Catalogue prices on this route
+        // are public by product design.
         return masterServiceRepository
                 .findByMasterIdAndIsActiveTrueWithGraph(masterId, PageRequest.of(0, 200))
                 .stream()
                 .map(MasterServiceResponse::from)
-                .map(MasterServiceResponse::fromPublic)
                 .toList();
     }
 
@@ -627,6 +1145,117 @@ public class ServiceCatalogService {
                 .toList();
     }
 
+    /**
+     * Returns the FULL service list of one master in {@code salonId}, {@code priceOverride}
+     * unmasked — the salon OWNER/ADMIN management read this class did not previously expose
+     * (Phase 309 D1). Same query and shape as {@link #getMyServices}, just resolved from a
+     * caller-supplied {@code (salonId, masterId)} pair behind an ownership gate instead of the
+     * principal's own {@code userId}.
+     *
+     * <p><b>Defense-in-depth (Phase 309 D2), same shape as {@link #unassignServiceFromMaster}'s
+     * precedent, DIFFERENT failure code on the master-ownership half.</b> The controller's
+     * {@code @PreAuthorize} already checks {@code @authz.canReadSalonMasterServices}; {@code
+     * actorId} re-proves the identical salon-management predicate here via {@link
+     * com.beautica.common.security.AuthorizationService#hasManagementAccess(UUID, UUID)} so a
+     * future non-HTTP caller cannot bypass the SpEL gate — mirrors {@code
+     * deactivateServiceDefinition}'s idiom. The master-belongs-to-salon half intentionally does
+     * NOT go through {@code @authz.masterBelongsToSalon} — that predicate is wired into {@code
+     * unassignServiceFromMaster}'s {@code @PreAuthorize} SpEL, where a cross-salon {@code
+     * masterId} 403s. Phase 309 D2 requires the OPPOSITE here: a cross-salon {@code masterId}
+     * must 404, indistinguishable from "no such master". So this method calls {@link
+     * MasterRepository#existsByIdAndSalonId} directly — the exact predicate {@code
+     * masterBelongsToSalon} itself delegates to — and denies with {@link NotFoundException}
+     * instead of {@link ForbiddenException}.
+     *
+     * <p><b>Own-row branch (Phase 310 D2/D2.4).</b> A {@code SALON_MASTER} reading their own row
+     * always fails {@code hasManagementAccess} — they are neither {@code SALON_OWNER} nor {@code
+     * SALON_ADMIN} — so it alone would wrongly 403 the exact caller Phase 310 widened the SpEL
+     * gate to admit. Before refusing, this method re-derives the identical own-row grant the SpEL
+     * predicate already proved: the resolved {@code masters} row's {@code user_id} must be the
+     * actor, AND {@code salonId} must actually own that row ({@code masterBelongsToSalon}, D2.4)
+     * — never compare against the {@code masters} row id itself, only {@code masters.user_id}
+     * (user id vs. row id is the confusion this defense-in-depth check exists to catch). The
+     * {@code SALON_OWNER}/{@code SALON_ADMIN} fast path above is unchanged — this branch only
+     * runs when {@code hasManagementAccess} has already failed, so it costs no extra query on the
+     * owner/admin path.
+     *
+     * <p><b>D3 query reuse (perf MEDIUM, 2026-09-11).</b> The own-row branch's {@code
+     * masterBelongsToSalon} call and the D3 check below both resolve {@code
+     * existsByIdAndSalonId(masterId, salonId)} — same predicate, same arguments. On the accepted
+     * own-row path this method captures that result and reuses it for D3 instead of issuing the
+     * identical query twice. The owner/admin fast path is untouched: {@code masterBelongsToSalon}
+     * is never computed there, so D3 still issues its own query, preserving that path's existing
+     * query count.
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} (D3) — a
+     * user id never satisfies {@code existsByIdAndSalonId} and so also 404s.
+     *
+     * <p><b>NOT cached (D4).</b> Mirrors {@link #getMyServices}: a low-volume, authenticated
+     * management read. The public {@code masterServices} cache — populated ONLY by {@link
+     * #getMasterServices(UUID)} with the masked shape — is never read, populated or evicted
+     * here.
+     *
+     * <p>{@code isActive = true} only (D5) — same visibility as both sibling reads.
+     *
+     * @throws ForbiddenException if the actor cannot manage {@code salonId} and does not own
+     *                            {@code masterId} themselves
+     * @throws NotFoundException  if {@code masterId} does not exist, or exists in a different salon
+     */
+    @Transactional(readOnly = true)
+    public List<MasterServiceResponse> getSalonMasterServices(
+            UUID actorId, UUID salonId, UUID masterId, Pageable pageable) {
+        // Perf MEDIUM (2026-09-11): masterBelongsToSalon(masterId, salonId) and the D3 check below
+        // are the SAME existsByIdAndSalonId predicate. On the own-row branch we already prove it
+        // here — capture the result and reuse it for D3 instead of re-querying. Stays null (and D3
+        // falls back to its own query) on the owner/admin fast path, where this branch never runs —
+        // that path's query count (3 for owner, 2 for admin) is unchanged. Only assigned when
+        // ownsMasterRow is true: `||` short-circuits masterBelongsToSalon() away otherwise, so a
+        // non-owning SALON_MASTER still costs exactly the one findByIdWithUserAndSalon query before
+        // its 403, same as before.
+        Boolean masterBelongsToSalon = null;
+        if (!authz.hasManagementAccess(salonId, actorId)) {
+            boolean ownsMasterRow = masterRepository.findByIdWithUserAndSalon(masterId)
+                    .map(m -> m.getUser() != null && m.getUser().getId().equals(actorId))
+                    .orElse(false);
+            if (ownsMasterRow) {
+                masterBelongsToSalon = authz.masterBelongsToSalon(masterId, salonId);
+            }
+            if (!ownsMasterRow || !masterBelongsToSalon) {
+                throw new ForbiddenException("Access denied");
+            }
+        }
+        boolean masterExistsInSalon = masterBelongsToSalon != null
+                ? masterBelongsToSalon
+                : masterRepository.existsByIdAndSalonId(masterId, salonId);
+        if (!masterExistsInSalon) {
+            throw new NotFoundException("Master not found: " + masterId);
+        }
+
+        // ADDITIVE pagination (2026-09-13 audit, P7). This used to hard-code
+        // PageRequest.of(0, SALON_MASTER_SERVICES_PAGE_CAP) and log.warn on exact-cap — truncation
+        // was DETECTED but never ESCAPABLE. The controller now supplies a Pageable defaulting to
+        // that same size, so every existing caller is byte-identical while a caller who does hit
+        // the cap can page past it. The warn is kept and — since the cycle-2 audit (B10) — genuinely
+        // narrowed to the first page by a `pageNumber == 0` gate: it flags the boundary for a
+        // client that is not paging, and stays silent for one that is. Until B10 the comment
+        // claimed that narrowing and the code had no gate at all, so a legitimate client paging
+        // with ?size=50 logged a warning on every full page.
+        List<MasterServiceResponse> services = masterServiceRepository
+                .findByMasterIdAndIsActiveTrueWithGraph(masterId, pageable)
+                .stream()
+                .map(MasterServiceResponse::from)
+                .toList();
+
+        if (pageable.getPageNumber() == 0 && services.size() == pageable.getPageSize()) {
+            log.warn(
+                    "getSalonMasterServices returned exactly the {} row page size for salonId={} "
+                            + "masterId={} page={} — a non-paging client may be truncated",
+                    pageable.getPageSize(), salonId, masterId, pageable.getPageNumber());
+        }
+
+        return services;
+    }
+
     @Transactional
     // Controller applies the role-only fast gate (hasAnyRole SALON_OWNER/INDEPENDENT_MASTER);
     // ownership is enforced here (anti-bug §D/§B14 defense-in-depth) so a future non-HTTP caller
@@ -649,9 +1278,13 @@ public class ServiceCatalogService {
         // available-slots cache entries for affected masters. Clients may otherwise see
         // stale slot data for the inactive service until the cache TTL expires.
         // Date-specific eviction is not feasible here (no date context at deactivation
-        // time), so we evict all available-slots cache keys whose first element is a
-        // matching masterId using the Caffeine prefix scan pattern (anti-bug §F rule 6).
-        evictAvailableSlotsCache(affectedMasterIds);
+        // time), so eviction is by the Caffeine prefix scan pattern (anti-bug §F rule 6) — but see
+        // MEDIUM-3 (Phase-307 perf audit) just below: the direct synchronous call this comment used
+        // to describe is gone, because evictBookableFutureSlotsCache's off-thread sweep already
+        // covers "available-slots" as a superset (SlotCalculationService#BOOKING_WRITE_CACHES).
+        // Duplicating it here scanned the same cache, for the same masters, twice — once
+        // synchronously on the committing thread, which is exactly what
+        // MasterCachePrefixEvictor's javadoc says must not happen.
 
         // Fix #6 PERF: deactivation removes this definition from every performing master's bookable set,
         // so the shared master-service-bookable free-slot verdict (gating the booking master-list) is now
@@ -659,8 +1292,10 @@ public class ServiceCatalogService {
         evictBookableFutureSlotsCache(affectedMasterIds);
 
         // Fix #2/#6 PERF: a SALON-owned definition leaving the bookable set changes the salon catalogue.
-        // findSalonOwnerId returns the salon id only for a SALON-owned def (empty → master-owned, no
-        // catalogue entry). Resolved before the UPDATE (deactivation flips is_active, not ownerType).
+        // findSalonOwnerId returns the salon id only for a SALON-owned def (empty → master-owned, which
+        // post-Phase-302 means an INDEPENDENT master with no salon catalogue entry to evict — a salon
+        // master's definitions are SALON-owned, so this branch already resolves their salon id).
+        // Resolved before the UPDATE (deactivation flips is_active, not ownerType).
         evictSalonCatalogAfterCommit(serviceRepository.findSalonOwnerId(serviceDefId).orElse(null));
 
         // Step 3: execute the update; check after registration so the callback is a
@@ -906,8 +1541,8 @@ public class ServiceCatalogService {
      * </ul>
      */
     private void applyPriceMode(ServiceDefinition definition, PriceType priceType,
-                                 java.math.BigDecimal price, java.math.BigDecimal priceMin,
-                                 java.math.BigDecimal priceMax) {
+                                 BigDecimal price, BigDecimal priceMin,
+                                 BigDecimal priceMax) {
         definition.setPriceType(priceType);
         if (priceType == PriceType.FIXED) {
             definition.setBasePrice(price);
@@ -934,14 +1569,17 @@ public class ServiceCatalogService {
      * assigned, and with ≥1 free future slot after existing bookings are subtracted. This is the same
      * verdict the booking master-list uses ({@code BookingMasterService#getBookableMasters}), so the
      * catalogue and the master picker can never disagree. Candidate assignments are loaded once
-     * ({@code findBookableAssignmentsBySalon}), grouped by master, and each master's schedule + booking
-     * window is resolved ONCE by {@code SlotCalculationService#filterBookableAssignments} — O(distinct
-     * masters) heavy loads, not O(services × masters).
+     * ({@code findBookableAssignmentsBySalon}), grouped by master, and EVERY master's schedule + booking
+     * window is resolved in ONE statement each — total, not per master — by
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch} (Phase 315: O(1) heavy loads for
+     * the whole salon, not O(distinct masters); see that method's javadoc and
+     * {@code SalonCatalogueBatchLoadIT} for the statement-count gate).
      *
      * <p><b>Caching (perf/security #2).</b> Cached in {@code salon-service-catalog} keyed on
      * {@code salonId} (60-sec TTL, {@code sync=true}) — this is a {@code permitAll} endpoint whose body
-     * runs an O(distinct masters) free-slot compute per hit (schedule resolve + booking load per master),
-     * a DB-amplification / stampede surface without a result cache. {@code sync=true} collapses the
+     * runs a free-slot compute per hit (one batched schedule resolve + one batched booking load for the
+     * whole salon, Phase 315), a DB-amplification / stampede surface without a result cache. {@code
+     * sync=true} collapses the
      * thundering herd when a popular salon's entry expires (§F-7). Explicit eviction runs afterCommit via
      * {@link SalonCatalogCacheEvictor} from every write that can flip the bookable-service set: a
      * booking / cancellation / schedule change on any master in the salon (evicted at those write sites
@@ -950,6 +1588,12 @@ public class ServiceCatalogService {
      *
      * <p>The result is the WHOLE catalog (not paginated) so the mobile client can group it by
      * category client-side; the candidate query is bounded by salon scope, not a caller-supplied size.
+     *
+     * <p><b>Pricing (Phase 314).</b> Each row's {@code priceType}/{@code priceMin}/{@code priceMax}/
+     * {@code priceDisplay} is the union hull of its bookable masters' RESOLVED bands — see
+     * {@link #priceForSalonCatalogue} — never the shared {@link ServiceDefinition}'s own band. This
+     * costs no extra query: the same {@code candidates} loaded above carry every value the
+     * aggregation needs (D5).
      */
     @Transactional(readOnly = true)
     @Cacheable(value = "salon-service-catalog", key = "#salonId", sync = true)
@@ -961,14 +1605,24 @@ public class ServiceCatalogService {
             return new SalonServiceCatalogResponse(List.of());
         }
 
-        List<ServiceDefinition> definitions = bookableDefinitions(candidates);
-        if (definitions.isEmpty()) {
+        Map<UUID, List<MasterServiceAssignment>> bookableByDefinition = bookableDefinitions(candidates);
+        if (bookableByDefinition.isEmpty()) {
             return new SalonServiceCatalogResponse(List.of());
         }
 
         CategoryOrderAndNames orderAndNames = buildCategoryOrderAndNames();
         Map<String, Integer> categoryOrder = orderAndNames.order();
         Map<String, String> categoryDisplayNames = orderAndNames.displayNames();
+
+        // Phase 314 D2 — one representative ServiceDefinition per surviving group, sorted
+        // (category, name) exactly as the pre-314 `bookableDefinitions` did; the assignment list
+        // behind each definition is what D1's aggregation reads, never the definition alone.
+        List<ServiceDefinition> definitions = bookableByDefinition.values().stream()
+                .map(assignments -> assignments.get(0).getServiceDefinition())
+                .sorted(Comparator
+                        .comparing((ServiceDefinition sd) -> Objects.requireNonNullElse(sd.getCategory(), ""))
+                        .thenComparing(ServiceDefinition::getName))
+                .toList();
 
         Map<String, List<ServiceDefinition>> byCategory = definitions.stream()
                 .collect(Collectors.groupingBy(
@@ -985,36 +1639,116 @@ public class ServiceCatalogService {
                         e.getKey(),
                         categoryDisplayNames.getOrDefault(e.getKey(), e.getKey()),
                         e.getValue().size(),
-                        e.getValue().stream().map(ServiceDefinitionResponse::from).toList()))
+                        e.getValue().stream()
+                                .map(sd -> priceForSalonCatalogue(sd, bookableByDefinition.get(sd.getId())))
+                                .toList()))
                 .toList();
 
         return new SalonServiceCatalogResponse(categories);
     }
 
     /**
-     * Groups the candidate assignments by master, runs the batched free-slot gate once per master
-     * ({@code SlotCalculationService#filterBookableAssignments} — one schedule resolve + one booking
-     * load per master), and returns the distinct {@link ServiceDefinition}s that at least one bookable
-     * master performs, sorted by {@code (category, name)} so the caller's category grouping keeps the
-     * same within-group ordering the previous {@code findBookableServicesBySalon} query produced.
+     * Groups the candidate assignments by master, runs the batched free-slot gate ONCE for the WHOLE
+     * salon ({@code SlotCalculationService#filterBookableAssignmentsBatch} — Phase 315: one schedule
+     * resolve statement and one booking-load statement for every master in the salon COMBINED, not one
+     * of each per master), and returns the surviving assignments grouped by {@code serviceDefinition.id}
+     * (Phase 314 D2). Earlier this collapsed straight to distinct {@link ServiceDefinition}s and threw
+     * the assignments away; that made it impossible to tell WHICH masters' bands should price the row,
+     * so this reshaping is required before {@link #priceForSalonCatalogue} can aggregate correctly —
+     * aggregating over the raw, un-filtered {@code candidates} would let a filtered-out master's band
+     * still set the salon's displayed floor or ceiling.
+     *
+     * <p><b>Phase 315 — batching changed WHEN rows load, never WHAT this method returns.</b> The
+     * pre-315 body called {@code filterBookableAssignments} once per master in a loop; this calls
+     * {@code filterBookableAssignmentsBatch} exactly once with every master's candidates pre-grouped.
+     * The per-master gate logic, the per-master {@code verdictByDuration} memo and the free-slot walk
+     * are byte-for-byte the same code, reached through one call instead of N — the union this method
+     * assembles from the batch result is identical, master for master and assignment for assignment, to
+     * the union the old per-master loop assembled (pinned by {@code SalonCatalogueBatchLoadIT} case 11,
+     * the non-vacuous batch-vs-N-singleton-calls differential).
+     *
+     * <p><b>Phase 305 D1 — the free-slot gate applied here is DELIBERATE contract, not a bug.</b> A
+     * candidate assignment is kept only when the batched gate finds its master a free future slot for
+     * the service's effective duration; a master with NO working hours configured resolves zero
+     * effective schedule days and is therefore filtered out entirely, so NONE of their services reach
+     * the salon catalogue — even though Phases 302/303 make those definitions genuinely
+     * {@code SALON}-owned. {@code GET /salons/{salonId}/services} answers "what can a client book here
+     * right now?", not "what does this salon's staff list on paper?", and this is the call frame where
+     * that answer is enforced.
+     *
+     * <p><b>Do not "fix" this.</b> Any future finding titled "a master's services are missing from
+     * the salon catalogue" must first check whether that master has working hours configured — see
+     * {@code SalonCatalogueVisibilityIT#should_notBeVisible_when_masterHasNoWorkingHours_pinningD1AsDeliberate}
+     * (Phase 305 D1/D2 condition 5), which pins exactly this behaviour as deliberate.
      */
-    private List<ServiceDefinition> bookableDefinitions(List<MasterServiceAssignment> candidates) {
+    private Map<UUID, List<MasterServiceAssignment>> bookableDefinitions(
+            List<MasterServiceAssignment> candidates) {
         Map<UUID, List<MasterServiceAssignment>> byMaster = candidates.stream()
                 .collect(Collectors.groupingBy(a -> a.getMaster().getId()));
 
-        Map<UUID, ServiceDefinition> bookableById = new LinkedHashMap<>();
-        for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : byMaster.entrySet()) {
-            for (MasterServiceAssignment msa :
-                    slotCalculationService.filterBookableAssignments(entry.getKey(), entry.getValue())) {
-                bookableById.putIfAbsent(msa.getServiceDefinition().getId(), msa.getServiceDefinition());
+        Map<UUID, List<MasterServiceAssignment>> bookableByMaster =
+                slotCalculationService.filterBookableAssignmentsBatch(byMaster);
+
+        Map<UUID, List<MasterServiceAssignment>> bookableByDefinition = new LinkedHashMap<>();
+        for (List<MasterServiceAssignment> bookable : bookableByMaster.values()) {
+            for (MasterServiceAssignment msa : bookable) {
+                bookableByDefinition
+                        .computeIfAbsent(msa.getServiceDefinition().getId(), key -> new ArrayList<>())
+                        .add(msa);
             }
         }
 
-        return bookableById.values().stream()
-                .sorted(Comparator
-                        .comparing((ServiceDefinition sd) -> Objects.requireNonNullElse(sd.getCategory(), ""))
-                        .thenComparing(ServiceDefinition::getName))
-                .toList();
+        return bookableByDefinition;
+    }
+
+    /**
+     * Phase 314 D1/D3 — prices one salon-catalogue row as the union hull of {@code assignments}'
+     * RESOLVED bands ({@link ServicePricing#ofAssignment}), never {@code sd}'s own band. Pure
+     * in-memory work over the already-loaded, already-bookable-filtered assignment list — no
+     * repository call happens here (D5): the statement count for this method is zero.
+     *
+     * <p>{@code assignments} is guaranteed non-empty and non-null by construction — it is exactly
+     * the value {@link #bookableDefinitions} stored under {@code sd.getId()}, which is only ever
+     * populated by an {@code add}, never a put of an empty list.
+     */
+    private ServiceDefinitionResponse priceForSalonCatalogue(
+            ServiceDefinition sd, List<MasterServiceAssignment> assignments) {
+        BigDecimal min = null;
+        BigDecimal max = null;
+
+        for (MasterServiceAssignment msa : assignments) {
+            ServicePricing pricing = ServicePricing.ofAssignment(msa);
+            BigDecimal floor = pricing.priceMin();
+            if (floor == null) {
+                // D1 — ServiceDefinition.basePrice carries no entity-level @NotNull; skip a
+                // contributor that resolves to no floor rather than let it corrupt the hull.
+                continue;
+            }
+            // FIXED resolves to a null ceiling (ServicePricing contract) — the degenerate
+            // interval [floor, floor], per D1's ceiling(msa) rule.
+            BigDecimal ceiling = pricing.priceMax() != null ? pricing.priceMax() : floor;
+
+            min = min == null ? floor : min.min(floor);
+            max = max == null ? ceiling : max.max(ceiling);
+        }
+
+        if (min == null) {
+            // D1 — every contributor was null; fall back to the definition rather than emit a
+            // half-formed band (case 14).
+            return ServiceDefinitionResponse.from(sd);
+        }
+
+        // D4 — every contributing band is closed by construction (chk_master_service_price_mode
+        // + MasterServiceBand.validate). Assert it anyway so a future loosening of either
+        // guarantee fails loudly here rather than rendering an inverted band to a customer.
+        if (max.compareTo(min) < 0) {
+            throw new IllegalStateException(
+                    "salon catalogue price aggregate produced max < min for service definition "
+                            + sd.getId());
+        }
+
+        BigDecimal renderedMax = max.compareTo(min) == 0 ? null : max;
+        return ServiceDefinitionResponse.fromSalonAggregate(sd, min, renderedMax);
     }
 
     /**
@@ -1133,47 +1867,6 @@ public class ServiceCatalogService {
         // (auto-escaped), so no manual sanitize is needed here.
         serviceTypeSuggestionService.submitSuggestion(
                 request.categoryName(), request.name(), request.description(), requestedByUserId);
-    }
-
-    /**
-     * Evicts all {@code available-slots} cache entries whose key prefix matches any
-     * of the given master IDs.
-     *
-     * <p>The {@code available-slots} cache key is a SpEL array
-     * {@code {masterId, date, masterServiceId}}. Spring renders it as a
-     * {@code SimpleKey} whose {@code toString()} starts with {@code "[masterId,"}.
-     * Because deactivation has no date/service context, we remove all date × service
-     * combinations for the affected masters in one sweep.
-     *
-     * <p>When a Spring transaction is active, the eviction is deferred to
-     * {@code afterCommit} (anti-bug §F rule 2).
-     *
-     * <p>Fix MEDIUM-9.
-     */
-    private void evictAvailableSlotsCache(List<UUID> masterIds) {
-        if (masterIds.isEmpty()) return;
-        if (TransactionSynchronizationManager.isSynchronizationActive()) {
-            TransactionSynchronizationManager.registerSynchronization(
-                    new TransactionSynchronization() {
-                        @Override
-                        public void afterCommit() {
-                            doEvictAvailableSlots(masterIds);
-                        }
-                    }
-            );
-        } else {
-            doEvictAvailableSlots(masterIds);
-        }
-    }
-
-    private void doEvictAvailableSlots(List<UUID> masterIds) {
-        // available-slots is @Cacheable(key = "{#masterId, #date, #masterServiceId}") — an explicit SpEL
-        // inline list, so the runtime key is an ArrayList whose first element is the masterId, never a
-        // SimpleKey. The local copy of this predicate that used to live here tested `instanceof SimpleKey`
-        // and so evicted nothing at all; the shared evictor owns the one correct key-shape check.
-        for (UUID masterId : masterIds) {
-            cachePrefixEvictor.evictByKeyPrefixNow(masterId, "available-slots");
-        }
     }
 
     /**
@@ -1363,6 +2056,309 @@ public class ServiceCatalogService {
                         type != null ? type.getNameUk() : null, existingId);
             }
         }
+    }
+
+    /**
+     * Phase 302 D2/D4 — the SALON branch's whole read-then-write critical section, in ONE query
+     * for the whole batch: it both rejects a genuine per-master conflict (409) and returns the
+     * salon definitions the batch should reuse.
+     *
+     * <p><b>Why the SALON branch cannot use the owner-level guard.</b> Under D1 the owner is the
+     * salon, shared by every master in it. Asking "does the OWNER already offer this type" would
+     * reject the salon's second master from ever offering «Манікюр» — the exact opposite of the
+     * phase's goal. The salon already offering a type is the REUSE path; the only genuine
+     * conflict left is <em>this master</em> already performing it, whose backing invariant is
+     * {@code master_services}' {@code UNIQUE (master_id, service_def_id)}.
+     *
+     * <p><b>One round-trip, not three (audit LOW-3).</b> This previously ran a per-master
+     * assignment query, then an owner-level definition query, then a {@code findAllById} that
+     * merely re-fetched definitions the second query had already joined. Once the advisory lock
+     * became salon-keyed (audit HIGH-2) that serialized window is salon-wide, so three round-trips
+     * inside it multiply across every concurrent master setup in the salon.
+     * {@link ServiceRepository#findSalonBulkSetupCandidates} answers all three questions in one
+     * batched (never per-item) statement.
+     *
+     * <p><b>Salon-scoped (audit HIGH-1).</b> The deleted per-master finder matched on
+     * {@code master_id} alone, so a master ROTATED between salons — rotation moves
+     * {@code masters.salon_id} and never touches {@code master_services} — kept ACTIVE assignments
+     * to the SOURCE salon's definitions and was refused in the destination with a 409 disclosing a
+     * source-salon {@code existingServiceDefId}. Scoping lives in the query's owner predicate; its
+     * {@code INDEPENDENT_MASTER} arm keeps the ~60 legacy master-owned rows (phase 303 backfills
+     * them) firing as conflicts.
+     *
+     * @return type id → the salon's reusable ACTIVE definition (plus, Phase 307 D6, type id → any
+     *         INACTIVE assignment of the master's own that must be reactivated rather than
+     *         re-inserted); empty when the salon offers none of the batch's types
+     * @throws DuplicateServiceException (409) naming the first item this master already offers
+     */
+    private SalonBulkCandidateResolution resolveSalonBulkCandidates(
+            UUID masterId, UUID salonId,
+            List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
+
+        if (typesById.isEmpty()) {
+            return new SalonBulkCandidateResolution(Map.of(), Map.of());
+        }
+
+        List<SalonBulkSetupCandidate> candidates = serviceRepository
+                .findSalonBulkSetupCandidates(salonId, masterId, typesById.keySet());
+
+        assertMasterDoesNotAlreadyOffer(candidates, items, typesById);
+        Map<UUID, ServiceDefinition> reusableByTypeId = reusableSalonDefinitions(candidates);
+        Map<UUID, UUID> reactivateAssignmentIdByTypeId = reactivatableAssignmentIdByTypeId(candidates);
+        return new SalonBulkCandidateResolution(reusableByTypeId, reactivateAssignmentIdByTypeId);
+    }
+
+    /**
+     * Phase 307 D6 + 2026-09-13 audit P1 — resolves every reactivation target in ONE
+     * {@code findAllById}, keyed back by service-type id for the per-item walk.
+     *
+     * <p>{@link #createSingleFromBulkItem} previously issued {@code findById} per item, inside the
+     * salon-keyed advisory lock, for ids the caller had already projected. A 100-item batch where
+     * every item is a reactivation therefore held that salon-wide lock across 100 serialized
+     * round-trips. One batched read replaces them.
+     *
+     * <p>A missing row is the same {@link IllegalStateException} the per-item lookup raised: the
+     * ids come from {@code findSalonBulkSetupCandidates} inside this very transaction, so a gap
+     * means the row vanished mid-transaction and the batch must not silently insert a duplicate
+     * against {@code master_services}' non-partial {@code UNIQUE (master_id, service_def_id)}.
+     */
+    private Map<UUID, MasterServiceAssignment> loadReactivationTargets(
+            Map<UUID, UUID> reactivateAssignmentIdByTypeId) {
+
+        if (reactivateAssignmentIdByTypeId.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<UUID, MasterServiceAssignment> byId = masterServiceRepository
+                .findAllById(reactivateAssignmentIdByTypeId.values()).stream()
+                .collect(Collectors.toMap(MasterServiceAssignment::getId, Function.identity()));
+
+        Map<UUID, MasterServiceAssignment> byTypeId = new LinkedHashMap<>();
+        reactivateAssignmentIdByTypeId.forEach((typeId, assignmentId) -> {
+            MasterServiceAssignment assignment = byId.get(assignmentId);
+            if (assignment == null) {
+                throw new IllegalStateException(
+                        "Reactivation candidate vanished mid-transaction: " + assignmentId);
+            }
+            byTypeId.put(typeId, assignment);
+        });
+        return byTypeId;
+    }
+
+    /**
+     * Bundles {@link #resolveSalonBulkCandidates}'s two answers: which definitions to reuse, and
+     * which of the master's own INACTIVE assignments must be reactivated rather than re-inserted
+     * (Phase 307 D6). A small local record rather than two separately-threaded maps or a third
+     * round-trip — both come off the same {@link SalonBulkSetupCandidate} list.
+     */
+    private record SalonBulkCandidateResolution(
+            Map<UUID, ServiceDefinition> reusableByTypeId,
+            Map<UUID, UUID> reactivateAssignmentIdByTypeId) {
+    }
+
+    /**
+     * Phase 307 D6 — type id → the master's own INACTIVE {@code master_services} row id for the
+     * salon's reused definition of that type, for every candidate the master previously
+     * unassigned. Only {@code ownerType = SALON} candidates qualify, mirroring
+     * {@link #reusableSalonDefinitions}: an {@code INDEPENDENT_MASTER}-owned legacy definition is a
+     * conflict signal only, never a reuse/reactivation target.
+     */
+    private static Map<UUID, UUID> reactivatableAssignmentIdByTypeId(
+            List<SalonBulkSetupCandidate> candidates) {
+
+        Map<UUID, UUID> reactivateByTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (candidate.definition().getOwnerType() == OwnerType.SALON
+                    && candidate.hasInactiveAssignment()) {
+                reactivateByTypeId.put(candidate.serviceTypeId(), candidate.masterAssignmentId());
+            }
+        }
+        return reactivateByTypeId;
+    }
+
+    /**
+     * Phase 312 D3/D9 — resolves the FULL per-master band a reused item writes onto
+     * {@code master_services}, superseding the Phase 302 guard that used to REJECT a shape
+     * differing from the reused definition's ({@code assertReusableShapesAreRepresentable} /
+     * {@code isShapeRepresentableOnAssignment}, retired). V165 (Phase 311) gives
+     * {@code master_services} its own shape and ceiling, so every shape the item can express is
+     * now representable — the reuse branch stores it instead of discarding it:
+     * <ul>
+     *   <li>{@code FIXED 500} definition + {@code RANGE 400–900} item → the master's OWN
+     *       {@code RANGE 400–900} band is stored (previously flattened to {@code FIXED 400}).</li>
+     *   <li>{@code RANGE 400–900} definition + {@code FIXED 600} item → the master's OWN
+     *       {@code FIXED 600} is stored (previously rendered {@code 600–900}, a ceiling nobody
+     *       set).</li>
+     *   <li>{@code RANGE 400–900} definition + {@code RANGE 500–800} item → the master's OWN
+     *       ceiling {@code 800} is stored (previously discarded in favour of the salon's 900).</li>
+     * </ul>
+     *
+     * <p><b>Inherited when the item's band matches the reused definition's, own band otherwise
+     * (Phase 311 D2 — all-or-nothing).</b> An item whose type, floor AND (for RANGE) ceiling all
+     * equal the reused definition's needs no override at all: leaving the three columns
+     * {@code NULL} means this assignment keeps tracking the shared definition, exactly as a plain
+     * FIXED-against-FIXED reuse always has. Any other item is stored as a complete, independent
+     * band — never a partial one, which {@link MasterServiceBand#isLegal} guards as
+     * defense-in-depth (D2's one-truth-table property, Phase 312's whole point: this is the SAME
+     * validator {@code updateMasterServiceBand} and {@link #assignServiceToMaster} defer to, not
+     * a second copy of the comparisons).
+     *
+     * <p>The floor/ceiling comparison uses {@code compareTo}, never {@code equals}: {@code 900}
+     * and {@code 900.00} are the same money and must not be read as a diverging band.
+     *
+     * <p>Pure in-memory — {@code reused} was already loaded by
+     * {@link ServiceRepository#findSalonBulkSetupCandidates} in this transaction, so this adds no
+     * round-trip inside the salon-wide serialized window.
+     *
+     * @param item   the batch item being written; already internally coherent — {@code @Valid}'s
+     *               {@code @ServicePriceValid} on {@link BulkServiceItemRequest} guarantees a
+     *               FIXED item carries only {@code price} and a RANGE item carries a STRICTLY
+     *               increasing {@code priceMin < priceMax} pair — {@code ServicePriceValidator}
+     *               rejects {@code priceMax == priceMin} — before this method ever runs
+     * @param reused the salon's existing active definition this item reuses
+     * @return the triple to write onto the new/reactivated {@link MasterServiceAssignment}; all
+     *         three {@code null} for Inherited, or all three populated for an own band
+     */
+    private static ResolvedBand resolveBulkReuseBand(BulkServiceItemRequest item, ServiceDefinition reused) {
+        if (bulkItemBandMatchesDefinition(item, reused)) {
+            return ResolvedBand.INHERITED;
+        }
+
+        BigDecimal floor = item.priceType() == PriceType.FIXED ? item.price() : item.priceMin();
+        BigDecimal ceiling = item.priceType() == PriceType.RANGE ? item.priceMax() : null;
+
+        // Assertion, not a guard — and no longer a vacuous one. @ServicePriceValid on
+        // BulkServiceItemRequest and MasterServiceBand.isLegal now agree on the strict (>)
+        // floor/ceiling comparison (Phase 312 D8), so this fires only if the two truth tables
+        // genuinely drift, or if the field translation above (definition-shaped priceMin/priceMax
+        // → band-shaped price/priceMax) stops being faithful. Either is a bug, not a bad request,
+        // hence IllegalStateException rather than a 400.
+        if (!MasterServiceBand.isLegal(item.priceType(), floor, ceiling)) {
+            throw new IllegalStateException(
+                    "Bulk item band failed the MasterServiceBand invariant after passing "
+                            + "@ServicePriceValid — validator drift: " + item);
+        }
+        return new ResolvedBand(item.priceType(), floor, ceiling);
+    }
+
+    /**
+     * True iff {@code item}'s full band (shape, floor, and — for RANGE — ceiling) is
+     * byte-for-byte what {@code reused} already offers, i.e. the assignment needs no override at
+     * all and can stay Inherited (Phase 311 D2).
+     */
+    private static boolean bulkItemBandMatchesDefinition(BulkServiceItemRequest item, ServiceDefinition reused) {
+        if (item.priceType() != reused.getPriceType()) {
+            return false;
+        }
+        BigDecimal itemFloor = item.priceType() == PriceType.FIXED ? item.price() : item.priceMin();
+        BigDecimal reusedFloor = reused.getBasePrice();
+        if (itemFloor == null || reusedFloor == null || itemFloor.compareTo(reusedFloor) != 0) {
+            return false;
+        }
+        if (item.priceType() != PriceType.RANGE) {
+            return true;
+        }
+        BigDecimal itemCeiling = item.priceMax();
+        BigDecimal reusedCeiling = reused.getPriceMax();
+        return itemCeiling != null && reusedCeiling != null
+                && itemCeiling.compareTo(reusedCeiling) == 0;
+    }
+
+    /**
+     * The band {@link #resolveBulkReuseBand} decides to write onto a reused-definition
+     * assignment: either {@link #INHERITED} (all three {@code master_services} band columns
+     * {@code NULL}) or a fully-specified own band — never partial (Phase 311 D2).
+     */
+    private record ResolvedBand(PriceType priceType, BigDecimal price, BigDecimal priceMax) {
+        private static final ResolvedBand INHERITED = new ResolvedBand(null, null, null);
+    }
+
+    /**
+     * Phase 302 D4 — the per-MASTER conflict half of {@link #resolveSalonBulkCandidates}.
+     *
+     * <p>Keyed on the SERVICE TYPE, not on the definition id: the client picks a type, and a
+     * master must not end up with two rows for the same type even if two owners held a definition
+     * for it. Checking {@code serviceDefId} instead would be satisfied by the assignment unique
+     * constraint alone and would not express this rule.
+     *
+     * <p>Reports the FIRST collision in <em>request</em> order — result order is unspecified, and
+     * blaming a later item for an earlier item's conflict would make the error non-deterministic
+     * across identical requests. The reported {@code existingServiceDefId} prefers the SALON-owned
+     * row when a legacy master-owned definition for the same type also exists: that is the row the
+     * caller is authorised for and can deep-link to.
+     *
+     * <p>Like every read-then-write guard here it is TOCTOU-prone; the assignment unique key is
+     * the actual guarantee, and the advisory lock this runs under makes ordinary contention
+     * produce this clean, item-naming 409 rather than a raced constraint violation.
+     *
+     * @throws DuplicateServiceException (409) naming the first item this master already offers
+     */
+    private static void assertMasterDoesNotAlreadyOffer(List<SalonBulkSetupCandidate> candidates,
+            List<BulkServiceItemRequest> items, Map<UUID, ServiceType> typesById) {
+
+        Map<UUID, UUID> conflictingDefIdByTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (!candidate.assignedToMaster()) {
+                continue;
+            }
+            boolean salonOwned = candidate.definition().getOwnerType() == OwnerType.SALON;
+            if (salonOwned || !conflictingDefIdByTypeId.containsKey(candidate.serviceTypeId())) {
+                conflictingDefIdByTypeId.put(
+                        candidate.serviceTypeId(), candidate.definition().getId());
+            }
+        }
+
+        for (BulkServiceItemRequest item : items) {
+            UUID existingId = conflictingDefIdByTypeId.get(item.serviceTypeId());
+            if (existingId != null) {
+                ServiceType type = typesById.get(item.serviceTypeId());
+                throw new DuplicateServiceException(
+                        type != null ? type.getNameUk() : null, existingId);
+            }
+        }
+    }
+
+    /**
+     * Phase 302 D2 — the REUSE half of {@link #resolveSalonBulkCandidates}: the salon's own ACTIVE
+     * definitions, keyed by service-type id, so {@link #createSingleFromBulkItem} can attach this
+     * master's assignment to them instead of minting a second definition V121 would refuse.
+     *
+     * <p>Only {@code ownerType = SALON} rows qualify. A legacy {@code INDEPENDENT_MASTER}-owned
+     * definition in the candidate set is a CONFLICT signal only (see
+     * {@link #assertMasterDoesNotAlreadyOffer}); reusing it would leave the salon's catalogue
+     * without the row the catalogue query requires. V121 admits at most one active SALON-owned
+     * definition per {@code (salonId, typeId)}, so at most one row can land per key.
+     *
+     * <p>The definitions arrive already hydrated from the candidate query — the assignment insert
+     * needs the managed entity, D3's override comparison needs its base price/duration, and the
+     * response DTO renders it. Their {@code serviceType} association resolves from the persistence
+     * context ({@code resolveBulkServiceTypes} loaded exactly these types in this transaction), so
+     * no N+1 follows.
+     */
+    private static Map<UUID, ServiceDefinition> reusableSalonDefinitions(
+            List<SalonBulkSetupCandidate> candidates) {
+
+        Map<UUID, ServiceDefinition> reusableByTypeId = new LinkedHashMap<>();
+        for (SalonBulkSetupCandidate candidate : candidates) {
+            if (candidate.definition().getOwnerType() == OwnerType.SALON) {
+                reusableByTypeId.put(candidate.serviceTypeId(), candidate.definition());
+            }
+        }
+        return reusableByTypeId;
+    }
+
+    /**
+     * Phase 302 D3 — the {@code master_services.duration_override_minutes} for a reused
+     * definition: the batch item's duration when it differs from the salon definition's
+     * {@code base_duration_minutes}, else {@code null}.
+     */
+    @Nullable
+    private static Integer overrideDurationFor(BulkServiceItemRequest item, ServiceDefinition reused) {
+        Integer itemDuration = item.durationMinutes();
+        if (itemDuration == null || itemDuration == reused.getBaseDurationMinutes()) {
+            return null;
+        }
+        return itemDuration;
     }
 
     /**

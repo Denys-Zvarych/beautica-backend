@@ -65,10 +65,10 @@ class InviteValidateGetRateLimitTest {
     }
 
     /**
-     * 21 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
+     * 22 positional caches — one per {@code @Qualifier} arg on the production constructor. Only
      * the 20th (invite-validate) is constrained; every other bucket — including the 21st
-     * (invite-accept) — is permissive, so a 429 here can only have come from the branch under
-     * test.
+     * (invite-accept) and the 22nd (catalogue-browse) — is permissive, so a 429 here can only
+     * have come from the branch under test.
      */
     private AuthRateLimitFilter filterWithTinyInviteValidateBucket() {
         return new AuthRateLimitFilter(
@@ -77,7 +77,7 @@ class InviteValidateGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(),
-                tinyInviteValidateCache(), permissive());
+                tinyInviteValidateCache(), permissive(), permissive());
     }
 
     private static MockHttpServletRequest get(String path, String remoteAddr) {

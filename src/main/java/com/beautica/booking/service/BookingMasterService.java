@@ -35,7 +35,7 @@ import java.util.UUID;
  * bookings subtracted; slot start ≥ now + {@link BookingWindow#MIN_MINUTES_AHEAD}). This
  * is the exact same verdict the salon catalogue uses
  * ({@code ServiceCatalogService#getSalonServiceCatalog} via
- * {@link SlotCalculationService#filterBookableAssignments}), computed from the exact same
+ * {@link SlotCalculationService#filterBookableAssignmentsBatch}), computed from the exact same
  * effective-day resolver and {@code TimeSlotCalculator} subtraction that
  * {@link SlotCalculationService#getAvailableSlots} exposes — so the master list, the catalogue, and
  * the slot picker can never disagree on whether a master is bookable. Salon master rosters are small
