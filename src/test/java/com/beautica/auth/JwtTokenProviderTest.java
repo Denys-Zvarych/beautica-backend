@@ -14,11 +14,14 @@ import org.slf4j.LoggerFactory;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.Date;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("JwtTokenProvider — unit")
@@ -294,5 +297,28 @@ class JwtTokenProviderTest {
         assertThat(jwtTokenProvider.isAccessToken(claims))
                 .as("isAccessToken from pre-parsed Claims must return true for access token")
                 .isTrue();
+    }
+
+    @Test
+    @DisplayName("token minted under a Clock pinned one year in the past still parses")
+    void should_parseToken_when_mintedUnderClockFixedOneYearInThePast() {
+        // Regression guard (§G): the parser must validate `exp` against the INJECTED Clock,
+        // not the system wall clock. A provider whose parser has no clock throws
+        // ExpiredJwtException here, because a token minted a year ago with a 15-minute TTL
+        // is long dead by real time. Every frozen-clock integration test that authenticates
+        // depends on this (see SalonCatalogueBatchLoadIT).
+        var pastClock = Clock.fixed(Instant.now().minus(Duration.ofDays(365)), ZoneOffset.UTC);
+        var provider = new JwtTokenProvider(
+                new JwtConfig(SECRET, ACCESS_EXPIRY_MS, REFRESH_EXPIRY_MS), pastClock);
+        var userId = UUID.randomUUID();
+
+        String token = provider.generateAccessToken(userId, "past@beautica.com", Role.CLIENT);
+
+        assertThatCode(() -> provider.parseAllClaims(token))
+                .as("parser must honour the injected Clock, not system time, when checking exp")
+                .doesNotThrowAnyException();
+        assertThat(provider.getUserIdFromToken(token))
+                .as("claims from a past-clock token must still resolve")
+                .isEqualTo(userId);
     }
 }
