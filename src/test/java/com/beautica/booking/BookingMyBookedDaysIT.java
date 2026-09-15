@@ -621,7 +621,76 @@ class BookingMyBookedDaysIT extends AbstractIntegrationTest {
                 .isEqualTo(2);
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // 7 — the DEACTIVATED performing SALON_MASTER (Phase 318)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Phase 318 wired {@code getMyBookedDays}' provider branch to {@code
+     * BookingService#resolveProviderMasterScope}, the shared resolver that denies a {@code
+     * SALON_MASTER} whose {@code masters.is_active} has gone false. That resolver was pinned only
+     * through {@code GET /bookings/me} ({@code ProviderCanReviewClientIT#
+     * should_return403OnList_when_performingSalonMasterIsDeactivated}), so THIS surface's wiring to
+     * it was unasserted: a future edit re-inlining {@code masterRepository.findByUserId(...)} here
+     * would reopen the hole with every test still green. The rail is not a lesser surface — a dot
+     * on a day is a booking, and {@code GET /bookings/me?from=D&to=D} (which this suite already
+     * proves agrees with the rail) serves the client's name, phone and price behind it.
+     *
+     * <p>Shape mirrors the {@code ProviderCanReviewClientIT} pins exactly: the JWT is captured
+     * BEFORE deactivation and reused after, so the test proves the token still AUTHENTICATES and
+     * only authorization changed — the real exposure is an already-issued JWT in a fired stylist's
+     * app, not a fresh login. Both halves are load-bearing: a mutant that re-inlines the lookup
+     * fails the 403, a mutant that denies every salon master fails the 200 control.
+     */
+    @Test
+    @DisplayName("BOOKED-DAYS 200 → 403 — the performing SALON_MASTER's rail is served while they "
+            + "are employed, then the SAME token is refused the moment masters.is_active goes "
+            + "false; pins that getMyBookedDays resolves its provider scope through the shared "
+            + "resolveProviderMasterScope and not an inlined masterRepository.findByUserId")
+    void should_return403OnBookedDays_when_performingSalonMasterIsDeactivated() throws Exception {
+        BookingTestFixtures.SalonFixture salon =
+                fixtures.createSalon("mbbd-deact-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = fixtures.createUser(
+                "mbbd-deact-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createSalonService(salon.salonId(), salon.masterId());
+
+        LocalDate day = LocalDate.of(2032, 9, 14);
+        insertBooking(clientId, salon.masterId(), serviceId, salon.salonId(), kyiv(day, 11, 0));
+
+        String masterToken = fixtures.tokenFor(salon.masterEmail());
+
+        assertThat(callBookedDays(masterToken, day, day))
+                .as("ACTIVE-MASTER CONTROL — while employed, the performing master's rail dots the "
+                        + "day they are booked on. Without this half the 403 below could pass "
+                        + "vacuously against a hard-deny mutant, or against a fixture that never "
+                        + "produced a dot in the first place")
+                .containsExactly(day);
+
+        deactivateMaster(salon.masterId());
+
+        ResponseEntity<String> afterResp = callBookedDaysRaw(masterToken, day, day);
+        assertThat(HttpStatus.valueOf(afterResp.getStatusCode().value()))
+                .as("403, NOT a 200 with an empty list — the same answer GET /bookings/me and GET "
+                        + "/bookings/{id} already give a deactivated master. A 200-with-nothing "
+                        + "would also be wrong in kind: it claims the history is gone, which is "
+                        + "false. body=%s", afterResp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
     // ── fixtures ─────────────────────────────────────────────────────────────
+
+    /**
+     * Exactly what {@code MasterService#deactivateMasterInternal} persists — {@code
+     * masters.is_active = false} and nothing else. Driven in SQL rather than through {@code DELETE
+     * /masters/&#123;masterId&#125;} so the fixture is independent of that endpoint's own
+     * authorization, and so it is explicit that the {@code users} row, its {@code SALON_MASTER}
+     * role and its login all survive — which is the whole premise of the test above. Mirrors
+     * {@code ProviderCanReviewClientIT#deactivateMaster}.
+     */
+    private void deactivateMaster(UUID masterId) {
+        int updated = jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", masterId);
+        assertThat(updated).as("fixture sanity — the master row must exist to be deactivated").isEqualTo(1);
+    }
 
     /** Resolves a Kyiv-local wall-clock instant to its UTC-backed {@link OffsetDateTime}. */
     private static OffsetDateTime kyiv(LocalDate date, int hour, int minute) {
@@ -671,10 +740,18 @@ class BookingMyBookedDaysIT extends AbstractIntegrationTest {
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────
 
-    private List<LocalDate> callBookedDays(String token, LocalDate from, LocalDate to) throws Exception {
+    /**
+     * Status-tolerant form of {@link #callBookedDays}, for the cases where a NON-200 IS the claim
+     * and {@code callBookedDays}' own 200 assertion would fail before the real one is reached.
+     */
+    private ResponseEntity<String> callBookedDaysRaw(String token, LocalDate from, LocalDate to) {
         String url = BOOKINGS_URL + "/me/booked-days?from=" + from + "&to=" + to;
-        ResponseEntity<String> resp = restTemplate.exchange(
+        return restTemplate.exchange(
                 url, HttpMethod.GET, new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
+    }
+
+    private List<LocalDate> callBookedDays(String token, LocalDate from, LocalDate to) throws Exception {
+        ResponseEntity<String> resp = callBookedDaysRaw(token, from, to);
         assertThat(resp.getStatusCode()).as("booked-days call must succeed").isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
         List<LocalDate> dates = new ArrayList<>();

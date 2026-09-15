@@ -306,6 +306,112 @@ class BookingUnclosedCountIT extends AbstractIntegrationTest {
                 .isEqualTo(masterScopeStatements);
     }
 
+    // ── the DEACTIVATED performing SALON_MASTER (Phase 318) ──────────────────────────────────────
+
+    /**
+     * Phase 318 wired {@code getUnclosedCount}'s provider branch to {@code
+     * BookingService#resolveProviderMasterScope}, the shared resolver that denies a {@code
+     * SALON_MASTER} whose {@code masters.is_active} has gone false. That resolver was pinned only
+     * through {@code GET /bookings/me}, so THIS surface's wiring to it was unasserted — a future
+     * edit re-inlining {@code masterRepository.findByUserId(...)} here would reopen the hole with
+     * every test green. The badge count is small but it is not nothing: it tells a fired stylist
+     * how many of their former clients' visits are still open, and this suite's own agreement test
+     * proves the number is exactly the {@code ?partition=AWAITING_CLOSURE} page behind it.
+     *
+     * <p>Shape mirrors {@code ProviderCanReviewClientIT}'s Phase 318 pins: the JWT is captured
+     * BEFORE deactivation and reused after, so the test proves the token still AUTHENTICATES and
+     * only authorization changed — the real exposure is an already-issued JWT, not a fresh login.
+     * Both halves are load-bearing: a re-inlining mutant fails the 403, a deny-every-salon-master
+     * mutant fails the 200 control.
+     */
+    @Test
+    @DisplayName("UNCLOSED-COUNT 200 → 403 — the performing SALON_MASTER reads their own awaiting-"
+            + "closure count while employed, then the SAME token is refused the moment "
+            + "masters.is_active goes false; pins that getUnclosedCount resolves its provider scope "
+            + "through the shared resolveProviderMasterScope and not an inlined "
+            + "masterRepository.findByUserId")
+    void should_return403OnUnclosedCount_when_performingSalonMasterIsDeactivated() throws Exception {
+        BookingTestFixtures.SalonFixture salon =
+                fixtures.createSalon("unclosed-deact-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = fixtures.createUser(
+                "unclosed-deact-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createSalonService(salon.salonId(), salon.masterId());
+
+        insertBooking(clientId, salon.masterId(), serviceId, salon.salonId(),
+                "CONFIRMED", NOW.minusHours(3), NOW.minusHours(2));
+
+        String masterToken = fixtures.tokenFor(salon.masterEmail());
+
+        assertThat(count(masterToken))
+                .as("ACTIVE-MASTER CONTROL — while employed, the performing master's badge reads "
+                        + "their own single elapsed CONFIRMED booking. Without this half the 403 "
+                        + "below could pass vacuously against a hard-deny mutant, or against a "
+                        + "fixture that never produced a countable row")
+                .isEqualTo(1L);
+
+        deactivateMaster(salon.masterId());
+
+        ResponseEntity<String> afterResp = restTemplate.exchange(
+                COUNT_URL, HttpMethod.GET,
+                new HttpEntity<>(fixtures.bearerHeaders(masterToken)), String.class);
+        assertThat(HttpStatus.valueOf(afterResp.getStatusCode().value()))
+                .as("403, NOT a 200 with count:0 — the same answer GET /bookings/me and GET "
+                        + "/bookings/{id} already give a deactivated master. A count:0 would also "
+                        + "be wrong in kind: it claims nothing is open, which is false. body=%s",
+                        afterResp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    /**
+     * The OTHER half of {@code resolveProviderMasterScope}'s role split, and the one no test pinned
+     * until now (backend-qa, 2026-09-15). The liveness conjunct is scoped to {@code SALON_MASTER}
+     * <b>deliberately</b>: it makes the provider list surfaces an exact mirror of the detail path,
+     * where {@code enforceCanViewBooking} admits an independent master through {@code
+     * isAuthorizedToManageBooking} — a leg that carries no liveness term and must not acquire one.
+     * Gating the role here and not there would make {@code GET /bookings/me} deny rows that {@code
+     * GET /bookings/&#123;id&#125;} still serves.
+     *
+     * <p><b>Why this needs its own pin.</b> The three 403 tests around it all push in one
+     * direction, so a "make the guard consistent" edit widening it to {@code role != Role.CLIENT}
+     * would leave every one of them green while silently locking a solo master out of their own
+     * client book. A deactivated {@code INDEPENDENT_MASTER} is reachable only by self-deactivation
+     * — there is no third party who can flip that row — so the actor here is always reading their
+     * OWN history, which is why the deny is wrong for this role and right for the salon one.
+     */
+    @Test
+    @DisplayName("UNCLOSED-COUNT 200 — a DEACTIVATED INDEPENDENT_MASTER still reads their own "
+            + "awaiting-closure count: the liveness conjunct is scoped to SALON_MASTER on purpose, "
+            + "mirroring the detail path's isAuthorizedToManageBooking leg. FAILS if the guard is "
+            + "ever widened to every provider role")
+    void should_return200_when_deactivatedIndependentMasterReadsOwnBook() throws Exception {
+        String masterEmail = "unclosed-deact-solo-" + System.nanoTime() + "@beautica.test";
+        UUID masterId = fixtures.createIndependentMaster(masterEmail);
+        UUID clientId = fixtures.createUser(
+                "unclosed-deact-solo-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID serviceId = fixtures.createIndependentMasterService(masterId);
+
+        insertBooking(clientId, masterId, serviceId, null,
+                "CONFIRMED", NOW.minusHours(3), NOW.minusHours(2));
+
+        String masterToken = fixtures.tokenFor(masterEmail);
+
+        assertThat(count(masterToken))
+                .as("control — while active, the solo master's badge reads their own single "
+                        + "elapsed CONFIRMED booking")
+                .isEqualTo(1L);
+
+        // Self-deactivation: masters.is_active = false on an INDEPENDENT_MASTER's own row. No
+        // third party can reach this state for a solo master, which is the whole reason the role
+        // is ungated.
+        deactivateMaster(masterId);
+
+        assertThat(count(masterToken))
+                .as("STILL 200 with the SAME number, not 403 and not 0 — the count must be "
+                        + "unchanged by the is_active flip. A 403 here would contradict GET "
+                        + "/bookings/{id}, which keeps serving these very rows to this very actor")
+                .isEqualTo(1L);
+    }
+
     @Test
     @DisplayName("401 for an unauthenticated request")
     void should_return401_when_unauthenticated() {
@@ -316,6 +422,19 @@ class BookingUnclosedCountIT extends AbstractIntegrationTest {
     }
 
     // ── fixture + HTTP helpers ───────────────────────────────────────────────────────────────────
+
+    /**
+     * Exactly what {@code MasterService#deactivateMasterInternal} persists — {@code
+     * masters.is_active = false} and nothing else. Driven in SQL rather than through {@code DELETE
+     * /masters/&#123;masterId&#125;} so the fixture is independent of that endpoint's own
+     * authorization, and so it is explicit that the {@code users} row, its {@code SALON_MASTER}
+     * role and its login all survive — the whole premise of the test above. Mirrors {@code
+     * ProviderCanReviewClientIT#deactivateMaster}.
+     */
+    private void deactivateMaster(UUID masterId) {
+        int updated = jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", masterId);
+        assertThat(updated).as("fixture sanity — the master row must exist to be deactivated").isEqualTo(1);
+    }
 
     private void seedUnclosed(UUID clientId, UUID masterId, UUID serviceId, int count) {
         for (int i = 0; i < count; i++) {
