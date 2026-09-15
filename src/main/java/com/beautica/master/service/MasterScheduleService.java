@@ -37,6 +37,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -45,6 +46,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 /**
@@ -378,13 +380,21 @@ public class MasterScheduleService {
     }
 
     /**
-     * Batched counterpart of {@link #resolveEffectiveRange} — Phase 315 (D2), written to kill the
-     * salon catalogue's per-master N+1 ({@code SlotCalculationService#filterBookableAssignmentsBatch}
-     * is the one production caller). Resolves EVERY master in {@code masterIds} over the SAME
-     * {@code [from, to]} window in exactly two statements total (D1's {@code IN (:masterIds)} idiom,
-     * mirroring {@code MasterServiceRepository#findDistinctOfferedCategoriesByMasterIds}), then folds
-     * each master's rows in-memory via the exact same {@link #foldDates} core {@link #foldRange} uses —
+     * Batched, FULLY MATERIALISED counterpart of {@link #resolveEffectiveRange} — Phase 315 (D2),
+     * written to kill the salon catalogue's per-master N+1. Resolves EVERY master in
+     * {@code masterIds} over the SAME {@code [from, to]} window in exactly two statements total
+     * (D1's {@code IN (:masterIds)} idiom, mirroring
+     * {@code MasterServiceRepository#findDistinctOfferedCategoriesByMasterIds}), then folds each
+     * master's rows in-memory via the exact same {@link #foldDate} core {@link #foldRange} uses —
      * no second fold, no new precedence rule.
+     *
+     * <p><b>Not the production gate's entry point any more (2026-09-15 perf MEDIUM-3).</b>
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch} now calls
+     * {@link #reduceEffectiveRangeBatch} directly so it can stop at the first bookable day. This
+     * eager projection remains the resolver's pinned public contract — it is what
+     * {@code MasterScheduleServiceIT} and {@code SalonCatalogueBatchLoadIT} assert the fold's
+     * override/template/gap precedence against, off an already-closed transaction — and it is the
+     * only form safe to hand to a caller that will read the days later (see below).
      *
      * <p><b>D3 — every requested master gets an entry; absent ≠ empty.</b> The loop below iterates
      * {@code masterIds} (the caller's requested set), not the KEYS of whatever the batched queries
@@ -398,16 +408,86 @@ public class MasterScheduleService {
      *
      * <p>Returns {@link Map#of()} for an empty {@code masterIds} without issuing any statement.
      *
-     * <p><b>No {@code IN}-list chunking (D11).</b> Postgres' bind-parameter ceiling is 65535; the
-     * largest conceivable salon is two orders of magnitude below it. For {@code masterIds.size()}
-     * masters over a 180-day window, the {@code LEFT JOIN FETCH intervals} cartesian on each batched
-     * query is bounded by {@code Σ(schedules × intervals)} across those masters — small, and the same
-     * per-master bound {@link #foldRange} has always carried; a 500-master salon would need chunking
-     * and is out of this phase's scope.
+     * <p><b>Fully materialised, and deliberately so.</b> Every returned day is folded before this
+     * method returns, so the lists are safe to touch after the transaction closes
+     * ({@code open-in-view: false}; a day's fold reads {@code WeeklySchedule#getDiscreteTimes()},
+     * which the batched finder does NOT {@code JOIN FETCH}). A caller that only needs to know
+     * whether SOME day satisfies a predicate must use {@link #reduceEffectiveRangeBatch} instead —
+     * it folds lazily and therefore stops at the day the predicate accepts.
      */
     @Transactional(readOnly = true)
     public Map<UUID, List<EffectiveDayResponse>> resolveEffectiveRangeBatch(
             Collection<UUID> masterIds, LocalDate from, LocalDate to) {
+        // List.copyOf forces the lazy view below, element by element, INSIDE this transaction —
+        // that is exactly the pre-existing eager behaviour, expressed once instead of twice.
+        return reduceEffectiveRangeBatch(masterIds, from, to, (masterId, days) -> List.copyOf(days));
+    }
+
+    /**
+     * <b>Short-circuiting counterpart of {@link #resolveEffectiveRangeBatch}</b> (2026-09-15 perf
+     * MEDIUM-3 / security MEDIUM): loads every master's schedule rows in the SAME two statements,
+     * then hands {@code reducer} a per-master day list that folds <b>on first access, one day at a
+     * time</b>. A reducer that stops early — {@code SlotCalculationService}'s free-slot gate returns
+     * at the first bookable day — therefore materialises only the {@link EffectiveDayResponse}s it
+     * actually looked at, instead of all {@code BookingWindow#MAX_DAYS_AHEAD + 1} (181) per master.
+     *
+     * <p><b>Why this exists.</b> The gate answers a BOOLEAN, but until this method it had to be
+     * handed a fully materialised 181-day projection per master first. The salon catalogue
+     * ({@code GET /salons/{salonId}/services}) and the wish list's SALON arm
+     * ({@code ServiceCatalogService#hullsForSalonServices}) both run that gate over every candidate
+     * master; a wish-list page spanning 100 salons could reach ~2 000 masters and thus ~360 000 day
+     * objects for a page of booleans. A typical bookable master resolves on the first or second day
+     * walked, so the folded-day count collapses by two orders of magnitude.
+     *
+     * <p><b>The verdict is unchanged, by construction.</b> Laziness is a MATERIALISATION strategy,
+     * not a rule: index {@code i} of the view is the value {@link #foldDate} produces for
+     * {@code dates.get(i)} — the exact method {@link #foldDates} calls for the eager path — off the
+     * exact same loaded rows, memoised so a second walk (the gate evaluates one duration per
+     * distinct effective duration per master) never re-folds a day. Nothing branches on how many
+     * days have been folded, so a reducer that reads every element sees the eager list verbatim;
+     * {@link #resolveEffectiveRangeBatch} above IS that reducer.
+     *
+     * <p><b>The view must not escape {@code reducer} — and the view itself enforces that</b>
+     * (2026-09-15 perf LOW). Folding touches lazily batch-fetched collections
+     * ({@code discreteTimes}), so it is only legal inside this method's transaction. Control is
+     * inverted for precisely that reason: the view is a lambda parameter, consumed and discarded
+     * before the transaction closes. A reducer that stores the list for later use breaks that
+     * contract — return the folded values ({@code List.copyOf}) instead.
+     *
+     * <p>The rule used to be javadoc-only, and its failure mode was the worst kind: a reducer that
+     * returned {@code days} itself handed back a list whose ALREADY-FOLDED prefix reads fine and
+     * whose unfolded tail dereferences detached proxies once the transaction closes
+     * ({@code open-in-view: false}) — a {@code LazyInitializationException} at an arbitrary,
+     * data-dependent index, far from the reducer that caused it. So the loop below marks each view
+     * <b>spent</b> the moment its reducer returns, and {@code get(int)} throws
+     * {@link IllegalStateException} thereafter: the contract now breaks loudly, at the first read,
+     * pointing at the rule it broke. {@code size()} is deliberately still legal — it folds nothing.
+     * The flag flips AFTER the reducer returns, never during, so
+     * {@link #resolveEffectiveRangeBatch}'s {@code List.copyOf(days)} — which forces the whole view
+     * from inside the reducer — is unaffected.
+     *
+     * <p><b>D3 — every requested master gets an entry; absent ≠ empty.</b> Unchanged: the loop
+     * iterates {@code masterIds}, so a master with NO schedule rows still receives a full
+     * {@code dates.size()}-entry view of {@link EffectiveDaySource#NO_SCHEDULE} days.
+     *
+     * <p>Returns {@link Map#of()} for an empty {@code masterIds} without issuing any statement.
+     *
+     * <p><b>No {@code IN}-list chunking (D11).</b> Postgres' bind-parameter ceiling is 65535 and the
+     * {@code IN (:masterIds)} list carries one bind per master. The widest caller is no longer one
+     * salon: {@code ServiceCatalogService#hullsForSalonServices} (the wish list's SALON arm) sums
+     * the candidate masters of every salon on a page, capped at
+     * {@code spring.data.web.pageable.max-page-size} = 100 saved rows, so the worst realistic list
+     * is ~100 salons × the masters each staffs — low thousands, still more than an order of
+     * magnitude below the ceiling, and the catalogue's single-salon list is far below that again.
+     * The {@code LEFT JOIN FETCH intervals} cartesian on each batched query stays bounded by
+     * {@code Σ(schedules × intervals)} across the requested masters. Chunking becomes necessary only
+     * if a single call ever has to span tens of thousands of masters, which no current route can
+     * produce.
+     */
+    @Transactional(readOnly = true)
+    public <T> Map<UUID, T> reduceEffectiveRangeBatch(
+            Collection<UUID> masterIds, LocalDate from, LocalDate to,
+            BiFunction<UUID, List<EffectiveDayResponse>, T> reducer) {
         if (masterIds.isEmpty()) {
             return Map.of();
         }
@@ -415,14 +495,89 @@ public class MasterScheduleService {
         List<LocalDate> dates = dateMath.expandInclusive(from, to);
         BatchLoadedRows rows = loadRowsForMasters(masterIds, from, to);
 
-        Map<UUID, List<EffectiveDayResponse>> result = new LinkedHashMap<>();
+        Map<UUID, T> result = new LinkedHashMap<>();
         for (UUID masterId : masterIds) {
-            List<ResolvedDay> resolved = foldDates(dates,
+            LazyFoldedDays view = lazyFoldedDays(dates,
                     rows.overridesByMaster().getOrDefault(masterId, Map.of()),
                     rows.windowsByMaster().getOrDefault(masterId, List.of()));
-            result.put(masterId, resolved.stream().map(ResolvedDay::day).toList());
+            T reduced = reducer.apply(masterId, view);
+            // AFTER apply, never during: resolveEffectiveRangeBatch's List.copyOf(days) forces the
+            // whole view from INSIDE the reducer and must keep working.
+            view.markSpent();
+            result.put(masterId, reduced);
         }
         return result;
+    }
+
+    /**
+     * A {@code dates.size()}-element view whose element {@code i} is {@link #foldDate}'s verdict for
+     * {@code dates.get(i)}, computed on first access and memoised. {@link AbstractList#iterator()}
+     * walks it through {@link AbstractList#get(int)} in ascending order, which is what lets a
+     * for-each with an early {@code return} stop the fold.
+     *
+     * <p>Request-scoped and single-threaded, like every other object on this path — the memo array
+     * is deliberately unsynchronised. Each slot is written with the value {@link #foldDate} returns
+     * for its own date, so even a racing writer could only store the same value twice.
+     *
+     * <p>One view per master, never shared: each call allocates its own {@code memo}, so one
+     * master's early exit cannot leak a folded day into another's list. Pinned across THREE masters
+     * by {@code SalonCatalogueBatchLoadIT}'s case 15c.
+     */
+    private LazyFoldedDays lazyFoldedDays(List<LocalDate> dates,
+            Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+        return new LazyFoldedDays(dates, overridesByDate, windows);
+    }
+
+    /**
+     * The lazily folding, memoised, single-use day view {@link #reduceEffectiveRangeBatch} hands its
+     * reducer — see that method's javadoc for the laziness contract and for why
+     * {@link #markSpent()} exists.
+     */
+    private final class LazyFoldedDays extends AbstractList<EffectiveDayResponse> {
+
+        private final List<LocalDate> dates;
+        private final Map<LocalDate, ScheduleException> overridesByDate;
+        private final List<WeeklySchedule> windows;
+        private final EffectiveDayResponse[] memo;
+        private boolean spent;
+
+        private LazyFoldedDays(List<LocalDate> dates,
+                Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+            this.dates = dates;
+            this.overridesByDate = overridesByDate;
+            this.windows = windows;
+            this.memo = new EffectiveDayResponse[dates.size()];
+        }
+
+        /** Folds nothing, so it stays legal after the view is spent. */
+        @Override
+        public int size() {
+            return memo.length;
+        }
+
+        @Override
+        public EffectiveDayResponse get(int index) {
+            if (spent) {
+                throw new IllegalStateException(
+                        "reduceEffectiveRangeBatch's day view is SPENT: the reducer has returned and"
+                                + " the transaction that makes folding legal is closing, so reading"
+                                + " index " + index + " of " + memo.length + " would dereference"
+                                + " detached Hibernate proxies. The view must not escape the reducer"
+                                + " — return the folded values (List.copyOf(days)) instead, exactly"
+                                + " as resolveEffectiveRangeBatch does.");
+            }
+            EffectiveDayResponse folded = memo[index];
+            if (folded == null) {
+                folded = foldDate(dates.get(index), overridesByDate, windows).day();
+                memo[index] = folded;
+            }
+            return folded;
+        }
+
+        /** Called by {@link #reduceEffectiveRangeBatch} once its reducer has returned. */
+        private void markSpent() {
+            this.spent = true;
+        }
     }
 
     /**
@@ -469,15 +624,25 @@ public class MasterScheduleService {
             Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
         List<ResolvedDay> result = new ArrayList<>(dates.size());
         for (LocalDate date : dates) {
-            ScheduleException override = overridesByDate.get(date);
-            if (override != null) {
-                result.add(new ResolvedDay(resolveFromOverride(date, override), override, null));
-            } else {
-                WeeklySchedule covering = firstCovering(windows, date);
-                result.add(new ResolvedDay(resolveFromTemplate(date, covering), null, covering));
-            }
+            result.add(foldDate(date, overridesByDate, windows));
         }
         return result;
+    }
+
+    /**
+     * The ONE date fold: override beats template beats gap. Extracted from {@link #foldDates}'s loop
+     * body so {@link #lazyFoldedDays} can invoke it for a single date without duplicating the
+     * precedence rule — the eager and short-circuiting paths are then the same method called a
+     * different number of times, which is why their verdicts cannot diverge.
+     */
+    private ResolvedDay foldDate(LocalDate date,
+            Map<LocalDate, ScheduleException> overridesByDate, List<WeeklySchedule> windows) {
+        ScheduleException override = overridesByDate.get(date);
+        if (override != null) {
+            return new ResolvedDay(resolveFromOverride(date, override), override, null);
+        }
+        WeeklySchedule covering = firstCovering(windows, date);
+        return new ResolvedDay(resolveFromTemplate(date, covering), null, covering);
     }
 
     /**

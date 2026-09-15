@@ -497,6 +497,55 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     List<MasterServiceAssignment> findBookableAssignmentsBySalon(@Param("salonId") UUID salonId);
 
     /**
+     * Cross-salon sibling of {@link #findBookableAssignmentsBySalon}, keyed by a SET of SALON-owned
+     * definition ids instead of one salon id — backs
+     * {@code ServiceCatalogService#hullsForSalonServices}, which prices the wish list's SALON arm
+     * with the same cross-master hull {@code GET /salons/&#123;salonId&#125;/services} renders.
+     *
+     * <p><b>This is the anti-N+1 seam.</b> A wish-list page can hold up to
+     * {@code spring.data.web.pageable.max-page-size} SALON rows spanning as many distinct salons;
+     * one call of this method loads EVERY candidate assignment behind all of them in ONE statement
+     * (which the caller then feeds to ONE batched free-slot gate), instead of a per-row or
+     * per-salon catalogue build.
+     *
+     * <p><b>Predicates are the {@link #findBookableAssignmentsBySalon} set, re-expressed without a
+     * single fixed salon.</b> That method pins the salon twice ({@code m.salon.id = :salonId} AND
+     * {@code sd.ownerId = :salonId}) to close the rotated-master and cross-salon leaks; with no
+     * single salon to pin, the same closure is {@code sd.ownerId = s.id} — the definition must be
+     * owned by the performing master's OWN salon. {@code s.isActive = true} is additionally
+     * required here (as {@link #existsBookableAssignmentForSalonService} requires it, and unlike
+     * the salon-scoped catalogue finder, whose caller has already resolved a live salon):
+     * {@code SalonService.deactivateSalon} does not cascade to {@code masters.is_active}, so
+     * without it a closed salon's masters would still price a row.
+     *
+     * <p>{@code JOIN FETCH msa.serviceDefinition sd} initialises every column
+     * {@link com.beautica.service.dto.ServicePricing#hullOfAssignments} reads and the effective
+     * duration the free-slot gate needs; {@code JOIN FETCH msa.master m} + {@code JOIN FETCH
+     * m.salon s} initialise the master the gate groups by (Anti-Bug §E — no lazy load per row).
+     * {@code sd.serviceType} is deliberately NOT fetched: unlike the catalogue finder, no caller of
+     * this method builds a {@code ServiceDefinitionResponse} from these rows — only a price hull.
+     *
+     * <p>Bounded by the caller's id set, which is itself bounded by one page of favourites. Callers
+     * MUST short-circuit on an empty {@code serviceDefIds} — an empty {@code IN} list must never
+     * reach the database.
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.serviceDefinition sd
+            JOIN FETCH msa.master m
+            JOIN FETCH m.salon s
+            WHERE sd.id IN :serviceDefIds
+              AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+              AND sd.ownerId = s.id
+              AND sd.isActive = true
+              AND s.isActive = true
+              AND m.isActive = true
+              AND msa.isActive = true
+            """)
+    List<MasterServiceAssignment> findBookableAssignmentsForSalonServices(
+            @Param("serviceDefIds") Collection<UUID> serviceDefIds);
+
+    /**
      * Existence-only sibling of {@link #findBookableAssignmentsBySalon} for exactly ONE service
      * definition — backs {@code FavoriteService.validateSalonServiceTarget} (salon-service-favourites
      * track): a {@code SALON_SERVICE} favourite target must have at least one active assignment by

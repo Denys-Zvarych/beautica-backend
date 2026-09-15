@@ -2,9 +2,7 @@ package com.beautica.service.dto;
 
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.entity.ServiceDefinition;
-import com.beautica.service.util.PriceDisplayFormatter;
 import io.swagger.v3.oas.annotations.media.Schema;
-import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -89,24 +87,23 @@ public record ServiceDefinitionResponse(
 
     /**
      * Phase 314 — the salon-catalogue projection: the band is the union hull across the salon's
-     * bookable masters (see {@code ServiceCatalogService#getSalonServiceCatalog}), never the
-     * {@link ServiceDefinition}'s own band. Used ONLY by that call; {@link #from} keeps serving
-     * every provider-side response ({@code POST}/{@code PATCH /services/...}), where the price
-     * fields must keep meaning the definition's own band — that is what an owner is editing.
+     * bookable masters ({@link ServicePricing#hullOfAssignments}), never the
+     * {@link ServiceDefinition}'s own band. {@link #from} keeps serving every provider-side
+     * response ({@code POST}/{@code PATCH /services/...}), where the price fields must keep
+     * meaning the definition's own band — that is what an owner is editing.
      *
-     * <p>{@code max == null} means the hull collapsed to a single price (every contributing
-     * master resolves to the same floor and ceiling) and renders {@link PriceType#FIXED} — the
-     * COMMON case, not a degenerate range. A non-null, strictly greater {@code max} renders
-     * {@link PriceType#RANGE}. The caller (D1/D2/D3) computes {@code min}/{@code max}; this
-     * factory only decides the resulting {@code priceType} and formats the display string — it
-     * never reads {@code sd.getPriceType()}/{@code sd.getBasePrice()}/{@code sd.getPriceMax()}.
+     * <p>{@code hull.priceMax() == null} means the hull collapsed to a single price (every
+     * contributing master resolves to the same floor and ceiling) and renders
+     * {@link PriceType#FIXED} — the COMMON case, not a degenerate range. This factory only
+     * formats; the hull itself (including the FIXED/RANGE decision) is computed in exactly one
+     * place, so {@code GET /salons/&#123;salonId&#125;/services} and the wish list's SALON arm
+     * cannot print different numbers for the same service. It never reads
+     * {@code sd.getPriceType()}/{@code sd.getBasePrice()}/{@code sd.getPriceMax()}.
      */
     public static ServiceDefinitionResponse fromSalonAggregate(
-            ServiceDefinition sd, BigDecimal min, @Nullable BigDecimal max) {
-        PriceType priceType = max == null ? PriceType.FIXED : PriceType.RANGE;
-        String priceDisplay = PriceDisplayFormatter.format(priceType, min, max);
-
-        return build(sd, priceType, min, max, priceDisplay);
+            ServiceDefinition sd, ServicePricing.Hull hull) {
+        return build(sd, hull.priceType(), hull.priceMin(), hull.priceMax(),
+                ServicePricing.display(hull.priceType(), hull.priceMin(), hull.priceMax()));
     }
 
     private static ServiceDefinitionResponse build(ServiceDefinition sd, PriceType priceType,

@@ -13,6 +13,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
 
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -262,6 +265,199 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
         assertThat(stats.getEntityStatistics(User.class.getName()).getLoadCount()).isZero();
     }
 
+    // ── wish list, SALON arm — the hull aggregation must not scale with the page ──
+    //
+    // A SALON row is priced by the salon-catalogue HULL across that salon's bookable masters, not
+    // by the definition's own band. The naive shape is one aggregation per row (or per distinct
+    // salon) — an N+1 on a list endpoint. ServiceCatalogService#hullsForSalonServices instead runs
+    // ONE candidate load for every definition on the page plus ONE batched free-slot gate (Phase
+    // 315: one schedule-resolve and one booking-load statement for every master COMBINED), so the
+    // count is flat in the number of rows AND in the number of distinct salons they span.
+
+    @Test
+    @DisplayName("listServiceFavorites prices every SALON row with one batched hull aggregation — "
+            + "the same statement count at any number of salons")
+    void should_runBoundedStatementCount_when_wishListHoldsManySalonServiceFavorites() {
+        long atTwo = countSalonServiceWishListStatements("small", 2);
+        long atFive = countSalonServiceWishListStatements("large", 5);
+
+        assertThat(atTwo)
+                .as("got %s statements for 2 wish-listed salon services (2 salons) and %s for 5 — a "
+                        + "count that tracks the row/salon count is the per-row or per-salon hull "
+                        + "aggregation this seam exists to avoid", atTwo, atFive)
+                .isEqualTo(atFive);
+        assertThat(atFive)
+                .as("EXACTLY six, every one of them named: %s; got %s", SIX_STATEMENTS, atFive)
+                .isEqualTo(SALON_SERVICE_WISH_LIST_STATEMENTS);
+    }
+
+    /**
+     * The six statements one page of SALON wish-list rows costs, enumerated so the constant below is
+     * not an unexplained number. #5 is the one the 2026-09-15 perf audit could not account for from
+     * source: nothing calls it, it is a LAZY collection fetch Hibernate issues on its own.
+     */
+    private static final String SIX_STATEMENTS = """
+            1 the wish-list content query (FavoriteRepository#findFavoriteServiceRows; the count \
+            query is skipped on a short page) | \
+            2 the candidate load for every definition on the page \
+            (MasterServiceRepository#findBookableAssignmentsForSalonServices) | \
+            3 the batched override load (ScheduleExceptionRepository#findByMasterIdsAndDateBetweenWithIntervals) | \
+            4 the batched template load (WeeklyScheduleRepository#findOverlappingRangeWithIntervalsByMasterIds) | \
+            5 the LAZY WeeklySchedule.discreteTimes batch-fetch (working_interval_times) — issued by \
+            Hibernate, not by any call site: MasterScheduleService#resolveFromTemplate reads \
+            getDiscreteTimes() on every covering template to decide EXPLICIT_TIMES vs INTERVAL, and \
+            the first such read initialises every already-loaded proxy in one go \
+            (hibernate.default_batch_fetch_size=50), so it is ceil(distinct schedule rows / 50) \
+            statements, NOT one per master | \
+            6 the batched booking load (BookingRepository#findActiveTimeRangesByMasterIdsInRange)""";
+
+    private static final int SALON_SERVICE_WISH_LIST_STATEMENTS = 6;
+
+    /** {@code hibernate.default_batch_fetch_size}, {@code application.yml} — statement #5's divisor. */
+    private static final int BATCH_FETCH_SIZE = 50;
+
+    // ── the MASTER dimension — the one every gate query is actually keyed by ──
+    //
+    // The salon-dimension arms above vary SALONS (2 -> 5) with one master each. Every statement the
+    // free-slot gate issues is keyed by MASTER (IN (:masterIds)), so those arms hold the dimension
+    // that matters FIXED at one and cannot see a per-master regression at all. This arm varies it:
+    // one salon, one wish-listed salon service, N masters all performing it.
+
+    @Test
+    @DisplayName("listServiceFavorites prices ONE salon service performed by many masters with the "
+            + "same batched gate — flat in the MASTER count, across the batch_fetch_size boundary")
+    void should_runBoundedStatementCount_when_oneSalonServiceIsPerformedByManyMasters() {
+        long atTen = countManyMasterWishListStatements("ten", 10);
+        long atFifty = countManyMasterWishListStatements("fifty", BATCH_FETCH_SIZE);
+        long atSixty = countManyMasterWishListStatements("sixty", BATCH_FETCH_SIZE + 10);
+
+        assertThat(atTen)
+                .as("10 vs 50 masters on ONE wish-listed service: both sit at or below the "
+                        + "batch_fetch_size ceiling, so EVERY statement — gate queries and the "
+                        + "collection fetch alike — must be identical. A per-master gate query "
+                        + "would show up here as a 40-statement gap; got %s and %s", atTen, atFifty)
+                .isEqualTo(atFifty);
+        assertThat(atFifty)
+                .as("the master count does not change WHICH statements run: the same six as the "
+                        + "salon-dimension arms — %s; got %s", SIX_STATEMENTS, atFifty)
+                .isEqualTo(SALON_SERVICE_WISH_LIST_STATEMENTS);
+        assertThat(atSixty)
+                .as("60 schedule rows cross the batch_fetch_size=50 ceiling, so statement #5 — and "
+                        + "ONLY #5 — becomes ceil(60/50)=2: exactly ONE more statement than 50 "
+                        + "masters cost. Not zero (which would mean the sweep never crossed the "
+                        + "boundary and the flatness above proves nothing) and not ten more (a "
+                        + "per-master regression). This is the same ceil(rows/50) formula "
+                        + "SalonCatalogueBatchLoadIT case 14 pins on the catalogue side; got %s",
+                        atSixty)
+                .isEqualTo(atFifty + 1);
+    }
+
+    /**
+     * Seeds ONE salon holding ONE salon-owned service definition performed by {@code masters}
+     * bookable masters, wish-lists that single definition, then measures one page.
+     *
+     * <p><b>Non-vacuity.</b> Same guard as the salon-dimension helper: every master carries an own
+     * {@code 777.00} band against the definition's {@code 500.00} and real working hours, so a run
+     * that found no candidate or no bookable master renders {@code "500 ₴"} and fails rather than
+     * reporting a flatteringly low count. The page holds exactly ONE row at every master count, so
+     * the only thing the sweep varies is the size of the gate's {@code IN (:masterIds)} set.
+     */
+    private long countManyMasterWishListStatements(String tag, int masters) {
+        UUID clientId = createClient("fav-many-masters-" + tag + "@beautica.test");
+        UUID salon = createSalon("fav-many-masters-owner-" + tag + "@beautica.test");
+        UUID firstMasterService = createSalonMasterService(
+                createSalonMasterWithSchedule("fav-many-masters-m0-" + tag + "@beautica.test", salon),
+                salon);
+        seedOwnBand(firstMasterService, "777.00");
+        UUID serviceDefId = serviceDefIdOf(firstMasterService);
+        for (int i = 1; i < masters; i++) {
+            UUID master = createSalonMasterWithSchedule(
+                    "fav-many-masters-m" + i + "-" + tag + "@beautica.test", salon);
+            seedOwnBand(assignExistingDefinition(master, serviceDefId), "777.00");
+        }
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, serviceDefId);
+
+        Statistics stats = statistics();
+        stats.clear();
+        var page = favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+        long statementCount = stats.getPrepareStatementCount();
+
+        assertThat(page.getContent())
+                .as("one definition wish-listed -> exactly one row, at every master count")
+                .hasSize(1);
+        assertThat(page.getContent())
+                .as("the row must be priced by the bookable masters' own band (777), not the "
+                        + "definition's 500 — otherwise the gate never ran and the count is vacuous")
+                .allMatch(row -> "777 ₴".equals(row.priceDisplay()));
+        assertThat(stats.getCollectionStatistics(DISCRETE_TIMES_COLLECTION).getFetchCount())
+                .as("statement #5 attributed by NAME, not by subtraction: the lazy "
+                        + "WeeklySchedule.discreteTimes fetch really is what the sixth statement is, "
+                        + "and it is ceil(%s masters / %s) of them", masters, BATCH_FETCH_SIZE)
+                .isEqualTo((masters + BATCH_FETCH_SIZE - 1) / BATCH_FETCH_SIZE);
+        return statementCount;
+    }
+
+    private static final String DISCRETE_TIMES_COLLECTION =
+            com.beautica.master.entity.WeeklySchedule.class.getName() + ".discreteTimes";
+
+    private UUID createSalonMasterWithSchedule(String email, UUID salonId) {
+        UUID masterId = createSalonMaster(email, salonId);
+        seedUsableSchedule(masterId);
+        return masterId;
+    }
+
+    /** A second (third, …) master performing an ALREADY-EXISTING salon service definition. */
+    private UUID assignExistingDefinition(UUID masterId, UUID serviceDefId) {
+        UUID masterServiceId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
+                masterServiceId, masterId, serviceDefId);
+        return masterServiceId;
+    }
+
+    /**
+     * Seeds {@code n} wish-listed SALON services, each in its OWN salon with its own bookable
+     * master, then measures one page.
+     *
+     * <p><b>Non-vacuity.</b> Every master carries an own band ({@code 777.00}) that differs from
+     * the shared definition's {@code 500.00}, and each master has real working hours, so the
+     * measured page can only render {@code "777 ₴"} if the candidate load, the batched free-slot
+     * gate and the hull fold all actually ran. A run that silently short-circuited (no candidates,
+     * or no bookable master) would render the definition's band and fail the assertion below
+     * rather than reporting a flatteringly low statement count.
+     */
+    private long countSalonServiceWishListStatements(String tag, int n) {
+        UUID clientId = createClient("fav-salon-svc-" + tag + "@beautica.test");
+        for (int i = 0; i < n; i++) {
+            UUID salon = createSalon("fav-salon-svc-owner-" + tag + "-" + i + "@beautica.test");
+            UUID master = createSalonMaster("fav-salon-svc-master-" + tag + "-" + i + "@beautica.test", salon);
+            UUID masterServiceId = createSalonMasterService(master, salon);
+            seedOwnBand(masterServiceId, "777.00");
+            seedUsableSchedule(master);
+            favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE,
+                    serviceDefIdOf(masterServiceId));
+        }
+
+        Statistics stats = statistics();
+        stats.clear();
+        var page = favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+        long statementCount = stats.getPrepareStatementCount();
+
+        assertThat(page.getContent())
+                .as("the measurement is only meaningful if the page actually returned %s rows", n)
+                .hasSize(n);
+        assertThat(page.getContent())
+                .as("every row must be priced by the bookable master's own band (777), not the "
+                        + "definition's 500 — otherwise the hull path never ran and this "
+                        + "measurement proves nothing")
+                .allMatch(row -> "777 \u20b4".equals(row.priceDisplay()));
+        assertThat(stats.getCollectionStatistics(DISCRETE_TIMES_COLLECTION).getFetchCount())
+                .as("the sixth statement, named rather than inferred \u2014 see SIX_STATEMENTS #5")
+                .isEqualTo(1);
+        return statementCount;
+    }
+
     // ── seed helpers (ASCII data) ────────────────────────────────────────────────
 
     private UUID createClient(String email) {
@@ -365,6 +561,37 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                         + "NOW() - interval '2 hours', NOW() - interval '1 hour', "
                         + "500.00, 60, 0, NOW(), NOW())",
                 UUID.randomUUID(), clientId, masterId, masterServiceId);
+    }
+
+    private UUID serviceDefIdOf(UUID masterServiceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT service_def_id FROM master_services WHERE id = ?", UUID.class, masterServiceId);
+    }
+
+    /**
+     * Gives an assignment its OWN FIXED band. All three override columns move together —
+     * {@code chk_master_service_price_mode} (V165 D2) makes a partial band unrepresentable.
+     */
+    private void seedOwnBand(UUID masterServiceId, String price) {
+        jdbcTemplate.update(
+                "UPDATE master_services SET price_type_override = 'FIXED', price_override = ?, "
+                        + "price_max_override = NULL WHERE id = ?",
+                new java.math.BigDecimal(price), masterServiceId);
+    }
+
+    /** Working hours today, 09:00-17:00 — enough for the free-slot gate to find the master bookable. */
+    private void seedUsableSchedule(UUID masterId) {
+        LocalDate today = LocalDate.now(ZoneId.of("Europe/Kyiv"));
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
+                scheduleId, masterId, today);
+        jdbcTemplate.update(
+                "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                UUID.randomUUID(), scheduleId, today.getDayOfWeek().getValue(),
+                LocalTime.of(9, 0), LocalTime.of(17, 0));
     }
 
     private UUID resolveServiceTypeId() {

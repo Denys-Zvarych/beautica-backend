@@ -275,14 +275,112 @@ class FavoriteServiceListIT extends AbstractIntegrationTest {
                 favoriteService.listServiceFavorites(clientId, Pageable.ofSize(20))
                         .getContent().get(0).priceDisplay();
 
-        String cataloguePriceDisplay = serviceCatalogService.getSalonServiceCatalog(salonId)
-                .categories().stream()
-                .flatMap(g -> g.services().stream())
-                .filter(s -> s.id().equals(serviceDefId))
-                .map(ServiceDefinitionResponse::priceDisplay)
-                .findFirst().orElseThrow();
+        assertThat(wishListPriceDisplay).isEqualTo(cataloguePriceDisplay(salonId, serviceDefId));
+    }
 
-        assertThat(wishListPriceDisplay).isEqualTo(cataloguePriceDisplay);
+    // ── Phase 311 D9 / Phase 314: the wish list must print the price that will be charged ──
+
+    @Test
+    @DisplayName("a MASTER row prints the performing master's OWN band, not the shared definition's "
+            + "— the row carries the ids the booking is created with, so the two must agree")
+    void should_printTheMastersOwnBand_when_theAssignmentCarriesOne() {
+        UUID clientId = createClient("own-band-client@beautica.test");
+        UUID masterId = createIndependentMaster("own-band-master@beautica.test");
+        UUID masterServiceId = createIndependentMasterService(masterId);
+        seedOwnBand(masterServiceId, "RANGE", "1000.00", "1400.00");
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SERVICE, masterServiceId);
+
+        FavoriteServiceResponse row =
+                favoriteService.listServiceFavorites(clientId, Pageable.ofSize(20)).getContent().get(0);
+
+        assertThat(row.priceDisplay())
+                .as("the definition's own band is 500 ₴; the master charges 1000-1400 and the wish "
+                        + "list advertises what the client will actually be charged")
+                .isEqualTo("від 1000 до 1400 ₴");
+        assertThat(row.priceMin()).isEqualByComparingTo("1000.00");
+        assertThat(row.priceMax()).isEqualByComparingTo("1400.00");
+    }
+
+    @Test
+    @DisplayName("a SALON row prints the catalogue HULL across the salon's bookable masters, and "
+            + "the exact string GET /salons/{id}/services prints for the same definition")
+    void should_printTheCatalogueHull_when_mastersCarryDifferentOwnBands() {
+        UUID clientId = createClient("hull-client@beautica.test");
+        UUID salonId = createSalon("hull-owner@beautica.test");
+        UUID serviceDefId = createSalonServiceDefinitionWithPrice(salonId, "FIXED", "600.00", null);
+
+        UUID cheapMaster = createSalonMaster(salonId, "hull-cheap-master@beautica.test");
+        seedUsableSchedule(cheapMaster);
+        seedOwnBand(assignMasterToService(cheapMaster, serviceDefId, true), "FIXED", "700.00", null);
+
+        UUID pricyMaster = createSalonMaster(salonId, "hull-pricy-master@beautica.test");
+        seedUsableSchedule(pricyMaster);
+        seedOwnBand(assignMasterToService(pricyMaster, serviceDefId, true), "FIXED", "1200.00", null);
+
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, serviceDefId);
+
+        FavoriteServiceResponse row =
+                favoriteService.listServiceFavorites(clientId, Pageable.ofSize(20)).getContent().get(0);
+
+        assertThat(row.priceDisplay())
+                .as("the definition's own band is 600 ₴; the salon offers 700-1200 across its "
+                        + "bookable masters")
+                .isEqualTo("від 700 до 1200 ₴");
+        assertThat(row.priceDisplay()).isEqualTo(cataloguePriceDisplay(salonId, serviceDefId));
+    }
+
+    @Test
+    @DisplayName("a master with NO working hours contributes nothing to the hull — the locked "
+            + "'bookable' rule, not merely 'active and assigned'")
+    void should_excludeMasterWithoutWorkingHours_fromTheHull() {
+        UUID clientId = createClient("hull-nohours-client@beautica.test");
+        UUID salonId = createSalon("hull-nohours-owner@beautica.test");
+        UUID serviceDefId = createSalonServiceDefinitionWithPrice(salonId, "FIXED", "600.00", null);
+
+        UUID bookableMaster = createSalonMaster(salonId, "hull-nohours-bookable@beautica.test");
+        seedUsableSchedule(bookableMaster);
+        seedOwnBand(assignMasterToService(bookableMaster, serviceDefId, true), "FIXED", "700.00", null);
+
+        UUID unschedulableMaster = createSalonMaster(salonId, "hull-nohours-idle@beautica.test");
+        seedOwnBand(assignMasterToService(unschedulableMaster, serviceDefId, true),
+                "FIXED", "5000.00", null);
+
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, serviceDefId);
+
+        FavoriteServiceResponse row =
+                favoriteService.listServiceFavorites(clientId, Pageable.ofSize(20)).getContent().get(0);
+
+        assertThat(row.priceDisplay())
+                .as("the 5000 master has no working hours, so nothing of theirs is bookable and "
+                        + "their band must not stretch the advertised ceiling")
+                .isEqualTo("700 \u20b4");
+        assertThat(row.priceDisplay()).isEqualTo(cataloguePriceDisplay(salonId, serviceDefId));
+    }
+
+    /**
+     * The documented empty-hull fallback. The row deliberately SURVIVES when no master is
+     * currently bookable — the wish-list query filters on active assignment / active master /
+     * active salon, never on free slots — so it must still render a price. The definition's own
+     * band is that fallback, mirroring {@code ServiceCatalogService#priceForSalonCatalogue}'s own
+     * unpriceable-hull fallback, rather than blanking the card.
+     */
+    @Test
+    @DisplayName("a SALON row whose salon has no currently-bookable master falls back to the "
+            + "definition's own band rather than rendering no price")
+    void should_fallBackToDefinitionBand_when_noMasterIsBookable() {
+        UUID clientId = createClient("hull-empty-client@beautica.test");
+        UUID salonId = createSalon("hull-empty-owner@beautica.test");
+        UUID serviceDefId = createSalonServiceDefinitionWithPrice(salonId, "FIXED", "600.00", null);
+        UUID masterId = createSalonMaster(salonId, "hull-empty-master@beautica.test");
+        seedOwnBand(assignMasterToService(masterId, serviceDefId, true), "FIXED", "700.00", null);
+
+        favoriteService.addFavorite(clientId, FavoriteTargetType.SALON_SERVICE, serviceDefId);
+
+        FavoriteServiceResponse row =
+                favoriteService.listServiceFavorites(clientId, Pageable.ofSize(20)).getContent().get(0);
+
+        assertThat(row.priceDisplay()).isEqualTo("600 \u20b4");
+        assertThat(row.priceMin()).isEqualByComparingTo("600.00");
     }
 
     // ── pagination across the UNION ALL boundary ────────────────────────────────
@@ -470,6 +568,29 @@ class FavoriteServiceListIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, ?, NOW(), NOW())",
                 assignmentId, masterId, serviceDefId, assignmentActive);
         return assignmentId;
+    }
+
+    /**
+     * Gives an assignment its OWN band (Phase 311 D9). All three override columns move together —
+     * {@code chk_master_service_price_mode} (V165 D2) makes a partial band unrepresentable — and a
+     * FIXED band must leave {@code price_max_override} NULL.
+     */
+    private void seedOwnBand(UUID masterServiceId, String priceType, String price, String priceMax) {
+        jdbcTemplate.update(
+                "UPDATE master_services SET price_type_override = ?, price_override = ?, "
+                        + "price_max_override = ? WHERE id = ?",
+                priceType, new java.math.BigDecimal(price),
+                priceMax == null ? null : new java.math.BigDecimal(priceMax), masterServiceId);
+    }
+
+    /** What {@code GET /salons/{salonId}/services} prints for {@code serviceDefId}. */
+    private String cataloguePriceDisplay(UUID salonId, UUID serviceDefId) {
+        return serviceCatalogService.getSalonServiceCatalog(salonId)
+                .categories().stream()
+                .flatMap(g -> g.services().stream())
+                .filter(sd -> sd.id().equals(serviceDefId))
+                .map(ServiceDefinitionResponse::priceDisplay)
+                .findFirst().orElseThrow();
     }
 
     private void setCreatedAt(UUID clientId, FavoriteTargetType targetType, UUID targetId, Instant createdAt) {

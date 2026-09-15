@@ -23,6 +23,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.PriceType;
+import com.beautica.service.dto.ServicePricing;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.user.User;
@@ -49,6 +50,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -104,6 +106,9 @@ class FavoriteServiceTest {
 
     @Mock
     private FavoriteCategoryResolver favoriteCategoryResolver;
+
+    @Mock
+    private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
 
     @InjectMocks
     private FavoriteService favoriteService;
@@ -874,21 +879,44 @@ class FavoriteServiceTest {
 
         /**
          * Builds a raw {@code Object[]} row matching the merged native projection's column
-         * layout (indices 0-14 — see {@code FavoriteRepository.findFavoriteServiceRows}'s
-         * javadoc); columns 15/16 (ordering-only) are omitted since
+         * layout (indices 0-18 — see {@code FavoriteRepository.findFavoriteServiceRows}'s
+         * javadoc); columns 19/20 (ordering-only) are omitted since
          * {@code FavoriteServiceResponse.fromRow} never reads them.
+         *
+         * <p>The projection selects RAW columns — the definition's four and the assignment's four
+         * overrides — and derives nothing, so this builder must not COALESCE either: it copies
+         * the entity's columns across verbatim, exactly as the SQL does.
          */
         private static Object[] masterArmRow(MasterServiceAssignment msa, String firstName,
                                              String lastName, String avatarUrl) {
+            ServiceDefinition sd = msa.getServiceDefinition();
             return new Object[] {
                     "MASTER", msa.getId(), msa.getMaster().getId(),
-                    msa.getServiceDefinition().getId(), msa.getServiceDefinition().getName(),
+                    sd.getId(), sd.getName(),
                     firstName, lastName, avatarUrl,
-                    msa.getServiceDefinition().getBaseDurationMinutes(),
-                    msa.getServiceDefinition().getPriceType().name(),
-                    msa.getServiceDefinition().getBasePrice(),
-                    msa.getServiceDefinition().getPriceMax(),
+                    sd.getBaseDurationMinutes(),
+                    msa.getDurationOverrideMinutes(),
+                    sd.getPriceType().name(),
+                    sd.getBasePrice(),
+                    sd.getPriceMax(),
+                    msa.getPriceTypeOverride() == null ? null : msa.getPriceTypeOverride().name(),
+                    msa.getPriceOverride(),
+                    msa.getPriceMaxOverride(),
                     null, null, null
+            };
+        }
+
+        /** A SALON-arm row: no assignment, so every override column is {@code NULL}. */
+        private static Object[] salonArmRow(UUID serviceDefId, UUID salonId, String serviceName,
+                                            int baseDurationMinutes, String priceType,
+                                            BigDecimal basePrice, BigDecimal priceMax) {
+            return new Object[] {
+                    "SALON", null, null, serviceDefId, serviceName,
+                    null, null, null,
+                    baseDurationMinutes, null,
+                    priceType, basePrice, priceMax,
+                    null, null, null,
+                    salonId, "Salon Bella", "https://cdn/salon.png"
             };
         }
 
@@ -941,12 +969,8 @@ class FavoriteServiceTest {
         void should_mapSalonArmRow_when_clientHasSalonServiceFavorite() {
             UUID serviceDefId = UUID.randomUUID();
             UUID salonId = UUID.randomUUID();
-            Object[] row = {
-                    "SALON", null, null, serviceDefId, "Pedicure",
-                    null, null, null,
-                    45, "FIXED", new BigDecimal("400.00"), null,
-                    salonId, "Salon Bella", "https://cdn/salon.png"
-            };
+            Object[] row = salonArmRow(serviceDefId, salonId, "Pedicure", 45, "FIXED",
+                    new BigDecimal("400.00"), null);
             when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
                     .thenReturn(new PageImpl<>(List.<Object[]>of(row)));
 
@@ -967,6 +991,82 @@ class FavoriteServiceTest {
             assertThat(response.salonAvatarUrl()).isEqualTo("https://cdn/salon.png");
             assertThat(response.durationMinutes()).isEqualTo(45);
             assertThat(response.priceDisplay()).isEqualTo("400 ₴");
+        }
+
+        @Test
+        @DisplayName("a MASTER row prints the master's OWN band, not the definition's — the "
+                + "wish-list/master-menu divergence this projection shipped")
+        void should_printTheMastersOwnBand_when_assignmentCarriesAPriceOverride() {
+            MasterServiceAssignment msa = assignmentOwnedBy(Role.SALON_MASTER, true, true);
+            ReflectionTestUtils.setField(msa, "priceTypeOverride", PriceType.RANGE);
+            ReflectionTestUtils.setField(msa, "priceOverride", new BigDecimal("1000.00"));
+            ReflectionTestUtils.setField(msa, "priceMaxOverride", new BigDecimal("1400.00"));
+            ReflectionTestUtils.setField(msa, "durationOverrideMinutes", 90);
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(masterArmRow(msa, "Марія", "Левченко", null))));
+
+            FavoriteServiceResponse row = favoriteService
+                    .listServiceFavorites(clientId, PageRequest.of(0, 20)).getContent().get(0);
+
+            assertThat(row.priceType()).isEqualTo(PriceType.RANGE);
+            assertThat(row.priceMin()).isEqualByComparingTo("1000.00");
+            assertThat(row.priceMax()).isEqualByComparingTo("1400.00");
+            assertThat(row.priceDisplay()).isEqualTo("від 1000 до 1400 ₴");
+            assertThat(row.durationMinutes()).isEqualTo(90);
+        }
+
+        @Test
+        @DisplayName("a MASTER row never consults the salon-hull aggregation")
+        void should_notAggregateHulls_when_pageHoldsOnlyMasterRows() {
+            MasterServiceAssignment msa = assignmentOwnedBy(Role.SALON_MASTER, true, true);
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(masterArmRow(msa, "Марія", "Левченко", null))));
+
+            favoriteService.listServiceFavorites(clientId, PageRequest.of(0, 20));
+
+            verify(serviceCatalogService).hullsForSalonServices(Set.of());
+        }
+
+        @Test
+        @DisplayName("a SALON row is repriced by the salon-catalogue hull, not the definition's band")
+        void should_priceSalonRowByCatalogueHull_when_hullIsAvailable() {
+            UUID serviceDefId = UUID.randomUUID();
+            Object[] row = salonArmRow(serviceDefId, UUID.randomUUID(), "Pedicure", 45, "FIXED",
+                    new BigDecimal("400.00"), null);
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(row)));
+            when(serviceCatalogService.hullsForSalonServices(Set.of(serviceDefId)))
+                    .thenReturn(Map.of(serviceDefId, new ServicePricing.Hull(
+                            PriceType.RANGE, new BigDecimal("400.00"), new BigDecimal("900.00"))));
+
+            FavoriteServiceResponse mapped = favoriteService
+                    .listServiceFavorites(clientId, PageRequest.of(0, 20)).getContent().get(0);
+
+            assertThat(mapped.priceType()).isEqualTo(PriceType.RANGE);
+            assertThat(mapped.priceMin()).isEqualByComparingTo("400.00");
+            assertThat(mapped.priceMax()).isEqualByComparingTo("900.00");
+            assertThat(mapped.priceDisplay()).isEqualTo("від 400 до 900 ₴");
+            assertThat(mapped.durationMinutes())
+                    .as("the hull reprices money only — duration is untouched")
+                    .isEqualTo(45);
+        }
+
+        @Test
+        @DisplayName("a SALON row with no bookable master falls back to the definition's own band")
+        void should_keepDefinitionBand_when_noBookableMasterPricesTheSalonRow() {
+            UUID serviceDefId = UUID.randomUUID();
+            Object[] row = salonArmRow(serviceDefId, UUID.randomUUID(), "Pedicure", 45, "FIXED",
+                    new BigDecimal("400.00"), null);
+            when(favoriteRepository.findFavoriteServiceRows(eq(clientId), any(Pageable.class)))
+                    .thenReturn(new PageImpl<>(List.<Object[]>of(row)));
+            when(serviceCatalogService.hullsForSalonServices(Set.of(serviceDefId)))
+                    .thenReturn(Map.of());
+
+            FavoriteServiceResponse mapped = favoriteService
+                    .listServiceFavorites(clientId, PageRequest.of(0, 20)).getContent().get(0);
+
+            assertThat(mapped.priceDisplay()).isEqualTo("400 ₴");
+            assertThat(mapped.priceMax()).isNull();
         }
 
         @Test

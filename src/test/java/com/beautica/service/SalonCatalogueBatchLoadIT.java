@@ -2,10 +2,12 @@ package com.beautica.service;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.common.ApiResponse;
+import com.beautica.common.BookingWindow;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.service.MasterScheduleService;
+import com.beautica.master.service.ScheduleMapper;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.service.dto.BulkCreateServicesRequest;
 import com.beautica.service.dto.BulkServiceItemRequest;
@@ -24,6 +26,7 @@ import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.assertj.core.api.SoftAssertions;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import com.beautica.support.NotATimedTest;
 import org.junit.jupiter.api.DisplayName;
@@ -35,6 +38,7 @@ import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -118,7 +122,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code SalonCatalogueVisibilityIT} do.
  */
 @Slf4j
-@Import({TestSecurityConfig.class, SalonCatalogueBatchLoadIT.FrozenKyivClockConfig.class})
+@Import({TestSecurityConfig.class, SalonCatalogueBatchLoadIT.FrozenKyivClockConfig.class,
+        SalonCatalogueBatchLoadIT.FoldCountingScheduleMapperConfig.class})
 @DisplayName("GET /salons/{salonId}/services — Phase 315 batched bookability gate")
 class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
 
@@ -155,6 +160,109 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
     private MasterScheduleService masterScheduleService;
     @Autowired
     private EntityManagerFactory emf;
+
+    /**
+     * The fold's only allocator of {@link EffectiveDayResponse}: every resolved day — override,
+     * template or {@code NO_SCHEDULE} gap — is built by one of {@code ScheduleMapper.toEffectiveDay}'s
+     * overloads. Counting those calls therefore COUNTS FOLDED DAYS directly, which is the quantity
+     * cases 15/15b/15c bound; a statement counter cannot see this at all (the fold issues no
+     * statements, which is exactly why the D8 ledger stayed flat while the fold was 181x larger than
+     * it needed to be).
+     *
+     * <p><b>Explicitly ARMED, not a class-level spy (2026-09-15 perf LOW, test-infra).</b> This used
+     * to be a {@code @MockitoSpyBean ScheduleMapper} declared at class level, which instrumented the
+     * hottest inner loop for all sixteen cases while only the three fold-count cases ever read it —
+     * cases 9/12/14 seed 20-60 masters and therefore paid ByteBuddy interception plus an
+     * argument-capturing {@code Invocation} allocation for up to ~11 000 folds each, on tests this
+     * class's own javadoc already flags as timing-fragile (they carry {@link NotATimedTest} against
+     * {@code SlowTestExtension}'s wall-clock ceiling). {@link FoldCountingScheduleMapper} is a plain
+     * subclass that delegates to the real mapper and records nothing until a test calls
+     * {@link FoldCountingScheduleMapper#arm()}, so the other thirteen cases pay one predictable
+     * branch instead.
+     *
+     * <p><b>Why not a {@code @Nested} block owning the spy</b> — the other option on the table.
+     * {@code @MockitoSpyBean} is a bean override, so declaring it on a nested class puts that class
+     * in a DIFFERENT {@code ApplicationContext} from its enclosing one: this class would boot two
+     * Spring contexts instead of one (it already has a unique context key via
+     * {@link FrozenKyivClockConfig}), and the nested tests would have to re-{@code @Autowired}
+     * {@code SlotCalculationService} because the outer instance's fields are injected from the OUTER
+     * context — a spy in one context cannot observe a service from the other. That trades a few tens
+     * of milliseconds of Mockito overhead for a whole extra context boot, which is the wrong way
+     * round for a finding whose whole subject is cost. Per-test {@code reset} was not an option
+     * either: {@code @MockitoSpyBean} already resets after every test method, so it buys nothing.
+     */
+    @Autowired
+    private FoldCountingScheduleMapper foldCounter;
+
+    /**
+     * Replaces the real {@link ScheduleMapper} bean (by {@code @Primary}) with a counting subclass —
+     * see {@link #foldCounter}. {@code ScheduleMapper} is a dependency-free {@code @Component}, so
+     * the subclass needs no constructor of its own and inherits every mapping method unchanged;
+     * only the two {@code toEffectiveDay} overloads are intercepted, which is exactly the set the
+     * old spy filtered for by method name.
+     */
+    @TestConfiguration
+    static class FoldCountingScheduleMapperConfig {
+        @Bean
+        @Primary
+        FoldCountingScheduleMapper foldCountingScheduleMapper() {
+            return new FoldCountingScheduleMapper();
+        }
+    }
+
+    /**
+     * Delegating {@link ScheduleMapper} that tallies folded days BY DATE once {@link #arm()} is
+     * called. The by-date histogram is what makes case 15c's per-master attribution possible: the
+     * mapper never sees a master id, but three masters walking prefixes of the SAME date list leave
+     * a strictly decreasing step function whose steps are the per-master walk lengths.
+     */
+    static final class FoldCountingScheduleMapper extends ScheduleMapper {
+
+        private final Map<LocalDate, Integer> foldsByDate = new LinkedHashMap<>();
+        private boolean armed;
+
+        /** Starts counting from zero. Call AFTER fixture seeding, which also folds. */
+        void arm() {
+            foldsByDate.clear();
+            armed = true;
+        }
+
+        void disarm() {
+            armed = false;
+            foldsByDate.clear();
+        }
+
+        long totalFolds() {
+            return foldsByDate.values().stream().mapToLong(Integer::longValue).sum();
+        }
+
+        long foldsOn(LocalDate date) {
+            return foldsByDate.getOrDefault(date, 0);
+        }
+
+        private void record(LocalDate date) {
+            if (armed) {
+                foldsByDate.merge(date, 1, Integer::sum);
+            }
+        }
+
+        @Override
+        public EffectiveDayResponse toEffectiveDay(LocalDate date,
+                com.beautica.master.dto.EffectiveDaySource source,
+                List<com.beautica.master.dto.WorkIntervalDto> intervals) {
+            record(date);
+            return super.toEffectiveDay(date, source, intervals);
+        }
+
+        @Override
+        public EffectiveDayResponse toEffectiveDay(LocalDate date,
+                com.beautica.master.dto.EffectiveDaySource source,
+                List<com.beautica.master.dto.WorkIntervalDto> intervals,
+                List<LocalTime> times) {
+            record(date);
+            return super.toEffectiveDay(date, source, intervals, times);
+        }
+    }
 
     private ServiceTestFixtures fixtures;
 
@@ -562,9 +670,21 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
     }
 
     /**
-     * Case 12 (D8's caveat): the {@code discreteTimes} surcharge tracks SCHEDULE ROWS
-     * ({@code ceil(rows / 50)}), not master count — 51 masters x 1 explicit day costs the SAME
-     * statement count as 1 master x 51 explicit days.
+     * Case 12 (D8's caveat): the {@code discreteTimes} surcharge tracks the schedule rows the fold
+     * WALKS ({@code ceil(walked / 50)}), not master count — and 51 masters x 1 explicit day
+     * therefore costs one statement MORE than 1 master x 51 explicit days, never fewer.
+     *
+     * <p><b>Re-derived 2026-09-15 (the fold bound, perf MEDIUM-3).</b> This case used to assert the
+     * two sides were EQUAL, on the reasoning that both load 51 rows. That equality was a property of
+     * the eager fold: every one of a master's covering templates got walked because every date got
+     * folded. Now that the gate stops at the first bookable day
+     * ({@code MasterScheduleService#reduceEffectiveRangeBatch}), the one-master side walks only the
+     * template covering days 0-1 and leaves the other 50 rows' {@code discreteTimes} proxies
+     * untouched — so it costs 5 where the many-masters side, which must fold all 51 masters to
+     * produce 51 verdicts, costs 6. Both sides' VERDICTS are unchanged; only the one-master side's
+     * statement count fell, which is the improvement showing through at the statement layer. The
+     * anti-N+1 claim this case contributes is unaffected and is pinned twice over by case 9 (flat
+     * across 1..20 masters) and case 14 (50 vs 51 masters costs +1, not +51).
      *
      * <p><b>QA fix (Phase 315 mutation 9 follow-up — reported GREEN-but-vacuous, now RE-DERIVED).</b>
      * The original fixture placed the one-master side's 20 "extra" rows at
@@ -593,8 +713,8 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
             + "measures a quantity this test makes no claim about, and on a loaded machine the "
             + "fixture build alone has been observed at 14.6s against a 5.66s quiet-machine figure. "
             + "Trimming the fixture would delete the boundary crossing, i.e. the test.")
-    @DisplayName("Case 12 (D8 caveat): the discreteTimes surcharge is O(rows/50), independent of "
-            + "master count, pinned across the batch_fetch_size=50 boundary (51 rows either way)")
+    @DisplayName("Case 12 (D8 caveat): the discreteTimes surcharge is O(walked rows / 50) — 51 "
+            + "masters x 1 row costs one statement MORE than 1 master x 51 rows, never fewer")
     void should_makeDiscreteTimesSurchargeIndependentOfMasterCount() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
                 "owner-315-c12-" + System.nanoTime() + "@beautica.test");
@@ -640,14 +760,24 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
                 rows, manyMastersStatements, rows, oneMasterStatements);
 
         assertThat(manyMastersStatements)
-                .as("51 schedule rows cross the batch_fetch_size=50 ceiling -> ceil(51/50)+4 = 6, "
-                        + "the SAME named formula case 14 pins by master count")
+                .as("51 masters must each be folded, so all 51 schedule rows are walked and cross "
+                        + "the batch_fetch_size=50 ceiling -> ceil(51/50)+4 = 6, the SAME named "
+                        + "formula case 14 pins by master count")
                 .isEqualTo(ONE_MASTER_STATEMENT_COUNT + 1);
         assertThat(oneMasterStatements)
-                .as("the surcharge must track SCHEDULE ROWS, not MASTER COUNT — 51 schedule rows "
-                        + "must cost the SAME whether spread across 51 masters or piled onto 1, "
-                        + "even ACROSS the batch_fetch_size=50 boundary")
-                .isEqualTo(manyMastersStatements);
+                .as("ONE master's 51 rows cost ceil(1/50)+4 = 5, NOT 51/50+4: the fold stops at "
+                        + "that master's first bookable day (day 1 — 09:00 on TODAY is already past "
+                        + "the 09:15 cutoff), which lies inside the FIRST 3-day template, so the "
+                        + "other 50 rows are loaded but never walked and their discreteTimes "
+                        + "proxies are never initialised. 51x the ROWS on one master therefore "
+                        + "costs LESS than 51 masters, never more — the surcharge tracks neither "
+                        + "master count NOR loaded rows, but WALKED rows")
+                .isEqualTo(ONE_MASTER_STATEMENT_COUNT);
+        assertThat(oneMasterStatements)
+                .as("the direction is the claim: piling rows onto one master may only ever cost "
+                        + "LESS than spreading them across masters. Strictly more would mean the "
+                        + "surcharge had started tracking loaded rows per master — a per-row N+1")
+                .isLessThan(manyMastersStatements);
     }
 
     /**
@@ -746,6 +876,206 @@ class SalonCatalogueBatchLoadIT extends AbstractIntegrationTest {
                             + "boundary", i)
                     .isEqualTo(nonCrossingDays.get(i).isWorkingDay());
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════
+    // Case 15 (2026-09-15 perf MEDIUM-3 / security MEDIUM) — the FOLD bound.
+    // ══════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * The horizon the gate folds over: {@code today … today + 180}, inclusive — 181 days, which is
+     * what a bookable master used to cost regardless of how early the answer was known.
+     */
+    private static final int HORIZON_DAYS = BookingWindow.MAX_DAYS_AHEAD + 1;
+
+    /**
+     * Generous ceiling for "the gate stopped almost immediately". The fixture below is bookable on
+     * day 0 (frozen 09:00 Kyiv, a 09:00-17:00 interval every weekday, cutoff 09:15), so the true
+     * count is 1; the slack absorbs a fixture or lead-time tweak without letting a regression to the
+     * 181-day fold through — any accidental re-materialisation lands two orders of magnitude above.
+     */
+    private static final long MAX_FOLDED_DAYS_FOR_AN_EARLY_BOOKABLE_MASTER = 10L;
+
+    @Test
+    @NotATimedTest(reason = "asserts a FOLD COUNT measured by a counting mapper, not wall-clock time")
+    @DisplayName("Case 15: a master bookable on the first day costs a handful of folded days, not "
+            + "the whole 181-day horizon — while the verdict stays bookable")
+    void should_foldOnlyTheDaysWalked_when_theMasterIsBookableEarlyInTheHorizon() {
+        UUID masterId = seedMaster();
+        seedUsableSchedule(masterId);
+        MasterServiceAssignment msa = assignment(masterId, 30, 0);
+        // The fixture seeding above also folds; arming here counts only the gate's own folds.
+        foldCounter.arm();
+
+        Map<UUID, List<MasterServiceAssignment>> result =
+                slotCalculationService.filterBookableAssignmentsBatch(Map.of(masterId, List.of(msa)));
+
+        long foldedDays = foldCounter.totalFolds();
+        log.info("Case 15 folded days for a day-0-bookable master: {} (horizon = {})",
+                foldedDays, HORIZON_DAYS);
+
+        SoftAssertions.assertSoftly(softly -> {
+            softly.assertThat(result.get(masterId))
+                    .as("THE VERDICT IS THE INVARIANT: bounding the fold may not change who is "
+                            + "bookable — this master has a free 09:00-17:00 day and must survive "
+                            + "the gate exactly as before the bound existed")
+                    .containsExactly(msa);
+            softly.assertThat(foldedDays)
+                    .as("the gate answers a BOOLEAN and returns at the first bookable day, so it "
+                            + "must fold only the prefix it walked. Before the 2026-09-15 bound it "
+                            + "folded all %s days per master first — measured=%s",
+                            HORIZON_DAYS, foldedDays)
+                    .isLessThanOrEqualTo(MAX_FOLDED_DAYS_FOR_AN_EARLY_BOOKABLE_MASTER);
+            softly.assertThat(foldedDays)
+                    .as("premise: the gate really did fold SOMETHING — a zero would mean the spy "
+                            + "missed the fold and the bound above is vacuous")
+                    .isGreaterThanOrEqualTo(1L);
+        });
+    }
+
+    @Test
+    @NotATimedTest(reason = "asserts a FOLD COUNT measured by a counting mapper, not wall-clock time")
+    @DisplayName("Case 15b: a master bookable on NO day still folds the whole horizon — the bound "
+            + "is an early exit, never a truncated search")
+    void should_foldTheWholeHorizon_when_noDayIsBookable() {
+        UUID masterId = seedMaster();
+        // No schedule row at all -> every one of the 181 days resolves NO_SCHEDULE, and the gate
+        // can only prove "not bookable" by looking at all of them.
+        MasterServiceAssignment msa = assignment(masterId, 30, 0);
+        foldCounter.arm();
+
+        Map<UUID, List<MasterServiceAssignment>> result =
+                slotCalculationService.filterBookableAssignmentsBatch(Map.of(masterId, List.of(msa)));
+
+        long foldedDays = foldCounter.totalFolds();
+
+        SoftAssertions.assertSoftly(softly -> {
+            softly.assertThat(result.get(masterId))
+                    .as("no schedule -> not bookable, exactly as before the bound")
+                    .isEmpty();
+            softly.assertThat(foldedDays)
+                    .as("a negative verdict has no shorter proof: every day must be folded, so the "
+                            + "count is the full horizon. This is the other half of 'the verdict is "
+                            + "unchanged' — the bound never stops the search early on a NEGATIVE")
+                    .isEqualTo(HORIZON_DAYS);
+        });
+    }
+
+    /**
+     * Case 15c — the MULTI-master arm of the fold bound (2026-09-15 perf LOW).
+     *
+     * <p><b>The blind spot this closes.</b> Every other fold-count pin — cases 15 and 15b above, and
+     * all three {@code MasterScheduleServiceTest} arms — calls the gate with ONE master. A regression
+     * where one master's early exit leaked into another's view, or where the memo array were hoisted
+     * and shared across masters, changes NOTHING a statement counter or a verdict assertion can see:
+     * it shows up only as a fold count, and only when more than one master is in flight. Exactly the
+     * blind-spot class the statement-count ledger had before it was widened.
+     *
+     * <p><b>Per-master attribution, from a mapper that never sees a master id.</b> The counting
+     * mapper tallies folds BY DATE. All three masters walk PREFIXES of the same 181-date list, so the
+     * histogram is a step function whose steps are the walk lengths:
+     *
+     * <pre>
+     *   master          fixture                                   first bookable   days walked
+     *   A  seedUsableSchedule (valid from today-1, 09:00-17:00)    day 0            1
+     *   B  interval schedule valid from today+90, 09:00-17:00      day 90           91
+     *   C  no weekly_schedules row at all                          never            181 (whole horizon)
+     *
+     *   folds on today+0            = A + B + C = 3
+     *   folds on today+1 … today+90 = B + C     = 2   (90 dates)
+     *   folds on today+91 … +180    = C         = 1   (90 dates)
+     *   total                       = 3 + 180 + 90   = 273 = 1 + 91 + 181
+     * </pre>
+     *
+     * The step positions are the walk lengths, so asserting the three bands IS asserting 1 / 91 / 181
+     * per master — exactly, not as a range. A shared memo would collapse every band to 1 (total 181);
+     * a leaked early exit would truncate C's band; a lost early exit would flatten every band to 3
+     * (total 543).
+     *
+     * <p>Day 90 is {@code 2026-12-13}, a Sunday, and the fixture seeds all seven ISO weekdays, so
+     * B's first covered date really is its {@code valid_from} and not some later weekday.
+     */
+    @Test
+    @NotATimedTest(reason = "asserts a FOLD COUNT measured by a counting mapper, not wall-clock time")
+    @DisplayName("Case 15c: three masters in ONE batch fold exactly 1 / 91 / 181 days — each early "
+            + "exit is private to its own master, and all three verdicts are correct")
+    void should_boundTheFoldPerMaster_when_theBatchHoldsThreeMastersWithDifferentFirstBookableDays() {
+        UUID bookableOnDayZero = seedMaster();
+        seedUsableSchedule(bookableOnDayZero);
+        UUID bookableOnDayNinety = seedMaster();
+        seedIntervalSchedule(bookableOnDayNinety, TODAY.plusDays(FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER),
+                null, LocalTime.of(9, 0), LocalTime.of(17, 0));
+        UUID neverBookable = seedMaster();
+
+        MasterServiceAssignment earlyMsa = assignment(bookableOnDayZero, 30, 0);
+        MasterServiceAssignment lateMsa = assignment(bookableOnDayNinety, 30, 0);
+        MasterServiceAssignment neverMsa = assignment(neverBookable, 30, 0);
+        Map<UUID, List<MasterServiceAssignment>> input = new LinkedHashMap<>();
+        input.put(bookableOnDayZero, List.of(earlyMsa));
+        input.put(bookableOnDayNinety, List.of(lateMsa));
+        input.put(neverBookable, List.of(neverMsa));
+        // The fixture seeding above also folds; arming here counts only the gate's own folds.
+        foldCounter.arm();
+
+        Map<UUID, List<MasterServiceAssignment>> result =
+                slotCalculationService.filterBookableAssignmentsBatch(input);
+
+        log.info("Case 15c total folded days across three masters: {} (expected {} = 1 + {} + {})",
+                foldCounter.totalFolds(), EXPECTED_TOTAL_FOLDS_FOR_THE_THREE_MASTERS,
+                FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER + 1, HORIZON_DAYS);
+
+        SoftAssertions.assertSoftly(softly -> {
+            softly.assertThat(result.get(bookableOnDayZero))
+                    .as("THE VERDICT IS THE INVARIANT: a master free from 09:00 today is bookable")
+                    .containsExactly(earlyMsa);
+            softly.assertThat(result.get(bookableOnDayNinety))
+                    .as("a master whose template only starts on day %s is still bookable — the "
+                            + "early exit is an optimisation, not a shorter horizon",
+                            FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER)
+                    .containsExactly(lateMsa);
+            softly.assertThat(result.get(neverBookable))
+                    .as("a master with no schedule at all is not bookable, and neither neighbour's "
+                            + "early exit may make it look bookable")
+                    .isEmpty();
+
+            softly.assertThat(foldCounter.foldsOn(TODAY))
+                    .as("day 0 is walked by ALL THREE masters — one fold each, never one shared "
+                            + "fold reused across masters (a hoisted memo would read 1 here)")
+                    .isEqualTo(3L);
+            for (int i = 1; i <= FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER; i++) {
+                LocalDate date = TODAY.plusDays(i);
+                softly.assertThat(foldCounter.foldsOn(date))
+                        .as("day %s: master A exited at day 0, so only B and C reach here", i)
+                        .isEqualTo(2L);
+            }
+            for (int i = FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER + 1; i < HORIZON_DAYS; i++) {
+                LocalDate date = TODAY.plusDays(i);
+                softly.assertThat(foldCounter.foldsOn(date))
+                        .as("day %s: A and B have both exited, so only C — the never-bookable "
+                                + "master — still walks", i)
+                        .isEqualTo(1L);
+            }
+            softly.assertThat(foldCounter.foldsOn(TODAY.plusDays(HORIZON_DAYS)))
+                    .as("nothing is folded past the horizon's last day")
+                    .isZero();
+            softly.assertThat(foldCounter.totalFolds())
+                    .as("the three bands sum to 1 + 91 + 181; before the bound existed this batch "
+                            + "cost 3 x %s = %s folds", HORIZON_DAYS, 3L * HORIZON_DAYS)
+                    .isEqualTo(EXPECTED_TOTAL_FOLDS_FOR_THE_THREE_MASTERS);
+        });
+    }
+
+    /** Case 15c's middle master: its template's {@code valid_from} is {@code today + 90}. */
+    private static final int FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER = 90;
+
+    /** 1 (day-0 master) + 91 (day-90 master) + 181 (never-bookable master) — see case 15c. */
+    private static final long EXPECTED_TOTAL_FOLDS_FOR_THE_THREE_MASTERS =
+            1L + (FIRST_BOOKABLE_DAY_OF_THE_LATE_MASTER + 1) + HORIZON_DAYS;
+
+    /** The counting mapper is a context singleton; leaving it armed would leak into the next test. */
+    @AfterEach
+    void disarmFoldCounter() {
+        foldCounter.disarm();
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════
