@@ -400,20 +400,28 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * {@code FavoriteListProjectionTest}'s "zero Salon / zero User entity loads" assertions hold
      * for both arms without qualification.
      *
-     * <p><b>Price band</b> — {@code price_type} / {@code price_min} / {@code price_max} are read
-     * straight off {@code service_definitions.price_type} / {@code base_price} / {@code
-     * price_max} for BOTH arms; that is exactly the definition's advertised band, i.e. exactly
-     * what {@code ServicePricing.ofDefinition(sd)} would derive from the same row (Phase 31.4
-     * D2) — the override on {@code master_services.price_override} affects only the booking
-     * floor, never this band (see {@code ServicePricing}'s class javadoc), so it is correctly
-     * absent from this SELECT. {@code duration_minutes} is the one field the two arms compute
-     * differently: the MASTER arm applies {@code COALESCE(msa.duration_override_minutes,
-     * sd.base_duration_minutes)} (the master's own override); the SALON arm has no assignment to
-     * override from, so it is bare {@code sd.base_duration_minutes} — matching
-     * {@code ServicePricing.ofDefinition}'s {@code effectiveDurationMinutes} for a bare
-     * definition (override arguments {@code null}). {@code FavoriteService} formats
-     * {@code priceDisplay} from these three scalars via the same {@code PriceDisplayFormatter}
-     * {@code ServicePricing} calls internally — see {@code FavoriteServiceResponse.fromRow}.
+     * <p><b>Price and duration — RAW columns only; this SELECT derives nothing (Phase 31.4 D2).</b>
+     * Both arms project the four {@code service_definitions} inputs
+     * ({@code price_type}/{@code base_price}/{@code price_max}/{@code base_duration_minutes}) AND
+     * the four {@code master_services} override inputs
+     * ({@code price_type_override}/{@code price_override}/{@code price_max_override}/
+     * {@code duration_override_minutes}) — the MASTER arm off its assignment, the SALON arm as
+     * typed {@code NULL}s, since a SALON row has no assignment yet. There is deliberately NO
+     * {@code COALESCE} here, not even for duration: the eight scalars are fed verbatim to
+     * {@code ServicePricing.Columns} / {@code ServicePricing.of}, which owns the one
+     * implementation of Phase 311 D9's resolution rule. Re-deriving the band in SQL is exactly how
+     * this projection drifted from {@code MasterServiceResponse} once {@code V165} gave a master
+     * their own band — do not put a {@code COALESCE} back.
+     *
+     * <p><b>The SALON arm's band is then REPLACED by the salon-catalogue hull.</b> What
+     * {@code ServicePricing} derives from these columns for a SALON row is the DEFINITION's own
+     * band, which is not what {@code GET /salons/&#123;salonId&#125;/services} prints — that
+     * endpoint renders the union hull across the salon's BOOKABLE masters (Phase 314). So
+     * {@code FavoriteService.listServiceFavorites} overlays that same hull onto every SALON row
+     * ({@code ServiceCatalogService#hullsForSalonServices}, one batched aggregation for the whole
+     * page), and the definition's band survives only as the documented fallback for a salon with
+     * no currently-bookable master. This query is not the place to compute that hull: it needs the
+     * free-slot bookability gate, which is in-memory Java over a master's schedule and bookings.
      *
      * <p><b>Master-performed invariant on the SALON arm (locked product decision).</b> The
      * {@code EXISTS} clause mirrors {@code MasterServiceRepository
@@ -425,9 +433,9 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      * ({@code msa.is_active}, {@code sd.is_active}, {@code m.is_active}, salon-active-or-null)
      * for the same reason, unchanged from Phase 31.3/31.4.
      *
-     * <p><b>Column layout</b> (stable — index-matched in {@code FavoriteService.mapWishListRow}
-     * and {@code FavoriteServiceResponse.fromRow}); columns 15/16 exist for the {@code ORDER BY}
-     * tiebreak only and are never read on the Java side:
+     * <p><b>Column layout</b> (stable — index-matched in {@code FavoriteServiceResponse.fromRow});
+     * columns 19/20 exist for the {@code ORDER BY} tiebreak only and are never read on the Java
+     * side:
      * <ol start="0">
      *   <li>{@code source_type} — {@code "MASTER"} or {@code "SALON"}</li>
      *   <li>{@code master_service_id} — {@code master_services.id}; {@code NULL} for a SALON row</li>
@@ -437,10 +445,14 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
      *   <li>{@code master_first_name} — {@code NULL} for a SALON row</li>
      *   <li>{@code master_last_name} — {@code NULL} for a SALON row</li>
      *   <li>{@code master_avatar_url} — {@code NULL} for a SALON row</li>
-     *   <li>{@code duration_minutes} — effective duration (see above)</li>
-     *   <li>{@code price_type}</li>
-     *   <li>{@code price_min} — the definition's {@code base_price}</li>
-     *   <li>{@code price_max} — {@code NULL} for FIXED</li>
+     *   <li>{@code def_base_duration_minutes} — {@code service_definitions.base_duration_minutes}</li>
+     *   <li>{@code duration_override_minutes} — {@code master_services}; {@code NULL} on a SALON row</li>
+     *   <li>{@code def_price_type} — {@code service_definitions.price_type}</li>
+     *   <li>{@code def_base_price} — {@code service_definitions.base_price}</li>
+     *   <li>{@code def_price_max} — {@code service_definitions.price_max}; {@code NULL} for FIXED</li>
+     *   <li>{@code price_type_override} — {@code master_services}; {@code NULL} on a SALON row</li>
+     *   <li>{@code price_override} — {@code master_services}; {@code NULL} on a SALON row</li>
+     *   <li>{@code price_max_override} — {@code master_services}; {@code NULL} on a SALON row</li>
      *   <li>{@code salon_id} — {@code NULL} for a MASTER row</li>
      *   <li>{@code salon_name} — {@code NULL} for a MASTER row</li>
      *   <li>{@code salon_avatar_url} — {@code NULL} for a MASTER row</li>
@@ -464,10 +476,14 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                     u.first_name             AS master_first_name,
                     u.last_name              AS master_last_name,
                     u.avatar_url             AS master_avatar_url,
-                    COALESCE(msa.duration_override_minutes, sd.base_duration_minutes) AS duration_minutes,
-                    sd.price_type            AS price_type,
-                    sd.base_price            AS price_min,
-                    sd.price_max             AS price_max,
+                    sd.base_duration_minutes AS def_base_duration_minutes,
+                    msa.duration_override_minutes AS duration_override_minutes,
+                    sd.price_type            AS def_price_type,
+                    sd.base_price            AS def_base_price,
+                    sd.price_max             AS def_price_max,
+                    msa.price_type_override  AS price_type_override,
+                    msa.price_override       AS price_override,
+                    msa.price_max_override   AS price_max_override,
                     NULL::uuid               AS salon_id,
                     NULL::varchar            AS salon_name,
                     NULL::varchar            AS salon_avatar_url,
@@ -497,10 +513,14 @@ public interface FavoriteRepository extends JpaRepository<Favorite, UUID> {
                     NULL::varchar            AS master_first_name,
                     NULL::varchar            AS master_last_name,
                     NULL::varchar            AS master_avatar_url,
-                    sd.base_duration_minutes AS duration_minutes,
-                    sd.price_type            AS price_type,
-                    sd.base_price            AS price_min,
-                    sd.price_max             AS price_max,
+                    sd.base_duration_minutes AS def_base_duration_minutes,
+                    NULL::int                AS duration_override_minutes,
+                    sd.price_type            AS def_price_type,
+                    sd.base_price            AS def_base_price,
+                    sd.price_max             AS def_price_max,
+                    NULL::varchar            AS price_type_override,
+                    NULL::numeric            AS price_override,
+                    NULL::numeric            AS price_max_override,
                     sal.id                   AS salon_id,
                     sal.name                 AS salon_name,
                     sal.avatar_url           AS salon_avatar_url,

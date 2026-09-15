@@ -1648,11 +1648,87 @@ public class ServiceCatalogService {
     }
 
     /**
+     * The salon-catalogue price hull for each of {@code serviceDefIds} — keyed by
+     * {@code service_definitions.id}, spanning arbitrarily many salons in ONE pass.
+     *
+     * <p><b>Why it exists.</b> The BEAUTY WISH LIST's SALON arm
+     * ({@code FavoriteService#listServiceFavorites}) advertises a saved salon service at the price
+     * the client will actually be offered, which is the catalogue's cross-master hull — the
+     * definition's own band is NOT that number once a master carries an own band (Phase 311 D9).
+     * This method is the shared seam: it runs the same candidate predicate, the same free-slot
+     * bookability gate and the same {@link ServicePricing#hullOfAssignments} fold that
+     * {@link #getSalonServiceCatalog} runs, so a wish-list row and the catalogue tile it was saved
+     * from cannot print different numbers.
+     *
+     * <p><b>Statement count is O(1) in the number of rows, not O(rows) or O(salons).</b> One
+     * candidate load ({@code MasterServiceRepository#findBookableAssignmentsForSalonServices}) for
+     * the WHOLE id set, then {@link #bookableDefinitions}' single
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch} — one schedule-resolve and one
+     * booking-load statement for every master across every salon COMBINED (Phase 315). Three
+     * statements for a full page; three for a single row. Deliberately NOT a loop over
+     * {@link #getSalonServiceCatalog} per distinct salon, which would be one candidate load plus
+     * two batched loads PER SALON and would additionally build (and cache) the whole catalogue of
+     * each salon to read one row out of it.
+     *
+     * <p><b>Not cached, deliberately — and NOT a gap beside the cached catalogue (2026-09-15 perf
+     * audit MEDIUM-4, rejected).</b> The obvious-looking objection is that {@code getSalonServiceCatalog}
+     * has a {@code salon-service-catalog} entry while its twin here has none. They are not twins.
+     * That cache holds a WHOLE catalogue keyed by {@code salonId}; this call asks for a handful of
+     * arbitrary {@code service_definitions} ids chosen by one client's wish list. Neither can serve
+     * the other: a salon-keyed entry cannot answer a subset query without being built in full (which
+     * is the cost this method exists to avoid — see the paragraph above), and a
+     * {@code serviceDefId → Hull} cache would be a 38th cache whose only sharing is one wish list
+     * hitting another wish list that saved the very same service, at a 60-second TTL. The eviction
+     * surface it would add (every schedule write, every booking write, every band edit, for every
+     * master who performs the id) buys a hit rate close to zero. The heavy loads underneath this
+     * method are the ones Phase 315 batched and the 2026-09-15 fold bound
+     * ({@code MasterScheduleService#reduceEffectiveRangeBatch}) shortened; that is where the cost
+     * was, and it is paid there.
+     *
+     * <p><b>Precondition — this method performs NO authorization (2026-09-15 security LOW).</b> It
+     * trusts {@code serviceDefIds} completely: it neither knows nor asks who is calling, and it
+     * happily prices any live SALON-owned definition whose id is handed to it. <b>Every caller must
+     * pass only ids the caller is already entitled to see.</b> The sole caller satisfies that by
+     * construction — {@code FavoriteService#listServiceFavorites} derives the ids from a page already
+     * filtered by the authenticated {@code client_id}, so a client can only ever ask about rows they
+     * saved. The disclosure is bounded anyway (the same hull is served anonymously by the
+     * {@code permitAll} {@code GET /salons/&#123;salonId&#125;/services}), which is why this stays a
+     * documented contract rather than an ownership check — but a future caller that derives ids from
+     * client-supplied input MUST authorize them first, here or above.
+     *
+     * <p><b>An absent key means "no bookable master priced it"</b> — the id was not a live
+     * SALON-owned definition, nobody bookable performs it, or every contributor resolved to a null
+     * floor. The map is never populated with a half-formed band, and the CALLER decides what to
+     * render for a missing key (the wish list falls back to the definition's own band; the
+     * catalogue omits such a row entirely). An empty {@code serviceDefIds} short-circuits before
+     * any query — an empty {@code IN} list never reaches the database.
+     */
+    @Transactional(readOnly = true)
+    public Map<UUID, ServicePricing.Hull> hullsForSalonServices(Collection<UUID> serviceDefIds) {
+        if (serviceDefIds.isEmpty()) {
+            return Map.of();
+        }
+
+        List<MasterServiceAssignment> candidates =
+                masterServiceRepository.findBookableAssignmentsForSalonServices(serviceDefIds);
+        if (candidates.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<UUID, ServicePricing.Hull> hulls = new LinkedHashMap<>();
+        bookableDefinitions(candidates).forEach((serviceDefId, assignments) ->
+                ServicePricing.hullOfAssignments(assignments)
+                        .ifPresent(hull -> hulls.put(serviceDefId, hull)));
+        return hulls;
+    }
+
+    /**
      * Groups the candidate assignments by master, runs the batched free-slot gate ONCE for the WHOLE
-     * salon ({@code SlotCalculationService#filterBookableAssignmentsBatch} — Phase 315: one schedule
-     * resolve statement and one booking-load statement for every master in the salon COMBINED, not one
+     * candidate set ({@code SlotCalculationService#filterBookableAssignmentsBatch} — Phase 315: one
+     * schedule resolve statement and one booking-load statement for every master COMBINED, not one
      * of each per master), and returns the surviving assignments grouped by {@code serviceDefinition.id}
-     * (Phase 314 D2). Earlier this collapsed straight to distinct {@link ServiceDefinition}s and threw
+     * (Phase 314 D2). Nothing here is salon-scoped, which is why {@link #hullsForSalonServices} can
+     * reuse it verbatim for a candidate set spanning many salons — the gate is per MASTER. Earlier this collapsed straight to distinct {@link ServiceDefinition}s and threw
      * the assignments away; that made it impossible to tell WHICH masters' bands should price the row,
      * so this reshaping is required before {@link #priceForSalonCatalogue} can aggregate correctly —
      * aggregating over the raw, un-filtered {@code candidates} would let a filtered-out master's band
@@ -1703,52 +1779,25 @@ public class ServiceCatalogService {
 
     /**
      * Phase 314 D1/D3 — prices one salon-catalogue row as the union hull of {@code assignments}'
-     * RESOLVED bands ({@link ServicePricing#ofAssignment}), never {@code sd}'s own band. Pure
-     * in-memory work over the already-loaded, already-bookable-filtered assignment list — no
-     * repository call happens here (D5): the statement count for this method is zero.
+     * RESOLVED bands, never {@code sd}'s own band. The fold itself lives in
+     * {@link ServicePricing#hullOfAssignments} — the ONE implementation, shared with the wish
+     * list's SALON arm ({@code FavoriteService.listServiceFavorites} via
+     * {@link #hullsForSalonServices}) so a saved salon service and the catalogue tile it was
+     * saved from cannot print different numbers. Pure in-memory work over the already-loaded,
+     * already-bookable-filtered assignment list — no repository call happens here (D5): the
+     * statement count for this method is zero.
      *
      * <p>{@code assignments} is guaranteed non-empty and non-null by construction — it is exactly
      * the value {@link #bookableDefinitions} stored under {@code sd.getId()}, which is only ever
-     * populated by an {@code add}, never a put of an empty list.
+     * populated by an {@code add}, never a put of an empty list. An EMPTY hull is therefore only
+     * reachable when every contributor resolves to a null floor (D1, case 14); it falls back to
+     * the definition's own band rather than emitting a half-formed one.
      */
     private ServiceDefinitionResponse priceForSalonCatalogue(
             ServiceDefinition sd, List<MasterServiceAssignment> assignments) {
-        BigDecimal min = null;
-        BigDecimal max = null;
-
-        for (MasterServiceAssignment msa : assignments) {
-            ServicePricing pricing = ServicePricing.ofAssignment(msa);
-            BigDecimal floor = pricing.priceMin();
-            if (floor == null) {
-                // D1 — ServiceDefinition.basePrice carries no entity-level @NotNull; skip a
-                // contributor that resolves to no floor rather than let it corrupt the hull.
-                continue;
-            }
-            // FIXED resolves to a null ceiling (ServicePricing contract) — the degenerate
-            // interval [floor, floor], per D1's ceiling(msa) rule.
-            BigDecimal ceiling = pricing.priceMax() != null ? pricing.priceMax() : floor;
-
-            min = min == null ? floor : min.min(floor);
-            max = max == null ? ceiling : max.max(ceiling);
-        }
-
-        if (min == null) {
-            // D1 — every contributor was null; fall back to the definition rather than emit a
-            // half-formed band (case 14).
-            return ServiceDefinitionResponse.from(sd);
-        }
-
-        // D4 — every contributing band is closed by construction (chk_master_service_price_mode
-        // + MasterServiceBand.validate). Assert it anyway so a future loosening of either
-        // guarantee fails loudly here rather than rendering an inverted band to a customer.
-        if (max.compareTo(min) < 0) {
-            throw new IllegalStateException(
-                    "salon catalogue price aggregate produced max < min for service definition "
-                            + sd.getId());
-        }
-
-        BigDecimal renderedMax = max.compareTo(min) == 0 ? null : max;
-        return ServiceDefinitionResponse.fromSalonAggregate(sd, min, renderedMax);
+        return ServicePricing.hullOfAssignments(assignments)
+                .map(hull -> ServiceDefinitionResponse.fromSalonAggregate(sd, hull))
+                .orElseGet(() -> ServiceDefinitionResponse.from(sd));
     }
 
     /**

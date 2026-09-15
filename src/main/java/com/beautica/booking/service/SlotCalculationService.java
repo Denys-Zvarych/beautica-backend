@@ -877,6 +877,22 @@ public class SlotCalculationService {
      * {@link #hasBookableFutureSlot} for the same window — batching is a LOADING STRATEGY, the returned
      * set never changes (D7).
      *
+     * <p><b>Bounded fold (2026-09-15 perf MEDIUM-3 / security MEDIUM).</b> This gate answers a
+     * BOOLEAN per (master, duration), and {@link #hasFreeFutureSlot} has always returned at the first
+     * bookable day — but it used to be handed a fully materialised 181-day projection per master
+     * first, so a page of the wish list spanning 100 salons (≈2 000 candidate masters) built ≈360 000
+     * {@code EffectiveDayResponse}s to produce a page of booleans, on an unthrottled route. The
+     * schedule rows are still loaded in the same two batched statements; only the FOLD is now
+     * deferred per day ({@code MasterScheduleService#reduceEffectiveRangeBatch}), so a master
+     * bookable on day 0 folds one day, not 181. A master who is bookable on no day still folds all
+     * 181 — that case has no shorter proof — which is why the bound is on the common path, not the
+     * worst case. The verdict is untouched in every case: the same fold, the same per-day predicate,
+     * the same order, merely stopped as soon as the answer is known.
+     *
+     * <p><b>Statement order.</b> The window's bookings are now loaded BEFORE the schedule rows (they
+     * must exist before the reducer runs), where they used to follow them. Same three statements,
+     * same bind values; only the sequence differs, and no caller or ledger depends on it.
+     *
      * <p><b>D3.3 — the empty-assignment short-circuit survives PER MASTER, at zero cost.</b> A master
      * whose assignment list is empty contributes {@code List.of()} without being included in either
      * batched load's {@code IN (:masterIds)} set — mirroring the pre-315 method's
@@ -915,40 +931,60 @@ public class SlotCalculationService {
                 .map(Map.Entry::getKey)
                 .toList();
 
-        Map<UUID, List<EffectiveDayResponse>> daysByMaster;
-        Map<UUID, Map<LocalDate, List<TimeRange>>> occupiedByMaster;
+        Instant cutoff = bookableCutoff();
+        Map<UUID, List<MasterServiceAssignment>> gated;
         if (loadedMasterIds.isEmpty()) {
-            daysByMaster = Map.of();
-            occupiedByMaster = Map.of();
+            gated = Map.of();
         } else {
             LocalDate from = LocalDate.now(kyivClock);
             LocalDate to = from.plusDays(BookingWindow.MAX_DAYS_AHEAD);
-            daysByMaster = masterScheduleService.resolveEffectiveRangeBatch(loadedMasterIds, from, to);
-            occupiedByMaster = loadOccupiedByDayBatch(loadedMasterIds, from, to);
+            Map<UUID, Map<LocalDate, List<TimeRange>>> occupiedByMaster =
+                    loadOccupiedByDayBatch(loadedMasterIds, from, to);
+            // The reducer runs INSIDE MasterScheduleService's transaction, once per loaded master,
+            // against a day list that folds on access — so `days` costs only the prefix the gate
+            // actually walks. Nothing about the gate's rule moved: the body below is the pre-existing
+            // per-master loop verbatim, only relocated into the callback.
+            gated = masterScheduleService.reduceEffectiveRangeBatch(loadedMasterIds, from, to,
+                    (masterId, days) -> gateByDuration(
+                            assignmentsByMaster.get(masterId), days,
+                            occupiedByMaster.getOrDefault(masterId, Map.of()), cutoff));
         }
-        Instant cutoff = bookableCutoff();
 
         Map<UUID, List<MasterServiceAssignment>> result = new LinkedHashMap<>();
         for (Map.Entry<UUID, List<MasterServiceAssignment>> entry : assignmentsByMaster.entrySet()) {
-            UUID masterId = entry.getKey();
-            List<MasterServiceAssignment> assignments = entry.getValue();
-            if (assignments.isEmpty()) {
-                result.put(masterId, List.of());
-                continue;
-            }
-            List<EffectiveDayResponse> days = daysByMaster.getOrDefault(masterId, List.of());
-            Map<LocalDate, List<TimeRange>> occupiedByDay = occupiedByMaster.getOrDefault(masterId, Map.of());
-            Map<Duration, Boolean> verdictByDuration = new HashMap<>();
-            List<MasterServiceAssignment> bookable = new ArrayList<>();
-            for (MasterServiceAssignment msa : assignments) {
-                if (verdictByDuration.computeIfAbsent(effectiveDuration(msa),
-                        duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff))) {
-                    bookable.add(msa);
-                }
-            }
-            result.put(masterId, bookable);
+            // A master excluded from loadedMasterIds (empty assignment list) keeps its D3.3
+            // zero-cost List.of(); every loaded master is a key of `gated` by construction, the
+            // getOrDefault being defensive rather than load-bearing.
+            result.put(entry.getKey(), entry.getValue().isEmpty()
+                    ? List.of()
+                    : gated.getOrDefault(entry.getKey(), List.of()));
         }
         return result;
+    }
+
+    /**
+     * One master's bookable subset: the assignments whose effective duration fits somewhere in
+     * {@code days}, memoised by duration (phase-302 audit LOW-4, kept per master by Phase 315 — see
+     * {@link #filterBookableAssignmentsBatch}).
+     *
+     * <p>{@code days} may be a lazily folding view
+     * ({@code MasterScheduleService#reduceEffectiveRangeBatch}), so the memo earns a second keep:
+     * besides skipping a repeated walk, it stops two same-duration assignments from re-walking — and
+     * therefore re-folding — the same prefix. The view memoises folded days itself, so even the
+     * distinct-duration walks share every day either of them reaches.
+     */
+    private List<MasterServiceAssignment> gateByDuration(
+            List<MasterServiceAssignment> assignments, List<EffectiveDayResponse> days,
+            Map<LocalDate, List<TimeRange>> occupiedByDay, Instant cutoff) {
+        Map<Duration, Boolean> verdictByDuration = new HashMap<>();
+        List<MasterServiceAssignment> bookable = new ArrayList<>();
+        for (MasterServiceAssignment msa : assignments) {
+            if (verdictByDuration.computeIfAbsent(effectiveDuration(msa),
+                    duration -> hasFreeFutureSlot(days, duration, occupiedByDay, cutoff))) {
+                bookable.add(msa);
+            }
+        }
+        return bookable;
     }
 
     // ── shared internals ────────────────────────────────────────────────────────────────────
@@ -1191,6 +1227,13 @@ public class SlotCalculationService {
      * Walks {@code days} ascending and returns {@code true} at the first free slot starting at/after
      * {@code cutoff}. Reuses {@link #computeDayFreeRanges} (the same subtraction getAvailableSlots uses),
      * so the gate's verdict cannot drift from the slot list beyond the {@code cutoff} lead-time floor.
+     *
+     * <p><b>The early return is now load-bearing, not merely tidy.</b> {@code days} may be the lazily
+     * folding view {@code MasterScheduleService#reduceEffectiveRangeBatch} hands the batched gate, in
+     * which case the for-each below folds exactly the prefix it walks. Keep the loop element-at-a-time
+     * and ascending: a rewrite to {@code days.stream().anyMatch(...)} stays correct, but anything that
+     * materialises or reorders the list first (a {@code copyOf}, a sort, a {@code parallelStream})
+     * silently reinstates the full 181-day fold this shape exists to avoid.
      *
      * <p><b>Perf #3.</b> {@code occupiedByDay} is the master's window bookings pre-bucketed by Kyiv-civil
      * date ({@link #loadOccupiedByDay}) so each walked day indexes its slice in O(1) instead of re-scanning

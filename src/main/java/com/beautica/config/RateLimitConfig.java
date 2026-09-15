@@ -109,6 +109,55 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.salon-master-services-read-capacity:60}")
     private long salonMasterServicesReadCapacity;
 
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // ACCEPTED RISK — 2026-09-15, architect sign-off (wish-list hull audit, cycle 2, perf LOW).
+    // GET /api/v1/favorites/** — and GET /api/v1/favorites/services in particular — carries NO
+    // bucket, in this class or any other filter. Listed here only so this inventory stays truthful
+    // about every route that is deliberately unthrottled.
+    //
+    // THE MEASURED FIGURE. The wish list's SALON arm prices each saved row by the salon-catalogue
+    // HULL, which runs the bookability gate over every candidate master of every salon on the page.
+    // Favouriting deliberately requires no bookability (phase-246 D3 validates active-ness only), so
+    // a client may save 100 services belonging to salons whose masters have no schedule at all — and
+    // a negative verdict has no shorter proof than the whole horizon. At the 100-row page cap
+    // (spring.data.web.pageable.max-page-size) that is ~100 salons x ~20 masters x 181 days
+    // ≈ 362 000 folded day objects in ONE request. The 2026-09-15 lazy fold bound
+    // (MasterScheduleService#reduceEffectiveRangeBatch) collapses the TYPICAL page by two orders of
+    // magnitude — a bookable master resolves on its first or second day — but it is an early exit,
+    // not a shorter horizon, so it cannot touch this all-negative worst case. Pinned by
+    // SalonCatalogueBatchLoadIT's case 15b (one master, all 181 days) and case 15c (the per-master
+    // arithmetic across three masters).
+    //
+    // WHY IT IS ACCEPTED. Every route on FavoriteController is @PreAuthorize("hasRole('CLIENT')"),
+    // so there is no anonymous reach: each request is attributable to a registered, verified,
+    // BANNABLE account. Abuse is therefore an account-level moderation problem with a real lever
+    // already in place, not an open-to-the-internet amplifier. The route is also not yet in front of
+    // real traffic (pre-release), so there is no abuse signal to size a bucket against.
+    //
+    // REOPEN TRIGGER — whichever comes FIRST:
+    //   (a) observed abuse (latency or connection-pool pressure traceable to this route);
+    //   (b) the route, or its authorization predicate, opening to a role below CLIENT — anonymous or
+    //       guest reach removes the whole "bannable account" premise this acceptance rests on;
+    //   (c) public launch.
+    // Unlike the Phase 309 acceptance above, (b) has NOT fired: the gate is a plain role check with
+    // no ownership predicate that could quietly widen.
+    //
+    // DO NOT PATCH A ONE-OFF BUCKET IN HERE. Rejected explicitly by the architect — see the
+    // `service/controller/ServiceController.java` INFO row in docs/backend-phases/backlog.md, under
+    // "Performance findings (backend-perf)", Phase 309: "Resolved this chain as a documented
+    // ACCEPTED RISK (dated sign-off in RateLimitConfig.java), not by adding a one-off bucket."
+    // That chain was resolved exactly as this one is. Cited by CONTENT, not by line number:
+    // backlog.md is append-only, so every line number into it goes stale on the next insertion —
+    // which is how the reference this comment replaced went stale inside a single session. The
+    // throttle SHAPE is already pre-decided in phase-247 D8 and must be implemented as written when
+    // a trigger fires: per-PRINCIPAL (JWT userId, IP fallback only for anonymous), a new filter
+    // registered AFTER JwtAuthenticationFilter, key "fav:" + userId, 60 per 60 s via
+    // app.rate-limit.*-capacity, 429 documented on every list endpoint, pinned by a regression test
+    // mirroring ServiceWriteRateLimitRegressionTest — and scoped to ALL authenticated reads that fan
+    // out over other users' data, not /favorites/** alone. D8 also records the cheaper lever to
+    // evaluate FIRST: caching the per-master bookability verdict at {masterId, duration, from, to}.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
