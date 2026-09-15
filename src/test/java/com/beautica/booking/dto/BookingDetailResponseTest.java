@@ -97,7 +97,7 @@ class BookingDetailResponseTest {
     @Test
     @DisplayName("maps every field correctly when booking is fully populated, including PII traversal")
     void should_mapAllFields_when_bookingIsValid() {
-        var response = BookingDetailResponse.from(booking, true, true, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, true, true, "Київ", "Шевченківський", NOW, null);
 
         // shared fields
         assertThat(response.id()).isEqualTo(bookingId);
@@ -154,7 +154,7 @@ class BookingDetailResponseTest {
         when(booking.getClientComment()).thenReturn(null);
         when(booking.getProviderComment()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, null, null, NOW);
+        var response = BookingDetailResponse.from(booking, false, false, null, null, NOW, null);
 
         assertThat(response.clientComment()).isNull();
         assertThat(response.providerComment()).isNull();
@@ -167,7 +167,7 @@ class BookingDetailResponseTest {
         when(booking.getGuestName()).thenReturn("Оксана");
         when(booking.getGuestSurname()).thenReturn("Мельник");
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.clientId()).isNull();
         assertThat(response.clientFirstName()).isEqualTo("Оксана");
@@ -183,7 +183,7 @@ class BookingDetailResponseTest {
     void should_returnNullProfessionalTitle_when_masterHasNoTitle() {
         when(masterUser.getProfessionalTitle()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.masterProfessionalTitle()).isNull();
         // the rest of the master row is unaffected by a missing title
@@ -200,7 +200,7 @@ class BookingDetailResponseTest {
         when(masterUser.getProfessionalTitle()).thenReturn(null);
         when(masterUser.getLocationNote()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.clientId()).isNull();
         assertThat(response.masterProfessionalTitle()).isNull();
@@ -222,7 +222,7 @@ class BookingDetailResponseTest {
         lenient().when(laterSalon.getLocationNote()).thenReturn("Later salon note — must NOT surface");
         master.setSalon(laterSalon);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.salonName()).isNull();
         assertThat(response.locationNote()).isEqualTo("Дзвонити двічі");
@@ -239,7 +239,7 @@ class BookingDetailResponseTest {
         when(salon.getLocationNote()).thenReturn("3-й поверх, код 1234");
         when(booking.getSalon()).thenReturn(salon);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.salonName()).isEqualTo("Glamour Studio");
         assertThat(response.locationNote()).isEqualTo("3-й поверх, код 1234");
@@ -253,7 +253,7 @@ class BookingDetailResponseTest {
     void should_returnFrozenCeiling_when_bookingHasOne() {
         when(booking.getPriceMaxAtBooking()).thenReturn(new BigDecimal("500.00"));
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
     }
@@ -263,7 +263,7 @@ class BookingDetailResponseTest {
     void should_returnNullPriceMax_when_bookingFrozeNoCeiling() {
         when(booking.getPriceMaxAtBooking()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.priceMaxAtBooking()).isNull();
     }
@@ -279,7 +279,7 @@ class BookingDetailResponseTest {
         lenient().when(serviceDef.getPriceMax()).thenReturn(new BigDecimal("9999.00"));
         lenient().when(booking.getMasterService().getPriceOverride()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.priceMaxAtBooking())
                 .as("the agreed ceiling, not the edited one")
@@ -295,7 +295,7 @@ class BookingDetailResponseTest {
         lenient().when(serviceDef.getPriceType()).thenReturn(PriceType.FIXED);
         lenient().when(serviceDef.getPriceMax()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.priceMaxAtBooking()).isEqualByComparingTo(new BigDecimal("500.00"));
     }
@@ -325,7 +325,7 @@ class BookingDetailResponseTest {
         when(clientUser.getAvatarUrl()).thenReturn(CLIENT_AVATAR);
         when(masterUser.getAvatarUrl()).thenReturn(MASTER_AVATAR);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.clientAvatarUrl())
                 .as("must be booking.getClient().getAvatarUrl(); a copy-paste of the adjacent "
@@ -349,7 +349,7 @@ class BookingDetailResponseTest {
         when(booking.getGuestSurname()).thenReturn("Мельник");
         when(masterUser.getAvatarUrl()).thenReturn(MASTER_AVATAR);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.clientAvatarUrl())
                 .as("a guest has no account and so no photo — and unlike the name there is nothing "
@@ -371,7 +371,7 @@ class BookingDetailResponseTest {
     void should_returnNullClientAvatar_when_registeredClientNeverUploadedOne() {
         when(clientUser.getAvatarUrl()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.clientAvatarUrl()).isNull();
         assertThat(response.clientId())
@@ -397,7 +397,7 @@ class BookingDetailResponseTest {
             + "whatever the caller passed in — from() never derives one from the other")
     void should_returnTrueAwaitingClosure_when_confirmedAndElapsed_independentOfPassedInCanReview() {
         var response = BookingDetailResponse.from(
-                booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusMinutes(1));
+                booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusMinutes(1), null);
 
         assertThat(response.awaitingClosure()).isTrue();
         assertThat(response.canReview())
@@ -410,7 +410,7 @@ class BookingDetailResponseTest {
     @DisplayName("awaitingClosure is FALSE for a future CONFIRMED booking (now < endsAt)")
     void should_returnFalseAwaitingClosure_when_confirmedAndNotYetElapsed() {
         var response = BookingDetailResponse.from(
-                booking, false, false, "Київ", "Шевченківський", ENDS_AT.minusMinutes(1));
+                booking, false, false, "Київ", "Шевченківський", ENDS_AT.minusMinutes(1), null);
 
         assertThat(response.awaitingClosure()).isFalse();
     }
@@ -419,7 +419,7 @@ class BookingDetailResponseTest {
     @DisplayName("awaitingClosure is FALSE at the exact endsAt boundary — strict '<', half-open")
     void should_returnFalseAwaitingClosure_when_nowEqualsEndsAt() {
         var response = BookingDetailResponse.from(
-                booking, false, false, "Київ", "Шевченківський", ENDS_AT);
+                booking, false, false, "Київ", "Шевченківський", ENDS_AT, null);
 
         assertThat(response.awaitingClosure()).isFalse();
     }
@@ -431,7 +431,7 @@ class BookingDetailResponseTest {
         when(booking.getStatus()).thenReturn(BookingStatus.COMPLETED);
 
         var response = BookingDetailResponse.from(
-                booking, true, false, "Київ", "Шевченківський", ENDS_AT.minusYears(1));
+                booking, true, false, "Київ", "Шевченківський", ENDS_AT.minusYears(1), null);
 
         assertThat(response.awaitingClosure())
                 .as("endsAt is well in the future of now, yet COMPLETED must never be awaitingClosure")
@@ -447,9 +447,9 @@ class BookingDetailResponseTest {
             when(booking.getStatus()).thenReturn(status);
 
             var elapsed = BookingDetailResponse.from(
-                    booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusYears(1));
+                    booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusYears(1), null);
             var notYetElapsed = BookingDetailResponse.from(
-                    booking, false, false, "Київ", "Шевченківський", ENDS_AT.minusYears(1));
+                    booking, false, false, "Київ", "Шевченківський", ENDS_AT.minusYears(1), null);
 
             assertThat(elapsed.awaitingClosure()).as("%s, elapsed", status).isFalse();
             assertThat(notYetElapsed.awaitingClosure()).as("%s, not elapsed", status).isFalse();
@@ -462,9 +462,9 @@ class BookingDetailResponseTest {
             + "static clock")
     void should_returnDifferentFlags_when_calledTwiceWithDifferentNowOnSameEntity() {
         var beforeElapse = BookingDetailResponse.from(
-                booking, false, false, "Київ", "Шевченківський", ENDS_AT.minusMinutes(1));
+                booking, false, false, "Київ", "Шевченківський", ENDS_AT.minusMinutes(1), null);
         var afterElapse = BookingDetailResponse.from(
-                booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusMinutes(1));
+                booking, false, false, "Київ", "Шевченківський", ENDS_AT.plusMinutes(1), null);
 
         assertThat(beforeElapse.awaitingClosure()).isFalse();
         assertThat(afterElapse.awaitingClosure()).isTrue();
@@ -483,7 +483,7 @@ class BookingDetailResponseTest {
         master.setAvgRating(new BigDecimal("4.75"));
         master.setReviewCount(12);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.masterAvgRating()).isEqualByComparingTo(new BigDecimal("4.75"));
         assertThat(response.masterReviewCount()).isEqualTo(12);
@@ -496,7 +496,7 @@ class BookingDetailResponseTest {
         master.setAvgRating(new BigDecimal("0.00"));
         master.setReviewCount(0);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.masterAvgRating()).isNull();
         assertThat(response.masterReviewCount()).isZero();
@@ -525,7 +525,7 @@ class BookingDetailResponseTest {
         when(bookingSalon.getId()).thenReturn(salonId);
         when(booking.getSalon()).thenReturn(bookingSalon);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.salonId()).isEqualTo(salonId);
     }
@@ -536,7 +536,7 @@ class BookingDetailResponseTest {
     void should_returnNullSalonId_when_bookingHasNoSalon() {
         // booking.getSalon() is unstubbed — Mockito returns null, exactly like an
         // INDEPENDENT_MASTER row whose salon_id is NULL.
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.salonId()).isNull();
         assertThat(response.id()).isEqualTo(bookingId);
@@ -590,7 +590,7 @@ class BookingDetailResponseTest {
         when(masterUser.getBuildingNo()).thenReturn("MASTER-99");
         when(masterUser.getLocationNote()).thenReturn("Master's own note — must NOT surface");
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.salonId())
                 .as("the review is stamped with booking.salon, so that is the id whose aggregates "
@@ -636,7 +636,7 @@ class BookingDetailResponseTest {
         var serviceDef = booking.getMasterService().getServiceDefinition();
         when(serviceDef.getCategory()).thenReturn("Manicure");
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.categoryKey()).isEqualTo("MANICURE");
         assertThat(response.categoryName())
@@ -652,7 +652,7 @@ class BookingDetailResponseTest {
         var serviceDef = booking.getMasterService().getServiceDefinition();
         when(serviceDef.getCategory()).thenReturn("  Nail Care & Spa!!  ");
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.categoryKey())
                 .as("trim + uppercase + collapse non-alphanumeric runs to '_' + strip leading/"
@@ -668,7 +668,7 @@ class BookingDetailResponseTest {
         var serviceDef = booking.getMasterService().getServiceDefinition();
         when(serviceDef.getCategory()).thenReturn(null);
 
-        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW);
+        var response = BookingDetailResponse.from(booking, false, false, "Київ", "Шевченківський", NOW, null);
 
         assertThat(response.categoryKey())
                 .as("a booking card must render NO icon for an uncategorised service — a non-null "

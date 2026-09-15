@@ -3,7 +3,6 @@ package com.beautica.location;
 import com.beautica.AbstractIntegrationTest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -16,7 +15,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -52,11 +50,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private ObjectMapper objectMapper;
 
-    private void ensureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
     private static HttpEntity<Void> anonymous() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
@@ -89,7 +82,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /oblasts — excludes Донецька/Луганська/Крим/Севастополь and is name_uk-ordered")
     void should_excludeOccupiedAndBeNameUkOrdered_when_getOblasts() throws Exception {
-        ensureHttpClient();
         log.debug("Act: GET {} against the real V53 seed — assert exclusion + ordering", OBLASTS_URL);
 
         JsonNode data = getData(OBLASTS_URL);
@@ -126,7 +118,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /oblasts/{id}/cities — Kyiv carries hasDistricts=true against the real seed")
     void should_flagKyivHasDistrictsTrue_when_getCitiesForKyivOblast() throws Exception {
-        ensureHttpClient();
         UUID kyivOblastId = oblastIdByNameUk("Київ"); // Kyiv special-status oblast row
         log.debug("Act: GET /oblasts/{}/cities — Kyiv city must report hasDistricts=true", kyivOblastId);
 
@@ -152,7 +143,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /cities/{id}/districts — Kyiv returns 10 districts, name_uk-ordered")
     void should_returnTenDistrictsOrdered_when_cityIsKyiv() throws Exception {
-        ensureHttpClient();
         UUID kyivCityId = cityIdByNameUk("Київ");
         log.debug("Act: GET /cities/{}/districts — Kyiv must return 10 ordered districts", kyivCityId);
 
@@ -179,7 +169,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /cities/{id}/districts — Kharkiv returns 9 districts")
     void should_returnNineDistricts_when_cityIsKharkiv() throws Exception {
-        ensureHttpClient();
         UUID kharkivCityId = cityIdByNameUk("Харків");
         log.debug("Act: GET /cities/{}/districts — Kharkiv must return 9 districts", kharkivCityId);
 
@@ -193,7 +182,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /cities/{id}/districts — a city with no urban districts returns an empty array")
     void should_returnEmptyArray_when_cityHasNoDistricts() throws Exception {
-        ensureHttpClient();
         // A real seeded city that is NOT one of the 17 with category-B districts.
         UUID noDistrictCityId = jdbcTemplate.queryForObject(
                 "SELECT id FROM cities WHERE id NOT IN "
@@ -214,7 +202,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /oblasts twice — identical body served from the Spring cache (end-to-end)")
     void should_serveSecondCallFromCache_when_oblastsRequestedTwice() throws Exception {
-        ensureHttpClient();
         log.debug("Act: GET {} twice — second response must be cache-served and byte-identical", OBLASTS_URL);
 
         ResponseEntity<String> first = restTemplate.exchange(
@@ -234,7 +221,6 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("Security — all 3 locality GETs reachable unauthenticated; a protected endpoint still 401")
     void should_allowLocalityGetsUnauthenticated_andStillProtectOtherEndpoints() throws Exception {
-        ensureHttpClient();
         UUID kyivOblastId = oblastIdByNameUk("Київ");
         UUID kyivCityId = cityIdByNameUk("Київ");
 

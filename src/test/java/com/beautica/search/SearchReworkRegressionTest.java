@@ -7,7 +7,6 @@ import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -20,7 +19,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.lang.reflect.RecordComponent;
 import java.nio.file.Files;
@@ -98,11 +96,6 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @SpyBean
     private DiscoveryLocationResolver discoveryLocationResolver;
 
-    private void ensureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
     private static HttpEntity<Void> anonymous() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
@@ -128,7 +121,6 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("regression — a salon is found by its taxonomy city_id even though its legacy free-text city holds the Russian spelling 'Киев' (old AND city = :city path is gone)")
     void should_findSalonByCityId_regardlessOfLegacyFreeTextSpelling() throws Exception {
-        ensureHttpClient();
         UUID kyivCityId = cityIdByName("Київ");
 
         // The salon's legacy free-text column is the WRONG spelling on purpose
@@ -170,7 +162,6 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("regression — an INDEPENDENT_MASTER is found by city_id even though its user-row legacy city is an arbitrary free-text spelling (FK discovery, not the old string path)")
     void should_findMasterByCityId_regardlessOfLegacyUserRowSpelling() throws Exception {
-        ensureHttpClient();
         UUID kyivCityId = cityIdByName("Київ");
 
         // Phase 19.7: /search/masters returns INDEPENDENT_MASTER only. The
@@ -209,7 +200,6 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("M2 — every master & salon search routes locality through DiscoveryLocationResolver.resolveFilter (seam is on the call path)")
     void should_invokeResolverSeam_when_searchPerformed() {
-        ensureHttpClient();
         Mockito.clearInvocations(discoveryLocationResolver);
         UUID kyivCityId = cityIdByName("Київ");
 
@@ -322,7 +312,6 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         // while an independent master in district A is still discovered via its
         // own user-row locality. This pins that the role predicate lives on both
         // the data and the count path across a multi-salon owner context.
-        ensureHttpClient();
         UUID kyivCityId = cityIdByName("Київ");
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
@@ -384,7 +373,6 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
             + "data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is the "
             + "actual guard, not the salon's locality data")
     void should_neverSurfaceSalonMasterUnderOwnPersonalLocality_when_salonIsCityLess() throws Exception {
-        ensureHttpClient();
         UUID ownerPersonalCity = cityIdByName("Київ");
         UUID ownerPersonalDistrict = districtIdInCity("Київ", 0);
         // The salon's OWN real city — deliberately NOT Kyiv, so a search scoped to the master's

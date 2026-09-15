@@ -9,6 +9,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import io.swagger.v3.oas.annotations.media.Schema;
+import org.springframework.lang.Nullable;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -155,8 +156,8 @@ import java.util.UUID;
  * review CTA before that action lets them rate a visit they have not yet attested happened — see
  * {@code BookingClosureRule#isProviderReviewEligible}'s javadoc for the full rationale; (3) the
  * booking has a real client (not a guest/LINK booking); (4) no {@code ClientReview} already
- * exists for this booking. A CLIENT or
- * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
+ * exists for this booking. A CLIENT viewer, a SALON_MASTER viewing a booking they did NOT perform,
+ * or a provider with no authority over this specific booking, always reads
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
  * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
  * DTO at all. TWO callers compute this for real, through ONE shared conjunction
@@ -338,7 +339,10 @@ public record BookingDetailResponse(
                 + "booking, the booking is COMPLETED (strictly — unlike the client-side canReview "
                 + "flag, an elapsed-but-unclosed CONFIRMED booking does NOT qualify here; see "
                 + "BookingClosureRule#isProviderReviewEligible), it has a real (non-guest) "
-                + "client, and no ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
+                + "client, and no ClientReview exists for it yet. A SALON_MASTER reads TRUE only on a "
+                + "booking they themselves performed (phase 316) and FALSE on a colleague's; this is "
+                + "the ONLY booking write that role holds — decline/not-complete/complete/reschedule "
+                + "still 403 for them. FALSE for a CLIENT viewer, an "
                 + "unauthorized provider, or any row of the CLIENT listing path of "
                 + "GET /bookings/me (which hardcodes false). The PROVIDER rows of "
                 + "GET /bookings/me carry the real per-row value — see "
@@ -455,7 +459,26 @@ public record BookingDetailResponse(
                         + "(Beauty Timeline). Prefer this over categoryName for icon resolution — "
                         + "categoryName is for display only. Never a fallback/placeholder value: a "
                         + "null here must render no icon, not a guessed one.")
-        String categoryKey
+        String categoryKey,
+        // Phase 317. Appended LAST for the same compile-time-slip-detection reason as every field
+        // above it — and here the protection is real rather than incidental: this is the first
+        // NON-scalar component on the record, so no reordering against any existing field can
+        // survive compilation.
+        @Schema(nullable = true,
+                description = "The review THIS booking's client left about the master — rating "
+                        + "plus the full comment (phase 317 D2: the text is already world-readable "
+                        + "through the permitAll GET /masters/{id}/reviews listing, so withholding "
+                        + "it here would be theatre). Null when the booking carries no review. "
+                        + "SERVED ONLY BY GET /bookings/{id}: every listing surface — the provider "
+                        + "and CLIENT branches of GET /bookings/me, GET /bookings/salon/{salonId}, "
+                        + "and the create/reschedule mutation responses — sends null unconditionally, "
+                        + "because a booking CARD renders no review body and paying a per-page "
+                        + "review fetch for a field nothing draws is not worth the statement. Do NOT "
+                        + "read a null on a list row as 'this booking has no review'; re-read the "
+                        + "booking through GET /bookings/{id} to learn that. This is the same "
+                        + "explicitly-surface-scoped contract providerCanReviewClient already "
+                        + "documents on this DTO.")
+        ClientAuthoredReviewResponse reviewByClient
 ) {
 
     /**
@@ -559,7 +582,8 @@ public record BookingDetailResponse(
             boolean providerCanReviewClient,
             String cityLabel,
             String districtLabel,
-            OffsetDateTime now
+            OffsetDateTime now,
+            @Nullable ClientAuthoredReviewResponse reviewByClient
     ) {
         Master master = booking.getMaster();
         // V157 / phase 294 D3 — NULLABLE. A booking is a HISTORICAL record: the staff account behind
@@ -650,7 +674,12 @@ public record BookingDetailResponse(
                 // Derived from the SAME serviceDefinition.getCategory() read as categoryName above
                 // — no second lazy-graph walk, no widening of this factory's documented hydration
                 // contract. See categoryKeyOrNull's javadoc.
-                categoryKeyOrNull(booking.getMasterService().getServiceDefinition().getCategory())
+                categoryKeyOrNull(booking.getMasterService().getServiceDefinition().getCategory()),
+                // Phase 317 — supplied by the caller, never derived here: the review lives in a
+                // different aggregate (reviews), is reachable from no association on Booking, and
+                // only the DETAIL call path pays the statement that fetches it. Every other caller
+                // of this factory passes null on purpose; see the component's own @Schema.
+                reviewByClient
         );
     }
 }

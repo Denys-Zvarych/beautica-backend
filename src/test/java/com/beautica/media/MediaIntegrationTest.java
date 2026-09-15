@@ -100,7 +100,6 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void configureClientAndR2() {
-        restTemplate.getRestTemplate().setRequestFactory(HC5_FACTORY);
         when(r2StorageService.buildPublicUrl(anyString()))
                 .thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
         doNothing().when(r2StorageService).uploadFile(anyString(), any(), anyLong(), anyString());

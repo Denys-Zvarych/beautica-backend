@@ -6,7 +6,6 @@ import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.core.io.ByteArrayResource;
@@ -14,7 +13,6 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -29,19 +27,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Concrete subclasses declare their own {@code @Autowired} fields, {@code @MockBean}s,
  * and {@code @BeforeEach} setup — this class only provides stateless seeding and
  * request-building helpers so neither concrete class needs to duplicate them.
+ *
+ * <p>It no longer publishes an HC5 factory constant: {@link AbstractIntegrationTest} installs the
+ * timeout-bounded, zero-retry factory on the shared {@code TestRestTemplate} before every test, so
+ * a subclass that re-installed its own would only be discarding that policy.
  */
 abstract class AbstractMediaIntegrationTest extends AbstractIntegrationTest {
 
     static final String TEST_PASSWORD = "Str0ngP@ss1!";
     static final byte[] JPEG_HEADER = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00};
-
-    /**
-     * Shared HC5 factory — allocated once per JVM, never per test instance.
-     * Concrete subclasses reference this field in {@code @BeforeEach} to avoid
-     * re-allocating a connection pool on every test (§M.4).
-     */
-    protected static final HttpComponentsClientHttpRequestFactory HC5_FACTORY =
-            new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
 
     // Declared abstract so subclasses resolve the correct @MockBean-scoped context beans.
     protected abstract TestRestTemplate restTemplate();

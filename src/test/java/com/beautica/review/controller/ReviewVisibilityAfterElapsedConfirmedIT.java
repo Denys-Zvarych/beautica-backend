@@ -7,9 +7,6 @@ import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.support.AbstractRatingVisibilityIT;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -22,7 +19,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -68,24 +64,12 @@ class ReviewVisibilityAfterElapsedConfirmedIT extends AbstractRatingVisibilityIT
     private static final String MASTERS_URL = "/api/v1/masters";
     private static final String SALONS_URL = "/api/v1/salons";
     private static final String COMMENT = "Майстер чудовий, все сподобалось";
-    private static final HttpComponentsClientHttpRequestFactory HTTP_FACTORY =
-            new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
 
     @Autowired
     private TestRestTemplate restTemplate;
 
     @Autowired
     private ObjectMapper objectMapper;
-
-    @AfterAll
-    static void destroyHttpFactory() throws Exception {
-        HTTP_FACTORY.destroy();
-    }
-
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(HTTP_FACTORY);
-    }
 
     // ── independent master ─────────────────────────────────────────────────────
 

@@ -23,9 +23,7 @@ import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.service.NotificationService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.slf4j.LoggerFactory;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -38,7 +36,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -118,12 +115,6 @@ class NotificationOutboxIntegrationTest extends AbstractIntegrationTest {
 
     @MockBean
     private NotificationService notificationService;
-
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     @Test
     @DisplayName("POST /bookings — notification_outbox has 2 rows (NEW_BOOKING→master, STATUS_CHANGED→client) when booking is auto-confirmed (Decision D3)")

@@ -3929,7 +3929,13 @@ class BookingServiceTest {
         // Only a COMPLETED booking can reach the review-existence query (canReview's short
         // circuit skips it otherwise) — stub it only when the caller needs it to fire.
         if (status == BookingStatus.COMPLETED) {
-            when(reviewRepository.existsByBookingId(bookingId)).thenReturn(reviewExists);
+            // Phase 317 — the detail path's ONE review lookup is now findViewByBookingId: its
+            // PRESENCE is canReview's reviewExists input and its body is reviewByClient. The
+            // statement count and the short-circuit in front of it are unchanged.
+            when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(
+                    reviewExists
+                            ? Optional.of(new com.beautica.review.repository.BookingReviewView((short) 5, "Гарно"))
+                            : Optional.empty());
         }
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         return bookingService.getBooking(clientId, bookingId);
@@ -3989,7 +3995,7 @@ class BookingServiceTest {
     void should_returnProviderCanReviewClientTrue_when_authorityCompletedNoReview() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
         when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(false);
@@ -4005,7 +4011,7 @@ class BookingServiceTest {
     void should_returnProviderCanReviewClientFalse_when_actorLacksProviderAuthority() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(false);
 
@@ -4106,7 +4112,7 @@ class BookingServiceTest {
     void should_returnProviderCanReviewClientFalse_when_clientReviewAlreadyExists() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
         when(authz.hasProviderAuthorityOverBooking(clientId, booking)).thenReturn(true);
         when(clientReviewRepository.existsByBookingId(bookingId)).thenReturn(true);
@@ -4215,7 +4221,7 @@ class BookingServiceTest {
         MasterServiceAssignment enrichedMsa = buildMsa(masterServiceId, enriched, serviceDef, null, null);
         Booking booking = buildBooking(bookingId, client, enriched, enrichedMsa, BookingStatus.COMPLETED);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
-        when(reviewRepository.existsByBookingId(bookingId)).thenReturn(false);
+        when(reviewRepository.findViewByBookingId(bookingId)).thenReturn(Optional.empty());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(
                 new com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels(
                         Map.of(cityId, "Kyiv"), Map.of(districtId, "Shevchenkivskyi")));

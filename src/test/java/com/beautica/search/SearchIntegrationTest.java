@@ -7,7 +7,6 @@ import com.beautica.search.dto.MasterSearchResult;
 import com.beautica.search.service.SearchService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -23,7 +22,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -92,24 +90,11 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private SearchService searchService;
 
-    /**
-     * Wires the Apache HttpClient factory before the first request in each
-     * test. Kept as an explicit method (called once per test) rather than a
-     * {@code @BeforeEach} hook to avoid swapping the factory between
-     * unrelated tests in the same JVM-shared application context. The factory
-     * itself is reusable; only the call ordering matters.
-     */
-    private void ensureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
     // ── Master search — happy paths ──────────────────────────────────────────
 
     @Test
     @DisplayName("GET /search/masters — finds masters by city when masters exist in city")
     void should_findMastersByCity_when_mastersExistInCity() throws Exception {
-        ensureHttpClient();
         seedMasterWithCity("Київ", "4.50");
         seedMasterWithCity("Київ", "4.20");
         seedMasterWithCity("Київ", "3.80");
@@ -178,7 +163,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — filters by category when master has service in category")
     void should_filterByCategory_when_masterHasServiceInCategory() throws Exception {
-        ensureHttpClient();
         UUID m1 = seedMaster("Київ", "4.00");
         seedServiceWithCategory(m1, m1, "MANICURE", new BigDecimal("250.00"), true, true);
 
@@ -199,7 +183,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — filters by price range using HAVING aggregate")
     void should_filterByPriceRange_when_minAndMaxPriceSet() throws Exception {
-        ensureHttpClient();
         seedMasterWithService("Київ", "4.00", new BigDecimal("150.00"));
         seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
         seedMasterWithService("Київ", "4.00", new BigDecimal("600.00"));
@@ -220,7 +203,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — filters by minimum rating")
     void should_filterByMinRating_when_ratingSet() throws Exception {
-        ensureHttpClient();
         seedMasterWithCity("Київ", "3.50");
         seedMasterWithCity("Київ", "4.00");
         seedMasterWithCity("Київ", "4.80");
@@ -238,7 +220,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — totalElements correct when many masters match a filter and page is small")
     void should_returnCorrectTotalElements_when_manyMastersMatchFilter() throws Exception {
-        ensureHttpClient();
         for (int i = 0; i < 7; i++) {
             seedMasterWithCity("Київ", "4.00");
         }
@@ -258,7 +239,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — an out-of-range page reports the TRUE total, not 0")
     void should_reportTrueTotal_when_masterPageIsPastTheEnd() throws Exception {
-        ensureHttpClient();
         for (int i = 0; i < 7; i++) {
             seedMasterWithCity("Київ", "4.00");
         }
@@ -282,7 +262,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — an out-of-range page reports the TRUE total, not 0")
     void should_reportTrueTotal_when_salonPageIsPastTheEnd() throws Exception {
-        ensureHttpClient();
         for (int i = 0; i < 3; i++) {
             seedActiveSalon("Київ", null);
         }
@@ -304,7 +283,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — a genuinely empty FIRST page still reports 0 (no probe)")
     void should_reportZeroTotal_when_firstPageGenuinelyMatchesNothing() throws Exception {
-        ensureHttpClient();
         seedMasterWithCity("Київ", "4.00");
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -319,7 +297,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — empty content when city has no masters")
     void should_returnEmptyList_when_noCityMatch() throws Exception {
-        ensureHttpClient();
         seedMasterWithCity("Київ", "4.00");
 
         log.debug("Act: GET {}?city=Одеса — must return 0 masters", MASTERS_URL);
@@ -339,7 +316,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/{masters,salons} — both endpoints return 200 without auth")
     void should_return200WithNoAuth_when_searchEndpointsAccessed() {
-        ensureHttpClient();
 
         ResponseEntity<String> mastersResponse = restTemplate.exchange(
                 MASTERS_URL + "?page=0&size=20", HttpMethod.GET,
@@ -361,7 +337,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — excludes masters with masters.is_active=false")
     void should_excludeInactiveMasters_when_searchPerformed() throws Exception {
-        ensureHttpClient();
         UUID activeId = seedMasterWithCity("Київ", "4.00");
         UUID inactiveId = seedMasterWithCity("Київ", "4.00");
         jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", inactiveId);
@@ -380,7 +355,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — excludes masters whose user has users.is_active=false")
     void should_excludeInactiveUsers_when_searchPerformed() throws Exception {
-        ensureHttpClient();
         UUID active = seedMasterWithCity("Київ", "4.00");
         UUID inactive = seedMasterWithCity("Київ", "4.00");
         UUID inactiveUserId = jdbcTemplate.queryForObject(
@@ -401,7 +375,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — price aggregate ignores master_services rows where is_active=false")
     void should_excludeInactiveMasterServices_when_priceFiltered() throws Exception {
-        ensureHttpClient();
         UUID master = seedMaster("Київ", "4.00");
 
         // Active row: price 600 (above filter ceiling)
@@ -425,7 +398,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — totalElements matches HAVING-filtered count, not pre-HAVING DISTINCT")
     void should_returnCorrectTotalElements_with_priceHavingFilter() throws Exception {
-        ensureHttpClient();
         // 1 master in [200,500], 2 outside — naive COUNT(DISTINCT m.id) without HAVING would
         // return 3 and produce phantom pages. Real count must be 1.
         seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
@@ -456,7 +428,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — maxPrice excludes an expensive-only master and keeps a master whose floor clears the ceiling")
     void should_excludeExpensiveOnlyMaster_when_maxPriceBelowEntireBand() throws Exception {
-        ensureHttpClient();
         // A band [100,800] — its cheapest 100 sits under the ceiling.
         UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
                 new BigDecimal("100.00"), new BigDecimal("800.00"));
@@ -481,7 +452,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — minPrice above a master's ENTIRE band (ceiling 800 < 900) excludes it (min-bound correctness lock; ceiling-vs-floor discrimination lives in the min-only band test)")
     void should_excludeMaster_when_minPriceAboveEntireBand() throws Exception {
-        ensureHttpClient();
         // A band [100,800] — ceiling 800 < 900 → A must NOT match even though its
         // cheap 100 would pass a (wrong) floor-driven predicate inversion.
         UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
@@ -512,7 +482,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — both bounds: a master is included when its band overlaps [min,max], not when a single service falls inside")
     void should_includeMaster_when_bandOverlapsBothBounds() throws Exception {
-        ensureHttpClient();
         // A band [100,800] overlaps [400,500] (ceiling 800 >= 400 AND floor 100 <= 500)
         // even though NEITHER seeded service price (100, 800) lands inside [400,500].
         UUID a = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
@@ -535,7 +504,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — min-only band test: master included iff its ceiling clears minPrice")
     void should_applyMinOnlyBand_usingCeiling() throws Exception {
-        ensureHttpClient();
         // [100,800] — ceiling 800 >= 500 → included.
         UUID included = seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
                 new BigDecimal("100.00"), new BigDecimal("800.00"));
@@ -560,7 +528,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — max-only band test: master included iff its floor is at or below maxPrice")
     void should_applyMaxOnlyBand_usingFloor() throws Exception {
-        ensureHttpClient();
         // [1000,1200] — floor 1000 > 500 → excluded.
         seedMasterWithTwoServices("Київ", "4.00", "MANICURE",
                 new BigDecimal("1000.00"), new BigDecimal("1200.00"));
@@ -585,7 +552,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — price band is SCOPED to the category filter (a cheap service in another category must not rescue a master)")
     void should_scopePriceBandToCategory_when_categoryAndMaxSet() throws Exception {
-        ensureHttpClient();
         // Trap: cheap HAIRCUT 100 + expensive MANICURE 900. The whole-catalogue
         // cheapest is 100, but the MANICURE-scoped band is [900,900]. Under the old
         // unscoped predicate (floor 100 <= 300) this master wrongly survived.
@@ -620,7 +586,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — no category/price filter returns null minEffectivePrice (JOIN elided)")
     void should_returnNullMinEffectivePrice_when_noServiceJoinNeeded() throws Exception {
-        ensureHttpClient();
         UUID masterId = seedMasterWithService("Київ", "4.50", new BigDecimal("250.00"));
 
         log.debug("Act: GET {}?city=Київ — no category/price filter, JOIN should be elided", MASTERS_URL);
@@ -644,7 +609,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — category filter forces JOIN and returns aggregated minEffectivePrice")
     void should_returnAggregatedMinEffectivePrice_when_categoryFilterSet() throws Exception {
-        ensureHttpClient();
         UUID master = seedMaster("Київ", "4.20");
         seedServiceWithCategory(master, master, "MANICURE", new BigDecimal("180.00"), true, true);
         seedServiceWithCategory(master, master, "MANICURE", new BigDecimal("320.00"), true, true);
@@ -665,7 +629,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — flat count branch returns totalElements without HAVING when no price filter")
     void should_useFlatCountBranch_when_noPriceFilterApplied() throws Exception {
-        ensureHttpClient();
         for (int i = 0; i < 5; i++) {
             seedMasterWithCity("Київ", "4.00");
         }
@@ -686,7 +649,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — wrapped-subquery count branch honours HAVING price filter")
     void should_useSubqueryCountBranch_when_priceFilterApplied() throws Exception {
-        ensureHttpClient();
         // Five candidates; price filter should retain exactly two.
         seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));   // below
         seedMasterWithService("Київ", "4.00", new BigDecimal("250.00"));   // in range
@@ -712,7 +674,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — first 5 pages populate the search:masters:browse cache")
     void should_populateCache_when_firstPagesQueried() {
-        ensureHttpClient();
         Cache cache = cacheManager.getCache("search:masters:browse");
         assertThat(cache).as("search:masters:browse cache must be registered").isNotNull();
         cache.clear();
@@ -734,7 +695,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — page index >= 5 skips the cache (cold-path)")
     void should_skipCache_when_pageIndexIsAtOrAboveFive() {
-        ensureHttpClient();
         seedMasterWithCity("Київ", "4.00");
 
         Cache cache = cacheManager.getCache("search:masters:browse");
@@ -776,7 +736,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — combines all filters and returns only the matching master")
     void should_combineAllFiltersAndReturnOnlyMatchingMaster_when_fullFilterRequest() throws Exception {
-        ensureHttpClient();
         // m1: matches every predicate
         UUID m1 = seedMasterWithServiceCategoryAndPrice("Київ", "4.50", "MANICURE", new BigDecimal("180.00"));
         // m2: out of price range — fails minPrice
@@ -804,7 +763,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — second identical call hits cache without growing entry count")
     void should_returnCachedResultWithoutHittingDb_when_secondIdenticalCall() throws Exception {
-        ensureHttpClient();
         Cache cache = cacheManager.getCache("search:masters:browse");
         assertThat(cache).as("search:masters:browse cache must be registered").isNotNull();
         cache.clear();
@@ -836,7 +794,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — distinct cache keys produced when requests differ by a single filter")
     void should_useDistinctCacheKeys_when_requestsDifferByOnlyOneFilter() {
-        ensureHttpClient();
         Cache cache = cacheManager.getCache("search:masters:browse");
         assertThat(cache).as("search:masters:browse cache must be registered").isNotNull();
         cache.clear();
@@ -857,7 +814,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — master without master_services rows surfaces with null minEffectivePrice when no filter applied")
     void should_returnMasterWithNullPrice_when_masterHasNoMasterServicesRows_andNoFilter() throws Exception {
-        ensureHttpClient();
         UUID masterId = seedMasterWithoutServices("Київ", "4.00");
 
         log.debug("Act: GET {}?city=Київ — JOIN must be elided, master visible with null price", MASTERS_URL);
@@ -877,7 +833,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — master without services excluded when category filter forces the JOIN")
     void should_excludeMasterWithoutServices_when_categoryFilterApplied() throws Exception {
-        ensureHttpClient();
         seedMasterWithoutServices("Київ", "4.00");
 
         log.debug("Act: GET {}?city=Київ&category=MANICURE — JOIN active, master without services must drop", MASTERS_URL);
@@ -898,7 +853,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — finds salons by city when salons exist in city")
     void should_findSalonsByCity_when_salonsExistInCity() throws Exception {
-        ensureHttpClient();
         seedActiveSalon("Київ", "Region-A");
         seedActiveSalon("Львів", "Region-B");
 
@@ -915,7 +869,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — empty page when no salons match city")
     void should_returnEmptyList_when_noSalonsMatchCity() throws Exception {
-        ensureHttpClient();
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -930,7 +883,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — first 5 pages populate the search:salons:browse cache")
     void should_populateSalonCache_when_firstPagesQueried() {
-        ensureHttpClient();
         Cache cache = cacheManager.getCache("search:salons:browse");
         assertThat(cache).as("search:salons:browse cache must be registered").isNotNull();
         cache.clear();
@@ -950,7 +902,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — page index >= 5 skips the search:salons:browse cache")
     void should_skipSalonCache_when_pageIndexIsAtOrAboveFive() {
-        ensureHttpClient();
         Cache cache = cacheManager.getCache("search:salons:browse");
         assertThat(cache).as("search:salons:browse cache must be registered").isNotNull();
         cache.clear();
@@ -972,7 +923,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — a SALON_ADMIN account never appears in master results AND is not counted (no pagination leak)")
     void should_excludeSalonAdmin_fromBothResultsAndTotalElements() throws Exception {
-        ensureHttpClient();
         UUID legitMaster = seedMasterWithCity("Київ", "4.40");
         UUID adminMasterId = seedSalonAdminMaster("Київ", "4.95");
 
@@ -1007,7 +957,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — district-primary: ?location.districtId returns only masters in that district, not the rest of the city")
     void should_filterMastersByDistrict_when_districtIdSupplied() throws Exception {
-        ensureHttpClient();
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
         UUID inDistrictA = seedIndependentMasterInDistrict("Київ", districtA, "4.30");
@@ -1032,7 +981,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — districted city WITHOUT a districtId widens to city-level (both district masters returned)")
     void should_widenToCityLevel_when_districtedCityHasNoDistrictId() throws Exception {
-        ensureHttpClient();
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
         seedIndependentMasterInDistrict("Київ", districtA, "4.30");
@@ -1053,7 +1001,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — district-primary: ?location.districtId filters salons by district, not the whole city")
     void should_filterSalonsByDistrict_when_districtIdSupplied() throws Exception {
-        ensureHttpClient();
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
         seedSalonInDistrict("Київ", districtA, "Salon District A");
@@ -1080,7 +1027,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — Phase 19.7: an employed SALON_MASTER is NEVER returned (reachable only via the salon page); an INDEPENDENT_MASTER in the same district IS returned")
     void should_excludeSalonMasterButReturnIndependent_when_searchedByDistrict() throws Exception {
-        ensureHttpClient();
         UUID district = districtIdInCity("Київ", 0);
 
         // An employed SALON_MASTER whose salon sits in the searched district.
@@ -1117,7 +1063,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — an INDEPENDENT_MASTER (no salon) is discovered via its own user-row district (COALESCE falls through)")
     void should_resolveIndependentMasterLocalityViaUserRow_when_searchedByDistrict() throws Exception {
-        ensureHttpClient();
         UUID district = districtIdInCity("Київ", 0);
         UUID masterId = seedIndependentMasterInDistrict("Київ", district, "4.10");
 
@@ -1139,7 +1084,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — district master carries resolved cityLabel AND districtLabel name_uk in one response")
     void should_stampBothLabels_when_masterIsInADistrict() throws Exception {
-        ensureHttpClient();
         UUID district = districtIdInCity("Київ", 0);
         seedIndependentMasterInDistrict("Київ", district, "4.80");
 
@@ -1166,7 +1110,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — non-districted salon has resolved cityLabel and a null districtLabel")
     void should_returnNullDistrictLabel_when_salonCityIsNotDistricted() throws Exception {
-        ensureHttpClient();
         seedActiveSalon("Львів", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1185,7 +1128,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — Phase 19.7: SALON_MASTER absent, INDEPENDENT_MASTER present with its minEffectivePrice")
     void should_returnOnlyIndependentMaster_when_salonMasterAlsoInCity() throws Exception {
-        ensureHttpClient();
         // One employed SALON_MASTER and one INDEPENDENT_MASTER in the same city.
         UUID salonMasterId = seedEmployedSalonMaster("Київ", "4.90");
         UUID independentId = seedMaster("Київ", "4.10");
@@ -1220,7 +1162,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — priceMin = lowest base_price, priceMax = highest (price_max for RANGE, base_price for FIXED) across the salon's masters' active services")
     void should_returnSalonPriceRange_acrossFixedAndRangeServices() throws Exception {
-        ensureHttpClient();
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // FIXED 200 (floor & ceiling 200); RANGE 150..600 (floor 150, ceiling 600).
@@ -1241,7 +1182,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — category filter scopes the price range to matching services only")
     void should_scopeSalonPriceRange_toCategoryFilter() throws Exception {
-        ensureHttpClient();
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
@@ -1262,7 +1202,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — priceMin AND priceMax both null when the salon has no active priced services")
     void should_returnNullPriceRange_when_salonHasNoActiveServices() throws Exception {
-        ensureHttpClient();
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service exists — it must not contribute to the band.
@@ -1285,7 +1224,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — priceMin == priceMax (equal values, not collapsed) when a single FIXED service prices the salon")
     void should_returnEqualPriceMinMax_when_singleFixedService() throws Exception {
-        ensureHttpClient();
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         seedSalonServiceForMaster(masterId, salonId, "MANICURE", "FIXED",
@@ -1306,7 +1244,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — serviceNames carries the salon's distinct active service names, capped at 3")
     void should_populateSalonServiceNames_distinctAndCapped() throws Exception {
-        ensureHttpClient();
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Five distinct names + one duplicate → 5 distinct, 6 rows; cap is 3.
@@ -1338,7 +1275,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — serviceNames is an empty array (never null) for a salon with no active priced services")
     void should_returnEmptySalonServiceNames_when_salonHasNoActiveServices() throws Exception {
-        ensureHttpClient();
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
         // Only an INACTIVE service — it must not contribute to serviceNames.
@@ -1363,7 +1299,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — a rotated-away master's stale assignment must NOT surface its OLD salon (bookable gate mx.salon_id correlation)")
     void should_excludeRotatedMasterSalon_fromServiceFilteredSearch() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Salon A owns a type-A def, but its ONLY performing master rotated to salon B
@@ -1400,7 +1335,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons (UNFILTERED, ?location.cityId only) — a rotated-away master's stale assignment must NOT leak its OLD salon's serviceNames/price band (projection mad/mm2.salon_id = s.id correlation)")
     void should_notLeakRotatedMasterServiceNamesOrPrice_onUnfilteredCitySearch() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Salon A (Kyiv) owns a def, but its ONLY performing master ROTATED to salon B (masters.salon_id = B)
@@ -1606,7 +1540,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?q matches the master's last name case-insensitively")
     void should_matchMasterByName_caseInsensitively_when_qSupplied() throws Exception {
-        ensureHttpClient();
         UUID match = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
         seedNamedIndependentMaster("Київ", "4.50", "Ivan", "Petrenko");
 
@@ -1624,7 +1557,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?q matches a master via the (custom) service-definition name")
     void should_matchMasterByServiceName_when_qSupplied() throws Exception {
-        ensureHttpClient();
         UUID match = seedNamedIndependentMaster("Київ", "4.50", "Anna", "Koval");
         seedNamedServiceForMaster(match, "Французький манікюр", "MANICURE", new BigDecimal("300.00"));
         seedNamedIndependentMaster("Київ", "4.50", "Boris", "Tkach");
@@ -1642,7 +1574,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — serviceNames carries the custom service-definition names (custom-over-default automatic)")
     void should_populateServiceNames_withCustomNames() throws Exception {
-        ensureHttpClient();
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Olena", "Master");
         seedNamedServiceForMaster(master, "Авторський манікюр", "MANICURE", new BigDecimal("250.00"));
         seedNamedServiceForMaster(master, "Педикюр SPA", "PEDICURE", new BigDecimal("350.00"));
@@ -1663,7 +1594,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — serviceNames is an empty array (not null) for a master with no active services")
     void should_returnEmptyServiceNames_when_masterHasNoServices() throws Exception {
-        ensureHttpClient();
         seedNamedIndependentMaster("Київ", "4.50", "Solo", "Master");
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1682,7 +1612,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?category=EYELASH — serviceNames lists ONLY the filtered-category names (no foreign-category leak)")
     void should_scopeServiceNamesToFilteredCategory_when_masterHasMultiCategoryServices() throws Exception {
-        ensureHttpClient();
         // ONE master carrying services in TWO categories: 2 in EYELASH, 1 in MAKEUP.
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Lash", "Master");
         seedNamedServiceForMaster(master, "Ламінування вій №3", "EYELASH", new BigDecimal("400.00"));
@@ -1717,7 +1646,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters (no category) — serviceNames spans ALL categories (no-filter branch stays catalogue-wide)")
     void should_returnAllCategoryServiceNames_when_noCategoryFilter() throws Exception {
-        ensureHttpClient();
         // Same multi-category master; with NO category filter the preview is
         // catalogue-wide and capped at SERVICE_NAME_CAP=3 → all three names surface.
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Multi", "Master");
@@ -1741,7 +1669,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?category=EYELASH — serviceNames is category-scoped (salon-side parity guard)")
     void should_scopeSalonServiceNamesToFilteredCategory_when_salonHasMultiCategoryServices() throws Exception {
-        ensureHttpClient();
         // ONE salon, ONE master carrying services in TWO categories: 2 EYELASH, 1 MAKEUP.
         UUID salonId = seedActiveSalon("Київ", null);
         UUID masterId = seedSalonMasterFor(salonId, "Київ", "4.00");
@@ -1765,7 +1692,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — priceMax == minEffectivePrice for a single FIXED-price master")
     void should_returnPriceMaxEqualToMin_forSingleFixedPriceMaster() throws Exception {
-        ensureHttpClient();
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Fixed", "Master");
         // A single FIXED service at 300.00 → both floor and ceiling are 300.00.
         seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("300.00"));
@@ -1787,7 +1713,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — priceMax > minEffectivePrice for a master carrying a RANGE service")
     void should_returnPriceMaxAboveMin_forRangeMaster() throws Exception {
-        ensureHttpClient();
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Range", "Master");
         // A RANGE service 200..650 → floor 200.00, ceiling 650.00 (a genuine range).
         seedRangeServiceForMaster(master, "Авторський манікюр", "MANICURE",
@@ -1815,7 +1740,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?sort=PRICE_ASC orders by ascending minEffectivePrice")
     void should_orderByPriceAscending_when_sortPriceAsc() throws Exception {
-        ensureHttpClient();
         seedMasterWithService("Київ", "4.00", new BigDecimal("500.00"));
         seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
         seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
@@ -1835,7 +1759,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — min_effective_price NULL masters are excluded by a price filter")
     void should_excludeNullPriceMasters_when_priceFilterApplied() throws Exception {
-        ensureHttpClient();
         seedNamedIndependentMaster("Київ", "4.00", "No", "Price");   // no services → NULL price
         seedMasterWithService("Київ", "4.00", new BigDecimal("250.00"));
 
@@ -1852,7 +1775,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — ?minPrice/?maxPrice narrows to salons whose price band overlaps the requested band")
     void should_narrowSalonsByPriceBand_when_priceFilterApplied() throws Exception {
-        ensureHttpClient();
         // Salon A: band 150..200 (overlaps [250,400]? no)
         UUID salonA = seedActiveSalon("Київ", null);
         UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
@@ -1880,7 +1802,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — a salon with no active priced service is excluded once a price bound is supplied")
     void should_excludeUnpricedSalon_when_priceFilterApplied() throws Exception {
-        ensureHttpClient();
         seedActiveSalon("Київ", null);   // no master / no services → NULL band
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1896,7 +1817,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — ?q matches the salon name case-insensitively")
     void should_matchSalonByName_caseInsensitively_when_qSupplied() throws Exception {
-        ensureHttpClient();
         UUID glow = seedNamedSalon("Київ", "Glow Studio");
         seedNamedSalon("Київ", "Shine Bar");
 
@@ -1920,7 +1840,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — regression: ?q matches a salon via an OFFERED service-definition name even when the salon NAME does not contain the term (pre-fix name-only predicate returned 0)")
     void should_matchSalonByServiceName_when_salonNameDoesNotContainTerm() throws Exception {
-        ensureHttpClient();
         // Salon name has NO "balayage"; its offered service does. Pre-fix this
         // salon was invisible for q=balayage (s.name ILIKE only).
         UUID match = seedNamedSalon("Київ", "Downtown Studio");
@@ -1949,7 +1868,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — ?q matches a salon's offered service name case-insensitively and partially (Cyrillic: service 'Манікюр', q='манік')")
     void should_matchSalonByServiceName_caseInsensitivePartialCyrillic_when_qSupplied() throws Exception {
-        ensureHttpClient();
         UUID match = seedNamedSalon("Київ", "Beauty Hub");
         UUID matchMaster = seedSalonMasterFor(match, "Київ", "4.00");
         seedNamedSalonServiceForMaster(matchMaster, match, "Манікюр",
@@ -1971,7 +1889,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — ?q matches a salon via a BOOKABLE salon-owned service_definition (active def + active master + active link); an inactive def never surfaces")
     void should_matchSalonByServiceName_onBookableActiveDef() throws Exception {
-        ensureHttpClient();
         // Bookable-gate contract (mirrors ServiceRepository.findBookableServicesBySalon):
         // a salon matches ?q via one of its owned services only when that service is
         // actively performed by an active master. Gates:
@@ -2001,7 +1918,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — location.cityId narrows masters to that city and excludes others (server-side filter proof)")
     void should_narrowMastersByCity_andExcludeOtherCities() throws Exception {
-        ensureHttpClient();
         UUID inKyiv = seedNamedIndependentMaster("Київ", "4.50", "Kyiv", "Master");
         seedNamedIndependentMaster("Львів", "4.90", "Lviv", "Master");
 
@@ -2021,7 +1937,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?q matches the master's FIRST name case-insensitively (Cyrillic фолд: q=олена matches 'Олена')")
     void should_matchMasterByFirstName_caseInsensitively_cyrillic_when_qSupplied() throws Exception {
-        ensureHttpClient();
         UUID match = seedNamedIndependentMaster("Київ", "4.50", "Олена", "Коваленко");
         seedNamedIndependentMaster("Київ", "4.50", "Іван", "Петренко");
 
@@ -2042,7 +1957,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — a literal '%' in ?q is escaped (matches a literal percent, NOT used as a wildcard)")
     void should_treatPercentInQ_asLiteral_notWildcard() throws Exception {
-        ensureHttpClient();
         // One master whose last name literally contains '%', one that does not.
         UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "50%off");
         seedNamedIndependentMaster("Київ", "4.50", "Boris", "Plainname");
@@ -2068,7 +1982,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — a literal '_' in ?q is escaped (single-underscore is not the any-char wildcard)")
     void should_treatUnderscoreInQ_asLiteral_notWildcard() throws Exception {
-        ensureHttpClient();
         UUID literal = seedNamedIndependentMaster("Київ", "4.50", "Anna", "a_b");
         // "axb" would be matched by an UNescaped '_' wildcard (a<any>b) — it must NOT match.
         seedNamedIndependentMaster("Київ", "4.50", "Boris", "axb");
@@ -2088,7 +2001,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — a literal '%' in ?q is escaped against the salon name (not a wildcard)")
     void should_treatPercentInSalonQ_asLiteral_notWildcard() throws Exception {
-        ensureHttpClient();
         UUID literal = seedNamedSalon("Київ", "Glow 50%");
         seedNamedSalon("Київ", "Shine Bar 50 off");
 
@@ -2108,7 +2020,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — serviceNames is DISTINCT and capped at 3 even when the master has 5 distinct active services")
     void should_capServiceNamesAtThree_andDeduplicate_when_masterHasManyServices() throws Exception {
-        ensureHttpClient();
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Many", "Services");
         // Five DISTINCT names + one duplicate of the first → 5 distinct, 6 rows.
         seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("200.00"));
@@ -2149,7 +2060,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?sort=PRICE_DESC orders by descending minEffectivePrice")
     void should_orderByPriceDescending_when_sortPriceDesc() throws Exception {
-        ensureHttpClient();
         seedMasterWithService("Київ", "4.00", new BigDecimal("100.00"));
         seedMasterWithService("Київ", "4.00", new BigDecimal("500.00"));
         seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
@@ -2170,7 +2080,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — ?sort=REVIEWS_DESC orders by descending review_count")
     void should_orderByReviewsDescending_when_sortReviewsDesc() throws Exception {
-        ensureHttpClient();
         seedMasterWithReviewCount("Київ", "4.00", 2);
         seedMasterWithReviewCount("Київ", "4.00", 50);
         seedMasterWithReviewCount("Київ", "4.00", 17);
@@ -2191,7 +2100,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — default sort (no ?sort) orders by descending avg_rating")
     void should_orderByRatingDescending_when_sortOmitted() throws Exception {
-        ensureHttpClient();
         seedMasterWithCity("Київ", "3.80");
         seedMasterWithCity("Київ", "4.90");
         seedMasterWithCity("Київ", "4.20");
@@ -2214,7 +2122,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — ?sort=PRICE_ASC orders salons by ascending priceMin band floor")
     void should_orderSalonsByPriceAscending_when_sortPriceAsc() throws Exception {
-        ensureHttpClient();
         UUID cheap = seedSalonWithFixedService("Київ", new BigDecimal("100.00"));
         UUID mid = seedSalonWithFixedService("Київ", new BigDecimal("300.00"));
         UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
@@ -2238,7 +2145,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — ?sort=PRICE_DESC orders salons by descending priceMax band ceiling")
     void should_orderSalonsByPriceDescending_when_sortPriceDesc() throws Exception {
-        ensureHttpClient();
         UUID cheap = seedSalonWithFixedService("Київ", new BigDecimal("100.00"));
         UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
 
@@ -2268,7 +2174,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — a 1-2 char ?q returns an EXPLICIT empty page + the Ukrainian helper message, never the unfiltered location-scoped set")
     void should_returnEmptyPageWithHelperMessage_when_qBelowMinimumLength() throws Exception {
-        ensureHttpClient();
         // Master in Київ whose name does NOT contain the short term "zz". Under the
         // old normalize-to-null behaviour this row leaked into the response.
         seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
@@ -2294,7 +2199,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — a 1-2 char ?q returns the same explicit empty page + helper message (both endpoints share the contract)")
     void should_returnEmptyPageWithHelperMessage_when_salonQBelowMinimumLength() throws Exception {
-        ensureHttpClient();
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
@@ -2312,7 +2216,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — FK-only match: a master whose service has service_type_id set (NAME does NOT contain the type name) is returned for that slug")
     void should_returnMaster_when_serviceMatchesByServiceTypeIdFk() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Match purely via the FK — the service name deliberately omits "Кератин".
         UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
@@ -2334,7 +2237,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — FK-only: a master whose service carries an UNRELATED service_type_id is NOT returned even when its NAME contains name_uk (substring fallback removed)")
     void should_notReturnMaster_when_serviceMatchesByNameOnly_withNullFk() throws Exception {
-        ensureHttpClient();
         // The service carries an unrelated service_type_id (differs from SLUG_A).
         // The former name-substring fallback is gone, so a name-only match no
         // longer qualifies — only a matching FK does. (Under the pre-V111 schema
@@ -2356,7 +2258,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — FK-only: only the FK-tagged master is returned; an unrelated-FK master whose NAME contains name_uk is excluded")
     void should_returnOnlyFkMaster_when_otherMatchesByNameOnly() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID fkMaster = seedNamedIndependentMaster("Київ", "4.50", "Fk", "Master");
         seedTypedServiceForMaster(fkMaster, "Догляд за волоссям", "HAIRCUT",
@@ -2375,7 +2276,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — OR/union of two slugs: master offering BOTH returned AND master offering only one also returned")
     void should_returnMastersOfferingAnySlug_when_unionOfTwoSlugs() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
         // Master A offers BOTH service types.
@@ -2402,7 +2302,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — all-unknown: the only selected slug is unresolvable → explicit empty page (NOT unfiltered everything)")
     void should_returnEmpty_when_allSelectedSlugsUnresolvable() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Real", "Master");
         seedTypedServiceForMaster(master, "Догляд за волоссям", "HAIRCUT",
@@ -2422,7 +2321,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — mix valid + unknown: the unknown slug is dropped; masters offering the VALID slug are returned")
     void should_returnMastersOfferingValidSlug_when_mixOfValidAndUnknownSlugs() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Master offers the valid slug A — must survive once the unknown slug is dropped.
         UUID valid = seedNamedIndependentMaster("Київ", "4.50", "Valid", "Master");
@@ -2445,7 +2343,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — matchedServiceNames present (distinct, capped at 3) when filtering; EMPTY when no serviceTypeSlugs")
     void should_populateMatchedServiceNames_whenFiltering_andEmptyOtherwise() throws Exception {
-        ensureHttpClient();
         // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // seeded all four names under the SAME typeIdA. Rewritten to use FOUR DISTINCT searchable
@@ -2494,7 +2391,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — inactive exclusion: a master matched only via an inactive master_service or inactive service_definition is NOT returned")
     void should_excludeMaster_when_onlyInactiveLayerMatchesSlug() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Master 1: service_definition inactive (FK matches but def is_active = false).
         UUID inactiveDef = seedNamedIndependentMaster("Київ", "4.50", "InactiveDef", "Master");
@@ -2514,7 +2410,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — composition: serviceTypeSlugs + category + price together narrow to the single fully-matching master")
     void should_narrowByServiceTypeSlugsCategoryAndPrice_when_combined() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // m1 — matches every predicate.
         UUID m1 = seedNamedIndependentMaster("Київ", "4.50", "Full", "Match");
@@ -2559,7 +2454,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?serviceTypeSlugs=… — regression: the displayed price band is scoped to the matched service-type — a master with a FIXED 500 on slug A and a RANGE 800..4000 on slug B shows 500/500 for A, 800/4000 for B, and the 500/4000 whole-catalogue band only when unfiltered")
     void should_scopeMasterPriceBand_toActiveServiceTypeSlug_acrossFixedAndRange() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
         UUID master = seedNamedIndependentMaster("Київ", "4.50", "Scoped", "Band");
@@ -2607,7 +2501,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — FK-only: a salon whose active master offers a service tagged with the type FK is returned; an unrelated-FK name-only match is excluded")
     void should_returnSalon_when_activeMasterOffersMatchingService() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Salon matched via FK (name omits "Кератин").
         UUID salonFk = seedActiveSalon("Київ", null);
@@ -2644,7 +2537,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — false-positive regression: a salon whose only service is beard-correction ('Корекція бороди', FK≠brows) is EXCLUDED from a brows-correction search (name substring '%Корекція%' no longer leaks); the genuine brows-correction salon is returned with the correct matched line")
     void should_excludeSubstringNameFalsePositiveSalon_when_filteringBySiblingCorrectionSlug() throws Exception {
-        ensureHttpClient();
         UUID browsTypeId = serviceTypeIdBySlug(SLUG_SEARCH);            // "Корекція"
         UUID beardTypeId = serviceTypeIdBySlug(SLUG_SUBSTRING_SIBLING); // "Корекція бороди"
         // Sanity: the two slugs resolve to DIFFERENT service types (FK must diverge
@@ -2690,7 +2582,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — false-positive regression (master analog): a master whose only service is beard-correction ('Корекція бороди', FK≠brows) is EXCLUDED from a brows-correction search; the genuine brows-correction master is returned (master search shares the FK-only helper)")
     void should_excludeSubstringNameFalsePositiveMaster_when_filteringBySiblingCorrectionSlug() throws Exception {
-        ensureHttpClient();
         UUID browsTypeId = serviceTypeIdBySlug(SLUG_SEARCH);            // "Корекція"
         UUID beardTypeId = serviceTypeIdBySlug(SLUG_SUBSTRING_SIBLING); // "Корекція бороди"
         assertThat(beardTypeId)
@@ -2727,7 +2618,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — OR/union of two slugs at salon granularity: salon offering BOTH AND salon offering only one are both returned")
     void should_returnSalonsOfferingAnySlug_when_unionOfTwoSlugs() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
         UUID salonBoth = seedActiveSalon("Київ", null);
@@ -2754,7 +2644,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — mix valid + unknown: the unknown slug is dropped; salons offering the VALID slug are returned")
     void should_returnSalonsOfferingValidSlug_when_mixOfValidAndUnknownSlugs() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Salon whose active master offers the valid slug A — survives after the drop.
         UUID validSalon = seedActiveSalon("Київ", null);
@@ -2778,7 +2667,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — all-unknown: the only selected slug is unresolvable → explicit empty page (NOT unfiltered everything)")
     void should_returnEmpty_when_allSelectedSalonSlugsUnresolvable() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // A real, matching salon exists — an unfiltered query would return it, proving
         // the empty result is the explicit empty page, not "no rows seeded".
@@ -2797,7 +2685,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — per-slug EXISTS surfaces a salon via a BOOKABLE salon-owned service_definition (active def + active master + active link); an inactive def is excluded")
     void should_surfaceSalonBySlug_onBookableActiveDef() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Active def + active master + active link → bookable → MUST surface
         // (mirrors ServiceRepository.findBookableServicesBySalon).
@@ -2823,7 +2710,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons — matchedServiceNames is aggregated across the salon's masters when filtering, and empty when unfiltered")
     void should_aggregateSalonMatchedServiceNames_acrossMasters_whenFiltering() throws Exception {
-        ensureHttpClient();
         // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // put BOTH masters' defs under the SAME typeIdA. Rewritten so master2's def carries a DISTINCT
@@ -2864,7 +2750,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — regression (salon analog): the salon price band is scoped to the matched service-type — a salon owning a FIXED 500 on slug A and a RANGE 800..4000 on slug B shows priceMin/priceMax 500/500 for A and 800/4000 for B (pre-fix the slug-filtered band leaked the whole-catalogue 500/4000)")
     void should_scopeSalonPriceBand_toActiveServiceTypeSlug_acrossFixedAndRange() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
         // ONE salon owning two BOOKABLE defs (each performed by an active master, no
@@ -2917,7 +2802,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?category=HAIRCUT — regression: a salon whose ONLY active services are in a DIFFERENT category is EXCLUDED (pre-fix it leaked in as an empty-name card)")
     void should_excludeSalon_when_offersNothingInFilteredCategory() throws Exception {
-        ensureHttpClient();
         // Salon A — an active master offering two ACTIVE services in category HAIRCUT.
         UUID salonA = seedActiveSalon("Київ", null);
         UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
@@ -2955,7 +2839,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons (no category) — null-gate no-op: BOTH salons returned regardless of which single category each offers")
     void should_returnBothSalons_when_noCategoryFilter() throws Exception {
-        ensureHttpClient();
         // Same two salons as the exclusion test — one HAIRCUT-only, one MANICURE-only.
         UUID salonA = seedActiveSalon("Київ", null);
         UUID masterA = seedSalonMasterFor(salonA, "Київ", "4.00");
@@ -2979,7 +2862,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?category=HAIRCUT&size=2 — countQuery parity: totalElements counts ONLY category-matching salons (the foreign-category salon is absent from the count too — no phantom page)")
     void should_matchCountQueryToFilteredRows_when_categoryFilterPaginated() throws Exception {
-        ensureHttpClient();
         // Three salons each offering an active HAIRCUT service ...
         UUID s1 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 1");
         UUID s2 = seedSalonOfferingCategory("Київ", "HAIRCUT", "Стрижка 2");
@@ -3030,7 +2912,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?category=NAIL_SERVICE — a salon surfaces via a BOOKABLE owned NAIL_SERVICE def (active master performs it) with the performing master's price band + category-scoped names; an unbookable off-category owned def never leaks, and a different-category salon is excluded")
     void should_surfaceSalonByBookableOwnedDef_underCategoryFilter() throws Exception {
-        ensureHttpClient();
         // Salon A — an active salon with an active master who actively performs a
         // NAIL_SERVICE RANGE 150..600 (no override → effective band 150..600). It
         // also owns an off-category HAIRCUT FIXED 900 that NO master performs
@@ -3086,7 +2967,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — the per-slug EXISTS surfaces a salon via a BOOKABLE owned def carrying the slug's service_type_id (active master performs it); matchedServiceNames carries that def's name; an unrelated-type / unbookable salon is excluded")
     void should_surfaceSalonBySlug_onBookableOwnedDef() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         // Salon with a BOOKABLE owned def carrying SLUG_A's service_type_id: an
         // active master actively performs it → the SearchService per-slug EXISTS
@@ -3144,7 +3024,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable gate): a salon that OWNS an active type-T service but has NO active master performing it is ABSENT; a salon whose active master performs it IS returned")
     void should_excludeSalonWithNoActiveMasterPerformingType_when_filteringByServiceType() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Salon A — owns an ACTIVE type-A service_definition but NO master_services
@@ -3176,7 +3055,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable gate): an INACTIVE master_services assignment (is_active=false) does NOT make the salon bookable — it is EXCLUDED")
     void should_excludeSalon_when_onlyTypeServiceAssignmentIsInactive() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Salon D — owns an ACTIVE type-A def; its ONLY master_services link is
@@ -3206,7 +3084,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable gate): an assignment on an INACTIVE master (masters.is_active=false) does NOT make the salon bookable — it is EXCLUDED")
     void should_excludeSalon_when_onlyPerformingMasterIsInactive() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Salon D — owns an ACTIVE type-A def with an ACTIVE assignment, but the
@@ -3238,7 +3115,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable price band): priceMin/priceMax = min–max of the PERFORMING masters' EFFECTIVE prices (price_override), NOT the salon-owned base_price")
     void should_computeSalonPriceBand_fromPerformingMastersEffectivePrices() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Salon B — ONE salon-owned type-A def with base_price 4000. TWO active
@@ -3268,7 +3144,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (bookable price band): with a single performing master and no override the band collapses to that master's base_price; an UNBOOKABLE owned type-T service does NOT drag the band")
     void should_collapseSalonPriceBand_toBasePrice_ignoringUnbookableOwnedService() throws Exception {
-        ensureHttpClient();
         // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // put BOTH defs under the SAME typeIdA. Rewritten so the unbookable def carries a DISTINCT
@@ -3305,7 +3180,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?serviceTypeSlugs=… — TARGET (matched lines): matchedServiceNames reflects ONLY master-performed type-T services; an unbookable owned type-T service is NOT listed")
     void should_limitSalonMatchedServiceNames_toMasterPerformedServices() throws Exception {
-        ensureHttpClient();
         // V121 (ux_service_def_owner_service_type_active, commit 274f15e) forbids two+ active
         // service_definitions sharing one service_type_id for the same owner — the original fixture
         // put BOTH defs under the SAME typeIdA. Rewritten so the unbookable def carries a DISTINCT
@@ -3355,7 +3229,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters?q=… (SINGLE token) — an ACTIVE cross-owner assignment to a SALON-owned definition must NOT make an independent master discoverable by that definition's name")
     void should_notDiscoverIndependentMaster_when_singleTokenQMatchesSalonOwnedDefViaStaleAssignment()
             throws Exception {
-        ensureHttpClient();
 
         // The master owns its OWN active service, so it is genuinely searchable —
         // without this an empty result would be vacuous (a serviceless master is
@@ -3395,7 +3268,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters?q=… (SINGLE token) — an ACTIVE assignment to ANOTHER independent master's definition must NOT make this master discoverable (owner_type alone is not enough)")
     void should_notDiscoverIndependentMaster_when_singleTokenQMatchesAnotherMastersOwnedDef()
             throws Exception {
-        ensureHttpClient();
 
         UUID borrower = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Стальна");
         seedNamedServiceForMaster(borrower, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
@@ -3427,7 +3299,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters?q=… (MULTI token) — the exact group predicate's owner gate must reject a cross-owner definition that alone satisfies every token")
     void should_notDiscoverIndependentMaster_when_multiTokenQIsSatisfiedOnlyByCrossOwnerDef()
             throws Exception {
-        ensureHttpClient();
 
         // This fixture is built so the index-servable PRE-FILTER admits the master on
         // its own services (each token is individually carried by one of them), and
@@ -3457,7 +3328,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters (unfiltered) — serviceNames must not print a cross-owner definition's name on an independent master's card")
     void should_notLeakCrossOwnerServiceName_inMasterServiceNamesPreview() throws Exception {
-        ensureHttpClient();
 
         UUID masterId = seedNamedIndependentMaster("Київ", "4.50", "Ірина", "Стальна");
         seedNamedServiceForMaster(masterId, "Педикюр класичний", "PEDICURE", new BigDecimal("400.00"));
@@ -3492,7 +3362,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — tokens satisfied by TWO DIFFERENT services of one master must NOT match (group-scoped precision fix)")
     void should_notMatchMaster_when_tokensAreSpreadAcrossTwoDifferentServices() throws Exception {
-        ensureHttpClient();
 
         // The false positive the group-scoped rewrite removed: «Ботокс вій» carries
         // "Ботокс", «Щастя для волосся» carries "для"+"волосся", so the OLD per-token
@@ -3517,7 +3386,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — two tokens spanning the NAME column and an offered SERVICE name match, and narrow the result vs either token alone")
     void should_matchAndNarrow_when_twoTokensSpanNameAndServiceName() throws Exception {
-        ensureHttpClient();
 
         // Both masters are called «Олена»; only one offers a manicure.
         UUID manicurist = seedNamedIndependentMaster("Київ", "4.80", "Олена", "Мороз");
@@ -3540,7 +3408,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — two tokens both in NAME columns match the one master carrying both; single-token decoys are excluded")
     void should_matchOnlyMasterCarryingBothNameTokens_when_fullNameQueried() throws Exception {
-        ensureHttpClient();
 
         UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
         // Decoys: each carries exactly ONE of the two tokens. Under group-scoped ANDed
@@ -3559,7 +3426,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — reversing token ORDER and flipping CASE returns the identical row set")
     void should_returnIdenticalRows_when_tokenOrderReversedAndCaseFlipped() throws Exception {
-        ensureHttpClient();
 
         UUID target = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
         seedNamedIndependentMaster("Київ", "4.80", "Вікторія", "Панченко");
@@ -3583,7 +3449,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — beyond MAX_TOKENS=4 the extra tokens are DROPPED, which can only widen the match, never wrongly empty it")
     void should_dropTokensBeyondCap_when_queryCarriesMoreThanFourTokens() throws Exception {
-        ensureHttpClient();
 
         // The master satisfies the first FOUR tokens only. A 5th token it cannot
         // satisfy must be discarded by the MAX_TOKENS cap rather than emptying the page.
@@ -3608,7 +3473,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — the curly apostrophe U+2019 is folded onto U+0027, so both keyboard forms match the same row")
     void should_matchSameRow_when_apostropheIsStraightOrCurly() throws Exception {
-        ensureHttpClient();
 
         // Stored names use the straight U+0027 (write-side normalisation).
         UUID target = seedNamedIndependentMaster("Київ", "4.90", "В'ячеслав", "Мар'яненко");
@@ -3638,7 +3502,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?q=…&serviceTypeSlugs=… — the COMBINED filter ANDs both conditions (dynamic q group predicate)")
     void should_applyBothFilters_when_salonQCombinedWithServiceTypeSlugs() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
 
@@ -3673,7 +3536,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?q=… — an ORPHAN salon service (no active master performs it) must be invisible on BOTH the static (q-only) and dynamic (q + slug) paths")
     void should_hideOrphanSalonService_onBothStaticAndDynamicQPaths() throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
 
         // Active SALON-owned definition with NO active master performing it — the
@@ -3704,7 +3566,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?q=… (MULTI token) — tokens spread across TWO different bookable services of one salon must NOT match")
     void should_notMatchSalon_when_tokensAreSpreadAcrossTwoDifferentServices() throws Exception {
-        ensureHttpClient();
 
         UUID falsePositive = seedActiveSalon("Київ", null);
         UUID fpMaster = seedSalonMasterFor(falsePositive, "Київ", "4.00");
@@ -3731,7 +3592,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?q=… — a mixed query (one token by SALON NAME, one by a bookable service) matches")
     void should_matchSalon_when_oneTokenByNameAndOneByService() throws Exception {
-        ensureHttpClient();
 
         UUID salonId = seedNamedSalon("Київ", "Aura Corner");
         UUID def = seedTypedSalonOwnedDef(salonId, "Манікюр гелевий", "MANICURE",
@@ -3757,7 +3617,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=<service name> — matchedServiceNames names the service that EXPLAINS the match, for a single AND a multi token query")
     void should_populateMatchedServiceNames_when_masterQMatchesServiceName() throws Exception {
-        ensureHttpClient();
 
         UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Ірина", "Пояснена");
         seedNamedServiceForMaster(masterId, "Ботокс для волосся", "HAIRCUT", new BigDecimal("700.00"));
@@ -3778,7 +3637,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=<person name> — matchedServiceNames is EMPTY for a pure NAME match (a service must contribute >=1 token through its own name)")
     void should_leaveMatchedServiceNamesEmpty_when_masterQMatchesNameOnly() throws Exception {
-        ensureHttpClient();
 
         UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Вікторія", "Руденко");
         seedNamedServiceForMaster(masterId, "Ботокс для волосся", "HAIRCUT", new BigDecimal("700.00"));
@@ -3802,7 +3660,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/masters?q=…&serviceTypeSlugs=… — matchedServiceNames is the INTERSECTION of both filters, and EMPTY when the intersection is empty")
     void should_intersectMatchedServiceNames_when_masterQCombinedWithServiceTypeSlugs()
             throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
 
@@ -3838,7 +3695,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=… — matchedServiceNames is capped at 3 and deterministically ordered")
     void should_capMatchedServiceNamesAtThree_when_masterQMatchesManyServices() throws Exception {
-        ensureHttpClient();
 
         UUID masterId = seedNamedIndependentMaster("Київ", "4.90", "Ірина", "Багата");
         seedNamedServiceForMaster(masterId, "Догляд Альфа", "HAIRCUT", new BigDecimal("300.00"));
@@ -3856,7 +3712,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?q=<service name> — matchedServiceNames names the explaining bookable service (static path), and is EMPTY for a pure salon-name match")
     void should_populateSalonMatchedServiceNames_when_qMatchesServiceName() throws Exception {
-        ensureHttpClient();
 
         UUID salonId = seedNamedSalon("Київ", "Aura Corner");
         UUID master = seedSalonMasterFor(salonId, "Київ", "4.00");
@@ -3883,7 +3738,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /search/salons?q=…&serviceTypeSlugs=… — matchedServiceNames on the DYNAMIC path is the intersection of free text and slug")
     void should_intersectSalonMatchedServiceNames_when_qCombinedWithServiceTypeSlugs()
             throws Exception {
-        ensureHttpClient();
         UUID typeIdA = serviceTypeIdBySlug(SLUG_A);
         UUID typeIdB = serviceTypeIdBySlug(SLUG_B);
 
@@ -3913,7 +3767,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — two pages under each sort mode are DISJOINT and globally ordered (inner Top-N and outer ORDER BY agree)")
     void should_returnDisjointOrderedPages_when_pagingUnderEachSortMode() throws Exception {
-        ensureHttpClient();
         UUID cityId = cityIdByName("Київ");
 
         // Five masters, each with a DISTINCT avg_rating, review_count and price, so
@@ -3954,7 +3807,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?sort=PRICE_DESC — an unpriced master sorts LAST (explicit NULLS LAST), not first")
     void should_sortUnpricedMasterLast_when_priceDescOrdering() throws Exception {
-        ensureHttpClient();
         UUID cityId = cityIdByName("Київ");
 
         UUID priced = seedMaster("Київ", "4.50");
@@ -4044,7 +3896,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=«Нарощення вій» — a CATEGORY display name matches masters offering that category, even though no service NAME contains either token")
     void should_findMastersByCategoryDisplayName_when_qIsACategoryLabel() throws Exception {
-        ensureHttpClient();
 
         // The service NAME shares no token with the query — the ONLY thing linking
         // this master to «Нарощення вій» is service_definitions.category. Before the
@@ -4070,7 +3921,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=«Нарощення вій» — the free-text result set EQUALS the category-filter result set (the correctness target)")
     void should_matchCategoryFilterResultSet_when_qIsACategoryLabel() throws Exception {
-        ensureHttpClient();
 
         UUID lashOne = seedNamedIndependentMaster("Київ", "4.90", "Оксана", "Литвин");
         seedNamedServiceForMaster(lashOne, "Класика 2Д", LASH_EXTENSIONS_CATEGORY, new BigDecimal("600.00"));
@@ -4094,7 +3944,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=«Нарощення вій» — matchedServiceNames EXPLAINS the category match instead of falling back to an arbitrary catalogue slice")
     void should_explainCategoryMatch_inMatchedServiceNames_when_qIsACategoryLabel() throws Exception {
-        ensureHttpClient();
 
         // A multi-category master: without the category half of the matched-names
         // lateral, condition (b) ("contributes a token through its own name") rejects
@@ -4115,7 +3964,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=«Нарощення вій» — an INACTIVE master_services assignment must NOT make the master discoverable by category (the active gate is not bypassed)")
     void should_notDiscoverMasterByCategory_when_theAssignmentIsInactive() throws Exception {
-        ensureHttpClient();
 
         // The category disjunct sits INSIDE the correlated EXISTS over active
         // assignments. If it were ever lifted to the master level, this master would
@@ -4140,7 +3988,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?q=«Педикюр» — a SOFT-DISABLED category label must NOT resolve (only selectable categories participate)")
     void should_notResolveCategory_when_theCategoryIsInactive() throws Exception {
-        ensureHttpClient();
 
         // PEDICURE is soft-disabled by V74 (active = FALSE) while its display name
         // «Педикюр» survives. It must not widen the search, or a category an admin
@@ -4161,7 +4008,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/salons?q=«Нарощення вій» — the category label matches salons, and an ORPHAN service in that category stays invisible (salon offering = master-performed only)")
     void should_findSalonsByCategoryDisplayName_andKeepOrphanServicesHidden() throws Exception {
-        ensureHttpClient();
 
         // Bookable: an ACTIVE master of THIS salon performs the LASH_EXTENSIONS service.
         UUID bookableSalon = seedActiveSalon("Київ", null);

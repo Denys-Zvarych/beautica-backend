@@ -64,6 +64,19 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *   <li>Relax {@code chk_masters_detachment_coherent}'s first arm to a bare
  *       {@code user_id IS NOT NULL} → case 16 red.</li>
  * </ul>
+ *
+ * <p><b>Two further mutation checks</b> added with case 17 (2026-09-15 QA pass, phase 316), on
+ * {@code AuthorizationService#isPerformingMasterOfRow} — the ONLY null-handling in the phase-316
+ * grant:
+ * <ul>
+ *   <li>Drop the {@code masterUserId != null} guard entirely
+ *       ({@code masterUserId.equals(actorUserId)}) → case 17's first assertion goes red with a
+ *       <b>500</b>, the NPE-inside-SpEL shape case 11 exists for, rather than the 403 it asserts.</li>
+ *   <li>Invert it to fail OPEN ({@code masterUserId == null || masterUserId.equals(actorUserId)}) —
+ *       the shape a reader reaches for when told "a detached master has no owner, so let the
+ *       performer through" → case 17's first assertion goes red with a <b>201</b>, and nothing else
+ *       in this class or in {@code ClientReviewIT} moves.</li>
+ * </ul>
  */
 @DisplayName("V157 — detachable master + staff-delete FK relaxation (phase 294)")
 class MasterDetachmentContractIT extends AbstractIntegrationTest {
@@ -645,7 +658,89 @@ class MasterDetachmentContractIT extends AbstractIntegrationTest {
                 .isNull();
     }
 
+    // ── case 17 — phase 316: a DETACHED master's booking grants the review to NOBODY ─────────────
+
+    /**
+     * <b>The other half of case 13, for the endpoint phase 316 just widened.</b> Case 13 pins that
+     * relaxing {@code findCompletionAccessById}'s {@code bm.user} join gave the SALON OWNER back
+     * {@code PATCH /bookings/&#123;id&#125;/complete} on a detached master's booking. That
+     * relaxation feeds all FOUR SpEL predicates, {@code canReviewClient} among them — and phase 316
+     * then added a leg to that one which reads {@code masterUserId} directly, the exact column the
+     * detach nulls. So the projection now hands {@code canReviewClient} a {@code null} where it
+     * previously handed it nothing at all, and which way that falls is a different question from
+     * the one case 13 settled.
+     *
+     * <p>It must fall CLOSED, for everyone: {@code AuthorizationService#isPerformingMasterOfRow}'s
+     * {@code masterUserId != null} guard is the whole of the protection, and the actor here is
+     * precisely the person whose {@code masters.user_id} was nulled — see the class javadoc for the
+     * two mutations of that guard this case is the sole detector for.
+     *
+     * <p><b>Why the deleted master can still call at all.</b> {@link #detach} leaves the
+     * {@code users} row in place (phase 294 D6 — case 5 covers the account delete separately), so
+     * the ex-master still logs in, still carries {@code ROLE_SALON_MASTER}, and still passes the
+     * {@code @PreAuthorize} role list that phase 316 added them to. Only the SpEL predicate stands
+     * between them and the write, which is what makes this worth a test rather than an argument.
+     *
+     * <p><b>The owner's 201 is the non-vacuity control and must stay SECOND.</b> Without it a 403
+     * above is equally satisfied by {@code findCompletionAccessById} having gone back to an INNER
+     * join — the case-13 regression — in which case this test would be passing while silently
+     * re-breaking the owner. Evaluated second because a review is once-per-booking (D1): reversing
+     * the order would turn the master's attempt into a 409 and destroy the distinction.
+     */
+    @Test
+    @DisplayName("case 17 — a DETACHED master's booking confers the phase-316 review grant on "
+            + "NOBODY: the ex-master gets 403 while the salon OWNER still gets 201")
+    void should_grantClientReviewToNobody_when_theBookingsPerformingMasterIsDetached() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("mdc-316-detach", 1);
+        UUID bookingId = leadBookingId(visit.id());
+        BookingTestFixtures.SalonFixture salon = fixtures.createSalon(email("316-detach-owner"));
+        // Same reparent as case 13 (see reparentOntoSalonMaster) plus the salon_id snapshot and the
+        // COMPLETED status POST /client-reviews requires — isProviderReviewEligible is strict.
+        jdbcTemplate.update(
+                "UPDATE bookings SET master_id = ?, salon_id = ?, appointment_id = NULL, "
+                        + "status = 'COMPLETED', starts_at = NOW() - INTERVAL '2 hours', "
+                        + "ends_at = NOW() - INTERVAL '1 hour' WHERE id = ?",
+                salon.masterId(), salon.salonId(), bookingId);
+        // Minted while the master is still attached — the realistic shape is an unexpired token in
+        // a phone, not a fresh login after the row was erased.
+        String exMasterToken = fixtures.tokenFor(salon.masterEmail());
+        String ownerToken = fixtures.tokenFor(salon.ownerEmail());
+
+        detach(salon.masterId());
+        assertThat(userIdOf(salon.masterId()))
+                .as("premise — the performing master really is detached")
+                .isNull();
+
+        ResponseEntity<String> exMasterResp = postClientReview(bookingId, 4, exMasterToken);
+        assertThat(exMasterResp.getStatusCode())
+                .as("the performer arm compares against a NULL masters.user_id and must fail "
+                        + "closed — body=%s", exMasterResp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM client_reviews WHERE booking_id = ?", Integer.class, bookingId))
+                .as("and writes nothing")
+                .isZero();
+
+        ResponseEntity<String> ownerResp = postClientReview(bookingId, 5, ownerToken);
+        assertThat(ownerResp.getStatusCode())
+                .as("control — the salon arm never reads masterUserId, so the owner keeps the "
+                        + "write exactly as case 13 keeps /complete. A 403 here is the INNER JOIN "
+                        + "bm.user back in findCompletionAccessById, not a phase-316 regression — "
+                        + "body=%s", ownerResp.getBody())
+                .isEqualTo(HttpStatus.CREATED);
+    }
+
     // ── fixtures / helpers ─────────────────────────────────────────────────────────────────────
+
+    /** {@code POST /client-reviews} as one actor — case 17's only HTTP verb. */
+    private ResponseEntity<String> postClientReview(UUID bookingId, int rating, String token)
+            throws Exception {
+        String body = objectMapper.writeValueAsString(
+                java.util.Map.of("bookingId", bookingId.toString(), "rating", rating));
+        return restTemplate.exchange(
+                "/api/v1/client-reviews", HttpMethod.POST,
+                new HttpEntity<>(body, fixtures.bearerHeaders(token)), String.class);
+    }
 
     private static String email(String discriminator) {
         return "mdc-" + discriminator + "-" + System.nanoTime() + "@beautica.test";

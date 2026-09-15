@@ -4,10 +4,9 @@ import com.beautica.config.TestAsyncConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
 import com.beautica.support.SlowTestExtension;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
-import org.apache.hc.core5.util.TimeValue;
+import com.beautica.support.TestHttpClients;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -15,7 +14,6 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Import;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -109,19 +107,31 @@ public abstract class AbstractIntegrationTest {
             var cache = cacheManager.getCache(name);
             if (cache != null) cache.clear();
         });
+    }
 
-        // Reset to a fresh Apache HttpClient after every test so context-sharing
-        // classes never inherit a stale/closed connection pool from a previous test.
-        // Finite response timeout (10 s) + zero retries: a rate-limit 429 that resets
-        // the socket will fail fast instead of hanging the suite for 27 minutes.
-        var httpClient = HttpClients.custom()
-                .setRetryStrategy(new DefaultHttpRequestRetryStrategy(0, TimeValue.ZERO_MILLISECONDS))
-                .build();
-        var factory = new HttpComponentsClientHttpRequestFactory(httpClient);
-        factory.setConnectionRequestTimeout(10_000);
-        factory.setConnectTimeout(10_000);
-        factory.setReadTimeout(10_000);
-        baseRestTemplate.getRestTemplate().setRequestFactory(factory);
+    /**
+     * Installs the timeout-bounded, zero-retry request factory on the shared
+     * {@link TestRestTemplate} before EVERY test in EVERY subclass.
+     *
+     * <p><b>This hook is the reason no subclass may install its own.</b> 96 classes used to open
+     * their own {@code @BeforeEach} with a bare {@code HttpClients.createDefault()}, which runs
+     * AFTER this one (JUnit 5 orders superclass {@code @BeforeEach} first) and therefore threw the
+     * policy away: a default HC5 client has an infinite response timeout and retries, so a
+     * rate-limit 429 whose socket the server resets hung the entire suite instead of failing one
+     * case. Installing it here — and nowhere else — makes that drift unrepresentable.
+     *
+     * <p>A fresh pool per test, not a shared static one, so no case inherits a stale or closed
+     * connection from a context-sharing sibling. Allocation is one object; the pool opens sockets
+     * lazily, so this is cheaper than the per-test factory it replaces (which ran in
+     * {@code @AfterEach} on top of each subclass's own copy).
+     *
+     * <p>Standalone {@code @SpringBootTest} classes that cannot extend this base call
+     * {@link TestHttpClients#timeoutBoundedRequestFactory()} directly.
+     */
+    @BeforeEach
+    void installTimeoutBoundedHttpClient() {
+        baseRestTemplate.getRestTemplate()
+                .setRequestFactory(TestHttpClients.timeoutBoundedRequestFactory());
     }
 
     /**

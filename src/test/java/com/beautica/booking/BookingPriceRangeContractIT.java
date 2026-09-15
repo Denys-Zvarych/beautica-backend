@@ -18,7 +18,6 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.UUID;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,7 +34,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
@@ -109,9 +107,7 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     private BookingTestFixtures fixtures;
 
     @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+    void seedFixtures() {
         fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
@@ -1106,11 +1102,13 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * at 6 through this change not because the new work is free but because their fixtures never
      * reach it. "At most +2, flat in page size" was, until this gate, verified by nothing.
      *
-     * <p><b>Why the OWNER and not a master.</b> A {@code SALON_MASTER} actor reaches only the first
-     * of the two lookups: {@code findIdsByIdInAndOwnerId} comes back empty (a master owns no
-     * salon), {@code withAuthority} is empty, and the second early return skips the
-     * {@code client_reviews} probe — a +1 branch, not the +2 one. The owner is the sole role that
-     * pays both. That +1 branch has its own gate now:
+     * <p><b>Why the OWNER and not a master.</b> A {@code SALON_MASTER} actor still pays only ONE of
+     * the two lookups, though phase 316 swapped WHICH one: the page's rows are all bookings the
+     * master performed, so {@code loadProviderReviewBatch}'s performer partition leaves {@code
+     * remaining} empty and {@code findIdsByIdInAndOwnerId} is skipped outright, while {@code
+     * withAuthority} is now NON-empty and the {@code client_reviews} probe fires. A +1 branch
+     * either way, and still not the +2 one — the owner remains the sole role that pays both. That
+     * +1 branch has its own gate:
      * {@link #SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS}. Until it existed this paragraph was the only
      * thing standing behind the claim, and prose does not go red.
      *
@@ -1163,9 +1161,21 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * branch — a per-row {@code findIdsByIdInAndOwnerId}, say — would have left every green test green.
      *
      * <p>7 = the six {@link #SALON_MASTER_PAGE_STATEMENTS} already accounts for (identical role
-     * branch, identical fixture shape apart from status), PLUS the single
-     * {@code findIdsByIdInAndOwnerId}. DERIVED FROM A RUN, never predicted — the arithmetic above is
-     * a post-hoc reconciliation of a measured number, not a prediction that was then asserted.
+     * branch, identical fixture shape apart from status), PLUS one page-scoped lookup. DERIVED FROM
+     * A RUN, never predicted — the arithmetic above is a post-hoc reconciliation of a measured
+     * number, not a prediction that was then asserted.
+     *
+     * <p><b>Phase 316 changed WHICH lookup that "+1" is, and the number is unchanged — which is
+     * exactly why the premises below had to be rewritten rather than left alone.</b> Before 316 the
+     * +1 was {@code SalonRepository#findIdsByIdInAndOwnerId}, which for a master could only ever
+     * answer "no", and the {@code client_reviews} probe was then skipped by the empty-authority
+     * early return. Since 316 the master holds review authority over every booking they performed,
+     * so {@code loadProviderReviewBatch} partitions all of them out before the salon lookup (it is
+     * skipped, &minus;1) and the {@code client_reviews} probe fires (+1). A pinned 7 that survives a
+     * swap of its own constituents is a gate measuring the wrong thing unless the premises say
+     * which branch is under the needle — hence the {@code providerCanReviewClient} premise below is
+     * now asserted TRUE, and asserting it false again would put this gate back on a branch that no
+     * longer exists.
      *
      * <p><b>Measured at TWO row counts (2 and 5), for the same reason
      * {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS} is.</b> One pinned number cannot separate "+1 flat"
@@ -1173,16 +1183,15 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * 1, deliberately: at a single row the two models are numerically identical and the comparison
      * would be inert.
      *
-     * <p><b>Mutation-verified (QA, 2026-08-17), and the numbers in the paragraph above are that
-     * mutation's OBSERVED output, not an estimate.</b> Rewriting {@code loadProviderReviewBatch} to
-     * run its authority filter and its {@code client_reviews} probe PER ROW (a one-element
-     * {@code List.of(b)} per iteration) moves this gate 7 &rarr; <b>11</b> on the 5-row page and
-     * 7 &rarr; <b>8</b> on the 2-row page — exactly one extra {@code findIdsByIdInAndOwnerId} per
-     * row, the {@code client_reviews} probe still never firing because the per-row authority filter
-     * comes back empty for a master just as the batched one did. The gate therefore goes red on its
-     * OWN absolute assertion, and would go red on its growth-model assertion too (8 &ne; 11); it does
-     * not merely ride along behind {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}, which under the same
-     * mutation moves 8 &rarr; 16.
+     * <p><b>Mutation-verified (QA, 2026-08-17) on the pre-316 shape of this branch.</b> Rewriting
+     * {@code loadProviderReviewBatch} to run its authority filter and its {@code client_reviews}
+     * probe PER ROW (a one-element {@code List.of(b)} per iteration) moved this gate 7 &rarr;
+     * <b>11</b> on the 5-row page and 7 &rarr; <b>8</b> on the 2-row page. Phase 316 re-pointed
+     * which of the two lookups this branch pays (see above), so those exact observed numbers belong
+     * to the superseded shape; the growth-model assertion below is unchanged and is what keeps the
+     * flat-vs-per-row distinction under a gate rather than in prose. It does not merely ride along
+     * behind {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}, which under the same mutation moved
+     * 8 &rarr; 16.
      */
     private static final long SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS = 7L;
 
@@ -1485,15 +1494,18 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                     assertThat(b.clientId()).isNotNull();
                     assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED);
                 });
-        // The other half of the premise: the SECOND early return must be the one taken. A master owns
-        // no salon, so findIdsByIdInAndOwnerId comes back empty, withAuthority is empty, and the
-        // client_reviews probe never fires. If this ever read true the branch under measurement would
-        // have become the owner's +2 one and the pinned 7 below would be measuring something else.
+        // The other half of the premise, INVERTED by phase 316. Every row on this page is a booking
+        // this master performed, so the performer partition claims all of them: findIdsByIdInAndOwnerId
+        // is skipped entirely and the client_reviews probe is the single lookup this branch pays.
+        // A FALSE here would mean the phase-316 grant never reached the batched path, putting this
+        // gate back on the pre-316 +1 (salon lookup, no probe) — the same number for a different
+        // reason, which is the one failure mode a bare statement count cannot see.
         assertThat(fiveRowPage.data())
-                .as("premise — a SALON_MASTER holds no provider review-authority, which is what makes "
-                        + "withAuthority empty and skips the client_reviews probe. A true here means "
-                        + "this gate silently migrated onto the +2 owner branch.")
-                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
+                .as("premise — since phase 316 a SALON_MASTER DOES hold provider review-authority "
+                        + "over the bookings they performed, which is what makes withAuthority "
+                        + "non-empty and fires the client_reviews probe. A false here means this "
+                        + "gate silently migrated back onto the pre-316 branch.")
+                .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isTrue());
 
         assertThat(statementsForFiveRows)
                 .as("absolute JDBC statement count for a 5-row review-eligible SALON_MASTER page — "

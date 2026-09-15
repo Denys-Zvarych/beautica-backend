@@ -11,9 +11,6 @@ import com.beautica.master.dto.WorkIntervalDto;
 import com.beautica.master.service.MasterScheduleService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.apache.hc.core5.util.TimeValue;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -23,7 +20,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -59,16 +55,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@link AbstractIntegrationTest}, so one intermediate class costs nothing and keeps the call sites
  * unchanged.
  *
- * <h2>The HTTP factory is static and never closed per class</h2>
- * ONE Apache HC5 pool for the whole JVM, released by a shutdown hook. A {@code @AfterAll} here would
- * destroy the pool after whichever subclass finished first and leave the others — which share cached
- * Spring contexts — with a closed pool. It is re-installed in {@link #installHttpFactory()} on every
- * test because {@link AbstractIntegrationTest#cleanDb()} replaces the {@code TestRestTemplate}'s
- * factory after each one. Zero retries and finite 10 s timeouts are deliberate and must be kept: a
- * rate-limit 429 that resets the socket has to fail fast rather than hang the suite for the full
- * {@code Retry-After} window — and these routes ARE rate-limited (see
- * {@code BookingRateLimitFilter}). {@code SimpleClientHttpRequestFactory} cannot be used: it rejects
- * PATCH.
+ * <h2>The HTTP factory is NOT this class's business any more</h2>
+ * {@link AbstractIntegrationTest} installs a zero-retry, 10 s-timeout Apache HC5 factory before
+ * every test (see {@link com.beautica.support.TestHttpClients}) — the identical policy this class
+ * used to build and re-install for itself. Those properties remain load-bearing and must be kept
+ * THERE: a rate-limit 429 that resets the socket has to fail fast rather than hang the suite for
+ * the full {@code Retry-After} window, and these routes ARE rate-limited (see
+ * {@code BookingRateLimitFilter}). {@code SimpleClientHttpRequestFactory} cannot be used: it
+ * rejects PATCH.
  *
  * <p>Fixture data uses no occupied-territory locality references.
  */
@@ -99,30 +93,6 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
     /** «Ім'я Прізвище» exactly as {@code StaffBookingService#masterName} renders it into the SMS. */
     protected static final String MASTER_NAME = MASTER_FIRST_NAME + " " + MASTER_LAST_NAME;
 
-    private static final HttpComponentsClientHttpRequestFactory HTTP_FACTORY = createHttpFactory();
-
-    static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                HTTP_FACTORY.destroy();
-            } catch (Exception ignored) {
-                // Best-effort pool release on JVM exit; throwing from a shutdown hook only obscures
-                // the real exit status.
-            }
-        }));
-    }
-
-    private static HttpComponentsClientHttpRequestFactory createHttpFactory() {
-        var client = HttpClients.custom()
-                .setRetryStrategy(new DefaultHttpRequestRetryStrategy(0, TimeValue.ZERO_MILLISECONDS))
-                .build();
-        var factory = new HttpComponentsClientHttpRequestFactory(client);
-        factory.setConnectionRequestTimeout(10_000);
-        factory.setConnectTimeout(10_000);
-        factory.setReadTimeout(10_000);
-        return factory;
-    }
-
     @Autowired
     protected TestRestTemplate restTemplate;
 
@@ -140,16 +110,15 @@ abstract class AbstractStaffBookingIT extends AbstractIntegrationTest {
 
     /**
      * Runs before any subclass {@code @BeforeEach} (JUnit orders superclass callbacks first), so a
-     * subclass may assume both the factory and {@link #salon} are ready.
+     * subclass may assume {@link #salon} is ready.
+     *
+     * <p>No longer installs an HTTP request factory: {@link com.beautica.AbstractIntegrationTest}
+     * does that for every test, with the identical zero-retry / 10 s policy this class used to
+     * build for itself. See {@link com.beautica.support.TestHttpClients}.
      */
     @BeforeEach
-    void installHttpFactoryAndSeedSalon() {
-        installHttpFactory();
+    void seedDefaultSalon() {
         salon = seedSalon();
-    }
-
-    protected void installHttpFactory() {
-        restTemplate.getRestTemplate().setRequestFactory(HTTP_FACTORY);
     }
 
     /** Distinct from {@link #MASTER_FIRST_NAME}/{@link #MASTER_LAST_NAME} — an attribution bug

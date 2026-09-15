@@ -9,9 +9,7 @@ import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -25,7 +23,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -56,16 +53,6 @@ class UserControllerIT extends AbstractIntegrationTest {
     // hardcoded UUID (the seed assigns ids via gen_random_uuid()).
     private static final String CITY_WITH_DISTRICTS_KATOTTH = "UA12020010010037010";
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
-
-    // ── setup ─────────────────────────────────────────────────────────────────
-    // JDK HttpURLConnection rejects PATCH as an invalid method. Replace the
-    // default SimpleClientHttpRequestFactory with Apache HttpClient 5, which
-    // supports all HTTP methods including PATCH.
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     // ── cleanup ───────────────────────────────────────────────────────────────
     // @Transactional is silently ignored on lifecycle callbacks in RANDOM_PORT tests.
