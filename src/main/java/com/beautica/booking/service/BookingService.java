@@ -840,8 +840,7 @@ public class BookingService {
         List<java.sql.Date> bookedDates = switch (role) {
             case CLIENT -> bookingRepository.findBookedDatesByClientId(actorUserId, fromTs, toExclusive);
             case SALON_MASTER, INDEPENDENT_MASTER -> {
-                Master master = masterRepository.findByUserId(actorUserId)
-                        .orElseThrow(() -> new NotFoundException("Master profile not found"));
+                Master master = resolveProviderMasterScope(role, actorUserId);
                 yield bookingRepository.findBookedDatesByMasterId(master.getId(), fromTs, toExclusive);
             }
             case SALON_OWNER -> {
@@ -897,8 +896,7 @@ public class BookingService {
         Specification<Booking> scope = switch (role) {
             case CLIENT -> BookingSpecifications.clientIdEquals(actorUserId);
             case SALON_MASTER, INDEPENDENT_MASTER -> {
-                Master master = masterRepository.findByUserId(actorUserId)
-                        .orElseThrow(() -> new NotFoundException("Master profile not found"));
+                Master master = resolveProviderMasterScope(role, actorUserId);
                 yield BookingSpecifications.masterIdEquals(master.getId());
             }
             case SALON_OWNER -> {
@@ -1263,6 +1261,44 @@ public class BookingService {
     }
 
     /**
+     * The provider-scope master resolution shared by every {@code GET /bookings/me*} surface —
+     * {@link #getMyBookings(UUID, Authentication, List, LocalDate, LocalDate, List,
+     * BookingPartition, Pageable)} (through {@link #listProviderBookings}),
+     * {@link #getMyBookedDays} and {@link #getUnclosedCount}. All three previously inlined the
+     * identical {@code masterRepository.findByUserId(...).orElseThrow(...)}; they now share one
+     * method so the liveness gate below cannot be present on one surface and absent on the next.
+     *
+     * <p><b>A deactivated {@code SALON_MASTER} is DENIED (403), not served an empty page.</b>
+     * {@link MasterRepository#findByUserId} carries no {@code is_active} filter, so before this
+     * gate the scope resolved exactly as it did while the master was employed and the endpoint
+     * returned their entire performed history — every client's name, phone, price and service.
+     * {@code MasterService#deactivateMasterInternal} (reached by {@code DELETE
+     * /masters/&#123;masterId&#125;}) flips {@code masters.is_active} and nothing else: the staff
+     * {@code users} row, its {@code SALON_MASTER} role and its login all survive, because {@code
+     * AuthService} gates on {@code user.isActive()}. 403 rather than an empty page because it is
+     * the same answer {@code AuthorizationService#enforceCanViewBooking} now gives the same actor
+     * for any single row of that page — a 200 with zero rows would claim the history is gone,
+     * which is false, and the list and the detail endpoint would disagree about the same actor.
+     *
+     * <p><b>{@code INDEPENDENT_MASTER} is deliberately NOT gated</b>, which keeps this method an
+     * exact mirror of the detail path rather than a wider narrowing. {@code
+     * enforceCanViewBooking} admits an independent master through {@code
+     * isAuthorizedToManageBooking}, a leg that carries no liveness term (a salon owner reaching it
+     * on a deactivated master's booking must keep full view — see that method's javadoc). Gating
+     * the role here and not there would make {@code GET /bookings/me} deny rows that {@code GET
+     * /bookings/&#123;id&#125;} still serves. The role split is therefore the same one the view
+     * guard makes, not a judgement about which providers deserve their history.
+     */
+    private Master resolveProviderMasterScope(Role role, UUID actorUserId) {
+        Master master = masterRepository.findByUserId(actorUserId)
+                .orElseThrow(() -> new NotFoundException("Master profile not found"));
+        if (role == Role.SALON_MASTER && !master.isActive()) {
+            throw new ForbiddenException("Access denied");
+        }
+        return master;
+    }
+
+    /**
      * Provider path — ID-page + graph hydrate (Fix H1), then the batched review-existence
      * queries (one per review DIRECTION — see {@link #loadProviderReviewBatch} for the
      * provider&rarr;client one and its salon-ownership companion) and the two-query label
@@ -1283,8 +1319,7 @@ public class BookingService {
         // batch-hydrate only those IDs with the full association graph in a second query.
         Page<UUID> idPage = switch (role) {
             case SALON_MASTER, INDEPENDENT_MASTER -> {
-                Master master = masterRepository.findByUserId(actorUserId)
-                        .orElseThrow(() -> new NotFoundException("Master profile not found"));
+                Master master = resolveProviderMasterScope(role, actorUserId);
                 yield partition != null
                         ? bookingRepository.findIdsByMasterIdFilteredByPartition(
                                 master.getId(), partition, now, from, toExclusive, serviceIds, pageable)

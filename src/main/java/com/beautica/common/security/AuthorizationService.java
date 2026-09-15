@@ -943,8 +943,17 @@ public class AuthorizationService {
                 return v.clientUserId() != null && v.clientUserId().equals(actorId);
             }
             if (actorRole == Role.SALON_MASTER) {
-                // SALON_MASTER may only view their own bookings — not all bookings at the salon.
-                return v.masterUserId() != null && v.masterUserId().equals(actorId);
+                // SALON_MASTER may only view their own bookings — not all bookings at the salon,
+                // and only while they are still an ACTIVE master. masterIsActive leads for the
+                // same reason it leads in enforceCanViewBooking (whose javadoc carries the full
+                // rationale) and in isPerformingMasterOfRow: DELETE /masters/{masterId} flips
+                // masters.is_active and leaves the users row, its SALON_MASTER role and its login
+                // intact, so without this conjunct a deactivated stylist keeps reading every
+                // client name, phone and price they ever served. This is the ONLY branch of either
+                // BookingViewAccess consumer allowed to read that leg — the salon-owner arm above
+                // must keep admitting the owner of a deactivated master's booking.
+                return v.masterIsActive()
+                        && v.masterUserId() != null && v.masterUserId().equals(actorId);
             }
             return false;
         }).orElse(false);
@@ -1657,6 +1666,35 @@ public class AuthorizationService {
      * magnitude rarer than a client, and their booking is salon-bound anyway, so the hoist would
      * buy little and widen the contract. The client probe carries no such overlap: it reads
      * {@code bookings.client_id}, which no manage predicate consults.
+     *
+     * <p><b>The {@code SALON_MASTER} branch LAPSES when that master is deactivated</b> — {@code
+     * masters.is_active} is a conjunct here for the same reason it is one in {@link
+     * #isPerformingMasterOfRow}, and it is FIRST for the same reason: a deactivated performer
+     * short-circuits before the {@code SecurityContext} role read and before the identity compare.
+     * {@code MasterService#deactivateMasterInternal} (reached by {@code DELETE
+     * /masters/&#123;masterId&#125;}) flips that flag and NOTHING else — the staff {@code users}
+     * row, its {@code SALON_MASTER} role and its login all survive, because {@code AuthService}
+     * gates on {@code user.isActive()}, never on the master row. Without this conjunct a fired
+     * stylist logging in on unexpired credentials kept READ access to every booking they ever
+     * performed: {@link com.beautica.booking.dto.BookingDetailResponse} carries the client's name,
+     * phone, price and service, so this is a standing PII export, not a stale CTA. The write leg
+     * got its liveness conjunct in phase 316; this read leg was the asymmetric half left behind,
+     * and it became HTTP-prominent the moment the mobile app gave {@code SALON_MASTER} a bookings
+     * surface of its own.
+     *
+     * <p><b>Deliberately inlined rather than delegated to {@link #isPerformingMasterOfBooking}.</b>
+     * The two predicates coincide today but answer different questions, and that method's javadoc
+     * pins an invariant this call would break: {@code grep isPerformingMasterOfBooking} must stay
+     * the complete answer to "where may a {@code SALON_MASTER} WRITE against a booking?". A read
+     * gate calling it would put a read site in that grep's output. The conjunct order and the null
+     * guard are copied verbatim from {@link #isPerformingMasterOfRow} so the two cannot disagree
+     * about who the performing master is.
+     *
+     * <p><b>OWNER/ADMIN are unaffected.</b> They are admitted by {@link
+     * #isAuthorizedToManageBooking} above, which never reaches this branch and carries no liveness
+     * term — a salon owner keeps full view of a booking whose master has since been deactivated,
+     * exactly as they keep complete/decline/reschedule over it (see {@link BookingReviewAccess}'s
+     * javadoc for why that asymmetry is deliberate).
      */
     public void enforceCanViewBooking(UUID actorUserId, Booking booking) {
         if (isOwningClientViewer(actorUserId, booking)) {
@@ -1669,9 +1707,11 @@ public class AuthorizationService {
         // the previous salon-scoped check leaked other masters' client names and prices to every
         // master at the same salon.
         // V157 / phase 294 D1 — a detached master's booking is viewable by nobody through this leg.
-        if (roleFromCurrentAuthentication() == Role.SALON_MASTER
-                && booking.getMaster().getUser() != null
-                && booking.getMaster().getUser().getId().equals(actorUserId)) {
+        Master performer = booking.getMaster();
+        if (performer.isActive()
+                && roleFromCurrentAuthentication() == Role.SALON_MASTER
+                && masterUserId(performer) != null
+                && masterUserId(performer).equals(actorUserId)) {
             return;
         }
         throw new ForbiddenException("Access denied");
