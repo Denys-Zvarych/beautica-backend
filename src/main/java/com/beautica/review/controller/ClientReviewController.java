@@ -33,8 +33,18 @@ public class ClientReviewController {
      * the entity-based {@code enforceCanReviewClient} re-check inside the service after its own
      * load — the established double-check pattern for booking provider actions in this codebase
      * (Anti-Bug §D), not an accidental duplication.
+     *
+     * <p><b>Phase 316 — {@code SALON_MASTER} joins the role list, and ONLY here.</b> This is the
+     * one booking write the read-only role may perform, and the role gate alone does not grant it:
+     * {@code @authz.canReviewClient} admits a salon master solely on the booking whose performing
+     * master they are ({@code AuthorizationService#isPerformingMasterOfBooking}), so a master
+     * pointing this endpoint at a colleague's booking — or at another salon's — still gets 403.
+     * The sibling provider actions ({@code /decline}, {@code /not-complete}, {@code /complete},
+     * {@code /reschedule}) keep their {@code SALON_MASTER}-free role lists AND their fast-reject
+     * inside {@code canCancelBooking}/{@code canCompleteBooking}/{@code canRescheduleBooking}; do
+     * not "align" them with this one.
      */
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER') "
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER','SALON_MASTER') "
             + "and @authz.canReviewClient(authentication, #request.bookingId)")
     @PostMapping
     public ResponseEntity<ApiResponse<ClientReviewResponse>> create(

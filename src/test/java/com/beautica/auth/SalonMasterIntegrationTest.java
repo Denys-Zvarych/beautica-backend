@@ -18,7 +18,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -35,7 +34,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -251,8 +249,6 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("GET /api/v1/masters/{id} returns workingHours array after PATCH")
     void should_returnMasterDetail_when_workingHoursSet() throws Exception {
         // Arrange: configure PATCH-capable HTTP client (Apache HC supports PATCH)
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
@@ -360,8 +356,6 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("PATCH /api/v1/masters/{id}/working-hours returns 403 when caller owns a different salon")
     void should_return403_when_differentSalonOwnerPatchesWorkingHours() throws Exception {
         // Arrange: configure PATCH-capable client
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
@@ -416,8 +410,6 @@ class SalonMasterIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("PATCH /api/v1/masters/{id}/working-hours returns 403 when called by a SALON_MASTER")
     void should_return403_when_salonMasterPatchesOwnWorkingHours() throws Exception {
         // Arrange: configure PATCH-capable client
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 

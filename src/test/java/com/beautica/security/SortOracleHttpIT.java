@@ -4,8 +4,6 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -19,7 +17,6 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.LocalDate;
@@ -84,20 +81,8 @@ class SortOracleHttpIT extends AbstractIntegrationTest {
     private String masterToken;
     private String ownerToken;
 
-    /**
-     * §M-4: the pooled request factory is installed once per class, never per test — a
-     * {@code @BeforeEach} here would allocate a fresh connection pool for every case.
-     */
-    @BeforeAll
-    static void configureHttpClientOnce() {
-        // Intentionally empty: the factory is set on the injected template in setUp(), which
-        // cannot be static. Kept as documentation of the §M-4 constraint for future edits.
-    }
-
     @BeforeEach
     void setUp() throws Exception {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
 
         UUID ownerId = createUser("owner-" + UUID.randomUUID() + "@test.com", "SALON_OWNER", null);
         salonId = UUID.randomUUID();

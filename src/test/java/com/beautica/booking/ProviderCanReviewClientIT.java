@@ -8,8 +8,6 @@ import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,7 +19,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.util.Optional;
@@ -57,12 +54,6 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     @Test
     @DisplayName("true — INDEPENDENT_MASTER views their own COMPLETED, non-guest, not-yet-reviewed booking")
@@ -242,9 +233,18 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                 .isTrue();
     }
 
+    /**
+     * Phase 316 — INVERTED. This test previously asserted {@code false} on the premise that a
+     * {@code SALON_MASTER} is "never admitted to provider-only actions like
+     * decline/complete/reschedule/review". Three quarters of that premise still hold and are pinned
+     * elsewhere ({@code BookingCompletionSecurityIT}, {@code BookingProviderRescheduleIT},
+     * {@code BookingSecurityTest} — all still red for this role). The REVIEW quarter was carved out:
+     * a master who performed the visit is the person with something to say about the client.
+     */
     @Test
-    @DisplayName("false — SALON_MASTER (read-only role) viewing their own salon's booking")
-    void should_returnFalse_when_salonMasterViews() throws Exception {
+    @DisplayName("TRUE — SALON_MASTER viewing the COMPLETED booking they themselves performed "
+            + "(phase 316: the one provider action the read-only role holds)")
+    void should_returnTrue_when_salonMasterViewsOwnPerformedBooking() throws Exception {
         Salon salon = createSalon("pcrc-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("pcrc-sm-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
@@ -253,9 +253,49 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
         JsonNode detail = getBookingDetail(bookingId, tokenFor(salon.masterEmail()));
 
         assertThat(detail.path("providerCanReviewClient").asBoolean())
-                .as("SALON_MASTER is a read-only role and never admitted to provider-only actions "
-                        + "like decline/complete/reschedule/review — same exclusion here")
-                .isFalse();
+                .as("the salon master PERFORMED this booking — phase 316 admits exactly them, and "
+                        + "only for this booking")
+                .isTrue();
+    }
+
+    /**
+     * Phase 316's narrowness, as far as THIS surface can express it — which is "not at all", and
+     * that is the finding worth pinning. {@code enforceCanViewBooking}'s {@code SALON_MASTER} branch
+     * admits only {@code masters.user_id == actor}, so a colleague never reaches the DTO to read a
+     * flag off it: the detail endpoint answers 403 BEFORE {@code computeProviderCanReviewClient}
+     * runs. Structurally identical to
+     * {@link #should_return403_when_assignedSalonAdminViewsBookingDetail} — a role-level view gate,
+     * not a review-authority one — and the reason the peer-vs-performer distinction is pinned on the
+     * two surfaces that CAN observe it: {@code ClientReviewIT
+     * #should_return403_when_salonMasterReviewsColleaguesBookingsClient} (the write path) and
+     * {@code AuthorizationServiceTest
+     * #should_returnFalse_when_salonMasterCallsCanReviewClientForColleaguesBooking} (the predicate).
+     *
+     * <p>Kept here anyway: if {@code enforceCanViewBooking} is ever widened to admit a peer master,
+     * this test flips from 403 to 200 and the {@code providerCanReviewClient} assertion below starts
+     * doing real work — at which point the phase-316 grant had better still be per-booking.
+     */
+    @Test
+    @DisplayName("403 (NOT the DTO) — a SALON_MASTER cannot even VIEW a COLLEAGUE's booking at the "
+            + "same salon, so phase 316's flag is unreachable for them on this surface")
+    void should_return403_when_salonMasterViewsColleaguesBooking() throws Exception {
+        Salon salon = createSalon("pcrc-sm-peer-owner-" + System.nanoTime() + "@beautica.test");
+        String peerEmail = "pcrc-sm-peer-" + System.nanoTime() + "@beautica.test";
+        UUID peerMasterId = createSalonMaster(salon.salonId(), peerEmail);
+        UUID clientId = createUser("pcrc-sm-peer-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        // The booking belongs to the SALON's own master, NOT to the peer who reads it.
+        UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "COMPLETED");
+        assertThat(peerMasterId).isNotEqualTo(salon.masterId());
+
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(tokenFor(peerEmail))), String.class);
+
+        assertThat(resp.getStatusCode())
+                .as("the view gate denies a peer master before any review flag is computed — "
+                        + "body=%s", resp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
     }
 
     /**
@@ -309,13 +349,21 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     // (BookingSpecifications#salonIdIn: `JOIN b.master m JOIN m.salon s WHERE s.id IN :salonIds`,
     // fed from findIdsByOwnerIdAndIsActiveTrue), and the batched authority gate tests the SAME
     // ownership of the SAME live salon. Every row an owner can see is therefore a row they own:
-    // a laxer membership predicate is TAUTOLOGICALLY invisible on the owner list surface. The role
-    // that CAN observe it is SALON_MASTER — scoped by master id with no salon predicate at all, so
-    // a loosened `ownedSalonIds::contains` hands the read-only role a review CTA
-    // (should_returnFalseOnListRow_when_salonMasterListsOwnSalonsBooking below). The remaining
-    // shapes — a foreign salon, a master with a null live salon, de-duplication of the page's salon
-    // ids — are unreachable over HTTP for the same structural reason and are pinned directly on
-    // AuthorizationServiceTest#filterBookingIdsWithProviderAuthority.
+    // a laxer membership predicate is TAUTOLOGICALLY invisible on the owner list surface.
+    //
+    // PHASE 316 CLOSED THE ONE HTTP-REACHABLE HOLE THIS BLOCK USED TO NAME. The SALON_MASTER list
+    // row used to be the single fixture that could observe a loosened `ownedSalonIds::contains` —
+    // a read-only role handed a review CTA. It can no longer: that role now legitimately reads TRUE
+    // on its own performed bookings (should_returnTrueOnListRow_when_salonMasterListsOwnPerformedBooking
+    // below), so a membership-loosening mutant and the correct implementation agree on every row a
+    // salon master can see. The peer-master fixture that WOULD separate them is unreachable here for
+    // the same structural reason as the rest: enforceCanViewBooking denies a colleague's booking
+    // outright (should_return403_when_salonMasterViewsColleaguesBooking), and GET /bookings/me is
+    // scoped to the actor's own master id, so a peer's row never lands on the page at all.
+    // The whole of that predicate — a foreign salon, a peer master at the same salon, a master with
+    // a null live salon, de-duplication of the page's salon ids — is therefore pinned ONLY on
+    // AuthorizationServiceTest#filterBookingIdsWithProviderAuthority from here on. Do not delete
+    // those unit cases on the grounds that "the IT covers it"; since phase 316 it does not.
 
     @Test
     @DisplayName("LIST true — SALON_OWNER listing GET /bookings/me sees the real flag on their own "
@@ -352,15 +400,21 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
     }
 
     /**
-     * The ONE list case with the power to catch a loosened salon-ownership membership test — see
-     * the block comment above for why no SALON_OWNER fixture can. A SALON_MASTER's page is scoped
-     * purely by master id, so an over-permissive predicate shows up here as a read-only role being
-     * handed a write CTA it would then be 403'd on by {@code POST /client-reviews}.
+     * Phase 316 — INVERTED, and RENAMED with it (a name still saying "returnFalse" over an
+     * {@code isTrue()} is how a later reader is told the opposite of what runs). This was the one
+     * list case able to catch a loosened salon-ownership membership test; it no longer is, and the
+     * block comment above records where that coverage went instead.
+     *
+     * <p>What it pins NOW is the parity that phase 316 made non-trivial: {@code
+     * loadProviderReviewBatch}'s performer partition must reach the same answer the detail path's
+     * {@code computeProviderCanReviewClient} reaches ({@code
+     * should_returnTrue_when_salonMasterViewsOwnPerformedBooking}), or the master's list screen and
+     * their booking screen disagree about the same booking's CTA.
      */
     @Test
-    @DisplayName("LIST false — SALON_MASTER (read-only role) listing their own salon's COMPLETED "
-            + "booking is NOT offered the client-review CTA")
-    void should_returnFalseOnListRow_when_salonMasterListsOwnSalonsBooking() throws Exception {
+    @DisplayName("LIST true — SALON_MASTER listing the COMPLETED booking they themselves performed "
+            + "IS offered the client-review CTA, matching the detail path (phase 316)")
+    void should_returnTrueOnListRow_when_salonMasterListsOwnPerformedBooking() throws Exception {
         Salon salon = createSalon("pcrc-list-sm-owner-" + System.nanoTime() + "@beautica.test");
         UUID clientId = createUser("pcrc-list-sm-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
         UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
@@ -369,19 +423,27 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
         JsonNode row = listRow(bookingId, tokenFor(salon.masterEmail()));
 
         assertThat(row.path("providerCanReviewClient").asBoolean())
-                .as("SALON_MASTER is never admitted to provider-only actions; the batched gate must "
-                        + "reproduce that exclusion, or the read-only role gets a CTA the write "
-                        + "endpoint will reject")
-                .isFalse();
+                .as("phase 316 — the batched gate (loadProviderReviewBatch) must reproduce the "
+                        + "DETAIL path's answer for the performing master, or the list and the "
+                        + "detail screen disagree about the same booking's CTA")
+                .isTrue();
         // canReview is deliberately viewer-AGNOSTIC on both surfaces (BookingService#canReview takes
         // no actor at all — it is the booking's own "a client could review this" state), so it reads
-        // true on a provider's row too. Pinned rather than glossed over: with the two flags carrying
-        // OPPOSITE values on one row, this row proves they are independently computed. A regression
-        // that collapsed providerCanReviewClient into canReview — the laziest possible way to make
-        // the regression test below go green — would show up right here.
+        // true on a provider's row too.
+        //
+        // PHASE 316 DEFANGED THIS PAIR AS A COLLAPSE DETECTOR, and saying so is the point of this
+        // comment. It used to read the two flags as OPPOSITES on one row, which is what proved they
+        // were independently computed; both now read true, so `providerCanReviewClient = canReview`
+        // would satisfy both assertions. Verified by mutation (QA, 2026-09-15): that collapse
+        // applied to GET /bookings/me leaves THIS test green and is caught instead by
+        // should_flipToFalseOnTheSameListRequest_when_providerLeavesTheClientReview and
+        // should_returnFalseOnListRow_when_bookingIsConfirmedButElapsed, whose rows still carry the two
+        // flags apart. The assertion stays — it is a correct statement about this row — but do not
+        // delete either of those two on the belief that this one backstops them.
         assertThat(row.path("canReview").asBoolean())
-                .as("the CLIENT-side canReview is a different, viewer-agnostic predicate; the two "
-                        + "flags must not collapse into one another")
+                .as("the CLIENT-side canReview is a different, viewer-agnostic predicate — on THIS "
+                        + "row the two agree; the rows that hold them apart are named in the "
+                        + "comment above")
                 .isTrue();
     }
 
@@ -615,6 +677,21 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
                 masterId, masterUserId, salonId);
         return new Salon(salonId, ownerEmail, masterId, masterEmail);
+    }
+
+    /**
+     * A SECOND {@code SALON_MASTER} at an already-created salon (phase 316). Needed only by the
+     * per-booking-vs-per-salon narrowness tests: every other fixture here uses the single master
+     * {@link #createSalon} already provisions.
+     */
+    private UUID createSalonMaster(UUID salonId, String email) {
+        UUID userId = createUser(email, "SALON_MASTER", salonId);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                masterId, userId, salonId);
+        return masterId;
     }
 
     private UUID createIndependentMaster(String email) {

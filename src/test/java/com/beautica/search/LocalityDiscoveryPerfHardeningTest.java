@@ -8,7 +8,6 @@ import com.beautica.search.service.SearchService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.hibernate.SessionFactory;
 import org.hibernate.resource.jdbc.spi.StatementInspector;
 import org.hibernate.stat.Statistics;
@@ -31,7 +30,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -168,11 +166,6 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      */
     @SpyBean
     private DiscoveryLocationResolver discoveryLocationResolver;
-
-    private void ensureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     // Per-request unique source IP — same rationale as SearchIntegrationTest:
     // the GET /api/v1/search/** rate-limiter (40/60 s per IP) plus Apache HC5's
@@ -370,7 +363,6 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC2 — N rows on a search page trigger exactly ONE batched resolveLabels call, never one per row")
     void should_resolveLabelsOncePerPage_when_masterSearchReturnsManyRows() throws Exception {
-        ensureHttpClient();
         Mockito.clearInvocations(discoveryLocationResolver);
         UUID kyivCityId = cityIdByName("Київ");
         for (int i = 0; i < 5; i++) {
@@ -400,7 +392,6 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC2 (MEDIUM-4) — SALON path: N salons on a page trigger exactly ONE batched resolveLabels call, never one per row")
     void should_resolveLabelsOncePerPage_when_salonSearchReturnsManyRows() throws Exception {
-        ensureHttpClient();
         Mockito.clearInvocations(discoveryLocationResolver);
         UUID kyivCityId = cityIdByName("Київ");
         for (int i = 0; i < 5; i++) {
@@ -432,7 +423,6 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC3 — a warm GET /locations/oblasts executes ZERO Hibernate queries (served entirely from cache)")
     void should_executeZeroQueries_when_oblastsRequestServedFromWarmCache() {
-        ensureHttpClient();
 
         // Cold call warms the locationOblasts cache (cleared by cleanDb()).
         restTemplate.exchange(OBLASTS_URL, HttpMethod.GET, anonymous(), String.class);
@@ -455,7 +445,6 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC3 — cache key is per-oblast: a 2nd oblast's cities call is a distinct cached entry")
     void should_cachePerOblast_when_citiesRequestedForTwoOblasts() {
-        ensureHttpClient();
 
         UUID oblastA = oblastIdByCity("Київ");
         UUID oblastB = oblastIdByCity("Львів");
@@ -481,7 +470,6 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC5 — warm median latency of a 10-row locality-filtered salon page is under a tight documented threshold and far under the recorded pre-rework baseline")
     void should_completeUnderWarmMedian_when_salonSearchFiltersByLocality() {
-        ensureHttpClient();
         UUID kyivCityId = cityIdByName("Київ");
         for (int i = 0; i < 10; i++) {
             seedActiveSalon("Київ");

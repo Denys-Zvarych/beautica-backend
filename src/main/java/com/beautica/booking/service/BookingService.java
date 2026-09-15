@@ -9,6 +9,7 @@ import com.beautica.booking.dto.BookingPriceRange;
 import com.beautica.booking.dto.BookingResponse;
 import com.beautica.booking.dto.CreateBookingRequest;
 import com.beautica.booking.dto.CancelBookingRequest;
+import com.beautica.booking.dto.ClientAuthoredReviewResponse;
 import com.beautica.booking.dto.RescheduleBookingRequest;
 import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.dto.UnclosedCountResponse;
@@ -26,6 +27,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.service.ScheduleDateMath;
+import com.beautica.review.repository.BookingReviewView;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.ReviewRepository;
 import com.beautica.common.exception.BookingElapsedException;
@@ -48,6 +50,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.lang.Nullable;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -171,7 +174,10 @@ public class BookingService {
     private BookingDetailResponse enrichCreated(UUID bookingId) {
         Booking booking = bookingRepository.findByIdWithFullGraph(bookingId)
                 .orElseThrow(() -> new NotFoundException("Booking not found"));
-        return enrichSingle(booking, false, false, resolveNow());
+        // Phase 317 — reviewByClient is null for the same structural reason canReview is false: a
+        // booking is born CONFIRMED with a future startsAt, so no Review can exist for it yet. This
+        // is not the "listing surfaces send null" contract; it is a genuine, provable absence.
+        return enrichSingle(booking, false, false, resolveNow(), null);
     }
 
     @Transactional(readOnly = true)
@@ -191,19 +197,52 @@ public class BookingService {
         // response (Phase 29.2's single-instant-per-request discipline, now load-bearing for
         // canReview too since it depends on endsAt-vs-now, not just status).
         OffsetDateTime now = resolveNow();
-        // reviewRepository.existsByBookingId is the one DB-bound input to canReview(...); short-
-        // circuit on the in-memory checks first (mirrors computeProviderCanReviewClient below) so
-        // the query only fires when it can actually flip the result — a future-dated CONFIRMED or
-        // guest booking (the common case for a detail fetch) never reaches it.
+        // reviewRepository.findViewByBookingId is the one DB-bound input to canReview(...) on this
+        // path — existsByBookingId is GONE from it, replaced by the projection fetch below (Phase
+        // 317). Short-circuit on the in-memory checks first (mirrors computeProviderCanReviewClient
+        // below) so the query only fires when it can actually flip the result — a future-dated
+        // CONFIRMED or guest booking (the common case for a detail fetch) never reaches it.
         boolean hasClient = booking.getClient() != null;
         boolean eligibleByStatusAndTime =
                 BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now);
+        // Phase 317 — ONE statement now answers both questions this path used to ask separately-in-
+        // spirit: "has this booking been reviewed" (canReview's negative conjunct) and "what does
+        // that review say" (reviewByClient). findViewByBookingId REPLACES the previous
+        // existsByBookingId probe rather than joining it, so the statement count is byte-identical
+        // and so is the gate in front of it — the fetch still fires only when the in-memory
+        // conjuncts leave the answer open, which is what keeps a future-dated CONFIRMED booking
+        // (the common detail read) at BookingPriceRangeContractIT#OWNER_DETAIL_STATEMENTS_ALIGNED.
+        //
+        // The gate is deliberately UNCHANGED rather than widened to "any booking that could carry a
+        // review": that would add a statement to every detail read of a future CONFIRMED booking to
+        // serve one narrow shape — a review left on an elapsed CONFIRMED booking that the provider
+        // then closed as NOT_COMPLETED/DECLINED, which drops back out of isReviewEligible. Such a
+        // booking renders reviewByClient as null here; the review itself is untouched and still
+        // world-readable through GET /masters/{id}/reviews. Widen this gate only with a matching
+        // re-pin of the statement gates it feeds.
+        Optional<BookingReviewView> reviewByClient = hasClient && eligibleByStatusAndTime
+                ? reviewRepository.findViewByBookingId(bookingId)
+                : Optional.empty();
         boolean canReview = hasClient
                 && eligibleByStatusAndTime
                 && canReview(booking.getStatus(), booking.getEndsAt(), now,
-                        reviewRepository.existsByBookingId(bookingId), hasClient);
+                        reviewByClient.isPresent(), hasClient);
         boolean providerCanReviewClient = computeProviderCanReviewClient(actorUserId, booking, now);
-        return enrichSingle(booking, canReview, providerCanReviewClient, now);
+        return enrichSingle(booking, canReview, providerCanReviewClient, now,
+                reviewByClient.map(BookingService::toClientAuthoredReview).orElse(null));
+    }
+
+    /**
+     * The single {@link BookingReviewView} &rarr; {@link ClientAuthoredReviewResponse} widening
+     * (Phase 317), so the {@code Short}-to-{@code Integer} rating conversion lives in one place
+     * rather than being re-inlined at each future call site — the same discipline
+     * {@code BookingDetailResponse#masterAvgRatingOrNull} and {@code #categoryKeyOrNull} enforce
+     * for their own cross-path derivations. Mirrors {@code ReviewResponse#from}'s
+     * {@code getRating().intValue()} exactly, so a rating reads identically on a booking and on
+     * {@code GET /masters/&#123;id&#125;/reviews}.
+     */
+    private static ClientAuthoredReviewResponse toClientAuthoredReview(BookingReviewView view) {
+        return new ClientAuthoredReviewResponse(view.rating().intValue(), view.comment());
     }
 
     /**
@@ -229,8 +268,17 @@ public class BookingService {
      * substitute for it; see {@link BookingClosureRule#isProviderReviewEligible}'s javadoc; (3)
      * the booking has a real client (a guest/LINK booking has none — V89 {@code
      * chk_bookings_guest_fields}); (4) no {@link com.beautica.review.entity.ClientReview} already
-     * exists for this booking. A CLIENT or SALON_MASTER viewer always fails condition (1), so this
-     * correctly reads {@code false} for them without any special-casing here.
+     * exists for this booking. A CLIENT viewer always fails condition (1), so this correctly reads
+     * {@code false} for them without any special-casing here.
+     *
+     * <p><b>Phase 316 — a {@code SALON_MASTER} viewer no longer always fails condition (1).</b>
+     * They pass it on, and ONLY on, the booking whose performing master they are ({@link
+     * AuthorizationService#isPerformingMasterOfBooking}); a colleague's booking at the same salon
+     * still reads {@code false}, because the union's other arm ({@link
+     * AuthorizationService#hasProviderAuthorityOverBooking}) is unchanged and its salon leg admits
+     * only owner/admin. This is the whole of the capability that phase grants the read-only role —
+     * {@code /complete}, {@code /not-complete}, {@code /decline} and {@code /reschedule} keep
+     * rejecting them, by role, before any booking is loaded.
      *
      * <p><b>Phase-242 QA audit, finding 2 (MEDIUM) — the leading
      * {@link AuthorizationService#isOwningClientViewer} gate is a COST gate, not a decision.</b>
@@ -268,8 +316,14 @@ public class BookingService {
      *            of what this method does with it, so leave it here rather than chase the ripple.
      */
     private boolean computeProviderCanReviewClient(UUID actorUserId, Booking booking, OffsetDateTime now) {
+        // Phase 316 — the SAME union AuthorizationService#enforceCanReviewClient throws on, in the
+        // same order, so this flag can never promise a CTA POST /client-reviews would then reject.
+        // isPerformingMasterOfBooking leads for the same reason it leads there: it is a free
+        // identifier read that short-circuits the master.getSalon()/getOwner() proxy walk
+        // hasProviderAuthorityOverBooking would otherwise make for a SALON_MASTER viewer.
         boolean hasProviderAuthority = !authz.isOwningClientViewer(actorUserId, booking)
-                && authz.hasProviderAuthorityOverBooking(actorUserId, booking);
+                && (authz.isPerformingMasterOfBooking(actorUserId, booking)
+                        || authz.hasProviderAuthorityOverBooking(actorUserId, booking));
         return providerCanReviewClient(
                 hasProviderAuthority, booking.getStatus(),
                 booking.getClient() != null,
@@ -348,7 +402,8 @@ public class BookingService {
      * {@code canReview} and {@code awaitingClosure} on the same row.
      */
     private BookingDetailResponse enrichSingle(
-            Booking booking, boolean canReview, boolean providerCanReviewClient, OffsetDateTime now) {
+            Booking booking, boolean canReview, boolean providerCanReviewClient, OffsetDateTime now,
+            @Nullable ClientAuthoredReviewResponse reviewByClient) {
         // Phase 242 — the BOOKING's salon snapshot, matching BookingDetailResponse#from. These two
         // ids feed cityLabel/districtLabel, so keeping them on master.getSalon() would pair salon
         // A's street with salon B's city on any booking made before a rotation.
@@ -371,7 +426,7 @@ public class BookingService {
         // row to disagree with itself.
         return BookingDetailResponse.from(
                 booking, canReview, providerCanReviewClient,
-                labels.cityLabel(cityId), labels.districtLabel(districtId), now);
+                labels.cityLabel(cityId), labels.districtLabel(districtId), now, reviewByClient);
     }
 
     /**
@@ -529,7 +584,15 @@ public class BookingService {
                 // Derived from the SAME p.categoryName() scalar — the projection's sd.category
                 // select — via the shared helper so this path and the entity path can never
                 // disagree (BookingDetailContractIT's reflective parity loop). No second query.
-                BookingDetailResponse.categoryKeyOrNull(p.categoryName()));
+                BookingDetailResponse.categoryKeyOrNull(p.categoryName()),
+                // Phase 317 — null on this surface too, for the same reason the two provider
+                // listing paths send null (see their comments). This projection already carries
+                // reviewExists via its LEFT JOIN Review, so the rating/comment could be selected
+                // here for free — deliberately not done: the field's contract is "GET /bookings/{id}
+                // only", and populating it on ONE of the four listing surfaces would make a null
+                // mean two different things depending on which list a row came from. Widen all
+                // four together or none.
+                null);
     }
 
     /**
@@ -968,14 +1031,33 @@ public class BookingService {
                             b.getStatus(), b.getEndsAt(), now, reviewed.contains(b.getId()), b.getClient() != null);
                     boolean isReviewCandidate = b.getClient() != null
                             && BookingClosureRule.isProviderReviewEligible(b.getStatus());
+                    // Phase 316 — the same union the detail path and the provider listing carry,
+                    // so one booking cannot report two different CTAs on two provider surfaces.
+                    // OUTCOME-EQUIVALENT on THIS endpoint today, but NOT structurally inert: the
+                    // @PreAuthorize narrows it to SALON_OWNER/SALON_ADMIN, and a SALON_OWNER very
+                    // much CAN be a masters.user_id — MasterService.createMasterForOwner builds an
+                    // owner-as-master row with .user(owner).masterType(SALON_OWNER). The new arm is
+                    // simply redundant there, because hasProviderAuthorityOverBooking's salon arm
+                    // already admits the owner of the booking's salon, and the /client-reviews
+                    // write gate carries the identical union, so a CTA shown here is always
+                    // honoured. Kept because a bare `hasProviderAuthorityOverBooking` would be the
+                    // one place the union is missing if that role list ever widens to a role the
+                    // salon arm does NOT already cover.
                     boolean hasProviderAuthority = isReviewCandidate
-                            && authz.hasProviderAuthorityOverBooking(actorUserId, b);
+                            && (authz.isPerformingMasterOfBooking(actorUserId, b)
+                                    || authz.hasProviderAuthorityOverBooking(actorUserId, b));
                     boolean providerCanReviewClient = providerCanReviewClient(
                             hasProviderAuthority, b.getStatus(), b.getClient() != null,
                             () -> alreadyReviewedByProvider.contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
-                            labels.cityLabel(cityId), labels.districtLabel(districtId), now);
+                            labels.cityLabel(cityId), labels.districtLabel(districtId), now,
+                            // Phase 317 — listing surfaces send reviewByClient as null
+                            // unconditionally: a booking CARD renders no review body, so fetching
+                            // one per page would buy a statement nothing draws. See the component's
+                            // @Schema — a null here means "not served on this surface", never "no
+                            // review exists".
+                            null);
                 })
                 .toList();
 
@@ -1267,7 +1349,13 @@ public class BookingService {
                             () -> providerReview.alreadyReviewed().contains(b.getId()));
                     return BookingDetailResponse.from(
                             b, canReview, providerCanReviewClient,
-                            labels.cityLabel(cityId), labels.districtLabel(districtId), now);
+                            labels.cityLabel(cityId), labels.districtLabel(districtId), now,
+                            // Phase 317 — listing surfaces send reviewByClient as null
+                            // unconditionally: a booking CARD renders no review body, so fetching
+                            // one per page would buy a statement nothing draws. See the component's
+                            // @Schema — a null here means "not served on this surface", never "no
+                            // review exists".
+                            null);
                 })
                 .toList();
         return new PageImpl<>(ordered, pageable, idPage.getTotalElements());
@@ -1291,7 +1379,8 @@ public class BookingService {
      * <p><b>Adds at most TWO statements per page request, and neither scales with page size:</b>
      * one {@code SalonRepository#findIdsByIdInAndOwnerId} over the page's DE-DUPLICATED live-salon
      * ids (inside {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, skipped
-     * outright when every master on the page is independent) and one
+     * outright when every master on the page is independent — and, since phase 316, also when every
+     * remaining candidate is one the actor performed themselves) and one
      * {@code ClientReviewRepository#findReviewedBookingIds} over a single bounded {@code IN} list.
      * The alternative — calling {@link #computeProviderCanReviewClient} per row — is a double N+1:
      * an authority query AND a {@code client_reviews} probe for every row, plus a live-salon proxy
@@ -1342,8 +1431,28 @@ public class BookingService {
         if (candidates.isEmpty()) {
             return ProviderReviewBatch.EMPTY;
         }
-        Set<UUID> withAuthority =
-                authz.filterBookingIdsWithProviderAuthority(role, actorUserId, candidates);
+        // Phase 316 — the page-scoped form of computeProviderCanReviewClient's leading disjunct.
+        // Partitioned rather than unioned after the fact so the batched salon-ownership lookup is
+        // handed only the rows it can still decide: a SALON_MASTER's page is entirely their own
+        // performed bookings, so `remaining` is empty and findIdsByIdInAndOwnerId — a statement
+        // that could only ever answer "no" for a master — is skipped outright.
+        // AuthorizationService#isPerformingMasterOfBooking issues no statement here because
+        // findAllByIdsWithGraph — the query that hydrated `candidates` — carries JOIN FETCH b.master
+        // m + LEFT JOIN FETCH m.user, so both the user id and masters.is_active it reads are already
+        // in the persistence context. It is NOT free by virtue of being an identifier read: Master
+        // and User use field-access @Id, so a genuine proxy WOULD initialise. Drop either fetch join
+        // and this partition becomes an N+1 per page
+        // (BookingPriceRangeContractIT#SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS is the gate).
+        Map<Boolean, List<Booking>> byPerformer = candidates.stream()
+                .collect(Collectors.partitioningBy(b -> authz.isPerformingMasterOfBooking(actorUserId, b)));
+        List<Booking> remaining = byPerformer.get(false);
+        Set<UUID> withAuthority = byPerformer.get(true).stream()
+                .map(Booking::getId)
+                .collect(Collectors.toCollection(HashSet::new));
+        if (!remaining.isEmpty()) {
+            withAuthority.addAll(
+                    authz.filterBookingIdsWithProviderAuthority(role, actorUserId, remaining));
+        }
         if (withAuthority.isEmpty()) {
             return ProviderReviewBatch.EMPTY;
         }
@@ -2803,7 +2912,10 @@ public class BookingService {
         // booking can never be.
         OffsetDateTime now = resolveNow();
         boolean canReview = canReview(saved.getStatus(), saved.getEndsAt(), now, false, saved.getClient() != null);
-        return enrichSingle(saved, canReview, false, now);
+        // Phase 317 — reviewByClient is null here on the SAME reasoning as the two booleans above:
+        // a rescheduled booking is CONFIRMED with a future endsAt, and no Review can hang off a
+        // booking that has not yet been performed. A provable absence, not the listing contract.
+        return enrichSingle(saved, canReview, false, now, null);
     }
 
     /**

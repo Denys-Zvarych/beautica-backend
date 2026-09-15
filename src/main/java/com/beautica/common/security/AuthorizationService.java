@@ -5,6 +5,7 @@ import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.entity.Booking;
 import com.beautica.booking.repository.BookingCompletionAccess;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.BookingReviewAccess;
 import com.beautica.booking.repository.BookingViewAccess;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -1491,31 +1492,127 @@ public class AuthorizationService {
 
     /**
      * SpEL {@code @PreAuthorize} predicate for {@code POST /client-reviews} (Phase 27.5 — REVERSES
-     * the previously-deferred/out-of-scope status of master&rarr;client reviews). Mirrors {@link
-     * #canCancelBooking}/{@link #canCompleteBooking}/{@link #canRescheduleBooking} verbatim — a
-     * provider may review the CLIENT of any booking they have provider authority over, the exact
-     * same authority shape as decline/complete/reschedule.
+     * the previously-deferred/out-of-scope status of master&rarr;client reviews).
+     *
+     * <p><b>Phase 316 — no longer a verbatim mirror of {@link #canCancelBooking}/{@link
+     * #canCompleteBooking}/{@link #canRescheduleBooking}.</b> Those three keep their {@code
+     * ROLE_SALON_MASTER} fast-reject; this one admits the performing master of THIS booking via
+     * {@link #isPerformingMasterOfRow}, unioned onto (never folded into) the unchanged {@link
+     * #hasProviderAuthorityOverBooking} predicate. Leaving feedback about the client one served is
+     * the single write the read-only salon-master role may perform on a booking — see {@link
+     * #isPerformingMasterOfBooking} for why the union lives here and not inside the shared
+     * authority kernel.
+     *
+     * <p>{@code ROLE_CLIENT} keeps its fast-reject: a client is never a provider on any booking,
+     * and {@code bookings.client_id} is a {@code Role.CLIENT} row asserted at insert, so it can
+     * never equal {@code masters.user_id}. {@code ROLE_SALON_MASTER}'s fast-reject is GONE — the
+     * answer now genuinely depends on which booking is being asked about, so the projection has to
+     * be read. A missing booking still maps to {@code false} (403, no existence oracle).
      */
     public boolean canReviewClient(Authentication auth, UUID bookingId) {
         boolean cannotReview = auth.getAuthorities().stream().anyMatch(a ->
-                a.getAuthority().equals("ROLE_SALON_MASTER")
-                        || a.getAuthority().equals("ROLE_CLIENT"));
+                a.getAuthority().equals("ROLE_CLIENT"));
         if (cannotReview) return false;
         UUID actorId = principalId(auth);
         Role actorRole = roleFromAuthentication(auth);
-        return bookingRepository.findCompletionAccessById(bookingId)
-                .map(v -> hasProviderAuthorityOverBooking(
-                        v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
+        return bookingRepository.findReviewAccessById(bookingId)
+                .map(v -> isPerformingMasterOfRow(v.masterUserId(), v.masterIsActive(), actorId)
+                        || hasProviderAuthorityOverBooking(
+                                v.salonId() == null, v.masterUserId(), v.salonId(), actorId, actorRole))
                 .orElse(false);
+    }
+
+    /**
+     * Phase 316 — the ONLY booking-scoped write authority a {@code SALON_MASTER} holds, and only
+     * over the booking they themselves performed. Admits any actor whose {@code users} row IS the
+     * booking's {@code masters.user_id}: the salon master this phase exists for, and (already
+     * admitted by {@link #hasProviderAuthorityOverBooking}'s independent-master arm, so this is a
+     * no-op for them) an {@code INDEPENDENT_MASTER} on their own booking.
+     *
+     * <p><b>Deliberately its own entry point, NOT a widening of {@link
+     * #hasProviderAuthorityOverBooking}.</b> That kernel also gates {@code /complete}, {@code
+     * /not-complete}, {@code /decline} and {@code /reschedule} ({@link #canCompleteBooking},
+     * {@link #canCancelBooking}, {@link #canRescheduleBooking}, {@link
+     * #enforceCanCompleteBooking}, {@link #enforceCanCancelBooking}, {@link
+     * #enforceCanRescheduleBooking}, {@link #enforceCanManageAppointment}) — the four actions a
+     * salon master must stay locked out of, and the reason its "actor is the performing master"
+     * arm is reachable only when {@code independentMasterBooking == true} (which implies {@code
+     * salonId == null}). Adding a salon-master leg there would hand the read-only role every one
+     * of them in a single edit. {@code grep isPerformingMasterOfBooking} must therefore stay the
+     * complete answer to "where may a SALON_MASTER write against a booking?" — exactly the
+     * property {@link #canEditMasterServiceBand} holds for {@code master_services} (Phase 311 D5).
+     *
+     * <p><b>The grant LAPSES when the master is deactivated</b> — {@code masters.is_active} is a
+     * conjunct, not a comment. {@code MasterService#deactivateMasterInternal} (reached by {@code
+     * DELETE /masters/&#123;masterId&#125;}) flips that flag and NOTHING else: the staff {@code
+     * users} row, its {@code SALON_MASTER} role and its login all survive, because {@code
+     * AuthService} gates on {@code user.isActive()}, never on the master row. Without this conjunct
+     * a fired stylist would log in on unexpired credentials and keep writing {@code client_reviews}
+     * against every client they ever served — each one moving that client's aggregate rating
+     * through {@code ClientReviewEventListener} — indefinitely. The conjunct is FIRST so a
+     * deactivated master short-circuits before the identity comparison.
+     *
+     * <p><b>This must NOT be pushed down into {@link #hasProviderAuthorityOverBooking}.</b> That
+     * kernel has the opposite requirement: a salon owner or admin keeps complete / not-complete /
+     * decline / reschedule over a booking whose master has since been deactivated. Hence the
+     * separate {@link BookingReviewAccess} projection for the SpEL twin — see its javadoc.
+     *
+     * <p><b>Reads no {@code SecurityContext} and issues no statement</b> — but NOT for the reason
+     * an earlier revision of this javadoc gave. It claimed {@code master.getUser().getId()} was "an
+     * IDENTIFIER read served off the uninitialised proxy"; that is false here. {@code Master} and
+     * {@code User} both use FIELD-access {@code @Id}, so Hibernate has no getter to intercept and
+     * {@code getId()} on a genuine proxy WOULD initialise it — as would {@code isActive()}, which
+     * is not an identifier at all. What actually makes both reads free is that every loading graph
+     * reaching this method fetches the master and its user outright:
+     * {@code JOIN FETCH b.master m} + {@code LEFT JOIN FETCH m.user} in {@code
+     * BookingRepository#findByIdWithFullGraph}, {@code #findAllByIdsWithGraph} and {@code
+     * #findByAppointmentIdWithGraph}. <b>Delete either fetch join and this method starts issuing a
+     * SELECT per booking</b> — an N+1 on the provider list page, not a compile error. That is also
+     * why no role lookup is needed: the comparison is against {@code masters.user_id}, which no
+     * {@code CLIENT} and no salon {@code owner_id} can equal. It matters twice over — the {@code
+     * GET /bookings/&#123;id&#125;} detail path calls this through {@code
+     * BookingService#computeProviderCanReviewClient} on a booking hydrated WITHOUT {@code m.salon},
+     * and {@code BookingPriceRangeContractIT} drives that path directly, with no {@code
+     * SecurityContextHolder} populated at all.
+     *
+     * <p>Fail-closed on a DETACHED master (V157 / phase 294 D1 — {@code masters.user_id} is NULL
+     * once the staff account is hard-deleted): {@code null} never equals a non-null {@code
+     * actorUserId}, so a booking whose performer's account is gone confers this grant on nobody.
+     * Doubly so now — {@code SalonService#removeMaster} deactivates the row as well as NULLing
+     * {@code user_id}, so both conjuncts deny independently.
+     */
+    public boolean isPerformingMasterOfBooking(UUID actorUserId, Booking booking) {
+        Master master = booking.getMaster();
+        return isPerformingMasterOfRow(masterUserId(master), master.isActive(), actorUserId);
+    }
+
+    /**
+     * Projection twin of {@link #isPerformingMasterOfBooking} — same decision, over the {@code
+     * masterUserId}/{@code masterIsActive} legs of a {@link BookingReviewAccess} row rather than a
+     * hydrated entity, so the SpEL gate and the service-layer guard cannot drift apart. See that
+     * method's javadoc for the whole rationale, including why the liveness conjunct is here and
+     * never folded into {@link #hasProviderAuthorityOverRow}.
+     */
+    private static boolean isPerformingMasterOfRow(
+            @Nullable UUID masterUserId, boolean masterIsActive, UUID actorUserId) {
+        return masterIsActive && masterUserId != null && masterUserId.equals(actorUserId);
     }
 
     /**
      * Service-layer defense-in-depth guard (Phase 27.5) — the entity-based twin of {@link
      * #canReviewClient}, for {@code ClientReviewService.create} to call after its own single load
      * (mirrors {@link #enforceCanCancelBooking}/{@link #enforceCanRescheduleBooking}).
+     *
+     * <p>Phase 316 — carries the SAME union its SpEL twin does, in the same order: the free
+     * in-memory {@link #isPerformingMasterOfBooking} identity read first (which also short-circuits
+     * the salon-proxy walk {@link #hasProviderAuthorityOverBooking} would otherwise make for a
+     * salon master), then the unchanged provider-authority kernel. A divergence between the two
+     * would show up as a CTA the write endpoint rejects, or a 403 after a green {@code
+     * @PreAuthorize} — which is why neither side re-derives the predicate.
      */
     public void enforceCanReviewClient(UUID actorUserId, Booking booking) {
-        if (!hasProviderAuthorityOverBooking(actorUserId, booking)) {
+        if (!isPerformingMasterOfBooking(actorUserId, booking)
+                && !hasProviderAuthorityOverBooking(actorUserId, booking)) {
             throw new ForbiddenException("Access denied");
         }
     }

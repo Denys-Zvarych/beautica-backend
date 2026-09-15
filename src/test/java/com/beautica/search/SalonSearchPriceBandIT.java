@@ -3,7 +3,6 @@ package com.beautica.search;
 import com.beautica.AbstractIntegrationTest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -13,7 +12,6 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -62,18 +60,12 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    private void ensureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
     // ── Case 17 — a master's RANGE own band reports its TRUE ceiling, not the floor ────────────
 
     @Test
     @DisplayName("Case 17 (D8): a salon whose only master holds RANGE 500-800 is returned by "
             + "maxPrice>=800, and its pmax is 800, not 500")
     void should_reportTrueCeiling_when_solesMasterHoldsAnOwnRangeBand() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
         // A usable schedule is now REQUIRED for a master to price the salon in search
@@ -100,7 +92,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 17b (sanity): the same RANGE-band salon is EXCLUDED once maxPrice sits "
             + "below its true floor")
     void should_excludeSalon_when_maxPriceBelowRangeBandFloor() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
         // A usable schedule is now REQUIRED for a master to price the salon in search
@@ -134,7 +125,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
             + "400-900 definition -> pmax == 700, not 900. Does NOT discriminate pre/post-D8 SQL "
             + "(see cases 17/20 for that)")
     void should_reportOwnFixedCeiling_when_definitionIsARangeTheMasterDidNotTake() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
         // A usable schedule is now REQUIRED for a master to price the salon in search
@@ -161,7 +151,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 19 (D8 regression lock): an all-Inherited salon's search price bounds are "
             + "unchanged from before this phase")
     void should_leaveAllInheritedSalonsBoundsUnchanged() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
         // A usable schedule is now REQUIRED for a master to price the salon in search
@@ -198,7 +187,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
             + "what the search lateral computes for the same salon and category — across TWO "
             + "bookable masters with different bands")
     void should_agreeWithTheCatalogue_when_comparingTheSameSalonAndCategory() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
         seedUsableSchedule(masterId);
@@ -259,7 +247,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 21 (H4): a master with NO schedule at all does not price the salon in "
             + "search — the same master the catalogue drops entirely")
     void should_excludeUnschedulableMasterFromTheSearchBand() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
 
         UUID bookableMaster = seedSalonMaster(salonId);
@@ -297,7 +284,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 22 (H4): a master whose ONLY weekly template has already EXPIRED "
             + "(valid_to in the past) does not price the salon either")
     void should_excludeMasterWithExpiredScheduleFromTheSearchBand() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
 
         UUID bookableMaster = seedSalonMaster(salonId);
@@ -321,7 +307,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 23 (H4 non-vacuity): the SAME cheap master DOES move the band once given a "
             + "usable schedule — cases 21/22 exclude on bookability, not on anything else")
     void should_includeTheSameCheapMaster_onceItHasAUsableSchedule() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
 
         UUID bookableMaster = seedSalonMaster(salonId);
@@ -353,7 +338,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
             + "schedule_exceptions row IS bookable, reaches the catalogue, and therefore MUST "
             + "price the salon in search — the H4 gate's template-only EXISTS dropped them")
     void should_priceTheSalon_when_theOnlyMasterIsScheduledSolelyByAFutureOverride() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
 
@@ -397,7 +381,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 25 (B1b): a master whose ONLY template starts BEYOND the 180-day booking "
             + "window is dropped by the catalogue, so it must not price the salon in search either")
     void should_excludeMasterWhoseOnlyTemplateStartsBeyondTheBookingWindow() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
 
         UUID bookableMaster = seedSalonMaster(salonId);
@@ -450,7 +433,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
     @DisplayName("Case 26: a structurally-scheduled but fully day-offed master KEEPS the search "
             + "band while its catalogue is EMPTY — pinning the occupancy divergence as deliberate")
     void should_keepTheSearchBand_when_theCatalogueIsEmptyForAFullyOccupiedMaster_pinningTheOccupancyDivergenceAsDeliberate() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
 
@@ -511,7 +493,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
             + "the category gate and still previews its service names, with a NULL price band — "
             + "pinning the three-gate asymmetry as deliberate")
     void should_stillPassTheCategoryGateAndPreviewNames_whenTheOnlyMasterHasNoResolvableSchedule_pinningTheThreeGateAsymmetryAsDeliberate() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
 
@@ -571,7 +552,6 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
             + "is dropped by the catalogue but STILL prices the salon in search — pinning the "
             + "empty-template gap in the template arm as deliberate")
     void should_keepTheSearchBand_when_theOnlyMasterTemplateHasNoWorkingIntervals_pinningTheEmptyTemplateGapAsDeliberate() {
-        ensureHttpClient();
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
 

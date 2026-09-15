@@ -28,6 +28,36 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     @Query("SELECT r.booking.id FROM Review r WHERE r.booking.id IN :bookingIds")
     java.util.List<UUID> findReviewedBookingIds(@Param("bookingIds") java.util.List<UUID> bookingIds);
 
+    /**
+     * Phase 317 — the client&rarr;provider review of ONE booking, as rating + comment, for {@code
+     * BookingDetailResponse#reviewByClient} on {@code GET /bookings/&#123;id&#125;}.
+     *
+     * <p><b>Replaces, never accompanies, {@link #existsByBookingId} on that call path</b> (&sect;E-1:
+     * a narrower variant kept alongside a wider one silently drifts). {@code BookingService#getBooking}
+     * needs both "does a review exist" (for {@code canReview}) and "what does it say" (for {@code
+     * reviewByClient}) about the SAME booking; presence of this {@link Optional} answers the first,
+     * so the detail path issues exactly one statement where it used to issue one
+     * {@code SELECT COUNT(*) &gt; 0} — the pinned count in {@code BookingPriceRangeContractIT
+     * #OWNER_DETAIL_STATEMENTS_ALIGNED} is unchanged. {@link #existsByBookingId} survives for
+     * {@code ReviewService#createReview}'s duplicate-write gate, which genuinely wants the cheaper
+     * existence form and never the body.
+     *
+     * <p>{@code reviews.booking_id} is a UNIQUE FK ({@code Review}), so this can match at most one
+     * row — {@link Optional} is exact, not a {@code Limit.of(1)} narrowing of a list.
+     *
+     * <p>Selects scalars off the {@code reviews} row alone: no join, no association walk, nothing
+     * lazy, and not even the {@code booking_id} it filters on — the caller already holds that id.
+     * Do NOT widen it to carry the author's name or the service name — see
+     * {@link BookingReviewView}'s javadoc.
+     */
+    @Query("""
+            SELECT new com.beautica.review.repository.BookingReviewView(
+                r.rating, r.comment)
+            FROM Review r
+            WHERE r.booking.id = :bookingId
+            """)
+    Optional<BookingReviewView> findViewByBookingId(@Param("bookingId") UUID bookingId);
+
     // Two-query pattern — avoids HHH90003004 (Hibernate in-memory pagination warning).
     // Step 1: paginate on IDs only — SQL LIMIT/OFFSET, no JOIN FETCH.
     @Query(value = """

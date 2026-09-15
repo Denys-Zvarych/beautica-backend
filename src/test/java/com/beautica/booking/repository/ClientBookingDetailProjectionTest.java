@@ -690,7 +690,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         // awaitingClosure derivation itself (covered by BookingDetailResponseTest);
                         // an arbitrary fixed instant well before every seeded booking's startsAt
                         // keeps both response paths' awaitingClosure identically false.
-                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
+                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC),
+                        // Phase 317 — reviewByClient. This suite pins entity-vs-projection parity,
+                        // and BOTH paths serve null for this field by contract (it is fetched only
+                        // by BookingService#getBooking, not by either mapper), so null on the entity
+                        // side is what parity REQUIRES here, not a shortcut.
+                        null);
 
         em.clear();
 
@@ -779,7 +784,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         // awaitingClosure derivation itself (covered by BookingDetailResponseTest);
                         // an arbitrary fixed instant well before every seeded booking's startsAt
                         // keeps both response paths' awaitingClosure identically false.
-                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
+                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC),
+                        // Phase 317 — reviewByClient. This suite pins entity-vs-projection parity,
+                        // and BOTH paths serve null for this field by contract (it is fetched only
+                        // by BookingService#getBooking, not by either mapper), so null on the entity
+                        // side is what parity REQUIRES here, not a shortcut.
+                        null);
         em.clear();
 
         Page<ClientBookingDetailProjection> page = findClientBookingDetails(
