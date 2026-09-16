@@ -2831,109 +2831,114 @@ class BookingServiceTest {
         verifyNoInteractions(bookingRepository);
     }
 
-    // ── Phase 319 step 5 — ACCEPTANCE CRITERIA FOR A QUEUED FIX, NOT YET IMPLEMENTED ─────────
+    // ── Phase 319 step 5 — REJECTED FINDING, NOW PINNED AS ACCEPTED BEHAVIOUR ────────────────
     //
-    // backend-perf raised it and QA confirmed it independently (2026-09-16): BookingService:1008
-    // (salon) and BookingService:731 (/me) both gate the span cap behind `from != null && to !=
-    // null`, so a request carrying ONLY a serviceId predicate and no range — or a half-open range
-    // with just `from` — reaches the query with NO starts_at bound at all and scans the salon's (or
-    // the provider's) entire booking history. The serviceId predicate has no index of its own, so
-    // this is the worst-case shape the phase introduces, and the mobile board can send it: the
-    // service chips are usable with the day rail cleared.
+    // backend-perf (MEDIUM) and backend-security (LOW) both raised "unbounded date range when
+    // serviceId is present": BookingService:1008 (salon) and BookingService:731 (/me) gate the
+    // span cap behind `from != null && to != null`, so a serviceId-only request reaches the query
+    // with no starts_at bound at all. The architect REJECTED it on 2026-09-16 as NOT A DEFECT —
+    // not deferred, not accepted-as-risk. The reasoning is preserved here so it is not
+    // re-litigated:
     //
-    // THESE TWO TESTS ARE RED AGAINST TODAY'S CODE (QA verified by enabling them: both fail with
-    // "Expecting code to raise a throwable"). They are @Disabled so the suite stays green for the
-    // pre-fix commit, and they were written as the acceptance criterion for a range-required guard.
+    //   1. ScheduleDateMath.MAX_EXPANSION_SPAN_DAYS (ScheduleDateMath:53-58) exists so callers
+    //      "cannot trigger unbounded LOOPS". The loop is /booked-days, which materialises one
+    //      entry per date — which is exactly why phase 319's D5 made from/to REQUIRED there and
+    //      left them optional on the list. The list has no loop: it is
+    //      findIdsBySalonIdFiltered over (salon_id, master_service_id, starts_at DESC) with
+    //      LIMIT pushdown.
+    //   2. A date range does not bound this query anyway. Work is O(rows matching the filter),
+    //      and serviceId is already hard-capped at 50 by @Size(max = 50). A 366-day window on a
+    //      busy salon scans MORE than unbounded history on a quiet one.
+    //   3. The exposure is self-scoped on both routes: the salon route is
+    //      owner/admin-of-this-salon, /me is the caller's own rows. No anonymous and no
+    //      cross-tenant amplification.
+    //   4. V166 + V167 removed the premise the finding rested on — 58 buffers for the modal
+    //      IN(2) case, 300 for the COUNT(*). Both agents scored it before those landed.
+    //   5. The surrounding guards are coherent and nothing is missing:
+    //      assertToPlusOneDayRepresentable(to) fires independently on `to`; `from.isAfter(to)` is
+    //      correctly inside the both-present block (you cannot order against a null); only the
+    //      SPAN is conditional, and a span genuinely requires two ends.
     //
-    // ── 2026-09-16, backend-dev: THE GUARD THEY SPECIFY CANNOT BE IMPLEMENTED AS WRITTEN. ──
+    // /me and the salon route STAY IDENTICAL — they are byte-identical today, share the same
+    // threat model, and divergence buys nothing.
     //
-    // They stay @Disabled and UNCHANGED (assertions byte-identical) because enabling them requires
-    // a behaviour that contradicts three things that are already green and/or already shipped.
-    // Recorded here so the next reader does not re-attempt it:
-    //
-    //   1. BookingSalonBookingsIT#should_paginateServiceFilteredListOverExactOrderedGroundTruth —
-    //      the test the SAME audit designates as the semantics pin that must stay green — calls
-    //      `GET /bookings/salon/{id}?serviceId=X&page=&size=` with NO from/to at all
-    //      (callSalonBookingsPaged, whose javadoc says the range is "deliberately NOT passed"), and
-    //      asserts 200 over rows seeded at 2032-03-01. A 400 turns it red; so does a DEFAULT
-    //      WINDOW, since any window anchored near "now" excludes rows six years out.
-    //   2. BookingServiceTest#should_passDeduplicatedServiceIds_when_serviceIdListProvided and
-    //      #should_acceptServiceIdFilter_when_exactly50DistinctValuesAtTheCountBound — the former
-    //      authored in this very phase — both call the service with a serviceId list and no range
-    //      and assert the repository IS reached. They are the direct negation of these two.
-    //   3. beautica-mobile master_archive_notifier.dart:275 ships `getMyBookings(serviceIds: ...)`
-    //      with no from/to on every «Архів» fetch. A 400 breaks a RELEASED screen the moment a
-    //      user taps a service chip — an unannounced breaking change to a shipped API.
-    //
-    // The underlying concern is real and is NOT dismissed; it is addressed differently. V166's
-    // (salon_id, master_service_id, starts_at DESC) index turns the unbounded salon-scope
-    // serviceId query into an index-ordered range scan with LIMIT pushdown rather than the
-    // history-wide scan the finding describes. The /me twin has had its master-scope equivalent,
-    // (master_id, master_service_id, starts_at), since V117. What remains unindexed on either
-    // route is only the COUNT(*) companion.
-    //
-    // Enabling these requires a PRODUCT decision to break the /me serviceId contract (and a
-    // coordinated mobile change), not a backend-dev judgement call. Do NOT delete them, and do NOT
-    // rewrite them to match whatever is implemented — they are the record of what was asked for.
+    // The two @Disabled tests that asserted a 400 here were DELETED rather than left parked:
+    // they encoded a REJECTED requirement, and a parked red test is a landmine — the next auditor
+    // enables one, it goes red, and they "fix" it by shipping the 400 that breaks the released
+    // «Архів» screen (beautica-mobile master_archive_notifier.dart:275 sends serviceIds with no
+    // range on every fetch). The two positive pins below replace them: they go red the moment
+    // anyone re-adds a range requirement.
 
+    /**
+     * Ledger for the rejected span-cap finding on the SALON list. A {@code serviceId} filter with
+     * no {@code from}/{@code to} must reach {@link BookingRepository#findIdsBySalonIdFiltered}
+     * with BOTH instant bounds {@code null} — neither a 400 nor a silently defaulted window (a
+     * default anchored near "now" would also be wrong: the semantics pin
+     * {@code BookingSalonBookingsIT#should_paginateServiceFilteredListOverExactOrderedGroundTruth}
+     * seeds rows at 2032-03-01 and asserts 200).
+     */
     @Test
-    @org.junit.jupiter.api.Disabled("Phase 319 step 5 — CANNOT BE ENABLED AS WRITTEN: a 400 (or a "
-            + "default window) here turns should_paginateServiceFilteredListOverExactOrderedGroundTruth "
-            + "red and breaks the shipped mobile «Архів» screen. See the block comment above.")
-    @DisplayName("BusinessException(400) when ?serviceId is supplied to the SALON list with no "
-            + "bounded date range — an unbounded serviceId scan has no index to fall back on")
-    void should_return400_when_salonListRangeUnbounded() {
+    @DisplayName("SALON list — ?serviceId with NO date range reaches the repository with both "
+            + "instant bounds null; the conditional span cap is accepted behaviour (finding "
+            + "REJECTED 2026-09-16), so re-adding a 400 or a default window turns this red")
+    void should_reachRepositoryWithNullBounds_when_serviceIdSuppliedWithNoRangeOnSalonList() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         UUID serviceId = UUID.randomUUID();
 
-        assertThatThrownBy(() -> bookingService.getSalonBookings(
-                        actorId, salonId, null, null, null, null, List.of(serviceId), Pageable.unpaged()))
-                .as("no range at all: neither bound present, so assertSpanWithinMax never fires today")
-                .isInstanceOf(BusinessException.class)
-                .extracting(ex -> ((BusinessException) ex).getStatus())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, null, null, null, null, Set.of(serviceId), normalizedUnpaged()))
+                .thenReturn(Page.empty());
 
-        assertThatThrownBy(() -> bookingService.getSalonBookings(
-                        actorId, salonId, null, null, LocalDate.of(2026, 1, 1), null,
-                        List.of(serviceId), Pageable.unpaged()))
-                .as("half-open range: 'from' alone still leaves the future side unbounded, and the "
-                        + "`from != null && to != null` conjunction still skips the span cap")
-                .isInstanceOf(BusinessException.class)
-                .extracting(ex -> ((BusinessException) ex).getStatus())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
+        bookingService.getSalonBookings(
+                actorId, salonId, null, null, null, null, List.of(serviceId), Pageable.unpaged());
 
-        verifyNoInteractions(bookingRepository);
+        ArgumentCaptor<OffsetDateTime> fromTs = ArgumentCaptor.forClass(OffsetDateTime.class);
+        ArgumentCaptor<OffsetDateTime> toExclusive = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                eq(salonId), eq(null), eq(null), fromTs.capture(), toExclusive.capture(),
+                eq(Set.of(serviceId)), eq(normalizedUnpaged()));
+        assertThat(fromTs.getValue())
+                .as("'from' must reach the query as a null predicate, actual=%s", fromTs.getValue())
+                .isNull();
+        assertThat(toExclusive.getValue())
+                .as("'to' must reach the query as a null predicate, actual=%s", toExclusive.getValue())
+                .isNull();
     }
 
+    /**
+     * The {@code /me} twin of the pin above. BookingService:731 carries the identical conditional
+     * span cap on purpose — the two routes stay symmetric — so this test exists so that a "fix"
+     * applied to only one of them cannot pass. It also guards the shipped mobile contract:
+     * {@code master_archive_notifier.dart:275} calls {@code getMyBookings(serviceIds: ...)} with
+     * no range on every «Архів» fetch.
+     */
     @Test
-    @org.junit.jupiter.api.Disabled("Phase 319 step 5 — CANNOT BE ENABLED AS WRITTEN: "
-            + "should_acceptServiceIdFilter_when_exactly50DistinctValuesAtTheCountBound asserts the "
-            + "exact opposite on this same method, and mobile's «Архів» screen ships this request "
-            + "shape today. See the block comment above.")
-    @DisplayName("BusinessException(400) when ?serviceId is supplied to GET /bookings/me with no "
-            + "bounded date range — BookingService:731 carries the identical unguarded shape, so "
-            + "fixing only the salon route would leave the same scan reachable on /me")
-    void should_return400_when_myBookingsRangeUnbounded() {
+    @DisplayName("GET /bookings/me — ?serviceId with NO date range reaches the repository with "
+            + "both instant bounds null; /me and the salon route stay byte-identical, so a range "
+            + "requirement re-added to either one turns this red")
+    void should_reachRepositoryWithNullBounds_when_serviceIdSuppliedWithNoRangeOnMyBookings() {
         UUID serviceId = UUID.randomUUID();
-        Pageable pageable = PageRequest.of(0, 20);
 
-        assertThatThrownBy(() -> bookingService.getMyBookings(
-                        clientId, buildAuth(Role.CLIENT), null, null, null, List.of(serviceId), pageable))
-                .as("no range at all on /me")
-                .isInstanceOf(BusinessException.class)
-                .extracting(ex -> ((BusinessException) ex).getStatus())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
+        when(bookingRepository.findIdsByClientIdFiltered(
+                        clientId, null, null, null, Set.of(serviceId), normalizedUnpaged()))
+                .thenReturn(Page.empty());
 
-        assertThatThrownBy(() -> bookingService.getMyBookings(
-                        clientId, buildAuth(Role.CLIENT), null, LocalDate.of(2026, 1, 1), null,
-                        List.of(serviceId), pageable))
-                .as("half-open range on /me")
-                .isInstanceOf(BusinessException.class)
-                .extracting(ex -> ((BusinessException) ex).getStatus())
-                .isEqualTo(HttpStatus.BAD_REQUEST);
+        bookingService.getMyBookings(
+                clientId, buildAuth(Role.CLIENT), null, null, null, List.of(serviceId),
+                Pageable.unpaged());
 
-        verifyNoInteractions(bookingRepository);
+        ArgumentCaptor<OffsetDateTime> fromTs = ArgumentCaptor.forClass(OffsetDateTime.class);
+        ArgumentCaptor<OffsetDateTime> toExclusive = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(bookingRepository).findIdsByClientIdFiltered(
+                eq(clientId), eq(null), fromTs.capture(), toExclusive.capture(),
+                eq(Set.of(serviceId)), eq(normalizedUnpaged()));
+        assertThat(fromTs.getValue())
+                .as("'from' must reach the query as a null predicate, actual=%s", fromTs.getValue())
+                .isNull();
+        assertThat(toExclusive.getValue())
+                .as("'to' must reach the query as a null predicate, actual=%s", toExclusive.getValue())
+                .isNull();
     }
 
     // ── Phase 319 — GET /bookings/salon/{salonId}/booked-days ────────────────────────────────
