@@ -1820,7 +1820,7 @@ class AuthorizationServiceTest {
 
         // Salon booking: salonOwnerUserId is non-null and equals actorId
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, actorId)));
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, true, actorId)));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -1839,7 +1839,7 @@ class AuthorizationServiceTest {
 
         // Salon booking: salonOwnerUserId is ownerA — ownerB must be rejected
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, ownerAId)));
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, true, ownerAId)));
 
         Authentication auth = mockAuth(ownerBId, "ROLE_SALON_OWNER");
 
@@ -1856,7 +1856,7 @@ class AuthorizationServiceTest {
 
         // salonOwnerUserId is null — this is an independent master booking
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), actorId, null)));
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), actorId, true, null)));
 
         Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
 
@@ -1871,7 +1871,7 @@ class AuthorizationServiceTest {
 
         // salonOwnerUserId is null — independent master booking, but masterUserId is a different master
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), UUID.randomUUID(), null)));
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), UUID.randomUUID(), true, null)));
 
         Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
 
@@ -2793,7 +2793,7 @@ class AuthorizationServiceTest {
 
         // Client is the booking owner — clientUserId matches actorId
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(actorId, masterUserId, salonOwnerUserId)));
+                .thenReturn(Optional.of(new BookingViewAccess(actorId, masterUserId, true, salonOwnerUserId)));
 
         Authentication auth = mockAuth(actorId, "ROLE_CLIENT");
 
@@ -2813,7 +2813,7 @@ class AuthorizationServiceTest {
 
         // Booking belongs to clientA, actor is clientB
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(clientAId, masterUserId, salonOwnerUserId)));
+                .thenReturn(Optional.of(new BookingViewAccess(clientAId, masterUserId, true, salonOwnerUserId)));
 
         Authentication auth = mockAuth(clientBId, "ROLE_CLIENT");
 
@@ -2832,7 +2832,7 @@ class AuthorizationServiceTest {
 
         // masterUserId matches actorId — the master is viewing their own booking
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, salonOwnerUserId)));
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, true, salonOwnerUserId)));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
 
@@ -2852,7 +2852,7 @@ class AuthorizationServiceTest {
 
         // masterUserId is otherMasterUserId — actor is a different salon master
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, otherMasterUserId, salonOwnerUserId)));
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, otherMasterUserId, true, salonOwnerUserId)));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
 
@@ -2891,7 +2891,7 @@ class AuthorizationServiceTest {
         // SALON_ADMIN's id matches none of the ownership fields. SALON_ADMIN is neither
         // CLIENT nor SALON_MASTER, so canViewBooking reaches the final `return false`.
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, masterUserId, salonOwnerUserId)));
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, masterUserId, true, salonOwnerUserId)));
 
         Authentication auth = mockAuth(adminId, "ROLE_SALON_ADMIN");
 
@@ -2913,7 +2913,7 @@ class AuthorizationServiceTest {
         // The salon-owner branch is skipped (null guard); the masterUserId branch fires
         // because the actor's role (INDEPENDENT_MASTER) is not SALON_MASTER.
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, null)));
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, true, null)));
 
         Authentication auth = mockAuth(actorId, "ROLE_INDEPENDENT_MASTER");
 
@@ -3055,6 +3055,10 @@ class AuthorizationServiceTest {
         when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
         when(master.getSalon()).thenReturn(salon);
         when(master.getUser()).thenReturn(assignedMasterUser);
+        // ACTIVE on purpose: the liveness conjunct leads the SALON_MASTER branch, so leaving
+        // isActive() at Mockito's default false would deny for the wrong reason and stop this
+        // test saying anything about the role/id conjuncts it exists to pin.
+        when(master.isActive()).thenReturn(true);
 
         Booking booking = mock(Booking.class);
         when(booking.getClient()).thenReturn(client);
@@ -3168,6 +3172,10 @@ class AuthorizationServiceTest {
         when(otherMaster.getMasterType()).thenReturn(MasterType.SALON_MASTER);
         when(otherMaster.getSalon()).thenReturn(otherSalon);
         when(otherMaster.getUser()).thenReturn(otherMasterUser);
+        // ACTIVE on purpose — see the identical note in
+        // should_throwForbidden_when_actorIsTheBookingsClientButAuthenticatedAsSalonMaster: the
+        // denial under test here is the cross-master identity mismatch, not deactivation.
+        when(otherMaster.isActive()).thenReturn(true);
 
         Booking booking = mock(Booking.class);
         when(booking.getMaster()).thenReturn(otherMaster);
@@ -3186,6 +3194,150 @@ class AuthorizationServiceTest {
         // hasManagementAccess and hit the DB — this fails the moment that happens.
         verify(userRepository, never()).findSalonIdById(any());
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+    }
+
+    // ── enforceCanViewBooking / canViewBooking — the DEACTIVATED performer ────
+    // The read half of the liveness posture phase 316 gave the WRITE grant. DELETE
+    // /masters/{masterId} (MasterService#deactivateMasterInternal) flips masters.is_active and
+    // NOTHING else: the staff users row, its SALON_MASTER role and its login all survive, because
+    // AuthService gates on user.isActive(). Until this conjunct existed, a fired stylist with an
+    // unexpired JWT kept full READ access to every booking they had performed — and
+    // BookingDetailResponse carries the client's name, phone, price and service.
+    //
+    // The admit/deny PAIR is the point. Each denial below is accompanied by the identical fixture
+    // with isActive() true, so a mutant that deletes the conjunct turns the denial red while the
+    // control stays green, and a mutant that hard-denies every salon master turns the control red.
+    // Neither half is meaningful alone.
+
+    @Test
+    @DisplayName("enforceCanViewBooking ADMITS an ACTIVE SALON_MASTER on the booking they perform "
+            + "— the non-vacuity control for the liveness conjunct below")
+    void should_notThrow_when_activeSalonMasterViewsOwnPerformedBooking() {
+        UUID actorMasterUserId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        User masterUser = mock(User.class);
+        when(masterUser.getId()).thenReturn(actorMasterUserId);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        when(master.getUser()).thenReturn(masterUser);
+        when(master.isActive()).thenReturn(true);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(actorMasterUserId, "ROLE_SALON_MASTER"));
+
+        assertThatCode(() -> authorizationService.enforceCanViewBooking(actorMasterUserId, booking))
+                .as("an EMPLOYED salon master must keep reading their own bookings exactly as "
+                        + "before — the liveness conjunct narrows the deactivated case only")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking throws ForbiddenException when a DEACTIVATED SALON_MASTER "
+            + "views a booking they themselves performed while active — masters.is_active is a "
+            + "conjunct of the view leg, not only of the phase-316 write leg")
+    void should_throwForbidden_when_deactivatedSalonMasterViewsOwnPerformedBooking() {
+        UUID actorMasterUserId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(UUID.randomUUID());
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        User masterUser = mock(User.class);
+        // Same identity the admitted control above uses: the ONLY difference between the two
+        // fixtures is masters.is_active, so nothing but the conjunct can explain the two results.
+        lenient().when(masterUser.getId()).thenReturn(actorMasterUserId);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        lenient().when(master.getUser()).thenReturn(masterUser);
+        when(master.isActive()).thenReturn(false);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(actorMasterUserId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanViewBooking(actorMasterUserId, booking))
+                .as("a deactivated stylist keeps their login (AuthService gates on user.isActive(), "
+                        + "which deactivateMasterInternal never touches) — the booking detail they "
+                        + "would read carries a third party's name, phone and price")
+                .isInstanceOf(ForbiddenException.class)
+                .hasMessage("Access denied");
+    }
+
+    @Test
+    @DisplayName("enforceCanViewBooking still ADMITS the SALON_OWNER of a booking whose performing "
+            + "master has been DEACTIVATED — the liveness conjunct is scoped to the SALON_MASTER "
+            + "leg and must never reach isAuthorizedToManageBooking")
+    void should_notThrow_when_salonOwnerViewsBookingOfDeactivatedMaster() {
+        UUID ownerUserId = UUID.randomUUID();
+
+        User salonOwner = mock(User.class);
+        when(salonOwner.getId()).thenReturn(ownerUserId);
+
+        Salon salon = mock(Salon.class);
+        when(salon.getOwner()).thenReturn(salonOwner);
+
+        Master master = mock(Master.class);
+        when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
+        when(master.getSalon()).thenReturn(salon);
+        // DEACTIVATED — and irrelevant to this actor: the owner is admitted by the manage leg,
+        // which runs before the SALON_MASTER branch and carries no liveness term.
+        lenient().when(master.isActive()).thenReturn(false);
+
+        Booking booking = mock(Booking.class);
+        when(booking.getMaster()).thenReturn(master);
+
+        SecurityContextHolder.getContext()
+                .setAuthentication(mockAuth(ownerUserId, "ROLE_SALON_OWNER"));
+
+        assertThatCode(() -> authorizationService.enforceCanViewBooking(ownerUserId, booking))
+                .as("an owner must keep reading the history of a stylist they just fired — that is "
+                        + "their own salon's book, and the same asymmetry BookingReviewAccess pins "
+                        + "for complete/decline/reschedule")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("canViewBooking (the SpEL twin) returns false for a DEACTIVATED SALON_MASTER on "
+            + "their own booking, and true on the identical row with masterIsActive true")
+    void should_returnFalse_when_deactivatedSalonMasterCallsCanViewBooking() {
+        UUID bookingId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        UUID clientUserId = UUID.randomUUID();
+        UUID salonOwnerUserId = UUID.randomUUID();
+        Authentication auth = mockAuth(actorId, "ROLE_SALON_MASTER");
+
+        when(bookingRepository.findViewAccessById(bookingId))
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, false, salonOwnerUserId)))
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, actorId, true, salonOwnerUserId)));
+
+        boolean deactivated = authorizationService.canViewBooking(auth, bookingId);
+        boolean active = authorizationService.canViewBooking(auth, bookingId);
+
+        assertThat(deactivated)
+                .as("the projection twin must reach the same verdict enforceCanViewBooking reaches "
+                        + "on the hydrated entity, or the SpEL gate and the service guard drift")
+                .isFalse();
+        assertThat(active)
+                .as("non-vacuity on the SAME row — only masterIsActive differs between the two "
+                        + "calls, so a hard-deny mutant cannot satisfy both assertions")
+                .isTrue();
     }
 
     // ── canManageMaster — role fast-path (no DB hit) ──────────────────────────
@@ -3533,7 +3685,7 @@ class AuthorizationServiceTest {
 
         // canManageBooking path: salonOwnerUserId == actorId in the lightweight projection
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, actorId)));
+                .thenReturn(Optional.of(new BookingViewAccess(UUID.randomUUID(), masterUserId, true, actorId)));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 
@@ -3556,7 +3708,7 @@ class AuthorizationServiceTest {
         // with full client data — the masterUserId == actorId branch would also match,
         // but the salon-owner branch fires first. Both grant; no contradiction.
         when(bookingRepository.findViewAccessById(bookingId))
-                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, masterUserId, actorId)));
+                .thenReturn(Optional.of(new BookingViewAccess(clientUserId, masterUserId, true, actorId)));
 
         Authentication auth = mockAuth(actorId, "ROLE_SALON_OWNER");
 

@@ -600,6 +600,88 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
                 .isFalse();
     }
 
+    // ── the DEACTIVATED performing master (read access) ──────────────────────────
+    // DELETE /masters/{masterId} (MasterService#deactivateMasterInternal) flips masters.is_active
+    // and NOTHING else — the staff users row, its SALON_MASTER role and its login all survive,
+    // because AuthService gates on user.isActive(). Both tests below therefore capture the token
+    // BEFORE deactivation and reuse it afterwards: that is the real exposure, an already-issued
+    // JWT in a fired stylist's app, not a fresh login.
+    //
+    // Each asserts 200 and 403 on the SAME fixture with the SAME token, separated only by the
+    // is_active UPDATE. A mutant that drops the liveness conjunct fails the second half; a mutant
+    // that denies every salon master fails the first. Neither half is assertable alone.
+
+    @Test
+    @DisplayName("DETAIL 200 → 403 — a SALON_MASTER reads the booking they performed, then the SAME "
+            + "token is refused the moment masters.is_active goes false")
+    void should_return403OnDetail_when_performingSalonMasterIsDeactivated() throws Exception {
+        Salon salon = createSalon("pcrc-deact-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("pcrc-deact-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "COMPLETED");
+        String masterToken = tokenFor(salon.masterEmail());
+
+        assertThat(getBookingDetailStatus(bookingId, masterToken))
+                .as("control — while employed, the performing master reads their own booking")
+                .isEqualTo(HttpStatus.OK);
+
+        deactivateMaster(salon.masterId());
+
+        assertThat(getBookingDetailStatus(bookingId, masterToken))
+                .as("BookingDetailResponse carries the client's name, phone, price and service — a "
+                        + "deactivated stylist on an unexpired JWT must not read it")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("LIST 200 → 403 — GET /bookings/me serves the performing SALON_MASTER their page, "
+            + "then refuses the SAME token once masters.is_active goes false (the provider-scope "
+            + "resolution had no active filter, so the whole history came back)")
+    void should_return403OnList_when_performingSalonMasterIsDeactivated() throws Exception {
+        Salon salon = createSalon("pcrc-deact-list-owner-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("pcrc-deact-list-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "COMPLETED");
+        String masterToken = tokenFor(salon.masterEmail());
+
+        assertThat(listRowIfPresent(bookingId, masterToken))
+                .as("control — while employed the master's own performed booking is on their page; "
+                        + "without this half a hard-deny mutant would pass")
+                .isPresent();
+
+        deactivateMaster(salon.masterId());
+
+        ResponseEntity<String> afterResp = restTemplate.exchange(
+                BOOKINGS_URL + "/me?size=50", HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(masterToken)), String.class);
+        assertThat(afterResp.getStatusCode())
+                .as("403, NOT a 200 with an empty page: a deactivated master is denied the scope, "
+                        + "the same answer GET /bookings/{id} gives them for any single row of it — "
+                        + "body=%s", afterResp.getBody())
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
+    @DisplayName("DETAIL 200 — the SALON_OWNER still reads a booking whose performing master has "
+            + "been deactivated; the liveness conjunct is scoped to the SALON_MASTER view leg")
+    void should_return200OnDetail_when_ownerViewsBookingOfDeactivatedMaster() throws Exception {
+        Salon salon = createSalon("pcrc-deact-ownerview-" + System.nanoTime() + "@beautica.test");
+        UUID clientId = createUser("pcrc-deact-ownerview-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
+        UUID bookingId = insertBooking(clientId, salon.masterId(), createSalonService(salon.salonId(), salon.masterId()),
+                salon.salonId(), "COMPLETED");
+
+        deactivateMaster(salon.masterId());
+
+        assertThat(getBookingDetailStatus(bookingId, tokenFor(salon.ownerEmail())))
+                .as("an owner must keep reading their own salon's book after firing a stylist — "
+                        + "they are admitted by isAuthorizedToManageBooking, which carries no "
+                        + "liveness term and must not acquire one")
+                .isEqualTo(HttpStatus.OK);
+        // A SALON_ADMIN control is deliberately absent: enforceCanViewBooking excludes that role
+        // unconditionally, deactivated master or not — pinned by
+        // should_return403_when_assignedSalonAdminViewsBookingDetail above.
+    }
+
     // ── HTTP helpers ─────────────────────────────────────────────────────────────
 
     /**
@@ -645,6 +727,26 @@ class ProviderCanReviewClientIT extends AbstractIntegrationTest {
         headers.setBearerAuth(token);
         headers.setContentType(MediaType.APPLICATION_JSON);
         return headers;
+    }
+
+    /** Status only — for the cases where the 403 IS the claim and there is no body to read. */
+    private HttpStatus getBookingDetailStatus(UUID bookingId, String token) {
+        ResponseEntity<String> resp = restTemplate.exchange(
+                BOOKINGS_URL + "/" + bookingId, HttpMethod.GET,
+                new HttpEntity<>(bearerHeaders(token)), String.class);
+        return HttpStatus.valueOf(resp.getStatusCode().value());
+    }
+
+    /**
+     * Exactly what {@code MasterService#deactivateMasterInternal} persists — {@code
+     * masters.is_active = false} and nothing else. Driving it in SQL rather than through {@code
+     * DELETE /masters/&#123;masterId&#125;} keeps the fixture independent of that endpoint's own
+     * authorization, and makes it explicit that the {@code users} row, its {@code SALON_MASTER}
+     * role and its login are all left intact — which is the whole premise of these tests.
+     */
+    private void deactivateMaster(UUID masterId) {
+        int updated = jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", masterId);
+        assertThat(updated).as("fixture sanity — the master row must exist to be deactivated").isEqualTo(1);
     }
 
     private JsonNode getBookingDetail(UUID bookingId, String token) throws Exception {

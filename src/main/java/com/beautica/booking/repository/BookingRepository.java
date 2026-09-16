@@ -1177,11 +1177,18 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * {@link #findByIdWithFullGraph}'s former inner {@code JOIN FETCH b.client} (CRITICAL
      * finding, track 24.7 audit) — fixed defensively here even though this projection is not
      * currently wired into any {@code @PreAuthorize} SpEL.
+     *
+     * <p><b>{@code bm.isActive} feeds one branch only</b> — {@code canViewBooking}'s
+     * {@code SALON_MASTER} leg, the projection twin of the liveness conjunct
+     * {@code AuthorizationService#enforceCanViewBooking} applies on the hydrated entity, so the
+     * SpEL gate and the service-layer guard cannot drift apart. It must NOT be consulted from the
+     * salon-owner or independent-master arms of either consumer; see {@link BookingViewAccess}.
      */
     @Query("""
             SELECT new com.beautica.booking.repository.BookingViewAccess(
                 bc.id,
                 bm.user.id,
+                bm.isActive,
                 sOwner.id
             )
             FROM Booking b
