@@ -1107,27 +1107,43 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * master performed, so {@code loadProviderReviewBatch}'s performer partition leaves {@code
      * remaining} empty and {@code findIdsByIdInAndOwnerId} is skipped outright, while {@code
      * withAuthority} is now NON-empty and the {@code client_reviews} probe fires. A +1 branch
-     * either way, and still not the +2 one — the owner remains the sole role that pays both. That
-     * +1 branch has its own gate:
+     * either way. Since the Phase 319 consolidation the OWNER pays a +1 too (see below), so the two
+     * branches now agree numerically while remaining structurally disjoint — the owner reaches the
+     * batched authority filter and the master does not. That master-side +1 branch has its own gate:
      * {@link #SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS}. Until it existed this paragraph was the only
      * thing standing behind the claim, and prose does not go red.
      *
-     * <p>8 = the six {@link #SALON_MASTER_PAGE_STATEMENTS} already accounts for, with
+     * <p><b>Moved 8 -&gt; 7 by the Phase 319 second-pass audit (LOW — the two batched
+     * provider-authority filters were consolidated onto one two-pass kernel).</b> The salon lookup
+     * that used to be this gate's second {@code +1} is GONE on a non-rotated page, which is what
+     * this fixture seeds: {@code AuthorizationService}'s kernel now settles a salon-employed row
+     * whose master is still at the salon the booking was made at entirely in memory, comparing
+     * {@code booking.getSalon().getOwner().getId()} — an owner read off the instance {@code
+     * findAllByIdsWithGraph}'s {@code LEFT JOIN FETCH b.salon} already materialised — instead of
+     * collecting every live-salon id on the page and asking the database unconditionally. The
+     * superseded single-pass form issued {@code SalonRepository#findIdsByIdInAndOwnerId} even when
+     * it could not possibly change an answer. <b>THIS GATE IS THE ONE THAT MEASURES THAT</b>: it is
+     * why the drop is a pinned number and not a claim, and a return to 8 means the unconditional
+     * lookup is back.
+     *
+     * <p>7 = the six {@link #SALON_MASTER_PAGE_STATEMENTS} already accounts for, with
      * {@code salonRepository.findIdsByOwnerIdAndIsActiveTrue} standing in for
      * {@code masterRepository.findByUserId} as the branch's own scope-resolution statement, PLUS
-     * the two this gate exists for: {@code SalonRepository#findIdsByIdInAndOwnerId} (page-scoped,
-     * over the DE-DUPLICATED live-salon ids) and
-     * {@code ClientReviewRepository#findReviewedBookingIds} (one bounded {@code IN} list).
-     * DERIVED FROM A RUN, never predicted — same rule as the constants above.
+     * the ONE this gate now exists for: {@code ClientReviewRepository#findReviewedBookingIds} (one
+     * bounded {@code IN} list). DERIVED FROM A RUN, never predicted — same rule as the constants
+     * above, and re-derived from a run after the consolidation rather than adjusted on paper.
      *
      * <p><b>Measured at TWO row counts (2 and 5), and that is the whole design.</b> A single
-     * pinned number cannot tell "+2 flat" from "+2 per row" — both are consistent with any one
+     * pinned number cannot tell "flat" from "per row" — both are consistent with any one
      * observation, so an N+1 in {@code loadProviderReviewBatch} would sit inside a green gate. Two
-     * counts separate them: flat stays at 8 and 8, per-row would read 10 and 16. Neither count is
+     * counts separate them: flat stays at 7 and 7, per-row would read 8 and 11. Neither count is
      * 1, deliberately — at a single row "flat" and "per row" are numerically identical and the
-     * comparison would be inert.
+     * comparison would be inert. The owner is STILL the discriminating actor here even though the
+     * count now matches {@link #SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS}: this branch reaches the
+     * authority filter with a non-empty {@code remaining} (the owner did not perform the bookings),
+     * the salon-master branch never reaches it at all, so the two 7s ride on disjoint code.
      */
-    private static final long OWNER_REVIEWABLE_PAGE_STATEMENTS = 8L;
+    private static final long OWNER_REVIEWABLE_PAGE_STATEMENTS = 7L;
 
     /**
      * Statement count for a SALON_MASTER page of REVIEW-ELIGIBLE bookings — the MIDDLE branch of
@@ -1141,8 +1157,12 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      *       to {@code ProviderReviewBatch.EMPTY}. Pinned three times over, by
      *       {@link #PROVIDER_PAGE_STATEMENTS}, {@link #CLIENT_PAGE_STATEMENTS} and
      *       {@link #SALON_MASTER_PAGE_STATEMENTS} (all seeded {@code CONFIRMED} at {@link #ANCHOR}).</li>
-     *   <li><b>+2</b> — a {@code SALON_OWNER} over review-eligible rows: BOTH lookups fire. Pinned by
-     *       {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}.</li>
+     *   <li><b>+1, the {@code client_reviews} probe, reached through the AUTHORITY FILTER</b> — a
+     *       {@code SALON_OWNER} over review-eligible rows. It was {@code +2} until the Phase 319
+     *       consolidation removed the unconditional salon lookup on a non-rotated page; the
+     *       authority filter still RUNS for this actor (unlike the salon-master branch below, where
+     *       the performer partition empties {@code remaining} first), it simply answers in memory.
+     *       Pinned by {@link #OWNER_REVIEWABLE_PAGE_STATEMENTS}.</li>
      *   <li><b>+1</b> — THIS one. A {@code SALON_MASTER} over review-eligible rows reaches
      *       {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, whose
      *       {@code liveSalonIds} set is NON-empty (the actor's rows are all salon-employed), so
@@ -1209,10 +1229,10 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      *       empty; {@code withAuthority} is then empty and the SECOND early return skips the
      *       {@code client_reviews} probe. The one extra statement is the SALON lookup.</li>
      *   <li><b>{@code INDEPENDENT_MASTER}</b> — THIS one. Every row's master is independent, so
-     *       {@code AuthorizationService#filterBookingIdsWithProviderAuthority} collects an EMPTY
-     *       {@code liveSalonIds} and short-circuits {@code ownedSalonIds} to {@code Set.of()}
-     *       WITHOUT a query. The independent arm ({@code masterUserId.equals(actorId)}) then admits
-     *       every row, {@code withAuthority} is non-empty, and
+     *       {@code AuthorizationService#filterBookingIdsWithProviderAuthority}'s in-memory pass
+     *       ({@code masterUserId.equals(actorId)}) admits every row and DEFERS none, so its batched
+     *       second pass never runs and no salon query is issued. {@code withAuthority} is therefore
+     *       non-empty, and
      *       {@code ClientReviewRepository#findReviewedBookingIds} DOES fire. The one extra statement
      *       is the {@code client_reviews} PROBE.</li>
      * </ul>
@@ -1379,9 +1399,10 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("SALON_OWNER scope, REVIEW-ELIGIBLE page — the two providerCanReviewClient lookups "
-            + "cost a fixed +2 for the WHOLE page, pinned at TWO row counts so a per-row regression "
-            + "cannot hide behind a single number")
+    @DisplayName("SALON_OWNER scope, REVIEW-ELIGIBLE page — providerCanReviewClient costs a fixed "
+            + "+1 for the WHOLE page (the client_reviews probe; the salon-ownership lookup is "
+            + "answered in memory since the Phase 319 filter consolidation), pinned at TWO row "
+            + "counts so a per-row regression cannot hide behind a single number")
     void should_notScaleStatementCount_when_ownerPageIsFullOfReviewEligibleBookings() {
         var salon = fixtures.createSalon(
                 "bprc-qcount-owner-reviewable-" + System.nanoTime() + "@beautica.test");
@@ -1427,15 +1448,15 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 .isEqualTo(OWNER_REVIEWABLE_PAGE_STATEMENTS);
         assertThat(statementsForTwoRows)
                 .as("the SAME absolute count on a 2-row page. Pinning one row count cannot "
-                        + "distinguish +2 flat from +2 per row; pinning two can.")
+                        + "distinguish flat from per row; pinning two can.")
                 .isEqualTo(OWNER_REVIEWABLE_PAGE_STATEMENTS);
         assertThat(statementsForFiveRows)
                 .as("the growth model, stated directly: flat in page size. Got %s for 2 rows and %s "
                         + "for 5. A per-row implementation of loadProviderReviewBatch would read %s "
                         + "and %s instead — equal absolute pins alone would not separate the two.",
                         statementsForTwoRows, statementsForFiveRows,
-                        OWNER_REVIEWABLE_PAGE_STATEMENTS + 2 * 2 - 2,
-                        OWNER_REVIEWABLE_PAGE_STATEMENTS + 2 * 5 - 2)
+                        OWNER_REVIEWABLE_PAGE_STATEMENTS - 1 + 2,
+                        OWNER_REVIEWABLE_PAGE_STATEMENTS - 1 + 5)
                 .isEqualTo(statementsForTwoRows);
     }
 

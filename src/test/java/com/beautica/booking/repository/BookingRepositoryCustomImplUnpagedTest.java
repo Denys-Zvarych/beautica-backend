@@ -77,7 +77,7 @@ class BookingRepositoryCustomImplUnpagedTest {
         UUID salonId = UUID.randomUUID();
 
         assertThatThrownBy(() -> repository.findIdsBySalonIdFiltered(
-                salonId, null, null, null, null, UNPAGED_WITH_SORT))
+                salonId, null, null, null, null, null, UNPAGED_WITH_SORT))
                 .as("the Phase 23.4 single-salon path shares findIdPage, so it shares the refusal")
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage(BookingRepositoryCustomImpl.UNPAGED_REJECTED_MESSAGE);

@@ -3839,14 +3839,17 @@ class AuthorizationServiceTest {
      * {@code salonId != null} guard exists to answer.
      */
     private Booking salonBookingWithSalon(UUID bookingId, Salon salon) {
-        // The master's own User is read for EVERY row (the independent-master arm's argument is
-        // evaluated eagerly, salon rows included), so it must be stubbed even here — it just can
-        // never match the actor, because the independentMasterBooking flag is false.
+        // The master's own User is stubbed LENIENTLY: the two-pass kernel (Phase 319 audit LOW —
+        // the two batched filters were consolidated onto one) reads it ONLY on the
+        // independent-master arm, so a SALON_MASTER row never touches it. The single-pass form this
+        // replaced evaluated the independent arm's argument eagerly for every row, salon rows
+        // included, which is why these were strict stubs. Either way the value can never match the
+        // actor, because the independent-master branch is not taken for this fixture.
         User masterUser = mock(User.class);
-        when(masterUser.getId()).thenReturn(UUID.randomUUID());
+        lenient().when(masterUser.getId()).thenReturn(UUID.randomUUID());
         Master master = mock(Master.class);
         when(master.getMasterType()).thenReturn(MasterType.SALON_MASTER);
-        when(master.getUser()).thenReturn(masterUser);
+        lenient().when(master.getUser()).thenReturn(masterUser);
         when(master.getSalon()).thenReturn(salon);
         Booking booking = mock(Booking.class);
         lenient().when(booking.getId()).thenReturn(bookingId);

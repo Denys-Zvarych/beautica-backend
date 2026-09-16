@@ -2520,7 +2520,7 @@ class BookingServiceTest {
 
         assertThatThrownBy(() -> bookingService.getSalonBookings(
                         actorId, salonId, null, null,
-                        LocalDate.of(2026, 7, 31), LocalDate.of(2026, 7, 1), Pageable.unpaged()))
+                        LocalDate.of(2026, 7, 31), LocalDate.of(2026, 7, 1), null, Pageable.unpaged()))
                 .isInstanceOf(BusinessException.class)
                 .extracting(ex -> ((BusinessException) ex).getStatus())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
@@ -2541,7 +2541,7 @@ class BookingServiceTest {
                 .when(dateMath).assertSpanWithinMax(from, to);
 
         assertThatThrownBy(() -> bookingService.getSalonBookings(
-                        actorId, salonId, null, null, from, to, Pageable.unpaged()))
+                        actorId, salonId, null, null, from, to, null, Pageable.unpaged()))
                 .isInstanceOf(BusinessException.class)
                 .extracting(ex -> ((BusinessException) ex).getStatus())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
@@ -2561,15 +2561,17 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
 
         when(bookingRepository.findIdsBySalonIdFiltered(
-                        salonId, filterMasterId, Set.of(BookingStatus.CONFIRMED), null, null, normalizedUnpaged()))
+                        salonId, filterMasterId, Set.of(BookingStatus.CONFIRMED), null, null, null,
+                        normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
         var result = bookingService.getSalonBookings(
-                actorId, salonId, filterMasterId, BookingStatus.CONFIRMED, null, null, pageable);
+                actorId, salonId, filterMasterId, List.of(BookingStatus.CONFIRMED), null, null, null, pageable);
 
         assertThat(result.totalElements()).isZero();
         verify(bookingRepository).findIdsBySalonIdFiltered(
-                salonId, filterMasterId, Set.of(BookingStatus.CONFIRMED), null, null, normalizedUnpaged());
+                salonId, filterMasterId, Set.of(BookingStatus.CONFIRMED), null, null, null,
+                normalizedUnpaged());
     }
 
     @Test
@@ -2580,13 +2582,13 @@ class BookingServiceTest {
         UUID salonId = UUID.randomUUID();
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
-        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result).isNotNull();
-        verify(bookingRepository).findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged());
+        verify(bookingRepository).findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged());
     }
 
     @Test
@@ -2596,10 +2598,10 @@ class BookingServiceTest {
         UUID salonId = UUID.randomUUID();
         Pageable pageable = Pageable.unpaged();
 
-        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
                 .thenReturn(Page.empty());
 
-        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result.data()).isEmpty();
         verify(bookingRepository, never()).findAllByIdsWithGraph(any());
@@ -2613,45 +2615,50 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
         Booking existingBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
 
-        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(existingBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result.totalElements()).isEqualTo(1);
         assertThat(result.data()).hasSize(1);
     }
 
     @Test
-    @DisplayName("providerCanReviewClient is computed per row via the entity-based "
-            + "AuthorizationService#hasProviderAuthorityOverBooking predicate — SALON_ADMIN-safe, "
-            + "unlike loadProviderReviewBatch's batched filterBookingIdsWithProviderAuthority kernel, "
-            + "which throws IllegalArgumentException for that role — for a COMPLETED booking with a "
-            + "registered client")
+    @DisplayName("providerCanReviewClient is computed for the WHOLE PAGE via "
+            + "AuthorizationService#filterBookingIdsWithProviderAuthorityForCurrentActor — the "
+            + "SALON_ADMIN-safe batched kernel, unlike loadProviderReviewBatch's "
+            + "filterBookingIdsWithProviderAuthority, which throws IllegalArgumentException for "
+            + "that role — for a COMPLETED booking with a registered client. Re-pointed from the "
+            + "per-row entity predicate by the Phase 319 audit N+1 fix (backend-perf MEDIUM): the "
+            + "per-row form cost one proxy-init plus one existsByIdAndOwnerId PER ROW once a "
+            + "master had rotated to another salon.")
     void should_computeProviderCanReviewClient_when_bookingIsCompletedWithRegisteredClient() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         Pageable pageable = Pageable.unpaged();
         Booking completedBooking = buildBooking(bookingId, client, master, msa, BookingStatus.COMPLETED);
 
-        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(completedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
         when(clientReviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
-        when(authz.hasProviderAuthorityOverBooking(actorId, completedBooking)).thenReturn(true);
+        when(authz.filterBookingIdsWithProviderAuthorityForCurrentActor(actorId, List.of(completedBooking)))
+                .thenReturn(Set.of(bookingId));
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).providerCanReviewClient()).isTrue();
-        verify(authz).hasProviderAuthorityOverBooking(actorId, completedBooking);
+        verify(authz).filterBookingIdsWithProviderAuthorityForCurrentActor(actorId, List.of(completedBooking));
+        verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
     }
 
     @Test
@@ -2664,19 +2671,355 @@ class BookingServiceTest {
         Pageable pageable = Pageable.unpaged();
         Booking confirmedBooking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
 
-        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, normalizedUnpaged()))
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
                 .thenReturn(new PageImpl<>(List.of(bookingId)));
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(confirmedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
-        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, pageable);
+        var result = bookingService.getSalonBookings(actorId, salonId, null, null, null, null, null, pageable);
 
         assertThat(result.data()).hasSize(1);
         assertThat(result.data().get(0).providerCanReviewClient()).isFalse();
         verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
+        // Phase 319 audit — the cost gate now short-circuits the PAGE-scoped batch, so the gate is
+        // asserted against the collaborator that actually issues the statement. Without this the
+        // assertion above would be vacuous: the per-row method is no longer called on this path at
+        // all, so `never()` on it would stay green even if the batch ran unconditionally.
+        verify(authz, never()).filterBookingIdsWithProviderAuthorityForCurrentActor(any(), any());
         verifyNoInteractions(clientReviewRepository);
+    }
+
+    // ── Phase 319 — GET /bookings/salon/{salonId} filter parity with GET /bookings/me ────────
+    //
+    // The mobile salon «Записи» board previously narrowed status and service CLIENT-side over a
+    // page that truncates at 100 (spring.data.web.pageable.max-page-size, Anti-Bug §J), so a salon
+    // day with more than 100 bookings filtered a TRUNCATED set. These tests pin the predicates
+    // reaching the repository instead, and the normalisation that must happen exactly once.
+
+    @Test
+    @DisplayName("a repeatable status list reaches the repository as a multi-value EnumSet — the "
+            + "server-side predicate mobile needs, not the one-element Set the pre-319 single "
+            + "?status= produced")
+    void should_passMultiValueStatusSet_when_statusListHasSeveralValues() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        Set<BookingStatus> expected = EnumSet.of(BookingStatus.CONFIRMED, BookingStatus.COMPLETED);
+
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, null, expected, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getSalonBookings(
+                actorId, salonId,
+                null, List.of(BookingStatus.CONFIRMED, BookingStatus.COMPLETED),
+                null, null, null, Pageable.unpaged());
+
+        assertThat(result.totalElements()).isZero();
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                salonId, null, expected, null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("a single-element status list still reaches the repository as the same one-element "
+            + "EnumSet the pre-319 single ?status= produced — this is what makes the widening "
+            + "backward compatible for every existing caller")
+    void should_passOneElementStatusSet_when_statusListHasOneValue() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, null, Set.of(BookingStatus.CANCELLED), null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, null, List.of(BookingStatus.CANCELLED), null, null, null, Pageable.unpaged());
+
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                salonId, null, Set.of(BookingStatus.CANCELLED), null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("an EMPTY status list passes through as null, never an empty Set — an empty Set "
+            + "would compile to a dead IN () and EnumSet.copyOf would throw on it outright")
+    void should_passNullStatuses_when_statusListIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        // serviceId is null, not List.of(), so this test isolates the STATUS arm: an empty
+        // serviceId list has its own pin below (should_passNullServiceIds_when_serviceIdListIsEmpty)
+        // and must not be able to keep this one green, nor this one keep that one green.
+        bookingService.getSalonBookings(
+                actorId, salonId, null, List.of(), null, null, null, Pageable.unpaged());
+
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                salonId, null, null, null, null, null, normalizedUnpaged());
+    }
+
+    @Test
+    @DisplayName("an EMPTY serviceId list passes through as null on the SALON path too, never an "
+            + "empty Set — the salon-path twin of the status pin above (backend-perf LOW, QA 2026-09-16)")
+    void should_passNullServiceIds_when_serviceIdListIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(salonId, null, null, null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, null, null, null, null, List.of(), Pageable.unpaged());
+
+        var captor = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                eq(salonId), eq(null), eq(null), eq(null), eq(null), captor.capture(),
+                eq(normalizedUnpaged()));
+        assertThat(captor.getValue())
+                .as("normalizeServiceIdFilter must hand the repository null, never an empty Set — "
+                        + "that is the contract EVERY BookingRepositoryCustom javadoc states, and "
+                        + "today it is held up ONLY by applyServiceFilter's defensive "
+                        + "null-or-empty guard. Nothing pins the service side of it, so a "
+                        + "regression to Set.of() would be invisible until a caller that is not "
+                        + "that helper (a native query, or a JPQL ':serviceIds IS NULL OR' arm) "
+                        + "turned it into a dead IN () matching nothing")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("a repeatable serviceId list reaches the repository de-duplicated and "
+            + "insertion-ordered, matching MasterService ids — the server-side service predicate")
+    void should_passDeduplicatedServiceIds_when_serviceIdListProvided() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID serviceA = UUID.randomUUID();
+        UUID serviceB = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, null, null, null, null, Set.of(serviceA, serviceB), normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, null, null, null, null,
+                List.of(serviceA, serviceB, serviceA), Pageable.unpaged());
+
+        var captor = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                eq(salonId), eq(null), eq(null), eq(null), eq(null), captor.capture(),
+                eq(normalizedUnpaged()));
+        assertThat(captor.getValue())
+                .as("the duplicate must collapse before the IN list is built")
+                .containsExactly(serviceA, serviceB);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when more than 50 distinct serviceId values are supplied — "
+            + "the same MAX_SERVICE_ID_FILTER bound GET /bookings/me enforces, hit BEFORE any query "
+            + "runs (Anti-Bug §B1: bounded collections only)")
+    void should_throwBadRequest_when_salonServiceIdFilterExceedsCap() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        List<UUID> tooMany = java.util.stream.Stream.generate(UUID::randomUUID).limit(51).toList();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null, null, null, tooMany, Pageable.unpaged()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    // ── Phase 319 step 5 — ACCEPTANCE CRITERIA FOR A QUEUED FIX, NOT YET IMPLEMENTED ─────────
+    //
+    // backend-perf raised it and QA confirmed it independently (2026-09-16): BookingService:1008
+    // (salon) and BookingService:731 (/me) both gate the span cap behind `from != null && to !=
+    // null`, so a request carrying ONLY a serviceId predicate and no range — or a half-open range
+    // with just `from` — reaches the query with NO starts_at bound at all and scans the salon's (or
+    // the provider's) entire booking history. The serviceId predicate has no index of its own, so
+    // this is the worst-case shape the phase introduces, and the mobile board can send it: the
+    // service chips are usable with the day rail cleared.
+    //
+    // THESE TWO TESTS ARE RED AGAINST TODAY'S CODE (QA verified by enabling them: both fail with
+    // "Expecting code to raise a throwable"). They are @Disabled so the suite stays green for the
+    // pre-fix commit, and they were written as the acceptance criterion for a range-required guard.
+    //
+    // ── 2026-09-16, backend-dev: THE GUARD THEY SPECIFY CANNOT BE IMPLEMENTED AS WRITTEN. ──
+    //
+    // They stay @Disabled and UNCHANGED (assertions byte-identical) because enabling them requires
+    // a behaviour that contradicts three things that are already green and/or already shipped.
+    // Recorded here so the next reader does not re-attempt it:
+    //
+    //   1. BookingSalonBookingsIT#should_paginateServiceFilteredListOverExactOrderedGroundTruth —
+    //      the test the SAME audit designates as the semantics pin that must stay green — calls
+    //      `GET /bookings/salon/{id}?serviceId=X&page=&size=` with NO from/to at all
+    //      (callSalonBookingsPaged, whose javadoc says the range is "deliberately NOT passed"), and
+    //      asserts 200 over rows seeded at 2032-03-01. A 400 turns it red; so does a DEFAULT
+    //      WINDOW, since any window anchored near "now" excludes rows six years out.
+    //   2. BookingServiceTest#should_passDeduplicatedServiceIds_when_serviceIdListProvided and
+    //      #should_acceptServiceIdFilter_when_exactly50DistinctValuesAtTheCountBound — the former
+    //      authored in this very phase — both call the service with a serviceId list and no range
+    //      and assert the repository IS reached. They are the direct negation of these two.
+    //   3. beautica-mobile master_archive_notifier.dart:275 ships `getMyBookings(serviceIds: ...)`
+    //      with no from/to on every «Архів» fetch. A 400 breaks a RELEASED screen the moment a
+    //      user taps a service chip — an unannounced breaking change to a shipped API.
+    //
+    // The underlying concern is real and is NOT dismissed; it is addressed differently. V166's
+    // (salon_id, master_service_id, starts_at DESC) index turns the unbounded salon-scope
+    // serviceId query into an index-ordered range scan with LIMIT pushdown rather than the
+    // history-wide scan the finding describes. The /me twin has had its master-scope equivalent,
+    // (master_id, master_service_id, starts_at), since V117. What remains unindexed on either
+    // route is only the COUNT(*) companion.
+    //
+    // Enabling these requires a PRODUCT decision to break the /me serviceId contract (and a
+    // coordinated mobile change), not a backend-dev judgement call. Do NOT delete them, and do NOT
+    // rewrite them to match whatever is implemented — they are the record of what was asked for.
+
+    @Test
+    @org.junit.jupiter.api.Disabled("Phase 319 step 5 — CANNOT BE ENABLED AS WRITTEN: a 400 (or a "
+            + "default window) here turns should_paginateServiceFilteredListOverExactOrderedGroundTruth "
+            + "red and breaks the shipped mobile «Архів» screen. See the block comment above.")
+    @DisplayName("BusinessException(400) when ?serviceId is supplied to the SALON list with no "
+            + "bounded date range — an unbounded serviceId scan has no index to fall back on")
+    void should_return400_when_salonListRangeUnbounded() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID serviceId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null, null, null, List.of(serviceId), Pageable.unpaged()))
+                .as("no range at all: neither bound present, so assertSpanWithinMax never fires today")
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null, LocalDate.of(2026, 1, 1), null,
+                        List.of(serviceId), Pageable.unpaged()))
+                .as("half-open range: 'from' alone still leaves the future side unbounded, and the "
+                        + "`from != null && to != null` conjunction still skips the span cap")
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @org.junit.jupiter.api.Disabled("Phase 319 step 5 — CANNOT BE ENABLED AS WRITTEN: "
+            + "should_acceptServiceIdFilter_when_exactly50DistinctValuesAtTheCountBound asserts the "
+            + "exact opposite on this same method, and mobile's «Архів» screen ships this request "
+            + "shape today. See the block comment above.")
+    @DisplayName("BusinessException(400) when ?serviceId is supplied to GET /bookings/me with no "
+            + "bounded date range — BookingService:731 carries the identical unguarded shape, so "
+            + "fixing only the salon route would leave the same scan reachable on /me")
+    void should_return400_when_myBookingsRangeUnbounded() {
+        UUID serviceId = UUID.randomUUID();
+        Pageable pageable = PageRequest.of(0, 20);
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        clientId, buildAuth(Role.CLIENT), null, null, null, List.of(serviceId), pageable))
+                .as("no range at all on /me")
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThatThrownBy(() -> bookingService.getMyBookings(
+                        clientId, buildAuth(Role.CLIENT), null, LocalDate.of(2026, 1, 1), null,
+                        List.of(serviceId), pageable))
+                .as("half-open range on /me")
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verifyNoInteractions(bookingRepository);
+    }
+
+    // ── Phase 319 — GET /bookings/salon/{salonId}/booked-days ────────────────────────────────
+
+    @Test
+    @DisplayName("the salon's booked days are read via findBookedDatesBySalonIds scoped to exactly "
+            + "this ONE salon — never the caller's whole owned-salon aggregate the /me variant uses")
+    void should_querySingleSalonScope_when_listingSalonBookedDays() {
+        UUID salonId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 7, 1);
+        LocalDate to = LocalDate.of(2026, 7, 31);
+        OffsetDateTime fromTs = from.atStartOfDay(com.beautica.common.TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime toExclusive =
+                to.plusDays(1).atStartOfDay(com.beautica.common.TimeZones.KYIV).toOffsetDateTime();
+
+        when(bookingRepository.findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive))
+                .thenReturn(List.of(java.sql.Date.valueOf(LocalDate.of(2026, 7, 5)),
+                        java.sql.Date.valueOf(LocalDate.of(2026, 7, 20))));
+
+        List<LocalDate> days = bookingService.getSalonBookedDays(salonId, from, to);
+
+        assertThat(days)
+                .as("the raw java.sql.Date rows must be converted in the service, never declared as "
+                        + "LocalDate on a native scalar projection (ConverterNotFoundException)")
+                .containsExactly(LocalDate.of(2026, 7, 5), LocalDate.of(2026, 7, 20));
+        verify(bookingRepository).findBookedDatesBySalonIds(List.of(salonId), fromTs, toExclusive);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is missing for salon booked-days — the range "
+            + "is REQUIRED, because an unbounded default would scan the salon's whole history")
+    void should_throwBadRequest_when_salonBookedDaysFromIsNull() {
+        UUID salonId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookedDays(salonId, null, LocalDate.of(2026, 7, 31)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'to' is missing for salon booked-days")
+    void should_throwBadRequest_when_salonBookedDaysToIsNull() {
+        UUID salonId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookedDays(salonId, LocalDate.of(2026, 7, 1), null))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("BusinessException(400) when 'from' is after 'to' for salon booked-days")
+    void should_throwBadRequest_when_salonBookedDaysFromIsAfterTo() {
+        UUID salonId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookedDays(
+                        salonId, LocalDate.of(2026, 7, 31), LocalDate.of(2026, 7, 1)))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    @Test
+    @DisplayName("the 366-day span cap for salon booked-days is delegated to "
+            + "ScheduleDateMath.assertSpanWithinMax, not re-implemented inline")
+    void should_delegateSpanCap_toScheduleDateMathForSalonBookedDays() {
+        UUID salonId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2026, 1, 1);
+        LocalDate to = LocalDate.of(2027, 6, 1);
+
+        org.mockito.Mockito.doThrow(
+                        new BusinessException(HttpStatus.BAD_REQUEST, "Date range exceeds the maximum of 366 days"))
+                .when(dateMath).assertSpanWithinMax(from, to);
+
+        assertThatThrownBy(() -> bookingService.getSalonBookedDays(salonId, from, to))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        verify(dateMath).assertToPlusOneDayRepresentable(to);
+        verify(dateMath).assertSpanWithinMax(from, to);
+        verifyNoInteractions(bookingRepository);
     }
 
     // ── Finding 1: SALON_OWNER multi-salon tests ───────────────────────────────

@@ -118,6 +118,24 @@ import java.util.UUID;
                 // master's TOTAL row count, not the service's). Converts that shape to a direct
                 // index-range seek on (master_id, master_service_id).
                 @Index(name = "idx_bookings_master_service_starts_at", columnList = "master_id, master_service_id, starts_at"),
+                // composite index (V166): the SALON-scope twin of the index directly above —
+                // GET /bookings/salon/{salonId}?serviceId=... (Phase 319). The master-scope index
+                // cannot serve it (master_id is not a prefix of the salon query's predicate), and
+                // without this one the planner leads with idx_bookings_master_service_id (V18, the
+                // bare FK index) whenever the filtered service is a small slice of the salon's
+                // volume — the normal case — discarding the salon scope to a post-scan Filter and
+                // losing LIMIT pushdown to a blocking Sort. V166 carries the measured EXPLAIN on
+                // both sides. JPA cannot encode the DESC sort direction; the migration declares
+                // (salon_id, master_service_id, starts_at DESC) and this annotation mirrors the
+                // columns for reader accuracy only — ddl-auto=validate does NOT check
+                // @Table(indexes=...) against the real schema (see the V118 note above).
+                //
+                // The three OTHER salon-scope indexes on this table — idx_bookings_salon_starts_at
+                // (V19), idx_bookings_salon_status_starts_at (V22/V113) and
+                // idx_bookings_salon_master_starts_at (V148) — have never been mirrored here. That
+                // is a PRE-EXISTING gap, not a statement that they do not exist; do not infer from
+                // their absence that a salon-scope index is missing from the schema.
+                @Index(name = "idx_bookings_salon_service_starts_at", columnList = "salon_id, master_service_id, starts_at"),
                 // partial index (V112, predicate narrowed by V113): client-scoped cross-master/salon
                 // overlap check (BookingRepository.findFirstConflictingClientBookingId[Excluding]).
                 // JPA cannot encode WHERE status = 'CONFIRMED' AND client_id IS NOT NULL — the
