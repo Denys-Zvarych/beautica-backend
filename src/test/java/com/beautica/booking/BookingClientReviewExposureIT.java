@@ -198,25 +198,32 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
     /**
      * Statements for a detail read whose review gate is OPEN — COMPLETED, real client, elapsed.
      * <b>DERIVED FROM A RUN, never predicted</b> (first measured 2026-09-15: gate-closed 2,
-     * gate-open 4).
+     * gate-open 4; <b>re-measured 2026-09-16 after Phase 320: gate-closed 2, gate-open 3</b>).
      *
-     * <p>Reconciliation, and the reason the delta asserted below is TWO rather than the one phase
-     * 317's javadoc might lead a reader to expect. {@code hasClient && eligibleByStatusAndTime}
-     * opens <b>two</b> independent lookups at once, on the same fixture, and no fixture can separate
-     * them — {@code BookingClosureRule#isReviewEligible} and {@code #isProviderReviewEligible} are
-     * both false for every shape that closes one of them:
+     * <p><b>Why it moved 4 &rarr; 3, and the delta 2 &rarr; 1.</b> The open branch used to issue
+     * <b>two</b> independent lookups that no fixture could separate:
      * <ol>
      *   <li>{@code ReviewRepository#findViewByBookingId} — phase 317's own read, the one that
-     *       REPLACED {@code existsByBookingId};</li>
+     *       REPLACED {@code existsByBookingId}. STILL ISSUED;</li>
      *   <li>{@code ClientReviewRepository#existsByBookingId} — the phase-27.5 probe behind
-     *       {@code providerCanReviewClient}. A different TABLE ({@code client_reviews}), a different
-     *       direction, untouched by this phase, and present on this branch since long before it.</li>
+     *       {@code providerCanReviewClient}, on a different TABLE ({@code client_reviews}) in the
+     *       opposite review direction. <b>NO LONGER ISSUED for the owner this test drives.</b>
+     *       Phase 320 narrowed that flag's authority term to
+     *       {@code AuthorizationService#isPerformingMasterOfBooking} (locked product decision:
+     *       "salon owner or salon admin can complete the booking, and after it only salon master
+     *       can leave the feedback"), and this fixture's owner is not the performing master, so
+     *       {@code BookingService#providerCanReviewClient} short-circuits on authority before the
+     *       {@code Supplier} that would run the probe is ever invoked.</li>
      * </ol>
-     * So the absolute and the delta below are <b>containment</b> gates: they catch any third
-     * statement appearing on the open branch. What pins phase 317's actual claim — one {@code
-     * reviews} read, not two — is the {@code @SpyBean} verification inside the test, which names the
-     * repository methods directly and is immune to an unrelated statement drifting into either
-     * count.
+     * The probe has NOT been removed from the code — drive the same fixture as its performing
+     * master and it comes back. It is simply off the OWNER's read, which is the actor this gate
+     * measures.
+     *
+     * <p>So the absolute and the delta below remain <b>containment</b> gates: they catch any
+     * SECOND statement appearing on the open branch. What pins phase 317's actual claim — one
+     * {@code reviews} read, not two — is the {@code @SpyBean} verification inside the test, which
+     * names the repository methods directly and is immune to an unrelated statement drifting into
+     * either count.
      *
      * <p>The closed-gate side is deliberately NOT a constant: it is measured in-test and used only
      * as the baseline. It reads 2 here, not the 3 of
@@ -226,14 +233,15 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
      * {@code stampSalonLocality} fixture issues two. Re-deriving it means a legitimate change to the
      * base detail graph moves both sides together and this gate stays about the review branch alone.
      */
-    private static final long OWNER_DETAIL_STATEMENTS_REVIEW_GATE_OPEN = 4L;
+    private static final long OWNER_DETAIL_STATEMENTS_REVIEW_GATE_OPEN = 3L;
 
     /**
-     * <b>Mutation-verified (QA, 2026-09-15).</b> Restoring the pre-317 shape —
-     * {@code reviewRepository.existsByBookingId(bookingId)} back inside the {@code canReview}
-     * conjunction ALONGSIDE the new {@code findViewByBookingId}, which is how this most plausibly
-     * unravels in a later merge — moves the open-gate measurement 4 &rarr; <b>5</b> and the delta
-     * 2 &rarr; <b>3</b>, and trips the {@code never()} verification, while
+     * <b>Mutation-verified (QA, 2026-09-15; numbers restated for the Phase 320 baseline).</b>
+     * Restoring the pre-317 shape — {@code reviewRepository.existsByBookingId(bookingId)} back
+     * inside the {@code canReview} conjunction ALONGSIDE the new {@code findViewByBookingId}, which
+     * is how this most plausibly unravels in a later merge — moves the open-gate measurement
+     * 3 &rarr; <b>4</b> and the delta 1 &rarr; <b>2</b>, and trips the {@code never()}
+     * verification, while
      * {@code BookingPriceRangeContractIT}'s two detail gates (both on the CLOSED branch) and every
      * payload assertion in this class stay green. That split is what this gate exists for.
      *
@@ -241,7 +249,7 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
      * purpose: {@code findViewByBookingId} returning an empty {@link java.util.Optional} must cost
      * the same single statement as returning a row. An "optimisation" that kept
      * {@code existsByBookingId} as a cheap pre-check and only fetched the view when it said yes
-     * would leave the unreviewed reading at 4 and push the reviewed one to 5 — caught here, and
+     * would leave the unreviewed reading at 3 and push the reviewed one to 4 — caught here, and
      * nowhere else.
      */
     @Test
@@ -295,12 +303,13 @@ class BookingClientReviewExposureIT extends AbstractIntegrationTest {
                         statementsGateClosed, statementsReviewed, statementsUnreviewed)
                 .isEqualTo(OWNER_DETAIL_STATEMENTS_REVIEW_GATE_OPEN);
         assertThat(statementsReviewed - statementsGateClosed)
-                .as("containment — opening the review gate buys exactly TWO statements and no "
-                        + "third: phase 317's reviews read plus the pre-existing phase-27.5 "
-                        + "client_reviews probe. See the constant's javadoc for why these two "
-                        + "cannot be separated by any fixture (gate-closed=%s, reviewed=%s).",
+                .as("containment — opening the review gate buys exactly ONE statement and no "
+                        + "second: phase 317's reviews read. The phase-27.5 client_reviews probe "
+                        + "that used to ride along is off this OWNER's read since phase 320 "
+                        + "narrowed providerCanReviewClient to the performing master. See the "
+                        + "constant's javadoc (gate-closed=%s, reviewed=%s).",
                         statementsGateClosed, statementsReviewed)
-                .isEqualTo(2L);
+                .isEqualTo(1L);
         assertThat(statementsUnreviewed)
                 .as("an ABSENT review must cost the same single statement as a present one — a "
                         + "cheap-exists-then-fetch shape would split these two (reviewed=%s, "

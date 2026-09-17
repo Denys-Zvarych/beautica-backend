@@ -257,8 +257,8 @@ public class BookingService {
      *
      * <p>Mirrors the EXACT conditions {@code ClientReviewService.create} checks before persisting
      * a {@code ClientReview}, so this can never promise a CTA the write endpoint would then
-     * reject: (1) the actor has provider review-authority over this booking, via
-     * {@link AuthorizationService#hasProviderAuthorityOverBooking} — the same predicate
+     * reject: (1) the actor IS the booking's performing master, via
+     * {@link AuthorizationService#isPerformingMasterOfBooking} — the same predicate
      * {@code enforceCanReviewClient} throws on, reused non-throwing here rather than
      * re-derived; (2) {@link BookingClosureRule#isProviderReviewEligible} — {@code status ==
      * COMPLETED}, STRICTLY, unlike the client-side {@code canReview} flag's {@link
@@ -271,14 +271,20 @@ public class BookingService {
      * exists for this booking. A CLIENT viewer always fails condition (1), so this correctly reads
      * {@code false} for them without any special-casing here.
      *
-     * <p><b>Phase 316 — a {@code SALON_MASTER} viewer no longer always fails condition (1).</b>
-     * They pass it on, and ONLY on, the booking whose performing master they are ({@link
-     * AuthorizationService#isPerformingMasterOfBooking}); a colleague's booking at the same salon
-     * still reads {@code false}, because the union's other arm ({@link
-     * AuthorizationService#hasProviderAuthorityOverBooking}) is unchanged and its salon leg admits
-     * only owner/admin. This is the whole of the capability that phase grants the read-only role —
-     * {@code /complete}, {@code /not-complete}, {@code /decline} and {@code /reschedule} keep
-     * rejecting them, by role, before any booking is loaded.
+     * <p><b>Phase 320 — condition (1) is the PERFORMING MASTER, and nothing else.</b> Phase 316
+     * added the performer as a union arm alongside
+     * {@link AuthorizationService#hasProviderAuthorityOverBooking}; the locked product decision
+     * ("salon owner or salon admin can complete the booking, and after it only salon master can
+     * leave the feedback") removes that second arm. A {@code SALON_MASTER} reads {@code true} on,
+     * and only on, the booking they themselves performed; a {@code SALON_OWNER} or {@code
+     * SALON_ADMIN} reads {@code false} on a booking one of their masters performed, even though
+     * they closed it — an owner-as-master row ({@code master_type = 'SALON_OWNER'}) is the one
+     * shape that still reads {@code true} for an owner, because the predicate compares
+     * {@code booking.master.user_id} and never consults role or salon. {@code /complete},
+     * {@code /not-complete}, {@code /decline} and {@code /reschedule} are UNAFFECTED: they run off
+     * {@link AuthorizationService#hasProviderAuthorityOverBooking}, which this change does not
+     * touch, so owner and admin keep every one of them and a salon master is still rejected from
+     * all four by role before any booking is loaded.
      *
      * <p><b>Phase-242 QA audit, finding 2 (MEDIUM) — the leading
      * {@link AuthorizationService#isOwningClientViewer} gate is a COST gate, not a decision.</b>
@@ -316,14 +322,18 @@ public class BookingService {
      *            of what this method does with it, so leave it here rather than chase the ripple.
      */
     private boolean computeProviderCanReviewClient(UUID actorUserId, Booking booking, OffsetDateTime now) {
-        // Phase 316 — the SAME union AuthorizationService#enforceCanReviewClient throws on, in the
-        // same order, so this flag can never promise a CTA POST /client-reviews would then reject.
-        // isPerformingMasterOfBooking leads for the same reason it leads there: it is a free
-        // identifier read that short-circuits the master.getSalon()/getOwner() proxy walk
-        // hasProviderAuthorityOverBooking would otherwise make for a SALON_MASTER viewer.
+        // Phase 320 — the SAME single term AuthorizationService#enforceCanReviewClient throws on,
+        // so this flag can never promise a CTA POST /client-reviews would then reject. What used to
+        // be a union with hasProviderAuthorityOverBooking is gone: an owner or admin may still
+        // CLOSE the booking, but only the master who performed it may rate its client.
+        //
+        // The leading isOwningClientViewer gate STAYS, and is still a cost gate rather than a
+        // decision (see this method's javadoc). It is cheaper still now — it keeps the owning client
+        // out of a master.getUser()/isActive() read — and it remains unable to change the answer: a
+        // bookings.client_id row is a Role.CLIENT row asserted at insert and can never equal
+        // masters.user_id.
         boolean hasProviderAuthority = !authz.isOwningClientViewer(actorUserId, booking)
-                && (authz.isPerformingMasterOfBooking(actorUserId, booking)
-                        || authz.hasProviderAuthorityOverBooking(actorUserId, booking));
+                && authz.isPerformingMasterOfBooking(actorUserId, booking);
         return providerCanReviewClient(
                 hasProviderAuthority, booking.getStatus(),
                 booking.getClient() != null,
@@ -944,19 +954,18 @@ public class BookingService {
      * BookingSpecifications#salonIdIn}'s multi-salon aggregate shape, keyed off the master's LIVE
      * affiliation instead).
      *
-     * <p><b>{@code providerCanReviewClient} authority is computed per row</b> via {@link
-     * AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)} — the same public,
-     * entity-based predicate {@link #getBooking} already uses for a single row — rather than
-     * {@link #loadProviderReviewBatch}'s page-batched {@code
-     * AuthorizationService#filterBookingIdsWithProviderAuthority}, which explicitly THROWS {@code
-     * IllegalArgumentException} for {@code SALON_ADMIN} ("add the assigned-salon arm before
-     * routing admins to this path" — this endpoint is the first caller that would need it, and
-     * extending that heavily-audited, {@code GET /bookings/me}-shared batch kernel was judged
-     * riskier than the bounded per-row cost paid here). The per-row call is gated behind the same
-     * cheap in-memory {@code isReviewCandidate} check {@link #loadProviderReviewBatch} uses as its
-     * own cost gate (client present AND {@link BookingClosureRule#isProviderReviewEligible}), so
-     * it only runs for rows that could possibly flip the flag — bounded by page size (capped
-     * globally at 100 — Anti-Bug §J), never by the salon's total booking volume.
+     * <p><b>{@code providerCanReviewClient} authority is computed per row, in memory</b> via
+     * {@link AuthorizationService#isPerformingMasterOfBooking} — the same predicate
+     * {@link #getBooking} uses for a single row and {@link #loadProviderReviewBatch} uses for the
+     * {@code GET /bookings/me} page, so all three surfaces answer identically. Since Phase 320
+     * that is the WHOLE predicate (only the booking's performing master may review its client), so
+     * the per-row call issues no statement at all: {@code findAllByIdsWithGraph} already
+     * materialises {@code masters.user_id} and {@code masters.is_active}. See
+     * {@link #resolveSalonPageProviderAuthority}. It is still gated behind the cheap in-memory
+     * {@code isReviewCandidate} check (client present AND
+     * {@link BookingClosureRule#isProviderReviewEligible}), so it only runs for rows that could
+     * possibly flip the flag — bounded by page size (capped globally at 100 — Anti-Bug §J), never
+     * by the salon's total booking volume.
      *
      * <p><b>Index coverage (Phase 23.4 audit fix, Finding 2 — corrects a stale citation).</b>
      * {@code idx_bookings_salon_status_starts_at} was originally added by V22, but V113 rebuilt it
@@ -1100,18 +1109,23 @@ public class BookingService {
      * The rows of ONE salon-board page the actor holds provider review-authority over, resolved in
      * a bounded number of statements that does not scale with page size.
      *
-     * <p><b>Phase 319 audit (MEDIUM, backend-perf) — the N+1 this replaces.</b> The per-row form
-     * this supersedes called {@code authz.hasProviderAuthorityOverBooking(actorUserId, b)} inside
-     * the response-mapping lambda. That is free only by an identity-map coincidence — {@code
-     * master.getSalon()} resolving to the {@code Salon} {@code findAllByIdsWithGraph} already
-     * fetched — which holds for a master still assigned to the salon the booking was made at and
-     * evaporates for a ROTATED one: the {@code Salon} proxies had to be initialised (in batches of
-     * {@code hibernate.default_batch_fetch_size}, so {@code ceil(k/50)} statements for {@code k}
-     * distinct foreign salons — NOT one apiece) and then, because the in-memory owner comparison
-     * necessarily failed, an {@code existsByIdAndOwnerId} PER ROW, which is the arm that actually
-     * scaled. See
-     * {@code AuthorizationService#filterBookingIdsWithProviderAuthorityForCurrentActor} for the
-     * batched shape and for why it returns the identical answer.
+     * <p><b>Phase 320 — ZERO authorization statements, because there is no salon arm left to
+     * resolve.</b> Phase 319 replaced a per-row {@code hasProviderAuthorityOverBooking} N+1 with a
+     * batched, page-scoped salon-ownership lookup
+     * ({@code AuthorizationService#filterBookingIdsWithProviderAuthorityForCurrentActor}). The
+     * locked product decision — "salon owner or salon admin can complete the booking, and after it
+     * only salon master can leave the feedback" — makes that whole lookup dead weight: the review
+     * flag is now exactly {@code master.user_id == actor && master.is_active}, both of which
+     * {@code findAllByIdsWithGraph} has already materialised via {@code JOIN FETCH b.master m} +
+     * {@code LEFT JOIN FETCH m.user}. The batched method was deleted with this change; that is why
+     * this method issues nothing at all, on a rotated page as much as a non-rotated one.
+     *
+     * <p><b>This does NOT narrow who may close a booking.</b> {@code /complete}, {@code
+     * /not-complete}, {@code /decline} and {@code /reschedule} still run off the untouched {@code
+     * AuthorizationService#hasProviderAuthorityOverBooking}, so the owner and admin who reach this
+     * board keep all four. They simply read {@code providerCanReviewClient: false} on a booking one
+     * of their masters performed — and {@code true} on an owner-as-master row, whose {@code
+     * masters.user_id} IS the owner.
      *
      * <p><b>The two pre-filters are pure cost gates and cannot change any row's flag</b> —
      * identical in both content and order to the conjuncts {@link #providerCanReviewClient}
@@ -1122,17 +1136,15 @@ public class BookingService {
      * semantics-preserving; it is the same short-circuit the caller previously spelled as
      * {@code isReviewCandidate &&}.
      *
-     * <p><b>The Phase 316 performer/authority union is preserved verbatim</b>, and partitioned
-     * rather than unioned after the fact so the batched salon lookup is handed only the rows it can
-     * still decide. It is OUTCOME-EQUIVALENT on this endpoint today but NOT structurally inert: the
-     * {@code @PreAuthorize} narrows callers to {@code SALON_OWNER}/{@code SALON_ADMIN}, and a
-     * {@code SALON_OWNER} very much CAN be a {@code masters.user_id} — {@code
-     * MasterService#createMasterForOwner} builds an owner-as-master row with
-     * {@code .user(owner).masterType(SALON_OWNER)}. The performer arm is simply redundant there,
-     * because the salon arm already admits the owner of the booking's salon and the
-     * {@code /client-reviews} write gate carries the identical union, so a CTA shown here is always
-     * honoured. It is kept because a bare salon-arm call would be the one place the union goes
-     * missing if that role list ever widens to a role the salon arm does not already cover.
+     * <p><b>The performer term is now the WHOLE predicate, and on this board it is load-bearing
+     * rather than redundant.</b> The {@code @PreAuthorize} narrows callers to {@code
+     * SALON_OWNER}/{@code SALON_ADMIN}, and a {@code SALON_OWNER} very much CAN be a {@code
+     * masters.user_id} — {@code MasterService#createMasterForOwner} builds an owner-as-master row
+     * with {@code .user(owner).masterType(SALON_OWNER)}. Before Phase 320 the salon arm already
+     * admitted that owner and the performer arm merely agreed; now the performer arm is the only
+     * thing that distinguishes an owner's OWN performed bookings (true) from their staff's (false),
+     * which is exactly the distinction the locked decision asks for. The {@code /client-reviews}
+     * write gate carries the identical single term, so a CTA shown here is always honoured.
      *
      * <p>{@code authz.isPerformingMasterOfBooking} issues no statement here for the same reason it
      * issues none in {@link #loadProviderReviewBatch}: {@code findAllByIdsWithGraph} carries
@@ -1147,17 +1159,10 @@ public class BookingService {
         if (candidates.isEmpty()) {
             return Set.of();
         }
-        Map<Boolean, List<Booking>> byPerformer = candidates.stream()
-                .collect(Collectors.partitioningBy(b -> authz.isPerformingMasterOfBooking(actorUserId, b)));
-        Set<UUID> withAuthority = byPerformer.get(true).stream()
+        return candidates.stream()
+                .filter(b -> authz.isPerformingMasterOfBooking(actorUserId, b))
                 .map(Booking::getId)
-                .collect(Collectors.toCollection(HashSet::new));
-        List<Booking> remaining = byPerformer.get(false);
-        if (!remaining.isEmpty()) {
-            withAuthority.addAll(
-                    authz.filterBookingIdsWithProviderAuthorityForCurrentActor(actorUserId, remaining));
-        }
-        return withAuthority;
+                .collect(Collectors.toSet());
     }
 
     /**
@@ -1558,7 +1563,7 @@ public class BookingService {
         Set<UUID> reviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(idPage.getContent()));
         // Same batching discipline for the provider->client direction: at most two more bounded
         // statements for the WHOLE page, never a per-row probe. See loadProviderReviewBatch.
-        ProviderReviewBatch providerReview = loadProviderReviewBatch(role, actorUserId, hydrated);
+        ProviderReviewBatch providerReview = loadProviderReviewBatch(actorUserId, hydrated);
         DiscoveryLabels labels = resolveBookingLabels(hydrated);
 
         // Restore the original ordering dictated by the pageable sort — the IN clause
@@ -1611,12 +1616,15 @@ public class BookingService {
      * Batched counterpart of the two per-row lookups {@link #computeProviderCanReviewClient} makes
      * on the single-booking detail path, for the {@code GET /bookings/me} provider listing.
      *
-     * <p><b>Adds at most TWO statements per page request, and neither scales with page size:</b>
-     * one {@code SalonRepository#findIdsByIdInAndOwnerId} over the page's DE-DUPLICATED live-salon
-     * ids (inside {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, skipped
-     * outright when every master on the page is independent — and, since phase 316, also when every
-     * remaining candidate is one the actor performed themselves) and one
-     * {@code ClientReviewRepository#findReviewedBookingIds} over a single bounded {@code IN} list.
+     * <p><b>Phase 320 — adds at most ONE statement per page request, and it does not scale with
+     * page size:</b> a single {@code ClientReviewRepository#findReviewedBookingIds} over a bounded
+     * {@code IN} list. The second statement this used to issue — {@code
+     * SalonRepository#findIdsByIdInAndOwnerId} over the page's de-duplicated live-salon ids, inside
+     * the now-deleted {@code AuthorizationService#filterBookingIdsWithProviderAuthority} — is gone
+     * with the salon arm of the review predicate itself: only the performing master may review the
+     * client, so no salon-ownership answer could change a row's flag. Owner and admin keep {@code
+     * /complete}, {@code /not-complete}, {@code /decline} and {@code /reschedule} — those run off
+     * the untouched {@code AuthorizationService#hasProviderAuthorityOverBooking}.
      * The alternative — calling {@link #computeProviderCanReviewClient} per row — is a double N+1:
      * an authority query AND a {@code client_reviews} probe for every row, plus a live-salon proxy
      * initialisation per distinct salon.
@@ -1643,16 +1651,14 @@ public class BookingService {
      * own. Adding it would buy nothing and would introduce a {@code SecurityContext} read on a path
      * that is called directly, without one, by {@code BookingPriceRangeContractIT}.
      *
-     * <p><b>{@code role} is passed through purely as an assertion.</b>
-     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} has no {@code SALON_ADMIN}
-     * arm and now throws rather than silently answering "no authority" for one; the role dispatch in
-     * {@link #listProviderBookings} already rejects {@code SALON_ADMIN} with a
-     * {@code ForbiddenException} before any row is hydrated, so that throw is unreachable from here.
-     * It exists so that relaxing the dispatch fails loudly instead of quietly under-reporting an
-     * assigned admin's authority.
+     * <p><b>The {@code role} parameter is GONE (Phase 320).</b> It existed only to assert into
+     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, which rejected {@code
+     * SALON_ADMIN}; with that call deleted the batch no longer consults the actor's role at all —
+     * the predicate is an identity comparison against {@code masters.user_id}, which no role can
+     * widen. {@link #listProviderBookings}'s own dispatch still rejects {@code SALON_ADMIN} before
+     * any row is hydrated, unchanged.
      */
-    private ProviderReviewBatch loadProviderReviewBatch(
-            Role role, UUID actorUserId, List<Booking> page) {
+    private ProviderReviewBatch loadProviderReviewBatch(UUID actorUserId, List<Booking> page) {
         // This b.getClient() != null pre-filter is what makes providerCanReviewClient's own
         // hasClient conjunct unreachable on THIS path — a guest/STAFF row never reaches
         // withAuthority, so it is already false by the authority term. That redundancy is retained
@@ -1666,28 +1672,25 @@ public class BookingService {
         if (candidates.isEmpty()) {
             return ProviderReviewBatch.EMPTY;
         }
-        // Phase 316 — the page-scoped form of computeProviderCanReviewClient's leading disjunct.
-        // Partitioned rather than unioned after the fact so the batched salon-ownership lookup is
-        // handed only the rows it can still decide: a SALON_MASTER's page is entirely their own
-        // performed bookings, so `remaining` is empty and findIdsByIdInAndOwnerId — a statement
-        // that could only ever answer "no" for a master — is skipped outright.
+        // Phase 320 — the page-scoped form of computeProviderCanReviewClient's ONLY remaining term.
+        // The batched salon-ownership arm this used to union in
+        // (AuthorizationService#filterBookingIdsWithProviderAuthority) is deleted: only the
+        // performing master may review the client, so a salon-ownership answer could no longer
+        // change any row's flag. The listing therefore issues ZERO authorization statements for
+        // every provider role, not just for a SALON_MASTER whose page happened to be entirely their
+        // own bookings.
+        //
         // AuthorizationService#isPerformingMasterOfBooking issues no statement here because
         // findAllByIdsWithGraph — the query that hydrated `candidates` — carries JOIN FETCH b.master
         // m + LEFT JOIN FETCH m.user, so both the user id and masters.is_active it reads are already
         // in the persistence context. It is NOT free by virtue of being an identifier read: Master
         // and User use field-access @Id, so a genuine proxy WOULD initialise. Drop either fetch join
-        // and this partition becomes an N+1 per page
+        // and this filter becomes an N+1 per page
         // (BookingPriceRangeContractIT#SALON_MASTER_REVIEWABLE_PAGE_STATEMENTS is the gate).
-        Map<Boolean, List<Booking>> byPerformer = candidates.stream()
-                .collect(Collectors.partitioningBy(b -> authz.isPerformingMasterOfBooking(actorUserId, b)));
-        List<Booking> remaining = byPerformer.get(false);
-        Set<UUID> withAuthority = byPerformer.get(true).stream()
+        Set<UUID> withAuthority = candidates.stream()
+                .filter(b -> authz.isPerformingMasterOfBooking(actorUserId, b))
                 .map(Booking::getId)
                 .collect(Collectors.toCollection(HashSet::new));
-        if (!remaining.isEmpty()) {
-            withAuthority.addAll(
-                    authz.filterBookingIdsWithProviderAuthority(role, actorUserId, remaining));
-        }
         if (withAuthority.isEmpty()) {
             return ProviderReviewBatch.EMPTY;
         }

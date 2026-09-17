@@ -638,26 +638,33 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // 6 — providerCanReviewClient wiring for SALON_ADMIN over a COMPLETED booking
+    // 6 — providerCanReviewClient on the salon board (Phase 320: performer-only)
     // ══════════════════════════════════════════════════════════════════════════
     //
-    // getSalonBookings resolves providerCanReviewClient through the PAGE-BATCHED
-    // AuthorizationService#filterBookingIdsWithProviderAuthorityForCurrentActor (Phase 319 audit,
-    // MEDIUM — it was per-row via the entity-based hasProviderAuthorityOverBooking(UUID, Booking)
-    // overload when this test was written). That batched form DOES answer SALON_ADMIN, through
-    // manageableSalonIds' assigned-salon arm — unlike loadProviderReviewBatch's role-param sibling,
-    // which still explicitly THROWS IllegalArgumentException for this role. Nothing anywhere else
-    // in this suite (or in BookingServiceTest, whose mocked `authz` never runs real
-    // hasManagementAccess SQL) proves an assigned SALON_ADMIN can actually list a COMPLETED,
-    // review-eligible booking without a 500 — this test exists to close exactly that gap, and it is
-    // the only gate that would have caught the batched path being wired to the throwing sibling.
+    // WHAT THIS SECTION USED TO PIN, and why it inverted. getSalonBookings resolved
+    // providerCanReviewClient through the PAGE-BATCHED
+    // AuthorizationService#filterBookingIdsWithProviderAuthorityForCurrentActor, whose salon arm
+    // answered SALON_ADMIN through manageableSalonIds' assigned-salon leg. Section 6 proved that
+    // arm GRANTED; section 6b proved it NARROWED to the master's LIVE salon.
+    //
+    // Phase 320 deleted the arm, the batched method and manageableSalonIds' role in this flag
+    // outright. Locked product decision: "salon owner or salon admin can complete the booking, and
+    // after it only salon master can leave the feedback". The flag is now
+    // `master.user_id == actor && master.is_active`, resolved in memory off the fetch-joined graph,
+    // so neither an owner nor an admin can read TRUE on a booking one of their STAFF performed —
+    // and the live-salon-vs-snapshot question 6b existed for no longer participates in the answer
+    // at all. Both tests below were rewritten onto what the endpoint now decides.
+    //
+    // The one shape that still reads TRUE for a caller of this endpoint is the OWNER-AS-MASTER row
+    // (MasterService#createMasterForOwner → master_type = 'SALON_OWNER', user_id = the owner). That
+    // is the separation section 6b now pins, and it is load-bearing rather than incidental: it is
+    // the only fixture on this board that can tell "performer-only" apart from "nobody, ever".
 
     @Test
     @DisplayName("an assigned SALON_ADMIN listing a COMPLETED booking gets providerCanReviewClient "
-            + "computed correctly (true) — proves the page-batched authority filter this endpoint "
-            + "uses resolves ADMIN authority via the assigned-salon arm rather than throwing the "
-            + "way loadProviderReviewBatch's role-param sibling would for this role")
-    void should_computeProviderCanReviewClient_when_adminListsCompletedBooking() throws Exception {
+            + "FALSE — they may complete the booking, but the client review belongs to the master "
+            + "who performed it (phase 320); the page itself must still resolve cleanly, never 500")
+    void should_returnProviderCanReviewClientFalse_when_adminListsCompletedBooking() throws Exception {
         String ownerEmail = "bsb-admin-review-owner-" + System.nanoTime() + "@beautica.test";
         BookingTestFixtures.SalonFixture salon = fixtures.createSalon(ownerEmail);
         String adminEmail = "bsb-admin-review-" + System.nanoTime() + "@beautica.test";
@@ -672,8 +679,7 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
         ResponseEntity<String> resp = callSalonBookings(fixtures.tokenFor(adminEmail), salon.salonId(), null, null);
 
         assertThat(resp.getStatusCode())
-                .as("premise — must resolve cleanly, never a 500 from the batched-kernel's "
-                        + "IllegalArgumentException; body: %s", resp.getBody())
+                .as("premise — an admin's salon board must resolve cleanly; body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
         JsonNode row = root.path("data").path("data").get(0);
@@ -681,64 +687,75 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
                 .as("premise — the completed booking must actually be on the page")
                 .isEqualTo(bookingId.toString());
         assertThat(row.path("providerCanReviewClient").asBoolean())
-                .as("an assigned SALON_ADMIN over a COMPLETED booking with a registered client and no "
-                        + "existing provider review must be authorized to leave one")
-                .isTrue();
+                .as("every review precondition is satisfied — COMPLETED, registered client, no "
+                        + "existing review — so this false is the phase-320 authority term and "
+                        + "nothing else. The controller also no longer names SALON_ADMIN in its "
+                        + "hasAnyRole for POST /client-reviews, so the CTA this flag gates would "
+                        + "403 if it were ever shown.")
+                .isFalse();
     }
 
-    // ── 6b — the ADMIN-side counterpart of the section-3 rotation guard ───────
+    // ── 6b — the ONE shape that still reads TRUE on this board ────────────────
     //
-    // The test above proves the assigned-salon arm GRANTS. Nothing proved it NARROWS. Pass one of
-    // AuthorizationService#filterBookingIdsWithProviderAuthority only short-circuits for the
-    // salon's OWNER, so for an ADMIN actor EVERY row on the page falls through to the deferred set
-    // and is answered by manageableSalonIds' SALON_ADMIN arm. If that arm ever returns the admin's
-    // assigned salon without reconciling it against the row's LIVE salon, an admin of salon A
-    // inherits provider authority over a booking whose master now works at salon B. The write path
-    // (/client-reviews) still re-checks per row, so today the only visible damage is a false
-    // providerCanReviewClient CTA — a regression hazard, which is exactly what a gate is for.
+    // Without this test, "performer-only" and "hardcoded false on the salon board" are
+    // indistinguishable here: the endpoint admits only SALON_OWNER and SALON_ADMIN, and neither is
+    // normally a masters.user_id. The owner-as-master row is the exception that separates them, and
+    // it is a real production shape (MasterService#createMasterForOwner). Both rows sit on the SAME
+    // page, for the SAME owner, differing only in which master performed them — so a mutant that
+    // collapses the flag to a constant, in either direction, fails one half or the other.
 
     @Test
-    @DisplayName("an assigned SALON_ADMIN gets providerCanReviewClient=FALSE on a COMPLETED booking "
-            + "whose master has SINCE ROTATED to another salon, while a same-page booking by a "
-            + "master still in the admin's own salon stays TRUE — pins the assigned-salon narrowing "
-            + "in manageableSalonIds' SALON_ADMIN arm, the admin-side counterpart of the owner "
-            + "rotation guard in section 3")
-    void should_returnProviderCanReviewClientFalse_when_assignedAdminsMasterHasRotatedAway() throws Exception {
+    @DisplayName("on ONE owner's salon page, the booking the OWNER personally performed (an "
+            + "owner-as-master row) carries providerCanReviewClient=TRUE while the booking their "
+            + "STAFF master performed carries FALSE — the phase-320 performer term, end to end")
+    void should_separateOwnerAsMasterFromStaffMaster_when_ownerListsTheSalonBoard() throws Exception {
         String suffix = "-" + System.nanoTime() + "@beautica.test";
-        BookingTestFixtures.SalonFixture salonA = fixtures.createSalon("bsb-admin-rotate-owner-a" + suffix);
-        BookingTestFixtures.SalonFixture salonB = fixtures.createSalon("bsb-admin-rotate-owner-b" + suffix);
-        String adminEmail = "bsb-admin-rotate-admin" + suffix;
-        fixtures.createUser(adminEmail, "SALON_ADMIN", salonA.salonId());
-        UUID clientId = fixtures.createUser("bsb-admin-rotate-client" + suffix, "CLIENT", null);
-        UUID stayingMasterId = createExtraSalonMaster(salonA.salonId());
+        String ownerEmail = "bsb-320-owner" + suffix;
+        BookingTestFixtures.SalonFixture salon = fixtures.createSalon(ownerEmail);
+        UUID ownerUserId = jdbcTemplate.queryForObject(
+                "SELECT id FROM users WHERE email = ?", UUID.class, ownerEmail);
+        UUID ownerMasterId = createOwnerAsMaster(salon.salonId(), ownerUserId);
+        UUID clientId = fixtures.createUser("bsb-320-client" + suffix, "CLIENT", null);
 
-        UUID rotatedBookingId = insertCompletedBooking(clientId, salonA, salonA.masterId(), kyiv(2020, 6, 10, 10, 0));
-        UUID controlBookingId = insertCompletedBooking(clientId, salonA, stayingMasterId, kyiv(2020, 6, 10, 12, 0));
-        // masters.salon_id moves; bookings.salon_id (the booking's own snapshot) does not — so BOTH
-        // rows stay on salon A's page and differ ONLY in the master's LIVE salon.
-        jdbcTemplate.update("UPDATE masters SET salon_id = ? WHERE id = ?", salonB.salonId(), salonA.masterId());
+        UUID ownerPerformedId =
+                insertCompletedBooking(clientId, salon, ownerMasterId, kyiv(2020, 6, 10, 10, 0));
+        UUID staffPerformedId =
+                insertCompletedBooking(clientId, salon, salon.masterId(), kyiv(2020, 6, 10, 12, 0));
 
-        ResponseEntity<String> resp = callSalonBookings(fixtures.tokenFor(adminEmail), salonA.salonId(), null, null);
+        ResponseEntity<String> resp = callSalonBookings(fixtures.tokenFor(ownerEmail), salon.salonId(), null, null);
 
         assertThat(resp.getStatusCode())
-                .as("premise — the rotation must not 500 or 403 the admin's own salon page; body: %s",
-                        resp.getBody())
+                .as("premise — the owner's own salon page must resolve; body: %s", resp.getBody())
                 .isEqualTo(HttpStatus.OK);
         JsonNode root = objectMapper.readTree(resp.getBody());
         assertThat(fixtures.extractIds(root))
-                .as("premise — both COMPLETED rows must be on salon A's page, or neither arm is exercised")
-                .containsExactlyInAnyOrder(rotatedBookingId, controlBookingId);
-        assertThat(providerCanReviewClient(root, controlBookingId))
-                .as("control — a master still assigned to the admin's OWN salon keeps the CTA, so the "
-                        + "false asserted next cannot be blamed on a missing review precondition "
-                        + "(guest client, wrong status, existing review) shared by both rows")
+                .as("premise — BOTH completed rows must be on the page, or neither half is exercised")
+                .containsExactlyInAnyOrder(ownerPerformedId, staffPerformedId);
+        assertThat(providerCanReviewClient(root, ownerPerformedId))
+                .as("the owner IS this booking's masters.user_id (master_type = 'SALON_OWNER'), so "
+                        + "the performer term admits them. A mutant that hard-denies every "
+                        + "owner/admin caller fails HERE.")
                 .isTrue();
-        assertThat(providerCanReviewClient(root, rotatedBookingId))
-                .as("the admin manages salon A only; the rotated master now lives in salon B, which is "
-                        + "NOT in the admin's manageable set, so provider authority over this row must "
-                        + "be denied. Widening the SALON_ADMIN arm to grant every deferred salon on "
-                        + "the page flips this to true.")
+        assertThat(providerCanReviewClient(root, staffPerformedId))
+                .as("the same owner, the same page, the same salon — but a booking their STAFF "
+                        + "master performed. A mutant that re-adds the salon-ownership arm flips "
+                        + "this to true and fails HERE. Both halves are needed.")
                 .isFalse();
+    }
+
+    /**
+     * An OWNER-AS-MASTER row — the shape {@code MasterService#createMasterForOwner} persists when a
+     * salon owner also performs services: {@code master_type = 'SALON_OWNER'} with {@code user_id}
+     * pointing at the OWNER's own {@code users} row (not a separate staff account, which is the
+     * whole difference from {@link #createExtraSalonMaster}).
+     */
+    private UUID createOwnerAsMaster(UUID salonId, UUID ownerUserId) {
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
+                masterId, ownerUserId, salonId);
+        return masterId;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -908,11 +925,27 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * five-row figure climbing away from the one-row figure, exactly as it did before.
      * DERIVED FROM A RUN, never predicted — same rule as every sibling constant here and in
      * {@code BookingPriceRangeContractIT}.
+     *
+     * <p><b>PHASE 320 — RE-DERIVED AGAIN, 2026-09-16: both moved 6 &rarr; 5.</b> The locked
+     * product decision ("salon owner or salon admin can complete the booking, and after it only
+     * salon master can leave the feedback") reduced {@code providerCanReviewClient} to
+     * {@code AuthorizationService#isPerformingMasterOfBooking}, which reads {@code masters.user_id}
+     * and {@code masters.is_active} — both already materialised by {@code findAllByIdsWithGraph}'s
+     * {@code JOIN FETCH b.master m} + {@code LEFT JOIN FETCH m.user}. The batched salon-ownership
+     * lookup that used to cost the rotated page its one flat extra statement
+     * ({@code SalonRepository#findIdsByIdInAndOwnerId}, inside the now-DELETED
+     * {@code AuthorizationService#filterBookingIdsWithProviderAuthorityForCurrentActor}) is gone
+     * with the salon arm it resolved. The rotated page therefore now costs exactly what the
+     * non-rotated page costs: authority resolution issues NOTHING, on either shape.
+     *
+     * <p>The MARGINAL figure is unchanged at ZERO — the fix removed a fixed prelude statement, not
+     * a per-row one — which is precisely why the pair and the per-row delta are asserted
+     * separately. A rise in the delta is still the per-row N+1 coming back.
      */
-    private static final long ROTATED_MASTER_ONE_ROW_STATEMENTS = 6L;
+    private static final long ROTATED_MASTER_ONE_ROW_STATEMENTS = 5L;
 
     /** Five-row counterpart of {@link #ROTATED_MASTER_ONE_ROW_STATEMENTS}. DERIVED FROM A RUN. */
-    private static final long ROTATED_MASTER_FIVE_ROW_STATEMENTS = 6L;
+    private static final long ROTATED_MASTER_FIVE_ROW_STATEMENTS = 5L;
 
     /**
      * The marginal JDBC cost of each additional rotated-master row, derived as
@@ -944,12 +977,13 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
         long statementsForOneRow;
         long statementsForFiveRows;
         com.beautica.common.PageResponse<com.beautica.booking.dto.BookingDetailResponse> result;
-        // A SecurityContext is REQUIRED here, unlike the non-rotated sibling gate: once the
-        // in-memory owner short-circuit fails, AuthorizationService:1180 falls through to
-        // roleFromCurrentAuthentication(), which reads the thread-local context. Without one the
-        // call 403s instead of querying — a real coupling of this read path to the request
-        // context, and the reason the rotated branch could never have been measured by simply
-        // copying the sibling gate's body.
+        // The SecurityContext used to be REQUIRED here: the batched authority filter fell through
+        // to roleFromCurrentAuthentication() once the in-memory owner short-circuit failed, and
+        // without a context the call 403'd instead of querying. Phase 320 deleted that filter, so
+        // this read path no longer touches the thread-local context at all. The context is kept
+        // deliberately — installing one cannot change the measurement, and removing it would make
+        // this gate silently depend on that decoupling holding, which is a property no assertion
+        // here states.
         try {
             SecurityContextHolder.getContext().setAuthentication(ownerAuthentication(ownerId));
 
@@ -976,10 +1010,12 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
                         + "call this gate measures is never invoked at all")
                 .allSatisfy(b -> assertThat(b.status()).isEqualTo(BookingStatus.COMPLETED));
         assertThat(result.data())
-                .as("premise — the owner of the salon the booking was MADE at loses the "
-                        + "providerCanReviewClient CTA once the master rotates away, because the "
-                        + "authority arm consults the master's LIVE salon. Pinned as observed "
-                        + "behaviour (QA finding, see the phase doc), not endorsed.")
+                .as("premise — the owner reads FALSE here BY RULE since phase 320, not as an "
+                        + "artefact of rotation: only the performing master may review the client, "
+                        + "and these rows were performed by staff masters. (Before 320 this false "
+                        + "was an unendorsed QA finding about the authority arm following the "
+                        + "master's LIVE salon; that arm no longer exists.) It is a premise rather "
+                        + "than the claim — what this gate measures is the statement count.")
                 .allSatisfy(b -> assertThat(b.providerCanReviewClient()).isFalse());
 
         assertThat(List.of(statementsForOneRow, statementsForFiveRows))

@@ -43,8 +43,24 @@ public class ClientReviewController {
      * {@code /reschedule}) keep their {@code SALON_MASTER}-free role lists AND their fast-reject
      * inside {@code canCancelBooking}/{@code canCompleteBooking}/{@code canRescheduleBooking}; do
      * not "align" them with this one.
+     *
+     * <p><b>Phase 320 — {@code SALON_ADMIN} LEAVES the role list; {@code SALON_OWNER} stays.</b>
+     * Locked product decision: "salon owner or salon admin can complete the booking, and after it
+     * only salon master can leave the feedback". {@code @authz.canReviewClient} is now the single
+     * term {@code AuthorizationService#isPerformingMasterOfBooking}, so an admin could never clear
+     * it: {@code MasterType} is {@code &#123;SALON_MASTER, INDEPENDENT_MASTER, SALON_OWNER&#125;} —
+     * there is no admin master type, so no {@code masters.user_id} can be a {@code SALON_ADMIN}
+     * user. Dropping the role is therefore provably not a narrowing beyond intent; it just moves
+     * the rejection from a 403-after-a-DB-read to a 403 before one.
+     *
+     * <p>{@code SALON_OWNER} must NOT be dropped alongside it, and the asymmetry is deliberate:
+     * {@code MasterService#createMasterForOwner} builds an owner-as-master row
+     * ({@code .user(owner).masterType(SALON_OWNER)}), so an owner who personally performs a visit
+     * IS the {@code masters.user_id} the SpEL compares against. Removing the role here would 403
+     * them on their own client — the opposite of the decision. Owner and admin alike keep {@code
+     * /complete} and every other closing action; only the review is narrowed.
      */
-    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER','SALON_MASTER') "
+    @PreAuthorize("hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER','SALON_MASTER') "
             + "and @authz.canReviewClient(authentication, #request.bookingId)")
     @PostMapping
     public ResponseEntity<ApiResponse<ClientReviewResponse>> create(
