@@ -161,6 +161,15 @@ class SalonServiceInviteHistoryTest {
     @Mock
     private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
 
+    // Phase 321 — getSalonMastersEffectiveSchedule's two collaborators. This suite exercises the
+    // invite-history ladder only and never reaches that method, so plain mocks satisfy the
+    // constructor with no stubbing (same rationale as staffAccountDisposalService above).
+    @Mock
+    private com.beautica.master.service.MasterScheduleService masterScheduleService;
+
+    @Mock
+    private com.beautica.master.service.ScheduleDateMath scheduleDateMath;
+
     private SalonService salonService;
 
     @BeforeEach
@@ -168,7 +177,8 @@ class SalonServiceInviteHistoryTest {
         Clock fixedClock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         salonService = new SalonService(
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
-                masterServiceRepository, localityWriteValidator, masterService, cityRepository,
+                masterServiceRepository, localityWriteValidator, masterService,
+                masterScheduleService, scheduleDateMath, cityRepository,
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
                 bookingService, serviceRepository, favoriteRepository, mediaRepository,
