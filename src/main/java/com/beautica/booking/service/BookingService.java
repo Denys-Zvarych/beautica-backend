@@ -973,9 +973,13 @@ public class BookingService {
      * it covers this method's {@code ?status=} filter only for those two values; a {@code status}
      * of {@code CANCELLED}/{@code DECLINED}/{@code NOT_COMPLETED} (or no status at all) falls back
      * to the unfiltered {@code idx_bookings_salon_starts_at} (V19). Neither index carries {@code
-     * master_id}, so the {@code masterId} filter above is served by a dedicated composite index,
-     * {@code idx_bookings_salon_master_starts_at} (V148, status-agnostic — see that migration for
-     * why it cannot reuse V22/V113's partial predicate).
+     * master_id}, so the {@code masterId} filter above is served by a dedicated composite index:
+     * originally {@code idx_bookings_salon_master_starts_at} (V148, status-agnostic — see that
+     * migration for why it cannot reuse V22/V113's partial predicate), and since Phase 322
+     * {@code idx_bookings_salon_master_partition_starts_at} (V168), which is a strict SUPERSET of
+     * V148's shape and REPLACED it in the same migration. This overload's plan is unchanged by that
+     * swap — measured byte-identical before and after (see V168's before/after table) — because the
+     * V148 prefix it relies on is still the new index's leading three columns.
      *
      * <p><b>Phase 319 — filter parity with {@code GET /bookings/me}.</b> {@code status} widened
      * from one optional {@link BookingStatus} to a repeatable {@link List} (mirroring {@code
@@ -1018,11 +1022,92 @@ public class BookingService {
      * service kept the correct plan, which is why the regression hid. V166 restores an Index Cond
      * on all three columns and the Incremental Sort. The {@code /me} twin is a different shape and
      * has had its own {@code (master_id, master_service_id, starts_at)} index since V117.
+     *
+     * <p><b>Phase 322.</b> This 8-argument overload is preserved byte-for-byte and simply delegates
+     * to the 9-argument {@link #getSalonBookings(UUID, UUID, UUID, List, LocalDate, LocalDate, List,
+     * BookingPartition, Pageable)} overload below with {@code partition = null} — not one line of
+     * the query logic lives here any more. This is the identical device Phase 28.2 used for
+     * {@link #getMyBookings}, and it is what pins the "absent {@code partition} ⇒ byte-identical to
+     * today" backwards-compatibility contract AT THE TYPE LEVEL rather than by inspection: every
+     * pre-322 caller keeps compiling and behaving identically without a single call site changing,
+     * including {@code BookingSalonBookingsIT}'s in-process statement-count gates, which that
+     * phase's D2 forbids editing. {@code @Transactional(readOnly = true)} is repeated here (not only
+     * on the 9-arg overload) so an EXTERNAL caller of this overload still gets a transaction from
+     * the Spring proxy; the resulting self-invocation then runs inside that already-open transaction
+     * (Spring's default {@code REQUIRED} propagation) rather than needing a second interception.
      */
     @Transactional(readOnly = true)
     public PageResponse<BookingDetailResponse> getSalonBookings(
             UUID actorUserId, UUID salonId, UUID masterId, List<BookingStatus> status,
             LocalDate from, LocalDate to, List<UUID> serviceId, Pageable pageable) {
+        return getSalonBookings(actorUserId, salonId, masterId, status, from, to, serviceId, null, pageable);
+    }
+
+    /**
+     * Phase 322 — {@code partition} overload backing {@code GET /bookings/salon/{salonId}?partition=}
+     * and the mobile salon «Архів» page. Same {@code masterId}/{@code status}/{@code from}/{@code
+     * to}/{@code serviceId} contract as the 8-argument overload above (see its javadoc), plus:
+     *
+     * <p><b>Precedence — {@code partition != null} makes {@code status} IGNORED, not a 400.</b>
+     * Copied verbatim from {@link #getMyBookings}'s Phase 28.2 rule, deliberately rather than
+     * re-decided: it is the rollout safety valve. The mobile archive ships {@code
+     * ?partition=HISTORY} to a fleet that may still be talking to a pre-322 backend for a window,
+     * where the unknown parameter is silently dropped and the caller degrades to {@code
+     * status}-only. If this backend 400'd on the combination, a client sending both to hedge would
+     * break on exactly one of the two backends. {@code statuses} below is computed as {@code null}
+     * (no predicate at all) whenever {@code partition != null} — the ignore happens BY
+     * CONSTRUCTION, and the repository sibling it dispatches to has no {@code statuses} parameter to
+     * pass one to. The controller's {@code @Size(max = 5)} on {@code status} still applies: Bean
+     * Validation runs before this method sees it, so an oversized list is still a 400 even when it
+     * is about to be ignored.
+     *
+     * <p><b>ONE {@code now} for the whole page, shared with {@code awaitingClosure}.</b> {@link
+     * #resolveNow()} is already called unconditionally on this path (it feeds every row's {@code
+     * awaitingClosure} flag and {@code canReview}); the partition boundary reuses THAT SAME value
+     * rather than resolving a second one. This is not cosmetic: a booking whose {@code endsAt} falls
+     * between two separately-resolved instants could be selected into {@code PAST} while its own row
+     * renders {@code awaitingClosure: false} (or the reverse) in the same response. See {@code
+     * BookingSpecifications#partition}'s javadoc for the clock/timezone invariant — {@link
+     * TimeZones#KYIV} governs only the day-granular {@code from}/{@code to} resolution here, never
+     * the partition boundary.
+     *
+     * <p>Dispatch is to a genuinely separate repository method ({@code
+     * findIdsBySalonIdFilteredByPartition}), never to {@code findIdsBySalonIdFiltered} with a
+     * {@code partition == null} branch bolted on — see {@code BookingRepositoryCustom}'s class
+     * comment for why that separation is what makes the backwards-compatibility contract airtight.
+     *
+     * <p><b>Index coverage (Phase 322 audit fix, Finding 1 — MEDIUM, backend-perf).</b> This
+     * overload's predicate is different IN KIND from the {@code ?status=} filter it sits beside:
+     * {@code BookingSpecifications#partition} compares {@code status} AND {@code ends_at}, the latter
+     * against a RUNTIME instant. Every salon-scope index before V168 stopped at {@code starts_at}, so
+     * {@code ends_at} could only be read from the HEAP — which turned {@code
+     * BookingRepositoryCustomImpl#countMatching} (it runs on every FULL page) into a Bitmap Heap Scan
+     * over the salon's ENTIRE physical footprint. The phase originally shipped with no index on the
+     * security-pass claim that {@code partition=HISTORY} is "no worse than the already-permitted
+     * unfiltered call"; measured on 60k salon rows, <b>that claim is false</b> — {@code
+     * HISTORY}/{@code PAST} cost 1694 buffers with {@code Heap Blocks: exact=1396} against 299 for
+     * the unfiltered call, and {@code HISTORY} WITH a {@code masterId} chip paid 1420 buffers to
+     * return 2 826 rows (one random heap fetch per row through V148's index), 20x worse PER ROW than
+     * the salon-wide shape it is supposed to narrow. V168 adds {@code
+     * idx_bookings_salon_partition_starts_at} and REPLACES V148 with {@code
+     * idx_bookings_salon_master_partition_starts_at}, both carrying {@code status, ends_at} AFTER the
+     * {@code starts_at} sort key: counts become Index Only Scans with {@code Heap Fetches: 0} at 495
+     * and 35 buffers respectively. V168 carries the full before/after table, the rejected
+     * alternatives, and why V19 is deliberately NOT dropped despite being a strict prefix.
+     *
+     * <p>One cost V168 deliberately does NOT remove: the id page still walks the future book before
+     * its first {@code HISTORY}/{@code PAST} row (103 buffers / 3 484 rows filtered on the measured
+     * fixture), because {@code ORDER BY starts_at DESC} is newest-first and every future booking is
+     * newest. That cost tracks how far ahead the salon BOOKS, not how much history it has, and it is
+     * inherent: a partial index excluding future rows would need {@code now()} in its predicate,
+     * which is not {@code IMMUTABLE}. A trailing-{@code id} index variant halves it and was measured
+     * to be a net loss overall — see V168.
+     */
+    @Transactional(readOnly = true)
+    public PageResponse<BookingDetailResponse> getSalonBookings(
+            UUID actorUserId, UUID salonId, UUID masterId, List<BookingStatus> status,
+            LocalDate from, LocalDate to, List<UUID> serviceId, BookingPartition partition,
+            Pageable pageable) {
         if (to != null) {
             dateMath.assertToPlusOneDayRepresentable(to);
         }
@@ -1039,13 +1124,31 @@ public class BookingService {
         // Phase 26.4 for serviceId): null/empty means "no predicate at all", never an empty
         // collection that would compile to a dead IN (). EnumSet.copyOf refuses an empty list,
         // hence the explicit isEmpty() arm — the identical guard getMyBookings carries.
-        Set<BookingStatus> statuses = (status == null || status.isEmpty()) ? null : EnumSet.copyOf(status);
+        //
+        // Phase 322 precedence rule, verbatim from getMyBookings: partition present -> the status
+        // predicate is never built at all (IGNORED, never a 400 — see this method's javadoc).
+        //
+        // The `partition != null ||` clause is DEFENCE IN DEPTH, not the enforcement. Mutation-tested
+        // 2026-09-19: deleting it alone changes no behaviour, because the dispatch below routes a
+        // partition request to a repository sibling that has no `statuses` parameter to receive one.
+        // Keep it anyway — it is what makes `statuses` provably null on this branch for any FUTURE
+        // reader of the variable, so a later edit that starts passing it somewhere cannot silently
+        // resurrect the ignored filter. The mutation that DOES go red is inverting the dispatch.
+        Set<BookingStatus> statuses = (partition != null || status == null || status.isEmpty())
+                ? null
+                : EnumSet.copyOf(status);
         Set<UUID> serviceIds = normalizeServiceIdFilter(serviceId);
+        // Resolved ONCE for the whole page and used three times over — the partition boundary
+        // below, every row's canReview, and every row's awaitingClosure. Never a second resolveNow()
+        // for the partition; see this method's javadoc for the inconsistency that would cause.
         OffsetDateTime now = resolveNow();
         Pageable normalizedPageable = normalizeBookingSort(pageable);
 
-        Page<UUID> idPage = bookingRepository.findIdsBySalonIdFiltered(
-                salonId, masterId, statuses, fromTs, toExclusive, serviceIds, normalizedPageable);
+        Page<UUID> idPage = partition != null
+                ? bookingRepository.findIdsBySalonIdFilteredByPartition(
+                        salonId, masterId, partition, now, fromTs, toExclusive, serviceIds, normalizedPageable)
+                : bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, masterId, statuses, fromTs, toExclusive, serviceIds, normalizedPageable);
         if (idPage.isEmpty()) {
             return PageResponse.of(List.of(), idPage.getNumber(), idPage.getSize(),
                     idPage.getTotalElements(), idPage.getTotalPages());

@@ -1,10 +1,12 @@
 package com.beautica.booking.repository;
 
+import com.beautica.booking.enums.BookingPartition;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -79,6 +81,22 @@ class BookingRepositoryCustomImplUnpagedTest {
         assertThatThrownBy(() -> repository.findIdsBySalonIdFiltered(
                 salonId, null, null, null, null, null, UNPAGED_WITH_SORT))
                 .as("the Phase 23.4 single-salon path shares findIdPage, so it shares the refusal")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(BookingRepositoryCustomImpl.UNPAGED_REJECTED_MESSAGE);
+    }
+
+    @Test
+    @DisplayName("findIdsBySalonIdFilteredByPartition rejects an unpaged Pageable instead of "
+            + "scanning unbounded")
+    void should_throwIllegalArgument_when_salonSinglePartitionPathIsCalledUnpaged() {
+        UUID salonId = UUID.randomUUID();
+
+        assertThatThrownBy(() -> repository.findIdsBySalonIdFilteredByPartition(
+                salonId, null, BookingPartition.HISTORY, OffsetDateTime.parse("2031-06-15T12:00:00Z"),
+                null, null, null, UNPAGED_WITH_SORT))
+                .as("the Phase 322 salon-partition path shares findIdPage, so it shares the refusal "
+                        + "— and HISTORY is the widest predicate on the endpoint, so an unbounded "
+                        + "scan here would materialise the salon's ENTIRE booking history")
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage(BookingRepositoryCustomImpl.UNPAGED_REJECTED_MESSAGE);
     }

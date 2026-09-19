@@ -217,6 +217,12 @@ public class BookingController {
      * uses for its own owner-or-admin-of-this-salon endpoints). An owner of a DIFFERENT salon, or
      * an admin assigned elsewhere, gets 403.
      *
+     * <p><b>Phase 322 — the expression is UNCHANGED by the {@code partition} parameter</b>, and
+     * deliberately so: a partition cannot widen an authorization surface, it only narrows a result
+     * set the caller was already entitled to read in full. {@code SALON_MASTER} is still not
+     * admitted — the invited staff master reads their own archive at
+     * {@code GET /bookings/me?partition=HISTORY}; this route is the owner/admin's salon-wide view.
+     *
      * <p>Route is {@code /api/v1/bookings/salon/{salonId}} — three path segments, so it cannot
      * collide with the two-segment {@code /{bookingId}} above (same collision-avoidance rationale
      * {@code /me/booked-days} documents; Spring's {@code PathPattern} prefers the literal {@code
@@ -240,7 +246,9 @@ public class BookingController {
             // the class-level @Validated makes a violation surface as a 400
             // ConstraintViolationException via GlobalExceptionHandler, never a 500 (Anti-Bug §B1).
             @Parameter(description = "Repeatable status filter, e.g. ?status=CONFIRMED&status=DECLINED. "
-                    + "Omit for no status predicate. A single ?status=CONFIRMED still works unchanged.")
+                    + "Omit for no status predicate. A single ?status=CONFIRMED still works unchanged. "
+                    + "IGNORED whenever `partition` is present — see that parameter's doc for the "
+                    + "precedence rule.")
             @RequestParam(required = false) @Size(max = 5) List<BookingStatus> status,
             @Parameter(description = "Bookings starting on/after the start of this local day (Europe/Kyiv). "
                     + "Omit for an open-ended future window.")
@@ -261,12 +269,31 @@ public class BookingController {
             @Parameter(description = "Repeatable MasterService id filter, e.g. "
                     + "?serviceId=<A>&serviceId=<B>. Omit for no service predicate.")
             @RequestParam(required = false) @Size(max = 50) List<UUID> serviceId,
+            // Phase 322: additive-optional time-based partition, the SAME BookingPartition type and
+            // the SAME precedence rule GET /bookings/me has carried since Phase 28.2 (see that
+            // parameter above). ANDs with masterId/from/to/serviceId exactly like `status` does.
+            // Absent (the default) => SQL and response byte-identical to pre-322 behaviour, because
+            // BookingService#getSalonBookings' 8-arg overload is still the code path taken — see
+            // that method's javadoc for the type-level backwards-compatibility argument.
+            @Parameter(description = "Time-based partition: UPCOMING (status=CONFIRMED and not yet "
+                    + "elapsed), PAST (COMPLETED/NOT_COMPLETED, or an elapsed unclosed CONFIRMED), "
+                    + "or CANCELLED (CANCELLED/DECLINED) — a total, disjoint cover of every "
+                    + "booking status. AWAITING_CLOSURE is a named subset of PAST (an elapsed "
+                    + "unclosed CONFIRMED booking only). HISTORY is a union view spanning PAST and "
+                    + "CANCELLED, i.e. every booking EXCEPT UPCOMING, in one correctly-paginated "
+                    + "request — use it for the salon \"archive\" list, which must include cancelled "
+                    + "and declined bookings alongside finished ones, across every master in the "
+                    + "salon. When present, `status` is IGNORED — NOT a 400 — this is the additive "
+                    + "rollout safety valve: a client sending both params degrades cleanly to the "
+                    + "pre-partition `status`-only behaviour against a backend that does not yet "
+                    + "know `partition`. Omit for byte-identical pre-Phase-322 behaviour.")
+            @RequestParam(required = false) BookingPartition partition,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
         return ApiResponse.ok(bookingService.getSalonBookings(
                 AuthenticationUtils.userId(auth), salonId, masterId, status, from, to, serviceId,
-                clampGiantOffset(pageable)));
+                partition, clampGiantOffset(pageable)));
     }
 
     /**

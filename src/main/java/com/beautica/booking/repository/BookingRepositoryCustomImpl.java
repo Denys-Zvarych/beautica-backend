@@ -170,6 +170,30 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
     }
 
     /**
+     * Phase 322 — see {@link BookingRepositoryCustom#findIdsBySalonIdFilteredByPartition} for the
+     * full contract and for why this is a fourth sibling rather than a reuse of {@link
+     * #findIdsBySalonIdsFilteredByPartition}. Structurally {@link #findIdsBySalonIdFiltered} with
+     * {@link BookingSpecifications#statusIn} swapped for {@link BookingSpecifications#partition}:
+     * the {@code bookingSalonIdEquals} scope, the optional {@code masterId} arm, {@link
+     * #applyDateRange}, {@link #applyServiceFilter} and {@link #findIdPage} are all the SAME shared
+     * pieces, never a parallel predicate builder.
+     */
+    @Override
+    public Page<UUID> findIdsBySalonIdFilteredByPartition(
+            UUID salonId, UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.bookingSalonIdEquals(salonId))
+                .and(BookingSpecifications.partition(partition, now));
+        if (masterId != null) {
+            spec = spec.and(BookingSpecifications.masterIdEquals(masterId));
+        }
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    /**
      * Phase 29.4 — public entry point onto the existing {@link #countMatching} helper (previously
      * private, used only as {@link #findIdPage}'s deferred count supplier). Exposed verbatim —
      * same {@link CriteriaQuery}-building logic, no new query shape — so {@code
@@ -298,7 +322,8 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * <p><b>{@code count(1)}, not {@code count(b.id)} (Phase 319 audit, MEDIUM — backend-perf).</b>
      * {@code cb.count(countRoot)} renders {@code count(b1_0.id)}, and {@code id} is a column in NONE
      * of the indexes that serve these predicates ({@code idx_bookings_salon_starts_at} V19,
-     * {@code idx_bookings_salon_service_starts_at} V166, {@code idx_bookings_master_starts_at}), so
+     * {@code idx_bookings_salon_service_starts_at} V166, {@code idx_bookings_salon_partition_starts_at}
+     * and {@code idx_bookings_salon_master_partition_starts_at} V168), so
      * naming it forces the planner off an Index Only Scan and onto the heap for EVERY matching row —
      * the count reads the whole match set, not a page of it. Counting a constant references no
      * column, so the same predicate plans as an Index Only Scan with {@code Heap Fetches: 0}.

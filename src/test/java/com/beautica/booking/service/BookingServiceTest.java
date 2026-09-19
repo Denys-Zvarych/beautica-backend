@@ -12,6 +12,7 @@ import com.beautica.booking.dto.StatusUpdateRequest;
 import com.beautica.booking.dto.AppointmentProviderNoteRequest;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.enums.BookingPartition;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
@@ -2854,6 +2855,168 @@ class BookingServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .extracting(ex -> ((BusinessException) ex).getStatus())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
+        verifyNoInteractions(bookingRepository);
+    }
+
+    // ── Phase 322 — GET /bookings/salon/{salonId}?partition= (the salon «Архів» read) ─────────
+    //
+    // Two contracts live here, both copied verbatim from the /bookings/me precedent rather than
+    // re-decided:
+    //   D2 — partition ABSENT is byte-identical to pre-322. Held at the TYPE level: the 8-arg
+    //        overload delegates with partition = null and the non-partition repository sibling is
+    //        the one invoked, so the eighteen pre-322 getSalonBookings tests above are themselves
+    //        the regression proof and needed no edit.
+    //   D3 — partition PRESENT makes `status` IGNORED, never a 400. Enforced by the ternary in
+    //        getSalonBookings AND by the repository sibling having no `statuses` parameter at all.
+
+    @Test
+    @DisplayName("Phase 322 D2 — partition ABSENT still routes to findIdsBySalonIdFiltered; the "
+            + "partition sibling is never touched, which is what makes the absent case byte-identical")
+    void should_useNonPartitionSibling_when_salonPartitionIsAbsent() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, null, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, null, List.of(BookingStatus.CONFIRMED), null, null, null, null,
+                Pageable.unpaged());
+
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                salonId, null, Set.of(BookingStatus.CONFIRMED), null, null, null, normalizedUnpaged());
+        verify(bookingRepository, never()).findIdsBySalonIdFilteredByPartition(
+                any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("Phase 322 D2 — the 8-argument overload is not a second implementation: it delegates "
+            + "to the 9-argument one with partition = null, reaching the SAME non-partition sibling "
+            + "with the SAME arguments as an explicit null does")
+    void should_delegateWithNullPartition_when_eightArgOverloadIsCalled() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID filterMasterId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFiltered(
+                        salonId, filterMasterId, Set.of(BookingStatus.COMPLETED), null, null, null,
+                        normalizedUnpaged()))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, filterMasterId, List.of(BookingStatus.COMPLETED), null, null, null,
+                Pageable.unpaged());
+
+        verify(bookingRepository).findIdsBySalonIdFiltered(
+                salonId, filterMasterId, Set.of(BookingStatus.COMPLETED), null, null, null,
+                normalizedUnpaged());
+        verify(bookingRepository, never()).findIdsBySalonIdFilteredByPartition(
+                any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("Phase 322 D3 — partition PRESENT routes to findIdsBySalonIdFilteredByPartition, "
+            + "and the supplied `status` is IGNORED rather than rejected: the partition sibling has "
+            + "no statuses parameter, so no status predicate is even constructible")
+    void should_ignoreStatus_when_salonPartitionIsSupplied() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFilteredByPartition(
+                        eq(salonId), eq(null), eq(BookingPartition.HISTORY), any(OffsetDateTime.class),
+                        eq(null), eq(null), eq(null), eq(normalizedUnpaged())))
+                .thenReturn(Page.empty());
+
+        var result = bookingService.getSalonBookings(
+                actorId, salonId, null, List.of(BookingStatus.CONFIRMED), null, null, null,
+                BookingPartition.HISTORY, Pageable.unpaged());
+
+        assertThat(result.totalElements()).isZero();
+        verify(bookingRepository).findIdsBySalonIdFilteredByPartition(
+                eq(salonId), eq(null), eq(BookingPartition.HISTORY), any(OffsetDateTime.class),
+                eq(null), eq(null), eq(null), eq(normalizedUnpaged()));
+        verify(bookingRepository, never()).findIdsBySalonIdFiltered(
+                any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("Phase 322 D5 — masterId, from/to and serviceId all compose with partition as AND: "
+            + "every one of them reaches the partition sibling alongside it, not instead of it")
+    void should_composeMasterIdDateRangeAndServiceIds_when_salonPartitionIsSupplied() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID filterMasterId = UUID.randomUUID();
+        UUID serviceId = UUID.randomUUID();
+        LocalDate from = LocalDate.of(2031, 6, 1);
+        LocalDate to = LocalDate.of(2031, 6, 10);
+        OffsetDateTime expectedFrom = from.atStartOfDay(KYIV).toOffsetDateTime();
+        OffsetDateTime expectedToExclusive = to.plusDays(1).atStartOfDay(KYIV).toOffsetDateTime();
+
+        when(bookingRepository.findIdsBySalonIdFilteredByPartition(
+                        eq(salonId), eq(filterMasterId), eq(BookingPartition.PAST), any(OffsetDateTime.class),
+                        eq(expectedFrom), eq(expectedToExclusive), eq(Set.of(serviceId)),
+                        eq(normalizedUnpaged())))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, filterMasterId, null, from, to, List.of(serviceId),
+                BookingPartition.PAST, Pageable.unpaged());
+
+        verify(bookingRepository).findIdsBySalonIdFilteredByPartition(
+                eq(salonId), eq(filterMasterId), eq(BookingPartition.PAST), any(OffsetDateTime.class),
+                eq(expectedFrom), eq(expectedToExclusive), eq(Set.of(serviceId)),
+                eq(normalizedUnpaged()));
+    }
+
+    @Test
+    @DisplayName("Phase 322 D7 — the `now` handed to the partition boundary is the injected Clock's "
+            + "own instant, resolved once: never OffsetDateTime.now(), and never a Kyiv-zoned value")
+    void should_passClockInstantAsPartitionNow_when_salonPartitionIsSupplied() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+
+        when(bookingRepository.findIdsBySalonIdFilteredByPartition(
+                        any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(Page.empty());
+
+        bookingService.getSalonBookings(
+                actorId, salonId, null, null, null, null, null,
+                BookingPartition.HISTORY, Pageable.unpaged());
+
+        ArgumentCaptor<OffsetDateTime> now = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(bookingRepository).findIdsBySalonIdFilteredByPartition(
+                eq(salonId), eq(null), eq(BookingPartition.HISTORY), now.capture(),
+                eq(null), eq(null), eq(null), eq(normalizedUnpaged()));
+        assertThat(now.getValue().toInstant())
+                .as("the partition boundary must be the injected Clock's instant — a wall-clock read "
+                        + "would make this untestable and would drift from the awaitingClosure flag")
+                .isEqualTo(clock.instant());
+    }
+
+    @Test
+    @DisplayName("Phase 322 — the 50-entry serviceId cap and the from>to guard still fire BEFORE any "
+            + "query when a partition is supplied: partition must not become a validation bypass")
+    void should_stillValidate_when_salonPartitionIsSupplied() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        List<UUID> tooMany = java.util.stream.Stream.generate(UUID::randomUUID).limit(51).toList();
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null, null, null, tooMany,
+                        BookingPartition.HISTORY, Pageable.unpaged()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
+        assertThatThrownBy(() -> bookingService.getSalonBookings(
+                        actorId, salonId, null, null,
+                        LocalDate.of(2031, 7, 31), LocalDate.of(2031, 7, 1), null,
+                        BookingPartition.HISTORY, Pageable.unpaged()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(ex -> ((BusinessException) ex).getStatus())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+
         verifyNoInteractions(bookingRepository);
     }
 

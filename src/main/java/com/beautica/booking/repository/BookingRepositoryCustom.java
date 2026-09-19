@@ -182,6 +182,47 @@ public interface BookingRepositoryCustom {
             Collection<UUID> serviceIds, Pageable pageable);
 
     /**
+     * Phase 322 — partition counterpart to {@link #findIdsBySalonIdFiltered}, backing
+     * {@code GET /bookings/salon/{salonId}?partition=} and the mobile salon «Архів» page. The
+     * FOURTH member of the {@code …FilteredByPartition} family, and a genuinely new shape rather
+     * than a reuse of one of the three Phase 28.1/28.2 siblings above:
+     *
+     * <ul>
+     *   <li>{@link #findIdsByMasterIdFilteredByPartition} scopes by {@code b.master.id} — it has no
+     *       salon term at all, so it cannot answer "this salon's history across every master".</li>
+     *   <li>{@link #findIdsBySalonIdsFilteredByPartition} scopes by {@link
+     *       BookingSpecifications#salonIdIn} — a {@code JOIN b.master m JOIN m.salon} over a
+     *       pre-resolved owner ESTATE, keyed off the master's LIVE affiliation, and with no
+     *       {@code masterId} arm. It is not a substitute on either count: this route must scope by
+     *       the booking's OWN {@code salon_id} SNAPSHOT (see {@link
+     *       BookingSpecifications#bookingSalonIdEquals} for the rotated-master defect class that
+     *       predicate exists to prevent), and its {@code masterId} chip must survive into the
+     *       archive.</li>
+     *   <li>{@link #findIdsByClientIdFilteredByPartition} scopes by {@code b.client.id}.</li>
+     * </ul>
+     *
+     * <p>It is a SIBLING, not a fork: the scope predicate, the optional {@code masterId} arm, the
+     * date composer, the service composer and {@code findIdPage} are all the very same shared
+     * pieces {@link #findIdsBySalonIdFiltered} composes — only {@link
+     * BookingSpecifications#statusIn} is swapped for {@link BookingSpecifications#partition}.
+     *
+     * <p>{@code statuses} is deliberately ABSENT from this signature, exactly as it is absent from
+     * the three siblings above: that is what makes "status is ignored when partition is present" a
+     * property of the TYPE at the query tier — a status predicate is not constructible from this
+     * parameter list — rather than a downstream filter that could regress into an accidental
+     * {@code AND}. Same already-resolved-absolute-instant contract for {@code now} (see
+     * {@link BookingSpecifications#partition}'s javadoc for the clock/timezone invariant — {@code
+     * now} is resolved ONCE per page in {@code BookingService#getSalonBookings}, the same instant
+     * that feeds every row's {@code awaitingClosure} flag), and the same Phase 26.2/26.3/26.4
+     * date-range / pre-validated-{@code Sort} / bounded-service-filter contracts
+     * {@link #findIdsBySalonIdFiltered} documents in full.
+     */
+    Page<UUID> findIdsBySalonIdFilteredByPartition(
+            UUID salonId, UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
+
+    /**
      * Phase 29.4 — a bare {@code COUNT(*)} over an arbitrary {@link Specification}, backing
      * {@code GET /bookings/me/unclosed-count}. Deliberately generic (unlike every other method on
      * this interface, which is a named, purpose-specific query) because the caller

@@ -1257,7 +1257,7 @@ class BookingControllerTest {
         var salonId = UUID.randomUUID();
         var ownerId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 1000, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
@@ -1268,7 +1268,7 @@ class BookingControllerTest {
 
         var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
         org.mockito.Mockito.verify(bookingService)
-                .getSalonBookings(any(), eq(salonId), any(), any(), any(), any(), any(), pageableCaptor.capture());
+                .getSalonBookings(any(), eq(salonId), any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
         org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
     }
 
@@ -1287,7 +1287,7 @@ class BookingControllerTest {
         var salonId = UUID.randomUUID();
         var ownerId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
@@ -1298,7 +1298,7 @@ class BookingControllerTest {
 
         org.mockito.Mockito.verify(bookingService).getSalonBookings(
                 any(), eq(salonId), any(), eq(java.util.List.of(BookingStatus.CONFIRMED)),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1308,7 +1308,7 @@ class BookingControllerTest {
         var salonId = UUID.randomUUID();
         var ownerId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
@@ -1320,7 +1320,7 @@ class BookingControllerTest {
         org.mockito.Mockito.verify(bookingService).getSalonBookings(
                 any(), eq(salonId), any(),
                 eq(java.util.List.of(BookingStatus.CONFIRMED, BookingStatus.COMPLETED)),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1344,7 +1344,7 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(false));
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any());
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1355,7 +1355,7 @@ class BookingControllerTest {
         var serviceA = UUID.randomUUID();
         var serviceB = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
@@ -1366,7 +1366,7 @@ class BookingControllerTest {
 
         org.mockito.Mockito.verify(bookingService).getSalonBookings(
                 any(), eq(salonId), any(), any(), any(), any(),
-                eq(java.util.List.of(serviceA, serviceB)), any());
+                eq(java.util.List.of(serviceA, serviceB)), any(), any());
     }
 
     @Test
@@ -1389,7 +1389,7 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.success").value(false));
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any());
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1400,7 +1400,7 @@ class BookingControllerTest {
         var salonId = UUID.randomUUID();
         var ownerId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
         var params = new org.springframework.util.LinkedMultiValueMap<String, String>();
         for (BookingStatus st : BookingStatus.values()) {
@@ -1415,7 +1415,7 @@ class BookingControllerTest {
 
         org.mockito.Mockito.verify(bookingService).getSalonBookings(
                 any(), eq(salonId), any(), eq(java.util.List.of(BookingStatus.values())),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1425,7 +1425,7 @@ class BookingControllerTest {
         var salonId = UUID.randomUUID();
         var ownerId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
         var params = new org.springframework.util.LinkedMultiValueMap<String, String>();
         for (int i = 0; i < 50; i++) {
@@ -1456,7 +1456,162 @@ class BookingControllerTest {
                 .andExpect(status().isForbidden());
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any());
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    // ── Phase 322 — GET /salon/{salonId}?partition= (the salon «Архів» read) ────
+    //
+    // The wire contract only: that the enum BINDS, that an unrecognised value is a 400 which does
+    // not echo the accepted constants, that `status` alongside it is still forwarded (the service —
+    // not the controller — is where the precedence rule lives, so a controller that silently
+    // dropped `status` would be the WRONG fix), and that absence still forwards a null partition so
+    // the service's pre-322 code path is the one taken.
+
+    @Test
+    @DisplayName("GET /salon/{salonId}?partition=HISTORY — binds the enum and forwards it to the "
+            + "service as the 8th argument")
+    void should_bindPartition_when_salonBookingsPartitionProvided() throws Exception {
+        var salonId = UUID.randomUUID();
+        var ownerId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("partition", "HISTORY")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(bookingService).getSalonBookings(
+                any(), eq(salonId), any(), any(), any(), any(), any(),
+                eq(com.beautica.booking.enums.BookingPartition.HISTORY), any());
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId} with NO ?partition — forwards a NULL partition, so the "
+            + "service takes its pre-322 code path (the type-level backwards-compatibility contract)")
+    void should_forwardNullPartition_when_salonBookingsPartitionOmitted() throws Exception {
+        var salonId = UUID.randomUUID();
+        var ownerId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("status", "CONFIRMED")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(bookingService).getSalonBookings(
+                any(), eq(salonId), any(), eq(java.util.List.of(BookingStatus.CONFIRMED)),
+                any(), any(), any(),
+                org.mockito.ArgumentMatchers.<com.beautica.booking.enums.BookingPartition>isNull(), any());
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId}?partition=HISTORY&status=CONFIRMED — the controller still "
+            + "forwards BOTH; the ignore is the SERVICE's precedence rule, not a controller-side drop")
+    void should_forwardBothPartitionAndStatus_when_salonBookingsBothProvided() throws Exception {
+        var salonId = UUID.randomUUID();
+        var ownerId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("partition", "HISTORY")
+                        .param("status", "CONFIRMED")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk());
+
+        org.mockito.Mockito.verify(bookingService).getSalonBookings(
+                any(), eq(salonId), any(), eq(java.util.List.of(BookingStatus.CONFIRMED)),
+                any(), any(), any(),
+                eq(com.beautica.booking.enums.BookingPartition.HISTORY), any());
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId}?partition=BOGUS — 400 (not 500), the service is never "
+            + "invoked, and the body does not echo the accepted BookingPartition constants")
+    void should_return400WithoutEchoingEnumConstants_when_salonPartitionIsUnrecognised() throws Exception {
+        var salonId = UUID.randomUUID();
+        var ownerId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        var body = mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("partition", "BOGUS")
+                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andReturn().getResponse().getContentAsString().toLowerCase();
+
+        org.assertj.core.api.Assertions.assertThat(body)
+                .as("the 400 must not turn into an enum-surface oracle (Anti-Bug §A/§I-3)")
+                .doesNotContain("upcoming")
+                .doesNotContain("cancelled")
+                .doesNotContain("awaiting_closure")
+                .doesNotContain("history");
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId}?partition=HISTORY — 403 for a SALON_MASTER (negative role "
+            + "case): the invited staff master keeps GET /bookings/me?partition=HISTORY, and a "
+            + "partition must never widen the role gate")
+    void should_return403_when_salonMasterRequestsSalonPartition() throws Exception {
+        var salonId = UUID.randomUUID();
+        var masterId = UUID.randomUUID();
+        // canManageSalon deliberately TRUE so the assertion can only be satisfied by the ROLE arm.
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("partition", "HISTORY")
+                        .with(authenticatedAs(masterId, "salonmaster@beautica.test", Role.SALON_MASTER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId}?partition=HISTORY — 403 for a CLIENT (negative role case)")
+    void should_return403_when_clientRequestsSalonPartition() throws Exception {
+        var salonId = UUID.randomUUID();
+        var clientId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("partition", "HISTORY")
+                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId}?partition=HISTORY — 403 when @authz.canManageSalon denies, "
+            + "so the per-salon assertion is not bypassable by adding a partition")
+    void should_return403_when_ownerDoesNotManageSalonForPartitionedList() throws Exception {
+        var salonId = UUID.randomUUID();
+        var ownerId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(false);
+
+        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
+                        .param("partition", "HISTORY")
+                        .with(authenticatedAs(ownerId, "stranger@beautica.test", Role.SALON_OWNER))
+                        .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isForbidden());
+
+        org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     // ── Phase 319 — GET /salon/{salonId}/booked-days (salon day-rail dot set) ───
@@ -1627,7 +1782,7 @@ class BookingControllerTest {
                 .andExpect(jsonPath("$.data[0]").value("2026-07-05"));
 
         org.mockito.Mockito.verify(bookingService, org.mockito.Mockito.never())
-                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any());
+                .getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1637,7 +1792,7 @@ class BookingControllerTest {
         var salonId = UUID.randomUUID();
         var ownerId = UUID.randomUUID();
         when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any()))
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
         mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
