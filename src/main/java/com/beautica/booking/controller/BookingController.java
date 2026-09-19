@@ -60,15 +60,34 @@ public class BookingController {
             Pattern.compile("^[A-Za-z0-9\\-_]{1,64}$");
 
     /**
-     * Giant-OFFSET clamp ceiling shared by every paginated booking list route (Anti-Bug §J /
-     * SEC-MEDIUM-3): a caller-supplied page number beyond this is silently clamped down to it
-     * rather than executed as-is, so an attacker cannot force an ever-deeper {@code OFFSET} scan
-     * by walking {@code page} up. Phase 23.4 audit fix, Finding 4 (LOW, backend-qa) — previously
-     * duplicated verbatim in both {@link #listMyBookings} and {@link #getSalonBookings}; extracted
-     * to {@link #clampGiantOffset(Pageable)} so there is exactly one implementation to test and
-     * keep in sync.
+     * Giant-OFFSET clamp ceiling, in ROWS, shared by every paginated booking list route
+     * (Anti-Bug §J / SEC-MEDIUM-3): a request whose {@code page × size} offset exceeds this is
+     * silently clamped down to it rather than executed as-is, so an attacker cannot force an
+     * ever-deeper {@code OFFSET} scan by walking {@code page} up. Phase 23.4 audit fix, Finding 4
+     * (LOW, backend-qa) — previously duplicated verbatim in both {@link #listMyBookings} and
+     * {@link #getSalonBookings}; extracted to {@link #clampGiantOffset(Pageable)} so there is
+     * exactly one implementation to test and keep in sync.
+     *
+     * <p><b>Phase 323 — this bounds the OFFSET, never the page INDEX.</b> It was
+     * {@code MAX_CLAMPED_PAGE_NUMBER = 1000} until Phase 323, which capped the page index while
+     * the scan cost it exists to bound tracks {@code page × size}. Since {@code size} is
+     * caller-supplied and capped at 100 ({@code application.yml}, {@code max-page-size}), that
+     * form let an attacker widen the guard 5× — 20 000 reachable rows at the
+     * {@code @PageableDefault(size = 20)} both routes declare, but 100 000 by appending
+     * {@code &size=100}. A security control a query parameter widens is a defective control.
+     * Do NOT regress this to a page cap: the ceiling must stay a constant independent of every
+     * caller-supplied parameter. 20 000 is the bound Phase 205 (26.6) and {@code backlog.md}
+     * already assert.
+     *
+     * <p>Against the pre-323 page cap the new form is: identical at {@code size = 20} (page 1000 ×
+     * 20 = 20 000 rows either way); strictly <b>tighter</b> above it ({@code size = 100}: 100 000
+     * reachable rows before, 20 000 now); and deliberately <b>looser</b> below it ({@code size =
+     * 1}: 1 000 rows before, 20 000 now) — because the ceiling is <b>rows, not pages</b>, and
+     * 20 000 rows costs the database the same whether they are fetched 1 or 100 at a time. The
+     * looser leg is intentional and pinned by
+     * {@code should_clampToOffset20000_when_pageExceedsCeilingAtSizeOne}.
      */
-    private static final int MAX_CLAMPED_PAGE_NUMBER = 1000;
+    private static final int MAX_CLAMPED_OFFSET = 20_000;
 
     private final BookingService bookingService;
 
@@ -338,12 +357,37 @@ public class BookingController {
     }
 
     /**
-     * Clamps a caller-supplied page number down to {@link #MAX_CLAMPED_PAGE_NUMBER} — see that
-     * constant's javadoc. Page size and sort pass through unchanged; only the page index is capped.
+     * Clamps a caller-supplied {@code page × size} OFFSET down to {@link #MAX_CLAMPED_OFFSET}
+     * rows — see that constant's javadoc for why the bound is the offset and not the page index.
+     * Page size and sort pass through unchanged; only the page index moves, to the deepest page
+     * whose offset still fits under the ceiling at the requested size — and because that rebuilt
+     * index <b>floors</b> ({@code MAX_CLAMPED_OFFSET / size} is integer division), the served
+     * offset can undershoot the ceiling by up to {@code size − 1} rows whenever the size does not
+     * divide it evenly ({@code ?size=30} → page 666 → offset 19 980, pinned by
+     * {@code should_clampToOffsetUnderCeiling_when_sizeDoesNotDivideTheCeiling}); it never exceeds
+     * it.
+     *
+     * <p>The offset is computed in {@code long}: {@code getPageNumber()} is an unbounded
+     * {@code int} and {@code getPageSize()} reaches 100, so the product overflows {@code int}
+     * above ~21M pages and a wrapped negative would sail straight past the guard. The pre-323
+     * page-index form could not overflow because it never multiplied; this one can, so the cast
+     * is load-bearing — do not drop it.
      */
     private static Pageable clampGiantOffset(Pageable pageable) {
-        if (pageable.getPageNumber() > MAX_CLAMPED_PAGE_NUMBER) {
-            return PageRequest.of(MAX_CLAMPED_PAGE_NUMBER, pageable.getPageSize(), pageable.getSort());
+        if (!pageable.isPaged()) {
+            return pageable;
+        }
+        // The division below relies on size >= 1, NOT merely size != 0. The offset test alone does
+        // not give that: page MIN_VALUE × size -1 is a positive product that clears the guard, and a
+        // negative size would both flip the quotient's sign and make PageRequest.of throw ("Page size
+        // must not be less than one"). size >= 1 holds because it is Spring Data's resolver floor —
+        // pinned by should_floorPageSizeToTheDefault_when_sizeIsBelowOne (+ the ?size=7 control that
+        // keeps it non-vacuous) — and because PageRequest.of / Pageable.ofSize reject a sub-1 size
+        // outright, so no constructible Pageable can carry one into this private method.
+        long offset = (long) pageable.getPageNumber() * pageable.getPageSize();
+        if (offset > MAX_CLAMPED_OFFSET) {
+            return PageRequest.of(MAX_CLAMPED_OFFSET / pageable.getPageSize(),
+                    pageable.getPageSize(), pageable.getSort());
         }
         return pageable;
     }

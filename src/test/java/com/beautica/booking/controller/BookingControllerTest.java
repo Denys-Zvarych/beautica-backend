@@ -1227,50 +1227,368 @@ class BookingControllerTest {
         org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageSize()).isEqualTo(100);
     }
 
-    @Test
-    @DisplayName("GET /me — page=999999 still clamps to 1000 (Anti-Bug §J deep-OFFSET guard, "
-            + "BookingController.java:127-130) — existing-cap regression pin, Phase 26.6")
-    void should_clampPageNumberTo1000_when_pageExceeds1000() throws Exception {
-        var clientId = UUID.randomUUID();
+    // ── Phase 323 — the deep-OFFSET clamp bounds the OFFSET, not the page index ──
+    //
+    // BookingController#clampGiantOffset is a SECURITY control (Anti-Bug §J / SEC-MEDIUM-3): it
+    // exists so an attacker cannot force an ever-deeper OFFSET scan by walking ?page up. Until
+    // Phase 323 it capped the page INDEX at 1000, while the scan cost tracks page × size — so
+    // appending &size=100 (the max-page-size ceiling) widened the guard 5×, from 20 000 reachable
+    // rows to 100 000.
+    //
+    // The pre-323 suite could not see that. Its clamp tests each pinned ONE axis in isolation
+    // (size=100000 at page 0; page=999999 at the default size 20) and asserted getPageNumber()
+    // alone, which cannot observe an offset. Both factors were covered; the PRODUCT never was.
+    // Every case below asserts pageNumber × pageSize, and no case leaves both axes implicit.
+    //
+    // Mutation-verified (Phase 323): reverting clampGiantOffset to the pre-323 page-index form
+    // turns should_clampToOffset20000_when_pageAndMaxSizeExceedTheOffsetCeiling RED on both
+    // routes while should_clampToOffset20000_when_pageExceedsCeilingAtDefaultSize stays GREEN —
+    // i.e. these tests distinguish the new behaviour from the old, which the three pre-existing
+    // tests demonstrably could not.
+
+    /** Mirrors {@code BookingController.MAX_CLAMPED_OFFSET} — the ceiling, in rows. */
+    private static final long MAX_CLAMPED_OFFSET = 20_000L;
+
+    /**
+     * Issues {@code GET /bookings/me} with the given raw {@code ?page}/{@code ?size} and returns
+     * the {@link org.springframework.data.domain.Pageable} the controller actually handed the
+     * service — the only place the clamp is observable from a slice test. A {@code null}
+     * {@code size} leaves {@code @PageableDefault(size = 20)} in force.
+     */
+    private org.springframework.data.domain.Pageable myBookingsPageable(String page, String size)
+            throws Exception {
+        return myBookingsPageable(page, size, null);
+    }
+
+    /**
+     * {@link #myBookingsPageable(String, String)} plus an explicit raw {@code ?sort}. A
+     * {@code null} {@code sort} leaves the {@code @PageableDefault(sort = "startsAt", DESC)} in
+     * force; {@code "startsAt,asc"} is the only non-default sort the route's whitelist accepts
+     * (see {@code BookingService.SORTABLE_BOOKING_PROPERTIES}), so it is what proves a caller's
+     * sort — not merely the default — survives the clamp's {@code PageRequest.of} rebuild.
+     */
+    private org.springframework.data.domain.Pageable myBookingsPageable(String page, String size, String sort)
+            throws Exception {
         when(bookingService.getMyBookings(any(), any(), any(), any(), any(), any(), any(), any()))
-                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 1000, 20, 0L, 0));
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
 
-        mockMvc.perform(get(BOOKINGS_URL + "/me")
-                        .param("page", "999999")
-                        .with(authenticatedAs(clientId, "client@beautica.test", Role.CLIENT))
-                        .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk());
+        var request = get(BOOKINGS_URL + "/me")
+                .param("page", page)
+                .with(authenticatedAs(UUID.randomUUID(), "client@beautica.test", Role.CLIENT))
+                .accept(MediaType.APPLICATION_JSON);
+        if (size != null) {
+            request = request.param("size", size);
+        }
+        if (sort != null) {
+            request = request.param("sort", sort);
+        }
+        mockMvc.perform(request).andExpect(status().isOk());
 
-        var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        var captor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
         org.mockito.Mockito.verify(bookingService)
-                .getMyBookings(any(), any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
-        org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
+                .getMyBookings(any(), any(), any(), any(), any(), any(), any(), captor.capture());
+        return captor.getValue();
+    }
+
+    /** {@link #myBookingsPageable} for the salon route — same clamp, second call site. */
+    private org.springframework.data.domain.Pageable salonBookingsPageable(String page, String size)
+            throws Exception {
+        var salonId = UUID.randomUUID();
+        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
+        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 0, 20, 0L, 0));
+
+        var request = get(BOOKINGS_URL + "/salon/" + salonId)
+                .param("page", page)
+                .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                .accept(MediaType.APPLICATION_JSON);
+        if (size != null) {
+            request = request.param("size", size);
+        }
+        mockMvc.perform(request).andExpect(status().isOk());
+
+        var captor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
+        org.mockito.Mockito.verify(bookingService)
+                .getSalonBookings(any(), eq(salonId), any(), any(), any(), any(), any(), any(), captor.capture());
+        return captor.getValue();
+    }
+
+    private static void assertOffset(org.springframework.data.domain.Pageable pageable, long expectedOffset) {
+        org.assertj.core.api.Assertions
+                .assertThat((long) pageable.getPageNumber() * pageable.getPageSize())
+                .as("page %d × size %d", pageable.getPageNumber(), pageable.getPageSize())
+                .isEqualTo(expectedOffset);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=999999&size=100 clamps the OFFSET to 20 000 (page 200 × size 100), "
+            + "NOT the page index to 1000 (which would serve OFFSET 100 000) — Phase 323 regression pin")
+    void should_clampToOffset20000_when_pageAndMaxSizeExceedTheOffsetCeiling() throws Exception {
+        var pageable = myBookingsPageable("999999", "100");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(200);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId} — page=999999&size=100 clamps the OFFSET to 20 000 — the same "
+            + "Phase 323 regression pin for the second clampGiantOffset call site")
+    void should_clampToOffset20000_when_salonPageAndMaxSizeExceedTheOffsetCeiling() throws Exception {
+        var pageable = salonBookingsPageable("999999", "100");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(200);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=999999 at the @PageableDefault size 20 still clamps to page 1000 / "
+            + "offset 20 000: Phase 323 is byte-identical to the pre-323 cap at the default size, "
+            + "which is every shipped caller (replaces should_clampPageNumberTo1000_when_pageExceeds1000)")
+    void should_clampToOffset20000_when_pageExceedsCeilingAtDefaultSize() throws Exception {
+        var pageable = myBookingsPageable("999999", null);
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(1000);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize()).isEqualTo(20);
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId} — page=999999 at the default size 20 still clamps to page 1000 / "
+            + "offset 20 000 (replaces should_clampPageNumberTo1000_when_salonBookingsPageExceeds1000)")
+    void should_clampToOffset20000_when_salonPageExceedsCeilingAtDefaultSize() throws Exception {
+        var pageable = salonBookingsPageable("999999", null);
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(1000);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize()).isEqualTo(20);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=200&size=100 sits EXACTLY on the 20 000-row ceiling and passes through "
+            + "unchanged — the clamp is `> ceiling`, not `>=`; off-by-one pin")
+    void should_notClamp_when_offsetIsExactlyAtTheCeiling() throws Exception {
+        var pageable = myBookingsPageable("200", "100");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=100&size=100 (offset 10 000) passes through unchanged: the clamp did "
+            + "NOT become a blanket page cap, and a page index below 1000 is not what it tests")
+    void should_notClamp_when_offsetIsBelowCeilingAtMaxSize() throws Exception {
+        var pageable = myBookingsPageable("100", "100");
+
+        assertOffset(pageable, 10_000L);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId} — page=100&size=100 (offset 10 000) passes through unchanged on "
+            + "the second call site too")
+    void should_notClamp_when_salonOffsetIsBelowCeilingAtMaxSize() throws Exception {
+        var pageable = salonBookingsPageable("100", "100");
+
+        assertOffset(pageable, 10_000L);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=Integer.MAX_VALUE&size=100 clamps to offset 20 000 and does not "
+            + "overflow: in int arithmetic that product wraps to -100, which slips PAST a `> ceiling` "
+            + "guard and serves the giant offset. Pins the `long` cast in clampGiantOffset.")
+    void should_notOverflow_when_pageNumberIsIntMax() throws Exception {
+        var pageable = myBookingsPageable(String.valueOf(Integer.MAX_VALUE), "100");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId} — page=Integer.MAX_VALUE&size=100 clamps to offset 20 000 with no "
+            + "int overflow on the second call site")
+    void should_notOverflow_when_salonPageNumberIsIntMax() throws Exception {
+        var pageable = salonBookingsPageable(String.valueOf(Integer.MAX_VALUE), "100");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("GET /salon/{salonId} — page=200&size=100 sits EXACTLY on the ceiling and passes "
+            + "through unchanged on the second call site")
+    void should_notClamp_when_salonOffsetIsExactlyAtTheCeiling() throws Exception {
+        var pageable = salonBookingsPageable("200", "100");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(200);
+    }
+
+    // ── Phase 323 QA — the four axes the ten pinning cases above still cannot distinguish ──
+    //
+    // The ten cases above all live at size=100 or the @PageableDefault size=20, and all assert
+    // only pageNumber × pageSize. Four independent mutations survive them:
+    //
+    //   (a) re-tightening the clamp to ALSO cap the page index (`min(offset clamp, page 1000)`) —
+    //       invisible at size >= 20, where the offset ceiling is already the binding constraint;
+    //   (b) rounding the rebuilt page index UP instead of down (`Math.ceilDiv`) — invisible for
+    //       every size that divides 20 000 exactly, which both 20 and 100 do;
+    //   (c) dropping `pageable.getSort()` from the PageRequest.of rebuild — invisible to every
+    //       offset assertion, and it silently flips a caller's explicit ?sort back to the
+    //       service's DEFAULT_BOOKING_SORT;
+    //   (d) the pageSize >= 1 invariant the new `MAX_CLAMPED_OFFSET / getPageSize()` division
+    //       rests on, which is Spring Data's resolver floor and is asserted nowhere.
+    //
+    // Each case below kills exactly one of those and is mutation-verified in isolation.
+
+    @Test
+    @DisplayName("GET /me — page=999999&size=1 clamps to page 20 000 / offset 20 000, NOT to page "
+            + "1000: below the default size the Phase 323 clamp is deliberately LOOSER than the "
+            + "pre-323 page cap (D2 — the ceiling is rows, not pages). Kills a re-tightening to "
+            + "min(offset clamp, page 1000), which every size>=20 case above lets through.")
+    void should_clampToOffset20000_when_pageExceedsCeilingAtSizeOne() throws Exception {
+        var pageable = myBookingsPageable("999999", "1");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber())
+                .as("at size=1 the deepest page under the 20 000-row ceiling is page 20 000, not page 1000")
+                .isEqualTo(20_000);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("GET /me — page=999999&size=30 clamps to page 666 / offset 19 980, i.e. the rebuilt "
+            + "page index rounds DOWN so the served offset never EXCEEDS the ceiling. 30 does not "
+            + "divide 20 000; both 20 and 100 do, so every case above is blind to a ceilDiv rebuild "
+            + "(which would serve offset 20 010, past the guard the clamp exists to enforce).")
+    void should_clampToOffsetUnderCeiling_when_sizeDoesNotDivideTheCeiling() throws Exception {
+        var pageable = myBookingsPageable("999999", "30");
+
+        assertOffset(pageable, 19_980L);
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageNumber()).isEqualTo(666);
+        org.assertj.core.api.Assertions
+                .assertThat((long) pageable.getPageNumber() * pageable.getPageSize())
+                .as("the clamped offset must never exceed the ceiling, only reach or undershoot it")
+                .isLessThanOrEqualTo(MAX_CLAMPED_OFFSET);
+    }
+
+    @Test
+    @DisplayName("GET /me — ?sort=startsAt,asc SURVIVES the clamp rebuild: the PageRequest.of the "
+            + "clamp constructs must carry pageable.getSort() forward. Dropping it yields an "
+            + "UNSORTED Pageable, which BookingService#normalizeBookingSort then silently replaces "
+            + "with DEFAULT_BOOKING_SORT (startsAt DESC) — the caller's explicit ASC flips to DESC "
+            + "on deep pages only, and no offset assertion can see it.")
+    void should_preserveRequestedSort_when_offsetIsClamped() throws Exception {
+        var pageable = myBookingsPageable("999999", "100", "startsAt,asc");
+
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+        org.assertj.core.api.Assertions.assertThat(pageable.getSort())
+                .as("requested sort must survive the clamp rebuild, actual=%s", pageable.getSort())
+                .isEqualTo(org.springframework.data.domain.Sort.by(
+                        org.springframework.data.domain.Sort.Direction.ASC, "startsAt"));
+    }
+
+    @Test
+    @DisplayName("GET /me — ?sort=startsAt,asc is honoured on a page the clamp does NOT touch "
+            + "(page=0&size=100). Positive control for the test above: proves the ASC assertion "
+            + "there is observing the clamp's rebuild and not a route that ignores ?sort outright.")
+    void should_honourRequestedSort_when_offsetIsNotClamped() throws Exception {
+        var pageable = myBookingsPageable("0", "100", "startsAt,asc");
+
+        assertOffset(pageable, 0L);
+        org.assertj.core.api.Assertions.assertThat(pageable.getSort())
+                .isEqualTo(org.springframework.data.domain.Sort.by(
+                        org.springframework.data.domain.Sort.Direction.ASC, "startsAt"));
+    }
+
+    @Test
+    @DisplayName("GET /me — the @PageableDefault sort (startsAt DESC) ALSO survives the clamp "
+            + "rebuild when the caller sends no ?sort — the shipped-client path, where a dropped "
+            + "getSort() would be masked by the service re-applying the same default.")
+    void should_preserveDefaultSort_when_offsetIsClamped() throws Exception {
+        var pageable = myBookingsPageable("999999", "100");
+
+        org.assertj.core.api.Assertions.assertThat(pageable.getSort())
+                .as("actual=%s", pageable.getSort())
+                .isEqualTo(org.springframework.data.domain.Sort.by(
+                        org.springframework.data.domain.Sort.Direction.DESC, "startsAt"));
+    }
+
+    // ── The pageSize >= 1 invariant the clamp's DIVISION rests on ──
+    //
+    // `MAX_CLAMPED_OFFSET / pageable.getPageSize()` divides by a caller-influenced value. Nothing
+    // in BookingController asserts that value is >= 1; safety rests entirely on Spring Data's
+    // PageableHandlerMethodArgumentResolver flooring a sub-1 ?size back to the @PageableDefault.
+    // That is a third-party invariant, and a Spring Data upgrade that changed it would turn a
+    // 200 into a 500 on these two routes. The pair below pins it AT the HTTP boundary, which is
+    // the only place it is actually load-bearing:
+    //
+    //   * the floor case proves ?size=0 and ?size=-1 arrive as 20, never as 0;
+    //   * the control case proves a small-but-legal ?size=7 arrives as 7 — without it, "20" would
+    //     be indistinguishable from "the route ignores ?size and always uses the default", and the
+    //     floor assertion would be vacuous (20 IS the default).
+    //
+    // These run against the PRODUCTION resolver, not a stock Spring stand-in: SortPathGuardConfig
+    // is a WebMvcConfigurer, which @WebMvcTest includes in its component filter, and it builds the
+    // PageableHandlerMethodArgumentResolver this slice uses by hand. Verified by probe — a
+    // ?sort=client.email,asc through this same slice returns 400, which only that config does.
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "?size={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"0", "-1"})
+    @DisplayName("GET /me — a sub-1 ?size is FLOORED to the @PageableDefault 20 by Spring Data's "
+            + "resolver and never reaches clampGiantOffset as 0. This is the sole guarantee that "
+            + "MAX_CLAMPED_OFFSET / getPageSize() cannot divide by zero; it is a Spring Data "
+            + "invariant, so pin it here rather than assume it.")
+    void should_floorPageSizeToTheDefault_when_sizeIsBelowOne(String size) throws Exception {
+        var pageable = myBookingsPageable("999999", size);
+
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize())
+                .as("?size=%s must be floored to the default 20, never passed through as <1", size)
+                .isEqualTo(20);
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+    }
+
+    @Test
+    @DisplayName("GET /me — ?size=7 is honoured verbatim (page 2857 × size 7 = offset 19 999). "
+            + "Positive control for the floor test above: a small ?size IS respected, so the 20 it "
+            + "asserts is a FLOOR and not the route quietly discarding ?size.")
+    void should_honourPageSize_when_sizeIsBelowTheDefaultButLegal() throws Exception {
+        var pageable = myBookingsPageable("999999", "7");
+
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize()).isEqualTo(7);
+        assertOffset(pageable, 19_999L);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "?size={0}")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"0", "-1"})
+    @DisplayName("GET /salon/{salonId} — the same sub-1 ?size floor on the second clampGiantOffset "
+            + "call site: both routes divide by getPageSize(), so both need the invariant pinned.")
+    void should_floorPageSizeToTheDefault_when_salonSizeIsBelowOne(String size) throws Exception {
+        var pageable = salonBookingsPageable("999999", size);
+
+        org.assertj.core.api.Assertions.assertThat(pageable.getPageSize())
+                .as("?size=%s must be floored to the default 20 on the salon route too", size)
+                .isEqualTo(20);
+        assertOffset(pageable, MAX_CLAMPED_OFFSET);
+    }
+
+    @Test
+    @DisplayName("clampGiantOffset(Pageable.unpaged()) returns the input instead of throwing "
+            + "UnsupportedOperationException — direct-contract pin. Reflection, not a route test: "
+            + "neither call site can produce an unpaged Pageable (@PageableDefault makes the "
+            + "resolver's fallback a PageRequest), so no HTTP request can reach this branch.")
+    void should_returnUnchanged_when_pageableIsUnpaged() throws Exception {
+        var m = BookingController.class.getDeclaredMethod("clampGiantOffset",
+                org.springframework.data.domain.Pageable.class);
+        m.setAccessible(true);
+        var unpaged = org.springframework.data.domain.Pageable.unpaged();
+
+        org.assertj.core.api.Assertions.assertThat(m.invoke(null, unpaged)).isSameAs(unpaged);
     }
 
     // ── GET /salon/{salonId} (Phase 23.4 audit fix, Finding 4) ───────────────────
-
-    @Test
-    @DisplayName("GET /salon/{salonId} — page=999999 still clamps to 1000 (Anti-Bug §J deep-OFFSET "
-            + "guard, shared with /me via BookingController#clampGiantOffset) — mirrors "
-            + "should_clampPageNumberTo1000_when_pageExceeds1000 for the Phase 23.4 route")
-    void should_clampPageNumberTo1000_when_salonBookingsPageExceeds1000() throws Exception {
-        var salonId = UUID.randomUUID();
-        var ownerId = UUID.randomUUID();
-        when(authorizationService.canManageSalon(any(), eq(salonId))).thenReturn(true);
-        when(bookingService.getSalonBookings(any(), any(), any(), any(), any(), any(), any(), any(), any()))
-                .thenReturn(com.beautica.common.PageResponse.of(java.util.List.of(), 1000, 20, 0L, 0));
-
-        mockMvc.perform(get(BOOKINGS_URL + "/salon/" + salonId)
-                        .param("page", "999999")
-                        .with(authenticatedAs(ownerId, "owner@beautica.test", Role.SALON_OWNER))
-                        .accept(MediaType.APPLICATION_JSON))
-                .andExpect(status().isOk());
-
-        var pageableCaptor = org.mockito.ArgumentCaptor.forClass(org.springframework.data.domain.Pageable.class);
-        org.mockito.Mockito.verify(bookingService)
-                .getSalonBookings(any(), eq(salonId), any(), any(), any(), any(), any(), any(), pageableCaptor.capture());
-        org.assertj.core.api.Assertions.assertThat(pageableCaptor.getValue().getPageNumber()).isEqualTo(1000);
-    }
 
     // ── Phase 319 — GET /salon/{salonId} filter parity with GET /bookings/me ────
     //
