@@ -105,11 +105,19 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * when non-null — the same optional-predicate discipline {@link #applyDateRange} already
      * applies to {@code from}/{@code toExclusive}, so a caller that omits it gets a {@code WHERE}
      * with no {@code master_id} term at all rather than a dead {@code IS NULL OR} branch.
+     *
+     * <p><b>Phase 319 — {@code serviceIds} composes through {@link #applyServiceFilter}</b>, the
+     * SAME helper the three {@code GET /bookings/me} query families already use, rather than a
+     * second, salon-specific copy of the same {@code masterService.id IN (…)} predicate. The
+     * status arm above is likewise unchanged: it already accepted an arbitrary
+     * {@code Collection<BookingStatus>}, so widening the wire contract from one {@code ?status=}
+     * to a repeatable one needed no change here at all.
      */
     @Override
     public Page<UUID> findIdsBySalonIdFiltered(
             UUID salonId, UUID masterId, Collection<BookingStatus> statuses,
-            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable) {
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
         Specification<Booking> spec = Specification.where(BookingSpecifications.bookingSalonIdEquals(salonId));
         if (masterId != null) {
             spec = spec.and(BookingSpecifications.masterIdEquals(masterId));
@@ -118,6 +126,7 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
             spec = spec.and(BookingSpecifications.statusIn(statuses));
         }
         spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
         return findIdPage(spec, pageable);
     }
 
@@ -155,6 +164,30 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
             Collection<UUID> serviceIds, Pageable pageable) {
         Specification<Booking> spec = Specification.where(BookingSpecifications.clientIdEquals(clientId))
                 .and(BookingSpecifications.partition(partition, now));
+        spec = applyDateRange(spec, from, toExclusive);
+        spec = applyServiceFilter(spec, serviceIds);
+        return findIdPage(spec, pageable);
+    }
+
+    /**
+     * Phase 322 — see {@link BookingRepositoryCustom#findIdsBySalonIdFilteredByPartition} for the
+     * full contract and for why this is a fourth sibling rather than a reuse of {@link
+     * #findIdsBySalonIdsFilteredByPartition}. Structurally {@link #findIdsBySalonIdFiltered} with
+     * {@link BookingSpecifications#statusIn} swapped for {@link BookingSpecifications#partition}:
+     * the {@code bookingSalonIdEquals} scope, the optional {@code masterId} arm, {@link
+     * #applyDateRange}, {@link #applyServiceFilter} and {@link #findIdPage} are all the SAME shared
+     * pieces, never a parallel predicate builder.
+     */
+    @Override
+    public Page<UUID> findIdsBySalonIdFilteredByPartition(
+            UUID salonId, UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable) {
+        Specification<Booking> spec = Specification.where(BookingSpecifications.bookingSalonIdEquals(salonId))
+                .and(BookingSpecifications.partition(partition, now));
+        if (masterId != null) {
+            spec = spec.and(BookingSpecifications.masterIdEquals(masterId));
+        }
         spec = applyDateRange(spec, from, toExclusive);
         spec = applyServiceFilter(spec, serviceIds);
         return findIdPage(spec, pageable);
@@ -285,12 +318,35 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * {@code offset + content.size()}, which is the true total precisely when the content is short
      * (see {@code PageableExecutionUtils#getPage}). No caller's total changes; only the round trip
      * disappears.
+     *
+     * <p><b>{@code count(1)}, not {@code count(b.id)} (Phase 319 audit, MEDIUM — backend-perf).</b>
+     * {@code cb.count(countRoot)} renders {@code count(b1_0.id)}, and {@code id} is a column in NONE
+     * of the indexes that serve these predicates ({@code idx_bookings_salon_starts_at} V19,
+     * {@code idx_bookings_salon_service_starts_at} V166, {@code idx_bookings_salon_partition_starts_at}
+     * and {@code idx_bookings_salon_master_partition_starts_at} V168), so
+     * naming it forces the planner off an Index Only Scan and onto the heap for EVERY matching row —
+     * the count reads the whole match set, not a page of it. Counting a constant references no
+     * column, so the same predicate plans as an Index Only Scan with {@code Heap Fetches: 0}.
+     * Measured on 60k salon rows:
+     *
+     * <pre>
+     * salon only, no filter   Bitmap Heap Scan 2798 buffers / 11.5 ms  -&gt; Index Only Scan  299 buffers / 6.7 ms
+     * salon + one serviceId   V18 FK + Filter  1190 buffers /  2.7 ms  -&gt; Index Only Scan   15 buffers / 0.2 ms
+     * </pre>
+     *
+     * <p>This runs on every FULL page (the short-circuit above only spares short ones), so a busy
+     * salon refreshing «Записи» was burning ~2800 shared buffers per request against a 10-connection
+     * Neon pool. The change is {@code COUNT} semantics-preserving in both directions: neither
+     * {@code count(b.id)} nor {@code count(1)} can skip a row, because {@code bookings.id} is the
+     * NOT NULL primary key and {@code COUNT(expr)} only skips NULLs. It applies to every
+     * {@link #findIdPage} caller — {@code GET /bookings/me}, {@code GET /bookings/salon/&#123;id&#125;}
+     * and the client listing alike — not only the salon board the audit found it on.
      */
     private long countMatching(Specification<Booking> spec) {
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();
         CriteriaQuery<Long> countQuery = cb.createQuery(Long.class);
         Root<Booking> countRoot = countQuery.from(Booking.class);
-        countQuery.select(cb.count(countRoot));
+        countQuery.select(cb.count(cb.literal(1)));
         Predicate countPredicate = spec.toPredicate(countRoot, countQuery, cb);
         if (countPredicate != null) {
             countQuery.where(countPredicate);

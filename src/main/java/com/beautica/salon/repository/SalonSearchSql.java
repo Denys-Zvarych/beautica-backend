@@ -401,6 +401,27 @@ public final class SalonSearchSql {
      *       {@code valid_from} upper bound is load-bearing, not decoration:
      *       {@code WeeklyScheduleRequest#validFrom} is only {@code @FutureOrPresent}, so a template
      *       starting in 2030 is reachable over the public API and the catalogue drops it.
+     *       <p><b>Both bounds resolve "today" as the <em>Europe/Kyiv</em> civil date, spelled
+     *       {@code (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date} — never bare
+     *       {@code CURRENT_DATE}</b> (and likewise for the exception arm below).
+     *       {@code CURRENT_DATE} resolves against the JDBC session's {@code TimeZone}, which
+     *       pgjdbc sets from the JVM default; Railway and Neon both run UTC, so between 00:00 and
+     *       03:00 Kyiv the session date is still <em>yesterday</em> in Kyiv. The catalogue half of
+     *       the contract this lateral mirrors resolves its own "today" from Kyiv unconditionally
+     *       ({@code ScheduleDateMath#today()}, built on {@code clock.withZone(TimeZones.KYIV)}),
+     *       so a bare {@code CURRENT_DATE} here let a master whose template expired
+     *       yesterday-Kyiv keep pricing the salon for three hours every night — search
+     *       advertising a floor the catalogue will not honour, i.e. a breach of the very
+     *       "salon price range = bookable masters only" rule this gate exists to uphold. Binding
+     *       the date as a {@code :today} parameter from {@code ScheduleDateMath} was rejected: it
+     *       would force a {@code @Param} onto all six {@code @Query} methods that share this SQL
+     *       and buys nothing, because the deterministic pin for the regression is {@code TZ=UTC}
+     *       in CI, not a fixed {@code Clock} —
+     *       {@code SalonSearchPriceBandIT#should_excludeMasterWithExpiredScheduleFromTheSearchBand}
+     *       (case 22)
+     *       goes RED under {@code TZ=UTC} the moment either arm reverts to {@code CURRENT_DATE},
+     *       and CI must therefore never be pinned to {@code TZ=Europe/Kyiv}, which would hide the
+     *       defect rather than fix it.</p>
      *       <p><b>It mirrors the RANGE only, not the fold's working-day outcome — and that
      *       remaining gap is deliberate (2026-09-13 cycle-3 audit, A6).</b>
      *       {@code WeeklyScheduleRequest#days} carries only {@code @Size(max = 7)} with no
@@ -503,12 +524,12 @@ public final class SalonSearchSql {
                       AND ms.is_active = true
                       AND (EXISTS (SELECT 1 FROM weekly_schedules ws
                                     WHERE ws.master_id = mad.id
-                                      AND ws.valid_from <= CURRENT_DATE + 180
-                                      AND (ws.valid_to IS NULL OR ws.valid_to >= CURRENT_DATE))
+                                      AND ws.valid_from <= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date + 180
+                                      AND (ws.valid_to IS NULL OR ws.valid_to >= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date))
                            OR EXISTS (SELECT 1 FROM schedule_exceptions se
                                        WHERE se.master_id = mad.id
-                                         AND se.date >= CURRENT_DATE
-                                         AND se.date <= CURRENT_DATE + 180
+                                         AND se.date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date
+                                         AND se.date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date + 180
                                          AND se.kind = 'CUSTOM_HOURS'))
                       AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
                 ) pr ON true

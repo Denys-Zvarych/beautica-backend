@@ -14,16 +14,19 @@ import com.beautica.salon.dto.RotateAdminRequest;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonInviteHistoryResponse;
 import com.beautica.salon.dto.SalonInviteResponse;
+import com.beautica.salon.dto.SalonMasterEffectiveScheduleResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.service.SalonService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -33,9 +36,11 @@ import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 
@@ -130,6 +135,60 @@ public class SalonController {
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<List<SalonStaffMemberResponse>> getSalonStaff(@PathVariable UUID salonId) {
         return ApiResponse.ok(salonService.getSalonStaff(salonId));
+    }
+
+    /**
+     * Phase 321 — every ACTIVE roster master's effective schedule over {@code [from, to]} in ONE
+     * read, backing the mobile salon «Записи» board. The board paints one column per master against
+     * a single shared timeline that must span the UNION of all masters' working hours, and greys out
+     * the masters who are off — neither is derivable from one master at a time, and calling the
+     * per-master {@code GET /masters/{masterId}/effective-schedule} N times is exactly the fan-out
+     * this endpoint exists to remove.
+     *
+     * <p><b>Sibling of phase 319's {@code GET /bookings/salon/{salonId}/booked-days}</b>, and gated
+     * by the IDENTICAL expression, verbatim: {@code hasAnyRole('SALON_OWNER','SALON_ADMIN')} for the
+     * role gate AND {@code @authz.canManageSalon(authentication, #salonId)} for the per-salon
+     * ownership/assignment assertion — the same pairing {@link #getSalonStaff} and
+     * {@link #getSiblingSalons} already carry, reused rather than re-derived so a future change to
+     * salon management cannot diverge between sibling endpoints. The role check alone would admit any
+     * owner or admin for ANY salon id; an owner of a different salon, or an admin assigned elsewhere,
+     * must still get 403. That is not boilerplate on a read: a salon's roster schedule is its
+     * staffing plan, and {@code canManageSalon} returning false for an unknown salon id is also what
+     * keeps this endpoint from being an existence oracle.
+     *
+     * <p><b>Both {@code from} and {@code to} are REQUIRED</b> — a missing bound is a 400, never an
+     * implicit default, for the same reason phase 319's {@code booked-days} requires them: this read
+     * materialises one object per (master, date), so a defaulted range silently picks the cost.
+     *
+     * <p><b>Span capped at 62 inclusive days</b>, in the service layer. Phase 319's sibling
+     * deliberately ships with NO controller-level span cap on {@code GET
+     * /bookings/salon/{salonId}} — the architect's 2026-09-16 ruling that a span cap "guards loops,
+     * not scans", that route being one indexed scan with {@code LIMIT} pushdown. This endpoint is the
+     * counter-example that ruling implies rather than a contradiction of it: its cost is a product,
+     * {@code |roster| × |days|}, entirely materialised into the response body.
+     *
+     * <p>Route sits under {@code /{salonId}/masters}, one segment deeper than the public
+     * {@link #getMastersBySalon} roster it is keyed against, so the two cannot collide —
+     * {@code effective-schedule} is a literal segment and Spring's {@code PathPattern} would prefer
+     * it over a variable in any case.
+     */
+    @Operation(summary = "Effective schedule for every active master of a salon",
+            description = "One entry per ACTIVE roster master, each carrying the effective "
+                    + "availability of every day in [from, to] (inclusive, Europe/Kyiv civil days). "
+                    + "Every active master appears even when all of their days are NO_SCHEDULE — an "
+                    + "absent masterId means 'not loaded', never 'not working'. Range required; span "
+                    + "capped at 62 days. Requires management access to the salon (owner or "
+                    + "assigned admin).")
+    @GetMapping("/{salonId}/masters/effective-schedule")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<SalonMasterEffectiveScheduleResponse>> getSalonMastersEffectiveSchedule(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Range start (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
+    ) {
+        return ApiResponse.ok(salonService.getSalonMastersEffectiveSchedule(salonId, from, to));
     }
 
     /**

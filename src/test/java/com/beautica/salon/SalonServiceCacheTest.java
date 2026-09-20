@@ -163,6 +163,16 @@ class SalonServiceCacheTest {
     @MockBean com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
     @MockBean com.beautica.media.repository.MediaRepository mediaRepository;
     @MockBean com.beautica.media.service.MediaService mediaService;
+    // Commit ac0a19e: SalonService now constructor-depends on MasterScheduleService (parameter 8)
+    // and ScheduleDateMath (parameter 9) for the salon-staff schedule read-through. WITHOUT BOTH
+    // the whole context fails to load with "No qualifying bean of type ..." — and supplying only
+    // the first just moves the failure to parameter 9 — taking all 8 tests red. The sibling slice
+    // SalonServiceInviteHistoryTest was updated in that commit; this one was missed.
+    // Mocks, not real beans: the 8 tests below assert @Cacheable/@CacheEvict on the salon-read
+    // path only, so neither collaborator is reached, and a real ScheduleDateMath would drag in
+    // the Clock this slice already fakes in TxConfig above.
+    @MockBean com.beautica.master.service.MasterScheduleService masterScheduleService;
+    @MockBean com.beautica.master.service.ScheduleDateMath scheduleDateMath;
     @Autowired SalonService salonService;
     @Autowired CacheManager cacheManager;
 

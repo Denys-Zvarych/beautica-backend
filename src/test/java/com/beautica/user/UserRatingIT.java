@@ -124,7 +124,7 @@ class UserRatingIT extends AbstractIntegrationTest {
         String reviewBody = "{\"bookingId\":\"" + bookingId + "\",\"rating\":4,\"comment\":\"Приватний коментар про клієнта\"}";
         ResponseEntity<String> reviewResp = restTemplate.exchange(
                 "/api/v1/client-reviews", HttpMethod.POST,
-                new HttpEntity<>(reviewBody, bearerHeaders(tokenFor(ownerEmail))), String.class);
+                new HttpEntity<>(reviewBody, bearerHeaders(tokenFor(masterEmail))), String.class);
         assertThat(reviewResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
         ResponseEntity<String> resp = restTemplate.exchange(

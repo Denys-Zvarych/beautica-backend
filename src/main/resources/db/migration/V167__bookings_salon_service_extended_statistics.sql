@@ -1,0 +1,60 @@
+-- Phase 319 audit fix (MEDIUM, backend-perf, second pass): V166's
+-- (salon_id, master_service_id, starts_at DESC) index serves a SINGLE-valued serviceId beautifully,
+-- and stops serving the ORDER BY the moment the mobile «Записи» board sends a SECOND service chip.
+--
+-- Why. findIdsBySalonIdFiltered's service predicate is a repeatable list, so two chips render
+-- `master_service_id = ANY (...)`. Postgres can only MergeAppend an `= ANY` when it sits on the
+-- LEADING index column; on a MIDDLE column (which is exactly where V166 puts it, between the
+-- salon_id equality and the starts_at sort key) the scan loses its ordering, the LIMIT pushdown
+-- goes with it, and the planner falls back to a blocking top-N Sort over the whole match set.
+--
+-- Measured, unbounded range, page 1, 40k seeded rows (ANALYZEd):
+--
+--   IN size   Plan                                                  Buffers    ms
+--   1         V166 index, Incremental Sort                               33   1.27
+--   2         V18 FK index + Filter: salon_id, BLOCKING Sort, 3158 rows 2362  10.60   <- worst
+--   5         V19 salon index + Filter                                  170   0.15
+--   10        V19 salon index + Filter                                  105   0.07
+--
+-- Non-monotonic: the planner flips between three strategies as the list grows and lands WORST at
+-- IN(2) — the most likely chip count a human actually taps. It is a shipped shape, not a
+-- hypothetical: beautica-mobile's master_archive_notifier.dart already sends `serviceIds:` plural
+-- with no date range.
+--
+-- The cause is a CARDINALITY MISESTIMATE, not a missing index. Postgres assumes salon_id and
+-- master_service_id are independent, so for `salon_id = :s AND master_service_id = ANY (:two)` it
+-- multiplies the two selectivities and predicts far fewer rows than the correlation actually
+-- yields — a master_service row belongs to exactly one salon, so the two columns are almost totally
+-- functionally dependent. Under that underestimate the narrow FK index looks cheap enough to be
+-- worth throwing away the sort order for.
+--
+-- Extended statistics tell the planner about the dependency, and that alone is enough: measured
+-- after this migration, IN(2) flips back onto the salon-scoped index with an Incremental Sort —
+-- 2362 -> 441 buffers, 10.6 -> 0.90 ms. NO query, contract or index change is required, which is
+-- why this is a statistics object and not a fourth composite index on an already heavily indexed
+-- table.
+--
+--   * ndistinct    — the true count of distinct (salon_id, master_service_id) pairs, so a
+--                    multi-column grouping/equality estimate stops being the product of two
+--                    independent guesses.
+--   * dependencies — the functional dependency itself (master_service_id -> salon_id), which is
+--                    what corrects the conjunctive selectivity above.
+--   * mcv          — most-common-value lists for the PAIR, so a busy salon's hot services are
+--                    estimated from observed frequencies rather than from an average.
+--
+-- The `= ANY` shape specifically needs `mcv`: `dependencies` is only consulted for equality
+-- clauses, and a multi-value list is decomposed into ORed equalities whose combined selectivity the
+-- MCV list is what actually bounds.
+CREATE STATISTICS st_bookings_salon_service (ndistinct, dependencies, mcv)
+    ON salon_id, master_service_id FROM bookings;
+
+-- CREATE STATISTICS only DECLARES the object; the planner sees nothing until the next ANALYZE
+-- populates pg_statistic_ext_data. Without this line the migration would be a no-op until
+-- autovacuum happened to visit `bookings` — on a table that is append-mostly, that can be hours,
+-- and on a freshly restored/seeded database it may not happen before the first user request.
+--
+-- ANALYZE is transaction-safe, unlike VACUUM: it takes only a ShareUpdateExclusiveLock, does not
+-- block concurrent SELECT/INSERT/UPDATE/DELETE, and MAY run inside the transaction block Flyway
+-- wraps each migration in (so no `flyway.executeInTransaction=false` marker is needed here, and
+-- adding one would be an unestablished one-off on this table — see V166's closing note).
+ANALYZE bookings;

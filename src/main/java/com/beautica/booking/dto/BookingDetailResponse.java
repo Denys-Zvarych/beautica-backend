@@ -143,11 +143,22 @@ import java.util.UUID;
  * <p><b>{@code providerCanReviewClient}</b> (extends track 27.x / Phase 27.5) — the PROVIDER-side
  * mirror of {@code canReview}, gating the "Залишити відгук про клієнта" CTA on
  * {@code GET /bookings/{id}} AND on every provider row of {@code GET /bookings/me} (see below).
- * {@code true} iff ALL of: (1) the CURRENT authenticated viewer has provider review-authority over THIS
- * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)}
- * — byte-for-byte the predicate {@code enforceCanReviewClient} throws on inside
- * {@code ClientReviewService.create}, so this flag and the service-layer arm of
- * {@code POST /client-reviews} can never disagree; (2)
+ * {@code true} iff ALL of: (1) the CURRENT authenticated viewer IS the booking's PERFORMING MASTER,
+ * computed by {@code AuthorizationService#isPerformingMasterOfBooking(UUID, Booking)} — byte-for-byte
+ * the predicate {@code enforceCanReviewClient} throws on inside {@code ClientReviewService.create},
+ * so this flag and the service-layer arm of {@code POST /client-reviews} can never disagree. <b>Phase
+ * 320 narrowed this term to that ONE comparison</b> (locked product decision: "salon owner or salon
+ * admin can complete the booking, and after it only salon master can leave the feedback"); it used
+ * to be a union with {@code AuthorizationService#hasProviderAuthorityOverBooking}, so a
+ * {@code SALON_OWNER} or {@code SALON_ADMIN} read {@code true} on any completed booking at their
+ * salon. They now read {@code false} on a booking one of their MASTERS performed — while keeping
+ * {@code /complete}, {@code /not-complete}, {@code /decline} and {@code /reschedule}, which run off
+ * the untouched {@code hasProviderAuthorityOverBooking}. An owner-as-master row
+ * ({@code master_type = 'SALON_OWNER'}, {@code MasterService#createMasterForOwner}) still reads
+ * {@code true} on the bookings that owner personally performed, because the comparison is against
+ * {@code booking.master.user_id} and never consults a role or a salon. A booking whose performing
+ * master has been DEACTIVATED reads {@code false} for everyone — {@code masters.is_active} is a
+ * conjunct of the term and there is no longer an owner arm behind it; (2)
  * {@link com.beautica.booking.domain.BookingClosureRule#isProviderReviewEligible} —
  * {@code status == COMPLETED}, STRICTLY. Unlike the client-side {@code canReview} flag (which uses
  * {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} and also admits an
@@ -157,7 +168,7 @@ import java.util.UUID;
  * {@code BookingClosureRule#isProviderReviewEligible}'s javadoc for the full rationale; (3) the
  * booking has a real client (not a guest/LINK booking); (4) no {@code ClientReview} already
  * exists for this booking. A CLIENT viewer, a SALON_MASTER viewing a booking they did NOT perform,
- * or a provider with no authority over this specific booking, always reads
+ * and a SALON_OWNER or SALON_ADMIN viewing a booking one of their masters performed, all read
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
  * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
  * DTO at all. TWO callers compute this for real, through ONE shared conjunction
@@ -175,25 +186,22 @@ import java.util.UUID;
  * structurally excluded from provider authority). See each of those sites' own comment before
  * "optimising" this away.
  *
- * <p><b>Precisely how far the "agrees with the write endpoint" claim reaches (phase-27.x security
- * audit, LOW 3).</b> An earlier revision of this javadoc asserted the flag "can never disagree" with
- * {@code @authz.canReviewClient} as well. That is NOT true in general, and the weaker claim above is
- * the accurate one. {@code POST /client-reviews} is gated TWICE — the SpEL {@code @PreAuthorize}
- * {@code @authz.canReviewClient} and then {@code enforceCanReviewClient} in the service — and the
- * two derive "is this an independent-master booking" from different sources. The SpEL arm reads the
- * {@code BookingCompletionAccess} projection and takes {@code salonId == null}; the entity arm (and
- * therefore this flag) takes {@code masterType == INDEPENDENT_MASTER}. Those coincide on every
- * production-normal row but not on all of them, because {@code masters.salon_id} is
- * {@code ON DELETE SET NULL} ({@code V4__Patch_salons_add_masters.sql:13}) and neither the schema nor
- * {@code Master} constrains {@code master_type} against it: a salon-typed master whose salon row was
- * deleted has {@code salonId == null} with {@code masterType != INDEPENDENT_MASTER}, so the SpEL arm
- * grants that master authority over their own booking while this flag reads {@code false}. What
- * still holds — and is what the CTA depends on — is that the endpoint accepts only the CONJUNCTION
- * of both arms, so a viewer this flag shows {@code true} to is never rejected on authority grounds
- * by the service arm, and the divergent row above is fail-closed for the UI (no CTA offered, and
- * none would have succeeded). The mirror case (an {@code INDEPENDENT_MASTER}-typed master carrying a
- * non-null {@code salon_id}) would invert that and over-offer the CTA into a 403; no writer produces
- * that shape today, but nothing structurally forbids it either.
+ * <p><b>Phase 320 — the flag now agrees with BOTH gates of the write endpoint, exactly.</b> This
+ * used to be a deliberately weakened claim (phase-27.x security audit, LOW 3): {@code
+ * POST /client-reviews} is gated TWICE — the SpEL {@code @PreAuthorize} {@code
+ * @authz.canReviewClient} and then {@code enforceCanReviewClient} in the service — and the two used
+ * to derive "is this an independent-master booking" from different sources ({@code salonId == null}
+ * off a projection vs {@code masterType == INDEPENDENT_MASTER} off the entity), which diverged on a
+ * salon-typed master whose salon row had been deleted ({@code masters.salon_id} is
+ * {@code ON DELETE SET NULL}, {@code V4__Patch_salons_add_masters.sql:13}, and nothing constrains
+ * {@code master_type} against it). That divergence is GONE with the {@code
+ * hasProviderAuthorityOverBooking} disjunct that owned it. All three sites — this flag, {@code
+ * AuthorizationService#canReviewClient} and {@code AuthorizationService#enforceCanReviewClient} —
+ * now evaluate the SAME two columns, {@code masters.user_id} and {@code masters.is_active}, one
+ * through the {@code BookingReviewAccess} projection and two through the hydrated entity. Neither
+ * reads {@code salon_id} or {@code master_type} at all, so no schema shape can split them. Keep it
+ * that way: if a future phase re-adds a salon-derived arm to any ONE of the three, this paragraph's
+ * guarantee dies with it.
  *
  * <p><b>Why the two derivations were NOT unified.</b> Unifying means putting {@code masterType} into
  * {@code BookingCompletionAccess} and switching the projection-based predicates to it. That

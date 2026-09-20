@@ -118,6 +118,54 @@ import java.util.UUID;
                 // master's TOTAL row count, not the service's). Converts that shape to a direct
                 // index-range seek on (master_id, master_service_id).
                 @Index(name = "idx_bookings_master_service_starts_at", columnList = "master_id, master_service_id, starts_at"),
+                // composite index (V166): the SALON-scope twin of the index directly above —
+                // GET /bookings/salon/{salonId}?serviceId=... (Phase 319). The master-scope index
+                // cannot serve it (master_id is not a prefix of the salon query's predicate), and
+                // without this one the planner leads with idx_bookings_master_service_id (V18, the
+                // bare FK index) whenever the filtered service is a small slice of the salon's
+                // volume — the normal case — discarding the salon scope to a post-scan Filter and
+                // losing LIMIT pushdown to a blocking Sort. V166 carries the measured EXPLAIN on
+                // both sides. JPA cannot encode the DESC sort direction; the migration declares
+                // (salon_id, master_service_id, starts_at DESC) and this annotation mirrors the
+                // columns for reader accuracy only — ddl-auto=validate does NOT check
+                // @Table(indexes=...) against the real schema (see the V118 note above).
+                //
+                // The two OTHER salon-scope indexes on this table — idx_bookings_salon_starts_at
+                // (V19) and idx_bookings_salon_status_starts_at (V22/V113) — have never been
+                // mirrored here. That is a PRE-EXISTING gap, not a statement that they do not
+                // exist; do not infer from their absence that a salon-scope index is missing from
+                // the schema.
+                @Index(name = "idx_bookings_salon_service_starts_at", columnList = "salon_id, master_service_id, starts_at"),
+                // composite index (V168, Phase 322): GET /bookings/salon/{salonId}?partition= — the
+                // mobile salon «Архів» page. BookingSpecifications#partition compares `status` AND
+                // `ends_at` (the latter against a RUNTIME instant), and every salon-scope index
+                // before this one stopped at starts_at, so `ends_at` could only be read from the
+                // HEAP — turning BookingRepositoryCustomImpl#countMatching (which runs on every FULL
+                // page) into a Bitmap Heap Scan over every heap page the salon touches. Measured on
+                // 60k salon rows: HISTORY/PAST count 1694 buffers with Heap Blocks exact=1396 — the
+                // salon's WHOLE physical footprint — against 299 for the unfiltered call this
+                // endpoint already permits. Carrying status+ends_at AFTER the starts_at sort key
+                // makes it an Index Only Scan, Heap Fetches 0, at 495. V168 carries the full
+                // before/after table and the rejected alternatives.
+                //
+                // starts_at comes BEFORE the two filter columns and that order is LOAD-BEARING, not
+                // cosmetic: starts_at is the ORDER BY key, so putting status/ends_at ahead of it
+                // would stop the index serving `ORDER BY starts_at DESC` and turn the Incremental
+                // Sort into a blocking one. JPA cannot encode the DESC direction — V168 declares
+                // (salon_id, starts_at DESC, status, ends_at) and this annotation mirrors the
+                // columns for reader accuracy only (see the V118 note above).
+                @Index(name = "idx_bookings_salon_partition_starts_at", columnList = "salon_id, starts_at, status, ends_at"),
+                // composite index (V168, Phase 322): the master-chip twin of the index directly
+                // above, and a REPLACEMENT for idx_bookings_salon_master_starts_at (V148) — of which
+                // it is a strict superset, so V168 drops V148's index rather than carrying both.
+                // This is the load-bearing half of that migration: with V148's narrower shape the
+                // master chip paid ONE RANDOM HEAP FETCH PER ROW, costing 1420 buffers to return
+                // 2826 rows where the salon-wide count paid 1694 for 56516 — 20x worse per row than
+                // the shape it exists to narrow. Measured 1420 -> 35 (Index Only Scan, Heap Fetches
+                // 0). Same column-order reasoning as above; V148's own javadoc-style header explains
+                // why master_id sits between the salon_id equality and the starts_at sort key.
+                @Index(name = "idx_bookings_salon_master_partition_starts_at",
+                        columnList = "salon_id, master_id, starts_at, status, ends_at"),
                 // partial index (V112, predicate narrowed by V113): client-scoped cross-master/salon
                 // overlap check (BookingRepository.findFirstConflictingClientBookingId[Excluding]).
                 // JPA cannot encode WHERE status = 'CONFIRMED' AND client_id IS NOT NULL — the

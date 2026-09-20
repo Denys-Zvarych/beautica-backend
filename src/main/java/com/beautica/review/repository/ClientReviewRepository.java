@@ -39,9 +39,11 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      * different salon or master. That is deliberate — the authority decision is not the repository's
      * to make, and folding an {@code actorId} in here would duplicate, in JPQL, the ownership rule
      * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} owns, giving two
-     * implementations that can drift. It is safe ONLY because the sole caller,
+     * implementations that can drift — the rule now lives in
+     * {@code AuthorizationService#isPerformingMasterOfBooking} (Phase 320: only the booking's
+     * performing master may review its client). It is safe ONLY because the sole caller,
      * {@code BookingService#loadProviderReviewBatch}, passes exactly the {@code withAuthority} set
-     * that method returned, and returns early when it is empty. Review-existence is a weak signal
+     * it computed from that predicate, and returns early when it is empty. Review-existence is a weak signal
      * (a boolean per id, no review content), but it is still information about a stranger's booking,
      * and a caller that skipped the narrowing would additionally hand attacker-chosen ids straight
      * into an unbounded {@code IN} list. Any NEW caller must narrow first, or this method must gain

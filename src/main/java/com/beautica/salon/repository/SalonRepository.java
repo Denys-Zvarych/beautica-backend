@@ -109,11 +109,18 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
 
     /**
      * Batched twin of {@link #existsByIdAndOwnerId}: of the supplied salon ids, the subset owned
-     * by {@code ownerId}. Backs
-     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} — ONE statement for a
-     * whole page of bookings instead of one {@code existsByIdAndOwnerId} per row (anti-bug §E: no
-     * N+1). Cost is flat in page size: the caller de-duplicates the page's salon ids first, and a
-     * page with no salon-employed master skips the call entirely.
+     * by {@code ownerId}. ONE statement for a whole page of bookings instead of one
+     * {@code existsByIdAndOwnerId} per row (anti-bug §E: no N+1). Cost is flat in page size: the
+     * caller de-duplicates the page's salon ids first, and a page with no salon-employed master
+     * skips the call entirely.
+     *
+     * <p><b>Phase 320 — currently has NO production caller.</b> Its only one was
+     * {@code AuthorizationService#filterBookingIdsWithProviderAuthority}, the page-scoped batched
+     * provider-authority filter behind the {@code providerCanReviewClient} listing flag. That flag
+     * is now the single term {@code AuthorizationService#isPerformingMasterOfBooking} (only the
+     * performing master may review the client), so the filter — and with it this query's caller —
+     * was deleted. Kept, with its {@code SalonRepositoryTest} coverage, as the ready-made batched
+     * form for the next page-scoped ownership question; delete it if none arrives.
      *
      * <p><b>Deliberately carries no {@code isActive} predicate</b>, unlike
      * {@link #findIdsByOwnerIdAndIsActiveTrue}. The per-row predicate this batches — the

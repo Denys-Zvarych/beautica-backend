@@ -285,6 +285,44 @@ class ScheduleDateMathTest {
                 .isInstanceOf(BusinessException.class);
     }
 
+    // ── Phase 321 — assertSpanWithinMax(from, to, maxSpanDays) ────────────────
+
+    @Test
+    void should_acceptSpanAtCeiling_when_assertSpanWithinMaxGetsExplicitMax() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2026, 9, 17));
+        LocalDate from = LocalDate.of(2026, 9, 17);
+
+        // span = 61 between -> 62 inclusive days, the salon-board ceiling: accepted.
+        math.assertSpanWithinMax(from, from.plusDays(61), 61L);
+    }
+
+    @Test
+    void should_rejectSpanOneDayPastCeiling_when_assertSpanWithinMaxGetsExplicitMax() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2026, 9, 17));
+        LocalDate from = LocalDate.of(2026, 9, 17);
+
+        assertThatThrownBy(() -> math.assertSpanWithinMax(from, from.plusDays(62), 61L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Date range exceeds the maximum of 62 days");
+    }
+
+    /**
+     * The no-arg overload must keep reproducing its historical message byte-for-byte — three
+     * {@code BookingServiceTest} cases stub that exact string, and phase 321 re-expressed it as
+     * {@code max + 1} rather than a literal.
+     */
+    @Test
+    void should_keepThe366DayMessage_when_assertSpanWithinMaxUsesTheDefaultCeiling() {
+        ScheduleDateMath math = atKyivDate(LocalDate.of(2026, 9, 17));
+        LocalDate from = LocalDate.of(2026, 9, 17);
+
+        math.assertSpanWithinMax(from, from.plusDays(365));
+
+        assertThatThrownBy(() -> math.assertSpanWithinMax(from, from.plusDays(366)))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Date range exceeds the maximum of 366 days");
+    }
+
     @Test
     void should_throw_when_expandInclusiveStartAfterEnd() {
         ScheduleDateMath math = atKyivDate(LocalDate.of(2024, 5, 22));

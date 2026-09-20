@@ -1,0 +1,52 @@
+-- Phase 319 audit fix (HIGH, backend-perf): GET /bookings/salon/{salonId}?serviceId=... gained a
+-- repeatable master_service_id filter (BookingRepositoryCustomImpl#applyServiceFilter), mirroring
+-- GET /bookings/me's Phase 26.4 filter. The phase shipped WITHOUT an index on the claim that the
+-- predicate "always ANDs with the hard salon_id scope ... filtering an already-index-narrowed row
+-- set". Measured against 40k seeded rows (ANALYZEd), that claim is FALSE, and it is false in
+-- precisely the normal case.
+--
+-- Because the filter is SELECTIVITY-driven, the planner abandons the salon scope entirely whenever
+-- the chosen service is a small slice of the salon's volume — i.e. one service out of a catalogue
+-- of dozens, which is what the mobile «Записи» service chips send. Measured plan for
+-- `salon + ONE DAY + serviceId` where the service is 0.2% of salon volume:
+--
+--   Index Scan using idx_bookings_master_service_id
+--     Index Cond: (master_service_id = '...')
+--     Filter: (starts_at >= ... AND salon_id = '...')
+--     Rows Removed by Filter: 80          <- 100% of the rows the index returned
+--   Sort  (blocking; NOT Incremental)     <- LIMIT pushdown lost, whole match set sorted
+--   Buffers: shared hit=82                <- vs 4 for the same query without serviceId
+--
+-- A HIGHLY NON-selective service keeps the salon-scoped plan, which is why this was never noticed:
+-- the regression hides on exactly the fixtures a hand-written test tends to build.
+--
+-- No existing index covers the (salon_id, master_service_id) equality pair:
+--   * idx_bookings_salon_starts_at            (V19:  salon_id, starts_at DESC)
+--   * idx_bookings_salon_status_starts_at     (V22/V113: salon_id, status, starts_at DESC
+--                                              WHERE status IN ('CONFIRMED','COMPLETED'))
+--   * idx_bookings_salon_master_starts_at     (V148: salon_id, master_id, starts_at DESC)
+--   * idx_bookings_master_service_starts_at   (V117: master_id, master_service_id, starts_at)
+--     — MASTER-scoped, serving GET /bookings/me's Phase 26.4 filter. It cannot serve the salon
+--     scope: master_id is not a prefix of this query's predicate.
+--   * idx_bookings_master_service_id          (V18 FK index: master_service_id alone) — the very
+--     index the planner wrongly leads with above.
+--
+-- (salon_id, master_service_id, starts_at DESC) — master_service_id sits between the salon_id
+-- equality predicate and the starts_at sort key, exactly as master_id does in V148, so
+-- `salon_id = :id AND master_service_id IN (...) ORDER BY starts_at DESC` plans as an Index Cond
+-- on all three columns with no residual Filter and an Incremental Sort instead of a blocking one.
+-- Verified post-change: pure Index Cond on all three columns, Incremental Sort restored, blocking
+-- Sort gone, 82 buffers -> 4.
+--
+-- No status predicate, matching V19/V148's unfiltered shape rather than V22/V113's partial one:
+-- findIdsBySalonIdFiltered's status filter is optional and (since Phase 319) a repeatable list, so
+-- this index must serve every status, not just CONFIRMED/COMPLETED.
+--
+-- master_service_id is NOT NULL on every booking row (V18), so no partial WHERE is needed to
+-- exclude unmatchable rows — same reasoning as V148.
+--
+-- Plain CREATE INDEX, matching every prior index migration on this table (V112, V142, V145, V148):
+-- Flyway runs each migration inside a transaction and CREATE INDEX CONCURRENTLY cannot run inside
+-- one, so introducing CONCURRENTLY here alone would be an unestablished one-off.
+CREATE INDEX idx_bookings_salon_service_starts_at
+    ON bookings (salon_id, master_service_id, starts_at DESC);

@@ -60,15 +60,34 @@ public class BookingController {
             Pattern.compile("^[A-Za-z0-9\\-_]{1,64}$");
 
     /**
-     * Giant-OFFSET clamp ceiling shared by every paginated booking list route (Anti-Bug §J /
-     * SEC-MEDIUM-3): a caller-supplied page number beyond this is silently clamped down to it
-     * rather than executed as-is, so an attacker cannot force an ever-deeper {@code OFFSET} scan
-     * by walking {@code page} up. Phase 23.4 audit fix, Finding 4 (LOW, backend-qa) — previously
-     * duplicated verbatim in both {@link #listMyBookings} and {@link #getSalonBookings}; extracted
-     * to {@link #clampGiantOffset(Pageable)} so there is exactly one implementation to test and
-     * keep in sync.
+     * Giant-OFFSET clamp ceiling, in ROWS, shared by every paginated booking list route
+     * (Anti-Bug §J / SEC-MEDIUM-3): a request whose {@code page × size} offset exceeds this is
+     * silently clamped down to it rather than executed as-is, so an attacker cannot force an
+     * ever-deeper {@code OFFSET} scan by walking {@code page} up. Phase 23.4 audit fix, Finding 4
+     * (LOW, backend-qa) — previously duplicated verbatim in both {@link #listMyBookings} and
+     * {@link #getSalonBookings}; extracted to {@link #clampGiantOffset(Pageable)} so there is
+     * exactly one implementation to test and keep in sync.
+     *
+     * <p><b>Phase 323 — this bounds the OFFSET, never the page INDEX.</b> It was
+     * {@code MAX_CLAMPED_PAGE_NUMBER = 1000} until Phase 323, which capped the page index while
+     * the scan cost it exists to bound tracks {@code page × size}. Since {@code size} is
+     * caller-supplied and capped at 100 ({@code application.yml}, {@code max-page-size}), that
+     * form let an attacker widen the guard 5× — 20 000 reachable rows at the
+     * {@code @PageableDefault(size = 20)} both routes declare, but 100 000 by appending
+     * {@code &size=100}. A security control a query parameter widens is a defective control.
+     * Do NOT regress this to a page cap: the ceiling must stay a constant independent of every
+     * caller-supplied parameter. 20 000 is the bound Phase 205 (26.6) and {@code backlog.md}
+     * already assert.
+     *
+     * <p>Against the pre-323 page cap the new form is: identical at {@code size = 20} (page 1000 ×
+     * 20 = 20 000 rows either way); strictly <b>tighter</b> above it ({@code size = 100}: 100 000
+     * reachable rows before, 20 000 now); and deliberately <b>looser</b> below it ({@code size =
+     * 1}: 1 000 rows before, 20 000 now) — because the ceiling is <b>rows, not pages</b>, and
+     * 20 000 rows costs the database the same whether they are fetched 1 or 100 at a time. The
+     * looser leg is intentional and pinned by
+     * {@code should_clampToOffset20000_when_pageExceedsCeilingAtSizeOne}.
      */
-    private static final int MAX_CLAMPED_PAGE_NUMBER = 1000;
+    private static final int MAX_CLAMPED_OFFSET = 20_000;
 
     private final BookingService bookingService;
 
@@ -217,6 +236,12 @@ public class BookingController {
      * uses for its own owner-or-admin-of-this-salon endpoints). An owner of a DIFFERENT salon, or
      * an admin assigned elsewhere, gets 403.
      *
+     * <p><b>Phase 322 — the expression is UNCHANGED by the {@code partition} parameter</b>, and
+     * deliberately so: a partition cannot widen an authorization surface, it only narrows a result
+     * set the caller was already entitled to read in full. {@code SALON_MASTER} is still not
+     * admitted — the invited staff master reads their own archive at
+     * {@code GET /bookings/me?partition=HISTORY}; this route is the owner/admin's salon-wide view.
+     *
      * <p>Route is {@code /api/v1/bookings/salon/{salonId}} — three path segments, so it cannot
      * collide with the two-segment {@code /{bookingId}} above (same collision-avoidance rationale
      * {@code /me/booked-days} documents; Spring's {@code PathPattern} prefers the literal {@code
@@ -230,29 +255,139 @@ public class BookingController {
             @PathVariable UUID salonId,
             @Parameter(description = "Filter to one master's bookings within the salon. Omit for every master.")
             @RequestParam(required = false) UUID masterId,
-            @Parameter(description = "Filter by a single status. Omit for no status predicate.")
-            @RequestParam(required = false) BookingStatus status,
+            // Phase 319: widened from a single optional BookingStatus to a repeatable list,
+            // mirroring the Phase 26.1 change /bookings/me received above — the reasoning is
+            // written out at that parameter and applies identically here. Spring binds both
+            // ?status=A (1-element list — every pre-319 caller keeps working UNCHANGED, which is
+            // what makes this widening backward compatible by construction) and ?status=A&status=B
+            // (multi-select). null/absent = no status predicate. @Size caps the repeated param at
+            // the enum's own cardinality (5) BEFORE it reaches EnumSet.copyOf in the service, and
+            // the class-level @Validated makes a violation surface as a 400
+            // ConstraintViolationException via GlobalExceptionHandler, never a 500 (Anti-Bug §B1).
+            @Parameter(description = "Repeatable status filter, e.g. ?status=CONFIRMED&status=DECLINED. "
+                    + "Omit for no status predicate. A single ?status=CONFIRMED still works unchanged. "
+                    + "IGNORED whenever `partition` is present — see that parameter's doc for the "
+                    + "precedence rule.")
+            @RequestParam(required = false) @Size(max = 5) List<BookingStatus> status,
             @Parameter(description = "Bookings starting on/after the start of this local day (Europe/Kyiv). "
                     + "Omit for an open-ended future window.")
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
             @Parameter(description = "Bookings starting on/before the end of this local day (Europe/Kyiv), "
                     + "inclusive. Omit for an open-ended past window.")
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            // Phase 319: optional, repeatable serviceId filter — same Phase 26.4 parameter
+            // /bookings/me carries above. Matches b.masterService.id (the master's own catalogue
+            // entry a booking was placed against), never masterService.serviceDefinition.id.
+            // @Size caps the list at 50: unlike status (self-bounded at the enum's cardinality of
+            // 5), a UUID list has no natural upper bound, so an explicit cap is what stops an
+            // unbounded IN list / plan-cache inflation (Anti-Bug §B1).
+            //
+            // NO FACET ENDPOINT — and note this list is salon-WIDE, spanning many masters, so its
+            // option universe is NOT /me's single-master catalogue. Mobile sources the options
+            // from the salon service catalogue it already holds (locked decision, see phase doc).
+            @Parameter(description = "Repeatable MasterService id filter, e.g. "
+                    + "?serviceId=<A>&serviceId=<B>. Omit for no service predicate.")
+            @RequestParam(required = false) @Size(max = 50) List<UUID> serviceId,
+            // Phase 322: additive-optional time-based partition, the SAME BookingPartition type and
+            // the SAME precedence rule GET /bookings/me has carried since Phase 28.2 (see that
+            // parameter above). ANDs with masterId/from/to/serviceId exactly like `status` does.
+            // Absent (the default) => SQL and response byte-identical to pre-322 behaviour, because
+            // BookingService#getSalonBookings' 8-arg overload is still the code path taken — see
+            // that method's javadoc for the type-level backwards-compatibility argument.
+            @Parameter(description = "Time-based partition: UPCOMING (status=CONFIRMED and not yet "
+                    + "elapsed), PAST (COMPLETED/NOT_COMPLETED, or an elapsed unclosed CONFIRMED), "
+                    + "or CANCELLED (CANCELLED/DECLINED) — a total, disjoint cover of every "
+                    + "booking status. AWAITING_CLOSURE is a named subset of PAST (an elapsed "
+                    + "unclosed CONFIRMED booking only). HISTORY is a union view spanning PAST and "
+                    + "CANCELLED, i.e. every booking EXCEPT UPCOMING, in one correctly-paginated "
+                    + "request — use it for the salon \"archive\" list, which must include cancelled "
+                    + "and declined bookings alongside finished ones, across every master in the "
+                    + "salon. When present, `status` is IGNORED — NOT a 400 — this is the additive "
+                    + "rollout safety valve: a client sending both params degrades cleanly to the "
+                    + "pre-partition `status`-only behaviour against a backend that does not yet "
+                    + "know `partition`. Omit for byte-identical pre-Phase-322 behaviour.")
+            @RequestParam(required = false) BookingPartition partition,
             @PageableDefault(size = 20, sort = "startsAt", direction = Sort.Direction.DESC) Pageable pageable,
             Authentication auth
     ) {
         return ApiResponse.ok(bookingService.getSalonBookings(
-                AuthenticationUtils.userId(auth), salonId, masterId, status, from, to,
-                clampGiantOffset(pageable)));
+                AuthenticationUtils.userId(auth), salonId, masterId, status, from, to, serviceId,
+                partition, clampGiantOffset(pageable)));
     }
 
     /**
-     * Clamps a caller-supplied page number down to {@link #MAX_CLAMPED_PAGE_NUMBER} — see that
-     * constant's javadoc. Page size and sort pass through unchanged; only the page index is capped.
+     * Phase 319 — {@code GET /bookings/salon/{salonId}/booked-days}: the distinct local
+     * (Europe/Kyiv) days on which THIS salon has bookings, feeding the day rail's "this day has
+     * bookings" dots on the mobile salon «Записи» board. Salon-wide counterpart to
+     * {@code GET /bookings/me/booked-days}, which returns the CALLER's days — for an owner that is
+     * every owned salon aggregated, and for a {@code SALON_ADMIN} it is a hard rejection, so
+     * neither shape could draw this board's dots.
+     *
+     * <p><b>Authorization is the SAME expression {@link #getSalonBookings} carries, verbatim</b> —
+     * {@code hasAnyRole('SALON_OWNER','SALON_ADMIN')} for the role gate AND
+     * {@code @authz.canManageSalon(authentication, #salonId)} for the per-salon
+     * ownership/assignment assertion. The role check alone would admit any owner/admin for ANY
+     * salon id; an owner of a different salon, or an admin assigned elsewhere, must still get 403.
+     * That is not boilerplate on a read-only day list: a salon's booked-day set IS its activity
+     * calendar, and leaking it would expose exactly how busy a competitor is.
+     *
+     * <p><b>Both {@code from} and {@code to} are REQUIRED</b> (unlike the sibling list's optional
+     * range) — an unbounded default would scan the salon's entire booking history. Deliberately
+     * filter-independent: no {@code status}/{@code serviceId}/{@code masterId} param, for the same
+     * reason {@code /me/booked-days} takes none (see {@code BookingService#getMyBookedDays}'s
+     * javadoc) — the dots mark where bookings ARE while a filter narrows the list below them.
+     *
+     * <p>Route is FOUR path segments, so it cannot collide with the two-segment
+     * {@code /{bookingId}} — the same collision-avoidance reasoning this controller already
+     * documents at {@code /me/booked-days} and {@code /salon/{salonId}}. Spring's
+     * {@code PathPattern} prefers the literal {@code salon} segment regardless, but the route is
+     * pinned by a controller test anyway, exactly as {@code /me/booked-days} is.
+     */
+    @Operation(summary = "List the salon's booked days (owner/admin)")
+    @GetMapping("/salon/{salonId}/booked-days")
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
+    public ApiResponse<List<LocalDate>> listSalonBookedDays(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Range start (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
+    ) {
+        return ApiResponse.ok(bookingService.getSalonBookedDays(salonId, from, to));
+    }
+
+    /**
+     * Clamps a caller-supplied {@code page × size} OFFSET down to {@link #MAX_CLAMPED_OFFSET}
+     * rows — see that constant's javadoc for why the bound is the offset and not the page index.
+     * Page size and sort pass through unchanged; only the page index moves, to the deepest page
+     * whose offset still fits under the ceiling at the requested size — and because that rebuilt
+     * index <b>floors</b> ({@code MAX_CLAMPED_OFFSET / size} is integer division), the served
+     * offset can undershoot the ceiling by up to {@code size − 1} rows whenever the size does not
+     * divide it evenly ({@code ?size=30} → page 666 → offset 19 980, pinned by
+     * {@code should_clampToOffsetUnderCeiling_when_sizeDoesNotDivideTheCeiling}); it never exceeds
+     * it.
+     *
+     * <p>The offset is computed in {@code long}: {@code getPageNumber()} is an unbounded
+     * {@code int} and {@code getPageSize()} reaches 100, so the product overflows {@code int}
+     * above ~21M pages and a wrapped negative would sail straight past the guard. The pre-323
+     * page-index form could not overflow because it never multiplied; this one can, so the cast
+     * is load-bearing — do not drop it.
      */
     private static Pageable clampGiantOffset(Pageable pageable) {
-        if (pageable.getPageNumber() > MAX_CLAMPED_PAGE_NUMBER) {
-            return PageRequest.of(MAX_CLAMPED_PAGE_NUMBER, pageable.getPageSize(), pageable.getSort());
+        if (!pageable.isPaged()) {
+            return pageable;
+        }
+        // The division below relies on size >= 1, NOT merely size != 0. The offset test alone does
+        // not give that: page MIN_VALUE × size -1 is a positive product that clears the guard, and a
+        // negative size would both flip the quotient's sign and make PageRequest.of throw ("Page size
+        // must not be less than one"). size >= 1 holds because it is Spring Data's resolver floor —
+        // pinned by should_floorPageSizeToTheDefault_when_sizeIsBelowOne (+ the ?size=7 control that
+        // keeps it non-vacuous) — and because PageRequest.of / Pageable.ofSize reject a sub-1 size
+        // outright, so no constructible Pageable can carry one into this private method.
+        long offset = (long) pageable.getPageNumber() * pageable.getPageSize();
+        if (offset > MAX_CLAMPED_OFFSET) {
+            return PageRequest.of(MAX_CLAMPED_OFFSET / pageable.getPageSize(),
+                    pageable.getPageSize(), pageable.getSort());
         }
         return pageable;
     }

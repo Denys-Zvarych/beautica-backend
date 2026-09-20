@@ -156,12 +156,21 @@ public interface BookingRepositoryCustom {
      * {@link BookingSpecifications#masterIdEquals}), composed alongside the hard {@code salonId}
      * scope rather than replacing it — {@code null} means "every master in the salon", the same
      * optional-predicate contract {@code statuses}/{@code from}/{@code toExclusive} carry (see
-     * {@link #findIdsByMasterIdFiltered}'s javadoc for that contract in full). {@code statuses}
-     * here is a single optional {@link BookingStatus} wrapped by the caller into a one-element
-     * {@link java.util.Set} (or {@code null}) — {@code GET /bookings/salon/{salonId}} takes one
-     * {@code status} query param, unlike {@code GET /bookings/me}'s repeatable list, so this
-     * method accepts the same {@code Collection<BookingStatus>} shape as every other query here
-     * for implementation reuse without widening the wire contract.
+     * {@link #findIdsByMasterIdFiltered}'s javadoc for that contract in full).
+     *
+     * <p><b>Phase 319 — {@code statuses} is now a genuine multi-value set, and {@code serviceIds}
+     * joins it.</b> This method previously received a one-element {@link java.util.Set} the caller
+     * wrapped around a single wire-level {@code ?status=}; {@code GET /bookings/salon/{salonId}}
+     * now takes the SAME repeatable {@code ?status=}/{@code ?serviceId=} params {@code GET
+     * /bookings/me} has carried since Phases 26.1/26.4, so both arrive here as ordinary bounded
+     * collections. The parameter TYPES did not change — only the cardinality the caller may put in
+     * them — so the "null or empty means no predicate" contract is untouched. {@code serviceIds}
+     * carries the identical Phase 26.4 contract as on {@link #findIdsByMasterIdFiltered}: a
+     * de-duplicated, size-bounded (max 50 — see {@code BookingService#getSalonBookings}) set of
+     * {@code MasterService} ids, matched against {@code b.masterService.id}, never
+     * {@code b.masterService.serviceDefinition.id}. Composed through the SAME
+     * {@code BookingRepositoryCustomImpl#applyServiceFilter} helper every sibling query uses —
+     * never a parallel predicate builder.
      *
      * <p>Same Phase 26.3 pre-validated-{@code Sort} contract as {@link #findIdsByMasterIdFiltered}
      * — the {@code Pageable} passed here MUST already be normalized by {@code
@@ -169,7 +178,49 @@ public interface BookingRepositoryCustom {
      */
     Page<UUID> findIdsBySalonIdFiltered(
             UUID salonId, UUID masterId, Collection<BookingStatus> statuses,
-            OffsetDateTime from, OffsetDateTime toExclusive, Pageable pageable);
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
+
+    /**
+     * Phase 322 — partition counterpart to {@link #findIdsBySalonIdFiltered}, backing
+     * {@code GET /bookings/salon/{salonId}?partition=} and the mobile salon «Архів» page. The
+     * FOURTH member of the {@code …FilteredByPartition} family, and a genuinely new shape rather
+     * than a reuse of one of the three Phase 28.1/28.2 siblings above:
+     *
+     * <ul>
+     *   <li>{@link #findIdsByMasterIdFilteredByPartition} scopes by {@code b.master.id} — it has no
+     *       salon term at all, so it cannot answer "this salon's history across every master".</li>
+     *   <li>{@link #findIdsBySalonIdsFilteredByPartition} scopes by {@link
+     *       BookingSpecifications#salonIdIn} — a {@code JOIN b.master m JOIN m.salon} over a
+     *       pre-resolved owner ESTATE, keyed off the master's LIVE affiliation, and with no
+     *       {@code masterId} arm. It is not a substitute on either count: this route must scope by
+     *       the booking's OWN {@code salon_id} SNAPSHOT (see {@link
+     *       BookingSpecifications#bookingSalonIdEquals} for the rotated-master defect class that
+     *       predicate exists to prevent), and its {@code masterId} chip must survive into the
+     *       archive.</li>
+     *   <li>{@link #findIdsByClientIdFilteredByPartition} scopes by {@code b.client.id}.</li>
+     * </ul>
+     *
+     * <p>It is a SIBLING, not a fork: the scope predicate, the optional {@code masterId} arm, the
+     * date composer, the service composer and {@code findIdPage} are all the very same shared
+     * pieces {@link #findIdsBySalonIdFiltered} composes — only {@link
+     * BookingSpecifications#statusIn} is swapped for {@link BookingSpecifications#partition}.
+     *
+     * <p>{@code statuses} is deliberately ABSENT from this signature, exactly as it is absent from
+     * the three siblings above: that is what makes "status is ignored when partition is present" a
+     * property of the TYPE at the query tier — a status predicate is not constructible from this
+     * parameter list — rather than a downstream filter that could regress into an accidental
+     * {@code AND}. Same already-resolved-absolute-instant contract for {@code now} (see
+     * {@link BookingSpecifications#partition}'s javadoc for the clock/timezone invariant — {@code
+     * now} is resolved ONCE per page in {@code BookingService#getSalonBookings}, the same instant
+     * that feeds every row's {@code awaitingClosure} flag), and the same Phase 26.2/26.3/26.4
+     * date-range / pre-validated-{@code Sort} / bounded-service-filter contracts
+     * {@link #findIdsBySalonIdFiltered} documents in full.
+     */
+    Page<UUID> findIdsBySalonIdFilteredByPartition(
+            UUID salonId, UUID masterId, BookingPartition partition, OffsetDateTime now,
+            OffsetDateTime from, OffsetDateTime toExclusive,
+            Collection<UUID> serviceIds, Pageable pageable);
 
     /**
      * Phase 29.4 — a bare {@code COUNT(*)} over an arbitrary {@link Specification}, backing

@@ -18,11 +18,14 @@ import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.LocationQueryService;
+import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.repository.MediaRepository;
@@ -35,6 +38,7 @@ import com.beautica.salon.dto.PublicSalonResponse;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonInviteHistoryResponse;
 import com.beautica.salon.dto.SalonInviteResponse;
+import com.beautica.salon.dto.SalonMasterEffectiveScheduleResponse;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.SiblingSalonOption;
@@ -70,6 +74,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -92,6 +97,12 @@ public class SalonService {
     private final MasterServiceRepository masterServiceRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
+    // Phase 321 — the salon roster board's effective-schedule read. MasterScheduleService is the
+    // owner of the override-beats-template-beats-gap fold; this service resolves WHICH masters and
+    // delegates the whole schedule verdict, never re-deriving it. ScheduleDateMath is the single
+    // home for the range guards (Kyiv civil dates, past floor, future cap, span ceiling).
+    private final MasterScheduleService masterScheduleService;
+    private final ScheduleDateMath scheduleDateMath;
     private final CityRepository cityRepository;
     private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
@@ -750,6 +761,138 @@ public class SalonService {
                 .collect(Collectors.toMap(
                         MasterServiceCountProjection::getMasterId,
                         MasterServiceCountProjection::getServiceCount));
+    }
+
+    /**
+     * Widest date range {@code getSalonMastersEffectiveSchedule} will resolve, expressed — like every
+     * other span bound in this codebase — as days BETWEEN two inclusive endpoints. 61 between means 62
+     * inclusive days, i.e. two months of board scrolling in one read.
+     *
+     * <p><b>Why this is tighter than the 366-day default, and why phase 319's sibling needs no cap at
+     * all.</b> {@code GET /bookings/salon/{salonId}} has no per-date loop — it is one indexed scan with
+     * {@code LIMIT} pushdown, which is exactly the architect's 2026-09-16 ruling that a span cap there
+     * "guards loops, not scans". This endpoint is the counter-example that ruling implies: its cost is a
+     * PRODUCT, {@code |roster| × |days|} folded {@code EffectiveDayResponse} objects, every one of them
+     * materialised into the response body. A 30-master salon over 366 days is ~11 000 day objects
+     * serialised per request. 62 days is generous for a board whose day rail shows one day at a time and
+     * whose widest realistic prefetch is the visible month plus its neighbours.
+     */
+    private static final long MAX_ROSTER_SCHEDULE_SPAN_DAYS = 61L;
+
+    /**
+     * Phase 321 — {@code GET /salons/{salonId}/masters/effective-schedule}: every ACTIVE roster
+     * master's effective availability over {@code [from, to]} (inclusive, Europe/Kyiv civil days), in
+     * ONE read. Backs the mobile salon «Записи» board, whose shared timeline must span the UNION of
+     * every master's working hours and which greys out the masters who are off.
+     *
+     * <p><b>Why an endpoint exists at all.</b> The alternative is the mobile client calling the
+     * per-master {@code GET /masters/{masterId}/effective-schedule} once per roster member — precisely
+     * the N-request fan-out {@code backend-perf} keeps flagging, and additionally wrong on the screen:
+     * N replies land at N different moments, so the union-derived timeline reflows as they arrive.
+     *
+     * <p><b>Cost: {@code 3 + ceil(S/50) + ceil(O/50)} statements — three fixed, two CHUNKED, none
+     * per-master.</b> An earlier revision of this javadoc claimed "1 roster query + 2 schedule queries,
+     * flat in roster size". That was false, and it is spelled out here because a false cost claim in
+     * load-bearing javadoc is how the next reader justifies the next regression:
+     * <ul>
+     *   <li><b>3 fixed</b> — the roster query ({@code masters}; the SAME
+     *       {@link MasterRepository#findBySalonIdAndIsActiveTrueWithUser} {@link #getSalonStaff} and
+     *       {@link #getMastersBySalon} use, one statement because {@link Pageable#unpaged()} makes
+     *       Spring Data skip the count query), plus the two {@code IN (:masterIds)} loads
+     *       {@link MasterScheduleService#resolveEffectiveRangeBatch} issues for every master's
+     *       templates and overrides at once ({@code weekly_schedules}, {@code schedule_exceptions} —
+     *       Phase 315 D1/D4). Nothing here loops a query.</li>
+     *   <li><b>{@code ceil(S/50)}</b> — Hibernate's lazy batch-fetch of
+     *       {@code WeeklySchedule.discreteTimes} ({@code working_interval_times}), S = weekly-schedule
+     *       rows loaded. {@code default_batch_fetch_size: 50} chunks it, so it is {@code ceil(S/50)},
+     *       never S.</li>
+     *   <li><b>{@code ceil(O/50)}</b> — the SAME chunking of {@code ScheduleException.discreteTimes}
+     *       ({@code schedule_exception_times}), O = non-{@code DAY_OFF} override rows INSIDE the
+     *       window. {@code ScheduleMapper#toOverrideDiscreteTimes} touches that lazy set for every
+     *       such override, so this term scales with the salon's override density, not with its
+     *       headcount — the dimension the old "flat in roster size" wording silently denied.</li>
+     * </ul>
+     * Measured by SQL capture in {@code SalonMasterEffectiveScheduleIT} at N = 60 over the full 62-day
+     * span, deliberately across the chunk boundary (a count taken below 50 is flat for the wrong reason
+     * and proves nothing): 9 statements at one override per master, 19 at ten — the entire growth being
+     * {@code schedule_exception_times} going 2 → 12. Both dimensions have their own differential case
+     * (10 pins S, 11 pins O); neither asserts a magic total. Two further statements precede all of
+     * these on every request — the {@code salons} + {@code users} pair {@code canManageSalon} issues at
+     * the gate — which is why the measured totals are 9/19 rather than 7/17.
+     *
+     * <p>A third chunked term, {@code ceil(S/50)} over {@code weekly_schedule_day_windows}, is absent
+     * ONLY because this path uses the window-free resolver; switching it to
+     * {@code resolveEffectiveRangeForDisplay} would add it (and break the board — see
+     * {@code SalonMasterEffectiveScheduleIT} case 12).
+     *
+     * <p><b>Unbounded {@code List} return is deliberate and bounded in fact</b> (Anti-Bug §E-3): the
+     * result is one entry per master of ONE salon — the salon's own headcount — exactly the reasoning
+     * that already lets {@link #getSalonStaff} and {@link #listSalonInvites} return capped {@code
+     * List}s for one salon. The unbounded dimension that DOES need a ceiling is the date range, capped
+     * at {@link #MAX_ROSTER_SCHEDULE_SPAN_DAYS} + 1 days below.
+     *
+     * <p><b>ROSTER-COMPLETENESS IS LOAD-BEARING — never optimise the all-{@code NO_SCHEDULE} masters
+     * away.</b> Every active roster master gets an entry even when every one of their days is {@link
+     * com.beautica.master.dto.EffectiveDaySource#NO_SCHEDULE}. That is what lets the board tell three
+     * states apart that must never collapse into two:
+     * <ul>
+     *   <li>master id <b>absent</b> from the response — unknown / still loading, rendered as today;</li>
+     *   <li>{@code OVERRIDE_DAY_OFF} — greyed column, «Вихідний»;</li>
+     *   <li>{@code NO_SCHEDULE} — greyed column, «Графік не задано».</li>
+     * </ul>
+     * Dropping a master with no schedule rows would make "off today" indistinguishable from "not
+     * loaded", and a slow fetch would render as a wall of grey instead of a wall of empty columns.
+     * Pinned directly by {@code SalonMasterEffectiveScheduleIT}. The guarantee is inherited, not
+     * re-implemented: {@code resolveEffectiveRangeBatch} iterates the REQUESTED ids rather than the
+     * keys its queries returned (Phase 315 D3), so a master with zero rows still receives a full
+     * {@code days.size()}-entry list. The {@link Objects#requireNonNull} below makes that inherited
+     * contract fail LOUDLY here rather than silently emitting a shortened roster, because the failure
+     * mode this method is guarding against is precisely a missing entry.
+     *
+     * <p><b>Authorization lives ENTIRELY at the controller boundary</b> — {@code
+     * hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)},
+     * the identical expression {@link #getSalonStaff} carries and the one phase 319's {@code
+     * booked-days} carries (Anti-Bug §D — one layer, not two). No {@code actorUserId} parameter: the
+     * scope IS the already-authorized {@code salonId}, so a principal-derived argument would be an
+     * unused input that merely looked like a second check. The role gate alone is not sufficient — it
+     * would admit any owner for ANY salon id, and a salon's roster schedule is its staffing plan.
+     *
+     * <p><b>Range guards run BEFORE the roster query, on purpose.</b> An empty roster returns early,
+     * so validating afterwards would let a salon with no masters accept a 10-year range with a 200.
+     * {@link ScheduleDateMath#assertExpandable} supplies the null / ordering / past-floor /
+     * future-cap checks verbatim (the same guard the per-master endpoint applies), then the board's
+     * own tighter span ceiling narrows it.
+     *
+     * <p>Not cached: schedule edits are frequent on this screen's own workflows and an un-evicted
+     * board is a wrong board (Anti-Bug §F-1). A handful of chunked statements with no per-master
+     * fan-out is not the cost that would justify a cache plus every write path that must evict it.
+     */
+    @Transactional(readOnly = true)
+    public List<SalonMasterEffectiveScheduleResponse> getSalonMastersEffectiveSchedule(
+            UUID salonId, LocalDate from, LocalDate to) {
+        scheduleDateMath.assertExpandable(from, to);
+        scheduleDateMath.assertSpanWithinMax(from, to, MAX_ROSTER_SCHEDULE_SPAN_DAYS);
+
+        List<UUID> masterIds = masterRepository
+                .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
+                .getContent().stream()
+                .map(Master::getId)
+                .toList();
+        if (masterIds.isEmpty()) {
+            return List.of();
+        }
+
+        Map<UUID, List<EffectiveDayResponse>> daysByMaster =
+                masterScheduleService.resolveEffectiveRangeBatch(masterIds, from, to);
+
+        return masterIds.stream()
+                .map(masterId -> new SalonMasterEffectiveScheduleResponse(
+                        masterId,
+                        Objects.requireNonNull(daysByMaster.get(masterId),
+                                "resolveEffectiveRangeBatch dropped a requested master; its D3"
+                                        + " absent-is-not-empty contract is what this board's"
+                                        + " three-state rendering depends on")))
+                .toList();
     }
 
     @Transactional(readOnly = true)
