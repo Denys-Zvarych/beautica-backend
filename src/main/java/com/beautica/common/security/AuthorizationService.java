@@ -994,6 +994,29 @@ public class AuthorizationService {
      * <p>Named distinctly rather than overloading {@code hasProviderAuthorityOverBooking}: with a
      * {@code Predicate} and a {@link Role} in the same trailing position, a {@code null} literal at
      * a call site would be an ambiguous reference.
+     *
+     * <p><b>The {@code salonId != null} conjunct below is UNREACHABLE as the code stands, and is
+     * kept deliberately (the unreachable-conjunct comment-accuracy finding, PR #129 audit
+     * 2026-09-20 — the comment that used to sit here claimed it was
+     * "pinned by the per-row cases above", which was never true; no test covers it, and none is
+     * owed).</b> Verified over every live entry point:
+     * <ul>
+     *   <li>Six call sites derive the flag as {@code v.salonId() == null} —
+     *       {@link #enforceCanManageAppointment} (twice, once via {@link AppointmentAuthorityKey}
+     *       and once via the memoized cascade), the three {@code findCompletionAccessById}
+     *       predicates, and {@link #filterBookingIdsWithProviderAuthority}. For all six,
+     *       {@code independentMasterBooking == false} IMPLIES {@code salonId != null}, so the
+     *       first arm has already returned by the time a null could reach here.</li>
+     *   <li>The entity overload {@link #hasProviderAuthorityOverBooking(UUID, Booking)} passes
+     *       {@code (true, …, null, …)} for an {@code INDEPENDENT_MASTER} and otherwise returns
+     *       {@code false} on {@code salon == null} BEFORE calling in at all.</li>
+     * </ul>
+     * Do NOT delete it. A fail-closed null check in the one kernel every provider-authority
+     * predicate funnels through costs a pointer comparison and is the difference between a future
+     * seventh caller getting {@code false} and getting an NPE inside a {@code @PreAuthorize} SpEL
+     * evaluation — which surfaces as a 500, not a 403. Do NOT write a test for it either: the only
+     * way to reach it is to construct an argument combination no caller can produce, which would
+     * pin the test's own fixture rather than any production behaviour.
      */
     private boolean hasProviderAuthorityOverRow(
             boolean independentMasterBooking, UUID masterUserId, UUID salonId, UUID actorId,
@@ -1001,6 +1024,8 @@ public class AuthorizationService {
         if (independentMasterBooking) {
             return masterUserId != null && masterUserId.equals(actorId);
         }
+        // Defensive, and provably unreachable today — see this method's javadoc for the
+        // caller-by-caller proof and for why it stays anyway.
         return salonId != null && managementAccess.test(salonId);
     }
 

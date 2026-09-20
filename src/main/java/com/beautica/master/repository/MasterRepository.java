@@ -87,6 +87,44 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     )
     Page<Master> findBySalonIdAndIsActiveTrueWithUser(@Param("salonId") UUID salonId, Pageable pageable);
 
+    /**
+     * Identifier-only projection of the same active roster {@link #findBySalonIdAndIsActiveTrueWithUser}
+     * returns — for a caller that wants the ids and nothing else (the roster id-projection
+     * finding, backend-perf 2026-09-20 —
+     * backend-perf).
+     *
+     * <p><b>Why this is not a duplicate finder</b> (Anti-Bug §E-1 forbids keeping a non-graph
+     * variant BESIDE a graph variant, because callers silently N+1 or hit
+     * {@code LazyInitializationException}). That rule protects callers who touch associations; it
+     * does not apply to a projection that returns no entity at all. {@code SELECT m.id} cannot be
+     * N+1'd and cannot be lazily initialised — there is nothing to initialise. The two methods are
+     * not interchangeable in the direction that matters: a caller needing {@code m.user} literally
+     * cannot use this one, so it can never be reached by mistake.
+     *
+     * <p><b>What it replaces.</b> {@code SalonService#getSalonMastersEffectiveSchedule} called the
+     * graph finder with {@link Pageable#unpaged()} and immediately did {@code .map(Master::getId)},
+     * so the whole roster's {@code masters} AND {@code users} rows were selected, materialised as
+     * managed entities and parked in the persistence context for the rest of the request — to
+     * extract a list of UUIDs. Same one statement either way; the saving is the row width, the
+     * entity instantiation, and the snapshot the persistence context keeps for dirty checking, on a
+     * read-only path that never touches a single non-id field.
+     *
+     * <p>{@link #findBySalonIdAndIsActiveTrueWithUser} is deliberately left ALONE — {@code
+     * SalonService#getSalonStaff} and {@code #getMastersBySalon} both map the fetched {@code
+     * m.user} into their responses and genuinely need the graph.
+     *
+     * <p>No {@code ORDER BY}, matching the graph finder byte-for-byte: the roster endpoint's
+     * response order is whatever the access path yields, exactly as before, so this change is
+     * ordering-neutral rather than quietly imposing a new contract.
+     *
+     * <p><b>Unscoped by default</b> (Anti-Bug §E-4): {@code salonId} is a plain parameter with no
+     * actor predicate. Its one caller is reached only through
+     * {@code @PreAuthorize("… and @authz.canManageSalon(authentication, #salonId)")}, which is
+     * where the ownership decision lives.
+     */
+    @Query("SELECT m.id FROM Master m WHERE m.salon.id = :salonId AND m.isActive = true")
+    List<UUID> findIdsBySalonIdAndIsActiveTrue(@Param("salonId") UUID salonId);
+
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
 
     /**

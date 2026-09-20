@@ -8,8 +8,8 @@ import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
+import com.beautica.support.HibernateStatistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -28,6 +28,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import java.net.URI;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -525,6 +526,91 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
                 .isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
+    /**
+     * The ceiling is 366 INCLUSIVE days — {@code ScheduleDateMath}'s default, i.e. 365 BETWEEN the
+     * endpoints — and it is frozen. See
+     * {@link com.beautica.booking.service.BookingService#getSalonBookedDays}'s javadoc for the full
+     * reasoning; the short form is that a PR #129 audit finding narrowed it to 62 to match the
+     * sibling roster endpoint, which 400s the shipped mobile client, and was reverted.
+     */
+    @Test
+    @DisplayName("booked-days — the span boundary pair: 366 inclusive days is accepted, 367 is 400")
+    void should_rejectSpan_when_salonBookedDaysRangeExceeds366Days() throws Exception {
+        String ownerEmail = "bsb-days-span-" + System.nanoTime() + "@beautica.test";
+        BookingTestFixtures.SalonFixture salon = fixtures.createSalon(ownerEmail);
+        String token = fixtures.tokenFor(ownerEmail);
+        LocalDate from = LocalDate.of(2031, 10, 1);
+
+        ResponseEntity<String> atCap = callSalonBookedDays(token, salon.salonId(), from, from.plusDays(365));
+        ResponseEntity<String> overCap = callSalonBookedDays(token, salon.salonId(), from, from.plusDays(366));
+
+        assertThat(atCap.getStatusCode())
+                .as("366 inclusive days is the documented ceiling — a full leap year — and the "
+                        + "result set is bounded at 367 bare dates however wide the window is, "
+                        + "because SELECT DISTINCT collapses the scan in Postgres")
+                .isEqualTo(HttpStatus.OK);
+        assertThat(overCap.getStatusCode())
+                .as("367 inclusive days must be a clean 400, even for a salon with no bookings at "
+                        + "all — the guard runs before the query, so an empty salon cannot buy an "
+                        + "unbounded range")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    /**
+     * The exact window the SHIPPED mobile client asks for, pinned from the backend side.
+     *
+     * <p>{@code beautica-mobile}'s {@code lib/features/booking/application/booked_days_notifier.dart}
+     * declares {@code kBookedDaysSpanDays = 180} and builds its one shared window as
+     * {@code [today - 180, today + 180]} — {@code 2 * 180 + 1 = 361} INCLUSIVE days.
+     * {@code salonBookedDaysProvider} calls {@code GET /bookings/salon/&#123;salonId&#125;/booked-days}
+     * through that same helper, so this is the literal request every salon «Записи»/«Архів» day-rail
+     * makes on open.
+     *
+     * <p><b>Why this test exists.</b> A PR #129 audit finding (the salon booked-days span-cap
+     * proposal, backend-perf 2026-09-20) narrowed the endpoint to 62 inclusive days. Every
+     * boundary test in this class passed, because they all pinned the CAP rather than the client's
+     * actual window — so nothing went red while the change 400'd every installed handset. Field
+     * installs cannot be fixed by a later mobile build, so release ordering does not rescue it
+     * either. This test pins the window itself: narrowing the cap below 361 turns it red here,
+     * before the merge.
+     *
+     * <p>Anchored on the real current date on purpose — the client anchors on the device's today,
+     * and pinning a literal date would stop exercising the arithmetic that must stay under the
+     * cap. Only calendar-day counts are involved ({@code LocalDate} plus/minus), so the assertion
+     * is DST- and timezone-independent.
+     */
+    @Test
+    @DisplayName("booked-days — the shipped mobile client's 361-day window (today +/- 180, "
+            + "kBookedDaysSpanDays = 180) is accepted: the cap must never narrow below it")
+    void should_returnDays_when_salonBookedDaysSpansTheShippedClientWindow() throws Exception {
+        String ownerEmail = "bsb-days-client-window-" + System.nanoTime() + "@beautica.test";
+        BookingTestFixtures.SalonFixture salon = fixtures.createSalon(ownerEmail);
+        String token = fixtures.tokenFor(ownerEmail);
+        LocalDate today = LocalDate.now(TimeZones.KYIV);
+        LocalDate from = today.minusDays(MOBILE_BOOKED_DAYS_SPAN_DAYS);
+        LocalDate to = today.plusDays(MOBILE_BOOKED_DAYS_SPAN_DAYS);
+
+        ResponseEntity<String> resp = callSalonBookedDays(token, salon.salonId(), from, to);
+
+        assertThat(ChronoUnit.DAYS.between(from, to) + 1)
+                .as("the mobile arithmetic — not just the constant — is what must stay under the "
+                        + "cap: 2 * %d + 1", MOBILE_BOOKED_DAYS_SPAN_DAYS)
+                .isEqualTo(361L);
+        assertThat(resp.getStatusCode())
+                .as("the window every shipped salon day-rail requests must be a 200. A 400 here is "
+                        + "a BREAKING contract change to clients already on handsets, which no "
+                        + "mobile release can reach")
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    /**
+     * Mirror of {@code beautica-mobile}'s {@code kBookedDaysSpanDays}
+     * ({@code lib/features/booking/application/booked_days_notifier.dart}). Duplicated here rather
+     * than derived, because the point is to FAIL if the two ever disagree about what the backend
+     * must accept.
+     */
+    private static final long MOBILE_BOOKED_DAYS_SPAN_DAYS = 180L;
+
     // ══════════════════════════════════════════════════════════════════════════
     // 3 — scope is booking.salon_id, not the master's LIVE salon_id
     // ══════════════════════════════════════════════════════════════════════════
@@ -750,12 +836,7 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * whole difference from {@link #createExtraSalonMaster}).
      */
     private UUID createOwnerAsMaster(UUID salonId, UUID ownerUserId) {
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
-                masterId, ownerUserId, salonId);
-        return masterId;
+        return fixtures.createOwnerAsMaster(salonId, ownerUserId);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -835,8 +916,21 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * in production too — not a new N+1: the mutation above still adds its own independent +1 on
      * top of this new baseline (identity-map miss vs. city-label resolution are unrelated code
      * paths), so the gate's discriminating power against that specific regression is unaffected.
+     *
+     * <p><b>Baseline moved 5 -&gt; 4</b> (the unscoped client-review probe finding,
+     * backend-security 2026-09-20). {@code listSalonBookings} now
+     * intersects its {@code client_reviews} review-existence probe with the page's
+     * {@code resolveSalonPageProviderAuthority} result before issuing it, so that
+     * {@code ClientReviewRepository#findReviewedBookingIds}'s documented "callers must pre-narrow"
+     * invariant is true for BOTH of its callers and not just one. For a SALON_OWNER who performs
+     * none of the page's bookings — which, since phase 320 handed client review-authority to the
+     * PERFORMING MASTER alone, is the normal owner page — that intersection is empty and the probe
+     * is skipped outright. One fewer round trip, and no response field can change: the only
+     * consumer of the probe's result is a supplier {@code providerCanReviewClient} evaluates ONLY
+     * after {@code hasProviderAuthority} has already passed. The gate keeps its full discriminating
+     * power — the mutation below still adds its own independent +1, now 4 -&gt; 5.
      */
-    private static final long SALON_OWNER_COMPLETED_PAGE_STATEMENTS = 5L;
+    private static final long SALON_OWNER_COMPLETED_PAGE_STATEMENTS = 4L;
 
     @Test
     @DisplayName("SALON_OWNER scope, COMPLETED (review-eligible) page — the per-row "
@@ -942,10 +1036,20 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
      * a per-row one — which is precisely why the pair and the per-row delta are asserted
      * separately. A rise in the delta is still the per-row N+1 coming back.
      */
-    private static final long ROTATED_MASTER_ONE_ROW_STATEMENTS = 5L;
+    private static final long ROTATED_MASTER_ONE_ROW_STATEMENTS = 4L;
 
-    /** Five-row counterpart of {@link #ROTATED_MASTER_ONE_ROW_STATEMENTS}. DERIVED FROM A RUN. */
-    private static final long ROTATED_MASTER_FIVE_ROW_STATEMENTS = 5L;
+    /**
+     * Five-row counterpart of {@link #ROTATED_MASTER_ONE_ROW_STATEMENTS}. DERIVED FROM A RUN.
+     *
+     * <p>Both moved 5 -&gt; 4 for the unscoped client-review probe finding (backend-security
+     * 2026-09-20), for the reason
+     * {@link #SALON_OWNER_COMPLETED_PAGE_STATEMENTS} documents: the page's {@code client_reviews}
+     * probe is now narrowed to the actor's provider authority and, for an owner who performs none
+     * of these bookings, skipped. What this gate measures — that the count does NOT grow with the
+     * number of rotated-master rows — is unchanged, and {@link #ROTATED_MASTER_PER_ROW_STATEMENTS}
+     * still derives 0 from the pair.
+     */
+    private static final long ROTATED_MASTER_FIVE_ROW_STATEMENTS = 4L;
 
     /**
      * The marginal JDBC cost of each additional rotated-master row, derived as
@@ -1158,10 +1262,12 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
         return token;
     }
 
+    /**
+     * @see com.beautica.support.HibernateStatistics#enabledOn (the duplicated test-helper
+     *      finding, backend-QA 2026-09-20)
+     */
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────
@@ -1170,16 +1276,16 @@ class BookingSalonBookingsIT extends AbstractIntegrationTest {
         return java.time.LocalDate.of(year, month, day).atTime(hour, minute).atZone(TimeZones.KYIV).toOffsetDateTime();
     }
 
-    /** Second SALON_MASTER in the given salon, for the masterId-filter tests. */
+    /**
+     * Second SALON_MASTER in the given salon, for the masterId-filter tests.
+     *
+     * @see BookingTestFixtures#createExtraSalonMaster (the duplicated test-helper finding,
+     *      backend-QA 2026-09-20: this body was
+     *      duplicated verbatim in BookingSalonBookingsPartitionIT, differing only in the email
+     *      prefix)
+     */
     private UUID createExtraSalonMaster(UUID salonId) {
-        String masterEmail = "bsb-extra-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterUserId = fixtures.createUser(masterEmail, "SALON_MASTER", salonId);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
-        return masterId;
+        return fixtures.createExtraSalonMaster(salonId, "bsb-extra");
     }
 
     private UUID insertBooking(UUID clientId, UUID masterId, UUID masterServiceId, UUID salonId,

@@ -414,14 +414,29 @@ public final class SalonSearchSql {
      *       advertising a floor the catalogue will not honour, i.e. a breach of the very
      *       "salon price range = bookable masters only" rule this gate exists to uphold. Binding
      *       the date as a {@code :today} parameter from {@code ScheduleDateMath} was rejected: it
-     *       would force a {@code @Param} onto all six {@code @Query} methods that share this SQL
-     *       and buys nothing, because the deterministic pin for the regression is {@code TZ=UTC}
-     *       in CI, not a fixed {@code Clock} —
+     *       would force a {@code @Param} onto all six {@code @Query} methods that share this SQL,
+     *       and the regression is pinned deterministically without it.</p>
+     *       <p><b>Two tests guard this, and they are not interchangeable.</b>
      *       {@code SalonSearchPriceBandIT#should_excludeMasterWithExpiredScheduleFromTheSearchBand}
-     *       (case 22)
-     *       goes RED under {@code TZ=UTC} the moment either arm reverts to {@code CURRENT_DATE},
-     *       and CI must therefore never be pinned to {@code TZ=Europe/Kyiv}, which would hide the
-     *       defect rather than fix it.</p>
+     *       (case 22) is the end-to-end behavioural proof — it shows the advertised band actually
+     *       moves — but it reaches Postgres over the pooled connection whose session zone is the JVM
+     *       default, so it discriminates ONLY while that zone's civil date differs from Kyiv's:
+     *       180 minutes of a summer day, 120 of a winter one, and NEVER under
+     *       {@code TZ=Europe/Kyiv}. That is not a defect in case 22; it is unavoidable, because when
+     *       the two dates agree the broken and fixed predicates are literally the same comparison,
+     *       so no fixture value separates them. This defect duly shipped in PR #125 and stayed green
+     *       from 09:42Z to 19:16Z; only the 21:22Z run caught it.
+     *       {@code SalonSearchTodayResolutionIT} is the deterministic backstop: it extracts these
+     *       four operands from this very constant, pins the SQL clock source to a literal instant,
+     *       and sweeps every quarter-hour of four reference days under three session zones — so a
+     *       {@code CURRENT_DATE} revert is RED at every one of the 24 UTC hours (re-measured
+     *       2026-09-20 against a live revert: 1824 of the sweep's 4608 pinned evaluations fail —
+     *       456 per operand &times; 4 operands — and 4 of that class's 9 test methods go RED, while
+     *       {@code SalonSearchPriceBandIT} stays 13/13 green at the same instant. The AssertJ
+     *       failure listing is capped at 1000 elements, so do not read the printed list length as
+     *       the failure count), whatever time CI runs. <b>CI must still never be pinned
+     *       to {@code TZ=Europe/Kyiv}</b>, which would silence case 22 entirely and hide the defect
+     *       rather than fix it.</p>
      *       <p><b>It mirrors the RANGE only, not the fold's working-day outcome — and that
      *       remaining gap is deliberate (2026-09-13 cycle-3 audit, A6).</b>
      *       {@code WeeklyScheduleRequest#days} carries only {@code @Size(max = 7)} with no

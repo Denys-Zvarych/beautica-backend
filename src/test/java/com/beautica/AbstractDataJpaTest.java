@@ -50,13 +50,14 @@ import java.util.UUID;
 @Import(MethodValidationPostProcessor.class)
 public abstract class AbstractDataJpaTest {
 
-    @SuppressWarnings("resource") // Singleton — never closed; JVM exit handles cleanup via Testcontainers Ryuk.
-    protected static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
-
-    static {
-        POSTGRES.start();
-    }
+    /**
+     * The shared slice-family container. A REFERENCE to {@link DataJpaPostgresContainer#INSTANCE},
+     * never a second declaration — the holder owns the singleton and its start-once initialiser so
+     * that a test needing only the JDBC URL can reach it without inheriting this Spring context
+     * (the per-class Testcontainers finding, backend-QA 2026-09-20). Subclasses read it through
+     * this field exactly as before.
+     */
+    protected static final PostgreSQLContainer<?> POSTGRES = DataJpaPostgresContainer.INSTANCE;
 
     // @DataJpaTest autoconfigures a JdbcTemplate bean when spring-jdbc is on the classpath —
     // used only to resolve a real cities.id row for salon fixtures (see #testCityId()).

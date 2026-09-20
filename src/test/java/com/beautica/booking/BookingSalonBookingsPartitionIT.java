@@ -8,8 +8,8 @@ import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
+import com.beautica.support.HibernateStatistics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -994,7 +994,14 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
      * absent from that fetch graph, and the defence against that is to add it to
      * {@code findAllByIdsWithGraph} in the same change — not a bigger fixture in this file.
      */
-    private static final long SALON_HISTORY_PAGE_STATEMENTS = 5L;
+    private static final long SALON_HISTORY_PAGE_STATEMENTS = 4L;
+
+    // Moved 5 -> 4 for the unscoped client-review probe finding (backend-security 2026-09-20),
+    // tracking its sibling
+    // BookingSalonBookingsIT#SALON_OWNER_COMPLETED_PAGE_STATEMENTS exactly — listSalonBookings now
+    // narrows its client_reviews probe to the page's provider authority and, for an owner who
+    // performs none of these bookings, skips it. The partition swap still changes only the
+    // predicate, never the statement count, which is what this constant's javadoc above asserts.
 
     @Test
     @DisplayName("a partition=HISTORY page costs a FIXED, absolute number of JDBC statements — 1 row "
@@ -1046,10 +1053,12 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
         }
     }
 
+    /**
+     * @see com.beautica.support.HibernateStatistics#enabledOn (the duplicated test-helper
+     *      finding, backend-QA 2026-09-20)
+     */
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     // ── fixture record + seeding ────────────────────────────────────────────────────────────────
@@ -1090,16 +1099,15 @@ class BookingSalonBookingsPartitionIT extends AbstractIntegrationTest {
                 completedElapsed, completedFutureEnds, notCompleted, cancelled, declined);
     }
 
-    /** An additional SALON_MASTER in the given salon. */
+    /**
+     * An additional SALON_MASTER in the given salon.
+     *
+     * @see BookingTestFixtures#createExtraSalonMaster (the duplicated test-helper finding,
+     *      backend-QA 2026-09-20: this body was
+     *      duplicated verbatim in BookingSalonBookingsIT, differing only in the email prefix)
+     */
     private UUID createExtraSalonMaster(UUID salonId) {
-        String masterEmail = "bsbp-extra-master-" + System.nanoTime() + "@beautica.test";
-        UUID masterUserId = fixtures.createUser(masterEmail, "SALON_MASTER", salonId);
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
-                masterId, masterUserId, salonId);
-        return masterId;
+        return fixtures.createExtraSalonMaster(salonId, "bsbp-extra");
     }
 
     /** Inserts a salon booking row directly via SQL, bypassing the create/decline/complete flows. */

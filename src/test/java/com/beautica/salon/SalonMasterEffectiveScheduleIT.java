@@ -362,6 +362,31 @@ class SalonMasterEffectiveScheduleIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("6b — an authenticated CLIENT gets 403: the role gate must deny the platform's "
+            + "largest population, not only the staff roles that sit next to it")
+    void should_return403_when_callerIsClient() throws Exception {
+        // Arrange — cases 4-6 deny only STAFF roles, and case 7 denies anonymity. Between them sits
+        // the role that actually outnumbers every other: an ordinary logged-in CLIENT. A gate
+        // widened to `isAuthenticated()` — the single likeliest way this endpoint regresses — would
+        // leave all of 4-8 green while exposing every salon's staffing roster to anybody with an
+        // account. The salon is staffed so the refusal is measured against a NON-EMPTY roster.
+        Fixture f = salonWithOwner("client-caller");
+        insertMaster(f.salonId(), "m");
+        UUID clientId = fixtures.insertUser(
+                "client-" + uniq("caller") + "@beautica.test", "CLIENT");
+        String token = fixtures.loginAndGetToken(fixtures.emailOf(clientId));
+
+        // Act
+        ResponseEntity<String> response =
+                get(token, f.salonId(), today.plusDays(2), today.plusDays(2));
+
+        // Assert
+        assertThat(response.getStatusCode())
+                .as("a CLIENT is authenticated but has no business reading a salon's master roster")
+                .isEqualTo(HttpStatus.FORBIDDEN);
+    }
+
+    @Test
     @DisplayName("7 — anonymous gets 401")
     void should_return401_when_anonymous() throws Exception {
         Fixture f = salonWithOwner("anon");

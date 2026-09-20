@@ -795,10 +795,13 @@ public class SalonService {
      * flat in roster size". That was false, and it is spelled out here because a false cost claim in
      * load-bearing javadoc is how the next reader justifies the next regression:
      * <ul>
-     *   <li><b>3 fixed</b> — the roster query ({@code masters}; the SAME
-     *       {@link MasterRepository#findBySalonIdAndIsActiveTrueWithUser} {@link #getSalonStaff} and
-     *       {@link #getMastersBySalon} use, one statement because {@link Pageable#unpaged()} makes
-     *       Spring Data skip the count query), plus the two {@code IN (:masterIds)} loads
+     *   <li><b>3 fixed</b> — the roster query ({@code masters}, via
+     *       {@link MasterRepository#findIdsBySalonIdAndIsActiveTrue}: an id-only projection over the
+     *       same active-roster predicate {@link #getSalonStaff} and {@link #getMastersBySalon} read
+     *       through the graph finder. One statement, and — since the roster id-projection fix
+     *       (backend-perf 2026-09-20) — no roster
+     *       {@code Master}/{@code User} entities in the persistence context for a list of ids),
+     *       plus the two {@code IN (:masterIds)} loads
      *       {@link MasterScheduleService#resolveEffectiveRangeBatch} issues for every master's
      *       templates and overrides at once ({@code weekly_schedules}, {@code schedule_exceptions} —
      *       Phase 315 D1/D4). Nothing here loops a query.</li>
@@ -873,11 +876,14 @@ public class SalonService {
         scheduleDateMath.assertExpandable(from, to);
         scheduleDateMath.assertSpanWithinMax(from, to, MAX_ROSTER_SCHEDULE_SPAN_DAYS);
 
-        List<UUID> masterIds = masterRepository
-                .findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged())
-                .getContent().stream()
-                .map(Master::getId)
-                .toList();
+        // The roster id-projection finding, backend-perf 2026-09-20: an id PROJECTION, not the
+        // graph finder. This used to
+        // call findBySalonIdAndIsActiveTrueWithUser(salonId, Pageable.unpaged()) and immediately
+        // .map(Master::getId) — hydrating every roster Master AND its JOIN FETCHed User into the
+        // persistence context, per request, to produce a list of UUIDs it then used for nothing
+        // else. Same single statement; the saving is row width, entity instantiation and the
+        // dirty-checking snapshot, on a read-only path that reads no non-id field.
+        List<UUID> masterIds = masterRepository.findIdsBySalonIdAndIsActiveTrue(salonId);
         if (masterIds.isEmpty()) {
             return List.of();
         }

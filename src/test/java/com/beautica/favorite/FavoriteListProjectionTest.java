@@ -4,9 +4,9 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.service.FavoriteService;
 import com.beautica.salon.entity.Salon;
+import com.beautica.support.HibernateStatistics;
 import com.beautica.user.User;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -53,10 +53,7 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
     private EntityManagerFactory emf;
 
     private Statistics statistics() {
-        SessionFactory sessionFactory = emf.unwrap(SessionFactory.class);
-        Statistics stats = sessionFactory.getStatistics();
-        stats.setStatisticsEnabled(true);
-        return stats;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     // ── master favorites — bounded statement count, independent of N ──────────────

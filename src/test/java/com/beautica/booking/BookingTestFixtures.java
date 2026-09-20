@@ -103,6 +103,64 @@ public class BookingTestFixtures {
         return id;
     }
 
+    /**
+     * An additional {@code SALON_MASTER} in the given salon, with its own freshly created staff
+     * {@code users} row — the shape an invited salon master has.
+     *
+     * <p>Extracted for the duplicated test-helper finding (backend-QA 2026-09-20, QA playbook
+     * Q4) from
+     * {@link BookingSalonBookingsIT} and {@link BookingSalonBookingsPartitionIT}, whose two copies
+     * differed in exactly one token: the email prefix. That prefix is now a parameter, so callers
+     * keep the per-class email namespacing that makes a failing fixture traceable to its IT.
+     *
+     * @param emailPrefix short per-IT tag for the generated staff email, e.g. {@code "bsb-extra"}
+     */
+    public UUID createExtraSalonMaster(UUID salonId, String emailPrefix) {
+        String masterEmail = emailPrefix + "-master-" + System.nanoTime() + "@beautica.test";
+        UUID masterUserId = createUser(masterEmail, "SALON_MASTER", salonId);
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_MASTER', true, NOW(), NOW())",
+                masterId, masterUserId, salonId);
+        return masterId;
+    }
+
+    /**
+     * An OWNER-AS-MASTER row — the shape {@code MasterService#createMasterForOwner} persists when a
+     * salon owner also performs services: {@code master_type = 'SALON_OWNER'} with {@code user_id}
+     * pointing at the OWNER's own {@code users} row rather than a separate staff account, which is
+     * the whole difference from {@link #createExtraSalonMaster}.
+     *
+     * <p>Since phase 320 it is the only shape in which a {@code SALON_OWNER} actor still holds
+     * provider review-authority, and therefore the only one whose page reaches
+     * {@code BookingService#loadProviderReviewBatch}'s {@code client_reviews} probe.
+     *
+     * <p>Extracted for the duplicated test-helper finding (backend-QA 2026-09-20, QA playbook
+     * Q4). It existed twice with
+     * BYTE-IDENTICAL bodies under two different names — {@code createOwnerAsMaster} in
+     * {@link BookingSalonBookingsIT} and {@code insertOwnerAsMaster} in
+     * {@link BookingPriceRangeContractIT} — which is the worst form of duplication, because a
+     * name-based search finds only half of it. The surviving name is {@code createOwnerAsMaster},
+     * matching every other {@code create*} factory on this class. A THIRD copy in
+     * {@code FavoriteMigrationIT} converged here on 2026-09-20 (test-hygiene LOW-2); it had been
+     * missed because that class is in another feature package.
+     *
+     * <p>{@code avg_rating}/{@code review_count} are left to their column DEFAULTs — V4's
+     * {@code masters} table declares {@code avg_rating NUMERIC(3,2) NOT NULL DEFAULT 0.00} and
+     * {@code review_count INTEGER NOT NULL DEFAULT 0}, and no later migration alters either — so the
+     * {@code FavoriteMigrationIT} copy's extra {@code 0.00, 0} column list was writing the defaults
+     * back verbatim and is redundant, not a divergence worth keeping.
+     */
+    public UUID createOwnerAsMaster(UUID salonId, UUID ownerUserId) {
+        UUID masterId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
+                masterId, ownerUserId, salonId);
+        return masterId;
+    }
+
     public UUID createIndependentMaster(String email) {
         UUID userId = createUser(email, "INDEPENDENT_MASTER", null);
         UUID masterId = UUID.randomUUID();

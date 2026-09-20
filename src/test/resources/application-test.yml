@@ -38,6 +38,14 @@ app:
     # (cycle-2 audit, B8): ITs drive many real GETs as one owner token, which would otherwise
     # exhaust that user's 60/min bucket.
     salon-master-services-read-capacity: 100000
+    # Same reasoning again, for the three expensive salon-board reads keyed on the principal
+    # (the unthrottled salon-board reads finding, backend-security 2026-09-20):
+    # BookingSalonBookingsIT, BookingSalonBookingsPartitionIT and
+    # SalonMasterEffectiveScheduleIT each drive dozens of real GETs as ONE owner token, so the
+    # production 60/min would 429 them mid-class. BookingRateLimitFilterTest builds the filter by
+    # hand with its own caches and is unaffected by this override, which is what keeps the 429
+    # behaviour itself genuinely tested.
+    salon-board-read-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000

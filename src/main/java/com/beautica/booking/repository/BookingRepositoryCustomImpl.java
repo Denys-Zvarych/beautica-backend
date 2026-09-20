@@ -322,7 +322,8 @@ class BookingRepositoryCustomImpl implements BookingRepositoryCustom {
      * <p><b>{@code count(1)}, not {@code count(b.id)} (Phase 319 audit, MEDIUM — backend-perf).</b>
      * {@code cb.count(countRoot)} renders {@code count(b1_0.id)}, and {@code id} is a column in NONE
      * of the indexes that serve these predicates ({@code idx_bookings_salon_starts_at} V19,
-     * {@code idx_bookings_salon_service_starts_at} V166, {@code idx_bookings_salon_partition_starts_at}
+     * {@code idx_bookings_salon_service_partition_starts_at} V169 — which replaced V166's
+     * {@code idx_bookings_salon_service_starts_at} — {@code idx_bookings_salon_partition_starts_at}
      * and {@code idx_bookings_salon_master_partition_starts_at} V168), so
      * naming it forces the planner off an Index Only Scan and onto the heap for EVERY matching row —
      * the count reads the whole match set, not a page of it. Counting a constant references no

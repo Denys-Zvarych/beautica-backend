@@ -3,10 +3,10 @@ package com.beautica.salon;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.service.SalonService;
+import com.beautica.support.HibernateStatistics;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
 import org.assertj.core.api.SoftAssertions;
-import org.hibernate.SessionFactory;
 import org.hibernate.resource.jdbc.spi.StatementInspector;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
@@ -184,9 +184,7 @@ class SalonSiblingProjectionShapeIT extends AbstractIntegrationTest {
     }
 
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     /**

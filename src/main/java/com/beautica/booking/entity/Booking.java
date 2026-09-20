@@ -118,24 +118,47 @@ import java.util.UUID;
                 // master's TOTAL row count, not the service's). Converts that shape to a direct
                 // index-range seek on (master_id, master_service_id).
                 @Index(name = "idx_bookings_master_service_starts_at", columnList = "master_id, master_service_id, starts_at"),
-                // composite index (V166): the SALON-scope twin of the index directly above —
-                // GET /bookings/salon/{salonId}?serviceId=... (Phase 319). The master-scope index
-                // cannot serve it (master_id is not a prefix of the salon query's predicate), and
-                // without this one the planner leads with idx_bookings_master_service_id (V18, the
-                // bare FK index) whenever the filtered service is a small slice of the salon's
-                // volume — the normal case — discarding the salon scope to a post-scan Filter and
-                // losing LIMIT pushdown to a blocking Sort. V166 carries the measured EXPLAIN on
-                // both sides. JPA cannot encode the DESC sort direction; the migration declares
-                // (salon_id, master_service_id, starts_at DESC) and this annotation mirrors the
-                // columns for reader accuracy only — ddl-auto=validate does NOT check
-                // @Table(indexes=...) against the real schema (see the V118 note above).
+                // composite index (V166, REPLACED by V169): the SALON-scope twin of the index
+                // directly above — GET /bookings/salon/{salonId}?serviceId=... (Phase 319). The
+                // master-scope index cannot serve it (master_id is not a prefix of the salon
+                // query's predicate), and without this one the planner leads with
+                // idx_bookings_master_service_id (V18, the bare FK index) whenever the filtered
+                // service is a small slice of the salon's volume — the normal case — discarding the
+                // salon scope to a post-scan Filter and losing LIMIT pushdown to a blocking Sort.
+                // V166 carries the measured EXPLAIN on both sides.
+                //
+                // V169 (the salon `partition=` + `serviceId=` index-gap finding, backend-perf
+                // 2026-09-20) EXTENDS that shape with `status` and `ends_at` as an INCLUDE payload
+                // and DROPS V166's index. V169's KEY list is IDENTICAL to V166's, not merely a
+                // strict prefix of it — same columns, same order, same DESC — and an INCLUDE column
+                // lives on leaf pages only and is never a scan key. So every access path V166
+                // served, V169 serves with the same cost profile (seek, range, backward scan,
+                // index-only eligibility); the DROP removes a duplicate, not a capability. The
+                // reason
+                // is the corner V168 never measured: `?partition=` and `?serviceId=` are accepted on
+                // the SAME request (BookingController:290, :309), and with neither V166 nor V168's
+                // indexes covering both columns the planner abandoned both and fell back onto V18's
+                // bare FK index with a Bitmap Heap Scan — one random heap fetch per matched row,
+                // exactly the pathology V168 fixed for the masterId chip. Measured: the COUNT
+                // companion for partition=HISTORY + one serviceId went 103 buffers (Bitmap Heap,
+                // Heap Blocks exact=100) -> 5 (Index Only Scan, Heap Fetches 0), because the
+                // partition predicate is now evaluated as a Filter against the INCLUDE payload in
+                // the index tuple. V169 carries the full before/after table, the rejected
+                // trailing-key-column variant, and the INSERT-buffer measurement behind the DROP.
+                //
+                // JPA can encode neither the DESC sort direction NOR the INCLUDE payload; V169
+                // declares (salon_id, master_service_id, starts_at DESC) INCLUDE (status, ends_at)
+                // and this annotation mirrors the KEY columns only, for reader accuracy —
+                // ddl-auto=validate does NOT check @Table(indexes=...) against the real schema (see
+                // the V118 note above), so the absent INCLUDE cannot cause a validation failure.
                 //
                 // The two OTHER salon-scope indexes on this table — idx_bookings_salon_starts_at
                 // (V19) and idx_bookings_salon_status_starts_at (V22/V113) — have never been
                 // mirrored here. That is a PRE-EXISTING gap, not a statement that they do not
                 // exist; do not infer from their absence that a salon-scope index is missing from
                 // the schema.
-                @Index(name = "idx_bookings_salon_service_starts_at", columnList = "salon_id, master_service_id, starts_at"),
+                @Index(name = "idx_bookings_salon_service_partition_starts_at",
+                        columnList = "salon_id, master_service_id, starts_at"),
                 // composite index (V168, Phase 322): GET /bookings/salon/{salonId}?partition= — the
                 // mobile salon «Архів» page. BookingSpecifications#partition compares `status` AND
                 // `ends_at` (the latter against a RUNTIME instant), and every salon-scope index
