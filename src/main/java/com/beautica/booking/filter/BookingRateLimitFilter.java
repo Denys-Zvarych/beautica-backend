@@ -199,6 +199,32 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
      */
     private static final String SALON_MASTER_SERVICES_PREFIX = "/api/v1/salons/";
     private static final String SALON_MASTER_SERVICES_SUFFIX = "/services";
+    /**
+     * The three EXPENSIVE authenticated reads behind the mobile salon «Записи» / «Архів» board
+     * (the unthrottled salon-board reads finding, backend-security 2026-09-20). All are keyed on
+     * the PRINCIPAL from one shared per-user budget — see
+     * {@code RateLimitConfig#salonBoardReadCapacity} for why they are a bucket of their own rather
+     * than folded into {@code catalogueBrowseBuckets} (per-IP, shared with anonymous reads, and
+     * evaluated in a filter that runs before authentication) or into
+     * {@link #SALON_MASTER_SERVICES_PREFIX}'s bucket (a different screen's budget).
+     *
+     * <p>{@code /api/v1/salons/&#123;salonId&#125;/masters/effective-schedule} is matched by the
+     * SAME prefix as the salon-master-services read above and a literal final pair of segments, so
+     * the two cannot collide: that one ends {@code /masters/&#123;masterId&#125;/services}, this one
+     * ends {@code /masters/effective-schedule}. Neither can swallow the {@code permitAll}
+     * {@code /api/v1/salons/&#123;salonId&#125;/services} catalogue read, which keeps its per-IP
+     * bucket in {@code AuthRateLimitFilter}.
+     *
+     * <p>The two booking routes are matched under {@link #SALON_BOOKINGS_PREFIX}
+     * ({@code /api/v1/bookings/salon/}) by segment COUNT, never by {@code startsWith} alone:
+     * {@code &#123;salonId&#125;} is the list, {@code &#123;salonId&#125;/booked-days} the dots.
+     * A deeper path is deliberately left unmatched so a future sub-route is unbucketed and loud
+     * rather than silently inheriting this budget — the same discipline {@link #BOOKINGS_SUFFIX}
+     * documents.
+     */
+    private static final String SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX = "/masters/effective-schedule";
+    private static final String SALON_BOOKINGS_PREFIX = "/api/v1/bookings/salon/";
+    private static final String BOOKED_DAYS_SEGMENT = "booked-days";
     private static final String RESCHEDULE_SUFFIX = "/reschedule";
     private static final String CANCEL_SUFFIX = "/cancel";
     private static final String COMPLETE_SUFFIX = "/complete";
@@ -240,6 +266,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** {@code Retry-After} for the salon-master-services management read — matches its 60s window. */
     private static final int SALON_MASTER_SERVICES_READ_RETRY_AFTER_SECONDS = 60;
 
+    /** {@code Retry-After} for the salon-board read bucket — matches its 60s refill window. */
+    private static final int SALON_BOARD_READ_RETRY_AFTER_SECONDS = 60;
+
     /**
      * {@code Retry-After} for the CLIENT self-delete bucket — matches its 60-minute refill window
      * (see {@code RateLimitConfig#selfDeleteCapacity}'s javadoc for the sizing rationale).
@@ -252,6 +281,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> staffBookingSmsBuckets;
     private final LoadingCache<String, Bucket> selfDeleteBuckets;
     private final LoadingCache<String, Bucket> salonMasterServicesReadBuckets;
+    private final LoadingCache<String, Bucket> salonBoardReadBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -261,6 +291,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> staffBookingSmsBuckets,
             LoadingCache<String, Bucket> selfDeleteBuckets,
             LoadingCache<String, Bucket> salonMasterServicesReadBuckets,
+            LoadingCache<String, Bucket> salonBoardReadBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
@@ -268,6 +299,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         this.staffBookingSmsBuckets = staffBookingSmsBuckets;
         this.selfDeleteBuckets = selfDeleteBuckets;
         this.salonMasterServicesReadBuckets = salonMasterServicesReadBuckets;
+        this.salonBoardReadBuckets = salonBoardReadBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -350,6 +382,14 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         if (HttpMethod.GET.matches(method) && isSalonMasterServicesReadPath(path)) {
             return new BucketRoute(
                     salonMasterServicesReadBuckets, SALON_MASTER_SERVICES_READ_RETRY_AFTER_SECONDS);
+        }
+        // The three expensive authenticated salon-board reads (the unthrottled salon-board reads
+        // finding, backend-security 2026-09-20). Evaluated
+        // AFTER the salon-master-services branch above, which is the narrower match on the same
+        // /api/v1/salons/ prefix; the two suffixes are disjoint, so the order is documentation of
+        // intent rather than a correctness dependency.
+        if (HttpMethod.GET.matches(method) && isSalonBoardReadPath(path)) {
+            return new BucketRoute(salonBoardReadBuckets, SALON_BOARD_READ_RETRY_AFTER_SECONDS);
         }
         // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
         // create) share the bookingWriteBuckets budget: both take the per-client advisory lock, so a
@@ -459,6 +499,35 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
                 && !segments[0].isEmpty()
                 && "masters".equals(segments[1])
                 && !segments[2].isEmpty();
+    }
+
+    /**
+     * True for exactly the three salon-board reads {@link #SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX}
+     * documents, and nothing else.
+     *
+     * <p>Every arm is bounded by SEGMENT COUNT, not by {@code startsWith}/{@code endsWith} alone, so
+     * a future deeper sub-route under either prefix is left unbucketed and visible rather than
+     * silently inheriting this budget. {@code GET /api/v1/bookings/&#123;bookingId&#125;} — the
+     * single-booking read — cannot match: it does not carry the literal {@code salon} segment.
+     */
+    private static boolean isSalonBoardReadPath(String path) {
+        if (path.startsWith(SALON_MASTER_SERVICES_PREFIX)
+                && path.endsWith(SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX)) {
+            String salonId = path.substring(
+                    SALON_MASTER_SERVICES_PREFIX.length(),
+                    path.length() - SALON_MASTERS_EFFECTIVE_SCHEDULE_SUFFIX.length());
+            return !salonId.isEmpty() && salonId.indexOf('/') < 0;
+        }
+        if (!path.startsWith(SALON_BOOKINGS_PREFIX)) {
+            return false;
+        }
+        String[] segments = path.substring(SALON_BOOKINGS_PREFIX.length()).split("/", -1);
+        if (segments.length == 1) {
+            return !segments[0].isEmpty();                                   // the board/archive list
+        }
+        return segments.length == 2
+                && !segments[0].isEmpty()
+                && BOOKED_DAYS_SEGMENT.equals(segments[1]);                  // the day-rail dots
     }
 
     /** Pairs the bucket cache a request must consume from with its bucket-specific Retry-After. */

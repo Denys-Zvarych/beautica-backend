@@ -5,10 +5,10 @@ import com.beautica.auth.Role;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.support.HibernateStatistics;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -516,9 +516,7 @@ class BookingMyBookedDaysIT extends AbstractIntegrationTest {
     private EntityManagerFactory emf;
 
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     private static Authentication authFor(Role role) {

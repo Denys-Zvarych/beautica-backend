@@ -1,6 +1,7 @@
 package com.beautica.favorite;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.booking.BookingTestFixtures;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.favorite.dto.FavoriteCategoryView;
 import com.beautica.favorite.dto.FavoriteMasterResponse;
@@ -10,11 +11,15 @@ import com.beautica.favorite.dto.FavoriteServiceResponse;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.favorite.service.FavoriteService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.dao.DataAccessException;
 import org.springframework.data.domain.Pageable;
+import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.util.List;
 import java.util.UUID;
@@ -42,6 +47,27 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
 
     @Autowired
     private FavoriteRepository favoriteRepository;
+
+    @Autowired
+    private TestRestTemplate restTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    /**
+     * Shared master/salon fixtures — this class reached them for
+     * {@link BookingTestFixtures#createOwnerAsMaster} (test-hygiene LOW-2, 2026-09-20: it was the
+     * THIRD hand-written copy of that insert, and the cycle-2 extraction had not reached it).
+     */
+    private BookingTestFixtures fixtures;
+
+    @BeforeEach
+    void buildFixtures() {
+        fixtures = new BookingTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
+    }
 
     // ── V92 constraints ─────────────────────────────────────────────────────────
 
@@ -981,7 +1007,11 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                 "UPDATE users SET street = 'Other Salon Street', building_no = '99', "
                         + "location_note = 'other note' WHERE id = ?", ownerUserId);
 
-        UUID ownerMaster = createOwnerAsMaster(employingSalon, ownerUserId);
+        // The shared fixture, not a fourth private copy: it writes the same row (master_type
+        // 'SALON_OWNER', salon_id set, user_id the salon's OWN owner) and leaves avg_rating /
+        // review_count to their V4 column DEFAULTs (0.00 / 0) — which is exactly what the copy
+        // this replaced spelled out by hand.
+        UUID ownerMaster = fixtures.createOwnerAsMaster(employingSalon, ownerUserId);
         favoriteService.addFavorite(clientId, FavoriteTargetType.MASTER, ownerMaster);
 
         List<FavoriteMasterResponse> masters =
@@ -1051,23 +1081,6 @@ class FavoriteMigrationIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, 'Other Salon Street', '99', 'other note', true, NOW(), NOW(), ?)",
                 salonId, ownerUserId, name, testCityId());
         return salonId;
-    }
-
-    /**
-     * A {@code SALON_OWNER} who also works as a master — {@code masters.master_type =
-     * 'SALON_OWNER'} with {@code salon_id} set, hung off the salon's OWN owner user rather than
-     * a fresh one, which is what makes the multi-salon {@code users.street} case reproducible.
-     * The complement of {@link #createSalonMaster(UUID, String)}, which builds an invited
-     * employee.
-     */
-    private UUID createOwnerAsMaster(UUID salonId, UUID ownerUserId) {
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, avg_rating, review_count, "
-                        + "is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', 0.00, 0, true, NOW(), NOW())",
-                masterId, ownerUserId, salonId);
-        return masterId;
     }
 
     /**

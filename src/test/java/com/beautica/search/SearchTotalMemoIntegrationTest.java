@@ -6,8 +6,8 @@ import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.search.service.SearchService;
+import com.beautica.support.HibernateStatistics;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -60,9 +60,7 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
     private EntityManagerFactory emf;
 
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     // ── 1. Statement-count assertion (load-bearing) ───────────────────────────

@@ -41,9 +41,24 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} owns, giving two
      * implementations that can drift — the rule now lives in
      * {@code AuthorizationService#isPerformingMasterOfBooking} (Phase 320: only the booking's
-     * performing master may review its client). It is safe ONLY because the sole caller,
-     * {@code BookingService#loadProviderReviewBatch}, passes exactly the {@code withAuthority} set
-     * it computed from that predicate, and returns early when it is empty. Review-existence is a weak signal
+     * performing master may review its client). It is safe ONLY because <b>every</b> caller passes
+     * ids already narrowed to bookings the actor holds provider authority over, and skips the call
+     * when that set is empty. There are TWO, not one:
+     * <ul>
+     *   <li>{@code BookingService#loadProviderReviewBatch} — passes exactly the
+     *       {@code withAuthority} set it computed from that predicate ({@code GET /bookings/me}).</li>
+     *   <li>{@code BookingService#listSalonBookings} — passes the page's review candidates
+     *       intersected with {@code resolveSalonPageProviderAuthority}'s result
+     *       ({@code GET /bookings/salon/&#123;salonId&#125;}).</li>
+     * </ul>
+     * The salon caller did NOT narrow until the unscoped client-review probe finding
+     * (backend-security 2026-09-20) — it passed every review
+     * candidate on the page — so this paragraph named one caller and was, for the other,
+     * <b>provably false</b>. It was not exploitable (salon-scoped ids the caller had already
+     * cleared via {@code canManageSalon}, a page-bounded {@code IN} list, and a
+     * {@code providerCanReviewClient} conjunction that short-circuits before the boolean can reach
+     * the response), but an invariant that is silently false for one of its callers cannot be
+     * relied on by the next one. Review-existence is a weak signal
      * (a boolean per id, no review content), but it is still information about a stranger's booking,
      * and a caller that skipped the narrowing would additionally hand attacker-chosen ids straight
      * into an unbounded {@code IN} list. Any NEW caller must narrow first, or this method must gain

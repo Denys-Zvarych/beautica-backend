@@ -222,6 +222,20 @@ public class BookingController {
     }
 
     /**
+     * Shared {@code 429} description for the three expensive authenticated salon-board reads
+     * throttled by {@code BookingRateLimitFilter}'s {@code salonBoardReadBuckets} (the unthrottled
+     * salon-board reads finding, backend-security 2026-09-20). Per this codebase's existing idiom (see {@code ServiceController#RATE_LIMITED_429}
+     * and {@code AppointmentController}), no {@code content} schema is declared: the filter writes a
+     * fixed {@code ApiResponse} error envelope with nothing machine-readable to branch on, so the
+     * client keys on the status code and the {@code Retry-After} header alone.
+     */
+    private static final String SALON_BOARD_RATE_LIMITED_429 =
+            "Per-authenticated-user rate limit exceeded (shared 60/min budget across this salon "
+                    + "board's schedule, booked-days and list reads). Honour the `Retry-After` "
+                    + "header (seconds) and retry after backoff — nothing was read. Branch on the "
+                    + "status code; the body carries no machine-readable code.";
+
+    /**
      * Phase 23.4 — {@code GET /bookings/salon/{salonId}}: a single-salon, paginated booking list
      * for {@code SALON_OWNER}/{@code SALON_ADMIN}, backing the mobile salon "Розклад" tab and the
      * salon-wide booking list. Distinct from {@code GET /bookings/me} (see {@code
@@ -249,6 +263,17 @@ public class BookingController {
      * keeps that unambiguous).
      */
     @Operation(summary = "List salon bookings (owner/admin)")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit typed 200 alongside the 429, so springdoc does NOT treat the lone 429 as the
+            // COMPLETE response set and drop the auto-derived body schema — which would regenerate
+            // the mobile Dart client to Response<void> and break `res.data?.data`. Same guard
+            // ServiceController documents and ServiceWriteApiDocsContractIT pins.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = SALON_BOARD_RATE_LIMITED_429,
+                    content = @io.swagger.v3.oas.annotations.media.Content())
+    })
     @GetMapping("/salon/{salonId}")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<PageResponse<BookingDetailResponse>> getSalonBookings(
@@ -343,14 +368,31 @@ public class BookingController {
      * {@code PathPattern} prefers the literal {@code salon} segment regardless, but the route is
      * pinned by a controller test anyway, exactly as {@code /me/booked-days} is.
      */
-    @Operation(summary = "List the salon's booked days (owner/admin)")
+    @Operation(summary = "List the salon's booked days (owner/admin)",
+            description = "Distinct local (Europe/Kyiv) days on which this salon has at least "
+                    + "one booking, ascending. Range REQUIRED; span capped at 366 inclusive "
+                    + "days. The shipped mobile client requests 361 days (today +/- 180), so "
+                    + "this ceiling is a frozen contract - see BookingService#getSalonBookedDays. "
+                    + "Filter-independent: no status/serviceId/masterId parameter.")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit typed 200 alongside the 429, so springdoc does NOT treat the lone 429 as the
+            // COMPLETE response set and drop the auto-derived body schema — which would regenerate
+            // the mobile Dart client to Response<void> and break `res.data?.data`. Same guard
+            // ServiceController documents and ServiceWriteApiDocsContractIT pins.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = SALON_BOARD_RATE_LIMITED_429,
+                    content = @io.swagger.v3.oas.annotations.media.Content())
+    })
     @GetMapping("/salon/{salonId}/booked-days")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<List<LocalDate>> listSalonBookedDays(
             @PathVariable UUID salonId,
             @Parameter(description = "Range start (inclusive), local Europe/Kyiv day. Required.")
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
-            @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required.")
+            @Parameter(description = "Range end (inclusive), local Europe/Kyiv day. Required. "
+                    + "The span `[from, to]` is at most 366 inclusive days; wider is a 400.")
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to
     ) {
         return ApiResponse.ok(bookingService.getSalonBookedDays(salonId, from, to));

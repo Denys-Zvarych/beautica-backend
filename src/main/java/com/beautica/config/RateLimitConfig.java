@@ -109,6 +109,49 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.salon-master-services-read-capacity:60}")
     private long salonMasterServicesReadCapacity;
 
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) for the three EXPENSIVE reads behind the mobile salon
+     * «Записи» / «Архів» board, consumed by {@link BookingRateLimitFilter} (the unthrottled
+     * salon-board reads finding, backend-security 2026-09-20 —
+     * backend-security):
+     * <ul>
+     *   <li>{@code GET /api/v1/salons/&#123;salonId&#125;/masters/effective-schedule} (phase 321) —
+     *       materialises {@code |roster| x up-to-62} {@code EffectiveDayResponse} objects into one
+     *       response body, at 9-19 statements per call.</li>
+     *   <li>{@code GET /api/v1/bookings/salon/&#123;salonId&#125;/booked-days} (phase 319) — a
+     *       status-unfiltered {@code SELECT DISTINCT} over every booking the salon has inside the
+     *       window.</li>
+     *   <li>{@code GET /api/v1/bookings/salon/&#123;salonId&#125;} (phase 23.4, widened by 319 and
+     *       322) — the board/archive list, whose {@code COUNT} companion runs on every FULL page.</li>
+     * </ul>
+     *
+     * <p><b>Why a separate bucket rather than folding into {@link #catalogueBrowseCapacity}</b> —
+     * the same reasoning {@link #salonMasterServicesReadCapacity} records, and it applies here
+     * verbatim. {@code catalogueBrowseBuckets} is keyed on the client IP and shared with two
+     * {@code permitAll} anonymous reads. Under carrier-grade NAT — the norm on Ukrainian mobile
+     * networks — every subscriber behind one egress IP draws from the same 60/min budget, so
+     * ordinary anonymous browsing could 429 a salon owner's board that happened to share that IP.
+     * All three routes here are authenticated, so they are keyed on the PRINCIPAL instead and one
+     * tenant's traffic can no longer starve another's. (Mechanically it could not live there
+     * anyway: {@code AuthRateLimitFilter} runs BEFORE {@code JwtAuthenticationFilter}, so no
+     * principal exists at that point.)
+     *
+     * <p><b>Why not fold into {@link #salonMasterServicesReadCapacity} either.</b> That bucket is
+     * one salon owner opening staff menus; these three are one screen's periodic refresh. Sharing
+     * would make a board refresh and a menu tap contend for the same 60 tokens, so a busy board
+     * could 429 an unrelated management action — the same starvation argument, one level down.
+     *
+     * <p><b>Sizing: 60/min, identical to {@code catalogueBrowseCapacity} and
+     * {@code slotsCapacity}.</b> One board refresh spends at most three tokens (schedule + dots +
+     * first page), so 60/min is twenty full refreshes a minute per account — far beyond any human
+     * scroll, and beyond the client's own refresh cadence, while still bounding the roster
+     * {@code |masters| x |days|} product and the booked-days scan that are the reason this bucket
+     * exists. Overridden to {@code 100000} in {@code application-test.yml} for the same reason its
+     * two siblings are: ITs drive many real GETs as one owner token.
+     */
+    @Value("${app.rate-limit.salon-board-read-capacity:60}")
+    private long salonBoardReadCapacity;
+
     // ══════════════════════════════════════════════════════════════════════════════════════════
     // ACCEPTED RISK — 2026-09-15, architect sign-off (wish-list hull audit, cycle 2, perf LOW).
     // GET /api/v1/favorites/** — and GET /api/v1/favorites/services in particular — carries NO
@@ -648,6 +691,16 @@ public class RateLimitConfig {
                 DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, salonMasterServicesReadCapacity, ONE_MINUTE);
     }
 
+    /**
+     * Per-user bucket (see {@link #salonBoardReadCapacity}) for the three expensive authenticated
+     * salon-board reads, consumed by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> salonBoardReadBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, salonBoardReadCapacity, ONE_MINUTE);
+    }
+
     @Bean
     public LoadingCache<String, Bucket> deviceTokenBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, deviceTokenCapacity, ONE_MINUTE);
@@ -1056,7 +1109,7 @@ public class RateLimitConfig {
         return new BookingRateLimitFilter(
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
                 staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
-                objectMapper);
+                salonBoardReadBuckets(), objectMapper);
     }
 
     /**

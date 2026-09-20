@@ -1005,7 +1005,10 @@ public class BookingService {
      * served by the same indexes the single value was (the predicate is one {@code IN} list rather
      * than an equality, and V113's partial index remains matchable only for its own {@code
      * CONFIRMED}/{@code COMPLETED} arm). {@code serviceId} is served by
-     * {@code idx_bookings_salon_service_starts_at} (V166).
+     * {@code idx_bookings_salon_service_partition_starts_at} (V169, which REPLACED V166's
+     * {@code idx_bookings_salon_service_starts_at} — same key columns plus a
+     * {@code status}/{@code ends_at} INCLUDE payload, so the same shape is served and the
+     * {@code partition=} combination is served too).
      *
      * <p><b>Correction (Phase 319 audit, HIGH — backend-perf).</b> This paragraph previously
      * claimed {@code serviceId} needed no index because it "always ANDs with the hard {@code
@@ -1159,20 +1162,39 @@ public class BookingService {
         // listProviderBookings, no role dependency (unlike the provider review batch below).
         Set<UUID> reviewed = new HashSet<>(reviewRepository.findReviewedBookingIds(idPage.getContent()));
 
+        // Phase 319 audit (MEDIUM, backend-perf): provider authority resolved ONCE for the page
+        // instead of once per row — see resolveSalonPageProviderAuthority.
+        Set<UUID> withProviderAuthority = resolveSalonPageProviderAuthority(actorUserId, hydrated);
+
         // Provider -> client review-existence batch, restricted to rows that could possibly
-        // qualify. Authority itself is batched too, one line below — see
-        // resolveSalonPageProviderAuthority (Phase 319 audit, MEDIUM: it used to be per-row).
+        // qualify.
+        //
+        // The unscoped client-review probe finding, backend-security 2026-09-20: the
+        // `withProviderAuthority` term of this filter
+        // is NEW, and the authority resolve above was MOVED to precede it so the term can exist.
+        // ClientReviewRepository#findReviewedBookingIds is UNSCOPED (anti-bug §E-4) and its
+        // @implNote states the invariant every caller must uphold: pass only ids already inside the
+        // actor's provider authority. loadProviderReviewBatch upheld it; THIS call site did not —
+        // it passed every review candidate on the page. Not exploitable as it stood (the ids are
+        // inside a salon the caller already cleared via canManageSalon, the IN list is page-bounded
+        // at <= 100, and providerCanReviewClient short-circuits on hasProviderAuthority so the
+        // boolean never reached the response for an unauthorized row), but a written safety
+        // invariant that is false for one of its two callers is unreliable for the third.
+        //
+        // Behaviour-preserving by construction, and it adds no statement: the only consumer of
+        // `alreadyReviewedByProvider` is the supplier at the bottom of this method, which
+        // providerCanReviewClient evaluates ONLY after hasProviderAuthority && isProviderReviewEligible
+        // && hasClient have all passed — exactly this intersection. Ids dropped here could never
+        // have flipped a response field. It can only REMOVE a statement, never add one: an actor
+        // with no provider authority over any row of the page now skips the query outright.
         List<UUID> reviewCandidateIds = hydrated.stream()
                 .filter(b -> b.getClient() != null && BookingClosureRule.isProviderReviewEligible(b.getStatus()))
                 .map(Booking::getId)
+                .filter(withProviderAuthority::contains)
                 .toList();
         Set<UUID> alreadyReviewedByProvider = reviewCandidateIds.isEmpty()
                 ? Set.of()
                 : Set.copyOf(clientReviewRepository.findReviewedBookingIds(reviewCandidateIds));
-
-        // Phase 319 audit (MEDIUM, backend-perf): provider authority resolved ONCE for the page
-        // instead of once per row — see resolveSalonPageProviderAuthority.
-        Set<UUID> withProviderAuthority = resolveSalonPageProviderAuthority(actorUserId, hydrated);
 
         DiscoveryLabels labels = resolveBookingLabels(hydrated);
 
@@ -1309,6 +1331,32 @@ public class BookingService {
      * Kyiv-zoned instant range {@link #getSalonBookings} uses, so a dot here and
      * {@code GET /bookings/salon/{salonId}?from=D&to=D} can never diverge on timezone or boundary
      * handling.
+     *
+     * <p><b>The 366-day cap is FROZEN — do not "re-align" it with the roster endpoint.</b> A
+     * PR #129 audit finding (the salon booked-days span-cap proposal, backend-perf 2026-09-20)
+     * argued for narrowing this to 62 days to match the sibling
+     * {@code GET /salons/&#123;salonId&#125;/masters/effective-schedule}, on the reasoning that two
+     * adjacent reads feeding the same «Записи» board should not disagree by a factor of six. That
+     * reasoning is WRONG on both halves and the change was reverted the same day:
+     * <ul>
+     *   <li><b>A SHIPPED client depends on a 361-day window.</b>
+     *       {@code beautica-mobile}'s {@code booked_days_notifier.dart} declares
+     *       {@code kBookedDaysSpanDays = 180} and builds {@code [today - 180, today + 180]} — 361
+     *       inclusive days — for the salon rail AND the master rail through one shared window
+     *       helper. A 62-day cap turns every salon «Записи»/«Архів» dot request into a hard 400.
+     *       Narrowing is a BREAKING contract change: it needs a coordinated mobile release and a
+     *       field-client migration window, because installs already on handsets cannot be fixed by
+     *       any later mobile build. {@code BookingSalonBookingsIT}'s
+     *       {@code should_returnDays_when_salonBookedDaysSpansTheShippedClientWindow} pins that
+     *       361-day request at 200 from this side, so the coupling is discoverable here.</li>
+     *   <li><b>The two surfaces are not comparable.</b> The roster endpoint caps at 62 because it
+     *       materialises {@code |roster| x days} {@code EffectiveDayResponse} objects — its payload
+     *       grows with the PRODUCT of both. This one returns a set of at most 367 bare
+     *       {@code LocalDate}s regardless of span, because {@code SELECT DISTINCT} over the
+     *       Kyiv-zoned date expression collapses the scan in Postgres. The scan is bounded by the
+     *       existing 366-day ceiling and the result by 367 rows; there is no product term to
+     *       bound.</li>
+     * </ul>
      *
      * <p><b>Reuses {@code findBookedDatesBySalonIds} verbatim</b> — the existing query {@link
      * #getMyBookedDays}'s {@code SALON_OWNER} arm already runs, called here with a one-element

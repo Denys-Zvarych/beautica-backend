@@ -18,8 +18,8 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.UUID;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
+import com.beautica.support.HibernateStatistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -1319,10 +1319,12 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
                 "test@example.com", null, List.of(new SimpleGrantedAuthority("ROLE_" + role.name())));
     }
 
+    /**
+     * @see com.beautica.support.HibernateStatistics#enabledOn (the duplicated test-helper
+     *      finding, backend-QA 2026-09-20)
+     */
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     @Test
@@ -1459,7 +1461,7 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         // staff master. Only the performing master holds the review grant now, so a staff-performed
         // page short-circuits at withAuthority.isEmpty() and this gate would measure nothing the
         // three sibling gates do not already cover. See the constant's javadoc.
-        UUID ownerMasterId = insertOwnerAsMaster(salon.salonId(), ownerId);
+        UUID ownerMasterId = createOwnerAsMaster(salon.salonId(), ownerId);
         UUID clientId = fixtures.createUser(
                 "bprc-qcount-owner-reviewable-client-" + System.nanoTime() + "@beautica.test", "CLIENT", null);
 
@@ -1529,7 +1531,7 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
         Pageable pageable = PageRequest.of(0, 20);
         Statistics statistics = statistics();
 
-        // The fixture's STAFF master performs every row — deliberately NOT insertOwnerAsMaster.
+        // The fixture's STAFF master performs every row — deliberately NOT createOwnerAsMaster.
         // That is the difference from the sibling gate above, and it is the whole point.
         seedCompletedSalonBookingsOnDistinctServices(clientId, salon.salonId(), salon.masterId(), 2);
         statistics.clear();
@@ -1608,13 +1610,8 @@ class BookingPriceRangeContractIT extends AbstractIntegrationTest {
      * staff-performed shape — an owner who does NOT perform the page's bookings — is pinned by
      * {@link #OWNER_STAFF_PAGE_SHORT_CIRCUIT_STATEMENTS} and deliberately does not use this helper.
      */
-    private UUID insertOwnerAsMaster(UUID salonId, UUID ownerUserId) {
-        UUID masterId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
-                masterId, ownerUserId, salonId);
-        return masterId;
+    private UUID createOwnerAsMaster(UUID salonId, UUID ownerUserId) {
+        return fixtures.createOwnerAsMaster(salonId, ownerUserId);
     }
 
     @Test

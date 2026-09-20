@@ -5,10 +5,11 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.dto.LocationFilter;
 import com.beautica.search.service.SearchService;
+import com.beautica.support.HibernateStatistics;
+import com.beautica.support.IndexCapabilityProbe;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.resource.jdbc.spi.StatementInspector;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.DisplayName;
@@ -52,15 +53,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Coverage map:
  * <ul>
- *   <li><b>AC1</b> — {@code EXPLAIN (ANALYZE, BUFFERS)} on the <em>real
- *       production</em> salon-search SQL Hibernate emits from the Phase 10.8
- *       SARGable {@link SearchService#searchSalons} dispatch (district filter +
+ *   <li><b>AC1</b> — a capability probe over the <em>real production</em>
+ *       salon-search SQL Hibernate emits from the Phase 10.8 SARGable
+ *       {@link SearchService#searchSalons} dispatch (district filter +
  *       city-only filter). The SQL is captured by a Hibernate
- *       {@link StatementInspector}, re-{@code PREPARE}d verbatim and
- *       {@code EXPLAIN EXECUTE}d with the real bound UUID under the
- *       <em>natural</em> cost-based planner (seq scan NOT disabled). The plan
- *       must use {@code idx_salons_district_id} / {@code idx_salons_city_id}
- *       and contain no {@code Seq Scan on salons}. The master query plan is
+ *       {@link StatementInspector}, its binds are filled verbatim, and it is
+ *       {@code EXPLAIN}ed by {@link com.beautica.support.IndexCapabilityProbe}
+ *       with every competing {@code salons} index removed. Each case pairs a
+ *       {@code pg_indexes} catalog assertion (V54's
+ *       {@code idx_salons_city_id} / {@code idx_salons_district_id} exists with
+ *       that shape) with the structural plan fact that the production predicate
+ *       is still an {@code Index Cond} scan key on it, never a residual
+ *       {@code Filter} or a {@code Seq Scan on salons}. It deliberately does
+ *       NOT assert which index a natural cost-based plan PICKS — that earlier
+ *       form needed a several-hundred-row seed and was only as stable as the
+ *       cost model (test-hygiene LOW-1, 2026-09-20). The master query plan is
  *       captured; its locality predicate {@code COALESCE(sal.*, u.*)} is a
  *       known post-join filter (backlog LOW, defer-with-trigger p95&gt;200ms)
  *       — asserted only that the indexed {@code masters}/{@code users} join
@@ -97,6 +104,10 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     private static final String MASTERS_URL = "/api/v1/search/masters";
     private static final String SALONS_URL = "/api/v1/search/salons";
     private static final String OBLASTS_URL = "/api/v1/locations/oblasts";
+
+    /** V54's salon locality FK indexes — the pair AC1 guards. */
+    private static final String CITY_INDEX = "idx_salons_city_id";
+    private static final String DISTRICT_INDEX = "idx_salons_district_id";
 
     /**
      * Asserted warm latency threshold for a 10-row locality-filtered salon
@@ -186,22 +197,34 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     }
 
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
+    }
+
+    /**
+     * Probes {@code salons} for AC1 — {@code new} per test rather than a field, because it holds no
+     * state and every case that uses it names its own index.
+     */
+    private IndexCapabilityProbe salonsProbe() {
+        return new IndexCapabilityProbe(jdbcTemplate, "salons");
+    }
+
+    /**
+     * The {@code pg_indexes.indexdef} of a {@code salons} index, or {@code null} if it does not
+     * exist — the catalog half of the AC1 pairing (name + shape), which the capability probe then
+     * completes by proving the shape still SERVES the production predicate.
+     */
+    private String salonIndexDefinition(String indexName) {
+        return jdbcTemplate.query(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'salons' AND indexname = ?",
+                rs -> rs.next() ? rs.getString(1) : null,
+                indexName);
     }
 
     // ── AC1 — index scans on the locality predicates (salon search) ───────────
 
     @Test
-    @DisplayName("AC1 — the REAL production salon CITY-filter SQL (Hibernate-emitted) uses idx_salons_city_id on the NATURAL cost-based plan (seq scan NOT disabled)")
+    @DisplayName("AC1 — V54 idx_salons_city_id exists AND still serves the REAL production salon CITY-filter SQL as an Index Cond (capability probe, every competing salons index removed)")
     void should_useCityIndex_when_salonSearchFiltersByCity() {
-        // Seed a population spread across many cities so a single-city
-        // predicate is highly selective. Self-contained + ANALYZE =>
-        // order-independent (no reliance on pg_statistics left by a prior
-        // test against an emptied table). At this scale, with real
-        // statistics, the cost-based planner genuinely prefers the index.
-        seedSalonsAcrossManyCities();
         UUID kyivCityId = cityIdByName("Київ");
 
         // Invoke the REAL production path. SearchService.searchSalons →
@@ -212,11 +235,11 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 new SalonSearchRequest(new LocationFilter(kyivCityId, null),
                         null, null, null, null, null, 0, 20, null));
 
-        // EXPLAIN the captured SQL verbatim via PREPARE/EXECUTE with the real
-        // bound UUID and the NATURAL planner (seq scan ENABLED — no crutch).
-        String naturalPlan = explainNaturalWithLiterals(productionSql, kyivCityId);
-        log.info("AC1 salon city-filter REAL production SQL:\n{}\n\nNATURAL (cost-based, "
-                + "seqscan-enabled) plan:\n{}", productionSql, naturalPlan);
+        String plan = salonsProbe()
+                .explainWithOnly(CITY_INDEX, fillLocalityBinds(productionSql, kyivCityId));
+        log.info("AC1 salon city-filter REAL production SQL:\n{}\n\nCAPABILITY plan "
+                + "(only {} left on salons, seqscan+bitmapscan off):\n{}",
+                productionSql, CITY_INDEX, plan);
 
         assertThat(productionSql)
                 .as("captured SQL must be the salons data SELECT (city_id equality), paginating "
@@ -224,42 +247,35 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 .containsIgnoringCase("from salons")
                 .containsIgnoringWhitespaces("city_id =")
                 .containsIgnoringWhitespaces("COUNT(*) OVER()");
-        assertThat(naturalPlan)
-                .as("the natural cost-based plan for the real production city-filter "
-                        + "SQL must use idx_salons_city_id")
-                .contains("idx_salons_city_id");
-        assertThat(naturalPlan)
-                .as("no sequential scan of salons on the natural plan")
+        assertThat(salonIndexDefinition(CITY_INDEX))
+                .as("V54's city FK index must exist on salons(city_id) under that exact name")
+                .isNotNull()
+                .contains("ON public.salons USING btree (city_id)");
+        assertThat(plan)
+                .as("the production city predicate must remain SARGable against " + CITY_INDEX
+                        + " — an Index Cond scan key, not a residual Filter over every row")
+                .contains("Index Cond: (city_id = ");
+        assertThat(plan)
+                .as("with " + CITY_INDEX + " the only droppable index on salons and seqscan "
+                        + "disabled, a Seq Scan means the index cannot serve the predicate at all")
                 .doesNotContain("Seq Scan on salons");
     }
 
     @Test
-    @DisplayName("AC1 — the REAL production salon DISTRICT-filter SQL (Hibernate-emitted) uses idx_salons_district_id on the NATURAL cost-based plan (seq scan NOT disabled)")
+    @DisplayName("AC1 — V54 idx_salons_district_id exists AND still serves the REAL production salon DISTRICT-filter SQL as an Index Cond (capability probe, every competing salons index removed)")
     void should_useDistrictIndex_when_salonSearchFiltersByDistrict() {
-        seedSalonsAcrossManyCities();
-        UUID targetDistrict = districtIdInCity("Київ", 0);
-        UUID otherDistrict = districtIdInCity("Київ", 1);
-        // Phase 19.7: the salon projection SELECT widened with two correlated
-        // price-range sub-queries. Make the target district a genuinely TINY
-        // fraction of a large districted population: seed a big cluster in a
-        // DIFFERENT district and only a few salons in the target district, then
-        // re-ANALYZE. With high selectivity the natural cost-based planner
-        // prefers idx_salons_district_id over a seq scan — the production shape
-        // the AC asserts (a seq-scan regression would still scan the whole big
-        // table and blow past the index path).
-        seedActiveSalonsInDistrict(otherDistrict, 400);
-        seedActiveSalonsInDistrict(targetDistrict, 3);
-        jdbcTemplate.execute("ANALYZE salons");
-        UUID districtId = targetDistrict;
+        UUID districtId = districtIdInCity("Київ", 0);
 
         String productionSql = captureSalonSearchSelect(
                 new SalonSearchRequest(
                         new LocationFilter(cityIdByName("Київ"), districtId),
                         null, null, null, null, null, 0, 20, null));
 
-        String naturalPlan = explainNaturalWithLiterals(productionSql, districtId);
-        log.info("AC1 salon district-filter REAL production SQL:\n{}\n\nNATURAL "
-                + "(cost-based, seqscan-enabled) plan:\n{}", productionSql, naturalPlan);
+        String plan = salonsProbe()
+                .explainWithOnly(DISTRICT_INDEX, fillLocalityBinds(productionSql, districtId));
+        log.info("AC1 salon district-filter REAL production SQL:\n{}\n\nCAPABILITY plan "
+                + "(only {} left on salons, seqscan+bitmapscan off):\n{}",
+                productionSql, DISTRICT_INDEX, plan);
 
         assertThat(productionSql)
                 .as("captured SQL must be the salons data SELECT (district_id equality), paginating "
@@ -267,12 +283,17 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 .containsIgnoringCase("from salons")
                 .containsIgnoringWhitespaces("district_id =")
                 .containsIgnoringWhitespaces("COUNT(*) OVER()");
-        assertThat(naturalPlan)
-                .as("the natural cost-based plan for the real production district-filter "
-                        + "SQL must use idx_salons_district_id")
-                .contains("idx_salons_district_id");
-        assertThat(naturalPlan)
-                .as("no sequential scan of salons on the natural plan")
+        assertThat(salonIndexDefinition(DISTRICT_INDEX))
+                .as("V54's district FK index must exist on salons(district_id) under that exact name")
+                .isNotNull()
+                .contains("ON public.salons USING btree (district_id)");
+        assertThat(plan)
+                .as("the production district predicate must remain SARGable against " + DISTRICT_INDEX
+                        + " — an Index Cond scan key, not a residual Filter over every row")
+                .contains("Index Cond: (district_id = ");
+        assertThat(plan)
+                .as("with " + DISTRICT_INDEX + " the only droppable index on salons and seqscan "
+                        + "disabled, a Seq Scan means the index cannot serve the predicate at all")
                 .doesNotContain("Seq Scan on salons");
     }
 
@@ -558,12 +579,25 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     }
 
     /**
-     * Runs {@code EXPLAIN (ANALYZE, BUFFERS)} on the captured production SQL
-     * under the <em>natural</em> cost-based planner — sequential scans remain
-     * <b>enabled</b> (no {@code enable_seqscan=off} crutch; that previously
-     * made the assertion tautological). With the seeded ~200-salon population
-     * + {@code ANALYZE}, the planner has real statistics and genuinely chooses
-     * the V54 index for the single-equality SARGable predicate.
+     * Substitutes concrete literals for the positional binds in the captured
+     * production SQL, returning a statement the capability probe can
+     * {@code EXPLAIN} directly.
+     *
+     * <p><b>Why this no longer EXPLAINs a natural cost-based plan.</b> It used
+     * to, and it asserted which index the planner CHOSE over a ~200-salon /
+     * ~400-salon seeded population — the same defect class that was removed
+     * from the {@code bookings} migration tests (see
+     * {@link IndexCapabilityProbe}'s javadoc for the PG 16.13 measurement:
+     * a semantically irrelevant {@code VACUUM} between seeds flips the winner).
+     * That assertion was only as stable as the cost model, which moves with
+     * heap layout, row estimates, autovacuum timing and PG minor version, and
+     * it needed a several-hundred-row fixture whose statistics a preceding test
+     * could perturb. The AC1 cases now pair a {@code pg_indexes} catalog
+     * assertion (name + shape) with
+     * {@link IndexCapabilityProbe#explainWithOnly} (the shape still SERVES the
+     * predicate as an {@code Index Cond}), which is decided structurally by
+     * {@code match_clause_to_indexcol} rather than by cost — so the fixture,
+     * the {@code ANALYZE} and the ordering sensitivity are all gone with it.
      *
      * <p>The Hibernate-emitted salon SELECT carries positional {@code ?}
      * placeholders (the locality UUID, then the {@code offset} / {@code fetch
@@ -572,8 +606,8 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * JDBC-parameterised string directly through {@code EXPLAIN EXECUTE} for an
      * arbitrary dialect form — so we substitute the ordered literals into the
      * exact captured text (UUID first as a {@code ::uuid} literal, then the
-     * integer pagination args) and {@code EXPLAIN} the resulting concrete
-     * statement. The SQL <em>shape</em> (joins, predicate, index opportunity)
+     * integer pagination args) and hand the resulting concrete statement to the
+     * probe. The SQL <em>shape</em> (joins, predicate, index opportunity)
      * is the captured production text byte-for-byte; only the {@code ?} tokens
      * become literals, which is exactly what the JDBC driver would send.
      *
@@ -609,7 +643,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * @param capturedSql the verbatim Hibernate-emitted salon SELECT
      * @param localityId  the bound discovery city/district UUID
      */
-    private String explainNaturalWithLiterals(String capturedSql, UUID localityId) {
+    private String fillLocalityBinds(String capturedSql, UUID localityId) {
         // Step 1: neutralise every string-typed bind. Hibernate renders each
         // :category / :q / :sortMode bind as `cast(? as text)` (case-insensitive).
         // Replacing the whole wrapper with a typed NULL exercises the no-filter
@@ -631,11 +665,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                             + "(cast(? as text)) binds and the LIMIT/OFFSET tail, found " + remaining
                             + "; SQL=" + capturedSql);
         }
-        String filled = paginationFilled.replace("?", "'" + localityId + "'::uuid");
-
-        List<String> lines = jdbcTemplate.queryForList(
-                "EXPLAIN (ANALYZE, BUFFERS) " + filled, String.class);
-        return String.join("\n", lines);
+        return paginationFilled.replace("?", "'" + localityId + "'::uuid");
     }
 
     /**
@@ -706,72 +736,11 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 masterId, masterUserId, avgRating);
     }
 
-    /**
-     * Seeds {@code count} active salons all stamped with the given Kyiv
-     * {@code districtId}. Used by the district AC1 test to guarantee the target
-     * district has a real, but still selective, matching set against the
-     * larger {@code seedSalonsAcrossManyCities()} population — so the natural
-     * cost-based planner has a reason to prefer {@code idx_salons_district_id}
-     * over a seq scan of the (Phase 19.7) wider projection rows.
-     */
-    private void seedActiveSalonsInDistrict(UUID districtId, int count) {
-        UUID kyivCityId = cityIdByName("Київ");
-        UUID ownerId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
-                ownerId, "perf-dcluster-owner-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest");
-        for (int i = 0; i < count; i++) {
-            UUID salonId = UUID.randomUUID();
-            jdbcTemplate.update(
-                    "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) "
-                            + "VALUES (?, ?, ?, 'City', ?, ?, true, NOW(), NOW())",
-                    salonId, ownerId, "DClusterSalon-" + salonId, kyivCityId, districtId);
-        }
-    }
-
-    /**
-     * Seeds ~200 active salons spread across many distinct cities (and, for
-     * the districted ones, distinct districts) so that a single-city /
-     * single-district predicate is highly selective. After {@code ANALYZE},
-     * the planner has real statistics and genuinely prefers
-     * {@code idx_salons_city_id} / {@code idx_salons_district_id} over a seq
-     * scan — making the AC1 index-coverage assertion order-independent and a
-     * true proof rather than a small-table planner artefact.
-     */
-    private void seedSalonsAcrossManyCities() {
-        List<UUID> cityIds = jdbcTemplate.queryForList(
-                "SELECT id FROM cities ORDER BY katotth_code LIMIT 50",
-                UUID.class);
-        UUID ownerId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
-                        + "VALUES (?, ?, ?, 'SALON_OWNER', true, true)",
-                ownerId, "perf-bulk-owner-" + UUID.randomUUID() + "@beautica.test",
-                "$2a$04$placeholdervaluefortestonlydigest");
-
-        UUID kyivCityId = cityIdByName("Київ");
-        List<UUID> kyivDistricts = jdbcTemplate.queryForList(
-                "SELECT cd.id FROM city_districts cd WHERE cd.city_id = ? "
-                        + "ORDER BY cd.katotth_code",
-                UUID.class, kyivCityId);
-
-        for (int i = 0; i < 200; i++) {
-            UUID cityId = cityIds.get(i % cityIds.size());
-            UUID districtId =
-                    cityId.equals(kyivCityId) && !kyivDistricts.isEmpty()
-                            ? kyivDistricts.get(i % kyivDistricts.size())
-                            : null;
-            UUID salonId = UUID.randomUUID();
-            jdbcTemplate.update(
-                    "INSERT INTO salons (id, owner_id, name, city, city_id, district_id, is_active, created_at, updated_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, true, NOW(), NOW())",
-                    salonId, ownerId, "BulkSalon-" + salonId, "City",
-                    cityId, districtId);
-        }
-        jdbcTemplate.execute("ANALYZE salons");
-    }
+    // seedActiveSalonsInDistrict / seedSalonsAcrossManyCities were DELETED with the
+    // natural-plan AC1 assertions they existed to prop up: the capability probe asserts a
+    // structural property of the index, so it needs no population, no ANALYZE and no
+    // TRUNCATE — which is also what makes it immune to test ordering. See
+    // fillLocalityBinds' javadoc.
 
     /**
      * Seeds an {@code INDEPENDENT_MASTER} (no salon) whose own user row carries

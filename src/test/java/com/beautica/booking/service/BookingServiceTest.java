@@ -77,6 +77,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.inOrder;
@@ -2675,7 +2676,6 @@ class BookingServiceTest {
         when(bookingRepository.findAllByIdsWithGraph(List.of(bookingId)))
                 .thenReturn(List.of(completedBooking));
         when(reviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
-        when(clientReviewRepository.findReviewedBookingIds(List.of(bookingId))).thenReturn(List.of());
         when(authz.isPerformingMasterOfBooking(actorId, completedBooking)).thenReturn(false);
         when(discoveryLocationResolver.resolveLabels(any(), any())).thenReturn(emptyLabels());
 
@@ -2686,6 +2686,14 @@ class BookingServiceTest {
                 .as("a non-performer reads false regardless of what salon authority would have said")
                 .isFalse();
         verify(authz, never()).hasProviderAuthorityOverBooking(any(), any());
+        // The unscoped client-review probe finding (backend-security 2026-09-20): the
+        // client_reviews probe is now narrowed to the page's provider
+        // authority BEFORE it is issued, so for a non-performing actor it is never issued at all.
+        // The stub this test used to carry for it became an UnnecessaryStubbing, which is the
+        // strict-stubbing engine reporting exactly the round trip the narrowing removed. Asserted
+        // as a verify() so the saving is PINNED rather than merely un-stubbed: re-widening the call
+        // site turns this green-by-accident case red.
+        verify(clientReviewRepository, never()).findReviewedBookingIds(any());
     }
 
     @Test
@@ -3194,6 +3202,19 @@ class BookingServiceTest {
         verifyNoInteractions(bookingRepository);
     }
 
+    /**
+     * The ceiling is the 366-day DEFAULT, asserted as the no-max overload of
+     * {@link com.beautica.booking.service.ScheduleDateMath#assertSpanWithinMax}.
+     *
+     * <p><b>The negative verify below is load-bearing.</b> A PR #129 audit finding (the salon
+     * booked-days span-cap proposal, backend-perf 2026-09-20) narrowed this endpoint to 62
+     * inclusive days by switching to the three-arg overload. That shipped a hard 400 to the
+     * already-installed mobile client, which requests 361 days
+     * ({@code booked_days_notifier.dart}'s {@code kBookedDaysSpanDays = 180}, today +/- 180), and
+     * was reverted the same day. Pinning that the three-arg overload is NEVER reached turns a
+     * silent re-narrowing red HERE, at unit speed, instead of in the field — see
+     * {@code BookingService#getSalonBookedDays}'s javadoc for why the cap is frozen.
+     */
     @Test
     @DisplayName("the 366-day span cap for salon booked-days is delegated to "
             + "ScheduleDateMath.assertSpanWithinMax, not re-implemented inline")
@@ -3213,6 +3234,7 @@ class BookingServiceTest {
 
         verify(dateMath).assertToPlusOneDayRepresentable(to);
         verify(dateMath).assertSpanWithinMax(from, to);
+        verify(dateMath, never()).assertSpanWithinMax(eq(from), eq(to), anyLong());
         verifyNoInteractions(bookingRepository);
     }
 
@@ -3782,7 +3804,6 @@ class BookingServiceTest {
     @DisplayName("ForbiddenException is thrown when SALON_ADMIN calls getMyBookings")
     void should_throwForbidden_when_salonAdminListsBookings() {
         UUID salonAdminId = UUID.randomUUID();
-        User salonAdmin = buildUser(salonAdminId, Role.SALON_ADMIN);
         Pageable pageable = Pageable.unpaged();
 
         assertThatThrownBy(() -> bookingService.getMyBookings(salonAdminId, buildAuth(Role.SALON_ADMIN), null, null, null, null, pageable))
@@ -4355,7 +4376,6 @@ class BookingServiceTest {
             fiftyIds.add(UUID.randomUUID());
         }
         java.util.Set<UUID> expectedServiceIds = new java.util.LinkedHashSet<>(fiftyIds);
-        Sort tiebreakerOnly = Sort.by(Sort.Direction.ASC, "id");
         Pageable pageable = Pageable.unpaged();
         Pageable expectedNormalizedPageable = Pageable.unpaged(DEFAULT_BOOKING_SORT_WITH_TIEBREAKER());
 

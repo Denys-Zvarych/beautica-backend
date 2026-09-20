@@ -49,6 +49,21 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class SalonController {
 
+    /**
+     * Shared {@code 429} description for the roster effective-schedule read, one of the three expensive authenticated salon-board reads
+     * throttled by {@code BookingRateLimitFilter}'s {@code salonBoardReadBuckets} (the unthrottled
+     * salon-board reads finding, backend-security 2026-09-20). Per this codebase's existing idiom (see {@code ServiceController#RATE_LIMITED_429}
+     * and {@code AppointmentController}), no {@code content} schema is declared: the filter writes a
+     * fixed {@code ApiResponse} error envelope with nothing machine-readable to branch on, so the
+     * client keys on the status code and the {@code Retry-After} header alone.
+     */
+    private static final String SALON_BOARD_RATE_LIMITED_429 =
+            "Per-authenticated-user rate limit exceeded (shared 60/min budget across this salon "
+                    + "board's schedule, booked-days and list reads). Honour the `Retry-After` "
+                    + "header (seconds) and retry after backoff — nothing was read. Branch on the "
+                    + "status code; the body carries no machine-readable code.";
+
+
     private final SalonService salonService;
     private final BookingMasterService bookingMasterService;
 
@@ -179,6 +194,17 @@ public class SalonController {
                     + "absent masterId means 'not loaded', never 'not working'. Range required; span "
                     + "capped at 62 days. Requires management access to the salon (owner or "
                     + "assigned admin).")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit typed 200 alongside the 429, so springdoc does NOT treat the lone 429 as the
+            // COMPLETE response set and drop the auto-derived body schema — which would regenerate
+            // the mobile Dart client to Response<void> and break `res.data?.data`. Same guard
+            // ServiceController documents and ServiceWriteApiDocsContractIT pins.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = SALON_BOARD_RATE_LIMITED_429,
+                    content = @io.swagger.v3.oas.annotations.media.Content())
+    })
     @GetMapping("/{salonId}/masters/effective-schedule")
     @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN') and @authz.canManageSalon(authentication, #salonId)")
     public ApiResponse<List<SalonMasterEffectiveScheduleResponse>> getSalonMastersEffectiveSchedule(

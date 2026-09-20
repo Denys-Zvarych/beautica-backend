@@ -280,6 +280,23 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
                 .isEqualByComparingTo(catalogueRow.path("priceMin").decimalValue());
     }
 
+    /**
+     * <p><b>This case is the behavioural proof, NOT the deterministic one — do not treat it as the
+     * regression net for the Kyiv-vs-session-zone defect it originally caught.</b> It reaches
+     * Postgres over the pooled connection, whose session zone is the JVM default, and its fixture
+     * seeds {@code valid_to = D_kyiv - 1} against a {@code valid_to >= <today>} predicate. When the
+     * session zone's civil date equals Kyiv's — 21 of every 24 hours under {@code TZ=UTC}, and all
+     * 24 under {@code TZ=Europe/Kyiv} — a bare {@code CURRENT_DATE} and the correct Kyiv expression
+     * are literally the same comparison, so this case passes either way and no choice of
+     * {@code valid_to} changes that. The defect duly shipped in PR #125 and stayed green from 09:42Z
+     * to 19:16Z; only the 21:22Z run caught it.
+     *
+     * <p>{@code SalonSearchTodayResolutionIT} is the deterministic backstop: it extracts the four
+     * date operands from {@code SalonSearchSql} itself, pins the SQL clock source, and sweeps every
+     * quarter-hour of four reference days under three session zones, so the same revert is RED at
+     * all 24 UTC hours. Keep both — that class cannot show the advertised band actually moves, and
+     * this one cannot fire at 10:00Z.
+     */
     @Test
     @DisplayName("Case 22 (H4): a master whose ONLY weekly template has already EXPIRED "
             + "(valid_to in the past) does not price the salon either")

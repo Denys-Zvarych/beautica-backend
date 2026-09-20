@@ -1,0 +1,219 @@
+-- Fix for the salon `?partition=` + `?serviceId=` index-gap finding (backend-perf 2026-09-20,
+-- PR #129 audit): the corner that V168
+-- left UNMEASURED.
+--
+-- V168 measured four shapes — baseline, `?status=`, `partition=`, and `partition=` + `masterId` —
+-- and shipped a covering index for each. It never measured `partition=` + `serviceId=`, although
+-- BookingController#getSalonBookings accepts BOTH parameters on the same request
+-- (BookingController.java:290 and :309), so the shape is reachable by contract and the mobile
+-- «Архів» board reaches it the moment a service chip is tapped while the archive partition is
+-- active. Neither shipped index covers it:
+--   * V166  (salon_id, master_service_id, starts_at DESC)          — has master_service_id, but
+--            stops at starts_at, so `status`/`ends_at` fall to the heap.
+--   * V168  (salon_id, starts_at DESC, status, ends_at)            — has the partition columns, but
+--   * V168  (salon_id, master_id, starts_at DESC, status, ends_at)   neither has master_service_id.
+-- Measured, the planner resolves that by abandoning BOTH and leading with
+-- idx_bookings_master_service_id (V18, the bare FK index) into a Bitmap Heap Scan — the SAME
+-- pathology V168 fixed for the masterId chip, one random heap fetch per matched row.
+--
+-- ── MEASURED BEFORE ───────────────────────────────────────────────────────────────────────────────
+-- Throwaway `perf322b` database rebuilt to V168's published spec, PG 16.14, 480 000 bookings /
+-- 60 000 in the target salon / 20 masters / 600 master_services (30 service definitions x 20
+-- masters) / 3 480 future CONFIRMED rows, full production index set through V168 + V167's extended
+-- statistics, REINDEXed and ANALYZEd, `max_parallel_workers_per_gather = 0`, page 1 size 20,
+-- `ORDER BY starts_at DESC, id`, 3rd warm run. Shared buffers, id page and COUNT companion listed
+-- separately because one request issues BOTH.
+--
+-- Fixture fidelity against V168's own table: index sizes reproduce EXACTLY (V19 19 MB, V166 27 MB,
+-- salon-wide partition 31 MB, salon+master partition 39 MB), and so do the COUNT halves V168
+-- published — baseline 299 -> 300 here, UPCOMING/HISTORY/PAST 495 -> 496, HISTORY+masterId 35 -> 35.
+-- The id-page halves run higher than V168's (369 vs 103 for HISTORY) because this rebuild staggers
+-- each master's slot grid by 7 minutes, which spreads the future book across more leaf pages than
+-- V168's fixture did. That axis is untouched by this migration — every id-page number below is
+-- IDENTICAL before and after — so it does not affect the decision. The COUNT half, which is the
+-- half this migration moves and the half that runs on every FULL page, reproduces to within 1
+-- buffer.
+--
+--   shape                             id page        COUNT                            total
+--   baseline (no filter)               14 IdxScan     300 IdxOnly    HeapFetch 0        314
+--   ?status=COMPLETED                  16 IdxScan     246 IdxOnly    HeapFetch 0        262
+--   partition=UPCOMING                 14 IdxScan     496 IdxOnly    HeapFetch 0        510
+--   partition=HISTORY                 369 IdxScan     496 IdxOnly    HeapFetch 0        865
+--   partition=PAST                    369 IdxScan     496 IdxOnly    HeapFetch 0        865
+--   partition=HISTORY + masterId      209 IdxScan      35 IdxOnly    HeapFetch 0        244
+--   serviceId(1)                      109 BitmapHeap    5 IdxOnly    HeapFetch 0        114
+--   serviceId(2)                      114 BitmapHeap   12 IdxOnly    HeapFetch 0        126
+--   serviceId(20)                     130 IdxScan      73 IdxOnly    HeapFetch 0        203
+--   partition=UPCOMING + serviceId(1)  82 BitmapHeap   76 BitmapHeap HeapBlk   5        158  <- here
+--   partition=UPCOMING + serviceId(20)142 BitmapHeap  136 BitmapHeap HeapBlk   8        278  <- down
+--   partition=HISTORY  + serviceId(1) 109 BitmapHeap  103 BitmapHeap HeapBlk 100        212  <- is
+--   partition=HISTORY  + serviceId(2) 114 BitmapHeap  108 BitmapHeap HeapBlk 102        222  <- the
+--   partition=HISTORY  + serviceId(20)436 IdxScan     510 BitmapHeap HeapBlk 151        946  <- un-
+--   partition=PAST     + serviceId(1) 109 BitmapHeap  103 BitmapHeap HeapBlk 100        212  <- mea-
+--   partition=PAST     + serviceId(20)436 IdxScan     510 BitmapHeap HeapBlk 151        946  <- sured
+--   partition=HISTORY + masterId
+--                     + serviceId(1)  110 IdxScan     104 IdxScan                       214
+--
+-- TWO numbers falsify "adding a service chip to an archive page narrows the work":
+--   (a) serviceId(1) ALONE counts 100 rows in 5 buffers (V166, Index Only Scan, Heap Fetches 0).
+--       Add partition=HISTORY and the SAME 100 rows cost 103 — a 20.6x regression, paid as one
+--       random heap fetch per matched row. That is byte-for-byte the shape of the defect V168
+--       called its "load-bearing justification" for the masterId chip (1420 buffers for 2 826 rows).
+--   (b) partition=HISTORY + serviceId(20) totals 946 against 865 for partition=HISTORY with NO
+--       service filter at all. The filter whose entire purpose is to narrow the result makes the
+--       request MORE expensive than not filtering — and serviceId(20) is the shape the salon board
+--       sends for "this service, across the whole roster", since `serviceId` matches
+--       b.masterService.id (one row PER MASTER), not the shared service definition.
+-- By the bar V168 set for itself (V166 for 82 -> 4, V167 for 2362 -> 441, V168 for 1420 -> 35),
+-- this clears it.
+--
+-- ── FIX ───────────────────────────────────────────────────────────────────────────────────────────
+-- Extend V166's shape with the two partition-predicate columns as an INCLUDE payload, and DROP
+-- V166. The new index's KEY LIST IS IDENTICAL to V166's -- (salon_id, master_service_id,
+-- starts_at DESC), same columns, same order, same DESC -- and the only difference is the non-key
+-- INCLUDE payload. Not a "strict prefix": a strict prefix would be a WEAKER claim, leaving open
+-- that some access path V166 served is now a scan over extra key columns. Identical keys make the
+-- conclusion exact. Every access path V166 offered, V169 offers with the same cost profile: the
+-- same seek bounds, the same range scans, the same backward scan for `starts_at DESC`, the same
+-- index-only eligibility. An INCLUDE column is stored on LEAF pages only and is never a scan key,
+-- so it cannot change descent depth, key comparison or sort order -- it can only ADD covered
+-- columns. Dropping V166 therefore removes no capability whatsoever; it removes a duplicate.
+--
+-- INCLUDE, not trailing KEY columns — this was measured, not assumed. `status` and `ends_at` are
+-- filter payload on this path: they are never a seek bound (the partition predicate on HISTORY is a
+-- NEGATION, and on PAST an OR) and never a sort key (`starts_at DESC` is). Building the variant with
+-- them as trailing key columns instead:
+--
+--   shape                                   INCLUDE (shipped)      trailing KEY columns (rejected)
+--   partition=UPCOMING + serviceId(1)         82 /   5 /  87        15 /   5 /  20   <- better
+--   partition=UPCOMING + serviceId(20)       142 /  84 / 226       189 /  84 / 273
+--   partition=HISTORY  + serviceId(1)        109 /   5 / 114       109 /   5 / 114
+--   partition=HISTORY  + serviceId(2)        114 /  12 / 126       114 /  12 / 126
+--   partition=HISTORY  + serviceId(20)       436 /  84 / 520       436 /  84 / 520
+--   partition=PAST     + serviceId(1)        109 /   5 / 114       118 /  16 / 134  <- worse
+--   partition=PAST     + serviceId(20)       436 /  84 / 520       436 / 247 / 683  <- much worse
+--   sum of the seven                                     1707                   1870
+--
+-- The PAST regression has a readable cause in the plan: with `status` promoted to a KEY column the
+-- planner appends `status = ANY('{COMPLETED,NOT_COMPLETED,CONFIRMED}')` as a scan key on the 4th
+-- column, which combines with the `= ANY` on the 2nd column into 20 x 3 = 60 separate index
+-- descents instead of 20 — it reads 247 buffers to return 1 900 rows where the INCLUDE variant
+-- reads 84. Both variants are 39 MB, so the trade is pure plan quality. HISTORY — the archive's
+-- DEFAULT partition — is identical under both, so the decision is made by PAST, and PAST prefers
+-- INCLUDE. The single shape where the key-column variant wins (UPCOMING + serviceId(1), 87 -> 20) is
+-- the CHEAPEST shape in the table and is not the archive's default.
+--
+-- ── MEASURED AFTER (same fixture, same methodology) ───────────────────────────────────────────────
+--
+--   shape                             id page        COUNT                            total   delta
+--   baseline (no filter)               14 IdxScan     300 IdxOnly    HeapFetch 0        314  unchanged
+--   ?status=COMPLETED                  16 IdxScan     246 IdxOnly    HeapFetch 0        262  unchanged
+--   partition=UPCOMING                 14 IdxScan     496 IdxOnly    HeapFetch 0        510  unchanged
+--   partition=HISTORY                 369 IdxScan     496 IdxOnly    HeapFetch 0        865  unchanged
+--   partition=PAST                    369 IdxScan     496 IdxOnly    HeapFetch 0        865  unchanged
+--   partition=HISTORY + masterId      209 IdxScan      35 IdxOnly    HeapFetch 0        244  unchanged
+--   serviceId(1)                      109 BitmapHeap    5 IdxOnly    HeapFetch 0        114  unchanged
+--   serviceId(2)                      114 BitmapHeap   12 IdxOnly    HeapFetch 0        126  unchanged
+--   serviceId(20)                     130 IdxScan      84 IdxOnly    HeapFetch 0        214     +5%
+--   partition=UPCOMING + serviceId(1)  82 BitmapHeap    5 IdxOnly    HeapFetch 0         87    -45%
+--   partition=UPCOMING + serviceId(20)142 BitmapHeap   84 IdxOnly    HeapFetch 0        226    -19%
+--   partition=HISTORY  + serviceId(1) 109 BitmapHeap    5 IdxOnly    HeapFetch 0        114    -46%
+--   partition=HISTORY  + serviceId(2) 114 BitmapHeap   12 IdxOnly    HeapFetch 0        126    -43%
+--   partition=HISTORY  + serviceId(20)436 IdxScan      84 IdxOnly    HeapFetch 0        520    -45%
+--   partition=PAST     + serviceId(1) 109 BitmapHeap    5 IdxOnly    HeapFetch 0        114    -46%
+--   partition=PAST     + serviceId(20)436 IdxScan      84 IdxOnly    HeapFetch 0        520    -45%
+--   partition=HISTORY + masterId
+--                     + serviceId(1)  110 IdxScan     104 IdxScan                       214  unchanged
+--
+-- The COUNT half becomes an Index Only Scan with Heap Fetches 0 on every partition+serviceId shape:
+-- the Index Cond covers (salon_id, master_service_id) and the partition predicate is evaluated as a
+-- Filter against the INCLUDE payload in the index tuple, never the heap. 103 -> 5 on the archive's
+-- default chip shape.
+--
+-- ── THE ONE REGRESSION, AND WHY IT IS ACCEPTED ────────────────────────────────────────────────────
+-- serviceId(20) WITHOUT a partition: COUNT 73 -> 84 (+11 buffers, +15%; total 203 -> 214, +5%). Same
+-- plan, same Index Only Scan, Heap Fetches 0 — it simply walks a 39 MB index where it used to walk
+-- V166's 27 MB one, so the same 2 000-row scan touches more leaf pages. serviceId(1) and
+-- serviceId(2) are unchanged at 5 and 12.
+--
+-- ── V166 IS DROPPED, UNLIKE V19 IN V168 ───────────────────────────────────────────────────────────
+-- V168 kept V19 although it is a strict prefix of V168's salon-wide index, because MEASUREMENT said
+-- so: dropping V19 regressed the board's DEFAULT request 299 -> 432 (+44%). The same counter-
+-- measurement was run here and says the opposite. Keeping V166 alongside this index buys exactly ONE
+-- improvement in the whole table — serviceId(20) without a partition, 84 -> 73 (-11 buffers) — on a
+-- shape that is not any screen's default. Every other row is byte-identical with V166 present or
+-- absent.
+--
+-- What keeping it would cost is quantified, not asserted. Measured on the same fixture with
+-- `EXPLAIN (ANALYZE, BUFFERS)` over a 1 000-row INSERT into `bookings` (rolled back, so the table is
+-- unchanged between variants), 4 runs each, run-to-run spread under 0.3%:
+--
+--   index set on `bookings`                       buffers / 1 000-row INSERT    per INSERT
+--   22 indexes (neither V166 nor this one)                     54 652              --
+--   23 indexes, V166 only            (V168 head)               57 682          +3.03  (+5.5%)
+--   23 indexes, this one only        (after V169)              57 796          +3.14  (+5.8%)
+--   24 indexes, BOTH                 (rejected)                60 791          +6.14 (+11.2%)
+--
+-- So carrying both would pay +3.1 buffers on EVERY `POST /bookings` — which holds
+-- `pg_advisory_xact_lock` across its INSERT, so the cost lands on the revenue path's lock hold — to
+-- save 11 buffers on one non-default read. Dropped.
+--
+-- Those numbers also settle the separate write-amplification-unquantified finding
+-- (backend-perf 2026-09-20):
+-- ONE B-tree of this shape costs ~3.1 buffers per INSERT, ~5.5% of a booking INSERT's total write-
+-- path buffer traffic, so the PR's net +2 indexes (V166 plus V168's net +1) is ~+6.2 buffers,
+-- ~+11%. Wall-clock was measured too (2 000 and 10 000 single-row INSERTs, 5-6 reps per variant) and
+-- came back BELOW this environment's noise floor: the run-to-run spread was +/-12% and the ordering
+-- between the 22-, 23- and 24-index states was not even monotonic. Buffers are reported instead
+-- because they resolve the signal; the latency figure would have been a number, not a measurement.
+-- THIS migration is index-count NEUTRAL (one CREATE, one DROP) and costs +0.11 buffers per INSERT
+-- (+0.2%) over the V166 it replaces — an INCLUDE payload widens leaf tuples but adds no key
+-- comparison and no extra page descent.
+--
+-- ── Plain CREATE/DROP INDEX, no CONCURRENTLY ──────────────────────────────────────────────────────
+-- Matching every prior index migration on this table (V112, V138, V142, V145, V148, V166, V168) and
+-- this repo's only convention: Flyway runs each migration inside a transaction, and neither CREATE
+-- INDEX CONCURRENTLY nor DROP INDEX CONCURRENTLY can run inside one. No migration in this project
+-- uses CONCURRENTLY anywhere, so introducing it here would be an unestablished one-off.
+--
+-- Same lock argument and the same 5s/1min values as V168:114 and V138:61 — CREATE INDEX takes SHARE
+-- on `bookings` (conflicts with ROW EXCLUSIVE, so it blocks every write for the whole build) and the
+-- DROP takes ACCESS EXCLUSIVE (V118:22); Postgres lock requests are FIFO, so a pending request
+-- queues every subsequent reader behind it while the old instance still serves a Railway rolling
+-- deploy, and Hikari's pool-size 10 / 20s connection timeout surfaces that as app-wide 500s within
+-- seconds. Fail fast; Flyway rolls this transaction back cleanly and the next deploy retries it.
+--
+-- statement_timeout is applied PER STATEMENT and re-armed for each one (V120:42, V121:47, V137:28,
+-- V138:50, V168:121) — there is no transaction-wide equivalent. TWO statements follow, so the
+-- literal ceiling is 2x1min. That is still the right bound: each is a single index build or unlink
+-- on one table, and lowering it to fit a 1min total would risk aborting a legitimately slow index
+-- build on a large production table, which crash-loops the deploy instead of converging (memory
+-- `project_flyway_checksum_recovery.md`).
+--
+-- SET LOCAL: scoped to Flyway's per-migration transaction, so neither value leaks to the pooled
+-- connection once this migration commits.
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '1min';
+
+-- REPLACES idx_bookings_salon_service_starts_at (V166). The KEY list below is IDENTICAL to V166's
+-- (same columns, same order, same DESC); the only addition is the non-key INCLUDE payload, which
+-- lives on leaf pages and is never a scan key. So V169 is a strict SUPERSET of V166's capability,
+-- not merely a prefix of it, and no access path is lost. Created BEFORE the drop so that shape is
+-- never absent from the catalog, even though Flyway's single transaction makes the pair atomic
+-- anyway (V168:139).
+--
+-- MEASURED BUT DELIBERATELY NOT TAKEN: adding `id` to the INCLUDE payload.
+-- The V169 measurement table above shows the id-page half is now the dominant cost on the chip
+-- shapes -- 436 of the 520 buffers on `partition=HISTORY + serviceId(20)` -- because `id` is
+-- neither a key column nor an INCLUDE column, so the keyset/id page MUST fetch the heap. Adding
+-- `id` to INCLUDE would make that half index-only too. It is NOT done, on purpose: this index is
+-- already 39 MB and already costs +3.14 buffers on EVERY `POST /bookings`, paid INSIDE the
+-- `pg_advisory_xact_lock` hold on the revenue path. Widening the leaf tuple by another 16 bytes
+-- raises that write cost on the highest-contention path in the product to speed up one non-default
+-- read shape. The trade was not measured end to end and MUST be before it is taken. Recorded here
+-- so a future reader finds the option already considered rather than "discovering" it and shipping
+-- it on the reasoning alone.
+CREATE INDEX idx_bookings_salon_service_partition_starts_at
+    ON bookings (salon_id, master_service_id, starts_at DESC) INCLUDE (status, ends_at);
+
+DROP INDEX IF EXISTS idx_bookings_salon_service_starts_at;
