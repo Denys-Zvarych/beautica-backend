@@ -119,3 +119,14 @@ logs/
 CLAUDE.md
 PLAN-backend.md
 memory/
+
+# ============================================================
+# Locality classifier snapshots (Phase 325)
+# ============================================================
+# The regenerated KATOTTH snapshot is a 5.6 MB intermediate of
+# scripts/locality/build_settlement_import.py. NOTHING reads it at build or at
+# runtime -- V171 reads only src/main/resources/db/data/settlements.csv, which
+# this snapshot is one input to. Committing it would put a multi-megabyte blob
+# in every clone for zero consumers. Regenerate it on demand:
+#   python3 scripts/locality/build_settlement_import.py
+docs/backend-phases/data/katottg-2025-07-02-free.json

@@ -122,8 +122,7 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
     }
 
     private CreateSalonRequest createRequest(String name) {
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         // CreateSalonRequest field order: name, description, city, region, address, phone,
         // instagramUrl, cityId, districtId, street, buildingNo, locationNote — mirrors the
         // proven shape used in SalonRegistrationIntegrationTest.
@@ -133,8 +132,7 @@ class SalonMutationPersistenceIT extends AbstractIntegrationTest {
     }
 
     private UpdateSalonRequest updateRequest(String name) {
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         // UpdateSalonRequest field order: name, description, city, region, address,
         // cityId, districtId, street, buildingNo, locationNote, phone, instagramUrl.
         return new UpdateSalonRequest(

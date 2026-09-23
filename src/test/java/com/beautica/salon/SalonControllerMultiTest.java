@@ -238,8 +238,7 @@ class SalonControllerMultiTest extends AbstractIntegrationTest {
     private void createSalon(String ownerToken, String salonName) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         // street + buildingNo are now @NotBlank on CreateSalonRequest (Phase 10.6 reversal);
         // the create must carry a valid pair to clear the @Valid boundary and reach 201.
         var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null,

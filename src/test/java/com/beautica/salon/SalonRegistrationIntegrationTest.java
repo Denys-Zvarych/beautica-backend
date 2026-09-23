@@ -77,8 +77,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     void should_autoCreateOwnerMaster_on_firstSalonCreation() {
         // Arrange
         UUID ownerId = persistOwner("owner-first@beautica.test");
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var request = new CreateSalonRequest(
                 "Velvet Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
 
@@ -119,8 +118,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     void should_notAutoCreateMaster_on_secondSalonCreation() {
         // Arrange
         UUID ownerId = persistOwner("owner-second@beautica.test");
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var firstRequest = new CreateSalonRequest(
                 "First Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
         var secondRequest = new CreateSalonRequest(
@@ -161,8 +159,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
         // and every existing owner is shown an unchecked box describing a state they are not in —
         // a defect no repository-level assertion above would notice.
         UUID ownerId = persistOwner("owner-defaulton@beautica.test");
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var request = new CreateSalonRequest(
                 "Default On Studio", null, "Kyiv", null, null, null, null, cityId, null,
                 VALID_STREET, VALID_BUILDING_NO, null);

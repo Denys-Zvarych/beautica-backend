@@ -171,8 +171,7 @@ class SalonSecurityTest extends AbstractIntegrationTest {
     private UUID createSalon(String ownerToken, String salonName) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null,
                 VALID_STREET, VALID_BUILDING_NO, null);
         ResponseEntity<String> resp = restTemplate.exchange(

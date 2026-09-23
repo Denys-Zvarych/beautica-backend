@@ -1,6 +1,7 @@
 package com.beautica.location.repository;
 
 import com.beautica.location.entity.City;
+import com.beautica.location.entity.SettlementType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -19,16 +20,42 @@ import java.util.UUID;
 public interface CityRepository extends JpaRepository<City, UUID> {
 
     /**
-     * Returns all cities within the given oblast, sorted alphabetically by
-     * Ukrainian name. Used to populate the second tier of the cascading
-     * locality picker after an oblast is selected.
+     * Returns the settlements of one {@code settlementType} within the given oblast, sorted
+     * alphabetically by Ukrainian name. Used to populate the second tier of the cascading
+     * locality picker after an oblast is selected, which passes
+     * {@link com.beautica.location.entity.SettlementType#CITY}.
      *
-     * <p>Backed by {@code idx_cities_oblast_id}.
+     * <p><b>Why the type argument exists (Phase 325 follow-up).</b> The predecessor
+     * {@code findByOblastIdOrderByNameUkAsc} had no type predicate, which was harmless while
+     * {@code cities} held V53's 356 category-M rows. V170/V171 widened the table to 25 698
+     * settlements, and the largest oblast now holds 1 928 of them — so the unfiltered finder turned
+     * a ~15-row picker response into a ~1 900-row one. The non-predicate variant is DELETED rather
+     * than kept alongside (§E-1): a caller reaching for the shorter name would silently re-open the
+     * same ~100× payload.
      *
-     * @param oblastId surrogate PK of the parent oblast
-     * @return cities in the oblast ordered by {@code name_uk ASC}
+     * <p>Bounded by data, not by a {@code LIMIT}: 353 rows are {@code CITY} (352 imported + Kyiv)
+     * and the largest oblast holds 44 of them, so the picker is back at its pre-V170 magnitude with
+     * NO silent truncation — a hard cap on an alphabetical picker would hide the tail of the list
+     * from the user rather than page it. The full-settlement surface is Phase 326's search
+     * endpoint, which owns paging and its own index.
+     *
+     * <p>Backed by {@code idx_cities_oblast_city_name} (V172) —
+     * {@code (oblast_id, name_uk) WHERE settlement_type = 'CITY'}.
+     *
+     * <p><b>This comment previously claimed the type predicate was "a filter on the
+     * already-ordered index range" of V52's {@code idx_cities_oblast_id}. It was not.</b> That
+     * index has no predicate, so the filter ran ABOVE the scan, on the heap: measured on
+     * Львівська (the largest oblast), <b>1 884 Rows Removed by Filter</b> to return 44 rows,
+     * 54 shared buffers, 0.35–0.89 ms. V172's partial index holds only the 353 CITY rows,
+     * pre-ordered by {@code name_uk} within each oblast, taking the same query to an Index Only
+     * Scan with 0 rows filtered, 30 shared buffers and 0.18 ms — for 40 kB / 353 entries.
+     *
+     * @param oblastId       surrogate PK of the parent oblast
+     * @param settlementType kind of populated place to return
+     * @return matching settlements in the oblast ordered by {@code name_uk ASC}
      */
-    List<City> findByOblastIdOrderByNameUkAsc(UUID oblastId);
+    List<City> findByOblastIdAndSettlementTypeOrderByNameUkAsc(UUID oblastId,
+                                                               SettlementType settlementType);
 
     /**
      * Looks up a city by its stable KATOTTH code.
@@ -80,8 +107,9 @@ public interface CityRepository extends JpaRepository<City, UUID> {
      *
      * <p>Sibling of {@link #findNameUkByIdIn(Collection)}: used by
      * {@code SalonService#getOwnerSalons} to stamp {@code oblastId} onto a whole
-     * page of an owner's salons at once. The single-key {@link #findOblastIdById(UUID)}
-     * (or {@link #findByIdWithOblast(UUID)}) would N+1 across the list (§E) — this
+     * page of an owner's salons at once. The single-key {@link #findByIdWithOblast(UUID)}
+     * (directly, or via {@code LocationQueryService#resolveCityOblastId}) would N+1 across the
+     * list (§E) — this
      * fuses the resolution into one round-trip regardless of how many distinct
      * cities the owner's salons reference. The 2-element scalar projection
      * {@code [id, oblast.id]} avoids hydrating the {@link City} entity (and its
@@ -93,30 +121,6 @@ public interface CityRepository extends JpaRepository<City, UUID> {
      */
     @Query("SELECT c.id, c.oblast.id FROM City c WHERE c.id IN :ids")
     List<Object[]> findOblastIdsByIdIn(@Param("ids") Collection<UUID> ids);
-
-    /**
-     * Resolves the parent oblast id of a single city by the city's id.
-     *
-     * <p>Single-key sibling of {@link CityDistrictRepository#findNameUkById(UUID)}:
-     * used by the {@code GET /users/me} read path to stamp the {@code oblastId}
-     * onto {@link com.beautica.user.UserProfileResponse} when the account owner
-     * has a {@code cityId} set. The mobile Location-edit screen needs the resolved
-     * oblast UUID to pre-select the oblast tier of the oblast→city→district
-     * cascade without scanning every oblast's city list.
-     *
-     * <p>Scalar projection ({@code c.oblast.id} only) avoids hydrating the
-     * {@link City} entity and its LAZY {@code oblast} association just to read one
-     * FK column — the {@code c.oblast.id} path compiles to the {@code cities.oblast_id}
-     * column with no JOIN to {@code oblasts}. Single-row by PK, so this is not a §E
-     * "non-graph variant" concern: it is the per-row read for a one-off profile
-     * lookup, never a page-level loop (the batch label path uses
-     * {@link #findNameUkByIdIn(Collection)} instead).
-     *
-     * @param id surrogate PK of the city to resolve
-     * @return the city's parent oblast id, or empty when the id is unknown
-     */
-    @Query("SELECT c.oblast.id FROM City c WHERE c.id = :id")
-    Optional<UUID> findOblastIdById(@Param("id") UUID id);
 
     /**
      * Single-query taxonomy resolution for the Phase 10.6 most-specific-node

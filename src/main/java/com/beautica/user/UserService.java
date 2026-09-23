@@ -16,6 +16,7 @@ import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.RatingCountProjection;
 import lombok.extern.slf4j.Slf4j;
@@ -43,6 +44,7 @@ public class UserService {
     private final LocalityWriteValidator localityWriteValidator;
     private final CityRepository cityRepository;
     private final CityDistrictRepository cityDistrictRepository;
+    private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
     private final ClientReviewRepository clientReviewRepository;
     private final MasterRepository masterRepository;
@@ -51,6 +53,7 @@ public class UserService {
                        LocalityWriteValidator localityWriteValidator,
                        CityRepository cityRepository,
                        CityDistrictRepository cityDistrictRepository,
+                       LocationQueryService locationQueryService,
                        CacheManager cacheManager,
                        ClientReviewRepository clientReviewRepository,
                        MasterRepository masterRepository) {
@@ -58,6 +61,7 @@ public class UserService {
         this.localityWriteValidator = localityWriteValidator;
         this.cityRepository = cityRepository;
         this.cityDistrictRepository = cityDistrictRepository;
+        this.locationQueryService = locationQueryService;
         this.cacheManager = cacheManager;
         this.clientReviewRepository = clientReviewRepository;
         this.masterRepository = masterRepository;
@@ -130,13 +134,20 @@ public class UserService {
                 ? null
                 : cityDistrictRepository.findNameUkById(user.getDistrictId()).orElse(null);
         // oblastId lets the mobile Location-edit screen pre-select the oblast tier without
-        // scanning every oblast's cities. Resolved on demand only when a city is set — one
-        // scalar FK lookup (cities.oblast_id, no JOIN to oblasts); null otherwise. No City is
-        // loaded on this read path (cityName/oblastName come from denormalised columns), so
-        // there is nothing to reuse — this is the minimal extra query.
+        // scanning every oblast's cities. Resolved on demand only when a city is set.
+        //
+        // Routed through the SHARED cached resolver, not a direct repository call (Phase 325 perf
+        // LOW). This path used to call cityRepository.findOblastIdById directly and so bypassed
+        // the `cityOblastId` cache that exists for exactly this question — even though
+        // SalonService and MasterService already ask it through LocationQueryService. GET
+        // /users/me is the hottest authenticated read in the app (every launch, every CLIENT), it
+        // is itself @Cacheable per user, and the taxonomy behind the answer is static
+        // Flyway-seed data — so one shared warm entry per provider city serves every account in
+        // that city instead of one PK lookup per profile read. The null guard stays in front of
+        // the call: a @Cacheable key can never be null.
         UUID oblastId = user.getCityId() == null
                 ? null
-                : cityRepository.findOblastIdById(user.getCityId()).orElse(null);
+                : locationQueryService.resolveCityOblastId(user.getCityId());
         return UserProfileResponse.from(user, districtName, oblastId, resolveHasMasterProfile(user));
     }
 

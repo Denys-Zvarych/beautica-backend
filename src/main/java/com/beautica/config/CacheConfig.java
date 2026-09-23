@@ -162,10 +162,13 @@ public class CacheConfig {
      *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
      *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
      *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
-     *   cityOblastId            — shared cityId -> oblastId resolver (SalonService/MasterService) —
-     *                             24 h TTL, max 400 entries; no eviction path (static reference data)
+     *   cityOblastId            — shared cityId -> oblastId resolver
+     *                             (SalonService/MasterService/UserService) — 24 h TTL,
+     *                             max 2000 entries; negatives not cached; no eviction path
+     *                             (static reference data)
      *   localityTaxonomyFacts  — fused city-exists/has-districts/district-child resolution
-     *                            per (cityId,districtId) write-validation pair — 24 h TTL, max 600 entries
+     *                            per (cityId,districtId) write-validation pair — 24 h TTL,
+     *                            max 600 entries (an admission FENCE, not a capacity estimate)
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -539,12 +542,29 @@ public class CacheConfig {
         // Phase 240 perf MEDIUM — shared cityId -> oblastId resolver
         // (LocationQueryService#resolveCityOblastId) backing SalonService/MasterService's
         // per-request oblastId resolution. Same static-reference-data rationale as the
-        // locationOblasts/* caches above: ~356 cities is the realistic ceiling, so 400 entries
-        // comfortably covers every distinct city ever resolved, with the same 24h TTL / no
-        // @CacheEvict contract (data is Flyway-seed-only, never mutated at runtime).
+        // locationOblasts/* caches above: 24h TTL, no @CacheEvict contract (data is
+        // Flyway-seed-only, never mutated at runtime).
+        //
+        // SIZING — 2 000. This was briefly 26 000 on a WRONG premise: that Phase 325's widening of
+        // `cities` from 356 rows to 25 698 had widened this cache's key space to match, making 400
+        // "1.5% of the key space". It had not. Every caller keys on a STORED FK — SalonService on
+        // `salons.city_id`, MasterService on the master's city, UserService#getProfile on
+        // `users.city_id` — so the reachable key space is CITIES-THAT-HOST-A-PROVIDER, which
+        // tracks provider growth, not the settlement table. Importing 25 342 villages nobody has
+        // registered in created no new keys.
+        //
+        // 26 000 was also 52% of every maximumSize in this file combined, for a cache whose live
+        // working set is in the hundreds — and the "~100 bytes/entry -> ~2.5 MB" arithmetic that
+        // justified it was low: a Caffeine bounded entry holding UUID -> UUID measures ~158 B, so
+        // 26 000 reserves ~4.1 MB of heap ceiling.
+        //
+        // 2 000 is ~10x the realistic distinct-provider-city count with room for years of growth,
+        // costs ~315 kB fully populated, and keeps the §F-5 bound meaningful. Negatives are not
+        // cached (`unless = "#result == null"` on the resolver), so an enumeration of random UUIDs
+        // cannot occupy entries at all — the cap no longer has to double as that defence.
         manager.registerCustomCache("cityOblastId",
                 Caffeine.newBuilder()
-                        .maximumSize(400)
+                        .maximumSize(2_000)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
         // Phase 10.6 — fused write-path taxonomy resolution per (cityId, districtId)
@@ -552,8 +572,18 @@ public class CacheConfig {
         // as the locationOblasts/* read caches above: KATOTTH rows are Flyway-seed
         // only and never mutate at runtime, so a long 24-hour TTL with NO @CacheEvict
         // path is correct (the only invalidation is JVM restart / redeploy — also
-        // the only time the seed can change). 600 entries comfortably hold every
-        // distinct (city, district) pair a real client submits (~600 taxonomy rows).
+        // the only time the seed can change).
+        //
+        // 600 IS A FENCE, NOT A CAPACITY ESTIMATE. The comment here used to justify it as
+        // "~600 taxonomy rows"; Phase 325 killed that premise (25 698 cities x districts is a far
+        // larger pair space). It is deliberately NOT resized to match, because unlike every other
+        // cache in this file the key is not derived from a stored FK: `(cityId, districtId)` comes
+        // straight off a CLIENT REQUEST BODY on the profile/salon write paths, and the
+        // CITY_ABSENT verdict is itself cached — so a caller posting random UUIDs mints a new,
+        // cacheable entry every time. A cap sized to the data would be a cap sized to the
+        // attacker. 600 bounds that at a few tens of kB while still holding every pair a real
+        // client population submits, and the cost of exceeding it is one 0.06 ms Index Only Scan
+        // (6 buffers) — a miss here is cheap, which is exactly why the fence can be tight.
         manager.registerCustomCache("localityTaxonomyFacts",
                 Caffeine.newBuilder()
                         .maximumSize(600)

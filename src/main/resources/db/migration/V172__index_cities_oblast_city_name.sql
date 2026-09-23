@@ -1,0 +1,68 @@
+-- ============================================================================
+-- V172 — partial index for the oblast → CITY tier of the cascading picker
+-- ============================================================================
+-- Phase 325 perf follow-up (LOW).
+--
+-- WHAT THE QUERY IS
+--   CityRepository#findByOblastIdAndSettlementTypeOrderByNameUkAsc, the second
+--   tier of the legacy oblast → city → district cascade behind the permitAll
+--   GET /api/v1/locations/oblasts/{id}/cities:
+--
+--     SELECT ... FROM cities
+--      WHERE oblast_id = ? AND settlement_type = 'CITY'
+--      ORDER BY name_uk;
+--
+-- WHY V52's idx_cities_oblast_id IS NOT ENOUGH ANY MORE
+--   That index is `(oblast_id, name_uk)` with no predicate. It was exactly
+--   right while `cities` held V53's 356 category-M rows — every row in an
+--   oblast's range WAS a city. V170 + V171 widened the table to 25 698
+--   settlements, so the same range now returns mostly villages that the
+--   `settlement_type` filter then throws away ABOVE the index.
+--
+--   Measured on Львівська (the largest oblast) before this migration:
+--     Index Scan idx_cities_oblast_id -> 1 884 Rows Removed by Filter to
+--     return 44 rows; 54 shared buffers; 0.35-0.89 ms.
+--   After (same oblast, same fully-migrated 25 698-row table):
+--     Bitmap Index Scan idx_cities_oblast_city_name -> Bitmap Heap Scan ->
+--     Sort; 0 Rows Removed by Filter; 30 shared buffers; 0.126 ms.
+--     Index size 40 kB / 353 entries.
+--
+--   NOTE ON THE PLAN SHAPE: the planner picks a BITMAP scan here, not an Index
+--   Only Scan, so the ORDER BY name_uk is satisfied by an explicit Sort node
+--   rather than by the index order. An earlier revision of this comment claimed
+--   "Index Only Scan, no sort" — that was wrong. It does not change what the
+--   index buys: the heap filter is gone (1 884 Rows Removed by Filter -> 0),
+--   shared buffers drop 54 -> 30, and the Sort runs over the 44 matching rows
+--   instead of the ~1 928 the old scan had to fetch first.
+--
+--   The repository Javadoc used to claim the type predicate was "a filter on
+--   the already-ordered index range"; it is not — it is a heap filter above
+--   the scan. That comment is corrected in the same change as this migration.
+--
+-- WHY PARTIAL, NOT `(oblast_id, settlement_type, name_uk)`
+--   353 of 25 698 rows are CITY (1.4 %). A three-column full index would carry
+--   all 25 698 entries to serve a query that can only ever return 353 of them —
+--   25 698 entries of write amplification on every future settlement import for
+--   no read benefit (playbook §E-5 / §O-6). The partial index holds exactly the
+--   353 qualifying rows, pre-ordered by name_uk within each oblast, so the scan
+--   reads only rows that can be returned instead of filtering 1 884 villages out
+--   above the index. (The planner still adds a Sort — see the plan note above.)
+--
+-- WHY idx_cities_oblast_id IS KEPT (no drop in this migration)
+--   It is NOT redundant with the partial index: it still serves the
+--   type-agnostic `oblast_id` lookups —
+--   CityDistrictRepository#findCityIdsWithDistrictsByOblastId joins
+--   city_districts -> cities on oblast_id with no settlement_type predicate,
+--   and Phase 326's settlement search will filter by oblast across ALL
+--   settlement types. Dropping it would push both onto a sequential scan of
+--   25 698 rows. §O-6 only asks for the redundant index to go; this one is not
+--   redundant.
+--
+-- IMMUTABILITY
+--   V170 and V171 are applied; this ships forward as the next free version
+--   rather than editing V170's SECTION 4 (playbook §O-9).
+-- ============================================================================
+
+CREATE INDEX idx_cities_oblast_city_name
+    ON cities (oblast_id, name_uk)
+    WHERE settlement_type = 'CITY';

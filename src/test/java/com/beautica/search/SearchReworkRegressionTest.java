@@ -102,17 +102,15 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         return new HttpEntity<>(headers);
     }
 
-    private UUID cityIdByName(String nameUk) {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = ? ORDER BY katotth_code LIMIT 1",
-                UUID.class, nameUk);
-    }
-
     private UUID districtIdInCity(String cityNameUk, int index) {
         return jdbcTemplate.queryForObject(
                 "SELECT cd.id FROM city_districts cd "
                         + "JOIN cities c ON c.id = cd.city_id "
-                        + "WHERE c.name_uk = ? ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
+                        // settlement_type = 'CITY' drops the namesake VILLAGES Phase 325
+                        // imported («Київ» in Миколаївська, «Львів» in Дніпропетровська),
+                        // which sort FIRST by katotth_code and carry no districts.
+                        + "WHERE c.name_uk = ? AND c.settlement_type = 'CITY' "
+                        + "ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
                 UUID.class, cityNameUk, index);
     }
 
@@ -121,7 +119,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("regression — a salon is found by its taxonomy city_id even though its legacy free-text city holds the Russian spelling 'Киев' (old AND city = :city path is gone)")
     void should_findSalonByCityId_regardlessOfLegacyFreeTextSpelling() throws Exception {
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         // The salon's legacy free-text column is the WRONG spelling on purpose
         // ("Киев" — Russian; the old code did `WHERE city = :city` so a Київ
@@ -162,7 +160,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("regression — an INDEPENDENT_MASTER is found by city_id even though its user-row legacy city is an arbitrary free-text spelling (FK discovery, not the old string path)")
     void should_findMasterByCityId_regardlessOfLegacyUserRowSpelling() throws Exception {
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         // Phase 19.7: /search/masters returns INDEPENDENT_MASTER only. The
         // "Київ ≠ Киев ≠ kyiv" regression under test is role-agnostic — it is
@@ -201,7 +199,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @DisplayName("M2 — every master & salon search routes locality through DiscoveryLocationResolver.resolveFilter (seam is on the call path)")
     void should_invokeResolverSeam_when_searchPerformed() {
         Mockito.clearInvocations(discoveryLocationResolver);
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + kyivCityId + "&page=0&size=20",
@@ -312,7 +310,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         // while an independent master in district A is still discovered via its
         // own user-row locality. This pins that the role predicate lives on both
         // the data and the count path across a multi-salon owner context.
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
 
@@ -373,7 +371,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
             + "data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is the "
             + "actual guard, not the salon's locality data")
     void should_neverSurfaceSalonMasterUnderOwnPersonalLocality_when_salonIsCityLess() throws Exception {
-        UUID ownerPersonalCity = cityIdByName("Київ");
+        UUID ownerPersonalCity = majorCityIdByName("Київ");
         UUID ownerPersonalDistrict = districtIdInCity("Київ", 0);
         // The salon's OWN real city — deliberately NOT Kyiv, so a search scoped to the master's
         // personal city/district can only return this master if the (broken) guard fell through

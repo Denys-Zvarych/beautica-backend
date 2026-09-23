@@ -11,6 +11,7 @@ import com.beautica.location.entity.City;
 import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.entity.MasterType;
@@ -40,6 +41,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -59,6 +61,9 @@ class UserServiceTest {
     private CityDistrictRepository cityDistrictRepository;
 
     @Mock
+    private LocationQueryService locationQueryService;
+
+    @Mock
     private CacheManager cacheManager;
 
     @Mock
@@ -72,8 +77,8 @@ class UserServiceTest {
     @BeforeEach
     void setUp() {
         userService = new UserService(
-                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager,
-                clientReviewRepository, masterRepository);
+                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository,
+                locationQueryService, cacheManager, clientReviewRepository, masterRepository);
     }
 
     @Test
@@ -162,9 +167,16 @@ class UserServiceTest {
         verify(cityDistrictRepository, times(1)).findNameUkById(districtId);
     }
 
+    /**
+     * Phase 325 perf LOW: this read used to call {@code cityRepository.findOblastIdById} directly
+     * and so bypassed the {@code cityOblastId} cache that exists for exactly this question, while
+     * SalonService and MasterService already asked it through the shared resolver. The
+     * {@code verifyNoInteractions(cityRepository)} is the half of this test that would go red on
+     * a regression to the direct call — asserting the returned value alone would not.
+     */
     @Test
-    @DisplayName("getProfile resolves oblastId via findOblastIdById exactly once when cityId is set")
-    void should_resolveOblastId_when_cityIdSet() {
+    @DisplayName("getProfile resolves oblastId through the SHARED cached resolver, not the repository")
+    void should_resolveOblastIdViaLocationQueryService_when_cityIdSet() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         UUID oblastId = UUID.randomUUID();
@@ -172,14 +184,15 @@ class UserServiceTest {
         user.setCityId(cityId);
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.of(oblastId));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
 
         UserProfileResponse response = userService.getProfile(userId);
 
         assertThat(response.oblastId())
-                .as("oblastId is the parent oblast id resolved by findOblastIdById for the set cityId")
+                .as("oblastId is whatever the shared resolver returns for the set cityId")
                 .isEqualTo(oblastId);
-        verify(cityRepository, times(1)).findOblastIdById(cityId);
+        verify(locationQueryService, times(1)).resolveCityOblastId(cityId);
+        verifyNoInteractions(cityRepository);
     }
 
     @Test
@@ -196,11 +209,11 @@ class UserServiceTest {
         assertThat(response.oblastId())
                 .as("no cityId set → oblastId stays null and no query is issued")
                 .isNull();
-        verify(cityRepository, never()).findOblastIdById(any());
+        verifyNoInteractions(locationQueryService, cityRepository);
     }
 
     @Test
-    @DisplayName("getProfile returns null oblastId when the city lookup resolves empty (orElse(null) arm)")
+    @DisplayName("getProfile returns null oblastId when the shared resolver cannot resolve the city")
     void should_returnNullOblastId_when_lookupEmpty() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
@@ -208,14 +221,14 @@ class UserServiceTest {
         user.setCityId(cityId);
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.empty());
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(null);
 
         UserProfileResponse response = userService.getProfile(userId);
 
         assertThat(response.oblastId())
-                .as("an unresolved cityId falls back to null via orElse(null), never throws")
+                .as("a stale cityId resolves to null and is surfaced as null, never thrown")
                 .isNull();
-        verify(cityRepository, times(1)).findOblastIdById(cityId);
+        verify(locationQueryService, times(1)).resolveCityOblastId(cityId);
     }
 
     // ── Phase 265 — hasMasterProfile (the owner-as-master toggle, derived on read) ─────

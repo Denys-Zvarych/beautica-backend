@@ -9,6 +9,7 @@ import com.beautica.service.dto.CreateServiceDefinitionRequest;
 import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.support.LocalityTestLookup;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -66,8 +67,7 @@ class ServiceTestFixtures {
     UUID createSalon(String ownerToken, String name) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
         // street + buildingNo are now @NotBlank on CreateSalonRequest (Phase 10.6
         // reversal); include a valid pair so this shared HTTP-boundary fixture clears
         // @Valid and returns 201 for every downstream integration test that relies on it.
@@ -89,8 +89,7 @@ class ServiceTestFixtures {
      * owner — avoiding an extra {@code /auth/login} round-trip (and its per-IP bucket cost).
      */
     UUID insertSalonWithOwner(String name) {
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
         UUID ownerUserId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "

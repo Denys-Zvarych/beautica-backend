@@ -554,8 +554,7 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = createSalon(ownerId, "Locality Salon " + System.nanoTime());
         String ownerToken = loginAndGetToken(ownerEmail);
 
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
 
         // UpdateSalonRequest field order: name, description, city, region, address,
         // cityId, districtId, street, buildingNo, locationNote, phone, instagramUrl.

@@ -102,7 +102,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — must return 3 masters", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -145,7 +145,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "вул. Хрещатик", "1A", "green door", masterId);
 
         Page<MasterSearchResult> results = searchService.searchMasters(
-                new MasterSearchRequest(new LocationFilter(cityIdByName("Київ"), null),
+                new MasterSearchRequest(new LocationFilter(majorCityIdByName("Київ"), null),
                         null, null, null, null, null, null, null, null, null),
                 PageRequest.of(0, 20));
 
@@ -226,7 +226,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ&size=3 — must return 3 in content, totalElements=7", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=3", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=3", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -248,7 +248,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // service falls back to a first-page probe. Without that probe this reports 0
         // and the client is told "no results" for a query matching 7 providers.
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=9&size=3",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=9&size=3",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -269,7 +269,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // Static (unfiltered) salon path — same single-query pagination trade as the
         // master path above, same first-page probe fallback.
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=9&size=2",
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=9&size=2",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -286,7 +286,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithCity("Київ", "4.00");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Одеса") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Одеса") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -301,7 +301,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Одеса — must return 0 masters", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -343,7 +343,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — inactive master must NOT appear", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -363,7 +363,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — master with inactive user must NOT appear", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -590,7 +590,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — no category/price filter, JOIN should be elided", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -635,7 +635,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ&size=2 — flat count branch — totalElements must equal 5", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=2", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=2", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -682,7 +682,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — expect cache to be populated after the call", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -707,7 +707,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // service returns an empty content list but the underlying query still
         // runs.
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -747,7 +747,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {} with full filter set — must return only m1", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&category=MANICURE&minPrice=100.00&maxPrice=300.00&minRating=4.0"
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&category=MANICURE&minPrice=100.00&maxPrice=300.00&minRating=4.0"
                         + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -769,7 +769,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         seedMasterWithCity("Київ", "4.00");
 
-        String url = MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20";
+        String url = MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20";
 
         // First call: cache miss → populates entry
         ResponseEntity<String> first = restTemplate.exchange(url, HttpMethod.GET, anonymous(), String.class);
@@ -801,9 +801,9 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithCity("Київ", "4.00");
         seedMasterWithCity("Львів", "4.00");
 
-        restTemplate.exchange(MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+        restTemplate.exchange(MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
-        restTemplate.exchange(MASTERS_URL + "?location.cityId=" + cityIdByName("Львів") + "&page=0&size=20",
+        restTemplate.exchange(MASTERS_URL + "?location.cityId=" + majorCityIdByName("Львів") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(countNativeEntries(cache))
@@ -818,7 +818,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ — JOIN must be elided, master visible with null price", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -837,7 +837,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?city=Київ&category=MANICURE — JOIN active, master without services must drop", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&category=MANICURE&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&category=MANICURE&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -857,7 +857,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Львів", "Region-B");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -872,7 +872,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Одеса") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -890,7 +890,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -909,7 +909,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=5&size=1", HttpMethod.GET,
                 anonymous(), String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 
@@ -928,7 +928,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?location.cityId=Київ — SALON_ADMIN must be absent from data AND from totalElements", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20", HttpMethod.GET,
                 anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -964,7 +964,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?location.cityId=Київ&location.districtId=A — district wins, only district-A master", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&location.districtId=" + districtA + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -988,7 +988,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {}?location.cityId=Київ (no districtId) — read side widens to whole city", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1007,7 +1007,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedSalonInDistrict("Київ", districtB, "Salon District B");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ")
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&location.districtId=" + districtA + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -1040,7 +1040,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
         log.debug("Act: GET {} by district — SALON_MASTER must be excluded (salon-page only), INDEPENDENT_MASTER returned", MASTERS_URL);
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&location.districtId=" + district + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -1067,7 +1067,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID masterId = seedIndependentMasterInDistrict("Київ", district, "4.10");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&location.districtId=" + district + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -1088,7 +1088,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedIndependentMasterInDistrict("Київ", district, "4.80");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&location.districtId=" + district + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -1113,7 +1113,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Львів", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Львів") + "&page=0&size=20",
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Львів") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
@@ -1135,7 +1135,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 new BigDecimal("250.00"), true, true);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1360,7 +1360,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         linkMasterToOwnedDef(masterC, defC, null, true);
 
         // No slug / q / category / price filter — the unfiltered city projection.
-        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
 
         assertThat(salonIds(data))
                 .as("both Kyiv salons are listed on the unfiltered city search (salon A is still an active "
@@ -1435,7 +1435,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * assertions are unambiguous.
      */
     private JsonNode singleSalonRow(String city, String category) throws Exception {
-        String url = SALONS_URL + "?location.cityId=" + cityIdByName(city)
+        String url = SALONS_URL + "?location.cityId=" + majorCityIdByName(city)
                 + (category == null ? "" : "&category=" + category)
                 + "&page=0&size=20";
         ResponseEntity<String> response = restTemplate.exchange(
@@ -1579,7 +1579,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedServiceForMaster(master, "Педикюр SPA", "PEDICURE", new BigDecimal("350.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1597,7 +1597,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedIndependentMaster("Київ", "4.50", "Solo", "Master");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode row = objectMapper.readTree(response.getBody()).path("data").path("data").get(0);
@@ -1621,7 +1621,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // Search the EYELASH category in the seed's city — the WHERE EXISTS keeps the
         // master in (it has an EYELASH service), and the names preview must be scoped.
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ")
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&category=EYELASH&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -1654,7 +1654,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedServiceForMaster(master, "Макіяж №1", "MAKEUP", new BigDecimal("700.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1697,7 +1697,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("300.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1719,7 +1719,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 new BigDecimal("200.00"), new BigDecimal("650.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1745,7 +1745,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -1787,7 +1787,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 new BigDecimal("300.00"), null, true, true);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ")
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ")
                         + "&minPrice=250&maxPrice=400&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
@@ -1805,7 +1805,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);   // no master / no services → NULL band
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&minPrice=100&page=0&size=20",
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&minPrice=100&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
@@ -1922,7 +1922,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedIndependentMaster("Львів", "4.90", "Lviv", "Master");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode data = objectMapper.readTree(response.getBody()).path("data");
@@ -2030,7 +2030,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedServiceForMaster(master, "Манікюр класичний", "MANICURE", new BigDecimal("210.00")); // duplicate name
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -2065,7 +2065,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithService("Київ", "4.00", new BigDecimal("300.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
@@ -2085,7 +2085,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithReviewCount("Київ", "4.00", 17);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=REVIEWS_DESC&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&sort=REVIEWS_DESC&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
@@ -2105,7 +2105,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedMasterWithCity("Київ", "4.20");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
@@ -2127,7 +2127,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&sort=PRICE_ASC&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
@@ -2149,7 +2149,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         UUID dear = seedSalonWithFixedService("Київ", new BigDecimal("500.00"));
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&sort=PRICE_DESC&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         JsonNode rows = objectMapper.readTree(response.getBody()).path("data").path("data");
@@ -2179,7 +2179,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedNamedIndependentMaster("Київ", "4.50", "Olena", "Kovalenko");
 
         ResponseEntity<String> response = restTemplate.exchange(
-                MASTERS_URL + "?location.cityId=" + cityIdByName("Київ") + "&q=zz&page=0&size=20",
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&q=zz&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode())
@@ -2202,7 +2202,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedActiveSalon("Київ", null);
 
         ResponseEntity<String> response = restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + cityIdByName("Київ") + "&q=zz&page=0&size=20",
+                SALONS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&q=zz&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -2381,7 +2381,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // should_populateMatchedServiceNames_when_masterQMatchesServiceName), so this
         // request must omit BOTH filters — it is not the "no serviceTypeSlugs" case
         // alone, and the assertion below deliberately does not claim to be.
-        JsonNode unfiltered = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        JsonNode unfiltered = masterSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
         assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
                 .as("matchedServiceNames is empty when NO explaining filter is active — neither a "
                         + "serviceTypeSlugs filter nor a free-text q")
@@ -2486,7 +2486,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 .isEqualByComparingTo(new BigDecimal("4000.00"));
 
         // ── no filter → whole-catalogue band 500 / 4000 (preserved) ──────────
-        JsonNode allRow = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20")
+        JsonNode allRow = masterSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20")
                 .path("data").get(0);
         assertThat(new BigDecimal(allRow.path("minEffectivePrice").asText()))
                 .as("unfiltered floor = catalogue MIN(500, 800) = 500 (whole-catalogue behaviour preserved)")
@@ -2740,7 +2740,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // Scope note: a free-text `q` ALSO populates this field on the salon side (see
         // should_populateSalonMatchedServiceNames_when_qMatchesServiceName), so this
         // request must omit BOTH the slug filter and `q`.
-        JsonNode unfiltered = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        JsonNode unfiltered = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
         assertThat(unfiltered.path("data").get(0).path("matchedServiceNames").size())
                 .as("matchedServiceNames is empty when NO explaining filter is active — neither a "
                         + "serviceTypeSlugs filter nor a free-text q")
@@ -2818,7 +2818,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedTypedSalonServiceForMaster(masterB, salonB, "Манікюр класичний", "MANICURE",
                 new BigDecimal("250.00"), null, true, true);
 
-        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ")
                 + "&category=HAIRCUT&page=0&size=20");
 
         assertThat(data.path("totalElements").asLong())
@@ -2849,7 +2849,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         seedTypedSalonServiceForMaster(masterB, salonB, "Манікюр класичний", "MANICURE",
                 new BigDecimal("250.00"), null, true, true);
 
-        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
 
         assertThat(data.path("totalElements").asLong())
                 .as("with no category the EXISTS gate is short-circuited by `:category IS NULL` — both salons returned (the null-gate no-op)")
@@ -2872,7 +2872,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         // phantom HAIRCUT page populated by the MANICURE salon.
         UUID manicureOnly = seedSalonOfferingCategory("Київ", "MANICURE", "Манікюр класичний");
 
-        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ")
                 + "&category=HAIRCUT&page=0&size=2");
 
         assertThat(data.path("totalElements").asLong())
@@ -2931,7 +2931,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "FIXED", new BigDecimal("700.00"), null, null, true);
         linkMasterToOwnedDef(masterB, hairDefB, null, true);
 
-        JsonNode data = salonSearch("?location.cityId=" + cityIdByName("Київ")
+        JsonNode data = salonSearch("?location.cityId=" + majorCityIdByName("Київ")
                 + "&category=NAIL_SERVICE&page=0&size=20");
 
         // (1) The bookable NAIL_SERVICE def surfaces — totalElements must NOT be 0.
@@ -3337,7 +3337,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
                 "FIXED", new BigDecimal("900.00"), null, null, true);
         linkMasterToOwnedDef(masterId, salonDefId, null, true);
 
-        JsonNode data = masterSearch("?location.cityId=" + cityIdByName("Київ") + "&page=0&size=20");
+        JsonNode data = masterSearch("?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20");
         JsonNode row = data.path("data").get(0);
 
         java.util.List<String> names = new java.util.ArrayList<>();
@@ -3767,7 +3767,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters — two pages under each sort mode are DISJOINT and globally ordered (inner Top-N and outer ORDER BY agree)")
     void should_returnDisjointOrderedPages_when_pagingUnderEachSortMode() throws Exception {
-        UUID cityId = cityIdByName("Київ");
+        UUID cityId = majorCityIdByName("Київ");
 
         // Five masters, each with a DISTINCT avg_rating, review_count and price, so
         // every sort mode has a total order with no ties to mask a paging defect.
@@ -3807,7 +3807,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /search/masters?sort=PRICE_DESC — an unpriced master sorts LAST (explicit NULLS LAST), not first")
     void should_sortUnpricedMasterLast_when_priceDescOrdering() throws Exception {
-        UUID cityId = cityIdByName("Київ");
+        UUID cityId = majorCityIdByName("Київ");
 
         UUID priced = seedMaster("Київ", "4.50");
         seedServiceWithCategory(priced, priced, "HAIRCUT", new BigDecimal("300.00"), true, true);
@@ -4373,7 +4373,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      */
     private UUID seedNamedIndependentMaster(String city, String avgRating,
                                             String firstName, String lastName) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID userId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4457,7 +4457,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
     /** Seeds a SALON_OWNER + an active salon with an explicit name in the given city. */
     private UUID seedNamedSalon(String city, String name) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4539,7 +4539,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * exclusion that still let SALON_MASTER leak in).
      */
     private UUID seedSalonAdminMaster(String city, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4578,7 +4578,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      */
     private UUID seedSalonMasterWithSalonDistrictAndUserDistrict(
             String city, UUID salonDistrictId, UUID userDistrictId, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4615,7 +4615,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * to the user row.
      */
     private UUID seedIndependentMasterInDistrict(String city, UUID districtId, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID userId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4634,7 +4634,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
 
     /** Seeds a SALON_OWNER + an active salon stamped with a district FK. */
     private UUID seedSalonInDistrict(String city, UUID districtId, String name) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4714,7 +4714,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * covered by their own dedicated tests below.
      */
     private UUID seedMaster(String city, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "search-master-" + UUID.randomUUID() + "@beautica.test";
@@ -4740,7 +4740,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * resolves through the salon link at query time.
      */
     private UUID seedEmployedSalonMaster(String city, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -4859,7 +4859,7 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * joins {@code salons}; no master or user rows are required.
      */
     private UUID seedActiveSalon(String city, String region) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID ownerId = UUID.randomUUID();
         String ownerEmail = "salon-owner-" + UUID.randomUUID() + "@beautica.test";
@@ -4884,12 +4884,6 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
      * drive the Phase 10.5 FK location filter ({@code ?location.cityId=})
      * and to stamp {@code salons.city_id} / wire the SALON_MASTER salon link.
      */
-    private UUID cityIdByName(String nameUk) {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = ? ORDER BY katotth_code LIMIT 1",
-                UUID.class, nameUk);
-    }
-
     /**
      * Seeds a service definition + master_services row, then refreshes
      * {@code masters.min_effective_price} so that PERF-M2 price-filter tests

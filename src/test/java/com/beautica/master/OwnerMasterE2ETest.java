@@ -123,8 +123,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         // ── Step 2: create salon ──────────────────────────────────────────────
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
-        UUID vinnytsiaCityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID vinnytsiaCityId = majorCityIdByName("Вінниця");
         // street + buildingNo are now @NotBlank on CreateSalonRequest (Phase 10.6 reversal);
         // supply a valid pair so the POST clears the @Valid boundary and returns 201.
         var createSalonReq = new CreateSalonRequest("E2E Owner Studio", null, "Kyiv", null, null, null, null,
