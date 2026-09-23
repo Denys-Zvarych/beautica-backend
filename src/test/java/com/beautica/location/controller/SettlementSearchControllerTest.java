@@ -26,6 +26,8 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.util.List;
 import java.util.UUID;
 
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -83,7 +85,14 @@ class SettlementSearchControllerTest {
     private JwtTokenProvider jwtTokenProvider;
 
     private static SettlementSearchResponse lviv(UUID id) {
-        return new SettlementSearchResponse(id, "Львів", SettlementType.CITY, "Львівська");
+        // hromadaNameUk is null: «Львів, Львівська» is unambiguous, which is the 76 % case.
+        return new SettlementSearchResponse(id, "Львів", SettlementType.CITY, "Львівська", null);
+    }
+
+    /** The 24 % case — «Миколаївка, Харківська» is 15 rows, so the label needs its hromada. */
+    private static SettlementSearchResponse mykolaivka(UUID id) {
+        return new SettlementSearchResponse(
+                id, "Миколаївка", SettlementType.VILLAGE, "Харківська", "Лозівська");
     }
 
     @Test
@@ -100,7 +109,27 @@ class SettlementSearchControllerTest {
                 .andExpect(jsonPath("$.data[0].settlementId").value(id.toString()))
                 .andExpect(jsonPath("$.data[0].nameUk").value("Львів"))
                 .andExpect(jsonPath("$.data[0].settlementType").value("CITY"))
-                .andExpect(jsonPath("$.data[0].oblastNameUk").value("Львівська"));
+                .andExpect(jsonPath("$.data[0].oblastNameUk").value("Львівська"))
+                // PRESENT and explicitly null, not omitted: the client branches on this field to
+                // choose the 2- or 3-part label (phase-327 D3). Switching the application to a
+                // NON_NULL inclusion policy would drop the key on 76 % of rows, and a client that
+                // read a missing key as "not yet loaded" rather than "no hromada" would break —
+                // so the key's PRESENCE is asserted separately from its value.
+                .andExpect(jsonPath("$.data[0]").value(hasKey("hromadaNameUk")))
+                .andExpect(jsonPath("$.data[0].hromadaNameUk").value(nullValue()));
+    }
+
+    @Test
+    @DisplayName("GET /settlements — an ambiguous row carries its hromada (phase-327 D3)")
+    void should_returnHromada_when_theRowsNameAndOblastCollide() throws Exception {
+        UUID id = UUID.randomUUID();
+        when(settlementSearchService.search("микола")).thenReturn(List.of(mykolaivka(id)));
+
+        mockMvc.perform(get(URL).param("query", "микола").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].nameUk").value("Миколаївка"))
+                .andExpect(jsonPath("$.data[0].oblastNameUk").value("Харківська"))
+                .andExpect(jsonPath("$.data[0].hromadaNameUk").value("Лозівська"));
     }
 
     @Test

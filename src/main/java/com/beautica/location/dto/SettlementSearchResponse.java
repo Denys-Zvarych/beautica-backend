@@ -33,18 +33,36 @@ import java.util.UUID;
  * {@code oblastId} and {@code katotthCode}; this record is not modelled on it, and widening this
  * one to match would be a regression, not consistency.)
  *
+ * <p><b>{@code hromadaNameUk} is the SECOND disambiguator, and its nullability IS the contract</b>
+ * (phase-327 D3). The oblast label alone resolves only 76.25 % of the 25 697 imported rows: 2 234
+ * name+oblast groups covering 6 103 rows collide, worst «Миколаївка, Харківська» ×15. Adding the
+ * hromada takes the residue to 111 groups / 226 rows (0.88 %). The raion does not — it leaves
+ * 9.72 % broken for the same cost, and hromada is a subset of raion (D1).
+ *
+ * <p>The field is populated ONLY for rows whose name+oblast pair is ambiguous, so the client
+ * composes «‹назва›, ‹область›» on null and «‹назва›, ‹громада›, ‹область›» on non-null, and holds
+ * no ambiguity logic of its own. Like {@code oblastNameUk} it carries the BARE adjective
+ * («Шишацька»); the server does not append «громада» and does not concatenate the label, because
+ * the grammatical form depends on where the label is shown.
+ *
+ * <p>226 rows stay ambiguous even with the hromada and that is accepted (phase-327 D6): KATOTTH
+ * exposes no level below the settlement, so there is nothing further to add.
+ *
  * @param settlementId   surrogate PK — the value the client stores and submits
  * @param nameUk         canonical Ukrainian settlement name
  * @param settlementType what kind of populated place this is (місто / селище / село), so the
  *                       picker can render a secondary marker and the user can tell «Львів» the
  *                       city from «Львів» the village
  * @param oblastNameUk   Ukrainian name of the parent oblast, as stored
+ * @param hromadaNameUk  bare hromada adjective, or {@code null} when the oblast already
+ *                       disambiguates this row — which it does for 76 % of them
  */
 public record SettlementSearchResponse(
         UUID settlementId,
         String nameUk,
         SettlementType settlementType,
-        String oblastNameUk
+        String oblastNameUk,
+        String hromadaNameUk
 ) {
 
     /**
@@ -63,6 +81,7 @@ public record SettlementSearchResponse(
                 row.getSettlementId(),
                 row.getNameUk(),
                 SettlementType.valueOf(row.getSettlementType()),
-                row.getOblastNameUk());
+                row.getOblastNameUk(),
+                row.getHromadaNameUk());
     }
 }

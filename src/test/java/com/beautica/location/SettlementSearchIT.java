@@ -21,7 +21,9 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -289,6 +291,106 @@ class SettlementSearchIT extends AbstractIntegrationTest {
                 assertThat(row.path("oblastNameUk").asText()).isNotBlank();
                 assertThat(row.path("nameUk").asText()).isEqualTo("Іванівка");
             });
+        }
+    }
+
+    // ── Acceptance: the hromada tier (phase-327) ──────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("hromada disambiguation (phase-327 D2/D3)")
+    class HromadaDisambiguation {
+
+        /** {@code null} for a JSON null OR an absent key; the label is 2-part either way. */
+        private String hromadaOf(JsonNode row) {
+            JsonNode value = row.path("hromadaNameUk");
+            return value.isMissingNode() || value.isNull() ? null : value.asText();
+        }
+
+        @Test
+        @DisplayName("the three «Львів» rows carry NO hromada — each is unique in its own oblast")
+        void should_omitTheHromada_when_theOblastAlreadyIdentifiesTheRow() throws Exception {
+            JsonNode data = getData("льв");
+
+            List<String> lvivHromadas = new ArrayList<>();
+            data.forEach(row -> {
+                if ("Львів".equals(row.path("nameUk").asText())) {
+                    lvivHromadas.add(hromadaOf(row));
+                }
+            });
+
+            assertThat(lvivHromadas)
+                    .as("«Львів» is three rows in THREE oblasts, so «Львів, Львівська» already "
+                            + "identifies each one. All three DO have a hromada stored "
+                            + "(Львівська / Новопільська / Мигіївська) — the CASE WHEN "
+                            + "ambiguous_in_oblast in the projection is what withholds it, and "
+                            + "this is the assertion that proves the projection is doing it.")
+                    .hasSize(3)
+                    .containsOnlyNulls();
+        }
+
+        @Test
+        @DisplayName("«іванівка» — rows sharing a name AND an oblast are told apart by hromada")
+        void should_carryDistinctHromadas_when_nameAndOblastCollide() throws Exception {
+            JsonNode data = getData("іванівка");
+
+            assertThat(data).isNotEmpty();
+            Map<String, List<String>> byOblast = new LinkedHashMap<>();
+            data.forEach(row -> {
+                if ("Іванівка".equals(row.path("nameUk").asText())) {
+                    byOblast.computeIfAbsent(row.path("oblastNameUk").asText(),
+                            key -> new ArrayList<>()).add(hromadaOf(row));
+                }
+            });
+
+            assertThat(byOblast)
+                    .as("«Іванівка» is 99 rows across 20 oblasts — 97 of them collide within their "
+                            + "own oblast, which is the case that made the oblast label alone "
+                            + "insufficient. This response is the top %d of them.", MAX_RESULTS)
+                    .isNotEmpty();
+
+            // The ledger. Everything below is inside `if (hromadas.size() > 1)`, so if a ranking
+            // change ever handed back at most one Іванівка per oblast the loop body would never
+            // run and this test would pass having asserted nothing about the hromada at all —
+            // which is the exact shape of the Phase 326 defect this suite exists because of (an
+            // empty result is equally consistent with "correct" and with "measured nothing").
+            long collidingOblasts = byOblast.values().stream().filter(rows -> rows.size() > 1)
+                    .count();
+            assertThat(collidingOblasts)
+                    .as("no oblast in this response holds more than one «Іванівка», so the "
+                            + "same-name-same-oblast case — the only one a hromada can fix — is "
+                            + "not in the sample and the assertions below measure nothing")
+                    .isGreaterThanOrEqualTo(1L);
+
+            byOblast.forEach((oblast, hromadas) -> {
+                if (hromadas.size() > 1) {
+                    assertThat(hromadas)
+                            .as("«Іванівка, %s» is %d rows — without a hromada a human cannot "
+                                    + "choose between them, and a wrong choice publishes a wrong "
+                                    + "work address", oblast, hromadas.size())
+                            .doesNotContainNull();
+                }
+            });
+        }
+
+        @Test
+        @DisplayName("the pre-typing major list carries the hromada where a major city needs one")
+        void should_labelTheMajorList_when_aMajorCityCollidesWithinItsOblast() throws Exception {
+            JsonNode data = getData(null);
+
+            Map<String, String> byName = new LinkedHashMap<>();
+            data.forEach(row -> byName.put(row.path("nameUk").asText(), hromadaOf(row)));
+
+            assertThat(byName)
+                    .as("three of the 50 curated majors share their name with a village in the "
+                            + "SAME oblast, so the pre-typing list needs the third part too — the "
+                            + "projection is on BOTH queries, not only the search")
+                    .containsEntry("Кам’янське", "Кам’янська")
+                    .containsEntry("Вишневе", "Вишнева")
+                    .containsEntry("Лозова", "Лозівська");
+            assertThat(byName)
+                    .as("and Київ, which has no hromada parent at all, is in the same response "
+                            + "with a null — so «the field is always populated» cannot pass here")
+                    .containsEntry("Київ", null);
         }
     }
 

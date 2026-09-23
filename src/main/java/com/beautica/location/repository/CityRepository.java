@@ -128,7 +128,8 @@ public interface CityRepository extends JpaRepository<City, UUID> {
             SELECT c.id              AS "settlementId",
                    c.name_uk         AS "nameUk",
                    c.settlement_type AS "settlementType",
-                   o.name_uk         AS "oblastNameUk"
+                   o.name_uk         AS "oblastNameUk",
+                   CASE WHEN c.ambiguous_in_oblast THEN c.hromada_name_uk END AS "hromadaNameUk"
             FROM cities c
             JOIN oblasts o ON o.id = c.oblast_id
             WHERE c.name_uk ILIKE :prefixPattern
@@ -171,7 +172,8 @@ public interface CityRepository extends JpaRepository<City, UUID> {
             SELECT c.id              AS "settlementId",
                    c.name_uk         AS "nameUk",
                    c.settlement_type AS "settlementType",
-                   o.name_uk         AS "oblastNameUk"
+                   o.name_uk         AS "oblastNameUk",
+                   CASE WHEN c.ambiguous_in_oblast THEN c.hromada_name_uk END AS "hromadaNameUk"
             FROM cities c
             JOIN oblasts o ON o.id = c.oblast_id
             WHERE c.is_major
@@ -209,6 +211,19 @@ public interface CityRepository extends JpaRepository<City, UUID> {
          * 99 «Іванівка» rows exist across 20 oblasts, and «Львів» is also two villages.
          */
         String getOblastNameUk();
+
+        /**
+         * Bare hromada adjective, or {@code null} when the oblast label already identifies the row
+         * (phase-327 D2/D3).
+         *
+         * <p>The {@code CASE WHEN c.ambiguous_in_oblast THEN ... END} in both queries is what makes
+         * this nullable in the SQL sense rather than merely nullable in Java: the column is
+         * populated for 25 695 of 25 698 rows, and projecting it unconditionally would grow the
+         * label on the 76 % of rows «‹назва›, ‹область›» already identifies. The DECISION of
+         * whether a hromada is needed is a property of the data, taken once at import time; the
+         * client holds no ambiguity logic and simply renders the third part when it is non-null.
+         */
+        String getHromadaNameUk();
     }
 
     /**

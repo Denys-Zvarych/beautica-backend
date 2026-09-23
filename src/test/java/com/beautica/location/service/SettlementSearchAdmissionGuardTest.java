@@ -129,6 +129,10 @@ class SettlementSearchAdmissionGuardTest {
             @Override public String getOblastNameUk() {
                 return "Львівська";
             }
+
+            @Override public String getHromadaNameUk() {
+                return null;
+            }
         };
     }
 

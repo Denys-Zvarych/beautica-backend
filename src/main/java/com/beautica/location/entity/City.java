@@ -129,6 +129,45 @@ public class City {
     private boolean major;
 
     /**
+     * Bare hromada adjective from this settlement's KATOTTH {@code level_3} parent — «Шишацька»,
+     * never «Шишацька селищна територіальна громада» (phase-327 D4). It matches the oblast
+     * convention, where the server stores «Полтавська» and the CLIENT appends the noun, because
+     * the grammatical form depends on where the label is shown.
+     *
+     * <p><b>Nullable, and the null is real</b> (phase-327 D5): Kyiv is KATOTTH category K — an
+     * oblast-equivalent, not a level-4 settlement — and the two exclusion-zone cities Прип'ять and
+     * Чорнобиль hang straight off Київська oblast with no category-H parent. A {@code NOT NULL}
+     * column would have to be filled with a falsehood for those three.
+     *
+     * <p>What holds instead is {@code chk_cities_hromada_disambiguates} (V174): a row the oblast
+     * label cannot disambiguate MUST carry a hromada. All three hromada-less rows have a unique
+     * name within their oblast, so the constraint costs the data nothing.
+     *
+     * <p>Written only by {@code V175__backfill_settlement_hromadas}, like every other column here.
+     */
+    @Column(name = "hromada_name_uk", length = 255)
+    @Size(max = 255)
+    private String hromadaNameUk;
+
+    /**
+     * Whether another free settlement shares this row's {@code (nameUk, oblast)} pair, so
+     * «‹назва›, ‹область›» cannot identify it on its own (phase-327 D2).
+     *
+     * <p>Precomputed at IMPORT time by {@code scripts/locality/build_settlement_import.py}, not
+     * derived at read time: {@code cities} is Flyway-seed reference data with no runtime writer, so
+     * ambiguity is fixed the moment the CSV is written, and recomputing it per keystroke would pay
+     * a self-join on an unauthenticated endpoint to rediscover a constant. 6 103 of 25 698 rows
+     * carry it; the other 76 % render exactly as they did before Phase 327.
+     *
+     * <p>It is also the gate on {@link #hromadaNameUk}'s VISIBILITY —
+     * {@code CityRepository#searchByName} projects
+     * {@code CASE WHEN c.ambiguous_in_oblast THEN c.hromada_name_uk END}, so the stored hromada is
+     * complete but the label grows a third part only where it must.
+     */
+    @Column(name = "ambiguous_in_oblast", nullable = false)
+    private boolean ambiguousInOblast;
+
+    /**
      * Static factory for a plain city — {@link SettlementType#CITY}, not flagged major.
      *
      * <p>Kept at its original arity so the Phase 10.1 call sites keep compiling. Every row it can

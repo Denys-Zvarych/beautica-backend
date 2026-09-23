@@ -12,6 +12,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -23,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * green, and one of them was fed to an existing test verbatim
  * ({@code SettlementSearchIT.should_treatUnderscoreAsLiteral_when_queryContainsALikeWildcard})
  * which passed, because it asserted SEMANTICS — the result was empty — and an empty result is
- * equally consistent with "escaped correctly" and with "scanned 25 697 rows and matched nothing".
+ * equally consistent with "escaped correctly" and with "scanned all 25 698 rows and matched nothing".
  * Every control that was then added closed the one input in front of it:
  *
  * <ul>
@@ -50,7 +51,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h3>The budget</h3>
  * {@link #MAX_WORK_RATIO} x the worst BENIGN query measured in the same run, rather than an
  * absolute constant, so the bound tracks the data instead of rotting against it. Measured on the
- * 25 697-row table at the time of writing: worst benign «іванівка» 40 816 work units / 10.9 ms;
+ * 25 698-row table at the time of writing: worst benign «іванівка» 40 816 work units / 10.9 ms;
  * worst admitted adversarial 67 150 / 5.5 ms; and the two vectors the service now refuses, if they
  * WERE executed, 151 100 / 20.4 ms and 503 500 / 51.7 ms.
  *
@@ -74,7 +75,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * defaults to {@code 0} when the pattern does not match. A Seq Scan plan has no index recheck to
  * report, so it emits that line and {@code measure} returns ZERO work units: the single most
  * expensive plan this endpoint can produce scores as the cheapest possible one.
- * {@code "•".repeat(50)} — 25 697 {@code similarity()} evaluations, 119 ms, the vector the whole
+ * {@code "•".repeat(50)} — 25 698 {@code similarity()} evaluations, 119 ms, the vector the whole
  * phase exists to close — measures 0. So
  * {@link #should_boundTheCostOfEveryAdmittedTerm_when_fedTheAdversarialCorpus()} would PASS an
  * admitted term that scans the entire table, and
@@ -83,6 +84,61 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the other, the cheap-looking half of the budget test is precisely the expensive half of reality,
  * and deleting the Seq Scan test as a duplicate would remove the only assertion standing between
  * this endpoint and the plan it was written to prevent.
+ *
+ * <h3>The Seq Scan test walks the BENIGN controls too, and that is not symmetry for its own sake</h3>
+ * It walked {@link AdversarialSearchTerms#corpus()} alone until Phase 327, which encodes the
+ * assumption that the planner only ever abandons the index under ATTACK. V175 falsified it: its
+ * full-table UPDATE bloated {@code idx_cities_name_uk_trgm} from 1 152 kB to 5 496 kB, and the
+ * planner then stopped using it for «нов» — a three-character keystroke, an ORDINARY one, in no
+ * adversarial corpus and never going to be in one. The guard was green throughout. What this class
+ * measures is a property of the PLAN, and the plan does not care how the term was typed; a Seq Scan
+ * on normal traffic is the same 25 698 {@code similarity()} evaluations per request, reachable by
+ * anyone typing a city name. So the loop takes both lists, and a benign name in its failure output
+ * points at the index rather than at the admission predicate.
+ *
+ * <h3>The budget has a FLOOR, because a ratio to a control at a different length is a coincidence</h3>
+ * {@link Cost#work()} is rechecks x term length, and the two sides of the ratio sit at opposite ends
+ * of the length axis: the worst benign control «іванівка» is 8 characters, every worst-case
+ * adversarial term is 50 (the {@code @Size} ceiling). The derived budget therefore only clears the
+ * adversarial terms because «іванівка» happens to carry ~3.8x their recheck count, and that is a
+ * property of the DATA, not of the design. Simulated against the measured table: thinning the
+ * {@code -івка} morphology by half drops the worst benign to 21 136 work units, the derived budget
+ * to 42 272, while the worst ADMITTED term stays near 50 000 — the guard reddens with no defect
+ * present. The exclusion set behind {@code settlement_hromadas.csv} is regenerated from Order 376
+ * every few weeks and thinning that morphology is exactly what such a refresh does; a guard that
+ * reddens for a non-defect is a guard somebody disables.
+ *
+ * <p>{@link #MIN_WORK_BUDGET} is the floor: the bound still TRACKS the data upwards (a bigger table
+ * raises it) and stops tracking it downwards past the point where the measurement was taken. The
+ * floor cannot silently rot into permissiveness, because
+ * {@link #should_exceedTheBudget_when_aRefusedVectorIsMeasuredAnyway()} measures the refused vectors
+ * against the SAME budget: if the data ever thinned far enough that 81 632 stopped discriminating,
+ * that test goes red and says to re-derive the floor. Normalising both sides to
+ * {@code MAX_QUERY_LENGTH} instead was considered and rejected — it throws away the length factor
+ * that makes a 50-character {@code similarity()} evaluation genuinely more expensive than an
+ * 8-character one, and it drops «•к»x25 (3 023 rechecks) below a normalised budget of 10 204, which
+ * would turn the discrimination test red on a correct tree.
+ *
+ * <h3>The plan is a symptom; the index SIZE is the fact</h3>
+ * Both plan-based tests here were falsified on 2026-09-23 against the very regression this class is
+ * credited with catching. With V175's {@code restoreTrigramIndexHealth} removed — the unfixed tree —
+ * the GIN stayed bloated at 5 488 kB and EVERY benign and admitted term still planned as an
+ * IndexScan, with recheck counts byte-identical to the fixed tree, before AND after a
+ * {@code VACUUM ANALYZE}. The plan is a reading of the planner's cost model against current
+ * statistics, autovacuum timing and page cache; it reports this defect on some runs and not others,
+ * which is also why the original regression first surfaced as "1 of 5 runs".
+ * {@link #should_keepTheTrigramIndexCompact_when_theMigrationsHaveApplied()} asserts the artefact
+ * instead — 1 204 224 B with both rebuilds, 2 023 424 B with V175's alone, 5 619 712 B with
+ * neither — and {@code VACUUM} cannot shrink a GIN, only {@code REINDEX} can, so that reading is
+ * autovacuum-immune. The plan assertions stay: they cover the index being dropped, renamed or made
+ * unusable, which a size assertion cannot see.
+ *
+ * <p><b>The middle column is Phase 327's second finding.</b> V175's REINDEX runs inside V175's own
+ * transaction, so the 26 041 dead tuples its UPDATE just created are not removable yet and the
+ * rebuild inherits them. Ordinary traffic paid for that: «нов» read 706 buffers against 378 on the
+ * reclaimed tree, «іванівка» 896 against 504 — an index scan throughout, so neither plan test above
+ * could see it. {@code V176__vacuum_cities_after_hromada_backfill} is non-transactional and
+ * {@code VACUUM}s before rebuilding; the ceiling below is what holds it in place.
  *
  * <p>Read-only throughout: every statement is an {@code EXPLAIN} or a {@code SELECT} against the
  * Flyway-seeded taxonomy, which {@link AbstractIntegrationTest#cleanDb()} deliberately does not
@@ -107,6 +163,54 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
      * makes about {@code MAX_RESULTS}.
      */
     private static final double MIN_SIMILARITY = 0.3d;
+
+    /**
+     * The absolute floor under the derived budget, in work units: the budget measured on
+     * 2026-09-23 against the real V170/V171/V175 taxonomy on postgres:16-alpine — worst benign
+     * «іванівка» 5 102 rechecked x 8 characters = 40 816, x {@link #MAX_WORK_RATIO}. Below this the
+     * bound stops being a statement about what the endpoint can be made to cost and becomes a
+     * statement about how many {@code -івка} settlements survive the current exclusion refresh. See
+     * the class javadoc for the simulation that produced it and for why normalising the two sides
+     * to a common length was rejected instead.
+     *
+     * <p>If {@link #should_exceedTheBudget_when_aRefusedVectorIsMeasuredAnyway()} ever fails, THIS
+     * number is what to re-derive — not that test's expectations.
+     */
+    private static final long MIN_WORK_BUDGET = 81_632L;
+
+    /**
+     * The GIN index the settlement autocomplete is served from — V173 creates it, V175's full-table
+     * UPDATE bloats it, V175's {@code restoreTrigramIndexHealth} rebuilds it over its own
+     * unremovable dead tuples, and {@code V176__vacuum_cities_after_hromada_backfill} rebuilds it
+     * clean once those tuples are gone.
+     */
+    private static final String TRIGRAM_INDEX = "idx_cities_name_uk_trgm";
+
+    /**
+     * Ceiling on {@link #TRIGRAM_INDEX}'s on-disk size, in bytes. 1.5 MiB, placed between THREE
+     * measured states of the same tree on 2026-09-23, so it discriminates both migrations that own
+     * this index rather than only the first:
+     *
+     * <table>
+     *   <caption>measured {@code pg_relation_size(idx_cities_name_uk_trgm)}</caption>
+     *   <tr><td>V175 REINDEX + V176 VACUUM/REINDEX</td><td>1 204 224 B</td>
+     *       <td>1.31x of headroom below the ceiling</td></tr>
+     *   <tr><td>V175's REINDEX alone (V176 deleted)</td><td>2 023 424 B</td>
+     *       <td>1.29x above — the rebuild inherits V175's own 26 041 dead tuples</td></tr>
+     *   <tr><td>neither (V175's rebuild deleted too)</td><td>5 619 712 B</td>
+     *       <td>3.57x above</td></tr>
+     * </table>
+     *
+     * <p>It was 3 MiB, which cleared the middle row and therefore could not see V176 at all. Not a
+     * round number chosen for tidiness — a discriminator with a measurement on each side of it, and
+     * the ONLY assertion in the suite that fails if V176 is deleted or reordered before V175.
+     *
+     * <p>Autovacuum-immune by construction, which is why the size is asserted and the far more
+     * obvious {@code n_dead_tup} is not: {@code VACUUM} reclaims GIN entries into the index's own
+     * free space and cannot hand whole pages back to the filesystem, so this number never falls on
+     * its own. A dead-tuple count, by contrast, is whatever the daemon last left behind.
+     */
+    private static final long MAX_TRIGRAM_INDEX_BYTES = 3L * 512 * 1024;
 
     private static final Pattern RECHECKED =
             Pattern.compile("\"Rows Removed by Index Recheck\": (\\d+)");
@@ -185,6 +289,15 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
                 .orElseThrow();
     }
 
+    /**
+     * The bound every admitted term is held to: {@link #MAX_WORK_RATIO} x the worst benign query
+     * measured in the SAME run, floored at {@link #MIN_WORK_BUDGET} so a data refresh that thins
+     * the benign control cannot redden this class without a defect.
+     */
+    private long budget() {
+        return Math.max(worstBenignWork() * MAX_WORK_RATIO, MIN_WORK_BUDGET);
+    }
+
     // ── The harness must be able to see cost at all ───────────────────────────────────────────
 
     @Test
@@ -192,8 +305,16 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
     void should_reportRecheckedRows_when_measuringTheWorstBenignQuery() {
         // Without this, an EXPLAIN whose JSON shape changed (or a regex that stopped matching)
         // would report zero for EVERYTHING and every budget assertion in this class would pass
-        // while measuring nothing at all. «іванівка» is the 99-row duplicate-name cluster and is
-        // the worst benign term by a wide margin — 5 102 rechecked rows, 10.9 ms.
+        // while measuring nothing at all. «іванівка» is the worst benign term by a wide margin —
+        // 5 102 rechecked rows, 10.9 ms.
+        //
+        // NOT because of the 99-row Іванівка duplicate-name cluster, which an earlier revision of
+        // this comment claimed: `Rows Removed by Index Recheck` counts the candidates that FAILED
+        // the similarity() recheck, and the 99 that match are precisely the ones NOT counted.
+        // Deleting every Іванівк% row leaves the figure at exactly 5 102. The cost is the `-івка`
+        // trigram neighbourhood — 5 460 settlements on this table end in it — and the wrong story
+        // is what made the budget look robust: a cluster is a stable landmark, a morphology is
+        // thinned by every exclusion refresh. See MIN_WORK_BUDGET.
         Cost benign = measure("іванівка");
 
         assertThat(benign.recheckedRows())
@@ -210,7 +331,7 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("every term the service ADMITS stays within 2x the worst legitimate query")
     void should_boundTheCostOfEveryAdmittedTerm_when_fedTheAdversarialCorpus() {
-        long budget = worstBenignWork() * MAX_WORK_RATIO;
+        long budget = budget();
 
         List<String> admitted = AdversarialSearchTerms.corpus().stream()
                 .filter(term -> !SettlementSearchService.isNotIndexServable(term))
@@ -233,7 +354,7 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
                         + "worst benign of %d; the worst admitted term here is %s at %d. This is "
                         + "the same family as «ка »x17 (503 500) and «•к»x25 (151 100), and the "
                         + "fix belongs in the admission predicate, not in this budget",
-                        budget, budget / MAX_WORK_RATIO,
+                        budget, worstBenignWork(),
                         costs.isEmpty() ? "-" : costs.get(0).term(),
                         costs.isEmpty() ? 0 : costs.get(0).work())
                 .isEmpty();
@@ -249,17 +370,118 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
         // and would sail through the assertion above. This is the only test that sees it, as well
         // as the one that catches the index being dropped, renamed or made unusable by a migration
         // rather than an input walking past the guard. Do not fold the two together.
-        List<String> scanned = AdversarialSearchTerms.corpus().stream()
+        //
+        // BENIGN CONTROLS ARE IN THIS LOOP, and that is the Phase 327 correction. This test walked
+        // corpus() alone, which encodes the assumption that the planner only ever gives up under
+        // ATTACK. V175's full-table UPDATE falsified it: the bloated index made «нов» — three
+        // characters, an ordinary keystroke, in no adversarial corpus — plan as a Seq Scan, and
+        // this guard saw nothing, because «нов» is not an attack. The failure mode this class is
+        // named for does not care how the term was typed, so neither does the loop: a planner that
+        // abandons the index for NORMAL traffic is the same 25 698 similarity() evaluations per
+        // request, reachable by anyone typing a city name rather than by someone crafting one.
+        List<String> admitted = Stream.concat(
+                        AdversarialSearchTerms.corpus().stream(),
+                        AdversarialSearchTerms.benignControls().stream())
                 .filter(term -> !SettlementSearchService.isNotIndexServable(term))
+                .distinct()
+                .toList();
+
+        assertThat(admitted)
+                .as("the ledger that keeps this loop honest — if the admission predicate ever "
+                        + "refused everything, or a generator change emptied the corpus, this test "
+                        + "would measure nothing and pass")
+                .hasSizeGreaterThan(10)
+                .containsAll(AdversarialSearchTerms.benignControls());
+
+        List<String> scanned = admitted.stream()
                 .map(this::measure)
                 .filter(Cost::sequentialScan)
                 .map(Cost::term)
                 .toList();
 
         assertThat(scanned)
-                .as("an admitted term planned as a Seq Scan means 25 697 similarity() evaluations "
-                        + "per request on a permitAll endpoint with a 240/60 s per-IP budget")
+                .as("a term planned as a Seq Scan means 25 698 similarity() evaluations per "
+                        + "request on a permitAll endpoint with a 240/60 s per-IP budget. If the "
+                        + "names here are BENIGN the cause is not an input at all — it is the "
+                        + "index, and the first suspect is a migration that rewrote `cities` "
+                        + "without rebuilding idx_cities_name_uk_trgm (see V175's "
+                        + "restoreTrigramIndexHealth)")
                 .isEmpty();
+    }
+
+    // ── The artefact V175 must leave behind ───────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("V175 left the trigram index rebuilt — the artefact, not the plan that follows it")
+    void should_keepTheTrigramIndexCompact_when_theMigrationsHaveApplied() {
+        // THE discriminator for the Phase 327 regression, and the reason the two plan tests above
+        // are no longer the only thing between this endpoint and a full-table sweep.
+        //
+        // Falsified 2026-09-23 by deleting `restoreTrigramIndexHealth(connection)` from V175 and
+        // re-running the whole chain: every benign control and all 92 admitted adversarial terms
+        // still planned as an IndexScan with recheck counts identical to the fixed tree, before AND
+        // after `VACUUM ANALYZE` — both plan tests GREEN over a live regression. The index measured
+        // 5 619 712 B against 2 023 424 B rebuilt, and only this assertion went red.
+        //
+        // The ceiling was then TIGHTENED from 3 MiB to 1.5 MiB, because 3 MiB could not see the
+        // second half of the defect: V175's in-transaction rebuild inherits its own 26 041 dead
+        // tuples and lands at 2 023 424 B, comfortably under the old ceiling, costing ordinary
+        // autocomplete terms ~+95 % buffer reads until autovacuum fires. Deleting V176 now reddens
+        // this assertion and nothing else in the suite — measured, not assumed.
+        //
+        // It is autovacuum-immune by construction: VACUUM reclaims GIN entries into the index's own
+        // free space and cannot hand whole pages back to the filesystem, so pg_relation_size does
+        // not fall no matter when autovacuum last ran. Only REINDEX moves this number down, which
+        // is exactly the statement V175 must have issued.
+        Long indexBytes = jdbcTemplate.queryForObject(
+                "SELECT pg_relation_size(?::regclass)", Long.class, TRIGRAM_INDEX);
+
+        assertThat(indexBytes)
+                .as("%s is missing or empty — pg_relation_size returned %s. The settlement "
+                        + "autocomplete then has no index at all, which is worse than the bloat "
+                        + "this test exists to catch", TRIGRAM_INDEX, indexBytes)
+                .isNotNull()
+                .isGreaterThan(0L);
+        assertThat(indexBytes)
+                .as("%s is %d B, over the %d B ceiling. A full-table UPDATE on `cities` bloated it "
+                        + "and nothing rebuilt it: the planner prices a GIN this size out of "
+                        + "ORDINARY queries on a permitAll endpoint with a 240/60 s per-IP budget, "
+                        + "which is the Phase 326 denial-of-service vector re-opened by a data "
+                        + "migration. VACUUM cannot fix it — the migration that rewrote the table "
+                        + "owes a REINDEX INDEX %s, the way V175's restoreTrigramIndexHealth does. "
+                        + "Do NOT relax this number to make a migration green",
+                        TRIGRAM_INDEX, indexBytes, MAX_TRIGRAM_INDEX_BYTES, TRIGRAM_INDEX)
+                .isLessThan(MAX_TRIGRAM_INDEX_BYTES);
+    }
+
+    @Test
+    @DisplayName("the floor alone clears every admitted term — a thinned corpus cannot redden this")
+    void should_clearEveryAdmittedTerm_when_onlyTheFloorIsApplied() {
+        // The reason MIN_WORK_BUDGET exists, asserted rather than asserted-about-in-a-comment.
+        // budget() is max(2 x worst benign, MIN_WORK_BUDGET); this pins the SECOND term on its own,
+        // which is the value the class falls back to when a data refresh thins the benign control.
+        // If it did not clear the worst admitted term, the floor would be decorative and this class
+        // would still go red the first time the -івка morphology shrinks — with no defect present,
+        // which is how a guard gets disabled.
+        //
+        // The other side of the floor is should_exceedTheBudget_when_aRefusedVectorIsMeasuredAnyway:
+        // together they say MIN_WORK_BUDGET sits strictly between the worst ADMITTED term and the
+        // cheapest REFUSED one. Both are measurements of this table, so a real data change moves
+        // them and one of the two says so.
+        long worstAdmitted = AdversarialSearchTerms.corpus().stream()
+                .filter(term -> !SettlementSearchService.isNotIndexServable(term))
+                .map(this::measure)
+                .mapToLong(Cost::work)
+                .max()
+                .orElseThrow();
+
+        assertThat(worstAdmitted)
+                .as("the worst term the service ADMITS costs %d work units against a floor of %d. "
+                        + "Either an input class got cheaper to admit — in which case re-derive the "
+                        + "floor downwards — or the corpus found something new, in which case the "
+                        + "fix belongs in SettlementSearchService's admission predicate",
+                        worstAdmitted, MIN_WORK_BUDGET)
+                .isLessThan(MIN_WORK_BUDGET);
     }
 
     // ── The budget has to discriminate, or the guard above is decorative ──────────────────────
@@ -276,7 +498,7 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
         // which pins a PostgreSQL property and cannot fail by design. Every number here is a
         // measurement of THIS table through THIS index, so a data or index change moves it and this
         // test says so.
-        long budget = worstBenignWork() * MAX_WORK_RATIO;
+        long budget = budget();
 
         Cost paddedBigrams = measure("ка ".repeat(16) + "ка");
         Cost interleaved = measure("•к".repeat(25));

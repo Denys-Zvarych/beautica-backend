@@ -58,6 +58,17 @@ class SettlementSearchServiceTest {
     }
 
     private static SettlementSearchRow row(String nameUk, String type, String oblast) {
+        return row(nameUk, type, oblast, null);
+    }
+
+    /**
+     * @param hromada the projected hromada — {@code null} for a row the oblast already
+     *                disambiguates, which the repository expresses as
+     *                {@code CASE WHEN c.ambiguous_in_oblast THEN c.hromada_name_uk END}
+     *                (phase-327 D2/D3), so a null here is the SQL's null and not a stub gap
+     */
+    private static SettlementSearchRow row(String nameUk, String type, String oblast,
+                                           String hromada) {
         UUID id = UUID.randomUUID();
         return new SettlementSearchRow() {
             @Override public UUID getSettlementId() {
@@ -74,6 +85,10 @@ class SettlementSearchServiceTest {
 
             @Override public String getOblastNameUk() {
                 return oblast;
+            }
+
+            @Override public String getHromadaNameUk() {
+                return hromada;
             }
         };
     }
@@ -336,6 +351,28 @@ class SettlementSearchServiceTest {
             assertThat(result).allSatisfy(r ->
                     assertThat(r.settlementId()).as("the client stores the id, never the name")
                             .isNotNull());
+        }
+
+        @Test
+        @DisplayName("carries the projected hromada through, and a null through as a null (D3)")
+        void should_carryHromadaAndItsAbsence_when_rowsDifferInAmbiguity() {
+            // Two rows of the SAME name in the SAME oblast — the shape the hromada exists for —
+            // beside one the oblast already identifies. The repository decides which is which via
+            // CASE WHEN c.ambiguous_in_oblast, so the service must pass BOTH outcomes through
+            // untouched: a mapper that defaulted the null to "" or dropped the field would make
+            // the client render «Тернове, , Полтавська» or lose the disambiguation entirely.
+            when(cityRepository.searchByName(anyString(), anyString(), anyDouble(), anyInt()))
+                    .thenReturn(List.of(
+                            row("Іванівка", "VILLAGE", "Дніпропетровська", "Петриківська"),
+                            row("Іванівка", "VILLAGE", "Дніпропетровська", "Чумаківська"),
+                            row("Іванівка", "SETTLEMENT", "Сумська", null)));
+
+            List<SettlementSearchResponse> result = service.search("Іванівка");
+
+            assertThat(result).extracting(SettlementSearchResponse::hromadaNameUk)
+                    .as("nullability IS the contract — the client composes the 2-part label on "
+                            + "null and the 3-part on non-null, and holds no ambiguity logic")
+                    .containsExactly("Петриківська", "Чумаківська", null);
         }
     }
 }

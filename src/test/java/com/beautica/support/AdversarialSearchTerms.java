@@ -14,19 +14,19 @@ import java.util.List;
  *
  * <ol>
  *   <li>{@code "•".repeat(50)} — no alphanumeric, so pg_trgm extracts an EMPTY key set, no GIN
- *       index can be used, and both tiers degrade into a sequential scan of 25 697 rows
+ *       index can be used, and both tiers degrade into a sequential scan of all 25 698 rows
  *       (119 ms against 3.4 ms for «нов»). An existing test fed exactly this input and passed:
  *       it asserted only that the result was empty, which is equally true of "escaped correctly"
  *       and of "scanned the whole table and matched nothing".</li>
  *   <li>{@code "ка ".repeat(17)} — 50 characters, so it clears {@code @Size}; longer than the
  *       3-character floor, so it clears that; and alphanumeric-bearing, so it cleared the guard
  *       added for (1). Every TOKEN is two characters, so the whole term yields three distinct
- *       padded trigram keys, a 0.3 threshold needs one of three to match, and 10 237 candidate
- *       rows each pay a {@code similarity()} recheck — 51.7 ms, 14.8x the documented worst
- *       case.</li>
+ *       padded trigram keys, a 0.3 threshold needs one of three to match, and 10 071 candidate
+ *       rows each pay a {@code similarity()} recheck — 51.7 ms, 12.3x the worst benign term's
+ *       rechecks. (Re-measured 2026-09-23; this read 10 237 when first written.)</li>
  *   <li>{@code "•к".repeat(25)} — found by THIS corpus, not by a person. One 50-character token,
  *       so a per-token floor admits it; alphanumeric throughout, so the guard added for (2) admits
- *       it; and every alphanumeric run is a single letter, so it yields two distinct keys, 3 022
+ *       it; and every alphanumeric run is a single letter, so it yields two distinct keys, 3 023
  *       rechecks and 21.7 ms. It is why the admission predicate is now the length of the longest
  *       alphanumeric RUN — the one property padding cannot inflate.</li>
  * </ol>
@@ -147,7 +147,17 @@ public final class AdversarialSearchTerms {
      * <p>Without them an over-tight budget and a broken measurement look identical: both make the
      * adversarial loop pass for the wrong reason. «нов» is the documented worst benign 3-character
      * keystroke (1 065 candidate rows), «іван фран» is the two-token acceptance case, and
-     * «іванівка» hits the 99-row duplicate-name cluster.
+     * «іванівка» is the worst benign term on the table at 5 102 rechecked rows.
+     *
+     * <p><b>«іванівка» is NOT expensive because of the 99-row Іванівка duplicate-name cluster</b>,
+     * which this javadoc claimed until 2026-09-23. {@code Rows Removed by Index Recheck} counts the
+     * candidates the {@code similarity()} recheck REJECTED, so the 99 rows that match are the ones
+     * it does not count; deleting every {@code Іванівк%} row leaves the figure at exactly 5 102.
+     * The cost is the {@code -івка} trigram neighbourhood — 5 460 settlements end in it. That
+     * distinction is load-bearing rather than pedantic: a named cluster reads as a stable landmark,
+     * while a morphology is thinned by every regeneration of the exclusion set, and
+     * {@code SettlementSearchCostGuardIT}'s budget is a multiple of THIS number. See
+     * {@code SettlementSearchCostGuardIT.MIN_WORK_BUDGET} for the floor that now absorbs it.
      */
     public static List<String> benignControls() {
         return List.of("нов", "льв", "іванівка", "іван фран", "кам'янка", "терноп");
