@@ -57,6 +57,160 @@ public interface CityRepository extends JpaRepository<City, UUID> {
     List<City> findByOblastIdAndSettlementTypeOrderByNameUkAsc(UUID oblastId,
                                                                SettlementType settlementType);
 
+
+    /**
+     * Ranked settlement autocomplete behind the {@code permitAll}
+     * {@code GET /api/v1/settlements?query=...} (Phase 326) — the surface that replaces the
+     * oblast -> city cascade for address entry.
+     *
+     * <p><b>Three tiers, and why trigram similarity alone is the wrong ranking.</b>
+     * {@code similarity('льв', 'Львів')} is only 0.43 because the length ratio dominates, so a
+     * 3-character prefix — by far the most common input from an autocomplete — ranks the intended
+     * answer below longer accidental matches. The ranking is therefore:
+     *
+     * <ol>
+     *   <li><b>Prefix</b> — {@code name_uk ILIKE :prefixPattern}. A settlement whose name STARTS
+     *       with what the user typed always outranks one that merely resembles it.</li>
+     *   <li><b>{@code is_major}</b> — 50 curated rows (23 serviceable oblast centres + the 27
+     *       next-largest cities, see {@code City#isMajor}).</li>
+     *   <li><b>Trigram similarity</b> — the typo/abbreviation fallback.</li>
+     * </ol>
+     *
+     * <p><b>{@code is_major} sits ABOVE similarity, not below it — this deviates from the phase
+     * doc's prose and satisfies its ACCEPTANCE.</b> phase-326 lists {@code is_major} as tier 3
+     * "so Львів beats Львівське", which raw similarity already achieves (0.43 vs 0.27). But the
+     * same doc requires «іван фран» to return Івано-Франківськ, and with similarity ranked first
+     * it does not: measured on the real 25 698-row table, {@code similarity('іван фран',
+     * 'Івано-Франкове') = 0.500} beats {@code similarity('іван фран', 'Івано-Франківськ') = 0.444},
+     * so the Львівська village won. Ordering by {@code is_major} first puts the oblast centre back
+     * on top.
+     *
+     * <p>That promotion is SAFE because the prefix tier dominates it: a major city can only
+     * outrank a settlement that is in the SAME tier. A user typing the exact name of a village
+     * («тернове») puts that village in tier 1 and every non-prefix city in tier 2, so the village
+     * wins no matter how major the city is — verified against «тернове», «львівка», «київс».
+     * Within one tier, "the big place you have heard of, first" is the behaviour an address picker
+     * wants.
+     *
+     * <p><b>Why {@code similarity(...) >= :minSimilarity} is present even though {@code %} already
+     * applies a threshold.</b> The {@code %} operator compares against the SESSION GUC
+     * {@code pg_trgm.similarity_threshold} (PostgreSQL default 0.3), which is the only indexable
+     * form — {@code similarity() >= const} alone cannot drive a GIN scan and would seq-scan
+     * 25 698 rows on every keystroke. Binding the floor explicitly makes the result set
+     * deterministic if that GUC is ever lowered somewhere; a RAISED GUC would still narrow recall
+     * silently, which is why {@code SettlementSearchIT} asserts the effective threshold rather
+     * than trusting it.
+     *
+     * <p><b>Index (V173):</b> {@code idx_cities_name_uk_trgm}, GIN {@code gin_trgm_ops} on
+     * {@code name_uk}. ONE index serves both predicates — the planner satisfies the {@code OR}
+     * with a {@code BitmapOr} over two Bitmap Index Scans of it. Measured on the fully populated
+     * table: 28.4 ms / 385 buffers sequential before, 0.27 ms / 46 buffers after for «льв»;
+     * 4.47 ms for the worst measured 3-character query («нов», 1 065 candidates). The plan holds
+     * under {@code force_generic_plan}, i.e. after pgJDBC promotes the statement to a server-side
+     * prepare.
+     *
+     * <p><b>No occupation predicate</b> (phase-325 D3 / phase-326 D4): there is no
+     * {@code occupation_status} column and no occupied row in this table — Phase 324's exclusion
+     * set is applied to the import SOURCE. This finder must not grow one.
+     *
+     * <p>Bounded by {@code LIMIT :maxResults} (§E-3), never by the caller's paging.
+     *
+     * @param prefixPattern  the LIKE pattern for tier 1 — the caller's term, apostrophe-folded and
+     *                       with {@code LIKE} metacharacters escaped, plus a trailing {@code %}.
+     *                       Never the raw user string.
+     * @param query          the caller's term for the trigram tiers, apostrophe-folded but NOT
+     *                       {@code LIKE}-escaped (pg_trgm treats punctuation as a word separator)
+     * @param minSimilarity  explicit trigram floor, mirroring the {@code %} operator's threshold
+     * @param maxResults     hard result cap (phase-326 D8: 20)
+     * @return ranked rows, at most {@code maxResults} of them
+     */
+    @Query(value = """
+            SELECT c.id              AS "settlementId",
+                   c.name_uk         AS "nameUk",
+                   c.settlement_type AS "settlementType",
+                   o.name_uk         AS "oblastNameUk"
+            FROM cities c
+            JOIN oblasts o ON o.id = c.oblast_id
+            WHERE c.name_uk ILIKE :prefixPattern
+               OR (c.name_uk % :query AND similarity(c.name_uk, :query) >= :minSimilarity)
+            ORDER BY (CASE WHEN c.name_uk ILIKE :prefixPattern THEN 0 ELSE 1 END),
+                     c.is_major DESC,
+                     similarity(c.name_uk, :query) DESC,
+                     length(c.name_uk),
+                     c.name_uk,
+                     o.name_uk,
+                     c.id
+            LIMIT :maxResults
+            """, nativeQuery = true)
+    List<SettlementSearchRow> searchByName(@Param("prefixPattern") String prefixPattern,
+                                           @Param("query") String query,
+                                           @Param("minSimilarity") double minSimilarity,
+                                           @Param("maxResults") int maxResults);
+
+    /**
+     * The "biggest places" list the settlement autocomplete shows BEFORE the user types
+     * (phase-326 D3) — the {@code is_major} settlements, ordered by Ukrainian name.
+     *
+     * <p><b>Unbounded return, deliberately (§E-3).</b> {@code is_major} is not a runtime flag: it
+     * is curated by hand in {@code scripts/locality/build_settlement_import.py} and pinned at
+     * EXACTLY 50 rows by {@code V171__import_free_settlements.EXPECTED_MAJOR}, which ABORTS the
+     * migration if the count drifts. The cardinality is a migration invariant, not an estimate, so
+     * a {@code Pageable} would page a list that cannot grow. The same reasoning the CITY-tier
+     * cascade finder records applies: a hard cap on an alphabetical picker hides its tail from the
+     * user rather than paging it.
+     *
+     * <p>Backed by {@code idx_cities_major_name_uk} (V170) — {@code (name_uk) WHERE is_major}, 50
+     * entries. Measured on the fully populated table: Bitmap Index Scan on that index, 0.31 ms.
+     *
+     * <p>Shares {@link SettlementSearchRow} with {@link #searchByName} so both halves of the
+     * endpoint map through one projection and one DTO factory.
+     *
+     * @return the 50 curated major settlements with their oblast labels, ordered by {@code name_uk}
+     */
+    @Query(value = """
+            SELECT c.id              AS "settlementId",
+                   c.name_uk         AS "nameUk",
+                   c.settlement_type AS "settlementType",
+                   o.name_uk         AS "oblastNameUk"
+            FROM cities c
+            JOIN oblasts o ON o.id = c.oblast_id
+            WHERE c.is_major
+            ORDER BY c.name_uk, o.name_uk, c.id
+            """, nativeQuery = true)
+    List<SettlementSearchRow> findMajorSettlements();
+
+    /**
+     * Typed Spring Data interface projection for the two settlement-autocomplete queries.
+     *
+     * <p>Column aliases are DOUBLE-QUOTED in the native SQL so PostgreSQL preserves their camel
+     * case: an unquoted {@code AS settlementId} is folded to {@code settlementid} and the
+     * projection binds nothing. This is also why a raw {@code Object[]} is not used — the repo has
+     * already been bitten once by Hibernate collapsing an {@code Object[]} row shape
+     * (see {@link TaxonomyFactsRow}).
+     *
+     * <p>{@code settlementType} is exposed as {@code String}, not as
+     * {@link com.beautica.location.entity.SettlementType}: the column is a {@code VARCHAR(20)}
+     * guarded by {@code chk_cities_settlement_type} and a native-query projection has no enum
+     * converter, so the service does the {@code valueOf} once, at the DTO boundary.
+     */
+    interface SettlementSearchRow {
+
+        /** Surrogate PK of the settlement — what the client stores (phase-326 D6). */
+        UUID getSettlementId();
+
+        /** Canonical Ukrainian settlement name. */
+        String getNameUk();
+
+        /** {@code cities.settlement_type} as stored; mapped to the enum by the service. */
+        String getSettlementType();
+
+        /**
+         * Ukrainian name of the parent oblast — the disambiguating label (phase-326 D5).
+         * 99 «Іванівка» rows exist across 20 oblasts, and «Львів» is also two villages.
+         */
+        String getOblastNameUk();
+    }
+
     /**
      * Looks up a city by its stable KATOTTH code.
      * Used by Phase 10.2 seed validation and Phase 10.3 FK resolution.

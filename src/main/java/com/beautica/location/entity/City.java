@@ -55,6 +55,16 @@ import java.util.UUID;
                 // 25 698-entry index and mislead the next reader, so it is documented
                 // rather than mirrored.
                 //
+                // And idx_cities_name_uk_trgm (V173) is a GIN index with the
+                // gin_trgm_ops opclass — `USING gin (name_uk gin_trgm_ops)`. @Index can
+                // express neither the access method nor the opclass, so mirroring it here
+                // would declare a plain B-tree on name_uk: a DIFFERENT index that
+                // ddl-auto=validate would then be satisfied by, masking the loss of the one
+                // the settlement autocomplete depends on. Documented instead, and asserted
+                // against pg_indexes by V173SettlementTrigramIndexMigrationTest — which is
+                // also where the plan shape is pinned. SettlementSearchIT owns the
+                // behaviour, not the index definition.
+                //
                 // Same for idx_cities_oblast_city_name (V172):
                 // `ON cities (oblast_id, name_uk) WHERE settlement_type = 'CITY'`.
                 // It backs CityRepository#findByOblastIdAndSettlementTypeOrderByNameUkAsc

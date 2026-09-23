@@ -162,6 +162,10 @@ public class CacheConfig {
      *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
      *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
      *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
+     *   settlementMajors       — the 50 curated is_major settlements shown before the user
+     *                            types in the Phase 326 autocomplete — 24 h TTL, max 2 entries
+     *                            (the method takes no arguments: ONE entry in practice);
+     *                            per-query results are NOT cached, by design
      *   cityOblastId            — shared cityId -> oblastId resolver
      *                             (SalonService/MasterService/UserService) — 24 h TTL,
      *                             max 2000 entries; negatives not cached; no eviction path
@@ -537,6 +541,27 @@ public class CacheConfig {
         manager.registerCustomCache("locationDistrictsByCity",
                 Caffeine.newBuilder()
                         .maximumSize(200)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
+                        .build());
+        // Phase 326 — the settlement autocomplete's PRE-TYPING list only: the 50 curated
+        // is_major settlements (SettlementSearchService#listMajorSettlements). Same static
+        // reference data and the same 24h-TTL / no-@CacheEvict contract as the three
+        // location* caches above — the rows are written by Flyway alone (V53/V170/V171), so
+        // the only invalidation is a redeploy, which is also the only time they can change.
+        //
+        // maximumSize(2), not 50: this cache holds ONE entry — the whole 50-row list under
+        // @Cacheable's SimpleKey.EMPTY, because the method takes no arguments. 2 leaves room
+        // for the key to gain a dimension later without silently thrashing at 1.
+        //
+        // THE PER-QUERY RESULTS ARE DELIBERATELY NOT CACHED and must not be added here. The
+        // key space is every prefix a caller can type against a permitAll endpoint, so a
+        // bounded Caffeine cache would be evicted out of usefulness by ordinary typing and
+        // could be packed with junk keys by an anonymous caller (§A, Caffeine slot
+        // exhaustion). The query is GIN-index-served in single-digit milliseconds (V173) and
+        // the endpoint is IP-throttled, which is the control that fits that shape.
+        manager.registerCustomCache("settlementMajors",
+                Caffeine.newBuilder()
+                        .maximumSize(2)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
         // Phase 240 perf MEDIUM — shared cityId -> oblastId resolver
