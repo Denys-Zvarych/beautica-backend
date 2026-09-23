@@ -40,7 +40,22 @@ public record MasterDetailResponse(
         // Null when the master has no location set or on the public endpoint.
         UUID cityId,
         UUID oblastId,
-        UUID districtId
+        UUID districtId,
+        /**
+         * Count of the master's CONFIRMED/COMPLETED bookings in the current Kyiv calendar month —
+         * the «Записів місяця» tile on the master hub (Qase defect #25).
+         *
+         * <p><b>Self-read only.</b> {@code null} on every path but {@code GET /masters/me}:
+         * {@link #from} never populates it and {@link #fromPublic} nulls it explicitly, so the
+         * {@code permitAll()} {@code GET /masters/{masterId}} cannot publish a master's trading
+         * volume to anonymous callers. Attach it with {@link #withBookingsThisMonth} at the point
+         * of use, never inside a factory that both paths share.
+         *
+         * <p>Deliberately NOT part of the {@code master-detail-by-user} cache entry: the profile
+         * is stable and the count changes with every booking, so it is resolved per request
+         * against a cached, booking-free DTO.
+         */
+        Integer bookingsThisMonth
 ) {
     /**
      * Builds a fully-populated response including locality cascade IDs.
@@ -81,7 +96,11 @@ public record MasterDetailResponse(
                 hours.stream().map(WorkingHoursResponse::from).toList(),
                 master.getUser().getCityId(),
                 oblastId,
-                master.getUser().getDistrictId()
+                master.getUser().getDistrictId(),
+                // bookingsThisMonth — never populated here. Three call sites share this factory
+                // and all three are @Cacheable; a count baked in would be served stale. See the
+                // component's own doc and `withBookingsThisMonth`.
+                null
         );
     }
 
@@ -122,7 +141,28 @@ public record MasterDetailResponse(
                 full.masterType(), full.salon(), full.workingHours(),
                 isIndependent ? full.cityId() : null,
                 isIndependent ? full.oblastId() : null,
-                isIndependent ? full.districtId() : null
+                isIndependent ? full.districtId() : null,
+                // bookingsThisMonth — ALWAYS null here, for every master type. This endpoint is
+                // `permitAll()`; a master's monthly trading volume is not public. Unlike the
+                // address fields above there is no disclosure case to gate on, so this is a
+                // constant, not a predicate.
+                null
         );
+    }
+
+    /**
+     * Returns a copy carrying {@code bookingsThisMonth} — the only supported way to populate it.
+     *
+     * <p>A wither rather than a {@link #from} parameter on purpose: {@code from} is shared by the
+     * public path and by three cached call sites, and a count threaded through it would be cached
+     * with the profile and served stale, or leaked by whichever caller forgot to pass null. Here
+     * the field can only be set by a caller that has already decided it is entitled to it.
+     */
+    public MasterDetailResponse withBookingsThisMonth(Integer bookingsThisMonth) {
+        return new MasterDetailResponse(
+                masterId, firstName, lastName, phoneNumber, city, street, buildingNo,
+                locationNote, bio, instagram, professionalTitle, avatarUrl, avgRating,
+                reviewCount, masterType, salon, workingHours, cityId, oblastId, districtId,
+                bookingsThisMonth);
     }
 }

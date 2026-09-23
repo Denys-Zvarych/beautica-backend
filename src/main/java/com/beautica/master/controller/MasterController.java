@@ -110,8 +110,16 @@ public class MasterController {
     @PreAuthorize("hasAnyRole('SALON_MASTER', 'INDEPENDENT_MASTER', 'SALON_OWNER')")
     public ApiResponse<MasterDetailResponse> getMyProfile(Authentication authentication) {
         UUID userId = AuthenticationUtils.userId(authentication);
-        return ApiResponse.ok(masterService.findMyMasterDetail(userId)
-                .orElseThrow(() -> new NotFoundException("Master not found")));
+        MasterDetailResponse profile = masterService.findMyMasterDetail(userId)
+                .orElseThrow(() -> new NotFoundException("Master not found"));
+        // Qase defect #25 — «Записів місяця» on the master hub. Attached HERE, outside the
+        // `master-detail-by-user` cache `findMyMasterDetail` sits behind, because the profile is
+        // stable and the count is not: baked into the cached entry it would survive every booking
+        // the master takes and contradict their own calendar. This is also the only endpoint that
+        // may carry it — the sibling `GET /masters/{masterId}` is `permitAll()`, and
+        // `MasterDetailResponse.fromPublic` nulls the field for exactly that reason.
+        return ApiResponse.ok(profile.withBookingsThisMonth(
+                masterService.countBookingsInCurrentKyivMonth(profile.masterId())));
     }
 
     /**

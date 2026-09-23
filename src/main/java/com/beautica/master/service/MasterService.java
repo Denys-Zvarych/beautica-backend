@@ -1367,6 +1367,30 @@ public class MasterService {
                 });
     }
 
+    /**
+     * Counts the master's active bookings in the CURRENT Kyiv calendar month — the «Записів
+     * місяця» tile on the master hub (Qase defect #25, case 36).
+     *
+     * <p><b>Deliberately not {@code @Cacheable}.</b> Its sibling {@link #findMyMasterDetail} is,
+     * and rightly so — a name and a bio do not change between requests. A booking count does, on
+     * every create and every cancellation, so caching it beside the profile is how the tile would
+     * go stale and start contradicting the calendar. The controller composes the two.
+     *
+     * <p>The month window is resolved against {@link TimeZones#KYIV}, never {@code CURRENT_DATE}:
+     * the DB resolves that against the JDBC session zone, so on a UTC connection the boundary
+     * lands at 03:00 Kyiv on the 1st and bookings drift between months. The bounds are half-open,
+     * so a booking at exactly Kyiv midnight on the 1st counts once, in the month that starts then.
+     */
+    @Transactional(readOnly = true)
+    public int countBookingsInCurrentKyivMonth(UUID masterId) {
+        LocalDate firstOfMonth = LocalDate.now(clock.withZone(TimeZones.KYIV)).withDayOfMonth(1);
+        OffsetDateTime from = firstOfMonth.atStartOfDay(TimeZones.KYIV).toOffsetDateTime();
+        OffsetDateTime to = firstOfMonth.plusMonths(1).atStartOfDay(TimeZones.KYIV)
+                .toOffsetDateTime();
+        return Math.toIntExact(
+                bookingRepository.countActiveByMasterIdAndStartsAtBetween(masterId, from, to));
+    }
+
     @Cacheable(value = "master-by-user", key = "#userId", sync = true)
     @Transactional(readOnly = true)
     public Master getMasterByUserId(UUID userId) {

@@ -1555,6 +1555,36 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("masterServiceId") UUID masterServiceId,
             @Param("now") OffsetDateTime now);
 
+    /**
+     * Counts a master's ACTIVE bookings inside a half-open instant range — the «Записів місяця»
+     * counter on the master hub (Qase defect #25).
+     *
+     * <p><b>The status set is not a choice.</b> It is copied from {@link
+     * #findActiveIdsByMasterIdAndStartsAtBetween}, the query that backs the provider «Графік»
+     * the counter is compared against (Qase case 36 step 3: "\u0427\u0438\u0441\u043b\u043e \u0437\u0431\u0456\u0433\u0430\u0454\u0442\u044c\u0441\u044f \u0437 \u0444\u0430\u043a\u0442\u0438\u0447\u043d\u043e\u044e
+     * \u043a\u0456\u043b\u044c\u043a\u0456\u0441\u0442\u044e \u0437\u0430\u043f\u0438\u0441\u0456\u0432 \u043c\u0456\u0441\u044f\u0446\u044f"). A cancelled or no-show booking is absent from that
+     * list, so counting it here would make the tile disagree with the screen it summarises —
+     * which is the whole assertion the manual case makes. Change one and you must change both.
+     *
+     * <p>The range is half-open ({@code >= from}, {@code < to}) for the same reason as the
+     * calendar query: a booking at exactly midnight on the 1st belongs to the month starting
+     * then, and to exactly one month. The caller resolves both bounds against {@link
+     * com.beautica.common.TimeZones#KYIV} — never {@code CURRENT_DATE}, which resolves the JDBC
+     * session zone and silently drifts a month boundary by the UTC offset.
+     */
+    @Query("""
+            SELECT COUNT(b) FROM Booking b
+            WHERE b.master.id = :masterId
+            AND b.startsAt >= :from
+            AND b.startsAt < :to
+            AND b.status IN (com.beautica.booking.enums.BookingStatus.CONFIRMED,
+                             com.beautica.booking.enums.BookingStatus.COMPLETED)
+            """)
+    long countActiveByMasterIdAndStartsAtBetween(
+            @Param("masterId") UUID masterId,
+            @Param("from") OffsetDateTime from,
+            @Param("to") OffsetDateTime to);
+
     // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
 
     /**

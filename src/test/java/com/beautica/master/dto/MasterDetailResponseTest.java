@@ -54,7 +54,9 @@ class MasterDetailResponseTest {
                 "вул. Хрещатик", "1A", "green door",
                 "Nail artist", "@oksana.nails", PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
                 new BigDecimal("4.75"), 12, masterType, salon, List.of(),
-                cityUuid, oblastUuid, districtUuid);
+                cityUuid, oblastUuid, districtUuid,
+                // bookingsThisMonth — self-read only (Qase defect #25)
+                null);
     }
 
     @Test
@@ -323,7 +325,9 @@ class MasterDetailResponseTest {
                 UUID.randomUUID(), "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door", "Nail artist", "@oksana.nails",
                 PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
-                null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null);
+                null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null,
+                // bookingsThisMonth — self-read only (Qase defect #25)
+                null);
 
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 
