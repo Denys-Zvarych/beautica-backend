@@ -208,6 +208,32 @@ class SettlementSearchGetRateLimitRegressionTest {
                         + "2-token charge would halve the observed allowance");
     }
 
+    @Test
+    @DisplayName("should_return429_when_theSameCacheableQueryIsRepeatedFromAFreshIp")
+    void should_return429_when_theSameCacheableQueryIsRepeatedFromAFreshIp() throws Exception {
+        // Phase 329 put a result cache behind this endpoint, so a repeat of «льв» costs the
+        // database nothing. The bucket must still charge it: the filter runs BEFORE the controller
+        // (and therefore before the cache), so a cache hit is indistinguishable from a miss here.
+        // Moving the throttle after the controller, or exempting cache hits, reddens this.
+        AuthRateLimitFilter filter = realFilter();
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", SETTLEMENTS_PATH);
+        request.setRemoteAddr("10.0.0.78");
+        request.setParameter("query", "льв");
+
+        int allowed = countAllowedBefore429(filter, request);
+        MockHttpServletResponse overCap = new MockHttpServletResponse();
+        MockFilterChain overCapChain = new MockFilterChain();
+        filter.doFilterInternal(request, overCap, overCapChain);
+
+        assertAtFirstContactGrant(allowed,
+                "the 61st identical query from a fresh IP must be 429 — a cacheable repeat spends "
+                        + "a token exactly like a miss");
+        assertThat(overCap.getStatus()).isEqualTo(429);
+        assertThat(overCapChain.getRequest())
+                .as("the throttled repeat must never reach the controller, and so never the cache")
+                .isNull();
+    }
+
     // ── bucket isolation ──────────────────────────────────────────────────────────────────────
 
     @Test

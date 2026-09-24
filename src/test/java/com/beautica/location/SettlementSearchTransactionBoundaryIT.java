@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.SettlementSearchService;
 import org.junit.jupiter.api.BeforeEach;
+import org.springframework.cache.CacheManager;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -81,9 +82,14 @@ class SettlementSearchTransactionBoundaryIT extends AbstractIntegrationTest {
     @Autowired
     private TransactionProbe transactionProbe;
 
+    @Autowired
+    private CacheManager cacheManager;
+
     @BeforeEach
     void resetProbe() {
         transactionProbe.observed().set(null);
+        // Phase 329: a cached «льв» would never reach the repository, leaving the probe null.
+        cacheManager.getCache(SettlementSearchService.CACHE_SETTLEMENT_SEARCH).clear();
     }
 
     /** What the thread-local transaction context looked like when the repository was entered. */

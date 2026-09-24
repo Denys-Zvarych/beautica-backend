@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 /**
@@ -31,6 +32,7 @@ import java.util.regex.Pattern;
  *       "biggest cities first" list the user sees before typing, not an empty result.</li>
  *   <li><b>not servable by the index</b> -> an EXPLICIT empty list, with no query issued. Never
  *       the major list, and never an unfiltered scan. ONE predicate decides this,
+ *       {@link #isAdmissible(String)}, built on
  *       {@link NormalizedSearchQuery#hasIndexServableRun(String)}: the term must contain an
  *       uninterrupted alphanumeric RUN of {@link NormalizedSearchQuery#MIN_QUERY_LENGTH}
  *       characters. Three weaker spellings each admitted the input the next one had to catch —
@@ -68,14 +70,27 @@ import java.util.regex.Pattern;
  * ("400 or empty, never a scan") permits either. The user-facing hint is attached by the
  * controller, where the rest of the HTTP presentation lives.
  *
- * <p><b>Caching.</b> Only the pre-typing major list is cached — a single fixed key over Flyway-seed
- * data that cannot change at runtime, so it follows the same 24h-TTL / no-eviction contract the
- * {@code location*} caches document, with {@code sync = true} because it is the hottest key on an
- * unauthenticated endpoint (§F-7). The per-query results are deliberately NOT cached: the key
- * space is every prefix a user can type, so a bounded Caffeine cache would be churned out of
- * usefulness by ordinary typing and could be filled with junk keys by an anonymous caller (§A,
- * Caffeine slot exhaustion). The query is index-served in single-digit milliseconds and the
- * endpoint is IP-throttled, which is the correct control for that shape.
+ * <p><b>Caching.</b> Two caches, both over Flyway-seed data that cannot change at runtime
+ * ({@code CityRepository} has no write method), so both follow the 24h-TTL / no-eviction contract
+ * the {@code location*} caches document:
+ * <ul>
+ *   <li>{@value #CACHE_MAJOR_SETTLEMENTS} — the pre-typing major list, one fixed key, with
+ *       {@code sync = true} because it is the single hottest key of an unauthenticated endpoint
+ *       (§F-7).</li>
+ *   <li>{@value #CACHE_SETTLEMENT_SEARCH} — the per-query results (Phase 329), keyed by the
+ *       normalised, LOWER-CASED term. This supersedes phase 326's "per-query results are NOT
+ *       cached", whose only rationale was the unbounded key space on a {@code permitAll}
+ *       endpoint; the cache is bounded at 1024 entries in {@code CacheConfig}, so a caller
+ *       cycling unique terms can only evict, and each miss costs what every request cost
+ *       before. The cache sits strictly INSIDE the three DoS controls: the per-IP bucket runs
+ *       before the controller (hits are charged), the controller's 50-char cap and the
+ *       admission guard in {@link #search(String)} run before the cache (a refused term is never
+ *       a key), and the 20-row {@code LIMIT} bounds every value. Deliberately NOT
+ *       {@code sync = true}: Caffeine's sync load holds a {@code synchronized} bin lock for the
+ *       whole miss (connection checkout + query, seconds on a Neon cold start), which pins a
+ *       virtual thread's carrier, and this cache misses on every new prefix. A duplicate
+ *       concurrent miss on the same prefix costs one extra ~1 ms indexed query.</li>
+ * </ul>
  *
  * <p><b>No occupation predicate</b> (phase-325 D3 / phase-326 D4): there is no
  * {@code occupation_status} column and no occupied row in {@code cities} — Phase 324's exclusion
@@ -89,6 +104,19 @@ public class SettlementSearchService {
 
     /** Cache name for the pre-typing major-settlement list. Registered in {@code CacheConfig}. */
     static final String CACHE_MAJOR_SETTLEMENTS = "settlementMajors";
+
+    /**
+     * Cache name for the per-query results (Phase 329). Registered, bounded and metered in
+     * {@code CacheConfig}, which is in another package — hence public.
+     */
+    public static final String CACHE_SETTLEMENT_SEARCH = "settlementSearch";
+
+    /**
+     * Ceiling on the BOUND term, mirroring the controller's {@code @Size(max = 50)} on the raw
+     * parameter. Re-asserted after normalisation because lower-casing can lengthen a string
+     * (see {@link #isAdmissible(String)}).
+     */
+    static final int MAX_TERM_LENGTH = 50;
 
     /** Hard result cap for a typed query (phase-326 D8). Applied as a SQL {@code LIMIT}. */
     static final int MAX_RESULTS = 20;
@@ -136,7 +164,7 @@ public class SettlementSearchService {
     /**
      * Self-proxy reference so both delegations out of {@link #search(String)} reach the Spring AOP
      * proxy: {@link #listMajorSettlements()} for its {@code @Cacheable}, and
-     * {@link #runIndexedSearch(String)} for its {@code @Transactional}. A direct {@code this.}
+     * {@link #runIndexedSearch(String)} for its {@code @Cacheable} and {@code @Transactional}. A direct {@code this.}
      * call bypasses the proxy entirely (§F-3: self-invocation does not trigger AOP), so the cache
      * would be configured, registered, metered — and never read or written, and the read-only
      * transaction would silently not exist, with nothing failing to say so either way.
@@ -171,10 +199,27 @@ public class SettlementSearchService {
         if (term.isEmpty()) {
             return self.listMajorSettlements();
         }
-        if (!NormalizedSearchQuery.hasIndexServableRun(term)) {
+        if (!isAdmissible(term)) {
             return List.of();
         }
+        // ONE string is admitted, used as the cache key and bound into the query: normalize()
+        // has already lower-cased it, so the admission verdict cannot drift from what runs.
         return self.runIndexedSearch(term);
+    }
+
+    /**
+     * The single admission predicate, over the NORMALISED (lower-cased) term: an uninterrupted
+     * alphanumeric run of {@link NormalizedSearchQuery#MIN_QUERY_LENGTH}, and no longer than
+     * {@link #MAX_TERM_LENGTH}.
+     *
+     * <p>The length re-check exists because lower-casing is not length-preserving: {@code U+0130}
+     * «İ» lowers to {@code i} + {@code U+0307}, so a 50-character query that clears the
+     * controller's {@code @Size} can normalise to 100 characters. The cost guard's budgets are
+     * calibrated against 50-character bound terms, so the service re-asserts that ceiling on the
+     * string it actually binds.
+     */
+    private static boolean isAdmissible(String term) {
+        return term.length() <= MAX_TERM_LENGTH && NormalizedSearchQuery.hasIndexServableRun(term);
     }
 
     /**
@@ -186,10 +231,18 @@ public class SettlementSearchService {
      * padding-only term from reaching a sequential scan of 25 698 rows, and this method repeats none
      * of it.
      *
-     * @param term an already-normalised term that {@link NormalizedSearchQuery#hasIndexServableRun}
-     *             accepts
-     * @return at most {@link #MAX_RESULTS} ranked settlements
+     * <p>Cached per term (Phase 329): the cache key IS the argument, which is why
+     * {@link #search(String)} passes the normalised, lower-cased form — only admitted terms ever
+     * reach this method, so only admitted terms ever become keys. The caching advisor wraps the
+     * transaction advisor ({@code CacheConfig}'s {@code @EnableCaching(order = HIGHEST_PRECEDENCE)}),
+     * so a hit opens no transaction and takes no connection. No {@code sync = true} — see the
+     * class Javadoc: a per-prefix miss must not pin a virtual-thread carrier under a bin lock.
+     *
+     * @param term an already-normalised, lower-cased term that
+     *             {@link NormalizedSearchQuery#hasIndexServableRun} accepts
+     * @return at most {@link #MAX_RESULTS} ranked settlements (unmodifiable — safe to share)
      */
+    @Cacheable(value = CACHE_SETTLEMENT_SEARCH)
     @Transactional(readOnly = true)
     public List<SettlementSearchResponse> runIndexedSearch(String term) {
         return cityRepository
@@ -236,8 +289,8 @@ public class SettlementSearchService {
      * identity is the point. It was previously a length-only test, independent of the two gates
      * {@code search} actually applied, so "the endpoint returned nothing" and "the user was told
      * why" could drift apart — and did: a 50-character punctuation run returned a silent empty
-     * list with no hint. Both readers now ask
-     * {@link NormalizedSearchQuery#hasIndexServableRun(String)}.
+     * list with no hint. Both readers now ask {@link #isAdmissible(String)} — the index-servable
+     * run AND the {@link #MAX_TERM_LENGTH} ceiling — over the same normalised, lower-cased term.
      *
      * <p>A blank query is NOT unservable: it is the deliberate pre-typing state that returns the
      * major list (phase-326 D3), which is why the emptiness check comes first.
@@ -247,12 +300,18 @@ public class SettlementSearchService {
      */
     public static boolean isNotIndexServable(String rawQuery) {
         String term = normalize(rawQuery);
-        return !term.isEmpty() && !NormalizedSearchQuery.hasIndexServableRun(term);
+        return !term.isEmpty() && !isAdmissible(term);
     }
 
     /**
-     * Trims, collapses internal whitespace runs and folds apostrophes onto the form
-     * {@code cities.name_uk} stores.
+     * Trims, collapses internal whitespace runs, folds apostrophes onto the form
+     * {@code cities.name_uk} stores, and lower-cases ({@link Locale#ROOT}).
+     *
+     * <p>Lower-casing happens HERE, before admission, so the admission check, the
+     * {@code settlementSearch} cache key and the bound query parameter are one string (Phase 329
+     * audit: lowering after admission let «İ»x50 pass on a 3-alnum run that the lowered, bound
+     * string no longer contained). Result-neutral: {@code ILIKE} is case-insensitive and
+     * {@code pg_trgm} lower-cases before building trigrams.
      *
      * <p>Whitespace collapsing matters to the trigram tier and not only to tidiness: pg_trgm pads
      * word boundaries, so {@code 'іван  фран'} and {@code 'іван фран'} would otherwise produce
@@ -266,7 +325,7 @@ public class SettlementSearchService {
             return "";
         }
         String collapsed = WHITESPACE.matcher(rawQuery.trim()).replaceAll(" ");
-        return APOSTROPHES.matcher(collapsed).replaceAll(STORED_APOSTROPHE);
+        return APOSTROPHES.matcher(collapsed).replaceAll(STORED_APOSTROPHE).toLowerCase(Locale.ROOT);
     }
 
     /**

@@ -3,9 +3,14 @@ package com.beautica.location;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.location.service.SettlementSearchService;
 import com.beautica.support.AdversarialSearchTerms;
+import com.beautica.support.HibernateStatistics;
+import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.CacheManager;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -220,6 +225,30 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
 
     private static final Pattern APOSTROPHES = Pattern.compile("['ʼ‘´]");
 
+    /** Phase 329's per-query result cache on {@code SettlementSearchService#runIndexedSearch}. */
+    private static final String SETTLEMENT_SEARCH_CACHE = "settlementSearch";
+
+    @Autowired
+    private SettlementSearchService settlementSearchService;
+
+    @Autowired
+    private CacheManager cacheManager;
+
+    @Autowired
+    private EntityManagerFactory entityManagerFactory;
+
+    /**
+     * Phase 329 put a result cache in front of the ranked query, in a context shared with every
+     * other {@code AbstractIntegrationTest}. The EXPLAIN measurements below bypass the service and
+     * cannot be served from it, but anything here that goes THROUGH the service must measure a
+     * miss — a term an earlier test class cached would otherwise cost zero and clear any budget
+     * vacuously.
+     */
+    @BeforeEach
+    void clearSettlementSearchCache() {
+        cacheManager.getCache(SETTLEMENT_SEARCH_CACHE).clear();
+    }
+
     @BeforeEach
     void freezeStatistics() {
         // The planner's choice between BitmapOr and Seq Scan depends on statistics, and a container
@@ -324,6 +353,24 @@ class SettlementSearchCostGuardIT extends AbstractIntegrationTest {
         assertThat(benign.sequentialScan())
                 .as("a benign 8-character term must be served from idx_cities_name_uk_trgm")
                 .isFalse();
+    }
+
+    @Test
+    @DisplayName("an admitted term still reaches the database on a miss — the cache cannot mask the cost")
+    void should_executeTheRankedQuery_when_anAdmittedTermMissesTheCache() {
+        // Phase 329. The budgets in this class are EXPLAIN measurements of the production predicate,
+        // so they hold whatever the service does; this pins the other half — that the service
+        // path they describe is still the one taken on a miss, i.e. the result cache sits in FRONT
+        // of the query and has not replaced it. Falsify: drop the @BeforeEach clear and run after
+        // any class that searched «іванівка» — the count is zero and this goes red.
+        Statistics statistics = HibernateStatistics.enabledOn(entityManagerFactory);
+        long before = statistics.getPrepareStatementCount();
+
+        settlementSearchService.search("іванівка");
+
+        assertThat(statistics.getPrepareStatementCount() - before)
+                .as("a cache miss must execute the ranked SQL this class measures")
+                .isPositive();
     }
 
     // ── The guard ─────────────────────────────────────────────────────────────────────────────

@@ -270,7 +270,7 @@ class SettlementSearchServiceTest {
     class QueryBinding {
 
         @Test
-        @DisplayName("binds an escaped prefix pattern, the bare term, the floor and the cap")
+        @DisplayName("binds an escaped prefix pattern, the bare lower-cased term, the floor and the cap")
         void should_bindPatternTermFloorAndCap_when_termIsExecutable() {
             when(cityRepository.searchByName(anyString(), anyString(), anyDouble(), anyInt()))
                     .thenReturn(List.of(row("Львів", "CITY", "Львівська")));
@@ -284,8 +284,10 @@ class SettlementSearchServiceTest {
             verify(cityRepository).searchByName(
                     pattern.capture(), term.capture(), floor.capture(), cap.capture());
 
-            assertThat(pattern.getValue()).isEqualTo("Львів%");
-            assertThat(term.getValue()).isEqualTo("Львів");
+            // Lower-cased (Phase 329) so «Львів» and «львів» share one settlementSearch cache
+            // entry; result-neutral because ILIKE and pg_trgm both fold case.
+            assertThat(pattern.getValue()).isEqualTo("львів%");
+            assertThat(term.getValue()).isEqualTo("львів");
             assertThat(floor.getValue()).isEqualTo(SettlementSearchService.MIN_SIMILARITY);
             assertThat(cap.getValue()).isEqualTo(SettlementSearchService.MAX_RESULTS);
         }
@@ -326,7 +328,7 @@ class SettlementSearchServiceTest {
             assertThat(term.getValue())
                     .as("the KATOTTH import stores U+2019; folding onto U+0027 like the sibling "
                             + "discovery search does would drop 589 settlements from the prefix tier")
-                    .isEqualTo("Кам’янка ’ ’ ’");
+                    .isEqualTo("кам’янка ’ ’ ’");
         }
 
         @Test

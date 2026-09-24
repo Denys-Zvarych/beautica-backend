@@ -1,12 +1,14 @@
 package com.beautica.location;
 
 import com.beautica.AbstractIntegrationTest;
+import com.beautica.location.repository.CityRepository;
 import com.beautica.support.HibernateStatistics;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.persistence.EntityManagerFactory;
 import org.hibernate.stat.Statistics;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -24,6 +26,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -68,6 +71,16 @@ class SettlementSearchIT extends AbstractIntegrationTest {
      */
     private static final int MAX_RESULTS = 20;
 
+    /** Phase 329's per-query result cache, restated so a rename fails here rather than skips. */
+    private static final String SETTLEMENT_SEARCH_CACHE = "settlementSearch";
+
+    /** {@code SettlementSearchService.MIN_SIMILARITY}, restated for the same reason as MAX_RESULTS. */
+    private static final double REPOSITORY_MIN_SIMILARITY = 0.3d;
+
+    private static List<UUID> settlementIds(List<CityRepository.SettlementSearchRow> rows) {
+        return rows.stream().map(CityRepository.SettlementSearchRow::getSettlementId).toList();
+    }
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -77,9 +90,24 @@ class SettlementSearchIT extends AbstractIntegrationTest {
     @Autowired
     private CacheManager cacheManager;
 
+    /** Direct, uncached repository access for the database-level case-fold proof. */
+    @Autowired
+    private CityRepository cityRepository;
+
     /** Statement-count probe for the zero-trigram guard — see {@link HibernateStatistics}. */
     @Autowired
     private EntityManagerFactory entityManagerFactory;
+
+    /**
+     * Phase 329: typed-query results are cached in a context shared with every other
+     * {@code AbstractIntegrationTest}. Cleared before each test so every statement-count assertion
+     * here measures a MISS — a term cached by an earlier test would otherwise make a "the guard
+     * issued zero statements" assertion pass for the wrong reason.
+     */
+    @BeforeEach
+    void clearSettlementSearchCache() {
+        cacheManager.getCache(SETTLEMENT_SEARCH_CACHE).clear();
+    }
 
     private static HttpEntity<Void> anonymous() {
         HttpHeaders headers = new HttpHeaders();
@@ -629,11 +657,9 @@ class SettlementSearchIT extends AbstractIntegrationTest {
         }
 
         /**
-         * The blank query IS cached, proven by statement count — and it is here to keep its sibling
-         * honest. A "no statement was saved" assertion is only meaningful if the same probe can also
-         * register a save; without this contrast, a probe that silently counted nothing would let
-         * {@link #should_queryTheDatabaseEveryTime_when_theSameTermIsSearchedTwice()} pass for the
-         * wrong reason.
+         * The blank query IS cached, proven by statement count. Its per-query sibling
+         * ({@link #should_issueNoStatement_when_theSameTermIsSearchedAgain()}) additionally proves
+         * the probe registers a MISS, so neither zero can come from a probe that counts nothing.
          */
         @Test
         @DisplayName("a repeated blank query is served from the cache — zero statements")
@@ -651,31 +677,68 @@ class SettlementSearchIT extends AbstractIntegrationTest {
                     .isZero();
         }
 
+        /**
+         * Phase 329 superseded phase 326's "per-query results are NOT cached": the results are now
+         * cached, BOUNDED at 1024 entries. Proven by statement count — the same probe the blank-query
+         * sibling uses, so the zero here is backed by a probe that demonstrably registers a save —
+         * and by the miss before it, which must still execute the SQL.
+         */
         @Test
-        @DisplayName("per-query results are NOT cached — the same term queries the DB every time")
-        void should_queryTheDatabaseEveryTime_when_theSameTermIsSearchedTwice() throws Exception {
-            // REWRITTEN from an assertion that three cache NAMES were absent. That test could only
-            // fail if someone introduced a cache spelled exactly "settlementSearch", "settlements"
-            // or "settlementQuery" — a spelling coincidence, not the property. A per-query
-            // @Cacheable added under any fourth name, which is the actual regression (§A: a Caffeine
-            // cache keyed on caller text behind a permitAll endpoint is slot-exhaustible by an
-            // anonymous caller), would have sailed past it green.
-            //
-            // The property itself is observable: if the result were cached, the repeat calls would
-            // issue no statement. The first call is made outside the measurement window so that
-            // statement-cache/plan warm-up cannot be mistaken for a result cache.
-            getData("льв");
+        @DisplayName("per-query results are cached (phase 329) — a repeated term issues no statement")
+        void should_issueNoStatement_when_theSameTermIsSearchedAgain() throws Exception {
             Statistics statistics = HibernateStatistics.enabledOn(entityManagerFactory);
-            long before = statistics.getPrepareStatementCount();
+            long beforeMiss = statistics.getPrepareStatementCount();
 
             getData("льв");
+            long afterMiss = statistics.getPrepareStatementCount();
             getData("льв");
+            getData("Льв");
 
-            assertThat(statistics.getPrepareStatementCount() - before)
-                    .as("two repeats of an already-seen term must cost two statements. One (or "
-                            + "zero) means a per-query result cache appeared, and its key space is "
-                            + "every prefix an anonymous caller can type")
-                    .isEqualTo(2);
+            assertThat(afterMiss - beforeMiss)
+                    .as("the first call is a MISS (the cache is cleared before each test) and must "
+                            + "execute the ranked query — otherwise the zero below proves nothing")
+                    .isPositive();
+            assertThat(statistics.getPrepareStatementCount() - afterMiss)
+                    .as("a repeat, and a case variant of it, are served from settlementSearch — the "
+                            + "key is the normalised lower-cased term")
+                    .isZero();
+        }
+
+        /**
+         * Phase 329 lower-cases the term before binding it, which is only result-neutral if the
+         * DATABASE folds Cyrillic case in both tiers ({@code ILIKE} and {@code pg_trgm}). Proven
+         * against the repository directly, bypassing the cache — the statement-count test above
+         * only proves a hit. Would go red on a C-ctype database where Cyrillic does not fold.
+         */
+        @Test
+        @DisplayName("the database folds case — «Львів» and «львів» return the same rows, uncached")
+        void should_returnIdenticalRows_when_termsDifferOnlyInCase() {
+            List<UUID> mixed = settlementIds(cityRepository.searchByName(
+                    "Львів%", "Львів", REPOSITORY_MIN_SIMILARITY, MAX_RESULTS));
+            List<UUID> lower = settlementIds(cityRepository.searchByName(
+                    "львів%", "львів", REPOSITORY_MIN_SIMILARITY, MAX_RESULTS));
+
+            assertThat(mixed)
+                    .as("the probe must match something, or identical empty lists prove nothing")
+                    .isNotEmpty();
+            assertThat(lower)
+                    .as("ILIKE and pg_trgm similarity must both ignore case, in the same order — "
+                            + "otherwise lower-casing the cache key changes what users see")
+                    .containsExactlyElementsOf(mixed);
+        }
+
+        @Test
+        @DisplayName("the per-query cache is bounded at 1024 entries")
+        @SuppressWarnings("unchecked")
+        void should_boundThePerQueryCache_when_theContextStarts() {
+            Cache<Object, Object> nativeCache = (Cache<Object, Object>)
+                    cacheManager.getCache(SETTLEMENT_SEARCH_CACHE).getNativeCache();
+
+            assertThat(nativeCache.policy().eviction().orElseThrow().getMaximum())
+                    .as("the bound is the entire reason a caller-keyed cache on a permitAll endpoint "
+                            + "is acceptable (phase 329 vs phase 326) — unbounded would be slot "
+                            + "exhaustion by an anonymous caller")
+                    .isEqualTo(1024L);
         }
     }
 }

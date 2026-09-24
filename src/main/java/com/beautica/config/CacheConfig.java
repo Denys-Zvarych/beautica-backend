@@ -3,6 +3,7 @@ package com.beautica.config;
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.service.SettlementSearchService;
 import com.beautica.search.service.SearchCacheNames;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -165,8 +166,10 @@ public class CacheConfig {
      *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
      *   settlementMajors       — the 50 curated is_major settlements shown before the user
      *                            types in the Phase 326 autocomplete — 24 h TTL, max 2 entries
-     *                            (the method takes no arguments: ONE entry in practice);
-     *                            per-query results are NOT cached, by design
+     *                            (the method takes no arguments: ONE entry in practice)
+     *   settlementSearch       — Phase 329: per-query settlement autocomplete results, keyed by
+     *                            the normalised lower-cased term — 24 h TTL, max 1024 entries
+     *                            (bounded; supersedes phase 326's "per-query NOT cached")
      *   cityOblastId            — shared cityId -> oblastId resolver
      *                             (SalonService/MasterService/UserService) — 24 h TTL,
      *                             max 2000 entries; negatives not cached; no eviction path
@@ -553,18 +556,38 @@ public class CacheConfig {
         // maximumSize(2), not 50: this cache holds ONE entry — the whole 50-row list under
         // @Cacheable's SimpleKey.EMPTY, because the method takes no arguments. 2 leaves room
         // for the key to gain a dimension later without silently thrashing at 1.
-        //
-        // THE PER-QUERY RESULTS ARE DELIBERATELY NOT CACHED and must not be added here. The
-        // key space is every prefix a caller can type against a permitAll endpoint, so a
-        // bounded Caffeine cache would be evicted out of usefulness by ordinary typing and
-        // could be packed with junk keys by an anonymous caller (§A, Caffeine slot
-        // exhaustion). The query is GIN-index-served in single-digit milliseconds (V173) and
-        // the endpoint is IP-throttled, which is the control that fits that shape.
         manager.registerCustomCache("settlementMajors",
                 Caffeine.newBuilder()
                         .maximumSize(2)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
+        // Phase 329 — per-query settlement autocomplete results
+        // (SettlementSearchService#runIndexedSearch), keyed by the normalised, LOWER-CASED term so
+        // «Льв» and «льв» share one entry.
+        //
+        // THIS DELIBERATELY OVERTURNS phase 326's "per-query results are NOT cached". Its sole
+        // rationale was the unbounded key space on a permitAll endpoint (§A, Caffeine slot
+        // exhaustion). maximumSize(1024) removes that premise: an attacker cycling unique terms
+        // can only EVICT entries, and each miss costs exactly what every request cost before
+        // this cache existed. None of the three
+        // phase-326/327 DoS controls moves: the 3-alnum-run admission and the 50-char cap run
+        // BEFORE the cache (a refused term never reaches it), the 20-row LIMIT bounds each value,
+        // and the per-IP bucket in AuthRateLimitFilter runs before the controller, so cache HITS
+        // are charged a token too.
+        //
+        // 24h TTL with no @CacheEvict path: the same static Flyway-seed contract as
+        // settlementMajors above — CityRepository has no write method, so a redeploy (JVM
+        // restart) is the only invalidation, and the only time the rows can change. Metered so
+        // the 1024 sizing can be checked against the real hit ratio rather than argued.
+        //
+        // Worst case ~4.4 MB (1024 keys x ~140 B + 1024 x <=20 rows x ~200 B). The @Cacheable is
+        // deliberately NOT sync = true: this cache misses on every new prefix, and a sync load
+        // holds Caffeine's synchronized bin lock across the whole miss, pinning a virtual-thread
+        // carrier (see the advisor-order note above) — a duplicate concurrent miss costs ~1 ms.
+        registerMetered(manager, meterRegistry, SettlementSearchService.CACHE_SETTLEMENT_SEARCH,
+                Caffeine.newBuilder()
+                        .maximumSize(1024)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
         // Phase 240 perf MEDIUM — shared cityId -> oblastId resolver
         // (LocationQueryService#resolveCityOblastId) backing SalonService/MasterService's
         // per-request oblastId resolution. Same static-reference-data rationale as the
