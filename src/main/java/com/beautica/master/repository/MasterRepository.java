@@ -19,6 +19,14 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<Master> findByUserId(UUID userId);
 
     /**
+     * The id of the {@code masters} row owned by a user, without loading the entity — for callers
+     * that only need a cache key (e.g. {@code SalonService}'s owner master-detail eviction).
+     * {@code masters.user_id} is unique, so at most one id comes back.
+     */
+    @Query("SELECT m.id FROM Master m WHERE m.user.id = :userId")
+    Optional<UUID> findIdByUserId(@Param("userId") UUID userId);
+
+    /**
      * Same as {@link #findByUserId} but also JOIN FETCH-es the {@code salon} association,
      * eliminating the extra {@code SELECT * FROM salons WHERE id = ?} fired when callers
      * dereference {@code master.getSalon().getId()} (MEDIUM F2+F3).

@@ -100,7 +100,7 @@ public record PublicSalonResponse(
                 salon.getDescription(),
                 salon.getCity(),
                 salon.getRegion(),
-                salon.getAddress(),
+                legacyAddress(salon),
                 salon.getCityId(),
                 oblastId,
                 salon.getDistrictId(),
@@ -117,5 +117,22 @@ public record PublicSalonResponse(
                 salon.getReviewCount() == 0 ? null : salon.getAvgRating(),
                 salon.getReviewCount()
         );
+    }
+
+    /**
+     * The legacy free-text {@code address}, or {@code null} once the salon has a structured
+     * {@code street}. Create no longer stores {@code address} and Update never could, so an owner
+     * cannot correct or remove it — yet it was served publicly. Mobile renders it only as the
+     * fallback line when {@code street} is absent, so suppressing it whenever {@code street} is
+     * present changes nothing visible while stopping the leak. The column itself is untouched
+     * (clearing it is destructive and left to a product decision). Shared with
+     * {@link SalonResponse#from} so both shapes apply one rule.
+     *
+     * @param salon the salon entity
+     * @return the legacy address, or {@code null} when a structured street supersedes it
+     */
+    public static String legacyAddress(Salon salon) {
+        String street = salon.getStreet();
+        return street != null && !street.isBlank() ? null : salon.getAddress();
     }
 }

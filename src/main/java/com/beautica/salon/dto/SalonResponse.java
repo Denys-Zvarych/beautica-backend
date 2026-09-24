@@ -80,7 +80,7 @@ public record SalonResponse(
                 salon.getDescription(),
                 salon.getCity(),
                 salon.getRegion(),
-                salon.getAddress(),
+                PublicSalonResponse.legacyAddress(salon),
                 salon.getCityId(),
                 oblastId,
                 salon.getDistrictId(),

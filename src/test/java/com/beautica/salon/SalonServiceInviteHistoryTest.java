@@ -179,6 +179,7 @@ class SalonServiceInviteHistoryTest {
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
                 masterServiceRepository, localityWriteValidator, masterService,
                 masterScheduleService, scheduleDateMath, cityRepository,
+                new com.beautica.location.SettlementDisplayNameResolver(cityRepository),
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
                 bookingService, serviceRepository, favoriteRepository, mediaRepository,

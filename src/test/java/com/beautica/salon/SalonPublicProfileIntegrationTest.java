@@ -593,11 +593,10 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         assertThat(publicSalon.buildingNo()).isEqualTo("22");
         assertThat(publicSalon.locationNote()).isEqualTo("Near the fountain");
         assertThat(publicSalon.city())
-                .as("backward-compat: the legacy free-text city ('Kyiv', set at fixture creation) "
-                        + "must survive a taxonomy-only PATCH untouched — updateSalon() never calls "
-                        + "setCity/setRegion/setAddress (Phase 10.6), so the new taxonomy fields are "
-                        + "additive, not a replacement, for pre-existing legacy data")
-                .isEqualTo("Kyiv");
+                .as("the legacy free-text city ('Kyiv', set at fixture creation) must be REPLACED by "
+                        + "the settlement name on a cityId PATCH — leaving it produced a stale city "
+                        + "next to the new id, which mobile seeds «Населений пункт» from (Phase 346)")
+                .isEqualTo("Вінниця");
     }
 
     @Test
@@ -621,6 +620,36 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
                         + "unrelated contacts PATCH (which returns SalonResponse) happened to "
                         + "populate it client-side. No PATCH is issued here on purpose")
                 .isEqualTo("+380671234567");
+    }
+
+    @Test
+    @DisplayName("GET /salons/{id} — legacy free-text address is null once a street exists, still served without one")
+    void should_suppressLegacyAddress_when_salonHasStructuredStreet() throws Exception {
+        UUID ownerId = createSalonOwner("owner-addr-" + System.nanoTime() + "@beautica.test");
+        UUID withStreet = createSalon(ownerId, "Street Salon " + System.nanoTime());
+        UUID withoutStreet = createSalon(ownerId, "Legacy Salon " + System.nanoTime());
+        jdbcTemplate.update("UPDATE salons SET address = ?, street = ?, building_no = ? WHERE id = ?",
+                "вул. Домашня 1, кв. 5", "вул. Шевченка", "12", withStreet);
+        jdbcTemplate.update("UPDATE salons SET address = ?, street = NULL WHERE id = ?",
+                "вул. Стара 3", withoutStreet);
+
+        PublicSalonResponse structured = objectMapper.readValue(
+                restTemplate.getForEntity(SALONS_URL + "/" + withStreet, String.class).getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {}).data();
+        PublicSalonResponse legacyOnly = objectMapper.readValue(
+                restTemplate.getForEntity(SALONS_URL + "/" + withoutStreet, String.class).getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {}).data();
+
+        assertThat(structured.address())
+                .as("the uneditable legacy text must not reach an unauthenticated caller once a street supersedes it")
+                .isNull();
+        assertThat(structured.street()).isEqualTo("вул. Шевченка");
+        assertThat(jdbcTemplate.queryForObject("SELECT address FROM salons WHERE id = ?", String.class, withStreet))
+                .as("non-destructive: the column itself is untouched")
+                .isEqualTo("вул. Домашня 1, кв. 5");
+        assertThat(legacyOnly.address())
+                .as("mobile's fallback line — still served when there is no street")
+                .isEqualTo("вул. Стара 3");
     }
 
     // ── fixtures — salon side ─────────────────────────────────────────────────────

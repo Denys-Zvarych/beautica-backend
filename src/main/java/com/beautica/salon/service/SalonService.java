@@ -16,6 +16,8 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.EffectiveDayResponse;
@@ -104,6 +106,7 @@ public class SalonService {
     private final MasterScheduleService masterScheduleService;
     private final ScheduleDateMath scheduleDateMath;
     private final CityRepository cityRepository;
+    private final SettlementDisplayNameResolver settlementDisplayNameResolver;
     private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
     private final AuthorizationService authorizationService;
@@ -255,6 +258,9 @@ public class SalonService {
      */
     public static final int MAX_ACTIVE_SALONS_PER_OWNER = 50;
 
+    private static final String MASTER_DETAIL_CACHE = "master-detail";
+    private static final String MASTER_DETAIL_BY_USER_CACHE = "master-detail-by-user";
+
     @Transactional
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
         // PESSIMISTIC_WRITE, not a plain findById (Perf LOW-A). The portfolio cap below is a
@@ -292,14 +298,14 @@ public class SalonService {
         // at creation only to be blocked later at update. Runs before save() so nothing is
         // persisted on rejection.
         localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+        // Resolved once, written to BOTH the salon row and the owner sync below.
+        SettlementDisplayNames settlementNames =
+                settlementDisplayNameResolver.resolve(request.cityId()).orElse(null);
 
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
                 .description(request.description())
-                .city(request.city())
-                .region(request.region())
-                .address(request.address())
                 .cityId(request.cityId())
                 .districtId(request.districtId())
                 .street(request.street())
@@ -310,21 +316,31 @@ public class SalonService {
                 .isActive(true)
                 .isPrimary(isFirstSalon)
                 .build();
+        salon.applySettlementDisplayNames(settlementNames);
 
         Salon savedSalon = salonRepository.save(salon);
 
         // Phase 10.3: sync location to owner's User row so /users/me reflects the salon
         // address. Locality validation already ran unconditionally above (Phase 12.1) —
-        // this guard now only governs the User-row sync. userRepository.save is intentionally
-        // scoped inside the guard: when no structured location is provided there is nothing to
-        // sync, and the multi-salon test asserts that save(owner) is never called unconditionally.
+        // this guard now only governs the User-row sync. No userRepository.save: `owner` was
+        // loaded by lockOwnerForCreate (findByIdForUpdate) inside THIS transaction, so it is a
+        // managed entity and dirty-checking flushes these setters on commit.
         if (request.cityId() != null) {
             owner.setCityId(request.cityId());
             owner.setDistrictId(request.districtId());
+            // Same denorm UserService applies on a profile cityId write — without it the owner's
+            // /users/me kept its previous city/region text next to the salon's new cityId.
+            owner.applySettlementDisplayNames(settlementNames);
             owner.setStreet(request.street());
             owner.setBuildingNo(request.buildingNo());
             owner.setLocationNote(request.locationNote());
-            userRepository.save(owner);
+            // The owner's users.city/region/cityId feed MasterDetailResponse, cached by masterId
+            // (master-detail) and by userId (master-detail-by-user). A FIRST salon has no master
+            // row yet (createMasterForOwner below creates it and evicts its own keys); a later
+            // salon rewrites a row both caches may already hold.
+            if (!isFirstSalon) {
+                evictOwnerMasterDetailCachesAfterCommit(owner.getId());
+            }
         }
 
         // Evict ownerSalons cache after commit so a concurrent reader cannot repopulate
@@ -358,6 +374,49 @@ public class SalonService {
         userProfileCacheEvictor.evictAfterCommit(ownerIdOf(savedSalon));
 
         return SalonResponse.from(savedSalon, resolveOblastId(savedSalon.getCityId()));
+    }
+
+    /**
+     * Re-derives the legacy {@code salons.city}/{@code salons.region} labels from the settlement
+     * taxonomy whenever {@code cityId} is written, via the shared
+     * {@link SettlementDisplayNameResolver} ({@code UserService} uses the same one for users).
+     *
+     * <p>{@code SalonResponse}/{@code PublicSalonResponse} read both columns verbatim and the
+     * mobile address screen seeds «Населений пункт» from {@code city}. Writing only
+     * {@code cityId} left a post-Phase-10.6 salon with {@code null} labels and an older salon
+     * showing its PREVIOUS free text next to the new id. V177/V178 backfill existing rows.
+     * An unresolvable id clears both labels (same rule as users) — unreachable in practice,
+     * since {@code validateProviderLocality} rejects an unknown city before this runs.
+     */
+    private void writeSettlementLabels(Salon salon, UUID cityId) {
+        salon.applySettlementDisplayNames(settlementDisplayNameResolver.resolve(cityId).orElse(null));
+    }
+
+    /**
+     * Evicts the owner's cached {@code MasterDetailResponse} under both keys after commit, for
+     * a write that rewrote the owner's {@code users.city/region/cityId}: {@code master-detail}
+     * (keyed by masterId — resolved here, inside the transaction) and
+     * {@code master-detail-by-user} (keyed by userId). Per-key evicts, never {@code clear()}
+     * (§F-6); {@code afterCommit} so no parallel reader repopulates the pre-write state (§F-2).
+     */
+    private void evictOwnerMasterDetailCachesAfterCommit(UUID ownerUserId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        UUID ownerMasterId = masterRepository.findIdByUserId(ownerUserId).orElse(null);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache detailByUser = cacheManager.getCache(MASTER_DETAIL_BY_USER_CACHE);
+                if (detailByUser != null) {
+                    detailByUser.evict(ownerUserId);
+                }
+                Cache detail = cacheManager.getCache(MASTER_DETAIL_CACHE);
+                if (detail != null && ownerMasterId != null) {
+                    detail.evict(ownerMasterId);
+                }
+            }
+        });
     }
 
     /**
@@ -544,8 +603,10 @@ public class SalonService {
         // Phase 10.6: a salon is a discoverable provider — its persisted
         // locality must satisfy the most-specific-node rule (city mandatory;
         // district mandatory iff the city has urban districts; district a child
-        // of the city). The legacy free-text city/region/address are NO LONGER
-        // written (kept nullable per Phase 10.3, no longer the source of truth).
+        // of the city). The legacy free-text address is NO LONGER written (kept
+        // nullable per Phase 10.3, no longer the source of truth). `city`/`region` are
+        // re-derived from the taxonomy (never from the request's free text) whenever
+        // cityId is written — see writeSettlementLabels.
         //
         // PATCH semantics: a null cityId means "locality not included in this update", NOT
         // "clear my city". Validating/writing the FK pair unconditionally against the raw
@@ -570,6 +631,7 @@ public class SalonService {
             localityWriteValidator.validateProviderLocality(request.toLocalityInput());
             salon.setCityId(request.cityId());
             salon.setDistrictId(request.districtId());
+            writeSettlementLabels(salon, request.cityId());
         }
 
         if (request.name() != null) {

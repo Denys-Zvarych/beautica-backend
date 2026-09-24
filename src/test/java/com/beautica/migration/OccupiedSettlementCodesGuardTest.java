@@ -9,7 +9,17 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.HexFormat;
 import java.util.List;
 
@@ -38,7 +48,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Plain JUnit: this asserts a property of a committed file, so neither Spring nor Postgres is
  * involved (§M-1).
  */
-@DisplayName("occupied-katotth-codes.txt <-> docs/qa/occupied-settlements.md")
+@DisplayName("occupied-katotth-codes.txt <-> docs/qa/occupied-settlements.md, and no tracked data file carries its codes")
 class OccupiedSettlementCodesGuardTest {
 
     private static final String DIGEST_HEADER = "# codes-sha256:";
@@ -97,6 +107,90 @@ class OccupiedSettlementCodesGuardTest {
                 .count();
 
         assertThat(declaredCount).isEqualTo(String.valueOf(codes));
+    }
+
+    /**
+     * Files allowed to carry exclusion-set codes, each pinned to its EXACT number of DISTINCT
+     * codes. Every one is either the exclusion set itself or a purge/guard that must name the
+     * codes it removes or proves absent — V53 seeded 17 occupied cities in error (an applied
+     * migration, immutable), V170 deleted them, V179 cleared the text they left behind, and the
+     * tests prove each step. A count moving in EITHER direction fails: up means occupied data
+     * leaked into a file that was allowed only a known purge list; down means a guard silently
+     * lost coverage.
+     */
+    private static final Map<String, Integer> ALLOWED_CODE_COUNTS = Map.of(
+            "src/test/resources/locality/occupied-katotth-codes.txt", OccupiedSettlementCodes.EXPECTED_CODE_COUNT,
+            "src/main/resources/db/migration/V53__seed_locality_taxonomy.sql", 17,
+            "src/main/resources/db/migration/V170__widen_cities_to_full_settlement_taxonomy.sql", 17,
+            "src/main/resources/db/migration/V179__clear_occupied_city_text_left_by_v170.sql", 17,
+            "src/test/java/com/beautica/migration/LocalityTaxonomySeedMigrationTest.java", 17,
+            "src/test/java/com/beautica/migration/V170OccupiedCityPurgeGuardTest.java", 17,
+            "src/test/java/db/migration/V171ImportFreeSettlementsTest.java", 1,
+            "src/test/java/db/migration/V175BackfillSettlementHromadasTest.java", 1);
+
+    /**
+     * Tier-1 tripwire (memory: occupied-territory data ban). A raw classifier snapshot that was
+     * only OBLAST-prefix-filtered ({@code katottg-2025-05-16.json}) sat tracked for months carrying
+     * 1 117 codes of this exclusion set — nothing checked repository files against the SET.
+     *
+     * <p>Scans EVERY file git would commit — tracked plus untracked-but-not-ignored
+     * ({@code git ls-files --cached --others --exclude-standard}), so work in progress is covered
+     * before it lands while an ignored local copy of a raw snapshot (kept on disk as tooling
+     * input) never trips it. That spans src/, docs/, scripts/ and every other top-level
+     * directory. Files are read as ISO-8859-1, so a code is found in ANY file, text or binary,
+     * without a decode failure silently skipping it. Match is by exact 19-character KATOTTH code,
+     * never by name substring (Кримне / Луганське in serviced oblasts are not occupied data).
+     */
+    @Test
+    @DisplayName("no repository file carries an exclusion-set code except the pinned purge/guard files, at their exact counts")
+    void should_findOnlyPinnedExclusionSetCodes_when_everyRepositoryFileIsScanned() throws Exception {
+        Set<String> excluded = new HashSet<>(OccupiedSettlementCodes.load());
+        List<String> files = repositoryFiles();
+        Map<String, Integer> actualCounts = new TreeMap<>();
+
+        for (String file : files) {
+            Path path = Path.of(file);
+            if (!Files.isRegularFile(path)) {
+                continue; // deleted in the working tree but still in the index
+            }
+            String content = Files.readString(path, StandardCharsets.ISO_8859_1);
+            Matcher code = KATOTTH_CODE.matcher(content);
+            Set<String> hits = new HashSet<>();
+            while (code.find()) {
+                if (excluded.contains(code.group())) {
+                    hits.add(code.group());
+                }
+            }
+            if (!hits.isEmpty()) {
+                actualCounts.put(file, hits.size());
+            }
+        }
+
+        assertThat(files)
+                .as("the scan must actually cover the settlement import CSV and this guard's own "
+                        + "resource — otherwise `git ls-files` saw nothing and the guard passes vacuously")
+                .contains("src/main/resources/db/data/settlements.csv",
+                        "src/test/resources/locality/occupied-katotth-codes.txt");
+        assertThat(actualCounts)
+                .as("files carrying occupied-settlement codes (distinct count per file). An UNLISTED "
+                        + "file: remove it from git (raw snapshot) or re-derive it through the Phase 324 "
+                        + "exclusion set — never commit occupied-territory data. A LISTED file whose "
+                        + "count moved: re-verify it and update ALLOWED_CODE_COUNTS deliberately")
+                .isEqualTo(new TreeMap<>(ALLOWED_CODE_COUNTS));
+    }
+
+    private static final Pattern KATOTTH_CODE = Pattern.compile("UA[0-9]{17}");
+
+    private static List<String> repositoryFiles() throws Exception {
+        Process git = new ProcessBuilder("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+                .redirectErrorStream(false)
+                .start();
+        String out = new String(git.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertThat(git.waitFor())
+                .as("`git ls-files` must succeed from the project directory — without it the guard "
+                        + "cannot tell a committable file from an ignored local snapshot")
+                .isZero();
+        return Arrays.stream(out.split("\0")).filter(f -> !f.isBlank()).toList();
     }
 
     private static List<String> readResourceLines() {

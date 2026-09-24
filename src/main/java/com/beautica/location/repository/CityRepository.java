@@ -1,5 +1,6 @@
 package com.beautica.location.repository;
 
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.SettlementType;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -250,6 +251,26 @@ public interface CityRepository extends JpaRepository<City, UUID> {
      */
     @Query("SELECT c FROM City c JOIN FETCH c.oblast WHERE c.id = :id")
     Optional<City> findByIdWithOblast(@Param("id") UUID id);
+
+    /**
+     * Resolves a settlement's two display labels — {@code cities.name_uk} and its oblast's
+     * {@code name_uk} — as a constructor projection, for the {@code city}/{@code region}
+     * denormalisation on the user and salon write paths
+     * ({@link com.beautica.location.SettlementDisplayNameResolver}).
+     *
+     * <p>Two strings, not two managed entities: nothing is added to the persistence context
+     * and no dirty-check snapshot is taken. The inner {@code JOIN} is on the
+     * {@code NOT NULL} {@code oblast_id} FK, so a found city always yields both labels.
+     *
+     * @param id surrogate PK of the city
+     * @return the labels, or empty when no city has that id
+     */
+    @Query("""
+            SELECT new com.beautica.location.SettlementDisplayNames(c.nameUk, o.nameUk)
+              FROM City c JOIN c.oblast o
+             WHERE c.id = :id
+            """)
+    Optional<SettlementDisplayNames> findDisplayNamesById(@Param("id") UUID id);
 
     /**
      * Batch-resolves city {@code name_uk} labels for a set of city ids in a

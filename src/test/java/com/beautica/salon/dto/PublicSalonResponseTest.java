@@ -178,4 +178,49 @@ class PublicSalonResponseTest {
 
         assertThat(response.oblastId()).isNull();
     }
+
+    // ── legacy free-text address: suppressed once a structured street exists ─────────────────
+
+    private static Salon salonWith(String street, String legacyAddress) {
+        return Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
+                .id(UUID.randomUUID())
+                .name("Beauty Bar")
+                .street(street)
+                .buildingNo(street == null ? null : "12")
+                .address(legacyAddress)
+                .build();
+    }
+
+    @Test
+    @DisplayName("address is null on BOTH response shapes when the salon has a structured street")
+    void should_returnNullAddress_when_salonHasStructuredStreet() {
+        Salon salon = salonWith("вул. Шевченка", "вул. Домашня 1, кв. 5");
+
+        PublicSalonResponse publicView = PublicSalonResponse.from(salon, null);
+        SalonResponse ownerView = SalonResponse.from(salon, null);
+
+        assertThat(publicView.address())
+                .as("uneditable legacy text must not be published once a street supersedes it")
+                .isNull();
+        assertThat(ownerView.address()).isNull();
+        assertThat(publicView.street()).isEqualTo("вул. Шевченка");
+    }
+
+    @Test
+    @DisplayName("address is still served on BOTH shapes when the salon has no street (mobile's fallback line)")
+    void should_returnLegacyAddress_when_salonHasNoStreet() {
+        Salon salon = salonWith(null, "вул. Стара 3");
+
+        assertThat(PublicSalonResponse.from(salon, null).address()).isEqualTo("вул. Стара 3");
+        assertThat(SalonResponse.from(salon, null).address()).isEqualTo("вул. Стара 3");
+    }
+
+    @Test
+    @DisplayName("a blank street does not count as structured — the legacy address is still served")
+    void should_returnLegacyAddress_when_streetIsBlank() {
+        Salon salon = salonWith("   ", "вул. Стара 3");
+
+        assertThat(PublicSalonResponse.from(salon, null).address()).isEqualTo("вул. Стара 3");
+    }
 }

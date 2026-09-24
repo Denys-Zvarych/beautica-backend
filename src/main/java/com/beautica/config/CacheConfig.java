@@ -2,6 +2,7 @@ package com.beautica.config;
 
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
+import com.beautica.location.SettlementDisplayNameResolver;
 import com.beautica.search.service.SearchCacheNames;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -587,11 +588,24 @@ public class CacheConfig {
         // costs ~315 kB fully populated, and keeps the §F-5 bound meaningful. Negatives are not
         // cached (`unless = "#result == null"` on the resolver), so an enumeration of random UUIDs
         // cannot occupy entries at all — the cap no longer has to double as that defence.
-        manager.registerCustomCache("cityOblastId",
+        registerMetered(manager, meterRegistry, "cityOblastId",
                 Caffeine.newBuilder()
                         .maximumSize(2_000)
-                        .expireAfterWrite(24, TimeUnit.HOURS)
-                        .build());
+                        .expireAfterWrite(24, TimeUnit.HOURS));
+        // Phase 346 — shared cityId -> (city name, oblast name) labels
+        // (SettlementDisplayNameResolver#resolve) denormalised into users/salons city/region on
+        // every cityId write. Sibling of cityOblastId above: static Flyway-seed data, 24h TTL, no
+        // @CacheEvict contract. Negatives are not cached (`unless = "#result == null"`), so only
+        // ids that name a real settlement occupy entries — the key space is bounded by the
+        // settlement table itself, and in practice by the cities users/providers actually pick.
+        // 2 000 matches cityOblastId's sizing argument; an entry (UUID -> two short strings) is a
+        // few hundred bytes, and a miss is one PK lookup.
+        // Metered (hit ratio / size / evictions) so the 2 000 sizing above can be checked
+        // against a real working set rather than argued; same for cityOblastId.
+        registerMetered(manager, meterRegistry, SettlementDisplayNameResolver.CACHE_SETTLEMENT_DISPLAY_NAMES,
+                Caffeine.newBuilder()
+                        .maximumSize(2_000)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
         // Phase 10.6 — fused write-path taxonomy resolution per (cityId, districtId)
         // pair, backing LocalityWriteValidator. Same static-reference-data rationale
         // as the locationOblasts/* read caches above: KATOTTH rows are Flyway-seed

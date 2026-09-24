@@ -117,6 +117,7 @@ class SalonServiceCacheTest {
     // slice's Salon mocks return a null cityId by default, so resolveOblastId short-circuits
     // and neither mock is exercised beyond satisfying Spring's bean graph.
     @MockBean CityRepository cityRepository;
+    @MockBean com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
     @MockBean com.beautica.location.service.LocationQueryService locationQueryService;
     // Phase 23.1: SalonService now constructor-depends on InviteTokenRepository
     // (listSalonInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
@@ -449,5 +450,63 @@ class SalonServiceCacheTest {
         assertThat(cacheManager.getCache("search:salons:browse").get(sentinelKey))
                 .as("search:salons:browse cache must be fully cleared after deactivateSalon (blanket eviction)")
                 .isNull();
+    }
+
+    // ── PERF-LOW-2: a later salon create rewrites the owner's users.city/region/cityId ──────────
+    // MasterDetailResponse reads those columns and is cached under masterId (master-detail) and
+    // userId (master-detail-by-user); both must be evicted after commit or the owner's detail
+    // keeps serving the previous city for the TTL.
+
+    private User ownerForCreate(UUID ownerId) {
+        User owner = new User("owner-" + ownerId + "@beautica.test", "hash", Role.SALON_OWNER, null, null, null);
+        org.springframework.test.util.ReflectionTestUtils.setField(owner, "id", ownerId);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.save(org.mockito.ArgumentMatchers.any(Salon.class))).thenAnswer(inv -> {
+            Salon saved = inv.getArgument(0);
+            org.springframework.test.util.ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
+            org.springframework.test.util.ReflectionTestUtils.setField(saved, "createdAt", Instant.now());
+            return saved;
+        });
+        return owner;
+    }
+
+    private static com.beautica.salon.dto.CreateSalonRequest createRequest(UUID cityId) {
+        return new com.beautica.salon.dto.CreateSalonRequest("Second Salon", null, null, null, null, null, null,
+                cityId, null, "Shevchenka St", "5A", null);
+    }
+
+    @Test
+    @DisplayName("createSalon (second salon) — evicts the owner's master-detail (by masterId) and master-detail-by-user (by userId) after commit")
+    void should_evictOwnerMasterDetailCaches_when_secondSalonCreatedWithCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        UUID bystanderUserId = UUID.randomUUID();
+        ownerForCreate(ownerId);
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(masterRepository.findIdByUserId(ownerId)).thenReturn(Optional.of(ownerMasterId));
+        cacheManager.getCache("master-detail").put(ownerMasterId, "stale-detail");
+        cacheManager.getCache("master-detail-by-user").put(ownerId, "stale-me");
+        cacheManager.getCache("master-detail-by-user").put(bystanderUserId, "other-owner");
+
+        salonService.createSalon(ownerId, createRequest(UUID.randomUUID()));
+
+        assertThat(cacheManager.getCache("master-detail").get(ownerMasterId))
+                .as("public master-detail keyed by the owner's masterId must be evicted").isNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(ownerId))
+                .as("GET /masters/me entry keyed by the owner's userId must be evicted").isNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(bystanderUserId))
+                .as("per-key evict, never clear() (§F-6)").isNotNull();
+    }
+
+    @Test
+    @DisplayName("createSalon (first salon) — does not look up an owner master that does not exist yet")
+    void should_notLookUpOwnerMaster_when_firstSalonCreated() {
+        UUID ownerId = UUID.randomUUID();
+        ownerForCreate(ownerId);
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+
+        salonService.createSalon(ownerId, createRequest(UUID.randomUUID()));
+
+        verify(masterRepository, Mockito.never()).findIdByUserId(ownerId);
     }
 }

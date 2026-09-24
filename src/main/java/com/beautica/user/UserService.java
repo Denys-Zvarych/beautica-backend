@@ -7,15 +7,13 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.SettlementDisplayNameResolver;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.search.service.SearchCacheNames;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
-import com.beautica.location.repository.CityRepository;
 import com.beautica.location.service.LocationQueryService;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.RatingCountProjection;
@@ -42,7 +40,7 @@ public class UserService {
 
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
-    private final CityRepository cityRepository;
+    private final SettlementDisplayNameResolver settlementDisplayNameResolver;
     private final CityDistrictRepository cityDistrictRepository;
     private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
@@ -51,7 +49,7 @@ public class UserService {
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
-                       CityRepository cityRepository,
+                       SettlementDisplayNameResolver settlementDisplayNameResolver,
                        CityDistrictRepository cityDistrictRepository,
                        LocationQueryService locationQueryService,
                        CacheManager cacheManager,
@@ -59,7 +57,7 @@ public class UserService {
                        MasterRepository masterRepository) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
-        this.cityRepository = cityRepository;
+        this.settlementDisplayNameResolver = settlementDisplayNameResolver;
         this.cityDistrictRepository = cityDistrictRepository;
         this.locationQueryService = locationQueryService;
         this.cacheManager = cacheManager;
@@ -462,33 +460,14 @@ public class UserService {
      * (e.g. {@link com.beautica.master.dto.MasterDetailResponse}) can surface
      * them without a JOIN to the taxonomy tables.
      *
-     * <p>Called only when {@code cityId} is non-null. If the city row is not
-     * found (e.g. stale/invalid UUID slipped past validation), a WARN is logged
-     * and both columns are left unchanged — the caller's transaction continues
-     * normally.</p>
-     *
-     * <p>The {@link com.beautica.location.entity.City#getOblast()} association is
-     * {@code FetchType.LAZY}; it is safe to traverse here because this method is
-     * always called within an active {@code @Transactional} context.</p>
+     * <p>The lookup is the shared {@link SettlementDisplayNameResolver} — the same one
+     * {@code SalonService} uses for {@code salons.city/region} and for the owner row it syncs
+     * on salon create. If the city row is not found (a stale/invalid UUID slipped past
+     * validation), the resolver logs a WARN and both columns are CLEARED — the same rule as
+     * salons, since a stale label beside a new cityId is exactly the defect this guards.</p>
      */
     private void writeCityDisplayStrings(User user, UUID cityId) {
-        if (cityId == null) {
-            return;
-        }
-        Optional<City> cityOpt = cityRepository.findByIdWithOblast(cityId);
-        if (cityOpt.isEmpty()) {
-            log.warn("applyLocality: city not found for id={}, skipping city/region denorm", cityId);
-            return;
-        }
-        City city = cityOpt.get();
-        Oblast oblast = city.getOblast();
-        if (oblast == null) {
-            log.warn("applyLocality: city {} has no oblast association, skipping region denorm", cityId);
-            user.setCity(city.getNameUk());
-            return;
-        }
-        user.setCity(city.getNameUk());
-        user.setRegion(oblast.getNameUk());
+        user.applySettlementDisplayNames(settlementDisplayNameResolver.resolve(cityId).orElse(null));
     }
 
     /**

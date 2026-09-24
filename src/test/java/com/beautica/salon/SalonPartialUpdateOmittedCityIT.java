@@ -8,6 +8,7 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -182,6 +183,183 @@ class SalonPartialUpdateOmittedCityIT extends AbstractIntegrationTest {
     }
 
     // ── fixtures ──────────────────────────────────────────────────────────────────
+
+    // ── salons.city = settlement name (Phase 346 blocker) ──────────────────────────────
+    // Mobile seeds «Населений пункт» from SalonResponse.city, which reads salons.city
+    // verbatim. SalonService used to write only city_id, so a new salon re-opened with an
+    // empty settlement and an old one showed its PREVIOUS free-text city next to a new id.
+
+    @Test
+    @DisplayName("POST /salons — the salon reads back settlement city + oblast region, and the owner's /users/me carries the same labels (both were null/stale)")
+    void should_returnSettlementLabels_when_salonCreatedWithCityId() throws Exception {
+        String ownerEmail = "owner-city-create-" + UUID.randomUUID() + "@beautica.test";
+        UUID ownerId = createOwner(ownerEmail);
+        // The owner's pre-fix shape: previous free-text locality on the users row.
+        jdbcTemplate.update("UPDATE users SET city = 'Kyiv', region = 'Kyiv oblast' WHERE id = ?", ownerId);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID cityId = testCityId();
+
+        UUID salonId = registerSalon(ownerToken, cityId);
+        JsonNode publicSalon = getPublicSalon(salonId);
+        JsonNode me = getMe(ownerToken);
+
+        assertThat(publicSalon.path("city").asText())
+                .as("GET /salons/{id} city must be the settlement's name_uk for a post-Phase-10.6 salon")
+                .isEqualTo(settlementName(cityId));
+        assertThat(publicSalon.path("region").asText())
+                .as("GET /salons/{id} region must be the settlement's oblast name_uk")
+                .isEqualTo(oblastName(cityId));
+        assertThat(me.path("cityId").asText()).isEqualTo(cityId.toString());
+        assertThat(me.path("cityName").asText())
+                .as("owner /users/me cityName must follow the synced cityId, not keep 'Kyiv'")
+                .isEqualTo(settlementName(cityId));
+        assertThat(me.path("oblastName").asText())
+                .as("owner /users/me oblastName must follow the synced cityId, not keep 'Kyiv oblast'")
+                .isEqualTo(oblastName(cityId));
+    }
+
+    @Test
+    @DisplayName("PATCH /salons/{id} changing cityId — PATCH body, GET /salons/{id} and GET /salons/mine all show the NEW settlement name, not the stale text")
+    void should_returnNewSettlementName_when_patchChangesCityId() throws Exception {
+        String ownerEmail = "owner-city-patch-" + UUID.randomUUID() + "@beautica.test";
+        createOwner(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID salonId = registerSalon(ownerToken, testCityId());
+        // The pre-fix shape of an older salon: legacy free text that no longer names its city.
+        jdbcTemplate.update("UPDATE salons SET city = 'Kyiv', region = 'Kyiv oblast' WHERE id = ?", salonId);
+        UUID newCityId = districtlessCityOtherThan(testCityId());
+        String expected = settlementName(newCityId);
+        String expectedRegion = oblastName(newCityId);
+        var cityPatch = new UpdateSalonRequest(
+                null, null, null, null, null,
+                newCityId, null, "Khreshchatyk St", "22", null, null, null);
+
+        ResponseEntity<String> patchResponse = restTemplate.exchange(
+                SALONS_URL + "/" + salonId, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(cityPatch), bearerHeaders(ownerToken)),
+                String.class);
+
+        assertThat(patchResponse.getStatusCode())
+                .as("cityId PATCH must succeed — actual body: %s", patchResponse.getBody())
+                .isEqualTo(HttpStatus.OK);
+        SalonResponse patched = objectMapper.readValue(
+                patchResponse.getBody(), new TypeReference<ApiResponse<SalonResponse>>() { }).data();
+        assertThat(patched.city()).as("PATCH response city").isEqualTo(expected);
+        assertThat(patched.region()).as("PATCH response region").isEqualTo(expectedRegion);
+        JsonNode publicSalon = getPublicSalon(salonId);
+        assertThat(publicSalon.path("city").asText()).as("public GET city after commit").isEqualTo(expected);
+        assertThat(publicSalon.path("region").asText()).as("public GET region after commit").isEqualTo(expectedRegion);
+        JsonNode mine = getMine(ownerToken, salonId);
+        assertThat(mine.path("city").asText()).as("owner GET /mine city after commit").isEqualTo(expected);
+        assertThat(mine.path("region").asText()).as("owner GET /mine region after commit").isEqualTo(expectedRegion);
+        assertThat(jdbcTemplate.queryForObject("SELECT city FROM salons WHERE id = ?", String.class, salonId))
+                .as("the committed row must no longer carry the stale 'Kyiv' text")
+                .isEqualTo(expected);
+        assertThat(jdbcTemplate.queryForObject("SELECT region FROM salons WHERE id = ?", String.class, salonId))
+                .as("the committed row must no longer carry the stale 'Kyiv oblast' text")
+                .isEqualTo(expectedRegion);
+    }
+
+    @Test
+    @DisplayName("the address-screen round trip: GET /mine and GET /salons/{id} already cached with city A → PATCH cityId B (another oblast) → both re-reads show B's settlement + oblast, never cached A")
+    void should_serveNewSettlementLabels_when_cachedReadsPrecedeCityIdPatch() throws Exception {
+        // Arrange — the mobile address screen reads the salon BEFORE editing it, so both
+        // @Cacheable reads (ownerSalons, salon-detail) hold city A when the PATCH lands.
+        String ownerEmail = "owner-city-roundtrip-" + UUID.randomUUID() + "@beautica.test";
+        createOwner(ownerEmail);
+        String ownerToken = loginAndGetToken(ownerEmail);
+        UUID cityA = testCityId();
+        UUID salonId = registerSalon(ownerToken, cityA);
+        UUID cityB = districtlessCityInAnotherOblast(cityA);
+        assertThat(oblastName(cityB)).as("precondition: B lies in a different oblast from A")
+                .isNotEqualTo(oblastName(cityA));
+        assertThat(getMine(ownerToken, salonId).path("city").asText())
+                .as("warm ownerSalons with A").isEqualTo(settlementName(cityA));
+        assertThat(getPublicSalon(salonId).path("city").asText())
+                .as("warm salon-detail with A").isEqualTo(settlementName(cityA));
+        var cityPatch = new UpdateSalonRequest(
+                null, null, null, null, null,
+                cityB, null, "Khreshchatyk St", "22", null, null, null);
+
+        // Act
+        ResponseEntity<String> patchResponse = restTemplate.exchange(
+                SALONS_URL + "/" + salonId, HttpMethod.PATCH,
+                new HttpEntity<>(objectMapper.writeValueAsString(cityPatch), bearerHeaders(ownerToken)),
+                String.class);
+
+        // Assert
+        assertThat(patchResponse.getStatusCode())
+                .as("cityId PATCH must succeed — actual body: %s", patchResponse.getBody())
+                .isEqualTo(HttpStatus.OK);
+        JsonNode mine = getMine(ownerToken, salonId);
+        assertThat(mine.path("cityId").asText()).as("GET /mine cityId after PATCH").isEqualTo(cityB.toString());
+        assertThat(mine.path("city").asText()).as("GET /mine city — the screen's re-open seed")
+                .isEqualTo(settlementName(cityB));
+        assertThat(mine.path("region").asText()).as("GET /mine region").isEqualTo(oblastName(cityB));
+        JsonNode publicSalon = getPublicSalon(salonId);
+        assertThat(publicSalon.path("city").asText()).as("GET /salons/{id} city").isEqualTo(settlementName(cityB));
+        assertThat(publicSalon.path("region").asText()).as("GET /salons/{id} region").isEqualTo(oblastName(cityB));
+    }
+
+    /** A districtless CITY whose oblast differs from {@code cityId}'s — so a stale region is detectable. */
+    private UUID districtlessCityInAnotherOblast(UUID cityId) {
+        return jdbcTemplate.queryForObject("""
+                SELECT c.id FROM cities c
+                 WHERE c.settlement_type = 'CITY'
+                   AND c.oblast_id <> (SELECT oblast_id FROM cities WHERE id = ?)
+                   AND NOT EXISTS (SELECT 1 FROM city_districts d WHERE d.city_id = c.id)
+                 ORDER BY c.katotth_code
+                 LIMIT 1
+                """, UUID.class, cityId);
+    }
+
+    private JsonNode getPublicSalon(UUID salonId) throws Exception {
+        ResponseEntity<String> response = restTemplate.getForEntity(SALONS_URL + "/" + salonId, String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    private JsonNode getMine(String ownerToken, UUID salonId) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                SALONS_URL + "/mine", HttpMethod.GET, new HttpEntity<>(bearerHeaders(ownerToken)), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        for (JsonNode salon : objectMapper.readTree(response.getBody()).path("data")) {
+            if (salonId.toString().equals(salon.path("id").asText())) {
+                return salon;
+            }
+        }
+        throw new AssertionError("salon " + salonId + " missing from GET /salons/mine");
+    }
+
+    private JsonNode getMe(String token) throws Exception {
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.GET, new HttpEntity<>(bearerHeaders(token)), String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        return objectMapper.readTree(response.getBody()).path("data");
+    }
+
+    private String oblastName(UUID cityId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT o.name_uk FROM cities c JOIN oblasts o ON o.id = c.oblast_id WHERE c.id = ?",
+                String.class, cityId);
+    }
+
+    private String settlementName(UUID cityId) {
+        return jdbcTemplate.queryForObject("SELECT name_uk FROM cities WHERE id = ?", String.class, cityId);
+    }
+
+    /** A CITY with no urban districts (so no districtId is needed) and a name distinct from the fixture's. */
+    private UUID districtlessCityOtherThan(UUID excludedCityId) {
+        return jdbcTemplate.queryForObject("""
+                SELECT c.id FROM cities c
+                 WHERE c.settlement_type = 'CITY'
+                   AND c.id <> ?
+                   AND c.name_uk <> (SELECT name_uk FROM cities WHERE id = ?)
+                   AND NOT EXISTS (SELECT 1 FROM city_districts d WHERE d.city_id = c.id)
+                 ORDER BY c.katotth_code
+                 LIMIT 1
+                """, UUID.class, excludedCityId, excludedCityId);
+    }
 
     private UUID createOwner(String email) {
         UUID userId = UUID.randomUUID();
