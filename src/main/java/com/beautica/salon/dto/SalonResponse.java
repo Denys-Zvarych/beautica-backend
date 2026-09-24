@@ -1,5 +1,7 @@
 package com.beautica.salon.dto;
 
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.salon.entity.Salon;
 
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -25,7 +27,7 @@ import java.util.UUID;
  * cascade directly, instead of scanning every oblast's city list — mirroring
  * {@code UserProfileResponse#oblastId} and {@code MasterDetailResponse#oblastId}. It is
  * derived from {@code cityId} at read time (never stored), so callers must pass the
- * resolved value in; see {@link #from(Salon, UUID)}.
+ * resolved value in; see {@link #from(Salon, UUID, SettlementDisplayNames)}.
  */
 public record SalonResponse(
         UUID id,
@@ -62,7 +64,23 @@ public record SalonResponse(
         // Phase 12.1: isPrimary surfaces the DB-level one-primary-per-owner invariant
         // so callers can determine whether the salon created during registration is primary.
         boolean isPrimary,
-        Instant createdAt
+        Instant createdAt,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Kind of the settlement behind cityId, so the client can prefix "
+                        + "the saved-locality label (м./смт/с./с-ще) exactly as for a "
+                        + "GET /settlements row. Resolved at read time; null only if cityId "
+                        + "does not resolve.")
+        SettlementType citySettlementType,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Bare hromada adjective of the settlement behind cityId, populated "
+                        + "ONLY when its name is ambiguous within its oblast (same rule as "
+                        + "GET /settlements hromadaNameUk); null otherwise. The oblast half of "
+                        + "the label is `region`.")
+        String cityHromadaNameUk
 ) {
     /**
      * @param salon    the salon entity
@@ -71,8 +89,12 @@ public record SalonResponse(
      *                 for a persisted salon — {@code cityId} is DB-level NOT NULL (V150/V151)
      *                 and FK-valid, and {@code cities.oblast_id} is itself NOT NULL with a FK
      *                 to {@code oblasts}, so the resolution always succeeds.
+     * @param settlement resolved label parts of {@code salon.getCityId()} (see
+     *                   {@code SettlementDisplayNameResolver}), or {@code null} when unresolved —
+     *                   supplies {@code citySettlementType} and {@code cityHromadaNameUk}
      */
-    public static SalonResponse from(Salon salon, UUID oblastId) {
+    public static SalonResponse from(
+            Salon salon, UUID oblastId, SettlementDisplayNames settlement) {
         return new SalonResponse(
                 salon.getId(),
                 salon.getOwner() != null ? salon.getOwner().getId() : null,
@@ -92,7 +114,9 @@ public record SalonResponse(
                 salon.getAvatarUrl(),
                 salon.isActive(),
                 salon.isPrimary(),
-                salon.getCreatedAt()
+                salon.getCreatedAt(),
+                settlement == null ? null : settlement.settlementType(),
+                settlement == null ? null : settlement.hromadaNameUk()
         );
     }
 }

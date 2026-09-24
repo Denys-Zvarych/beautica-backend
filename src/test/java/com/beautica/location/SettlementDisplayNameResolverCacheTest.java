@@ -1,5 +1,6 @@
 package com.beautica.location;
 
+import com.beautica.location.entity.SettlementType;
 import com.beautica.config.CacheConfig;
 import com.beautica.location.repository.CityRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -50,7 +51,7 @@ class SettlementDisplayNameResolverCacheTest {
     @DisplayName("a second resolve of the same city does not hit the repository")
     void should_queryOnce_when_sameCityResolvedTwice() {
         UUID cityId = UUID.randomUUID();
-        var names = new SettlementDisplayNames("Вінниця", "Вінницька");
+        var names = new SettlementDisplayNames("Вінниця", "Вінницька", SettlementType.CITY, null);
         when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.of(names));
 
         Optional<SettlementDisplayNames> first = resolver.resolve(cityId);
@@ -102,7 +103,7 @@ class SettlementDisplayNameResolverCacheTest {
     void should_countHit_when_secondResolveServedFromCache() {
         UUID cityId = UUID.randomUUID();
         when(cityRepository.findDisplayNamesById(cityId))
-                .thenReturn(Optional.of(new SettlementDisplayNames("Вінниця", "Вінницька")));
+                .thenReturn(Optional.of(new SettlementDisplayNames("Вінниця", "Вінницька", SettlementType.CITY, null)));
         var cache = (org.springframework.cache.caffeine.CaffeineCache)
                 cacheManager.getCache(SettlementDisplayNameResolver.CACHE_SETTLEMENT_DISPLAY_NAMES);
         long hitsBefore = cache.getNativeCache().stats().hitCount();

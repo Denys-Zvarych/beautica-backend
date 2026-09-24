@@ -1,5 +1,9 @@
 package com.beautica.user;
 
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
+import io.swagger.v3.oas.annotations.media.Schema;
+
 import java.util.UUID;
 
 /**
@@ -79,7 +83,27 @@ public record UserProfileResponse(
          * {@code professionalTitle} and {@code avatarUrl}. The boolean exists so the app does not
          * fire that call speculatively and take a 404 for an owner who has opted out.
          */
-        boolean hasMasterProfile
+        boolean hasMasterProfile,
+
+        /**
+         * Kind of the saved settlement ({@code cityId}) — so the client can prefix the label
+         * («м.»/«смт»/«с.»/«с-ще») exactly as it does for a {@code GET /api/v1/settlements} row.
+         * {@code null} when no {@code cityId} is set. Resolved per read from the cached
+         * {@code SettlementDisplayNameResolver}; never stored on {@code users}.
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "Kind of the saved settlement (cityId); "
+                + "null when no cityId is set.")
+        SettlementType citySettlementType,
+
+        /**
+         * Bare hromada adjective of the saved settlement («Шишацька»), populated ONLY when the
+         * settlement's name is ambiguous within its oblast — the same rule as
+         * {@code GET /api/v1/settlements}' {@code hromadaNameUk}. {@code null} otherwise, and when
+         * no {@code cityId} is set. The oblast half of the label is {@link #oblastName}.
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "Bare hromada adjective of the saved settlement, "
+                + "populated only when its name is ambiguous within its oblast; null otherwise.")
+        String cityHromadaNameUk
 ) {
 
     // NOTE — there is deliberately NO `from(User)` convenience overload.
@@ -89,7 +113,7 @@ public record UserProfileResponse(
     // opted-in owner while GET /users/me answered `true` — one non-nullable field with two
     // meanings on the same wire type. A single four-argument factory forces every call site to
     // state what it knows about the flag, so the bug cannot silently come back through a
-    // convenience shortcut. Callers with nothing to resolve pass `from(user, null, null, false)`
+    // convenience shortcut. Callers with nothing to resolve pass `from(user, null, null, false, null)`
     // explicitly.
 
     /**
@@ -108,9 +132,13 @@ public record UserProfileResponse(
      * @param hasMasterProfile whether an active {@code SALON_OWNER}-type master row exists for
      *                         this user — resolved by the caller, since this record has no
      *                         repository access
+     * @param settlement       resolved label parts of {@code user.getCityId()}, or {@code null}
+     *                         when no city is set / unresolved — supplies
+     *                         {@code citySettlementType} and {@code cityHromadaNameUk}
      */
     public static UserProfileResponse from(
-            User user, String districtName, UUID oblastId, boolean hasMasterProfile) {
+            User user, String districtName, UUID oblastId, boolean hasMasterProfile,
+            SettlementDisplayNames settlement) {
         return new UserProfileResponse(
                 user.getId(),
                 user.getEmail(),
@@ -133,7 +161,9 @@ public record UserProfileResponse(
                 user.isActive(),
                 user.isEmailVerified(),
                 user.getSalonId(),
-                hasMasterProfile
+                hasMasterProfile,
+                settlement == null ? null : settlement.settlementType(),
+                settlement == null ? null : settlement.hromadaNameUk()
         );
     }
 }

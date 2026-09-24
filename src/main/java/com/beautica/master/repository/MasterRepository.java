@@ -133,6 +133,23 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     @Query("SELECT m.id FROM Master m WHERE m.salon.id = :salonId AND m.isActive = true")
     List<UUID> findIdsBySalonIdAndIsActiveTrue(@Param("salonId") UUID salonId);
 
+    /**
+     * Cache keys of EVERY master row affiliated with {@code salonId} — active or not, since
+     * {@code GET /masters/{masterId}} carries no {@code isActive} predicate and may hold an
+     * inactive master's entry. Id-only constructor projection; the {@code LEFT JOIN} keeps a
+     * detached master (null {@code user}) in the result with a null {@code userId}.
+     *
+     * <p>Used by {@code SalonService#updateSalon} to evict the per-master detail entries whose
+     * embedded salon block changed with the salon's {@code cityId}. Bounded by the salon's
+     * roster, which is small by construction.
+     */
+    @Query("""
+            SELECT new com.beautica.master.repository.MasterCacheKeys(m.id, u.id)
+              FROM Master m LEFT JOIN m.user u
+             WHERE m.salon.id = :salonId
+            """)
+    List<MasterCacheKeys> findCacheKeysBySalonId(@Param("salonId") UUID salonId);
+
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
 
     /**

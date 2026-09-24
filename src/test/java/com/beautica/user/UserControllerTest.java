@@ -174,7 +174,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote
                 null, null, null,                   // bio, instagram
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.getProfile(userId)).thenReturn(profile);
 
@@ -213,7 +213,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote
                 null, null, null,                   // bio, instagram
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
@@ -365,7 +365,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote — all stay null
                 null, null, null,             // bio, instagram, professionalTitle
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
@@ -452,7 +452,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote
                 null, null, null,                   // bio, instagram
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
@@ -484,7 +484,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote
                 null, null, null,                   // bio, instagram
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
@@ -525,7 +525,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote
                 null, "beauty_studio", null,        // bio, instagram (normalized — @ stripped by the service)
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);
@@ -558,7 +558,7 @@ class UserControllerTest {
                 null, null, null,             // street, buildingNo, locationNote
                 null, null, null,                   // instagram cleared by the service (blank → null)
                 true, false, null,
-                false                         // hasMasterProfile — CLIENT never has an owner-master row
+                false, null, null                         // hasMasterProfile — CLIENT never has an owner-master row
         );
         when(userService.updateProfile(eq(userId), any(UpdateProfileRequest.class)))
                 .thenReturn(updated);

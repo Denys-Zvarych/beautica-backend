@@ -12,6 +12,8 @@ import com.beautica.common.exception.ConflictException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
+import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
@@ -73,6 +75,7 @@ public class MasterService {
     private final CacheManager cacheManager;
     private final com.beautica.common.cache.MasterCachePrefixEvictor cachePrefixEvictor;
     private final LocationQueryService locationQueryService;
+    private final SettlementDisplayNameResolver settlementDisplayNameResolver;
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
@@ -355,11 +358,11 @@ public class MasterService {
      *
      * <p>Eviction: explicit per-key eviction runs after commit in
      * {@link #deactivateMaster}, {@link #deactivateOwnerMaster}, and the reactivation
-     * branch of {@link #createMasterForOwner}. Profile-text write paths (bio, phone,
-     * instagram, locality) do not evict {@code master-detail} because those callers
-     * ({@link com.beautica.user.UserService}) hold only the {@code userId}, not the
-     * {@code masterId} key. The 5-minute TTL bounds the staleness window for those
-     * writes — an acceptable trade-off for a public discovery view.
+     * branch of {@link #createMasterForOwner}. Profile-text and locality
+     * write paths in {@link com.beautica.user.UserService} resolve the {@code masterId} key from
+     * the {@code userId} and evict this entry after commit too, and {@code SalonService#updateSalon}
+     * evicts every affiliated master's entry when the salon's {@code cityId} changes (the embedded
+     * salon block carries the city label parts). The 5-minute TTL is only the backstop.
      *
      * <p>Do NOT remove the entity overload {@link #getMasterDetail(Master)} — it is
      * used by internal callers that already hold a loaded entity.
@@ -373,10 +376,7 @@ public class MasterService {
         requireAttached(master);
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
-        UUID masterCityId = master.getUser().getCityId();
-        UUID oblastId = resolveOblastId(masterCityId);
-        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
-        return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
+        return toDetailResponse(master, hours);
     }
 
     /**
@@ -392,10 +392,7 @@ public class MasterService {
     public MasterDetailResponse getMasterDetail(Master master) {
         requireAttached(master);
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
-        UUID masterCityId = master.getUser().getCityId();
-        UUID oblastId = resolveOblastId(masterCityId);
-        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
-        return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
+        return toDetailResponse(master, hours);
     }
 
     // Fix 3 + Fix 7: use shared authorizationService, batch-load all days, saveAll
@@ -1124,6 +1121,39 @@ public class MasterService {
         }
     }
 
+    /**
+     * The one {@link MasterDetailResponse} assembly shared by {@link #getMasterDetail(UUID)},
+     * {@link #getMasterDetail(Master)} and {@link #findMyMasterDetail(UUID)} — it was three
+     * hand-copied blocks, and adding the settlement label parts to three copies is how one drifts.
+     *
+     * <p>The master's own settlement and the affiliated salon's are resolved separately (the two
+     * cities differ in general), with the same same-city short-circuit as
+     * {@link #resolveSalonOblastId}. Both go through the shared cached
+     * {@link SettlementDisplayNameResolver}; every caller is itself {@code @Cacheable}, so this
+     * runs once per cache fill.
+     */
+    private MasterDetailResponse toDetailResponse(Master master, List<WorkingHours> hours) {
+        UUID masterCityId = master.getUser().getCityId();
+        UUID oblastId = resolveOblastId(masterCityId);
+        UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
+        SettlementDisplayNames settlement =
+                settlementDisplayNameResolver.resolve(masterCityId).orElse(null);
+        SettlementDisplayNames salonSettlement = resolveSalonSettlement(master, masterCityId, settlement);
+        return MasterDetailResponse.from(
+                master, hours, oblastId, salonOblastId, settlement, salonSettlement);
+    }
+
+    private SettlementDisplayNames resolveSalonSettlement(
+            Master master, UUID masterCityId, SettlementDisplayNames masterSettlement) {
+        if (master.getSalon() == null) {
+            return null;
+        }
+        UUID salonCityId = master.getSalon().getCityId();
+        return Objects.equals(salonCityId, masterCityId)
+                ? masterSettlement
+                : settlementDisplayNameResolver.resolve(salonCityId).orElse(null);
+    }
+
     private UUID resolveSalonOblastId(Master master, UUID masterCityId, UUID masterOblastId) {
         if (master.getSalon() == null) {
             return null;
@@ -1360,10 +1390,7 @@ public class MasterService {
                 .map(master -> {
                     requireAttached(master);
                     var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(master.getId());
-                    UUID masterCityId = master.getUser().getCityId();
-                    UUID oblastId = resolveOblastId(masterCityId);
-                    UUID salonOblastId = resolveSalonOblastId(master, masterCityId, oblastId);
-                    return MasterDetailResponse.from(master, hours, oblastId, salonOblastId);
+                    return toDetailResponse(master, hours);
                 });
     }
 

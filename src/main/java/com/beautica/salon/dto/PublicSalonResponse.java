@@ -1,5 +1,7 @@
 package com.beautica.salon.dto;
 
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.salon.entity.Salon;
 
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -17,9 +19,10 @@ import java.util.UUID;
  * nothing but the legacy free-text {@code city} / {@code region} / {@code address} fields,
  * which {@code SalonService} stopped writing as of Phase 10.6 — every salon created/edited
  * since then showed no location at all on its public profile. The legacy fields are kept on
- * the wire for backward-compatible clients. No name resolution is done here — like
- * {@code SalonResponse} and {@code MasterDetailResponse}, only raw taxonomy UUIDs are
- * returned; the client resolves human-readable names via {@code /locations/*}.
+ * the wire for backward-compatible clients. The settlement's display parts
+ * ({@code citySettlementType}, ambiguous-only {@code cityHromadaNameUk}) are resolved by the
+ * caller and passed in, so the client can compose the full settlement label beside
+ * {@code city}/{@code region}.
  *
  * <p>No masking is applied to the locality fields, unlike
  * {@link com.beautica.master.dto.MasterDetailResponse#fromPublic}, which masks a
@@ -35,7 +38,7 @@ import java.util.UUID;
  * public, static parent tier of an already-public city in the government-territory taxonomy; see
  * {@code backend-security} audit note on commit {@code f00b6f1}. Like {@code SalonResponse}, it
  * is derived from {@code cityId} at read time (never stored) — callers pass the resolved value
- * in; see {@link #from(Salon, UUID)}.
+ * in; see {@link #from(Salon, UUID, SettlementDisplayNames)}.
  *
  * <p>{@code phone} was added for the same reason as {@code oblastId}: this endpoint is the ONLY
  * load path the mobile owner/admin salon-profile screen uses, so omitting the phone left the
@@ -83,7 +86,23 @@ public record PublicSalonResponse(
         String avatarUrl,
         String coverImageUrl,
         BigDecimal avgRating,
-        int reviewCount
+        int reviewCount,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Kind of the settlement behind cityId, so the client can prefix "
+                        + "the saved-locality label (м./смт/с./с-ще) exactly as for a "
+                        + "GET /settlements row. Resolved at read time; null only if cityId "
+                        + "does not resolve.")
+        SettlementType citySettlementType,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Bare hromada adjective of the settlement behind cityId, populated "
+                        + "ONLY when its name is ambiguous within its oblast (same rule as "
+                        + "GET /settlements hromadaNameUk); null otherwise. The oblast half of "
+                        + "the label is `region`.")
+        String cityHromadaNameUk
 ) {
     /**
      * @param salon    the salon entity
@@ -92,8 +111,12 @@ public record PublicSalonResponse(
      *                 for a persisted salon — {@code cityId} is DB-level NOT NULL (V150/V151)
      *                 and FK-valid, and {@code cities.oblast_id} is itself NOT NULL with a FK
      *                 to {@code oblasts}, so the resolution always succeeds.
+     * @param settlement resolved label parts of {@code salon.getCityId()} (see
+     *                   {@code SettlementDisplayNameResolver}), or {@code null} when unresolved —
+     *                   supplies {@code citySettlementType} and {@code cityHromadaNameUk}
      */
-    public static PublicSalonResponse from(Salon salon, UUID oblastId) {
+    public static PublicSalonResponse from(
+            Salon salon, UUID oblastId, SettlementDisplayNames settlement) {
         return new PublicSalonResponse(
                 salon.getId(),
                 salon.getName(),
@@ -115,7 +138,9 @@ public record PublicSalonResponse(
                 // regardless of what happens to be persisted in the column (anti-bug §A/§I
                 // spirit: never surface a fabricated "0.00" rating on a public DTO).
                 salon.getReviewCount() == 0 ? null : salon.getAvgRating(),
-                salon.getReviewCount()
+                salon.getReviewCount(),
+                settlement == null ? null : settlement.settlementType(),
+                settlement == null ? null : settlement.hromadaNameUk()
         );
     }
 

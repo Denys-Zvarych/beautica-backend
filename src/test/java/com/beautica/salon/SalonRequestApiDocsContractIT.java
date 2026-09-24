@@ -4,6 +4,7 @@ import com.beautica.AbstractIntegrationTest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -90,5 +91,38 @@ class SalonRequestApiDocsContractIT extends AbstractIntegrationTest {
         JsonNode node = property(schema, field);
 
         assertThat(node.path("deprecated").asBoolean(false)).isFalse();
+    }
+
+    // ── saved-settlement label parts — additive, nullable, on every response that exposes cityId ──
+
+    @ParameterizedTest(name = "{0}.citySettlementType is the SettlementType enum")
+    @CsvSource({"SalonResponse", "PublicSalonResponse", "UserProfileResponse", "MasterDetailResponse"})
+    @DisplayName("citySettlementType is published with the same four values as GET /settlements")
+    void should_publishSettlementTypeEnum_when_responseExposesCityId(String schema) throws Exception {
+        JsonNode node = property(schema, "citySettlementType");
+
+        assertThat(node.path("enum"))
+                .extracting(JsonNode::asText)
+                .containsExactlyInAnyOrder("CITY", "TOWN", "VILLAGE", "SETTLEMENT");
+        assertThat(node.path("deprecated").asBoolean(false)).isFalse();
+    }
+
+    @ParameterizedTest(name = "{0}.cityHromadaNameUk is a nullable string")
+    @CsvSource({"SalonResponse", "PublicSalonResponse", "UserProfileResponse", "MasterDetailResponse"})
+    @DisplayName("cityHromadaNameUk is published as a nullable string")
+    void should_publishNullableHromada_when_responseExposesCityId(String schema) throws Exception {
+        JsonNode node = property(schema, "cityHromadaNameUk");
+
+        assertThat(node.toString()).as("%s.cityHromadaNameUk must admit null: %s", schema, node)
+                .contains("null");
+        assertThat(node.toString()).contains("string");
+    }
+
+    @Test
+    @DisplayName("MasterDetailResponse publishes the oblast half of the label as region")
+    void should_publishRegion_when_masterDetailResponse() throws Exception {
+        JsonNode node = property("MasterDetailResponse", "region");
+
+        assertThat(node.toString()).contains("string");
     }
 }

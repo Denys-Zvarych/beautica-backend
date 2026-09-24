@@ -178,7 +178,7 @@ class SalonServiceInviteHistoryTest {
         salonService = new SalonService(
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
                 masterServiceRepository, localityWriteValidator, masterService,
-                masterScheduleService, scheduleDateMath, cityRepository,
+                masterScheduleService, scheduleDateMath,
                 new com.beautica.location.SettlementDisplayNameResolver(cityRepository),
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,

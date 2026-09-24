@@ -115,6 +115,9 @@ class MasterServiceTest {
     // the REAL CacheConfig in OwnerMasterCacheTest and UserCacheEvictionIT, where a cache
     // actually exists to observe; verifying a mock call here would only restate the source.
     @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+    // Settlement label parts on MasterDetailResponse — default answer is Optional.empty(), so an
+    // unstubbed resolve() yields null parts, never an NPE on a missing collaborator.
+    @Mock private com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
     // Phase 29.2 fallout: getMasterCalendar now resolves an absolute-instant "now" for
     // BookingResponse.awaitingClosure. A real fixed-value Clock (not a bare @Mock, which would
     // return null from #instant() and NPE) — the exact instant is irrelevant to every test in

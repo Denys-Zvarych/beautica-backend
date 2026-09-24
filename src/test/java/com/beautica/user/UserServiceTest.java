@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.location.entity.SettlementType;
 import com.beautica.auth.Role;
 import com.beautica.common.RatingBucket;
 import com.beautica.common.exception.BusinessException;
@@ -171,8 +172,10 @@ class UserServiceTest {
      * Phase 325 perf LOW: this read used to call {@code cityRepository.findOblastIdById} directly
      * and so bypassed the {@code cityOblastId} cache that exists for exactly this question, while
      * SalonService and MasterService already asked it through the shared resolver. The
-     * {@code verifyNoInteractions(cityRepository)} is the half of this test that would go red on
-     * a regression to the direct call — asserting the returned value alone would not.
+     * {@code never()} checks on the repository's oblast finders are the half of this test that
+     * would go red on a regression to a direct call — asserting the returned value alone would
+     * not. (Not {@code verifyNoInteractions}: the label-part lookup now legitimately touches
+     * {@code cityRepository} once, through {@code SettlementDisplayNameResolver}.)
      */
     @Test
     @DisplayName("getProfile resolves oblastId through the SHARED cached resolver, not the repository")
@@ -192,7 +195,41 @@ class UserServiceTest {
                 .as("oblastId is whatever the shared resolver returns for the set cityId")
                 .isEqualTo(oblastId);
         verify(locationQueryService, times(1)).resolveCityOblastId(cityId);
-        verifyNoInteractions(cityRepository);
+        // The direct oblast query must stay unused. (cityRepository IS now touched once, by the
+        // shared SettlementDisplayNameResolver for the label parts — so not verifyNoInteractions.)
+        verify(cityRepository, never()).findByIdWithOblast(any());
+    }
+
+    @Test
+    @DisplayName("getProfile carries the saved settlement's type + ambiguous-only hromada from the shared resolver")
+    void should_returnSettlementParts_when_cityIdSet() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "village@example.com", Role.CLIENT, "Has", "Village", "+380501111111");
+        user.setCityId(cityId);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.of(new SettlementDisplayNames(
+                "Іванівка", "Полтавська", com.beautica.location.entity.SettlementType.VILLAGE, "Шишацька")));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.citySettlementType())
+                .isEqualTo(com.beautica.location.entity.SettlementType.VILLAGE);
+        assertThat(response.cityHromadaNameUk()).isEqualTo("Шишацька");
+    }
+
+    @Test
+    @DisplayName("getProfile returns null settlement parts, and issues no lookup, when no cityId is set")
+    void should_returnNullSettlementParts_when_cityIdNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "noparts@example.com", Role.CLIENT, "No", "City", "+380501111111");
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.citySettlementType()).isNull();
+        assertThat(response.cityHromadaNameUk()).isNull();
+        verify(cityRepository, never()).findDisplayNamesById(any());
     }
 
     @Test
@@ -531,7 +568,7 @@ class UserServiceTest {
         User user = buildUser(userId, "im@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
 
         when(cityRepository.findDisplayNamesById(cityId))
-                .thenReturn(Optional.of(new SettlementDisplayNames("Київ", "Київська область")));
+                .thenReturn(Optional.of(new SettlementDisplayNames("Київ", "Київська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -559,7 +596,7 @@ class UserServiceTest {
         User user = buildUser(userId, "c@example.com", Role.CLIENT, "Cli", "Ent", "+380501111111");
 
         when(cityRepository.findDisplayNamesById(cityId))
-                .thenReturn(Optional.of(new SettlementDisplayNames("Київ", "Київська область")));
+                .thenReturn(Optional.of(new SettlementDisplayNames("Київ", "Київська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -587,7 +624,7 @@ class UserServiceTest {
         User user = buildUser(userId, "c6@example.com", Role.CLIENT, "Test", "Client", "+380501111111");
 
         when(cityRepository.findDisplayNamesById(cityId))
-                .thenReturn(Optional.of(new SettlementDisplayNames("Одеса", "Одеська")));
+                .thenReturn(Optional.of(new SettlementDisplayNames("Одеса", "Одеська", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -645,8 +682,11 @@ class UserServiceTest {
         assertThat(user.getRegion())
                 .as("denormalized region text is left untouched when cityId is omitted")
                 .isEqualTo("Вінницька область");
-        // writeCityDisplayStrings is reached ONLY when cityId is non-null — never queried here.
-        verify(cityRepository, never()).findDisplayNamesById(any());
+        // writeCityDisplayStrings is reached ONLY when cityId is non-null. The ONE lookup left is
+        // the response's label-part resolution for the RETAINED id; the unstubbed lookup answers
+        // empty, which WOULD have cleared city/region had the write path applied it — the two
+        // label assertions above are what exclude that.
+        verify(cityRepository, times(1)).findDisplayNamesById(existingCityId);
         // street/buildingNo/locationNote are null in the request — Optional.ifPresent skips them → retained.
         assertThat(user.getStreet()).isEqualTo("Old Street");
         assertThat(user.getBuildingNo()).isEqualTo("1");
@@ -684,7 +724,9 @@ class UserServiceTest {
         assertThat(user.getStreet())
                 .as("the street IS updated by the PATCH")
                 .isEqualTo("вул. Нова");
-        verify(cityRepository, never()).findDisplayNamesById(any());
+        // Response-side label-part lookup only (see the sibling test above for why the city
+        // assertion, not a never(), is what proves the write path stayed out).
+        verify(cityRepository, times(1)).findDisplayNamesById(hnivanCityId);
     }
 
     @Test
@@ -696,7 +738,7 @@ class UserServiceTest {
         User user = buildUser(userId, "happy@example.com", Role.CLIENT, "Happy", "Path", "+380501111111");
 
         when(cityRepository.findDisplayNamesById(cityId))
-                .thenReturn(Optional.of(new SettlementDisplayNames("Львів", "Львівська область")));
+                .thenReturn(Optional.of(new SettlementDisplayNames("Львів", "Львівська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -729,7 +771,7 @@ class UserServiceTest {
         user.setDistrictId(UUID.randomUUID());
 
         when(cityRepository.findDisplayNamesById(cityId))
-                .thenReturn(Optional.of(new SettlementDisplayNames("Одеса", "Одеська область")));
+                .thenReturn(Optional.of(new SettlementDisplayNames("Одеса", "Одеська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -780,7 +822,11 @@ class UserServiceTest {
         assertThat(user.getStreet())
                 .as("the street IS updated")
                 .isEqualTo("вул. Хрещатик");
-        verify(cityRepository, never()).findDisplayNamesById(any());
+        assertThat(user.getCity())
+                .as("denormalised city is untouched — the response-side lookup answers empty and "
+                        + "would have cleared it had the write path applied it")
+                .isEqualTo("Київ");
+        verify(cityRepository, times(1)).findDisplayNamesById(existingCityId);
     }
 
     @Test

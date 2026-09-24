@@ -8,6 +8,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
 import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
 import com.beautica.master.entity.MasterType;
@@ -37,6 +38,9 @@ import java.util.stream.IntStream;
 @Slf4j
 @Service
 public class UserService {
+
+    /** Public {@code GET /masters/{masterId}} DTO cache, keyed by masterId (see MasterService). */
+    private static final String MASTER_DETAIL_CACHE = "master-detail";
 
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
@@ -146,7 +150,22 @@ public class UserService {
         UUID oblastId = user.getCityId() == null
                 ? null
                 : locationQueryService.resolveCityOblastId(user.getCityId());
-        return UserProfileResponse.from(user, districtName, oblastId, resolveHasMasterProfile(user));
+        return UserProfileResponse.from(user, districtName, oblastId, resolveHasMasterProfile(user),
+                resolveSettlement(user));
+    }
+
+    /**
+     * The saved settlement's label parts ({@code citySettlementType}, ambiguous-only hromada) for
+     * {@link UserProfileResponse}, via the SAME cached {@link SettlementDisplayNameResolver} that
+     * denormalises {@code users.city}/{@code users.region} on every locality write — no parallel
+     * lookup. Both parts are a pure function of {@code users.city_id} over static KATOTTH data, so
+     * they add no writer to the {@code user-profile} cache: every {@code city_id} write already
+     * evicts it ({@code evictUserCachesAfterCommit}).
+     *
+     * @return the parts, or {@code null} when no city is set or the id no longer resolves
+     */
+    private SettlementDisplayNames resolveSettlement(User user) {
+        return settlementDisplayNameResolver.resolve(user.getCityId()).orElse(null);
     }
 
     /**
@@ -236,7 +255,12 @@ public class UserService {
         //
         // This also fixes IndependentMasterController#updateLocality, which serialises the very
         // same DTO by delegating to this method — there is one write path, not two.
-        return UserProfileResponse.from(user, null, null, resolveHasMasterProfile(user));
+        // The settlement label parts are resolved here too, for the same reason as
+        // hasMasterProfile: the client re-renders the saved locality from THIS body after a
+        // locality edit, and a null type would drop the «м.»/«с.» prefix it had a second ago.
+        // Cached lookup — the locality write above has just warmed the same key.
+        return UserProfileResponse.from(user, null, null, resolveHasMasterProfile(user),
+                resolveSettlement(user));
     }
 
     /**
@@ -327,6 +351,18 @@ public class UserService {
     }
 
     /**
+     * The {@code master-detail} cache key for {@code userId}'s master row, or {@code null} when the
+     * role can never own one ({@code CLIENT}, {@code SALON_ADMIN}) — those skip the lookup, so the
+     * hot CLIENT profile write stays at its current query count.
+     */
+    private UUID resolveMasterIdForEviction(UUID userId, Role role) {
+        if (role == Role.CLIENT || role == Role.SALON_ADMIN) {
+            return null;
+        }
+        return masterRepository.findIdByUserId(userId).orElse(null);
+    }
+
+    /**
      * Registers a post-commit callback that evicts user-keyed caches and, for
      * {@code INDEPENDENT_MASTER} writes, also clears the discovery cache.
      *
@@ -335,6 +371,8 @@ public class UserService {
      * correctness rule). Caches evicted:
      * <ul>
      *   <li>{@code master-detail-by-user} — DTO cache for {@code GET /masters/me}</li>
+     *   <li>{@code master-detail} — DTO cache for the public {@code GET /masters/{masterId}},
+     *       keyed by the user's master id (only when a master row exists)</li>
      *   <li>{@code master-by-user} — entity cache used by calendar and slot endpoints</li>
      *   <li>{@code user-profile} — DTO cache for {@code GET /users/me} (audit-fix cycle 2)</li>
      *   <li>{@code search:masters} — discovery cache; cleared only when the writing user
@@ -354,12 +392,22 @@ public class UserService {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
+        // Resolved INSIDE the transaction (an id-only indexed lookup), used after commit.
+        UUID masterId = resolveMasterIdForEviction(userId, role);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
                 Cache detail = cacheManager.getCache("master-detail-by-user");
                 if (detail != null) {
                     detail.evict(userId);
+                }
+                // The PUBLIC GET /masters/{masterId} entry is keyed by masterId, not userId, and
+                // renders these same users-row fields (name, bio, city/region and the settlement
+                // label parts). Without this evict it served the pre-write profile for its full
+                // TTL after every locality/profile write.
+                Cache publicDetail = cacheManager.getCache(MASTER_DETAIL_CACHE);
+                if (publicDetail != null && masterId != null) {
+                    publicDetail.evict(masterId);
                 }
                 Cache byUser = cacheManager.getCache("master-by-user");
                 if (byUser != null) {

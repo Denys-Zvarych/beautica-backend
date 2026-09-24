@@ -1,6 +1,8 @@
 package com.beautica.salon.dto;
 
 import com.beautica.TestConstants;
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.salon.entity.Salon;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -24,7 +26,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.avgRating())
                 .as("avgRating must be null, not a fabricated value, when reviewCount is 0")
@@ -43,7 +45,7 @@ class PublicSalonResponseTest {
                 .reviewCount(12)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.avgRating()).isEqualByComparingTo("4.75");
         assertThat(response.reviewCount()).isEqualTo(12);
@@ -60,7 +62,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.coverImageUrl()).isEqualTo("https://cdn.example.com/cover.jpg");
     }
@@ -76,7 +78,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.phone())
                 .as("the salon phone is the client-facing contact rendered next to instagramUrl; "
@@ -94,7 +96,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.phone()).isNull();
     }
@@ -116,7 +118,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.phone())
                 .as("a persisted empty-string phone must be served as \"\", not tidied into null")
@@ -133,7 +135,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.getClass().getRecordComponents())
                 .as("PublicSalonResponse must never grow an ownerId/owner-identifying field")
@@ -156,7 +158,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, oblastId);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, oblastId, null);
 
         assertThat(response.cityId()).isEqualTo(cityId);
         assertThat(response.oblastId())
@@ -174,7 +176,7 @@ class PublicSalonResponseTest {
                 .reviewCount(0)
                 .build();
 
-        PublicSalonResponse response = PublicSalonResponse.from(salon, null);
+        PublicSalonResponse response = PublicSalonResponse.from(salon, null, null);
 
         assertThat(response.oblastId()).isNull();
     }
@@ -197,8 +199,8 @@ class PublicSalonResponseTest {
     void should_returnNullAddress_when_salonHasStructuredStreet() {
         Salon salon = salonWith("вул. Шевченка", "вул. Домашня 1, кв. 5");
 
-        PublicSalonResponse publicView = PublicSalonResponse.from(salon, null);
-        SalonResponse ownerView = SalonResponse.from(salon, null);
+        PublicSalonResponse publicView = PublicSalonResponse.from(salon, null, null);
+        SalonResponse ownerView = SalonResponse.from(salon, null, null);
 
         assertThat(publicView.address())
                 .as("uneditable legacy text must not be published once a street supersedes it")
@@ -212,8 +214,8 @@ class PublicSalonResponseTest {
     void should_returnLegacyAddress_when_salonHasNoStreet() {
         Salon salon = salonWith(null, "вул. Стара 3");
 
-        assertThat(PublicSalonResponse.from(salon, null).address()).isEqualTo("вул. Стара 3");
-        assertThat(SalonResponse.from(salon, null).address()).isEqualTo("вул. Стара 3");
+        assertThat(PublicSalonResponse.from(salon, null, null).address()).isEqualTo("вул. Стара 3");
+        assertThat(SalonResponse.from(salon, null, null).address()).isEqualTo("вул. Стара 3");
     }
 
     @Test
@@ -221,6 +223,38 @@ class PublicSalonResponseTest {
     void should_returnLegacyAddress_when_streetIsBlank() {
         Salon salon = salonWith("   ", "вул. Стара 3");
 
-        assertThat(PublicSalonResponse.from(salon, null).address()).isEqualTo("вул. Стара 3");
+        assertThat(PublicSalonResponse.from(salon, null, null).address()).isEqualTo("вул. Стара 3");
+    }
+
+    // ── saved-settlement label parts ─────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("BOTH shapes carry the resolved settlementType + ambiguous-only hromada beside city/region")
+    void should_carrySettlementParts_when_settlementResolved() {
+        Salon salon = salonWith("вул. Шевченка", null);
+        var village = new SettlementDisplayNames(
+                "Іванівка", "Полтавська", SettlementType.VILLAGE, "Шишацька");
+
+        PublicSalonResponse publicView = PublicSalonResponse.from(salon, null, village);
+        SalonResponse ownerView = SalonResponse.from(salon, null, village);
+
+        assertThat(publicView.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(publicView.cityHromadaNameUk()).isEqualTo("Шишацька");
+        assertThat(ownerView.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(ownerView.cityHromadaNameUk()).isEqualTo("Шишацька");
+    }
+
+    @Test
+    @DisplayName("BOTH shapes return null parts when the settlement did not resolve — never a fabricated CITY")
+    void should_returnNullParts_when_settlementUnresolved() {
+        Salon salon = salonWith("вул. Шевченка", null);
+
+        PublicSalonResponse publicView = PublicSalonResponse.from(salon, null, null);
+        SalonResponse ownerView = SalonResponse.from(salon, null, null);
+
+        assertThat(publicView.citySettlementType()).isNull();
+        assertThat(publicView.cityHromadaNameUk()).isNull();
+        assertThat(ownerView.citySettlementType()).isNull();
+        assertThat(ownerView.cityHromadaNameUk()).isNull();
     }
 }

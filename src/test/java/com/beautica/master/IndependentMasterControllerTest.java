@@ -191,7 +191,7 @@ class IndependentMasterControllerTest {
                 true,         // isActive
                 true,         // emailVerified
                 null,         // salonId
-                false         // hasMasterProfile — an INDEPENDENT_MASTER's row is not SALON_OWNER-type
+                false, null, null         // hasMasterProfile — an INDEPENDENT_MASTER's row is not SALON_OWNER-type
         );
     }
 

@@ -1,5 +1,7 @@
 package com.beautica.master.dto;
 
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.salon.dto.PublicSalonResponse;
@@ -56,8 +58,14 @@ class MasterDetailResponseTest {
                 new BigDecimal("4.75"), 12, masterType, salon, List.of(),
                 cityUuid, oblastUuid, districtUuid,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null);
+                null,
+                // region / citySettlementType / cityHromadaNameUk — non-null so a masking
+                // assertion can fail (a null fixture would pass a missing mask vacuously)
+                OWN_REGION, SettlementType.VILLAGE, OWN_HROMADA);
     }
+
+    private static final String OWN_REGION = "Полтавська";
+    private static final String OWN_HROMADA = "Шишацька";
 
     @Test
     @DisplayName("INDEPENDENT_MASTER: address fields stay unmasked; phoneNumber is masked")
@@ -170,7 +178,7 @@ class MasterDetailResponseTest {
         when(salon.getPhone()).thenReturn(SALON_BUSINESS_PHONE);
         MasterDetailResponse full = fullDetailFor(MasterType.SALON_MASTER,
                 UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
-                PublicSalonResponse.from(salon, UUID.randomUUID()));
+                PublicSalonResponse.from(salon, UUID.randomUUID(), null));
 
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 
@@ -224,7 +232,7 @@ class MasterDetailResponseTest {
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(user);
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
 
         assertThat(response.professionalTitle())
                 .as("MasterDetailResponse.from reads professionalTitle off the linked User")
@@ -248,7 +256,7 @@ class MasterDetailResponseTest {
         when(master.getSalon()).thenReturn(salon);
 
         MasterDetailResponse response =
-                MasterDetailResponse.from(master, List.of(), masterOblastId, salonOblastId);
+                MasterDetailResponse.from(master, List.of(), masterOblastId, salonOblastId, null, null);
 
         assertThat(response.oblastId())
                 .as("the master's own oblastId must come from the `oblastId` parameter")
@@ -272,7 +280,7 @@ class MasterDetailResponseTest {
         when(master.getSalon()).thenReturn(null);
 
         MasterDetailResponse response =
-                MasterDetailResponse.from(master, List.of(), UUID.randomUUID(), UUID.randomUUID());
+                MasterDetailResponse.from(master, List.of(), UUID.randomUUID(), UUID.randomUUID(), null, null);
 
         assertThat(response.salon()).isNull();
     }
@@ -293,7 +301,7 @@ class MasterDetailResponseTest {
         // count, not off a null/zero check on the rating itself.
         when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
 
         assertThat(response.avgRating())
                 .as("an unreviewed master must not be served a fabricated 0.00 rating")
@@ -311,7 +319,7 @@ class MasterDetailResponseTest {
         when(master.getReviewCount()).thenReturn(1);
         when(master.getAvgRating()).thenReturn(new BigDecimal("1.00"));
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
 
         assertThat(response.avgRating())
                 .as("suppression triggers on count == 0 only — a real low rating must survive")
@@ -327,12 +335,93 @@ class MasterDetailResponseTest {
                 PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
                 null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null);
+                null, null, null, null);
 
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 
         assertThat(publicView.avgRating())
                 .as("the public masking copy must not resurrect a 0.00 from a null average")
                 .isNull();
+    }
+
+    // ── saved-settlement label parts (region / citySettlementType / cityHromadaNameUk) ─────
+
+    @Test
+    @DisplayName("fromPublic keeps the own-settlement label parts for INDEPENDENT_MASTER, like city")
+    void should_keepSettlementParts_when_masterTypeIsIndependentMaster() {
+        MasterDetailResponse full = fullDetailFor(MasterType.INDEPENDENT_MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.region()).isEqualTo(OWN_REGION);
+        assertThat(publicView.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(publicView.cityHromadaNameUk()).isEqualTo(OWN_HROMADA);
+    }
+
+    @Test
+    @DisplayName("fromPublic masks the own-settlement label parts for SALON_MASTER and SALON_OWNER, like city")
+    void should_maskSettlementParts_when_masterIsSalonAffiliated() {
+        for (MasterType type : List.of(MasterType.SALON_MASTER, MasterType.SALON_OWNER)) {
+            MasterDetailResponse full = fullDetailFor(type,
+                    UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+            MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+            assertThat(publicView.city()).as("%s precondition: city masked", type).isNull();
+            assertThat(publicView.region()).as("%s region", type).isNull();
+            assertThat(publicView.citySettlementType()).as("%s citySettlementType", type).isNull();
+            assertThat(publicView.cityHromadaNameUk()).as("%s cityHromadaNameUk", type).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("withBookingsThisMonth preserves the settlement label parts")
+    void should_preserveSettlementParts_when_bookingsThisMonthAttached() {
+        MasterDetailResponse full = fullDetailFor(MasterType.SALON_OWNER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+        MasterDetailResponse withCount = full.withBookingsThisMonth(7);
+
+        assertThat(withCount.region()).isEqualTo(OWN_REGION);
+        assertThat(withCount.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(withCount.cityHromadaNameUk()).isEqualTo(OWN_HROMADA);
+    }
+
+    @Test
+    @DisplayName("from takes region from the resolved settlement and routes the master's and the salon's settlements to the right halves")
+    void should_routeOwnAndSalonSettlementParts_when_bothResolved() {
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getSalon()).thenReturn(mock(Salon.class));
+        var own = new SettlementDisplayNames("Іванівка", OWN_REGION, SettlementType.VILLAGE, OWN_HROMADA);
+        var salonCity = new SettlementDisplayNames("Львів", "Львівська", SettlementType.CITY, null);
+
+        MasterDetailResponse response =
+                MasterDetailResponse.from(master, List.of(), null, null, own, salonCity);
+
+        assertThat(response.region()).isEqualTo(OWN_REGION);
+        assertThat(response.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(response.cityHromadaNameUk()).isEqualTo(OWN_HROMADA);
+        assertThat(response.salon().citySettlementType())
+                .as("the nested salon takes the SEPARATE salon settlement, never the master's own")
+                .isEqualTo(SettlementType.CITY);
+        assertThat(response.salon().cityHromadaNameUk()).isNull();
+    }
+
+    @Test
+    @DisplayName("from returns a null region when cityId is null, even if stale legacy users.region text is present")
+    void should_returnNullRegion_when_cityIdNull_evenIfLegacyRegionTextPresent() {
+        User user = mock(User.class);
+        when(user.getRegion()).thenReturn("Стара область"); // stale legacy text, city_id NULL
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(user);
+
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
+
+        assertThat(response.region())
+                .as("no resolved settlement → no oblast label, whatever legacy text the row holds")
+                .isNull();
+        assertThat(response.citySettlementType()).isNull();
     }
 }

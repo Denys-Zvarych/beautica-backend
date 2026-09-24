@@ -1,5 +1,6 @@
 package com.beautica.location.repository;
 
+import com.beautica.location.KeyedSettlementDisplayNames;
 import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.SettlementType;
@@ -254,7 +255,8 @@ public interface CityRepository extends JpaRepository<City, UUID> {
 
     /**
      * Resolves a settlement's two display labels — {@code cities.name_uk} and its oblast's
-     * {@code name_uk} — as a constructor projection, for the {@code city}/{@code region}
+     * {@code name_uk} — plus its {@code settlement_type} and its ambiguous-only hromada, as a
+     * constructor projection, for the {@code city}/{@code region}
      * denormalisation on the user and salon write paths
      * ({@link com.beautica.location.SettlementDisplayNameResolver}).
      *
@@ -266,11 +268,35 @@ public interface CityRepository extends JpaRepository<City, UUID> {
      * @return the labels, or empty when no city has that id
      */
     @Query("""
-            SELECT new com.beautica.location.SettlementDisplayNames(c.nameUk, o.nameUk)
+            SELECT new com.beautica.location.SettlementDisplayNames(
+                       c.nameUk, o.nameUk, c.settlementType,
+                       CASE WHEN c.ambiguousInOblast = true THEN c.hromadaNameUk ELSE NULL END)
               FROM City c JOIN c.oblast o
              WHERE c.id = :id
             """)
     Optional<SettlementDisplayNames> findDisplayNamesById(@Param("id") UUID id);
+
+    /**
+     * Batch sibling of {@link #findDisplayNamesById(UUID)} — resolves the display labels of every
+     * id in ONE {@code IN (...)} query, for list endpoints that stamp a settlement label onto each
+     * row ({@code GET /salons/mine}). Never loop the single-id finder instead (§E). Each row also
+     * carries the parent {@code oblastId}, so that endpoint needs no second oblast batch.
+     *
+     * <p>Same projection, same ambiguous-only hromada rule as the single-id form and as the
+     * {@code /settlements} autocomplete ({@code CASE WHEN ambiguous_in_oblast}); an id with no
+     * city row is simply absent from the result.
+     *
+     * @param ids distinct, non-null city ids; the caller short-circuits an empty set
+     * @return one keyed row per found id
+     */
+    @Query("""
+            SELECT new com.beautica.location.KeyedSettlementDisplayNames(
+                       c.id, o.id, c.nameUk, o.nameUk, c.settlementType,
+                       CASE WHEN c.ambiguousInOblast = true THEN c.hromadaNameUk ELSE NULL END)
+              FROM City c JOIN c.oblast o
+             WHERE c.id IN :ids
+            """)
+    List<KeyedSettlementDisplayNames> findDisplayNamesByIdIn(@Param("ids") Collection<UUID> ids);
 
     /**
      * Batch-resolves city {@code name_uk} labels for a set of city ids in a
@@ -290,27 +316,6 @@ public interface CityRepository extends JpaRepository<City, UUID> {
      */
     @Query("SELECT c.id, c.nameUk FROM City c WHERE c.id IN :ids")
     List<Object[]> findNameUkByIdIn(@Param("ids") Collection<UUID> ids);
-
-    /**
-     * Batch-resolves city → parent-oblast-id pairs for a set of city ids in a
-     * single {@code IN (...)} query.
-     *
-     * <p>Sibling of {@link #findNameUkByIdIn(Collection)}: used by
-     * {@code SalonService#getOwnerSalons} to stamp {@code oblastId} onto a whole
-     * page of an owner's salons at once. The single-key {@link #findByIdWithOblast(UUID)}
-     * (directly, or via {@code LocationQueryService#resolveCityOblastId}) would N+1 across the
-     * list (§E) — this
-     * fuses the resolution into one round-trip regardless of how many distinct
-     * cities the owner's salons reference. The 2-element scalar projection
-     * {@code [id, oblast.id]} avoids hydrating the {@link City} entity (and its
-     * LAZY {@code oblast}) just to read one FK column.
-     *
-     * @param ids distinct, non-null city ids to resolve
-     * @return rows of {@code [UUID cityId, UUID oblastId]}; empty when {@code ids}
-     *         is empty
-     */
-    @Query("SELECT c.id, c.oblast.id FROM City c WHERE c.id IN :ids")
-    List<Object[]> findOblastIdsByIdIn(@Param("ids") Collection<UUID> ids);
 
     /**
      * Single-query taxonomy resolution for the Phase 10.6 most-specific-node
