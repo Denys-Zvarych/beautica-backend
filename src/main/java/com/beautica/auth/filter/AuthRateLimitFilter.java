@@ -154,6 +154,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Matched EXACTLY, not by prefix: there is one route here and no /settlements/** subtree,
     // so a prefix match would silently adopt any future child route into this bucket's budget.
     private static final String SETTLEMENT_SEARCH_PATH = "/api/v1/settlements";
+    // Phase 331 search-suggestions autocomplete (GET, permitAll): GET /api/v1/search/suggestions.
+    // Matched EXACTLY and checked BEFORE the SEARCH_PATH_PREFIX branch below — this path also
+    // starts with "/api/v1/search/", so if this check ran AFTER the prefix branch it would never
+    // be reached (the prefix branch returns unconditionally) and suggestions would silently spend
+    // the results-search (searchBuckets) budget instead of its own. See the SEARCH_PATH_PREFIX
+    // branch's amended comment in doFilterInternal.
+    private static final String SEARCH_SUGGESTIONS_PATH = "/api/v1/search/suggestions";
     // Remove-admin DELETE carries both {salonId} and {userId} path variables, with the literal
     // "/admins/" segment between them: /api/v1/salons/{salonId}/admins/{userId}. Neither variable
     // can itself contain a "/" (both are UUIDs), so prefix + contains(segment) uniquely identifies
@@ -385,6 +392,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // names typed end to end plus a mistyped retry before the drip has to carry the session — while
     // capping the cold-start burst at ~0.6 s of database time, a quarter of what it was.
     private static final long SETTLEMENT_SEARCH_INITIAL_TOKENS = SETTLEMENT_SEARCH_CAPACITY / 4;
+    // Per-IP cap for GET /api/v1/search/suggestions (Phase 331) — its OWN bucket, a clone of
+    // settlementSearchBuckets' shape (same capacity, same greedy refill, same quarter first-
+    // contact grant), because the traffic SHAPE is identical: an incremental autocomplete box
+    // that fires roughly one request per settled keystroke. Not folded into searchBuckets
+    // (SEARCH_CAPACITY) — that bucket's own comment ("This is the ONLY search bucket") is about
+    // /search/masters and /search/salons sharing ONE result-page budget; typing traffic on the
+    // suggestions box must not starve a concurrent results-page read from the same IP, the exact
+    // reasoning settlementSearchBuckets already records for why it is not folded into
+    // searchBuckets either. 240/60s per IP.
+    private static final long SEARCH_SUGGESTIONS_CAPACITY = 240;
+    private static final Duration SEARCH_SUGGESTIONS_WINDOW = Duration.ofMinutes(1);
+    private static final long SEARCH_SUGGESTIONS_INITIAL_TOKENS = SEARCH_SUGGESTIONS_CAPACITY / 4;
     // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
     // unthrottled surface. This is both the residual enumeration/timing surface left after the
     // InviteService 409->idempotent fix (the already-registered and active-invite branches do
@@ -550,6 +569,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // flood/enumeration guard. Built internally rather than injected so the public constructor
     // stays stable for the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> settlementSearchBuckets;
+    // Per-IP bucket for GET /api/v1/search/suggestions — the Phase 331 search-suggestions
+    // autocomplete's own budget, carved out of searchBuckets so typing in the suggestions box
+    // cannot starve a concurrent /search/masters or /search/salons read from the same IP. Built
+    // internally rather than injected so the public constructor stays stable for the
+    // slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> searchSuggestionBuckets;
     // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
     // timing oracle in InviteService.sendInvite (the already-registered / active-invite
     // branches return fast). Built internally rather than injected so the public 16-arg
@@ -687,6 +712,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(settlementSearchBandwidth())
                         .build());
+        this.searchSuggestionBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SEARCH_SUGGESTIONS_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(searchSuggestionBandwidth())
+                        .build());
         this.inviteBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
@@ -810,6 +841,23 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
+    /**
+     * A clone of {@link #settlementSearchBandwidth()}'s shape (greedy refill + a quarter
+     * first-contact grant) for the same reason: {@code GET /api/v1/search/suggestions} is another
+     * per-settled-keystroke autocomplete box, so the same burst-vs-sustained-rate argument
+     * applies verbatim. Package-private for the same reason as its sibling —
+     * {@code SearchSuggestionsGetRateLimitRegressionTest} builds a bucket from this EXACT
+     * Bandwidth over a controllable {@code TimeMeter} to assert the refill strategy, which is not
+     * observable through {@code doFilterInternal} without a banned sleep or a real 60s wait.
+     */
+    static Bandwidth searchSuggestionBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SEARCH_SUGGESTIONS_CAPACITY)
+                .refillGreedy(SEARCH_SUGGESTIONS_CAPACITY, SEARCH_SUGGESTIONS_WINDOW)
+                .initialTokens(SEARCH_SUGGESTIONS_INITIAL_TOKENS)
+                .build();
+    }
+
     private static Bandwidth inviteBandwidth() {
         return BandwidthBuilder.builder()
                 .capacity(INVITE_CAPACITY)
@@ -901,12 +949,30 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Search-suggestions rate-limit: GET /api/v1/search/suggestions (Phase 331) — checked
+        // BEFORE the SEARCH_PATH_PREFIX branch below on purpose. That branch matches by prefix on
+        // "/api/v1/search/", which this exact path also starts with; if this check ran after it,
+        // the prefix branch would already have returned and this one would NEVER run, silently
+        // spending the results-search (searchBuckets) budget instead of its own. Cap: 240 / 60 s
+        // per IP, its own bucket (searchSuggestionBuckets) — see SEARCH_SUGGESTIONS_CAPACITY for
+        // why it is a separate budget from searchBuckets.
+        // FALSIFY: move this branch after the SEARCH_PATH_PREFIX branch below and
+        // SearchSuggestionsGetRateLimitRegressionTest's carve-out test must go red.
+        if (HttpMethod.GET.matches(method)
+                && path.equals(SEARCH_SUGGESTIONS_PATH)) {
+            applyRateLimit(request, response, filterChain, searchSuggestionBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
         // before the POST-only guard so these GET reads are covered. These permitAll() paths
         // expose authed-only independent-master street addresses, so the throttle is the
         // IP-layer ceiling on sustained scraping and DB amplification. Cap: 240 / 60 s per IP
-        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY search bucket — do
-        // not add a second one; both /search/masters and /search/salons share it by design.
+        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY bucket for RESULT reads
+        // — do not add a second one for /search/masters or /search/salons, which still share it
+        // by design. GET /api/v1/search/suggestions is deliberately carved OUT of this prefix by
+        // the branch above: it is typing traffic, not a result-page read, and must not compete
+        // with it for the same 240-token budget (Phase 331).
         if (HttpMethod.GET.matches(method)
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,

@@ -5,6 +5,9 @@ import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
 import com.beautica.location.service.SettlementSearchService;
 import com.beautica.search.service.SearchCacheNames;
+import com.beautica.search.service.SearchSuggestionActivePlaces;
+import com.beautica.search.service.SearchSuggestionAvailability;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
@@ -588,6 +591,55 @@ public class CacheConfig {
                 Caffeine.newBuilder()
                         .maximumSize(1024)
                         .expireAfterWrite(24, TimeUnit.HOURS));
+        // Phase 331 — the search-suggestions catalogue (SearchSuggestionCatalogue#snapshot),
+        // every selectable category + active service type with NO availability applied. ONE
+        // entry (the method takes no arguments — SimpleKey.EMPTY), 10-minute TTL (shorter than
+        // the 60-min service-types/platform-category-order caches it is built from, since this
+        // is a convenience autocomplete list, not authoritative catalogue data). sync = true on
+        // the bean itself (§F-7): the single hottest key behind an unauthenticated per-keystroke
+        // endpoint must collapse a TTL-expiry herd to one reload. maximumSize(4), not 1: mirrors
+        // approved-categories' own headroom for a future argument the method might gain.
+        manager.registerCustomCache(SearchSuggestionCatalogue.CACHE_NAME,
+                Caffeine.newBuilder()
+                        .maximumSize(4)
+                        .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
+        // Phase 331 — per-place availability for search suggestions
+        // (SearchSuggestionAvailability#forPlace), keyed by the district-primary-normalised
+        // SuggestionPlaceKey(cityId, districtId). D5 sizing: cities holds 25 698 settlements
+        // since V170, but availability only exists where providers are — realistically a few
+        // hundred distinct keys per 10-minute TTL (the pre-widening ~356 cities + 76 districts).
+        // maximumSize(1000) bounds worst case at ~15 MB (≤~200 UUIDs + ~21 short strings per
+        // entry), ~1 MB typical. Deliberately NOT sync = true — unlike the catalogue's one hot
+        // key, this cache misses on every new place, and a sync load would hold Caffeine's bin
+        // lock (pinning a virtual-thread carrier) across the whole miss, the same reasoning as
+        // settlementSearch above. Metered so the 1000 sizing can be checked against the real hit
+        // ratio.
+        registerMetered(manager, meterRegistry, SearchSuggestionAvailability.CACHE_NAME,
+                Caffeine.newBuilder()
+                        .maximumSize(1000)
+                        .expireAfterWrite(10, TimeUnit.MINUTES));
+        // Audit-fix cycle 1, finding 2 (LOW security + perf) — the active-places short-circuit
+        // gate consulted by SearchSuggestionService BEFORE calling
+        // SearchSuggestionAvailability#forPlace. Without this, searchSuggestionAvailability's
+        // 1 000-slot cache was keyed on an attacker-choosable (cityId, districtId) pair: any
+        // well-formed but unknown UUID minted one repository query AND one new per-place cache
+        // entry, and cycling ids could evict real places' hot entries. This cache holds ONE
+        // entry (the method takes no arguments — SimpleKey.EMPTY): the full set of city/district
+        // ids that have >=1 bookable offer, computed by SearchSuggestionAvailabilityRepository
+        // #findActivePlaces() with the SAME D3 predicates the per-place query uses. A request
+        // whose place is absent from this set short-circuits to PlaceAvailability.EMPTY without
+        // ever touching the per-place cache or the DB. Same 10-minute TTL as the two caches
+        // above (the national key is exempt from this gate and still resolves through
+        // searchSuggestionAvailability directly). sync = true: unlike the per-place cache, this
+        // one is now consulted on EVERY non-national request, so a TTL-expiry herd must collapse
+        // to one reload, mirroring searchSuggestionCatalogue's reasoning. maximumSize(4) mirrors
+        // that cache's own headroom for a future argument the method might gain.
+        manager.registerCustomCache(SearchSuggestionActivePlaces.CACHE_NAME,
+                Caffeine.newBuilder()
+                        .maximumSize(4)
+                        .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
         // Phase 240 perf MEDIUM — shared cityId -> oblastId resolver
         // (LocationQueryService#resolveCityOblastId) backing SalonService/MasterService's
         // per-request oblastId resolution. Same static-reference-data rationale as the

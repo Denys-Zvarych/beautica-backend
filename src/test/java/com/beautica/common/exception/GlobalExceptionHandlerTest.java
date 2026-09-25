@@ -646,6 +646,39 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    @DisplayName("handleValidation — a typeMismatch field error (failed type conversion) never echoes the "
+            + "raw rejected value; a genuine @Pattern/@Size message on another field is untouched (Phase 331 audit)")
+    void should_genericizeTypeMismatchMessage_butKeepBeanValidationMessagesVerbatim_when_validationFails()
+            throws NoSuchMethodException {
+        // Arrange — mirrors what Spring's DataBinder actually produces for a malformed
+        // @ModelAttribute-bound UUID field (e.g. GET .../suggestions?location.cityId=not-a-uuid):
+        // code "typeMismatch", rejectedValue the raw string, and a Spring-generated default
+        // message that embeds it verbatim — exactly the shape that leaked "not-a-uuid" into the
+        // response body before this fix (SearchSuggestionIT.should_return400_when_cityIdIsMalformed).
+        MethodParameter param = new MethodParameter(
+                GlobalExceptionHandlerTest.class.getDeclaredMethod("dummyMethod", String.class), 0);
+        var bindingResult = new BeanPropertyBindingResult(new Object(), "target");
+        bindingResult.addError(new FieldError(
+                "target", "location.cityId", "not-a-uuid", true, new String[]{"typeMismatch"}, null,
+                "Failed to convert value of type 'java.lang.String' to required type "
+                        + "'java.util.UUID'; Invalid UUID string: not-a-uuid"));
+        // A genuine Bean Validation message on a sibling field — must stay verbatim (it is
+        // developer-authored, declared-field-name-safe text, never a bound-value echo).
+        bindingResult.addError(new FieldError("target", "q", "q must be at most 50 characters"));
+        var ex = new MethodArgumentNotValidException(param, bindingResult);
+
+        ResponseEntity<ApiResponse<Void>> response = handler.handleValidation(ex);
+
+        assertThat(response.getBody().errors().get("location.cityId"))
+                .as("the raw rejected value must never reach the client")
+                .isEqualTo("Invalid value")
+                .doesNotContain("not-a-uuid");
+        assertThat(response.getBody().errors())
+                .as("a genuine Bean Validation message on another field is unaffected")
+                .containsEntry("q", "q must be at most 50 characters");
+    }
+
+    @Test
     @DisplayName("Should return 400 with static message when MissingServletRequestPartException is thrown")
     void should_return400_when_missingRequestPart() {
         // Arrange — multipart endpoint called without the required 'file' part

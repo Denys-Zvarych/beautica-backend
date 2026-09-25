@@ -70,4 +70,24 @@ public class ServiceTypeSlugResolver {
         }
         return bySlug;
     }
+
+    /**
+     * Every active platform service type, reduced to {@link ServiceTypeCatalogueEntry} — the
+     * search-suggestions catalogue snapshot's SERVICE half (Phase 331).
+     *
+     * <p>Backed by the SAME cached read as {@link #resolve(List)}
+     * ({@link ServiceTypeLookup#getByCategory(java.util.UUID)} with a {@code null} category),
+     * so building the suggestions catalogue costs no new query and no new cache — only a second
+     * projection of the one list already held in memory.
+     *
+     * @return every active type, in the cached list's order (no ordering contract beyond that —
+     *         the caller re-sorts as its own ranking requires)
+     */
+    @Transactional(readOnly = true)
+    public List<ServiceTypeCatalogueEntry> allActiveTypes() {
+        return serviceTypeLookup.getByCategory(null).stream()
+                .map(type -> new ServiceTypeCatalogueEntry(
+                        type.getId(), type.getSlug(), type.getNameUk(), type.getPlatformCategoryName()))
+                .toList();
+    }
 }
