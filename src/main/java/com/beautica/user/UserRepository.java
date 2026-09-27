@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -20,6 +21,19 @@ public interface UserRepository extends JpaRepository<User, UUID> {
 
     @Query("SELECT u.salonId FROM User u WHERE u.id = :userId")
     Optional<UUID> findSalonIdById(@Param("userId") UUID userId);
+
+    /**
+     * Narrow projection backing {@code MasterService#canManageSalonStaff} (Phase 290 finding #5
+     * role-gate fix) — reads only the {@code role} column, never the full {@link User} entity
+     * (which carries {@code passwordHash}), mirroring {@link #findSalonIdById}'s pattern.
+     *
+     * <p>Needed because {@code users.salon_id} is populated for BOTH an invited
+     * {@code SALON_ADMIN} and an invited {@code SALON_MASTER} ({@code User.createFromInvite} sets
+     * it from the invite token regardless of role) — a salon-id match alone cannot distinguish a
+     * staff manager from a read-only master, so the caller must resolve the role first.
+     */
+    @Query("SELECT u.role FROM User u WHERE u.id = :userId")
+    Optional<Role> findRoleById(@Param("userId") UUID userId);
 
     // findCreatedAtById was removed by the 2026-08 perf audit (F2): its only caller,
     // ClientPassportService, now reads the registration instant AND the authored-review count
@@ -46,15 +60,48 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     boolean existsByIdAndSalonIdAndRole(UUID id, UUID salonId, Role role);
 
     /**
-     * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids
-     * loading the full {@link User} entity on every cache-refresh read. Returns
-     * {@code Optional.empty()} both when the user does not exist and when
-     * {@code tokensValidAfter} is {@code null} (the common "never reset" case); callers
-     * only need to distinguish "no reset since this instant" from "reset happened at
-     * this instant", so the two empty cases are equivalent for this read path.
+     * Backs {@link com.beautica.salon.service.SalonService#getSalonStaff} — the
+     * {@code SALON_ADMIN} half of the management-scoped staff roster (Phase 21.5). Masters are
+     * sourced separately via {@code MasterRepository.findBySalonIdAndIsActiveTrueWithUser}
+     * (there is no {@code Master} row for an admin), so this finder is scoped by role so a
+     * de-activated or CLIENT-role user sharing the same {@code salon_id} column value (which
+     * cannot actually occur for CLIENT, but mirrors the role-scoping discipline of
+     * {@link #existsByIdAndSalonIdAndRole}) never leaks into the roster.
+     *
+     * <p><b>Renamed from {@code findBySalonIdAndRole} (Phase 290).</b> That method's own javadoc
+     * flagged this exact gap in advance: "nothing in this codebase ever sets
+     * {@code User.isActive = false} today ... if a future user-suspension feature starts setting
+     * it, this query must gain the same filter or deactivated admins will keep appearing in salon
+     * rosters." Phase 290's salon-deletion staff cascade is that feature — it sets
+     * {@code SALON_ADMIN.isActive = false} on a deleted salon's admin accounts, and
+     * {@code getSalonStaff} remains reachable afterwards (the OWNER's own management access is not
+     * gated on {@code salon.isActive}). Without this filter a deactivated admin of a deleted salon
+     * would keep appearing in that salon's own staff roster forever.
      */
-    @Query("SELECT u.tokensValidAfter FROM User u WHERE u.id = :userId")
-    Optional<Instant> findTokensValidAfterById(@Param("userId") UUID userId);
+    List<User> findBySalonIdAndRoleAndIsActiveTrue(UUID salonId, Role role);
+
+    /**
+     * Scalar projection backing {@link com.beautica.auth.TokensValidAfterCache} — avoids
+     * loading the full {@link User} entity on every cache-refresh read.
+     *
+     * <p><b>Row existence is part of the answer (phase 295 audit, HIGH-1).</b> This REPLACES the
+     * earlier {@code Optional<Instant> findTokensValidAfterById}, which returned
+     * {@code Optional.empty()} for BOTH "no such row" and "row exists with a null
+     * {@code tokens_valid_after}". {@link com.beautica.auth.JwtAuthenticationFilter} read that
+     * single empty as "no validity check applies" and went on to authenticate — so once phase 295
+     * started HARD-DELETING staff accounts, a deleted user's already-issued access token kept
+     * working for the remainder of its TTL. No non-row variant is kept alongside this one
+     * (Anti-Bug §E-1): a caller reaching for the old shape would silently reopen that fail-open.
+     *
+     * <p>Same {@code users_pkey} probe and the same cost as before — the projection widened by one
+     * column that the row already carries, nothing more.
+     */
+    @Query("""
+            SELECT new com.beautica.user.TokensValidAfterRow(u.id, u.tokensValidAfter)
+            FROM User u
+            WHERE u.id = :userId
+            """)
+    Optional<TokensValidAfterRow> findTokensValidAfterRowById(@Param("userId") UUID userId);
 
     /**
      * Acquires a PostgreSQL row-level exclusive lock on the user row before the

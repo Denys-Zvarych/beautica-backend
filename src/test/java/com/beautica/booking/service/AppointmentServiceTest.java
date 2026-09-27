@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.TestConstants;
 import com.beautica.booking.dto.CreateAppointmentRequest;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
@@ -145,6 +146,7 @@ class AppointmentServiceTest {
     /** An ACTIVE salon-employed master whose salon carries the given active flag. */
     private static Master salonMaster(boolean salonActive) {
         Salon salon = Salon.builder()
+                .cityId(TestConstants.DEFAULT_TEST_CITY_ID)
                 .id(UUID.randomUUID())
                 .isActive(salonActive)
                 .build();

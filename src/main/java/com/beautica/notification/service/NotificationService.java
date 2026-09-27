@@ -12,6 +12,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.user.User;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.lang.Nullable;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -111,8 +112,12 @@ public class NotificationService {
      */
     public void notifyNewBooking(BookingVisit visit) {
         Booking booking = visit.lead();
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "NEW_BOOKING");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String clientName = resolveClientName(booking);
         String bookingId = booking.getId().toString();
 
@@ -266,8 +271,12 @@ public class NotificationService {
      * {@link #notifyNewBooking(BookingVisit)} — with «Бронювання перенесено» copy.
      */
     public void notifyBookingRescheduled(Booking booking) {
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "BOOKING_RESCHEDULED");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
 
@@ -358,8 +367,12 @@ public class NotificationService {
      * handles the guest case for the copy that names the client in the reminder.
      */
     public void notifyClosureReminder(Booking booking) {
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "CLOSURE_REMINDER");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String clientName = resolveClientName(booking);
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
@@ -373,9 +386,103 @@ public class NotificationService {
         );
     }
 
+    /**
+     * Notifies the CLIENT (or guest) that the salon they had a future booking with was deleted by
+     * its owner, and the booking was auto-declined (Phase 269/293 — {@code SALON_CLOSED}).
+     *
+     * <p>Takes a {@link BookingVisit}, not a bare {@code Booking}, because exactly ONE
+     * {@code SALON_CLOSED} outbox row is enqueued per VISIT (D12) — {@code visit} may therefore
+     * describe several declined services at once, and the copy names all of them via
+     * {@link #bookedSubject(BookingVisit)}, never just the representative.
+     *
+     * <p><b>Per-audience delivery (D8).</b> A registered client (an account exists —
+     * {@code booking.getClient() != null}) always has an email on file (schema-guaranteed,
+     * {@code users.email NOT NULL}) — email + push. A guest ({@code LINK}) visit has no account
+     * and no email; its {@code guestPhone} is OTP-verified, so it gets an SMS instead
+     * ({@link #sendSalonClosedGuestSms(BookingVisit)}, mirroring
+     * {@link #sendLinkGuestDeclineSms(Booking)}). A STAFF walk-in's phone was typed by an
+     * employee, not proven by the recipient (Phase 22.1) — it is NOT an eligible SMS destination
+     * and is left a silent no-op, same gate as {@link #notifyBookingStatusChanged(BookingVisit)}.
+     *
+     * <p><b>No booking note is ever read here</b> (D10) — {@link BookingVisit} exposes no
+     * accessor for {@code clientComment}/{@code clientCancellationNote}/{@code providerComment} by
+     * construction, and this method does not read any of them off {@link BookingVisit#lead()}
+     * either, unlike the decline path.
+     */
+    public void notifySalonClosed(BookingVisit visit) {
+        Booking booking = visit.lead();
+        if (booking.getClient() == null) {
+            if (booking.getBookingSource() == BookingSource.LINK) {
+                sendSalonClosedGuestSms(visit);
+            } else {
+                log.debug("Skipping SALON_CLOSED notification for account-less non-LINK booking {}",
+                        booking.getId());
+            }
+            return;
+        }
+        String clientEmail = booking.getClient().getEmail();
+        UUID clientUserId = booking.getClient().getId();
+        String bookingId = booking.getId().toString();
+
+        emailService.sendSalonClosedEmail(clientEmail, visit);
+        pushService.sendToUser(
+                clientUserId,
+                "Салон закрито",
+                truncate("Салон закрився, і ваше бронювання на " + bookedSubject(visit) + " скасовано"),
+                Map.of("type", "SALON_CLOSED", "bookingId", bookingId)
+        );
+    }
+
+    /**
+     * Notifies the CLIENT (or guest) that the master they had a future booking with was removed
+     * from the salon, and the booking was auto-declined (Phase 298 — {@code MASTER_REMOVED}).
+     * Deliberately NOT a reuse of {@link #notifySalonClosed(BookingVisit)} — the salon did not
+     * close, only the master left it, and copy claiming the salon closed would be false in
+     * billable SMS traffic.
+     *
+     * <p>Same per-visit / per-audience shape as {@link #notifySalonClosed(BookingVisit)}: takes a
+     * {@link BookingVisit} (one {@code MASTER_REMOVED} row is enqueued per VISIT, D12), a
+     * registered client gets email + push, a guest ({@code LINK}) visit gets SMS via {@link
+     * #sendMasterRemovedGuestSms(BookingVisit)}, and a STAFF walk-in's unverified phone is left a
+     * silent no-op — identical gate to the salon-closure path.
+     *
+     * <p>Copy states the master is no longer working at this salon and the appointment was
+     * cancelled — it must never imply the salon closed and must never name a replacement master
+     * (no reassignment machinery exists). No booking note is ever read here (same D10 posture as
+     * {@link #notifySalonClosed(BookingVisit)} — {@link BookingVisit} exposes no note accessor).
+     */
+    public void notifyMasterRemoved(BookingVisit visit) {
+        Booking booking = visit.lead();
+        if (booking.getClient() == null) {
+            if (booking.getBookingSource() == BookingSource.LINK) {
+                sendMasterRemovedGuestSms(visit);
+            } else {
+                log.debug("Skipping MASTER_REMOVED notification for account-less non-LINK booking {}",
+                        booking.getId());
+            }
+            return;
+        }
+        String clientEmail = booking.getClient().getEmail();
+        UUID clientUserId = booking.getClient().getId();
+        String bookingId = booking.getId().toString();
+
+        emailService.sendMasterRemovedEmail(clientEmail, visit);
+        pushService.sendToUser(
+                clientUserId,
+                "Майстра більше немає в салоні",
+                truncate("Майстер, який мав прийняти вас на " + bookedSubject(visit) + ", більше не "
+                        + "працює в цьому салоні, і ваше бронювання скасовано"),
+                Map.of("type", "MASTER_REMOVED", "bookingId", bookingId)
+        );
+    }
+
     public void notifyClientCancelled(Booking booking) {
-        String masterEmail = booking.getMaster().getUser().getEmail();
-        UUID masterUserId = booking.getMaster().getUser().getId();
+        User masterUser = providerRecipient(booking, "CLIENT_CANCELLED");
+        if (masterUser == null) {
+            return;
+        }
+        String masterEmail = masterUser.getEmail();
+        UUID masterUserId = masterUser.getId();
         String clientName = resolveClientName(booking);
         String serviceName = safe(booking.getMasterService().getServiceDefinition().getName());
         String bookingId = booking.getId().toString();
@@ -503,6 +610,84 @@ public class NotificationService {
     }
 
     /**
+     * Dispatches the salon-closure SMS for a {@code LINK} guest visit (Phase 269/293). Mirrors
+     * {@link #sendLinkGuestDeclineSms(Booking)} exactly — same guard, same swallow-and-log-class-
+     * only failure handling (Anti-Bug §I: never log the phone or message text) — the one
+     * difference being the text names the whole VISIT via {@link #bookedSubject(BookingVisit)}
+     * rather than one booking's service, and carries no provider note (D10: {@link BookingVisit}
+     * exposes no note accessor to read in the first place).
+     *
+     * <p>Only the LINK branch of {@link #notifySalonClosed(BookingVisit)} may call this — same
+     * "not the STAFF walk-in" restriction {@link #sendLinkGuestDeclineSms(Booking)} documents.
+     */
+    private void sendSalonClosedGuestSms(BookingVisit visit) {
+        Booking lead = visit.lead();
+        String phone = lead.getGuestPhone();
+        if (phone == null || phone.isBlank()) {
+            log.warn("Guest SALON_CLOSED visit (lead booking {}) has no guestPhone — skipping SMS",
+                    lead.getId());
+            return;
+        }
+        String text = buildSalonClosedSms(visit);
+        try {
+            smsService.send(phone, text);
+        } catch (RuntimeException e) {
+            log.warn("Salon-closed guest SMS failed: {}", e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Renders the salon-closure SMS body. Never reads any booking note — {@link BookingVisit}
+     * exposes no accessor for one (D10) — so there is no reason/comment clause to append, unlike
+     * {@link #buildGuestDeclineSms(Booking)}.
+     */
+    private String buildSalonClosedSms(BookingVisit visit) {
+        OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+        return Placeholders.format(smsProperties.getSms().getSalonClosed(), Map.of(
+                "subject", bookedSubject(visit),
+                "date", SMS_DATE_FMT.format(kyiv),
+                "time", SMS_TIME_FMT.format(kyiv)));
+    }
+
+    /**
+     * Dispatches the master-removal SMS for a {@code LINK} guest visit (Phase 298). Mirrors
+     * {@link #sendSalonClosedGuestSms(BookingVisit)} exactly — same guard, same swallow-and-log-
+     * class-only failure handling (Anti-Bug §I: never log the phone or message text), same
+     * no-note posture (D10) — only the copy template differs.
+     *
+     * <p>Only the LINK branch of {@link #notifyMasterRemoved(BookingVisit)} may call this — same
+     * "not the STAFF walk-in" restriction {@link #sendLinkGuestDeclineSms(Booking)} documents.
+     */
+    private void sendMasterRemovedGuestSms(BookingVisit visit) {
+        Booking lead = visit.lead();
+        String phone = lead.getGuestPhone();
+        if (phone == null || phone.isBlank()) {
+            log.warn("Guest MASTER_REMOVED visit (lead booking {}) has no guestPhone — skipping SMS",
+                    lead.getId());
+            return;
+        }
+        String text = buildMasterRemovedSms(visit);
+        try {
+            smsService.send(phone, text);
+        } catch (RuntimeException e) {
+            log.warn("Master-removed guest SMS failed: {}", e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Renders the master-removal SMS body. Never reads any booking note — {@link BookingVisit}
+     * exposes no accessor for one (D10) — mirrors {@link #buildSalonClosedSms(BookingVisit)}
+     * exactly, with a copy template that names the master leaving, not the salon closing.
+     */
+    private String buildMasterRemovedSms(BookingVisit visit) {
+        OffsetDateTime kyiv = visit.startsAt().atZoneSameInstant(TimeZones.KYIV).toOffsetDateTime();
+        return Placeholders.format(smsProperties.getSms().getMasterRemoved(), Map.of(
+                "subject", bookedSubject(visit),
+                "date", SMS_DATE_FMT.format(kyiv),
+                "time", SMS_TIME_FMT.format(kyiv)));
+    }
+
+    /**
      * Neutralizes link-shaped content in a provider note — SMS rendering path ONLY. The
      * persisted {@code provider_comment} column is never touched by this method (it takes and
      * returns a local {@code String}), and the decline EMAIL path never calls it at all — see
@@ -587,10 +772,40 @@ public class NotificationService {
         return comment.substring(0, cut) + "…";
     }
 
+    /**
+     * The PROVIDER-side recipient of a booking notification, or {@code null} when there is nobody
+     * left to notify.
+     *
+     * <p>V157 / phase 294 D1 made {@code masters.user_id} nullable: when a salon is deleted the
+     * staff {@code users} row is hard-deleted and the historical {@code masters} row survives as a
+     * name-only stub with no mailbox, no device token and no account. Every provider-facing
+     * notification below therefore starts here and returns early on a detached master instead of
+     * NPEing deep inside the mail/push transport.
+     *
+     * <p>Unreachable as of phase 294 — nothing detaches a master yet (D6). It exists so phase 295's
+     * delete cannot turn a notification into a 500.
+     *
+     * <p>The log line carries identifiers only: no email, no name, no phone (Anti-Bug §I).
+     */
+    @Nullable
+    private static User providerRecipient(Booking booking, String notificationType) {
+        User masterUser = booking.getMaster().getUser();
+        if (masterUser == null) {
+            log.info("Skipping {} for booking {} — master {} is detached (staff account deleted)",
+                    notificationType, booking.getId(), booking.getMaster().getId());
+        }
+        return masterUser;
+    }
+
+    // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().
+    // A detached master (staff account hard-deleted, historical stub kept) has no user row, so the
+    // old two-line walk NPEs; the accessors fall back to the name snapshot taken at detach time.
+    // Still null-safe on either half — users.first_name / users.last_name are both nullable.
     private static String masterName(Master master) {
-        User u = master.getUser();
-        String first = u.getFirstName() == null ? "" : u.getFirstName().trim();
-        String last = u.getLastName() == null ? "" : u.getLastName().trim();
+        String firstName = master.displayFirstName();
+        String lastName = master.displayLastName();
+        String first = firstName == null ? "" : firstName.trim();
+        String last = lastName == null ? "" : lastName.trim();
         return (first + " " + last).trim();
     }
 

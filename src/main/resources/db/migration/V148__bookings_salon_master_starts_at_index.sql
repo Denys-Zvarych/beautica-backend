@@ -1,0 +1,27 @@
+-- Phase 23.4 audit fix (Finding 1 — MEDIUM, backend-perf): GET /bookings/salon/{salonId}
+-- supports an optional masterId filter (BookingRepositoryCustomImpl#findIdsBySalonIdFiltered),
+-- backing the mobile salon "Розклад" tab's per-master view — a routine, not edge-case, filter.
+--
+-- Neither existing salon-scoped index covers master_id:
+--   * idx_bookings_salon_starts_at (V19: salon_id, starts_at DESC) — every status, no master_id.
+--   * idx_bookings_salon_status_starts_at (V22, narrowed by V113: salon_id, status, starts_at DESC
+--     WHERE status IN ('CONFIRMED','COMPLETED')) — no master_id either, and only two statuses.
+-- Both plan as an Index Cond on salon_id alone, then a post-scan Filter on master_id — a scan of
+-- the salon's WHOLE row range (and its COUNT(*) companion pays the same cost again) instead of an
+-- Index Cond on the two-column equality prefix this filter actually needs.
+--
+-- (salon_id, master_id, starts_at DESC) — no status predicate, matching idx_bookings_salon_starts_at
+-- (V19)'s unfiltered shape rather than V22/V113's partial one: findIdsBySalonIdFiltered's status
+-- filter is single-valued and optional (unlike GET /bookings/me's repeatable list), so this index
+-- must serve every status, not just CONFIRMED/COMPLETED. master_id sits between the salon_id
+-- equality predicate and the starts_at sort key so `salon_id = :id AND master_id = :masterId ORDER
+-- BY starts_at DESC` plans as a pure Index Cond seek with no residual Filter and no Sort node.
+--
+-- master_id is NOT NULL on every booking row (V18), so — unlike idx_bookings_salon_client_starts_at
+-- (V142)'s dual-nullable predicate — no partial WHERE is needed here to exclude unmatchable rows.
+--
+-- Plain CREATE INDEX, matching every prior index migration on this table (V112, V142, V145):
+-- Flyway runs each migration inside a transaction, and CREATE INDEX CONCURRENTLY cannot run
+-- inside one at all, so introducing CONCURRENTLY here alone would be an unestablished one-off.
+CREATE INDEX idx_bookings_salon_master_starts_at
+    ON bookings (salon_id, master_id, starts_at DESC);

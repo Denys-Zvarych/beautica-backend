@@ -1,13 +1,17 @@
 package com.beautica;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.validation.beanvalidation.MethodValidationPostProcessor;
 import org.testcontainers.containers.PostgreSQLContainer;
+
+import java.util.UUID;
 
 /**
  * Base class for {@code @DataJpaTest} slice tests that need a real PostgreSQL container.
@@ -46,18 +50,47 @@ import org.testcontainers.containers.PostgreSQLContainer;
 @Import(MethodValidationPostProcessor.class)
 public abstract class AbstractDataJpaTest {
 
-    @SuppressWarnings("resource") // Singleton — never closed; JVM exit handles cleanup via Testcontainers Ryuk.
-    protected static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>("postgres:16-alpine");
+    /**
+     * The shared slice-family container. A REFERENCE to {@link DataJpaPostgresContainer#INSTANCE},
+     * never a second declaration — the holder owns the singleton and its start-once initialiser so
+     * that a test needing only the JDBC URL can reach it without inheriting this Spring context
+     * (the per-class Testcontainers finding, backend-QA 2026-09-20). Subclasses read it through
+     * this field exactly as before.
+     */
+    protected static final PostgreSQLContainer<?> POSTGRES = DataJpaPostgresContainer.INSTANCE;
 
-    static {
-        POSTGRES.start();
-    }
+    // @DataJpaTest autoconfigures a JdbcTemplate bean when spring-jdbc is on the classpath —
+    // used only to resolve a real cities.id row for salon fixtures (see #testCityId()).
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @DynamicPropertySource
     static void registerDatasource(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+    }
+
+    /**
+     * Resolves a real, persisted {@code cities.id} row for {@code @DataJpaTest} fixtures that
+     * {@code em.persist()} a {@link com.beautica.salon.entity.Salon}.
+     *
+     * <p>{@code salons.city_id} carries {@code fk_salons_city_id} (V54) to {@code cities(id)} and,
+     * as of V150, is {@code NOT NULL} — a literal {@code UUID.randomUUID()} fails the FK check on
+     * flush, so every fixture that persists a salon must resolve a seeded row instead of inventing
+     * one. Vinnytsia is used everywhere for consistency with
+     * {@link com.beautica.service.ServiceTestFixtures#createSalon} and
+     * {@link com.beautica.AbstractIntegrationTest#testCityId()} (the {@code @SpringBootTest}-side
+     * sibling of this method — the two slice families cannot share a base class, see this class's
+     * own javadoc on cross-slice sharing).
+     */
+    protected UUID testCityId() {
+        // Keyed on the KATOTTH code, not on name_uk. Phase 325 widened `cities` from 356 rows to
+        // 25 698, and 2 990 distinct names are now shared by 12 833 rows — «Київ» is both the
+        // capital and a village in Миколаївська oblast. «Вінниця» happens to still be unique, so
+        // this resolves the same row it always did, but a `WHERE name_uk = ? LIMIT 1` fixture is
+        // one classifier update away from silently pointing ~50 salon fixtures at a village.
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE katotth_code = 'UA05020030010063857'", UUID.class);
     }
 }

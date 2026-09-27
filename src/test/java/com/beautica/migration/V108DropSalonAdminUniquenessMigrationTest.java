@@ -115,8 +115,8 @@ class V108DropSalonAdminUniquenessMigrationTest extends AbstractIntegrationTest 
     private UUID insertSalon(UUID ownerId) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active) VALUES (?, ?, ?, true)",
-                id, ownerId, "V108 Test Salon");
+                "INSERT INTO salons (id, owner_id, name, is_active, city_id) VALUES (?, ?, ?, true, ?)",
+                id, ownerId, "V108 Test Salon", testCityId());
         return id;
     }
 

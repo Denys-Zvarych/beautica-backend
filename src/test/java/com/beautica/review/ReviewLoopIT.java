@@ -16,8 +16,6 @@ import com.beautica.review.event.ReviewCreatedEvent;
 import com.beautica.review.service.ReviewService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -31,7 +29,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.event.ApplicationEvents;
 import org.springframework.test.context.event.RecordApplicationEvents;
@@ -98,12 +95,6 @@ class ReviewLoopIT extends AbstractIntegrationTest {
 
     @MockBean
     private PushNotificationService pushService;
-
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     // ── T3: drain dispatches the review prompt to the client (email + push) ──────
 
@@ -348,8 +339,8 @@ class ReviewLoopIT extends AbstractIntegrationTest {
         UUID ownerId = createUser(ownerEmail, "SALON_OWNER", null);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, testCityId());
         UUID masterUserId = createUser("loop-salonmaster-" + System.nanoTime() + "@beautica.test", "SALON_MASTER", salonId);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(

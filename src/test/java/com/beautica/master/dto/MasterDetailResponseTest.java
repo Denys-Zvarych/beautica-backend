@@ -1,7 +1,11 @@
 package com.beautica.master.dto;
 
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.salon.dto.PublicSalonResponse;
+import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -30,15 +34,38 @@ class MasterDetailResponseTest {
 
     private static final String PROFESSIONAL_TITLE = "Майстер манікюру";
 
+    /**
+     * The master's OWN contact number — a natural person's PII, masked unconditionally by
+     * {@code fromPublic}. Deliberately a different value from {@link #SALON_BUSINESS_PHONE} so a
+     * swap between the two halves of the masking asymmetry cannot pass silently.
+     */
+    private static final String MASTER_PERSONAL_PHONE = "+380671234567";
+
+    /** The salon's published business contact — NOT masked; see the asymmetry test below. */
+    private static final String SALON_BUSINESS_PHONE = "+380442223344";
+
     private static MasterDetailResponse fullDetailFor(MasterType masterType, UUID cityUuid, UUID oblastUuid,
             UUID districtUuid) {
+        return fullDetailFor(masterType, cityUuid, oblastUuid, districtUuid, null);
+    }
+
+    private static MasterDetailResponse fullDetailFor(MasterType masterType, UUID cityUuid, UUID oblastUuid,
+            UUID districtUuid, PublicSalonResponse salon) {
         return new MasterDetailResponse(
-                UUID.randomUUID(), "Oksana", "Kovalenko", "+380671234567", "Київ",
+                UUID.randomUUID(), "Oksana", "Kovalenko", MASTER_PERSONAL_PHONE, "Київ",
                 "вул. Хрещатик", "1A", "green door",
                 "Nail artist", "@oksana.nails", PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
-                new BigDecimal("4.75"), 12, masterType, null, List.of(),
-                cityUuid, oblastUuid, districtUuid);
+                new BigDecimal("4.75"), 12, masterType, salon, List.of(),
+                cityUuid, oblastUuid, districtUuid,
+                // bookingsThisMonth — self-read only (Qase defect #25)
+                null,
+                // region / citySettlementType / cityHromadaNameUk — non-null so a masking
+                // assertion can fail (a null fixture would pass a missing mask vacuously)
+                OWN_REGION, SettlementType.VILLAGE, OWN_HROMADA);
     }
+
+    private static final String OWN_REGION = "Полтавська";
+    private static final String OWN_HROMADA = "Шишацька";
 
     @Test
     @DisplayName("INDEPENDENT_MASTER: address fields stay unmasked; phoneNumber is masked")
@@ -131,6 +158,44 @@ class MasterDetailResponseTest {
         assertThat(publicView.workingHours()).isEqualTo(full.workingHours());
     }
 
+    // ── phone masking asymmetry: personal number masked, salon business number public ──────
+    //
+    // Two deliberate halves of ONE rule, asserted together on purpose. MasterDetailResponse:108
+    // nulls `phoneNumber` (the master's own contact — a natural person's PII) for every
+    // MasterType, while :122 passes `full.salon()` through whole, so the embedded
+    // PublicSalonResponse keeps the salon's phone — the business contact GET /masters/{masterId}
+    // exists to publish, the direct analogue of the instagramUrl already on that DTO.
+    //
+    // Split across two tests either half could drift green: a "consistency" refactor that also
+    // masked the salon phone would re-break the mobile «Контакти» block (the bug this branch
+    // fixes by adding `phone` to PublicSalonResponse), and one that stopped masking phoneNumber
+    // would leak a real person's number on a permitAll path. It is the PAIRING that must hold.
+
+    @Test
+    @DisplayName("fromPublic masks the master's own phoneNumber while the embedded salon keeps its business phone")
+    void should_maskMasterPhone_butKeepSalonPhone_when_fromPublic() {
+        Salon salon = mock(Salon.class);
+        when(salon.getPhone()).thenReturn(SALON_BUSINESS_PHONE);
+        MasterDetailResponse full = fullDetailFor(MasterType.SALON_MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                PublicSalonResponse.from(salon, UUID.randomUUID(), null));
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.phoneNumber())
+                .as("the master's personal number is PII and must be masked on the public path for "
+                        + "every master type — it must never be confused with the salon's number")
+                .isNull();
+        assertThat(publicView.salon())
+                .as("fromPublic must not drop the embedded salon while masking the master")
+                .isNotNull();
+        assertThat(publicView.salon().phone())
+                .as("the salon's phone is a published business contact, not personal PII — it must "
+                        + "survive fromPublic() unmasked, or the app's «Контакти» block goes blank "
+                        + "again on the master profile")
+                .isEqualTo(SALON_BUSINESS_PHONE);
+    }
+
     // ── professionalTitle (V110) — public-facing headline, never masked ────────
 
     @Test
@@ -167,11 +232,57 @@ class MasterDetailResponseTest {
         Master master = mock(Master.class);
         when(master.getUser()).thenReturn(user);
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
 
         assertThat(response.professionalTitle())
                 .as("MasterDetailResponse.from reads professionalTitle off the linked User")
                 .isEqualTo("Візажист");
+    }
+
+    // ── salonOblastId — separate resolution from the master's own oblastId ────────────
+    // The embedded PublicSalonResponse#oblastId is derived from the SALON's cityId, not the
+    // master's own user.getCityId(); a fixture where the two differ proves the two `resolveOblastId`
+    // calls in MasterService are not accidentally collapsed into one (fixture-defang guard).
+
+    @Test
+    @DisplayName("from passes salonOblastId through to the embedded PublicSalonResponse, distinct from the master's own oblastId")
+    void should_passSalonOblastIdThroughToEmbeddedSalon_when_masterHasSalon() {
+        UUID masterOblastId = UUID.randomUUID();
+        UUID salonOblastId = UUID.randomUUID();
+        Salon salon = mock(Salon.class);
+        when(salon.getId()).thenReturn(UUID.randomUUID());
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getSalon()).thenReturn(salon);
+
+        MasterDetailResponse response =
+                MasterDetailResponse.from(master, List.of(), masterOblastId, salonOblastId, null, null);
+
+        assertThat(response.oblastId())
+                .as("the master's own oblastId must come from the `oblastId` parameter")
+                .isEqualTo(masterOblastId);
+        assertThat(response.salon())
+                .isNotNull()
+                .extracting(PublicSalonResponse::oblastId)
+                .as("the embedded salon's oblastId must come from the SEPARATE salonOblastId parameter, "
+                        + "not be swapped with or defaulted to the master's own oblastId")
+                .isEqualTo(salonOblastId);
+        assertThat(response.salon().oblastId())
+                .as("must not equal the master's own oblastId (fixtures use distinct values)")
+                .isNotEqualTo(masterOblastId);
+    }
+
+    @Test
+    @DisplayName("from leaves salon null (and never dereferences salonOblastId) when the master has no salon")
+    void should_leaveSalonNull_when_masterHasNoSalon() {
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getSalon()).thenReturn(null);
+
+        MasterDetailResponse response =
+                MasterDetailResponse.from(master, List.of(), UUID.randomUUID(), UUID.randomUUID(), null, null);
+
+        assertThat(response.salon()).isNull();
     }
 
     // ── Zero-review rating normalisation (Phase 240 audit, Finding 3) ─────────────────
@@ -190,7 +301,7 @@ class MasterDetailResponseTest {
         // count, not off a null/zero check on the rating itself.
         when(master.getAvgRating()).thenReturn(new BigDecimal("0.00"));
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
 
         assertThat(response.avgRating())
                 .as("an unreviewed master must not be served a fabricated 0.00 rating")
@@ -208,7 +319,7 @@ class MasterDetailResponseTest {
         when(master.getReviewCount()).thenReturn(1);
         when(master.getAvgRating()).thenReturn(new BigDecimal("1.00"));
 
-        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null);
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
 
         assertThat(response.avgRating())
                 .as("suppression triggers on count == 0 only — a real low rating must survive")
@@ -222,12 +333,95 @@ class MasterDetailResponseTest {
                 UUID.randomUUID(), "Oksana", "Kovalenko", "+380671234567", "Київ",
                 "вул. Хрещатик", "1A", "green door", "Nail artist", "@oksana.nails",
                 PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
-                null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null);
+                null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null,
+                // bookingsThisMonth — self-read only (Qase defect #25)
+                null, null, null, null);
 
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 
         assertThat(publicView.avgRating())
                 .as("the public masking copy must not resurrect a 0.00 from a null average")
                 .isNull();
+    }
+
+    // ── saved-settlement label parts (region / citySettlementType / cityHromadaNameUk) ─────
+
+    @Test
+    @DisplayName("fromPublic keeps the own-settlement label parts for INDEPENDENT_MASTER, like city")
+    void should_keepSettlementParts_when_masterTypeIsIndependentMaster() {
+        MasterDetailResponse full = fullDetailFor(MasterType.INDEPENDENT_MASTER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+        MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+        assertThat(publicView.region()).isEqualTo(OWN_REGION);
+        assertThat(publicView.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(publicView.cityHromadaNameUk()).isEqualTo(OWN_HROMADA);
+    }
+
+    @Test
+    @DisplayName("fromPublic masks the own-settlement label parts for SALON_MASTER and SALON_OWNER, like city")
+    void should_maskSettlementParts_when_masterIsSalonAffiliated() {
+        for (MasterType type : List.of(MasterType.SALON_MASTER, MasterType.SALON_OWNER)) {
+            MasterDetailResponse full = fullDetailFor(type,
+                    UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+            MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
+
+            assertThat(publicView.city()).as("%s precondition: city masked", type).isNull();
+            assertThat(publicView.region()).as("%s region", type).isNull();
+            assertThat(publicView.citySettlementType()).as("%s citySettlementType", type).isNull();
+            assertThat(publicView.cityHromadaNameUk()).as("%s cityHromadaNameUk", type).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("withBookingsThisMonth preserves the settlement label parts")
+    void should_preserveSettlementParts_when_bookingsThisMonthAttached() {
+        MasterDetailResponse full = fullDetailFor(MasterType.SALON_OWNER,
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+
+        MasterDetailResponse withCount = full.withBookingsThisMonth(7);
+
+        assertThat(withCount.region()).isEqualTo(OWN_REGION);
+        assertThat(withCount.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(withCount.cityHromadaNameUk()).isEqualTo(OWN_HROMADA);
+    }
+
+    @Test
+    @DisplayName("from takes region from the resolved settlement and routes the master's and the salon's settlements to the right halves")
+    void should_routeOwnAndSalonSettlementParts_when_bothResolved() {
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(mock(User.class));
+        when(master.getSalon()).thenReturn(mock(Salon.class));
+        var own = new SettlementDisplayNames("Іванівка", OWN_REGION, SettlementType.VILLAGE, OWN_HROMADA);
+        var salonCity = new SettlementDisplayNames("Львів", "Львівська", SettlementType.CITY, null);
+
+        MasterDetailResponse response =
+                MasterDetailResponse.from(master, List.of(), null, null, own, salonCity);
+
+        assertThat(response.region()).isEqualTo(OWN_REGION);
+        assertThat(response.citySettlementType()).isEqualTo(SettlementType.VILLAGE);
+        assertThat(response.cityHromadaNameUk()).isEqualTo(OWN_HROMADA);
+        assertThat(response.salon().citySettlementType())
+                .as("the nested salon takes the SEPARATE salon settlement, never the master's own")
+                .isEqualTo(SettlementType.CITY);
+        assertThat(response.salon().cityHromadaNameUk()).isNull();
+    }
+
+    @Test
+    @DisplayName("from returns a null region when cityId is null, even if stale legacy users.region text is present")
+    void should_returnNullRegion_when_cityIdNull_evenIfLegacyRegionTextPresent() {
+        User user = mock(User.class);
+        when(user.getRegion()).thenReturn("Стара область"); // stale legacy text, city_id NULL
+        Master master = mock(Master.class);
+        when(master.getUser()).thenReturn(user);
+
+        MasterDetailResponse response = MasterDetailResponse.from(master, List.of(), null, null, null, null);
+
+        assertThat(response.region())
+                .as("no resolved settlement → no oblast label, whatever legacy text the row holds")
+                .isNull();
+        assertThat(response.citySettlementType()).isNull();
     }
 }

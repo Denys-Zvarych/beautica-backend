@@ -6,6 +6,7 @@ import com.beautica.location.dto.OblastResponse;
 import com.beautica.location.entity.City;
 import com.beautica.location.entity.CityDistrict;
 import com.beautica.location.entity.Oblast;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
 import com.beautica.location.repository.OblastRepository;
@@ -111,13 +112,13 @@ class LocationQueryServiceTest {
     @Test
     @DisplayName("listOblasts — maps every field and preserves repository name_uk ordering")
     void should_mapAllFieldsAndPreserveOrder_when_listOblastsCalled() {
-        when(oblastRepository.findAllByOrderByNameUkAsc())
+        when(oblastRepository.findWithSettlementTypeOrderByNameUkAsc(SettlementType.CITY))
                 .thenReturn(List.of(kyivOblast, lvivOblast));
 
         List<OblastResponse> result = service.listOblasts();
 
         assertThat(result)
-                .as("order must mirror findAllByOrderByNameUkAsc — service adds no re-sort")
+                .as("order must mirror findWithSettlementTypeOrderByNameUkAsc — service adds no re-sort")
                 .extracting(OblastResponse::nameUk)
                 .containsExactly("Київ", "Львівська");
         assertThat(result.get(0))
@@ -130,9 +131,9 @@ class LocationQueryServiceTest {
     }
 
     @Test
-    @DisplayName("listOblasts — returns an empty list when no oblasts are seeded")
-    void should_returnEmptyList_when_noOblastsExist() {
-        when(oblastRepository.findAllByOrderByNameUkAsc()).thenReturn(List.of());
+    @DisplayName("listOblasts — returns an empty list when no oblast holds a CITY")
+    void should_returnEmptyList_when_noOblastHoldsACity() {
+        when(oblastRepository.findWithSettlementTypeOrderByNameUkAsc(SettlementType.CITY)).thenReturn(List.of());
 
         assertThat(service.listOblasts()).isEmpty();
         verifyNoInteractions(cityRepository, cityDistrictRepository);
@@ -150,13 +151,13 @@ class LocationQueryServiceTest {
 
         when(cityDistrictRepository.findCityIdsWithDistrictsByOblastId(kyivOblastId))
                 .thenReturn(Set.of(kyivCityId));
-        when(cityRepository.findByOblastIdOrderByNameUkAsc(kyivOblastId))
+        when(cityRepository.findByOblastIdAndSettlementTypeOrderByNameUkAsc(kyivOblastId, SettlementType.CITY))
                 .thenReturn(List.of(brovaryCity, kyivCity));
 
         List<CityResponse> result = service.listCitiesByOblast(kyivOblastId);
 
         assertThat(result)
-                .as("order mirrors findByOblastIdOrderByNameUkAsc; flag set from the set")
+                .as("order mirrors findByOblastIdAndSettlementTypeOrderByNameUkAsc; flag set from the set")
                 .extracting(CityResponse::nameUk, CityResponse::hasDistricts)
                 .containsExactly(
                         org.assertj.core.groups.Tuple.tuple("Бровари", false),
@@ -169,7 +170,7 @@ class LocationQueryServiceTest {
         UUID cityId = UUID.randomUUID();
         when(cityDistrictRepository.findCityIdsWithDistrictsByOblastId(kyivOblastId))
                 .thenReturn(Set.of());
-        when(cityRepository.findByOblastIdOrderByNameUkAsc(kyivOblastId))
+        when(cityRepository.findByOblastIdAndSettlementTypeOrderByNameUkAsc(kyivOblastId, SettlementType.CITY))
                 .thenReturn(List.of(city(cityId, "UA80", "Київ", "Kyiv")));
 
         CityResponse dto = service.listCitiesByOblast(kyivOblastId).get(0);
@@ -190,7 +191,7 @@ class LocationQueryServiceTest {
     void should_notCallExistsByCityIdPerRow_when_listCitiesByOblast() {
         when(cityDistrictRepository.findCityIdsWithDistrictsByOblastId(kyivOblastId))
                 .thenReturn(Set.of());
-        when(cityRepository.findByOblastIdOrderByNameUkAsc(kyivOblastId))
+        when(cityRepository.findByOblastIdAndSettlementTypeOrderByNameUkAsc(kyivOblastId, SettlementType.CITY))
                 .thenReturn(List.of(
                         city(UUID.randomUUID(), "c1", "А", "A"),
                         city(UUID.randomUUID(), "c2", "Б", "B"),
@@ -202,7 +203,7 @@ class LocationQueryServiceTest {
         // the ordered city list once. A per-row existsByCityId loop would be the
         // N+1 the picker contract forbids.
         verify(cityDistrictRepository, times(1)).findCityIdsWithDistrictsByOblastId(kyivOblastId);
-        verify(cityRepository, times(1)).findByOblastIdOrderByNameUkAsc(kyivOblastId);
+        verify(cityRepository, times(1)).findByOblastIdAndSettlementTypeOrderByNameUkAsc(kyivOblastId, SettlementType.CITY);
         verify(cityDistrictRepository, never()).existsByCityId(org.mockito.ArgumentMatchers.any());
     }
 
@@ -212,7 +213,7 @@ class LocationQueryServiceTest {
         UUID unknown = UUID.randomUUID();
         when(cityDistrictRepository.findCityIdsWithDistrictsByOblastId(unknown))
                 .thenReturn(Set.of());
-        when(cityRepository.findByOblastIdOrderByNameUkAsc(unknown))
+        when(cityRepository.findByOblastIdAndSettlementTypeOrderByNameUkAsc(unknown, SettlementType.CITY))
                 .thenReturn(List.of());
 
         assertThat(service.listCitiesByOblast(unknown)).isEmpty();

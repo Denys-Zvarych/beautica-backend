@@ -119,6 +119,7 @@ class MasterRepositoryBookingSlugTest extends AbstractDataJpaTest {
     private Master persistSalonMaster(String slug, boolean masterActive, boolean salonActive) {
         User owner = persistUser(Role.SALON_OWNER);
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Test Salon")
                 .isActive(salonActive)

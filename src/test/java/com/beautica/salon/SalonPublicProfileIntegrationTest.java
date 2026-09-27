@@ -20,9 +20,7 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -37,7 +35,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.LocalDate;
@@ -78,8 +75,6 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
     private static final String SALONS_URL   = "/api/v1/salons";
     private static final String REVIEWS_URL  = "/api/v1/reviews";
     private static final String TEST_PASSWORD = "Str0ngP@ss1!";
-    private static final HttpComponentsClientHttpRequestFactory HTTP_FACTORY =
-            new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -97,16 +92,6 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
 
     @MockBean
     private NotificationOutboxService notificationOutboxService;
-
-    @AfterAll
-    static void destroyHttpFactory() throws Exception {
-        HTTP_FACTORY.destroy();
-    }
-
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(HTTP_FACTORY);
-    }
 
     // ── GET /salons/{salonId}/services ───────────────────────────────────────────
 
@@ -569,8 +554,7 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         UUID salonId = createSalon(ownerId, "Locality Salon " + System.nanoTime());
         String ownerToken = loginAndGetToken(ownerEmail);
 
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
 
         // UpdateSalonRequest field order: name, description, city, region, address,
         // cityId, districtId, street, buildingNo, locationNote, phone, instagramUrl.
@@ -609,11 +593,63 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
         assertThat(publicSalon.buildingNo()).isEqualTo("22");
         assertThat(publicSalon.locationNote()).isEqualTo("Near the fountain");
         assertThat(publicSalon.city())
-                .as("backward-compat: the legacy free-text city ('Kyiv', set at fixture creation) "
-                        + "must survive a taxonomy-only PATCH untouched — updateSalon() never calls "
-                        + "setCity/setRegion/setAddress (Phase 10.6), so the new taxonomy fields are "
-                        + "additive, not a replacement, for pre-existing legacy data")
-                .isEqualTo("Kyiv");
+                .as("the legacy free-text city ('Kyiv', set at fixture creation) must be REPLACED by "
+                        + "the settlement name on a cityId PATCH — leaving it produced a stale city "
+                        + "next to the new id, which mobile seeds «Населений пункт» from (Phase 346)")
+                .isEqualTo("Вінниця");
+    }
+
+    @Test
+    @DisplayName("public salon profile exposes the phone persisted on the salon row, with no PATCH first")
+    void should_exposePhone_when_salonIsFetchedPubliclyWithoutAnyUpdate() throws Exception {
+        String ownerEmail = "owner-phone-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = createSalonOwner(ownerEmail);
+        UUID salonId = createSalon(ownerId, "Phone Salon " + System.nanoTime());
+        jdbcTemplate.update("UPDATE salons SET phone = ? WHERE id = ?", "+380671234567", salonId);
+
+        ResponseEntity<String> publicResp =
+                restTemplate.getForEntity(SALONS_URL + "/" + salonId, String.class);
+
+        assertThat(publicResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        var wrapper = objectMapper.readValue(publicResp.getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {});
+        assertThat(wrapper.data().phone())
+                .as("GET /salons/{id} is the ONLY load path the mobile owner/admin salon-profile "
+                        + "screen uses — PublicSalonResponse dropped `phone` entirely, so the "
+                        + "«Контакти» block stayed blank on a freshly registered salon until an "
+                        + "unrelated contacts PATCH (which returns SalonResponse) happened to "
+                        + "populate it client-side. No PATCH is issued here on purpose")
+                .isEqualTo("+380671234567");
+    }
+
+    @Test
+    @DisplayName("GET /salons/{id} — legacy free-text address is null once a street exists, still served without one")
+    void should_suppressLegacyAddress_when_salonHasStructuredStreet() throws Exception {
+        UUID ownerId = createSalonOwner("owner-addr-" + System.nanoTime() + "@beautica.test");
+        UUID withStreet = createSalon(ownerId, "Street Salon " + System.nanoTime());
+        UUID withoutStreet = createSalon(ownerId, "Legacy Salon " + System.nanoTime());
+        jdbcTemplate.update("UPDATE salons SET address = ?, street = ?, building_no = ? WHERE id = ?",
+                "вул. Домашня 1, кв. 5", "вул. Шевченка", "12", withStreet);
+        jdbcTemplate.update("UPDATE salons SET address = ?, street = NULL WHERE id = ?",
+                "вул. Стара 3", withoutStreet);
+
+        PublicSalonResponse structured = objectMapper.readValue(
+                restTemplate.getForEntity(SALONS_URL + "/" + withStreet, String.class).getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {}).data();
+        PublicSalonResponse legacyOnly = objectMapper.readValue(
+                restTemplate.getForEntity(SALONS_URL + "/" + withoutStreet, String.class).getBody(),
+                new TypeReference<ApiResponse<PublicSalonResponse>>() {}).data();
+
+        assertThat(structured.address())
+                .as("the uneditable legacy text must not reach an unauthenticated caller once a street supersedes it")
+                .isNull();
+        assertThat(structured.street()).isEqualTo("вул. Шевченка");
+        assertThat(jdbcTemplate.queryForObject("SELECT address FROM salons WHERE id = ?", String.class, withStreet))
+                .as("non-destructive: the column itself is untouched")
+                .isEqualTo("вул. Домашня 1, кв. 5");
+        assertThat(legacyOnly.address())
+                .as("mobile's fallback line — still served when there is no street")
+                .isEqualTo("вул. Стара 3");
     }
 
     // ── fixtures — salon side ─────────────────────────────────────────────────────
@@ -630,8 +666,8 @@ class SalonPublicProfileIntegrationTest extends AbstractIntegrationTest {
     private UUID createSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, is_active) VALUES (?, ?, ?, 'Kyiv', true)",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, city, is_active, city_id) VALUES (?, ?, ?, 'Kyiv', true, ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 

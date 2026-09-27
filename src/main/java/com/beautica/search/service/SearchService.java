@@ -227,7 +227,12 @@ public class SearchService {
      * master grid regardless of future data shape (replaces the earlier
      * {@code <> 'SALON_ADMIN'} exclusion that let {@code SALON_MASTER} leak in).
      */
-    private static final String ROLE_INDEPENDENT_MASTER = "INDEPENDENT_MASTER";
+    // Widened from private to public (Phase 331): the search-suggestions availability query
+    // (search.repository.SearchSuggestionAvailabilityRepository, a DIFFERENT package — hence
+    // public, not package-private) reuses this SAME value via
+    // appendMasterActiveIndependentPredicate below, rather than re-typing the literal — a
+    // second hand-typed 'INDEPENDENT_MASTER' string is exactly the drift risk §E warns about.
+    public static final String ROLE_INDEPENDENT_MASTER = "INDEPENDENT_MASTER";
 
     /**
      * {@code service_definitions.owner_type} value (stored via
@@ -253,9 +258,8 @@ public class SearchService {
      *
      * <p><b>Anti-Bug audit LOW-1 (2026-07):</b> {@code COALESCE}, not
      * {@code CASE WHEN sal.id IS NOT NULL THEN … ELSE … END}, is intentional and
-     * safe here — <em>not</em> because a salon is guaranteed to have a
-     * {@code city_id} (legacy pre-Phase-10.3 rows can be city-less;
-     * {@code Salon.cityId} carries no {@code NOT NULL}), but because
+     * safe here — <em>not</em> because a salon can have a null {@code city_id}
+     * ({@code salons.city_id} is {@code NOT NULL} as of V150), but because
      * {@code appendWhereClause} below pins {@code u.role = 'INDEPENDENT_MASTER'}
      * unconditionally (Phase 19.7 decision 7). Every row this query can ever
      * return belongs to an {@code INDEPENDENT_MASTER}, whose {@code masters.salon_id}
@@ -271,8 +275,12 @@ public class SearchService {
      * such role gate (bookings span all master types) and DOES use
      * {@code CASE WHEN} for exactly this reason.</p>
      */
-    private static final String DISCOVERY_CITY_EXPR = "COALESCE(sal.city_id, u.city_id)";
-    private static final String DISCOVERY_DISTRICT_EXPR = "COALESCE(sal.district_id, u.district_id)";
+    // Widened from private to public (Phase 331): reused verbatim by
+    // search.repository.SearchSuggestionAvailabilityRepository's master branch — a different
+    // package, hence public rather than package-private. Same string, same reasoning above;
+    // re-typing this COALESCE in a second file is exactly the drift the extraction avoids.
+    public static final String DISCOVERY_CITY_EXPR = "COALESCE(sal.city_id, u.city_id)";
+    public static final String DISCOVERY_DISTRICT_EXPR = "COALESCE(sal.district_id, u.district_id)";
 
     /**
      * EntityManager is field-injected via {@link PersistenceContext} rather than
@@ -1330,18 +1338,34 @@ public class SearchService {
      * an admin account never surfaces in public master discovery regardless of
      * any future data shape.
      */
+    /**
+     * Appends {@code m.is_active = true AND u.is_active = true AND u.role = :includedRole }
+     * (no leading {@code WHERE}/{@code AND}) and binds {@code includedRole}. Extracted (Phase
+     * 331) so {@code search.repository.SearchSuggestionAvailabilityRepository}'s master branch
+     * shares this EXACT predicate instead of re-typing it — see the D3 "no re-typed SQL"
+     * requirement. Public: the repository lives in a different package.
+     *
+     * <p>Behaviour-preserving by construction: the emitted text and the bound
+     * {@code (includedRole, "INDEPENDENT_MASTER")} pair are byte-for-byte what
+     * {@link #appendWhereClause} emitted before this extraction — see
+     * {@code SearchServiceTest} for the pinned assertion.
+     */
+    public static void appendMasterActiveIndependentPredicate(StringBuilder sb, Map<String, Object> params) {
+        sb.append("m.is_active = true AND u.is_active = true AND u.role = :includedRole ");
+        params.put("includedRole", ROLE_INDEPENDENT_MASTER);
+    }
+
     private static void appendWhereClause(
             StringBuilder sb,
             MasterSearchFilters filters,
             Map<String, Object> params
     ) {
-        sb.append("WHERE m.is_active = true AND u.is_active = true ");
+        sb.append("WHERE ");
         // Phase 19.7: restrict the public master grid to INDEPENDENT_MASTER only.
         // SALON_MASTER is reachable solely via the salon page; SALON_ADMIN /
         // SALON_OWNER are not bookable masters. Equality (not <>) keeps all
         // non-independent roles out regardless of future data shape.
-        sb.append("AND u.role = :includedRole ");
-        params.put("includedRole", ROLE_INDEPENDENT_MASTER);
+        appendMasterActiveIndependentPredicate(sb, params);
 
         if (filters.hasDistrictFilter()) {
             sb.append("AND ").append(DISCOVERY_DISTRICT_EXPR).append(" = :districtId ");
@@ -1986,7 +2010,11 @@ public class SearchService {
      * architect follow-up.
      */
     // TODO(architect follow-up): free-slot bookability not reflected in search SQL — see catalogue authoritative gate
-    private static void appendSalonBookableGate(StringBuilder sb, String defAlias, String salonAlias) {
+    // Widened from private to public (Phase 331): reused AS-IS by
+    // search.repository.SearchSuggestionAvailabilityRepository's salon branch — a different
+    // package, hence public rather than package-private (the doc's original "package-private"
+    // wording could not satisfy a genuine cross-package caller).
+    public static void appendSalonBookableGate(StringBuilder sb, String defAlias, String salonAlias) {
         sb.append("AND EXISTS (SELECT 1 FROM master_services msx ")
                 .append("JOIN masters mx ON mx.id = msx.master_id AND mx.is_active = true ")
                 .append("AND mx.salon_id = ").append(salonAlias).append(".id ")

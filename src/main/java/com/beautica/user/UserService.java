@@ -2,22 +2,26 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import com.beautica.common.RatingBucket;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
+import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
+import com.beautica.master.entity.MasterType;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.search.service.SearchCacheNames;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
 import com.beautica.location.repository.CityDistrictRepository;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.RatingCountProjection;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -35,25 +39,34 @@ import java.util.stream.IntStream;
 @Service
 public class UserService {
 
+    /** Public {@code GET /masters/{masterId}} DTO cache, keyed by masterId (see MasterService). */
+    private static final String MASTER_DETAIL_CACHE = "master-detail";
+
     private final UserRepository userRepository;
     private final LocalityWriteValidator localityWriteValidator;
-    private final CityRepository cityRepository;
+    private final SettlementDisplayNameResolver settlementDisplayNameResolver;
     private final CityDistrictRepository cityDistrictRepository;
+    private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
     private final ClientReviewRepository clientReviewRepository;
+    private final MasterRepository masterRepository;
 
     public UserService(UserRepository userRepository,
                        LocalityWriteValidator localityWriteValidator,
-                       CityRepository cityRepository,
+                       SettlementDisplayNameResolver settlementDisplayNameResolver,
                        CityDistrictRepository cityDistrictRepository,
+                       LocationQueryService locationQueryService,
                        CacheManager cacheManager,
-                       ClientReviewRepository clientReviewRepository) {
+                       ClientReviewRepository clientReviewRepository,
+                       MasterRepository masterRepository) {
         this.userRepository = userRepository;
         this.localityWriteValidator = localityWriteValidator;
-        this.cityRepository = cityRepository;
+        this.settlementDisplayNameResolver = settlementDisplayNameResolver;
         this.cityDistrictRepository = cityDistrictRepository;
+        this.locationQueryService = locationQueryService;
         this.cacheManager = cacheManager;
         this.clientReviewRepository = clientReviewRepository;
+        this.masterRepository = masterRepository;
     }
 
     /**
@@ -86,6 +99,32 @@ public class UserService {
         return UserRatingResponse.from(projection, distribution);
     }
 
+    /**
+     * The authenticated caller's own account record — {@code GET /api/v1/users/me}.
+     *
+     * <p><b>Cached since audit-fix cycle 2 (LOW).</b> This is the hottest authenticated read in the
+     * app (every role, every launch) and was the only one with no cache: three queries per hit —
+     * the {@code users} row, the district label when a district is set, the city→oblast scalar —
+     * plus a fourth {@code EXISTS} for a {@code SALON_OWNER}'s {@code hasMasterProfile}.
+     * {@code sync = true} because this is a per-user hot key and a herd on TTL expiry would
+     * otherwise admit N threads into all four (Anti-Bug §F-7).
+     *
+     * <p><b>The hazard, named.</b> This cache is CROSS-AGGREGATE. Everything on
+     * {@link UserProfileResponse} is read off the {@code users} row except
+     * {@code hasMasterProfile}, which {@link #resolveHasMasterProfile} derives from an active
+     * {@code masters} row of type {@code SALON_OWNER} — a table this service does not own and does
+     * not write. So {@code MasterService} and {@code SalonService} are writers of this cache
+     * without importing anything from this package, and nothing in the type system says so. That
+     * is why eviction does not live inline here but in
+     * {@link com.beautica.common.cache.UserProfileCacheEvictor}, whose javadoc carries the complete
+     * writer set, the paths that are provably NOT writers, and the field-by-field evidence for
+     * each. Adding a field to {@code UserProfileResponse} means re-deriving that set.
+     *
+     * <p>The 5-minute TTL is the backstop for a writer someone forgets to wire up — deliberately
+     * shorter than {@code master-detail-by-user}'s 10 minutes, because this DTO has strictly more
+     * writers than that one does.
+     */
+    @Cacheable(value = UserProfileCacheEvictor.USER_PROFILE_CACHE, key = "#userId", sync = true)
     @Transactional(readOnly = true)
     public UserProfileResponse getProfile(UUID userId) {
         User user = userRepository.findById(userId)
@@ -97,14 +136,66 @@ public class UserService {
                 ? null
                 : cityDistrictRepository.findNameUkById(user.getDistrictId()).orElse(null);
         // oblastId lets the mobile Location-edit screen pre-select the oblast tier without
-        // scanning every oblast's cities. Resolved on demand only when a city is set — one
-        // scalar FK lookup (cities.oblast_id, no JOIN to oblasts); null otherwise. No City is
-        // loaded on this read path (cityName/oblastName come from denormalised columns), so
-        // there is nothing to reuse — this is the minimal extra query.
+        // scanning every oblast's cities. Resolved on demand only when a city is set.
+        //
+        // Routed through the SHARED cached resolver, not a direct repository call (Phase 325 perf
+        // LOW). This path used to call cityRepository.findOblastIdById directly and so bypassed
+        // the `cityOblastId` cache that exists for exactly this question — even though
+        // SalonService and MasterService already ask it through LocationQueryService. GET
+        // /users/me is the hottest authenticated read in the app (every launch, every CLIENT), it
+        // is itself @Cacheable per user, and the taxonomy behind the answer is static
+        // Flyway-seed data — so one shared warm entry per provider city serves every account in
+        // that city instead of one PK lookup per profile read. The null guard stays in front of
+        // the call: a @Cacheable key can never be null.
         UUID oblastId = user.getCityId() == null
                 ? null
-                : cityRepository.findOblastIdById(user.getCityId()).orElse(null);
-        return UserProfileResponse.from(user, districtName, oblastId);
+                : locationQueryService.resolveCityOblastId(user.getCityId());
+        return UserProfileResponse.from(user, districtName, oblastId, resolveHasMasterProfile(user),
+                resolveSettlement(user));
+    }
+
+    /**
+     * The saved settlement's label parts ({@code citySettlementType}, ambiguous-only hromada) for
+     * {@link UserProfileResponse}, via the SAME cached {@link SettlementDisplayNameResolver} that
+     * denormalises {@code users.city}/{@code users.region} on every locality write — no parallel
+     * lookup. Both parts are a pure function of {@code users.city_id} over static KATOTTH data, so
+     * they add no writer to the {@code user-profile} cache: every {@code city_id} write already
+     * evicts it ({@code evictUserCachesAfterCommit}).
+     *
+     * @return the parts, or {@code null} when no city is set or the id no longer resolves
+     */
+    private SettlementDisplayNames resolveSettlement(User user) {
+        return settlementDisplayNameResolver.resolve(user.getCityId()).orElse(null);
+    }
+
+    /**
+     * The owner-as-master toggle state (Phase 265): {@code true} iff an <em>active</em> master row
+     * of type {@code SALON_OWNER} exists for this user. Derived on every read — the toggle IS that
+     * row, so there is no column to read and no migration in this phase.
+     *
+     * <p>The {@code isActive} predicate is the whole point. {@code DELETE
+     * /api/v1/salons/&#123;salonId&#125;/master} deactivates rather than hard-deletes, so a bare
+     * existence check would report every owner who has ever opted in as permanently opted in.
+     *
+     * <p>The role short-circuit ahead of the query is an optimisation that provably cannot change
+     * the answer, not a second source of truth: {@code MasterService.createMasterForOwner} is the
+     * only site in {@code src/main} that mints a {@code MasterType.SALON_OWNER} row and it throws
+     * {@link ForbiddenException} unless {@code owner.getRole() == SALON_OWNER}, and no production
+     * code path mutates {@code User.role} after registration (there is no {@code setRole} call in
+     * {@code src/main} at all). It keeps {@code GET /users/me} — the hottest authenticated read in
+     * the app, hit on every launch by every {@code CLIENT} — at its current query count.
+     *
+     * <p>Cross-package repository injection mirrors the existing {@code ClientReviewRepository}
+     * dependency on this same service: a one-boolean {@code EXISTS} needs no behaviour from
+     * {@code MasterService}, and routing it through that service would create a
+     * {@code UserService} ⇄ {@code MasterService} bean cycle.
+     */
+    private boolean resolveHasMasterProfile(User user) {
+        if (user.getRole() != Role.SALON_OWNER) {
+            return false;
+        }
+        return masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(
+                user.getId(), MasterType.SALON_OWNER);
     }
 
     @Transactional
@@ -153,7 +244,23 @@ public class UserService {
                 || request.districtId() != null;
         evictUserCachesAfterCommit(userId, user.getRole(), searchAffected);
 
-        return UserProfileResponse.from(user);
+        // Phase 265 / audit fix — resolve hasMasterProfile on the WRITE path too, with the same
+        // helper the GET path uses. This response is a full UserProfileResponse on the same wire
+        // type as GET /users/me, so a hard-coded `false` here would hand an opted-in owner a body
+        // that contradicts the read they made one second earlier: one non-nullable field with two
+        // meanings depending on which verb produced it. The field is not made nullable and is not
+        // omitted — a boolean that is sometimes absent is a worse contract than one that is always
+        // right. Cost is the same single indexed EXISTS as the read path, and only for
+        // SALON_OWNER (resolveHasMasterProfile short-circuits every other role without a query).
+        //
+        // This also fixes IndependentMasterController#updateLocality, which serialises the very
+        // same DTO by delegating to this method — there is one write path, not two.
+        // The settlement label parts are resolved here too, for the same reason as
+        // hasMasterProfile: the client re-renders the saved locality from THIS body after a
+        // locality edit, and a null type would drop the «м.»/«с.» prefix it had a second ago.
+        // Cached lookup — the locality write above has just warmed the same key.
+        return UserProfileResponse.from(user, null, null, resolveHasMasterProfile(user),
+                resolveSettlement(user));
     }
 
     /**
@@ -244,6 +351,18 @@ public class UserService {
     }
 
     /**
+     * The {@code master-detail} cache key for {@code userId}'s master row, or {@code null} when the
+     * role can never own one ({@code CLIENT}, {@code SALON_ADMIN}) — those skip the lookup, so the
+     * hot CLIENT profile write stays at its current query count.
+     */
+    private UUID resolveMasterIdForEviction(UUID userId, Role role) {
+        if (role == Role.CLIENT || role == Role.SALON_ADMIN) {
+            return null;
+        }
+        return masterRepository.findIdByUserId(userId).orElse(null);
+    }
+
+    /**
      * Registers a post-commit callback that evicts user-keyed caches and, for
      * {@code INDEPENDENT_MASTER} writes, also clears the discovery cache.
      *
@@ -252,7 +371,10 @@ public class UserService {
      * correctness rule). Caches evicted:
      * <ul>
      *   <li>{@code master-detail-by-user} — DTO cache for {@code GET /masters/me}</li>
+     *   <li>{@code master-detail} — DTO cache for the public {@code GET /masters/{masterId}},
+     *       keyed by the user's master id (only when a master row exists)</li>
      *   <li>{@code master-by-user} — entity cache used by calendar and slot endpoints</li>
+     *   <li>{@code user-profile} — DTO cache for {@code GET /users/me} (audit-fix cycle 2)</li>
      *   <li>{@code search:masters} — discovery cache; cleared only when the writing user
      *       is an {@code INDEPENDENT_MASTER}, since locality or profile changes affect
      *       search results. Salon-bound roles route discovery through the salon record.</li>
@@ -270,6 +392,8 @@ public class UserService {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
+        // Resolved INSIDE the transaction (an id-only indexed lookup), used after commit.
+        UUID masterId = resolveMasterIdForEviction(userId, role);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
@@ -277,9 +401,28 @@ public class UserService {
                 if (detail != null) {
                     detail.evict(userId);
                 }
+                // The PUBLIC GET /masters/{masterId} entry is keyed by masterId, not userId, and
+                // renders these same users-row fields (name, bio, city/region and the settlement
+                // label parts). Without this evict it served the pre-write profile for its full
+                // TTL after every locality/profile write.
+                Cache publicDetail = cacheManager.getCache(MASTER_DETAIL_CACHE);
+                if (publicDetail != null && masterId != null) {
+                    publicDetail.evict(masterId);
+                }
                 Cache byUser = cacheManager.getCache("master-by-user");
                 if (byUser != null) {
                     byUser.evict(userId);
+                }
+                // Audit-fix cycle 2 — GET /users/me is cached as of this cycle. Both public write
+                // paths on this service funnel through here, and so do the private helpers they
+                // call (applyLocality, writeLocalityFields, writeCityDisplayStrings) — those run
+                // inside these same two transactions and are not separate entry points, so this
+                // single call site covers every users-side write of a UserProfileResponse field.
+                // The masters-side writers evict through UserProfileCacheEvictor instead; see its
+                // javadoc for the full set.
+                Cache profile = cacheManager.getCache(UserProfileCacheEvictor.USER_PROFILE_CACHE);
+                if (profile != null) {
+                    profile.evict(userId);
                 }
                 // Search results reflect INDEPENDENT_MASTER locality and profile fields
                 // directly. Clear the entire search:masters cache so the next discovery
@@ -365,33 +508,14 @@ public class UserService {
      * (e.g. {@link com.beautica.master.dto.MasterDetailResponse}) can surface
      * them without a JOIN to the taxonomy tables.
      *
-     * <p>Called only when {@code cityId} is non-null. If the city row is not
-     * found (e.g. stale/invalid UUID slipped past validation), a WARN is logged
-     * and both columns are left unchanged — the caller's transaction continues
-     * normally.</p>
-     *
-     * <p>The {@link com.beautica.location.entity.City#getOblast()} association is
-     * {@code FetchType.LAZY}; it is safe to traverse here because this method is
-     * always called within an active {@code @Transactional} context.</p>
+     * <p>The lookup is the shared {@link SettlementDisplayNameResolver} — the same one
+     * {@code SalonService} uses for {@code salons.city/region} and for the owner row it syncs
+     * on salon create. If the city row is not found (a stale/invalid UUID slipped past
+     * validation), the resolver logs a WARN and both columns are CLEARED — the same rule as
+     * salons, since a stale label beside a new cityId is exactly the defect this guards.</p>
      */
     private void writeCityDisplayStrings(User user, UUID cityId) {
-        if (cityId == null) {
-            return;
-        }
-        Optional<City> cityOpt = cityRepository.findByIdWithOblast(cityId);
-        if (cityOpt.isEmpty()) {
-            log.warn("applyLocality: city not found for id={}, skipping city/region denorm", cityId);
-            return;
-        }
-        City city = cityOpt.get();
-        Oblast oblast = city.getOblast();
-        if (oblast == null) {
-            log.warn("applyLocality: city {} has no oblast association, skipping region denorm", cityId);
-            user.setCity(city.getNameUk());
-            return;
-        }
-        user.setCity(city.getNameUk());
-        user.setRegion(oblast.getNameUk());
+        user.applySettlementDisplayNames(settlementDisplayNameResolver.resolve(cityId).orElse(null));
     }
 
     /**

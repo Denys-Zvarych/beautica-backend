@@ -93,6 +93,23 @@ public final class BookingSpecifications {
     }
 
     /**
+     * Hard scope predicate (Phase 23.4): {@code b.salon.id = :salonId} — the booking's OWN salon
+     * snapshot column, deliberately NOT {@link #salonIdIn}'s {@code JOIN b.master m JOIN m.salon}
+     * shape. {@link #salonIdIn} answers "which of MY currently-owned salons", scoped by the
+     * master's LIVE affiliation, for the multi-salon {@code GET /bookings/me} aggregate; this
+     * predicate answers "which bookings happened AT this one salon", which must stay {@code
+     * booking.salon} so a master who has since rotated to another salon does not silently vanish
+     * from this salon's historical list — see {@code BookingDetailResponse}'s class javadoc for
+     * the {@code booking.getSalon()} vs {@code master.getSalon()} defect class this mirrors.
+     * ALWAYS required. Callers must supply the actor's already-authorized {@code salonId} (see
+     * {@code BookingController#getSalonBookings}'s {@code @authz.canManageSalon} gate) — never an
+     * arbitrary UUID (Anti-Bug §E-4).
+     */
+    public static Specification<Booking> bookingSalonIdEquals(UUID salonId) {
+        return (root, query, cb) -> cb.equal(root.get("salon").get("id"), salonId);
+    }
+
+    /**
      * Optional predicate: {@code b.status IN :statuses}. Callers must omit this predicate
      * entirely (never call this method / never bind a null) when the caller supplied no status
      * filter — that is what keeps the emitted SQL free of the dead-branch shape this fix removes.

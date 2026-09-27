@@ -1,6 +1,7 @@
 package com.beautica.salon.dto;
 
 import com.beautica.location.LocalityWriteInput;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
@@ -23,6 +24,16 @@ import java.util.UUID;
  * model); a blank/absent value now yields a clean 400 at the DTO boundary. Only
  * {@code locationNote} (and {@code districtId}, per the rule above) remains
  * optional.
+ *
+ * <p><strong>{@code locationNote} PATCH semantics:</strong> {@code null} means
+ * "not included in this update — leave the stored value unchanged" (the same
+ * contract as {@code cityId} above); the empty string ({@code ""}) is the
+ * explicit signal to <em>clear</em> a previously-saved note. This matches the
+ * mobile client exactly: {@code salon_management_profile_notifier.dart}'s
+ * {@code saveAddress()} omits the field (sends {@code null}) when the note is
+ * untouched and sends {@code ""} when the user blanks it. Do not "fix" this by
+ * treating blank/absent the same way — that would remove the only way to clear
+ * a note. See {@code SalonService#updateSalon}.
  *
  * <p>The legacy free-text {@code city} / {@code region} / {@code address}
  * fields are retained on the wire for backward-compatible clients but are
@@ -47,12 +58,25 @@ public record UpdateSalonRequest(
         String description,
 
         // ---- Legacy free-text locality (deprecated; no longer persisted) ----
+        // Accepted for old clients, validated, then IGNORED: the persisted city is derived from
+        // cityId (SalonService#writeSettlementLabels). Kept so an old payload still parses.
+        @Deprecated
+        @Schema(deprecated = true, description = "Ignored — derived from cityId")
         @Size(max = 100, message = "City must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "City must not contain control characters")
         String city,
+        // Accepted for old clients, validated, then IGNORED: the persisted region is derived from
+        // cityId (SalonService#writeSettlementLabels). Kept so an old payload still parses.
+        @Deprecated
+        @Schema(deprecated = true, description = "Ignored — derived from cityId")
         @Size(max = 100, message = "Region must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Region must not contain control characters")
         String region,
+        // Accepted for old clients, validated, then IGNORED: free-text address is no longer
+        // persisted (it is served publicly and Update could never correct or remove it). The
+        // structured street/buildingNo/locationNote fields replace it. Existing rows are kept.
+        @Deprecated
+        @Schema(deprecated = true, description = "Ignored — use street/buildingNo/locationNote")
         @Size(max = 500, message = "Address must be at most 500 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Address must not contain control characters")
         String address,

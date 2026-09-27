@@ -79,6 +79,20 @@ class SalonServiceRotateAdminTest {
     @Mock
     private AuthorizationService authorizationService;
 
+    // Audit-fix cycle 2: SalonService evicts the affected user's cached profile after commit
+    // (createSalon, removeAdmin, rotateAdmin all mutate a `users` row). @InjectMocks passes null
+    // for an UNDECLARED collaborator silently, so compileTestJava stays green and the omission
+    // only surfaces as an NPE at runtime — this field must exist even when no test here reaches
+    // an evict call.
+    @Mock
+    private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+
+    // Phase 301: SalonService now constructor-depends on the promoted staff-account
+    // hard-delete seam. None of these tests exercise a path that dereferences it, so a plain
+    // mock satisfies the constructor without any stubbing.
+    @Mock
+    private com.beautica.salon.service.StaffAccountDisposalService staffAccountDisposalService;
+
     @InjectMocks
     private SalonService salonService;
 

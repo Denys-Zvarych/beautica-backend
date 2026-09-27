@@ -39,9 +39,26 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      * different salon or master. That is deliberate — the authority decision is not the repository's
      * to make, and folding an {@code actorId} in here would duplicate, in JPQL, the ownership rule
      * {@code AuthorizationService#filterBookingIdsWithProviderAuthority} owns, giving two
-     * implementations that can drift. It is safe ONLY because the sole caller,
-     * {@code BookingService#loadProviderReviewBatch}, passes exactly the {@code withAuthority} set
-     * that method returned, and returns early when it is empty. Review-existence is a weak signal
+     * implementations that can drift — the rule now lives in
+     * {@code AuthorizationService#isPerformingMasterOfBooking} (Phase 320: only the booking's
+     * performing master may review its client). It is safe ONLY because <b>every</b> caller passes
+     * ids already narrowed to bookings the actor holds provider authority over, and skips the call
+     * when that set is empty. There are TWO, not one:
+     * <ul>
+     *   <li>{@code BookingService#loadProviderReviewBatch} — passes exactly the
+     *       {@code withAuthority} set it computed from that predicate ({@code GET /bookings/me}).</li>
+     *   <li>{@code BookingService#listSalonBookings} — passes the page's review candidates
+     *       intersected with {@code resolveSalonPageProviderAuthority}'s result
+     *       ({@code GET /bookings/salon/&#123;salonId&#125;}).</li>
+     * </ul>
+     * The salon caller did NOT narrow until the unscoped client-review probe finding
+     * (backend-security 2026-09-20) — it passed every review
+     * candidate on the page — so this paragraph named one caller and was, for the other,
+     * <b>provably false</b>. It was not exploitable (salon-scoped ids the caller had already
+     * cleared via {@code canManageSalon}, a page-bounded {@code IN} list, and a
+     * {@code providerCanReviewClient} conjunction that short-circuits before the boolean can reach
+     * the response), but an invariant that is silently false for one of its callers cannot be
+     * relied on by the next one. Review-existence is a weak signal
      * (a boolean per id, no review content), but it is still information about a stranger's booking,
      * and a caller that skipped the narrowing would additionally hand attacker-chosen ids straight
      * into an unbounded {@code IN} list. Any NEW caller must narrow first, or this method must gain
@@ -100,4 +117,19 @@ public interface ClientReviewRepository extends JpaRepository<ClientReview, UUID
      */
     @Query("SELECT cr.rating AS rating, COUNT(cr) AS count FROM ClientReview cr WHERE cr.subjectClient.id = :clientId GROUP BY cr.rating")
     List<RatingCountProjection> countBySubjectClientIdGroupByRating(@Param("clientId") UUID clientId);
+
+    /**
+     * Purges every provider&rarr;client review authored ABOUT {@code subjectClientId} — the CLIENT
+     * account self-deletion cascade (Phase 300 D3/D4). Unlike the client&rarr;provider direction
+     * ({@code reviews}, detached and kept), these rows are DELETED outright: they rate the
+     * *client*, the aggregate they feed ({@code users.avg_rating}/{@code review_count}) dies with
+     * the row being deleted anyway, and by the locked two-sided-ratings decision the client is the
+     * only reader of their own rating — a detached {@code client_review} would have no subject, no
+     * aggregate and no reader, so retaining it would relax {@code subject_client_id}'s NOT NULL
+     * (V128:19) for nobody. Must run BEFORE the {@code users} row is deleted — see {@code
+     * ClientAccountDeletionService}.
+     */
+    @Modifying
+    @Query("DELETE FROM ClientReview cr WHERE cr.subjectClient.id = :subjectClientId")
+    void deleteBySubjectClientId(@Param("subjectClientId") UUID subjectClientId);
 }

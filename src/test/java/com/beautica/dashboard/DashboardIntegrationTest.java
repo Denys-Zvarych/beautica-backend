@@ -8,9 +8,6 @@ import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -24,7 +21,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -69,24 +65,6 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    private static HttpComponentsClientHttpRequestFactory hc5Factory;
-
-    @BeforeEach
-    void configureHttpClient() {
-        if (hc5Factory == null) {
-            hc5Factory = new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault());
-        }
-        restTemplate.getRestTemplate().setRequestFactory(hc5Factory);
-    }
-
-    @AfterAll
-    static void destroyHttpClient() throws Exception {
-        if (hc5Factory != null) {
-            hc5Factory.destroy();
-            hc5Factory = null;
-        }
-    }
 
     // ── 1. Correct totals from COMPLETED bookings ─────────────────────────────
 
@@ -356,9 +334,13 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
                 "UPDATE service_definitions SET base_price = 999.00 WHERE id = ?",
                 fixture.serviceDefId());
 
-        // Also update master_services price_override if it exists (belt-and-suspenders)
+        // Also update master_services price_override if it exists (belt-and-suspenders).
+        // Phase 311 V165's chk_master_service_price_mode forbids a partial band, so
+        // price_type_override must be set alongside a non-null price_override — FIXED, matching
+        // "the master fixed their own price" (mirrors BookingPriceRangeContractIT#createRangeService).
         jdbcTemplate.update(
-                "UPDATE master_services SET price_override = 999.00 WHERE id = ?",
+                "UPDATE master_services SET price_override = 999.00, price_type_override = 'FIXED' "
+                        + "WHERE id = ?",
                 fixture.masterServiceId());
 
         log.debug("Act: GET {} as SALON_OWNER after price update — estimatedRevenue must be 100.00 (snapshot)", REVENUE_URL);
@@ -582,8 +564,8 @@ class DashboardIntegrationTest extends AbstractIntegrationTest {
 
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + ownerId, testCityId());
 
         UUID masterUserId = UUID.randomUUID();
         String masterEmail = "master-" + System.nanoTime() + "@beautica.test";

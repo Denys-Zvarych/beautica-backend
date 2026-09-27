@@ -77,7 +77,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWith(LoadingCache<String, Bucket> writeBuckets) {
         return new BookingRateLimitFilter(
-                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -87,7 +87,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithDeclineBuckets(LoadingCache<String, Bucket> declineBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -97,7 +97,7 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithOverrideBuckets(LoadingCache<String, Bucket> overrideBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
     }
 
     /**
@@ -109,7 +109,62 @@ class BookingRateLimitFilterTest {
      */
     private BookingRateLimitFilter filterWithStaffSmsBuckets(LoadingCache<String, Bucket> staffSmsBuckets) {
         return new BookingRateLimitFilter(
-                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, OBJECT_MAPPER);
+                generousBuckets(), generousBuckets(), generousBuckets(), staffSmsBuckets, generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+    }
+
+    /**
+     * Builds a filter with the given self-delete bucket and UNRELATED, generously-sized siblings —
+     * the mirror of {@link #filterWith(LoadingCache)} for tests that only exercise
+     * {@code DELETE /api/v1/users/me} (Phase 300 perf finding 2).
+     */
+    private BookingRateLimitFilter filterWithSelfDeleteBuckets(LoadingCache<String, Bucket> selfDeleteBuckets) {
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets,
+                generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+    }
+
+    /**
+     * Builds a filter with the given salon-master-services READ bucket and UNRELATED,
+     * generously-sized siblings — the mirror of {@link #filterWith(LoadingCache)} for
+     * {@code GET /api/v1/salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services}
+     * (cycle-2 audit, B8).
+     */
+    private BookingRateLimitFilter filterWithSalonMasterServicesReadBuckets(
+            LoadingCache<String, Bucket> readBuckets) {
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
+                generousBuckets(), readBuckets, generousBuckets(), OBJECT_MAPPER);
+    }
+
+    private static MockHttpServletRequest getSalonMasterServices(UUID salonId, UUID masterId) {
+        return new MockHttpServletRequest(
+                "GET", "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services");
+    }
+
+    /**
+     * Builds a filter with the given salon-BOARD read bucket and UNRELATED, generously-sized
+     * siblings — the mirror of {@link #filterWith(LoadingCache)} for the three expensive
+     * authenticated board reads (the unthrottled salon-board reads finding, backend-security
+     * 2026-09-20).
+     */
+    private BookingRateLimitFilter filterWithSalonBoardReadBuckets(
+            LoadingCache<String, Bucket> boardBuckets) {
+        return new BookingRateLimitFilter(
+                generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(),
+                generousBuckets(), generousBuckets(), boardBuckets, OBJECT_MAPPER);
+    }
+
+    private static MockHttpServletRequest getSalonEffectiveSchedule(UUID salonId) {
+        return new MockHttpServletRequest(
+                "GET", "/api/v1/salons/" + salonId + "/masters/effective-schedule");
+    }
+
+    private static MockHttpServletRequest getSalonBookings(UUID salonId) {
+        return new MockHttpServletRequest("GET", "/api/v1/bookings/salon/" + salonId);
+    }
+
+    private static MockHttpServletRequest getSalonBookedDays(UUID salonId) {
+        return new MockHttpServletRequest("GET", "/api/v1/bookings/salon/" + salonId + "/booked-days");
     }
 
     /** A bucket cache with effectively unlimited capacity — for the "other" bucket in a test. */
@@ -202,6 +257,11 @@ class BookingRateLimitFilterTest {
     /** The provider-facing read of a master's calendar — a GET, and never throttled. */
     private static MockHttpServletRequest getMasterBookings(UUID masterId) {
         return new MockHttpServletRequest("GET", "/api/v1/masters/" + masterId + "/bookings");
+    }
+
+    /** Phase 300 — the CLIENT self-deletion endpoint. */
+    private static MockHttpServletRequest deleteMyAccount() {
+        return new MockHttpServletRequest("DELETE", "/api/v1/users/me");
     }
 
     private static MockHttpServletRequest postOverrideConflictsPreview(UUID masterId) {
@@ -458,7 +518,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> declineBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+                        writeBuckets, declineBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the create/reschedule bucket.
@@ -972,7 +1032,7 @@ class BookingRateLimitFilterTest {
         LoadingCache<String, Bucket> overrideBuckets = singleSlotBuckets();
         BookingRateLimitFilter filter =
                 new BookingRateLimitFilter(
-                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), OBJECT_MAPPER);
+                        generousBuckets(), declineBuckets, overrideBuckets, generousBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Exhaust the decline bucket.
@@ -1137,7 +1197,7 @@ class BookingRateLimitFilterTest {
     @DisplayName("should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate")
     void should_notShareBudgets_when_sameStaffAlternatesClientCreateAndStaffCreate() throws Exception {
         BookingRateLimitFilter filter = new BookingRateLimitFilter(
-                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), OBJECT_MAPPER);
+                singleSlotBuckets(), generousBuckets(), generousBuckets(), singleSlotBuckets(), generousBuckets(), generousBuckets(), generousBuckets(), OBJECT_MAPPER);
         authenticateAs(UUID.randomUUID());
 
         // Spend the whole client-create budget.
@@ -1507,5 +1567,377 @@ class BookingRateLimitFilterTest {
         assertThat(secondStaffCreate.getStatus())
                 .as("and exactly one slot existed, so the next real create is throttled")
                 .isEqualTo(429);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Phase 300 perf finding 2 (2026-09 audit, MEDIUM) — DELETE /api/v1/users/me (CLIENT
+    // self-deletion) previously had NO rate limit at all: AuthRateLimitFilter only covers /auth/*.
+    // Reuses this exact per-user Bucket4j mechanism rather than a second, parallel one.
+    // -------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("should_return429_when_sameClientExceedsCapacityOnSelfDeletePath")
+    void should_return429_when_sameClientExceedsCapacityOnSelfDeletePath() throws Exception {
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        MockHttpServletResponse firstResponse = new MockHttpServletResponse();
+        MockFilterChain firstChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), firstResponse, firstChain);
+        assertThat(firstResponse.getStatus())
+                .as("the first self-delete attempt within capacity must be forwarded")
+                .isNotEqualTo(429);
+        assertThat(firstChain.getRequest()).isNotNull();
+
+        MockHttpServletResponse secondResponse = new MockHttpServletResponse();
+        MockFilterChain secondChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), secondResponse, secondChain);
+
+        assertThat(secondResponse.getStatus())
+                .as("a second DELETE /users/me from the SAME client within the window must be "
+                        + "throttled — this closes the previously-unthrottled self-delete gap")
+                .isEqualTo(429);
+        assertThat(secondChain.getRequest())
+                .as("a throttled self-delete must NOT reach the hard-delete cascade")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("should_writeOneHourRetryAfter_when_selfDeleteThrottled")
+    void should_writeOneHourRetryAfter_when_selfDeleteThrottled() throws Exception {
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(deleteMyAccount(), new MockHttpServletResponse(), new MockFilterChain());
+
+        MockHttpServletResponse throttled = new MockHttpServletResponse();
+        filter.doFilterInternal(deleteMyAccount(), throttled, new MockFilterChain());
+
+        assertThat(throttled.getStatus()).isEqualTo(429);
+        assertThat(throttled.getHeader("Retry-After"))
+                .as("the self-delete bucket's own 60-minute window")
+                .isEqualTo("3600");
+    }
+
+    @Test
+    @DisplayName("should_keySelfDeleteBucketPerUser_when_twoDifferentClientsCallIt")
+    void should_keySelfDeleteBucketPerUser_when_twoDifferentClientsCallIt() throws Exception {
+        LoadingCache<String, Bucket> buckets = singleSlotBuckets();
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(buckets);
+
+        UUID clientA = UUID.randomUUID();
+        authenticateAs(clientA);
+        filter.doFilterInternal(deleteMyAccount(), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse clientAExhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(deleteMyAccount(), clientAExhausted, new MockFilterChain());
+        assertThat(clientAExhausted.getStatus()).isEqualTo(429);
+
+        SecurityContextHolder.clearContext();
+        UUID clientB = UUID.randomUUID();
+        authenticateAs(clientB);
+        MockHttpServletResponse clientBResponse = new MockHttpServletResponse();
+        MockFilterChain clientBChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), clientBResponse, clientBChain);
+
+        assertThat(clientBResponse.getStatus())
+                .as("client B must not be throttled by client A's exhausted self-delete bucket")
+                .isNotEqualTo(429);
+        assertThat(clientBChain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_useSeparateBucket_when_selfDeleteAndBookingCreateAreBothCalledBySameUser")
+    void should_useSeparateBucket_when_selfDeleteAndBookingCreateAreBothCalledBySameUser() throws Exception {
+        // Exhausting the create/reschedule bucket must NOT throttle self-delete, and vice-versa.
+        LoadingCache<String, Bucket> writeBuckets = singleSlotBuckets();
+        LoadingCache<String, Bucket> selfDeleteBuckets = singleSlotBuckets();
+        BookingRateLimitFilter filter = new BookingRateLimitFilter(
+                writeBuckets, generousBuckets(), generousBuckets(), generousBuckets(), selfDeleteBuckets,
+                        generousBuckets(), generousBuckets(), OBJECT_MAPPER);
+        authenticateAs(UUID.randomUUID());
+
+        filter.doFilterInternal(postCreate(), new MockHttpServletResponse(), new MockFilterChain());
+        MockHttpServletResponse createExhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(postCreate(), createExhausted, new MockFilterChain());
+        assertThat(createExhausted.getStatus()).isEqualTo(429);
+
+        MockHttpServletResponse selfDeleteResponse = new MockHttpServletResponse();
+        MockFilterChain selfDeleteChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), selfDeleteResponse, selfDeleteChain);
+        assertThat(selfDeleteResponse.getStatus())
+                .as("an exhausted create/reschedule bucket must not throttle self-delete — separate bucket")
+                .isNotEqualTo(429);
+        assertThat(selfDeleteChain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_passThrough_when_selfDeleteCallerIsUnauthenticated")
+    void should_passThrough_when_selfDeleteCallerIsUnauthenticated() throws Exception {
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        MockFilterChain chain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), response, chain);
+
+        assertThat(response.getStatus()).isNotEqualTo(429);
+        assertThat(chain.getRequest())
+                .as("there is no user id to key a bucket on — the downstream 401 rejects instead")
+                .isNotNull();
+    }
+
+    @Test
+    @DisplayName("should_passThrough_when_pathIsUsersMeButMethodIsNotDelete")
+    void should_passThrough_when_pathIsUsersMeButMethodIsNotDelete() throws Exception {
+        // GET/PATCH /users/me are unrelated reads/updates — only the DELETE verb is throttled here.
+        BookingRateLimitFilter filter = filterWithSelfDeleteBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        var getResponse = new MockHttpServletResponse();
+        var getChain = new MockFilterChain();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", "/api/v1/users/me"), getResponse, getChain);
+        assertThat(getResponse.getStatus()).isNotEqualTo(429);
+        assertThat(getChain.getRequest()).isNotNull();
+
+        var patchResponse = new MockHttpServletResponse();
+        var patchChain = new MockFilterChain();
+        filter.doFilterInternal(new MockHttpServletRequest("PATCH", "/api/v1/users/me"), patchResponse, patchChain);
+        assertThat(patchResponse.getStatus()).isNotEqualTo(429);
+        assertThat(patchChain.getRequest()).isNotNull();
+
+        // The single-slot bucket must still be intact for the real DELETE.
+        var deleteResponse = new MockHttpServletResponse();
+        var deleteChain = new MockFilterChain();
+        filter.doFilterInternal(deleteMyAccount(), deleteResponse, deleteChain);
+        assertThat(deleteResponse.getStatus())
+                .as("the self-delete bucket must be untouched by the GET/PATCH calls above")
+                .isNotEqualTo(429);
+        assertThat(deleteChain.getRequest()).isNotNull();
+    }
+
+    // ── B8 (2026-09-13 cycle-2 audit): the salon-management read is keyed on the PRINCIPAL ───────
+
+    /**
+     * {@code GET /api/v1/salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services} used to
+     * share {@code catalogueBrowseBuckets} — an ANONYMOUS per-IP bucket in
+     * {@code AuthRateLimitFilter}. Under carrier-grade NAT one egress IP's anonymous browse traffic
+     * could 429 a salon owner's management UI. It now consumes a per-user bucket here instead.
+     */
+    @Test
+    @DisplayName("B8: the salon-master-services management read consumes a PER-USER bucket — a "
+            + "second call by the same principal is throttled")
+    void should_return429_when_salonMasterServicesReadExceedsThePerUserBudget() throws Exception {
+        BookingRateLimitFilter filter =
+                filterWithSalonMasterServicesReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID salonId = UUID.randomUUID();
+
+        var first = new MockHttpServletResponse();
+        filter.doFilterInternal(
+                getSalonMasterServices(salonId, UUID.randomUUID()), first, new MockFilterChain());
+
+        var second = new MockHttpServletResponse();
+        var secondChain = new MockFilterChain();
+        // A DIFFERENT master in a DIFFERENT salon — the budget is the CALLER's, not the target's.
+        filter.doFilterInternal(
+                getSalonMasterServices(UUID.randomUUID(), UUID.randomUUID()), second, secondChain);
+
+        assertThat(first.getStatus()).as("the first read must pass").isNotEqualTo(429);
+        assertThat(second.getStatus())
+                .as("the second read by the same principal must spend the per-user bucket")
+                .isEqualTo(429);
+        assertThat(secondChain.getRequest())
+                .as("a throttled management read must not reach the authorization traversal")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("B8: one principal exhausting the management-read budget leaves another "
+            + "principal's intact — the very starvation a shared per-IP bucket allowed")
+    void should_notThrottle_when_anotherPrincipalReadsAfterTheFirstExhaustedTheBudget() throws Exception {
+        BookingRateLimitFilter filter =
+                filterWithSalonMasterServicesReadBuckets(singleSlotBuckets());
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+
+        authenticateAs(UUID.randomUUID());
+        filter.doFilterInternal(getSalonMasterServices(salonId, masterId),
+                new MockHttpServletResponse(), new MockFilterChain());
+        var exhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(getSalonMasterServices(salonId, masterId),
+                exhausted, new MockFilterChain());
+        assertThat(exhausted.getStatus()).as("arrange check — user A is spent").isEqualTo(429);
+
+        authenticateAs(UUID.randomUUID());
+        var response = new MockHttpServletResponse();
+        var chain = new MockFilterChain();
+        filter.doFilterInternal(getSalonMasterServices(salonId, masterId), response, chain);
+
+        assertThat(response.getStatus())
+                .as("user B keeps their own budget — one tenant can no longer starve another, "
+                        + "which is exactly what the shared CGNAT per-IP bucket permitted")
+                .isNotEqualTo(429);
+        assertThat(chain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("B8 scoping: the PUBLIC salon catalogue read and a deeper look-alike path are not "
+            + "matched here — they keep their own per-IP bucket in AuthRateLimitFilter")
+    void should_notMatch_when_pathIsThePublicCatalogueReadOrADeeperLookAlike() throws Exception {
+        BookingRateLimitFilter filter =
+                filterWithSalonMasterServicesReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID salonId = UUID.randomUUID();
+
+        for (String path : List.of(
+                "/api/v1/salons/" + salonId + "/services",
+                "/api/v1/salons/" + salonId + "/masters/" + UUID.randomUUID() + "/portfolio/services")) {
+            for (int i = 0; i < 3; i++) {
+                var response = new MockHttpServletResponse();
+                var chain = new MockFilterChain();
+                filter.doFilterInternal(new MockHttpServletRequest("GET", path), response, chain);
+                assertThat(response.getStatus())
+                        .as("request %d to %s must not be matched by the management-read helper", i + 1, path)
+                        .isNotEqualTo(429);
+                assertThat(chain.getRequest()).isNotNull();
+            }
+        }
+    }
+
+    // ── the unthrottled salon-board reads finding (backend-security 2026-09-20): the three
+    // ── expensive salon-board reads share a PER-PRINCIPAL bucket ──────────────────────────────
+
+    /**
+     * {@code GET /salons/&#123;salonId&#125;/masters/effective-schedule},
+     * {@code GET /bookings/salon/&#123;salonId&#125;/booked-days} and
+     * {@code GET /bookings/salon/&#123;salonId&#125;} shipped with NO bucket at all. Each is an
+     * expensive authenticated read — a {@code |roster| x up-to-62} response body, a
+     * status-unfiltered DISTINCT scan, and a list whose {@code COUNT} companion runs on every full
+     * page — so they now draw from one shared per-user budget, keyed on the principal exactly as
+     * B8's management read is.
+     */
+    @Test
+    @DisplayName("salon-board throttle: every one of the three reads consumes the SAME per-user "
+            + "budget — a board refresh is three tokens, not three separate allowances")
+    void should_return429_when_theSalonBoardReadsShareOnePerUserBudget() throws Exception {
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+        UUID salonId = UUID.randomUUID();
+
+        var first = new MockHttpServletResponse();
+        filter.doFilterInternal(getSalonEffectiveSchedule(salonId), first, new MockFilterChain());
+
+        // A DIFFERENT route, and a DIFFERENT salon — the budget is the CALLER's, not the target's.
+        var second = new MockHttpServletResponse();
+        var secondChain = new MockFilterChain();
+        filter.doFilterInternal(getSalonBookedDays(UUID.randomUUID()), second, secondChain);
+
+        assertThat(first.getStatus()).as("the first board read must pass").isNotEqualTo(429);
+        assertThat(second.getStatus())
+                .as("the second board read by the same principal must spend the shared per-user "
+                        + "bucket, whichever of the three routes it is and whichever salon it names")
+                .isEqualTo(429);
+        assertThat(secondChain.getRequest())
+                .as("a throttled board read must not reach the authorization traversal or the query")
+                .isNull();
+    }
+
+    @Test
+    @DisplayName("salon-board throttle: each of the three routes is matched — a route left out "
+            + "of the matcher "
+            + "would be silently unbucketed and this loop is what catches it")
+    void should_matchEveryOneOfTheThreeSalonBoardReads() throws Exception {
+        UUID salonId = UUID.randomUUID();
+
+        for (MockHttpServletRequest request : List.of(
+                getSalonEffectiveSchedule(salonId),
+                getSalonBookedDays(salonId),
+                getSalonBookings(salonId))) {
+            BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+            authenticateAs(UUID.randomUUID());
+
+            filter.doFilterInternal(
+                    new MockHttpServletRequest(request.getMethod(), request.getRequestURI()),
+                    new MockHttpServletResponse(), new MockFilterChain());
+            var second = new MockHttpServletResponse();
+            filter.doFilterInternal(
+                    new MockHttpServletRequest(request.getMethod(), request.getRequestURI()),
+                    second, new MockFilterChain());
+
+            assertThat(second.getStatus())
+                    .as("%s must be matched by the salon-board matcher; an unmatched route passes "
+                            + "the filter untouched and would never reach 429", request.getRequestURI())
+                    .isEqualTo(429);
+        }
+    }
+
+    @Test
+    @DisplayName("salon-board throttle: one principal exhausting the board budget leaves "
+            + "another principal's "
+            + "intact, and the response carries Retry-After: 60")
+    void should_keepSalonBoardBudgetsPerPrincipal_andAdvertiseRetryAfter() throws Exception {
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        UUID salonId = UUID.randomUUID();
+
+        authenticateAs(UUID.randomUUID());
+        filter.doFilterInternal(getSalonBookings(salonId),
+                new MockHttpServletResponse(), new MockFilterChain());
+        var exhausted = new MockHttpServletResponse();
+        filter.doFilterInternal(getSalonBookings(salonId), exhausted, new MockFilterChain());
+
+        assertThat(exhausted.getStatus()).as("arrange check — user A is spent").isEqualTo(429);
+        assertThat(exhausted.getHeader("Retry-After"))
+                .as("the client cannot back off correctly without it, and the documented 429 "
+                        + "contract tells it to key on this header")
+                .isEqualTo("60");
+
+        authenticateAs(UUID.randomUUID());
+        var response = new MockHttpServletResponse();
+        var chain = new MockFilterChain();
+        filter.doFilterInternal(getSalonBookings(salonId), response, chain);
+
+        assertThat(response.getStatus())
+                .as("user B keeps their own budget — one salon's board refresh must not throttle "
+                        + "another tenant's")
+                .isNotEqualTo(429);
+        assertThat(chain.getRequest()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("salon-board throttle scoping: look-alike paths are NOT matched — the "
+            + "single-booking read, a "
+            + "deeper sub-route under either prefix, and a non-GET on the same path")
+    void should_notMatch_whenPathIsALookAlikeOfASalonBoardRead() throws Exception {
+        UUID salonId = UUID.randomUUID();
+        List<MockHttpServletRequest> unmatched = List.of(
+                // the single-booking read — no literal `salon` segment
+                new MockHttpServletRequest("GET", "/api/v1/bookings/" + UUID.randomUUID()),
+                // a deeper sub-route: left unbucketed ON PURPOSE so a future route is loud, not
+                // silently inheriting this budget
+                new MockHttpServletRequest("GET",
+                        "/api/v1/bookings/salon/" + salonId + "/booked-days/summary"),
+                new MockHttpServletRequest("GET",
+                        "/api/v1/salons/" + salonId + "/masters/effective-schedule/export"),
+                // the public catalogue read keeps its per-IP bucket in AuthRateLimitFilter
+                new MockHttpServletRequest("GET", "/api/v1/salons/" + salonId + "/services"),
+                // method-gated: this matcher is GET-only
+                new MockHttpServletRequest("PUT", "/api/v1/bookings/salon/" + salonId));
+
+        BookingRateLimitFilter filter = filterWithSalonBoardReadBuckets(singleSlotBuckets());
+        authenticateAs(UUID.randomUUID());
+
+        for (MockHttpServletRequest request : unmatched) {
+            for (int i = 0; i < 3; i++) {
+                var response = new MockHttpServletResponse();
+                var chain = new MockFilterChain();
+                filter.doFilterInternal(
+                        new MockHttpServletRequest(request.getMethod(), request.getRequestURI()),
+                        response, chain);
+                assertThat(response.getStatus())
+                        .as("request %d to %s %s must not be matched by the salon-board helper",
+                                i + 1, request.getMethod(), request.getRequestURI())
+                        .isNotEqualTo(429);
+                assertThat(chain.getRequest()).isNotNull();
+            }
+        }
     }
 }

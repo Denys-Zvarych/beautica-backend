@@ -169,11 +169,41 @@ class MasterScheduleWorkingWindowContractIT extends AbstractIntegrationTest {
         return body;
     }
 
-    /** Asserts the JSON key exists on the wire AND is JSON {@code null} — presence matters to codegen. */
+    /**
+     * Asserts the JSON key exists on the wire AND is JSON {@code null}.
+     *
+     * <p><b>This is a STABILITY lock, not a correctness one — do not restate it as the latter.</b> An
+     * earlier version of this message claimed an omitted key and a {@code null} value "are different
+     * things to the generated Dio model". They are not, and the claim was checked to destruction
+     * (architect, 2026-09-17):
+     * <ul>
+     *   <li>{@code beautica-mobile/api/lib/src/model/effective_day_response.dart} declares
+     *       {@code times}, {@code windowStart} and {@code windowEnd} nullable with no
+     *       {@code defaultValue};</li>
+     *   <li>its {@code _deserializeProperties} walks only the keys actually PRESENT in the payload and
+     *       shunts unknown ones into {@code default:} — an absent key never enters the loop, so the
+     *       builder field is simply left null;</li>
+     *   <li>{@code effective_day_response.g.dart}'s {@code _build()} raises no
+     *       {@code BuiltValueNullFieldError} for those three, so absence never throws;</li>
+     *   <li>the consumer, {@code schedule_mapper.dart}'s {@code _windowFromWire}, folds both cases into
+     *       one branch.</li>
+     * </ul>
+     * What this helper actually pins is that the wire SHAPE stays constant: the projection emits the
+     * same key set for a windowless day as for a windowed one, so the response is self-describing and
+     * a change to that shape (e.g. switching the DTO to {@code @JsonInclude(NON_NULL)}) is a reviewed
+     * decision with an OpenAPI regen behind it, never an incidental one. That change was in fact
+     * proposed and REJECTED on 2026-09-17: {@code server.compression} already collects ~96% of the
+     * payload win, and the client cannot tell the two encodings apart — which is exactly why this
+     * assertion is a lock and not a bug detector.
+     *
+     * <p>A false premise inside an assertion message is how the NEXT auditor builds the next wrong
+     * finding, so the message below states only what is true.
+     */
     private static void assertWindowKeysPresentAndNull(JsonNode node, String context) {
         assertThat(node.has("windowStart"))
-                .as("%s — the windowStart KEY must still be emitted (an omitted key and a null value are "
-                        + "different things to the generated Dio model), node=%s", context, node)
+                .as("%s — the windowStart KEY must still be emitted: this projection's key set is "
+                        + "deliberately constant across windowed and windowless days, and narrowing it "
+                        + "is a reviewed contract change, node=%s", context, node)
                 .isTrue();
         assertThat(node.has("windowEnd")).as("%s — the windowEnd KEY must still be emitted", context).isTrue();
         assertThat(node.get("windowStart").isNull())

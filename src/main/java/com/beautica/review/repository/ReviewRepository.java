@@ -28,6 +28,36 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     @Query("SELECT r.booking.id FROM Review r WHERE r.booking.id IN :bookingIds")
     java.util.List<UUID> findReviewedBookingIds(@Param("bookingIds") java.util.List<UUID> bookingIds);
 
+    /**
+     * Phase 317 — the client&rarr;provider review of ONE booking, as rating + comment, for {@code
+     * BookingDetailResponse#reviewByClient} on {@code GET /bookings/&#123;id&#125;}.
+     *
+     * <p><b>Replaces, never accompanies, {@link #existsByBookingId} on that call path</b> (&sect;E-1:
+     * a narrower variant kept alongside a wider one silently drifts). {@code BookingService#getBooking}
+     * needs both "does a review exist" (for {@code canReview}) and "what does it say" (for {@code
+     * reviewByClient}) about the SAME booking; presence of this {@link Optional} answers the first,
+     * so the detail path issues exactly one statement where it used to issue one
+     * {@code SELECT COUNT(*) &gt; 0} — the pinned count in {@code BookingPriceRangeContractIT
+     * #OWNER_DETAIL_STATEMENTS_ALIGNED} is unchanged. {@link #existsByBookingId} survives for
+     * {@code ReviewService#createReview}'s duplicate-write gate, which genuinely wants the cheaper
+     * existence form and never the body.
+     *
+     * <p>{@code reviews.booking_id} is a UNIQUE FK ({@code Review}), so this can match at most one
+     * row — {@link Optional} is exact, not a {@code Limit.of(1)} narrowing of a list.
+     *
+     * <p>Selects scalars off the {@code reviews} row alone: no join, no association walk, nothing
+     * lazy, and not even the {@code booking_id} it filters on — the caller already holds that id.
+     * Do NOT widen it to carry the author's name or the service name — see
+     * {@link BookingReviewView}'s javadoc.
+     */
+    @Query("""
+            SELECT new com.beautica.review.repository.BookingReviewView(
+                r.rating, r.comment)
+            FROM Review r
+            WHERE r.booking.id = :bookingId
+            """)
+    Optional<BookingReviewView> findViewByBookingId(@Param("bookingId") UUID bookingId);
+
     // Two-query pattern — avoids HHH90003004 (Hibernate in-memory pagination warning).
     // Step 1: paginate on IDs only — SQL LIMIT/OFFSET, no JOIN FETCH.
     @Query(value = """
@@ -99,10 +129,18 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      *
      * <p>No {@code ORDER BY} clause: ordering is driven by the caller's ID stream,
      * which is cheaper than a redundant DB sort on an unindexed set.
+     *
+     * <p><b>{@code client} is a {@code LEFT JOIN FETCH}, not INNER</b> (Phase 300 D3 —
+     * {@code reviews.client_id} became nullable so a self-deleted client's review survives with
+     * its rating and comment intact). An INNER join would silently drop that review from every
+     * page it belongs to, with the paged {@code totalElements} still counting it — the same
+     * failure class the V157 audit already fixed for {@code m.user}. {@link
+     * com.beautica.review.dto.ReviewResponse#from} renders the sentinel when {@code getClient()}
+     * is {@code null}.
      */
     @Query("""
             SELECT r FROM Review r
-            JOIN FETCH r.client
+            LEFT JOIN FETCH r.client
             JOIN FETCH r.master
             JOIN FETCH r.booking b
             JOIN FETCH b.masterService ms
@@ -118,6 +156,17 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * .serviceDefinition} (service name) so the whole {@link MyReviewResponse} row is built in
      * ONE SQL statement — no N+1, no lazy traversal at mapping time.
      *
+     * <p><b>{@code m.user} is a {@code LEFT JOIN} and must stay one</b> (V157 / phase 294 D1 —
+     * 2026-09 audit finding 6). It was an INNER join, which made a client's OWN authored review
+     * DISAPPEAR from {@code GET /reviews/me} the moment the master they reviewed was detached (staff
+     * {@code users} row hard-deleted) — the client's own writing, silently gone, with the paged
+     * {@code totalElements} still counting it (the count query never joined {@code m.user}). The two
+     * name columns {@code COALESCE} onto the V157 {@code detached_*} snapshot, i.e. exactly what
+     * {@code Master#displayFirstName()}/{@code displayLastName()} return, so this list keeps naming
+     * the provider the client actually saw. This is the client's OWN receipt, which the 2026-09-04
+     * product decision explicitly covers — unlike the anonymous salon listing
+     * ({@code SalonReviewResponse}), which masks the name instead.
+     *
      * <p>Filters strictly on {@code r.client.id = :clientId}: the caller-supplied id always
      * originates from the authenticated principal, never a request parameter (principal scoping).
      * {@code ORDER BY r.createdAt DESC} is hardcoded; the service strips any caller-supplied
@@ -127,8 +176,8 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             SELECT new com.beautica.review.dto.MyReviewResponse(
                 r.id,
                 m.id,
-                mu.firstName,
-                mu.lastName,
+                COALESCE(mu.firstName, m.detachedFirstName),
+                COALESCE(mu.lastName, m.detachedLastName),
                 sd.name,
                 CAST(r.rating AS integer),
                 r.comment,
@@ -137,7 +186,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
             )
             FROM Review r
             JOIN r.master m
-            JOIN m.user mu
+            LEFT JOIN m.user mu
             JOIN r.booking b
             JOIN b.masterService ms
             JOIN ms.serviceDefinition sd
@@ -166,7 +215,7 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
     // GET /reviews/{reviewId}, the second ReviewResponse.from() call site.
     @Query("""
             SELECT r FROM Review r
-            JOIN FETCH r.client
+            LEFT JOIN FETCH r.client
             JOIN FETCH r.master
             JOIN FETCH r.booking b
             JOIN FETCH b.masterService ms
@@ -367,12 +416,19 @@ public interface ReviewRepository extends JpaRepository<Review, UUID> {
      * <p><strong>Result order is undefined</strong> — same contract as
      * {@link #findByIdsWithGraph}. Callers must reorder using the ID sequence from the
      * {@code findIdsBySalonIdOrderBy...} method that produced {@code ids}.
+     *
+     * <p><b>{@code m.user} is a LEFT fetch and must stay one</b> (V157, phase 294 D1). A review
+     * whose master has been detached (staff account hard-deleted, historical {@code masters} stub
+     * kept) still belongs to the salon and still counts toward its rating; an INNER
+     * {@code JOIN FETCH m.user} would silently drop it from the salon's public review list.
+     * {@code SalonReviewResponse#from} reads the provider name via {@code Master#displayFirstName()}
+     * accordingly.
      */
     @Query("""
             SELECT r FROM Review r
-            JOIN FETCH r.client
+            LEFT JOIN FETCH r.client
             JOIN FETCH r.master m
-            JOIN FETCH m.user
+            LEFT JOIN FETCH m.user
             JOIN FETCH r.booking b
             JOIN FETCH b.masterService ms
             JOIN FETCH ms.serviceDefinition

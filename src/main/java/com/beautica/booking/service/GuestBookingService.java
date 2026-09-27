@@ -22,7 +22,6 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
-import com.beautica.user.User;
 import io.jsonwebtoken.JwtException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -498,10 +497,15 @@ public class GuestBookingService {
         return frontendBaseUrl + "/book/cancel/" + cancelToken;
     }
 
+    // V157 / phase 294 D3: displayFirstName()/displayLastName(), never getUser().getFirstName().
+    // A detached master (staff account hard-deleted, historical stub kept) has no user row, so the
+    // old two-line walk NPEs; the accessors fall back to the name snapshot taken at detach time.
+    // Still null-safe on either half — users.first_name / users.last_name are both nullable.
     private static String masterName(Master master) {
-        User u = master.getUser();
-        String first = u.getFirstName() == null ? "" : u.getFirstName().trim();
-        String last = u.getLastName() == null ? "" : u.getLastName().trim();
+        String firstName = master.displayFirstName();
+        String lastName = master.displayLastName();
+        String first = firstName == null ? "" : firstName.trim();
+        String last = lastName == null ? "" : lastName.trim();
         return (first + " " + last).trim();
     }
 }

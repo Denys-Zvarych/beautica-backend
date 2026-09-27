@@ -236,7 +236,79 @@ class MasterServiceResponseTest {
                 .isNull();
     }
 
-    // ── Phase 32.1: isFavorite — never populated by the factories, passed through by fromPublic ──
+    // ── Phase 311 D9: the assignment's OWN band, not the definition's (2026-09-13 audit, H3) ──
+    //
+    // The RANGE case above sets NO band overrides, so its assertions hold identically before and
+    // after MasterServiceResponse.from() was rewritten from `sdResponse.priceType()` to
+    // `ServicePricing.ofAssignment(msa)` — it is vacuous with respect to that change. These two
+    // cases are the ones that go RED if the rewrite is reverted: they are exactly the shapes where
+    // the definition's band and the assignment's resolved band DISAGREE.
+
+    @Test
+    @DisplayName("D9: an own FIXED band over a RANGE definition surfaces FIXED with a NULL priceMax "
+            + "— the definition's ceiling must not leak onto this master's menu row")
+    void should_surfaceOwnFixedBand_when_definitionIsRange() {
+        var rangeDefinition = definitionBuilder()
+                .priceType(PriceType.RANGE)
+                .basePrice(new BigDecimal("600.00"))
+                .priceMax(new BigDecimal("1200.00"))
+                .build();
+
+        var msa = assignmentWithBand(rangeDefinition, PriceType.FIXED, new BigDecimal("850.00"), null);
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.priceType())
+                .as("the RESOLVED shape is the master's own FIXED, not the definition's RANGE")
+                .isEqualTo(PriceType.FIXED);
+        assertThat(response.priceMin())
+                .as("the floor is the master's own 850, not the definition's 600 base_price")
+                .isEqualByComparingTo(new BigDecimal("850.00"));
+        assertThat(response.priceMax())
+                .as("a FIXED band has no ceiling — the definition's 1200 must not survive")
+                .isNull();
+        assertThat(response.priceDisplay())
+                .as("the rendered band follows the RESOLVED values, not the definition's")
+                .isEqualTo("850 ₴");
+        assertThat(response.serviceDefinition().priceMax())
+                .as("non-vacuity: the nested definition still reports its OWN 1200 ceiling, so the "
+                        + "top-level null above can only have come from ofAssignment")
+                .isEqualByComparingTo(new BigDecimal("1200.00"));
+    }
+
+    @Test
+    @DisplayName("D9: an own RANGE band over a FIXED definition surfaces RANGE with the master's "
+            + "own floor AND ceiling, neither of which the definition has")
+    void should_surfaceOwnRangeBand_when_definitionIsFixed() {
+        var fixedDefinition = definitionBuilder()
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("500.00"))
+                .priceMax(null)
+                .build();
+
+        var msa = assignmentWithBand(fixedDefinition, PriceType.RANGE,
+                new BigDecimal("700.00"), new BigDecimal("1100.00"));
+
+        var response = MasterServiceResponse.from(msa);
+
+        assertThat(response.priceType())
+                .as("the RESOLVED shape is the master's own RANGE, not the definition's FIXED")
+                .isEqualTo(PriceType.RANGE);
+        assertThat(response.priceMin()).isEqualByComparingTo(new BigDecimal("700.00"));
+        assertThat(response.priceMax())
+                .as("a FIXED definition carries no priceMax at all, so a non-null ceiling here "
+                        + "cannot have come from sdResponse")
+                .isEqualByComparingTo(new BigDecimal("1100.00"));
+        assertThat(response.priceDisplay()).isEqualTo("від 700 до 1100 ₴");
+        assertThat(response.effectivePrice())
+                .as("effectivePrice tracks the same resolved floor")
+                .isEqualByComparingTo(new BigDecimal("700.00"));
+        assertThat(response.serviceDefinition().priceType())
+                .as("non-vacuity: the nested definition still reports its OWN FIXED shape")
+                .isEqualTo(PriceType.FIXED);
+    }
+
+    // ── Phase 32.1: isFavorite — never populated by the factories, only by withIsFavorite ──
 
     @Test
     @DisplayName("isFavorite is always null when built from a MasterServiceAssignment — the cached "
@@ -253,20 +325,24 @@ class MasterServiceResponseTest {
     }
 
     @Test
-    @DisplayName("fromPublic carries isFavorite through verbatim rather than hardcoding null — proven "
-            + "with a non-null input so the passthrough is genuinely exercised, not merely null-to-null")
-    void should_carryIsFavoriteThrough_when_fromPublicApplied() {
-        var msa = buildAssignment(null, null);
-        // Manually promoted to a non-null value, standing in for the shape AFTER decoration — in
-        // production fromPublic always sees null here, but the passthrough must survive regardless
-        // of value, so a rearranged masking order can never silently start invented isFavorite.
-        var decorated = MasterServiceResponse.from(msa).withIsFavorite(true);
+    @DisplayName("withIsFavorite is a pure positional copy: it sets isFavorite and leaves every "
+            + "other field byte-identical (S5 retired fromPublic, this is now the only copier)")
+    void should_copyEveryOtherFieldVerbatim_when_withIsFavoriteApplied() {
+        var msa = buildAssignment(new BigDecimal("777.00"), 95);
+        var original = MasterServiceResponse.from(msa);
 
-        var masked = MasterServiceResponse.fromPublic(decorated);
+        var decorated = original.withIsFavorite(true);
 
-        assertThat(masked.isFavorite())
-                .as("fromPublic must pass isFavorite() through verbatim, never hardcode it")
+        assertThat(decorated.isFavorite())
+                .as("withIsFavorite must set the flag it is named for")
                 .isTrue();
+        assertThat(decorated)
+                .as("a 16-argument positional copy constructor is exactly where two adjacent "
+                        + "same-typed arguments get transposed; a recursive comparison catches "
+                        + "that, and is automatically extended by any future field")
+                .usingRecursiveComparison()
+                .ignoringFields("isFavorite")
+                .isEqualTo(original);
     }
 
     // --- helpers ---
@@ -297,6 +373,33 @@ class MasterServiceResponseTest {
                 .serviceDefinition(serviceDefinition)
                 .priceOverride(null)
                 .durationOverrideMinutes(null)
+                .isActive(true)
+                .build();
+    }
+
+    private static ServiceDefinition.ServiceDefinitionBuilder definitionBuilder() {
+        return ServiceDefinition.builder()
+                .id(UUID.randomUUID())
+                .ownerType(OwnerType.SALON)
+                .ownerId(UUID.randomUUID())
+                .name("Манікюр")
+                .category("MANICURE")
+                .baseDurationMinutes(BASE_DURATION)
+                .bufferMinutesAfter(0)
+                .isActive(true);
+    }
+
+    private static MasterServiceAssignment assignmentWithBand(ServiceDefinition definition,
+                                                              PriceType priceTypeOverride,
+                                                              BigDecimal priceOverride,
+                                                              BigDecimal priceMaxOverride) {
+        return MasterServiceAssignment.builder()
+                .id(UUID.randomUUID())
+                .master(Master.builder().id(UUID.randomUUID()).build())
+                .serviceDefinition(definition)
+                .priceTypeOverride(priceTypeOverride)
+                .priceOverride(priceOverride)
+                .priceMaxOverride(priceMaxOverride)
                 .isActive(true)
                 .build();
     }

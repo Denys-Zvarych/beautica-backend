@@ -1,5 +1,6 @@
 package com.beautica.booking.service;
 
+import com.beautica.TestConstants;
 import com.beautica.auth.Role;
 import com.beautica.booking.dto.AppointmentDetailResponse;
 import com.beautica.booking.dto.StaffBookingCommand;
@@ -1437,7 +1438,8 @@ class StaffBookingServiceTest {
         return Master.builder()
                 .id(masterId)
                 .user(user(Role.SALON_MASTER))
-                .salon(Salon.builder().id(salonId).isActive(true).build())
+                .salon(Salon.builder()
+                        .cityId(TestConstants.DEFAULT_TEST_CITY_ID).id(salonId).isActive(true).build())
                 .isActive(true)
                 .build();
     }

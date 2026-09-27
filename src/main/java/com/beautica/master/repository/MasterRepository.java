@@ -19,6 +19,14 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<Master> findByUserId(UUID userId);
 
     /**
+     * The id of the {@code masters} row owned by a user, without loading the entity — for callers
+     * that only need a cache key (e.g. {@code SalonService}'s owner master-detail eviction).
+     * {@code masters.user_id} is unique, so at most one id comes back.
+     */
+    @Query("SELECT m.id FROM Master m WHERE m.user.id = :userId")
+    Optional<UUID> findIdByUserId(@Param("userId") UUID userId);
+
+    /**
      * Same as {@link #findByUserId} but also JOIN FETCH-es the {@code salon} association,
      * eliminating the extra {@code SELECT * FROM salons WHERE id = ?} fired when callers
      * dereference {@code master.getSalon().getId()} (MEDIUM F2+F3).
@@ -87,6 +95,61 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     )
     Page<Master> findBySalonIdAndIsActiveTrueWithUser(@Param("salonId") UUID salonId, Pageable pageable);
 
+    /**
+     * Identifier-only projection of the same active roster {@link #findBySalonIdAndIsActiveTrueWithUser}
+     * returns — for a caller that wants the ids and nothing else (the roster id-projection
+     * finding, backend-perf 2026-09-20 —
+     * backend-perf).
+     *
+     * <p><b>Why this is not a duplicate finder</b> (Anti-Bug §E-1 forbids keeping a non-graph
+     * variant BESIDE a graph variant, because callers silently N+1 or hit
+     * {@code LazyInitializationException}). That rule protects callers who touch associations; it
+     * does not apply to a projection that returns no entity at all. {@code SELECT m.id} cannot be
+     * N+1'd and cannot be lazily initialised — there is nothing to initialise. The two methods are
+     * not interchangeable in the direction that matters: a caller needing {@code m.user} literally
+     * cannot use this one, so it can never be reached by mistake.
+     *
+     * <p><b>What it replaces.</b> {@code SalonService#getSalonMastersEffectiveSchedule} called the
+     * graph finder with {@link Pageable#unpaged()} and immediately did {@code .map(Master::getId)},
+     * so the whole roster's {@code masters} AND {@code users} rows were selected, materialised as
+     * managed entities and parked in the persistence context for the rest of the request — to
+     * extract a list of UUIDs. Same one statement either way; the saving is the row width, the
+     * entity instantiation, and the snapshot the persistence context keeps for dirty checking, on a
+     * read-only path that never touches a single non-id field.
+     *
+     * <p>{@link #findBySalonIdAndIsActiveTrueWithUser} is deliberately left ALONE — {@code
+     * SalonService#getSalonStaff} and {@code #getMastersBySalon} both map the fetched {@code
+     * m.user} into their responses and genuinely need the graph.
+     *
+     * <p>No {@code ORDER BY}, matching the graph finder byte-for-byte: the roster endpoint's
+     * response order is whatever the access path yields, exactly as before, so this change is
+     * ordering-neutral rather than quietly imposing a new contract.
+     *
+     * <p><b>Unscoped by default</b> (Anti-Bug §E-4): {@code salonId} is a plain parameter with no
+     * actor predicate. Its one caller is reached only through
+     * {@code @PreAuthorize("… and @authz.canManageSalon(authentication, #salonId)")}, which is
+     * where the ownership decision lives.
+     */
+    @Query("SELECT m.id FROM Master m WHERE m.salon.id = :salonId AND m.isActive = true")
+    List<UUID> findIdsBySalonIdAndIsActiveTrue(@Param("salonId") UUID salonId);
+
+    /**
+     * Cache keys of EVERY master row affiliated with {@code salonId} — active or not, since
+     * {@code GET /masters/{masterId}} carries no {@code isActive} predicate and may hold an
+     * inactive master's entry. Id-only constructor projection; the {@code LEFT JOIN} keeps a
+     * detached master (null {@code user}) in the result with a null {@code userId}.
+     *
+     * <p>Used by {@code SalonService#updateSalon} to evict the per-master detail entries whose
+     * embedded salon block changed with the salon's {@code cityId}. Bounded by the salon's
+     * roster, which is small by construction.
+     */
+    @Query("""
+            SELECT new com.beautica.master.repository.MasterCacheKeys(m.id, u.id)
+              FROM Master m LEFT JOIN m.user u
+             WHERE m.salon.id = :salonId
+            """)
+    List<MasterCacheKeys> findCacheKeysBySalonId(@Param("salonId") UUID salonId);
+
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
 
     /**
@@ -97,7 +160,42 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     boolean existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue(
             UUID userId, UUID salonId, MasterType masterType);
 
+    /**
+     * Returns {@code true} iff the given user has an <em>active</em> master row of the given type,
+     * in ANY salon. Backs {@code UserService.getProfile}'s derived
+     * {@code UserProfileResponse.hasMasterProfile} (Phase 265) — the owner-as-master toggle state,
+     * which is the presence of this row, never a stored column.
+     *
+     * <p><b>Why this is not a duplicate of
+     * {@link #existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue}.</b> That method answers
+     * "…in THIS salon", and every one of its callers has a {@code salonId} in hand from the path
+     * ({@code /salons/{salonId}/master}). {@code GET /users/me} has no path salon and must not
+     * invent one: {@code users.salon_id} is the owner's primary salon and would make the flag read
+     * {@code false} for an owner whose master row sits in a different salon of theirs. Passing a
+     * fabricated salon into the salon-scoped variant is exactly the bug this narrower predicate
+     * avoids, so the two coexist deliberately (§E-1) with disjoint call sites.
+     *
+     * <p>The {@code isActive} term is load-bearing, not defensive: the DELETE toggle endpoint
+     * <em>deactivates</em> the row rather than hard-deleting it, so a plain
+     * {@code existsByUserIdAndMasterType} would report every owner who has ever opted in as still
+     * opted in, forever.
+     */
+    boolean existsByUserIdAndMasterTypeAndIsActiveTrue(UUID userId, MasterType masterType);
+
     boolean existsByIdAndSalonId(UUID id, UUID salonId);
+
+    /**
+     * Ownership self-assertion for the {@code SALON_MASTER}/{@code INDEPENDENT_MASTER} account
+     * self-deletion booking cascade (Phase 301 Q3) — mirrors {@link #existsByIdAndSalonId}'s
+     * pattern (used at {@code BookingService.java:1559} by the master-removal cascade), just keyed
+     * by the acting USER rather than by the salon owner. {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete} calls this to prove {@code
+     * masterId} actually belongs to the deleting caller before bulk-declining any of their
+     * bookings — the caller cannot lean on role-based authorization here, since {@code
+     * SALON_MASTER} is rejected by every existing booking-mutation seam's fast path (§1 of the
+     * phase 301 plan).
+     */
+    boolean existsByIdAndUserId(UUID id, UUID userId);
 
     /**
      * Returns {@code true} if a master with the given {@code id} belongs to any of the
@@ -210,7 +308,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * <p>Must be called inside an existing {@code @Transactional} context — callers
      * in {@link com.beautica.service.service.ServiceCatalogService} satisfy this.
      */
-    @Modifying(clearAutomatically = true)
+    // flushAutomatically = true (2026-09-13 perf audit, LOW): callers mutate the managed
+    // MasterServiceAssignment (band/duration) and then call this in the SAME transaction, and
+    // clearAutomatically detaches that entity immediately afterwards. Whether the pending dirty
+    // row would otherwise be flushed depends on Hibernate's auto-flush query-space computation
+    // for a bulk HQL UPDATE Master whose subquery reads master_services — do not rely on it.
+    // Flushing first makes the subquery read the caller's own write and makes the detach safe.
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE Master m
             SET m.minEffectivePrice = (
@@ -236,7 +340,13 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      * {@code clearAutomatically = true} ensures the first-level cache is invalidated
      * after the bulk UPDATE so subsequent reads see the refreshed price.
      */
-    @Modifying(clearAutomatically = true)
+    // flushAutomatically = true (2026-09-13 perf audit, LOW): callers mutate the managed
+    // MasterServiceAssignment (band/duration) and then call this in the SAME transaction, and
+    // clearAutomatically detaches that entity immediately afterwards. Whether the pending dirty
+    // row would otherwise be flushed depends on Hibernate's auto-flush query-space computation
+    // for a bulk HQL UPDATE Master whose subquery reads master_services — do not rely on it.
+    // Flushing first makes the subquery read the caller's own write and makes the detach safe.
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             UPDATE Master m
             SET m.minEffectivePrice = (
@@ -302,4 +412,99 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
               AND (s IS NULL OR s.isActive = true)
             """)
     Optional<Master> findByBookingSlugWithUser(@Param("slug") String slug);
+
+    // ── phase 295 — salon-deletion staff HARD-DELETE cascade ────────────────────────────────────
+
+    /**
+     * Every {@code masters} row whose account is one of {@code userIds}, ATTACHED rows only, with
+     * {@code user} JOIN FETCH-ed (phase 295).
+     *
+     * <p>Used by {@code SalonService#deleteSalonStaff} to resolve the provider row behind each
+     * staff account it is about to hard-delete, so that row can be deleted or detached FIRST — see
+     * that method for the one representable ordering.
+     *
+     * <p><b>Deliberately NOT {@code is_active}-scoped.</b> A staff member deactivated by an
+     * earlier operation (a rotation, a manual {@code DELETE /masters/{id}}) still has a live
+     * {@code masters} row pointing at their {@code users} row, and {@code masters.user_id} is
+     * UNIQUE — so an {@code is_active = true} filter here would silently skip exactly the rows
+     * whose FK then fires {@code ON DELETE SET NULL} at {@code DELETE FROM users} time and
+     * violates {@code chk_masters_detachment_coherent} (V157). The caller's other master list
+     * ({@link #findBySalonIdAndIsActiveTrueWithUser}) IS active-scoped because it feeds
+     * {@code MasterService#deactivateMasters}, a different job.
+     *
+     * <p><b>The {@code user IS NOT NULL} predicate is not redundant.</b> {@code JOIN FETCH m.user}
+     * is an INNER join and already drops a detached row; the explicit predicate states the intent
+     * that this finder answers "which ATTACHED masters belong to these accounts", so a future
+     * conversion to {@code LEFT JOIN FETCH} (the reflex fix for a NULL-dropping join since V157)
+     * cannot silently start returning already-detached rows for the caller to detach twice.
+     *
+     * <p>Bounded by construction: {@code userIds} is one salon's resolved staff list, and
+     * {@code masters.user_id} is UNIQUE, so this returns at most {@code userIds.size()} rows.
+     */
+    @Query("""
+            SELECT m FROM Master m
+            JOIN FETCH m.user u
+            WHERE u.id IN :userIds
+              AND m.user IS NOT NULL
+            """)
+    List<Master> findAllByUserIdInWithUser(@Param("userIds") Collection<UUID> userIds);
+
+    /**
+     * Which of {@code masterIds} still have at least one historical record pointing at them
+     * (phase 295, D1). A master id ABSENT from the result can be {@code DELETE}d outright; one
+     * PRESENT must be DETACHED instead and survive as a name-only stub.
+     *
+     * <p><b>ONE query for the whole batch, not one per master (phase 295 audit, HIGH-2).</b> The
+     * predecessor {@code countHistoricalReferences(UUID)} was called inside the per-master loop in
+     * {@code SalonService#deleteSalonStaff}. Because it is {@code nativeQuery = true} with no
+     * declared query spaces, Hibernate 6 calls {@code session.flush()} before EVERY invocation —
+     * so each iteration flushed the previous iteration's detach UPDATE on its own (making
+     * {@code hibernate.jdbc.batch_size} and {@code order_updates} inert for that loop) and
+     * dirty-checked the entire persistence context, which at that point still holds everything the
+     * phase 293 decline cascade loaded. Cost was O(N x |persistence context|). Measured on a warm
+     * local socket, 50 masters: 75.2 ms looped vs 6.2 ms set-based; on Railway&rarr;Neon at 2 ms
+     * RTT the loop adds ~100 round trips where this adds 2. The caller now runs a pure in-memory
+     * branch over the returned id set, and {@code masterRepository.flush()} before the account
+     * delete becomes the ONLY flush — which is what finally lets the detach UPDATEs and the master
+     * DELETEs batch.
+     *
+     * <p>Three {@code EXISTS} arms rather than three {@code COUNT(*)}s, so a master with 40 000
+     * bookings costs the same index probe as one with a single booking. The arms are exactly the
+     * three {@code NO ACTION} foreign keys that would otherwise make {@code DELETE FROM masters}
+     * fail with a 500:
+     * <ul>
+     *   <li>{@code bookings.master_id} — {@code V18__create_bookings.sql:6}</li>
+     *   <li>{@code reviews.master_id} — {@code V40__create_reviews.sql:7}</li>
+     *   <li>{@code client_reviews.author_master_id} —
+     *       {@code V128__create_client_reviews_and_user_rating.sql:20}, indexed by
+     *       {@code idx_client_reviews_author_master} (V159) — it had no index at all until then,
+     *       so this arm AND the RI check Postgres runs on {@code DELETE FROM masters} both Seq
+     *       Scanned {@code client_reviews}, once per master.</li>
+     * </ul>
+     * If a future migration adds a FOURTH such reference to {@code masters}, it belongs here in
+     * the same commit — otherwise the delete branch starts throwing a
+     * {@code DataIntegrityViolationException} out of {@code DELETE /salons/{id}}. Pinned by
+     * {@code SalonStaffHardDeleteIT}'s past-booking case, whose mutation check (force this to
+     * return an empty list) fails on exactly that FK violation.
+     *
+     * <p>Native rather than JPQL: JPQL has no {@code EXISTS} over an arbitrary table expression
+     * that Hibernate will compile to independent index probes in a single round trip, and
+     * {@code client_reviews} is not on {@code Master}'s object graph at all.
+     *
+     * <p>Bounded by construction: {@code masterIds} is one salon's resolved staff master list.
+     * {@code SalonService} short-circuits on an empty collection to save a pointless round trip —
+     * <b>not</b> because an empty bind is unsafe. Measured 2026-09-04 (phase 295 QA): Hibernate 6
+     * rewrites an empty list bind for an {@code IN} predicate into an always-false form, and
+     * calling this method with {@code List.of()} returns an empty list without throwing. An
+     * earlier revision of this javadoc asserted the opposite ("a native {@code IN ()} is not valid
+     * SQL"); it was wrong and is corrected here rather than left to mislead the next caller.
+     */
+    @Query(value = """
+            SELECT m.id FROM masters m
+            WHERE m.id IN (:masterIds)
+              AND (   EXISTS (SELECT 1 FROM bookings b        WHERE b.master_id         = m.id)
+                   OR EXISTS (SELECT 1 FROM reviews r         WHERE r.master_id         = m.id)
+                   OR EXISTS (SELECT 1 FROM client_reviews cr WHERE cr.author_master_id = m.id))
+            """, nativeQuery = true)
+    List<UUID> findIdsWithHistoricalReferences(@Param("masterIds") Collection<UUID> masterIds);
 }

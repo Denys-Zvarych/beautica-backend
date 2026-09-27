@@ -57,6 +57,13 @@ class EmailVerificationProcessorTest {
     private TokenGenerator tokenGenerator;
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder(4);
+    // Audit-fix cycle 2: the success path evicts the verifying user's cached GET /users/me.
+    // A real evictor over a NoOpCacheManager keeps these tests free of a Mockito stub while
+    // still exercising the production code path (NoOpCache.evict is a no-op, never a throw).
+    private final com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor =
+            new com.beautica.common.cache.UserProfileCacheEvictor(
+                    new org.springframework.cache.support.NoOpCacheManager());
+
     private EmailVerificationProcessor processor;
 
     @BeforeEach
@@ -64,7 +71,8 @@ class EmailVerificationProcessorTest {
         Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         var policy = new VerificationPolicyConfig(
                 CUMULATIVE_THRESHOLD, LOCKOUT, Duration.ofHours(24), Duration.ofSeconds(60));
-        processor = new EmailVerificationProcessor(userRepository, tokenGenerator, clock, policy);
+        processor = new EmailVerificationProcessor(
+                userRepository, tokenGenerator, clock, policy, userProfileCacheEvictor);
     }
 
     // ─── happy path ───────────────────────────────────────────────────────────
@@ -390,7 +398,10 @@ class EmailVerificationProcessorTest {
             Clock clock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
             var policy = new VerificationPolicyConfig(
                     CUMULATIVE_THRESHOLD, LOCKOUT, Duration.ofHours(24), Duration.ofSeconds(60));
-            return new EmailVerificationProcessor(userRepository, realGenerator, clock, policy);
+            return new EmailVerificationProcessor(
+                    userRepository, realGenerator, clock, policy,
+                    new com.beautica.common.cache.UserProfileCacheEvictor(
+                            new org.springframework.cache.support.NoOpCacheManager()));
         }
 
         private User seededWith(String email, String rawOtp) {

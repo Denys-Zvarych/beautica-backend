@@ -96,8 +96,7 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
     }
 
     @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(HC5_FACTORY);
+    void seedFixtures() {
         // Stub R2 so test paths do not fan out to a real bucket. buildPublicUrl
         // returns a deterministic URL so MediaFileResponse.url has a value.
         when(r2StorageService.buildPublicUrl(anyString()))

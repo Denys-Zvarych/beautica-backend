@@ -3,11 +3,11 @@ package com.beautica;
 import com.beautica.config.TestAsyncConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
+import com.beautica.support.LocalityTestLookup;
 import com.beautica.support.SlowTestExtension;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.apache.hc.client5.http.impl.DefaultHttpRequestRetryStrategy;
-import org.apache.hc.core5.util.TimeValue;
+import com.beautica.support.TestHttpClients;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -15,7 +15,6 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Import;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -109,19 +108,31 @@ public abstract class AbstractIntegrationTest {
             var cache = cacheManager.getCache(name);
             if (cache != null) cache.clear();
         });
+    }
 
-        // Reset to a fresh Apache HttpClient after every test so context-sharing
-        // classes never inherit a stale/closed connection pool from a previous test.
-        // Finite response timeout (10 s) + zero retries: a rate-limit 429 that resets
-        // the socket will fail fast instead of hanging the suite for 27 minutes.
-        var httpClient = HttpClients.custom()
-                .setRetryStrategy(new DefaultHttpRequestRetryStrategy(0, TimeValue.ZERO_MILLISECONDS))
-                .build();
-        var factory = new HttpComponentsClientHttpRequestFactory(httpClient);
-        factory.setConnectionRequestTimeout(10_000);
-        factory.setConnectTimeout(10_000);
-        factory.setReadTimeout(10_000);
-        baseRestTemplate.getRestTemplate().setRequestFactory(factory);
+    /**
+     * Installs the timeout-bounded, zero-retry request factory on the shared
+     * {@link TestRestTemplate} before EVERY test in EVERY subclass.
+     *
+     * <p><b>This hook is the reason no subclass may install its own.</b> 96 classes used to open
+     * their own {@code @BeforeEach} with a bare {@code HttpClients.createDefault()}, which runs
+     * AFTER this one (JUnit 5 orders superclass {@code @BeforeEach} first) and therefore threw the
+     * policy away: a default HC5 client has an infinite response timeout and retries, so a
+     * rate-limit 429 whose socket the server resets hung the entire suite instead of failing one
+     * case. Installing it here — and nowhere else — makes that drift unrepresentable.
+     *
+     * <p>A fresh pool per test, not a shared static one, so no case inherits a stale or closed
+     * connection from a context-sharing sibling. Allocation is one object; the pool opens sockets
+     * lazily, so this is cheaper than the per-test factory it replaces (which ran in
+     * {@code @AfterEach} on top of each subclass's own copy).
+     *
+     * <p>Standalone {@code @SpringBootTest} classes that cannot extend this base call
+     * {@link TestHttpClients#timeoutBoundedRequestFactory()} directly.
+     */
+    @BeforeEach
+    void installTimeoutBoundedHttpClient() {
+        baseRestTemplate.getRestTemplate()
+                .setRequestFactory(TestHttpClients.timeoutBoundedRequestFactory());
     }
 
     /**
@@ -142,6 +153,58 @@ public abstract class AbstractIntegrationTest {
      *                  {@code INDEPENDENT_MASTER}
      * @param ownerId   {@code service_definitions.owner_id} — the salon or master id
      */
+    /**
+     * Resolves a real, persisted {@code cities.id} row for fixtures that INSERT a {@code salons}
+     * row via raw SQL.
+     *
+     * <p>{@code salons.city_id} carries {@code fk_salons_city_id} (V54) to {@code cities(id)} and,
+     * as of V150, is {@code NOT NULL} — a literal {@code UUID.randomUUID()} fails the FK check
+     * outright, so every fixture that persists a salon must resolve a seeded row instead of
+     * inventing one. Vinnytsia is used everywhere for consistency with
+     * {@link com.beautica.service.ServiceTestFixtures#createSalon} and because it has no urban
+     * districts in the KATOTTH classifier, so no {@code districtId} is required alongside it.
+     *
+     * <p>This is the single shared helper for the ~50 {@code AbstractIntegrationTest} subclasses
+     * that build a salon fixture with raw SQL — do not re-query {@code cities} ad hoc in a new
+     * test; call this instead.
+     */
+    protected UUID testCityId() {
+        // Keyed on the KATOTTH code, not on name_uk. Phase 325 widened `cities` from 356 rows to
+        // 25 698, and 2 990 distinct names are now shared by 12 833 rows — «Київ» is both the
+        // capital and a village in Миколаївська oblast. «Вінниця» happens to still be unique, so
+        // this resolves the same row it always did, but a `WHERE name_uk = ? LIMIT 1` fixture is
+        // one classifier update away from silently pointing ~50 salon fixtures at a village.
+        return jdbcTemplate.queryForObject(
+                "SELECT id FROM cities WHERE katotth_code = 'UA05020030010063857'", UUID.class);
+    }
+
+    /**
+     * Resolves the {@code cities.id} of a well-known CITY by its Ukrainian name.
+     *
+     * <p>The single shared replacement for the four hand-copied
+     * {@code cityIdByName(name) -> "... WHERE name_uk = ? ORDER BY katotth_code LIMIT 1"} helpers
+     * the search suites carried. Phase 325 widened {@code cities} from 356 category-M rows to
+     * 25 698 settlements, and 2 990 names are now shared by 12 833 rows — «Київ» is also a village
+     * in Миколаївська oblast and «Львів» is also villages in Дніпропетровська and Миколаївська.
+     * Both of those villages sort BEFORE the real city by {@code katotth_code}, so the old helper
+     * silently resolved onto a village with no districts and no salons.
+     *
+     * <p>Two deliberate choices make this hard to defang again: the {@code settlement_type = 'CITY'}
+     * predicate drops the namesake villages, and there is NO {@code LIMIT} — a name that is still
+     * ambiguous among cities raises {@code IncorrectResultSizeDataAccessException} instead of
+     * quietly picking one.
+     *
+     * <p>The query itself lives in {@link LocalityTestLookup} so the fixture classes that do not
+     * extend this base (they run their own containers, or are plain collaborator objects) share the
+     * one definition instead of re-copying the SQL.
+     *
+     * @param nameUk canonical Ukrainian city name, e.g. {@code "Київ"}
+     * @return the id of the one CITY with that name
+     */
+    protected UUID majorCityIdByName(String nameUk) {
+        return LocalityTestLookup.majorCityIdByName(jdbcTemplate, nameUk);
+    }
+
     protected UUID resolveUnusedServiceTypeId(String ownerType, UUID ownerId) {
         return jdbcTemplate.queryForObject(
                 """

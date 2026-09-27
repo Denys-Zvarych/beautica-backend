@@ -31,7 +31,7 @@ public class ReviewEventListener {
      * space from {@link #MASTER_DETAIL_CACHE}; evicted with {@code event.masterUserId()}.
      */
     private static final String MASTER_DETAIL_BY_USER_CACHE = "master-detail-by-user";
-    /** Public profile of one salon, keyed by salonId — see SalonService#getSalonEntity. */
+    /** Public profile of one salon, keyed by salonId — see SalonService#getPublicSalon. */
     private static final String SALON_DETAIL_CACHE = "salon-detail";
     private static final String REVIEWS_BY_MASTER_CACHE = "reviews-by-master";
     private static final String REVIEWS_BY_SALON_CACHE = "reviews-by-salon";
@@ -138,9 +138,10 @@ public class ReviewEventListener {
             evictAfterCompletion(() -> {
                 evictSalonReviewPages(event.salonId());
                 // Mirrors the master branch: recalculateSalonRating updates
-                // salons.avg_rating / review_count, and "salon-detail" caches the Salon
-                // ENTITY those columns live on (SalonService#getSalonEntity), which
-                // PublicSalonResponse.from reads to build the public salon profile.
+                // salons.avg_rating / review_count, and "salon-detail" caches the
+                // PublicSalonResponse DTO those columns feed (SalonService#getPublicSalon —
+                // Phase 240 CRITICAL fix moved the @Cacheable boundary here from the
+                // now-uncached SalonService#getSalonEntity, see its Javadoc).
                 // Without this evict the salon profile keeps the pre-review average for
                 // the cache's 5-minute TTL.
                 evictKey(SALON_DETAIL_CACHE, event.salonId());
@@ -180,7 +181,7 @@ public class ReviewEventListener {
      * <h4>Phase 240 re-audit, Finding 2 — ACCEPTED, deliberately not fixed</h4>
      *
      * <p><b>The hazard is real.</b> Both {@code master-detail}/{@code master-detail-by-user}
-     * ({@code MasterService}) and {@code salon-detail} ({@code SalonService#getSalonEntity}) are
+     * ({@code MasterService}) and {@code salon-detail} ({@code SalonService#getPublicSalon}) are
      * {@code @Cacheable(sync = true)}. Spring's {@code CacheInterceptor} implements {@code sync}
      * as {@code CaffeineCache.get(key, valueLoader)} → {@code Caffeine#get(key, mappingFunction)}
      * → {@code ConcurrentHashMap#computeIfAbsent}, which holds the hash BIN monitor for the whole

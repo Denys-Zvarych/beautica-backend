@@ -23,11 +23,17 @@ public record ClientReviewResponse(
 
     // Callers must ensure booking, subjectClient, and authorMaster are loaded (JOIN FETCH) —
     // all are FetchType.LAZY. Mirrors ReviewResponse.from's fetched-graph contract.
+    //
+    // Defensive null-guard on subjectClient (Phase 300 §8): client_reviews rows are DELETED, not
+    // detached, by ClientAccountDeletionService before the users row goes (D3), so a null
+    // subjectClient should be unreachable in practice — this is cheap insurance against an
+    // unguarded NPE, not a state this DTO is expected to actually render.
     public static ClientReviewResponse from(ClientReview review) {
+        UUID subjectClientId = review.getSubjectClient() != null ? review.getSubjectClient().getId() : null;
         return new ClientReviewResponse(
                 review.getId(),
                 review.getBooking().getId(),
-                review.getSubjectClient().getId(),
+                subjectClientId,
                 review.getAuthorMaster().getId(),
                 review.getRating().intValue(),
                 review.getComment(),

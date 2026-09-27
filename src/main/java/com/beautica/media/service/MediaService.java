@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -432,40 +433,207 @@ public class MediaService {
 
         // Step 1 — read tx: collect the rows. Connection released before any R2 call.
         List<MediaFile> rows = txRead(() -> mediaRepo.findByUploaderId(uploaderId));
-        if (rows.isEmpty()) {
+
+        // Steps 2-4 (R2 deletes, batch DB delete, post-commit cache eviction) are the
+        // shared sweep body — see sweepBlobs. No extra (non-media_files) keys on this path,
+        // and no single explicit entity to evict beyond whatever the rows themselves carry
+        // (a user may have contributed to more than one entity historically).
+        sweepBlobs(rows, List.of(), null, null);
+    }
+
+    /**
+     * Shared R2-plus-DB sweep body, promoted (REUSE-FIRST, Phase 268 D3) from what used to be
+     * {@link #deleteByUploader}'s steps 1-4 alone. Both {@link #deleteByUploader} and
+     * {@link #deleteBySalon} call this — no second implementation of the ordering/failure/eviction
+     * policy documented on {@link #deleteByUploader}'s own Javadoc, which still governs this method
+     * verbatim (R2-first-then-DB, per-row best-effort, orphans accepted on R2 failure, keys never
+     * logged).
+     *
+     * <p><b>Order:</b> {@code extraKeys} (blobs that live OUTSIDE {@code media_files} — a user's
+     * avatar-adjacent columns are handled by {@link #sweepAvatar} instead, but a salon's
+     * {@code avatar_url}/{@code cover_image_url} are exactly this shape) are deleted from R2
+     * FIRST, then every {@code rows} entry, THEN one batched DB delete of {@code rows}, THEN
+     * post-commit portfolio-cache eviction.
+     *
+     * <p><b>Deliberately does NOT short-circuit on {@code rows.isEmpty()}</b> the way the
+     * pre-promotion code did — a salon with an avatar/cover but zero portfolio photos (or the
+     * reverse) must still have its {@code extraKeys} swept. The only true no-op case is BOTH lists
+     * empty.
+     *
+     * @param rows      {@code media_files} rows to purge from R2 and the DB, collected under a read
+     *                  transaction by the caller (connection already released before this runs)
+     * @param extraKeys R2 keys for blobs that are not {@code media_files} rows (e.g. a salon's
+     *                  avatar/cover) — deleted from R2 but never touch {@code mediaRepo}
+     * @param evictType together with {@code evictId}, an explicit portfolio-cache entry to evict in
+     *                  addition to whatever {@code rows} themselves resolve to — needed so a
+     *                  rows-empty, extraKeys-only sweep still evicts the right entity. Either may be
+     *                  {@code null} when the caller has no single entity to name beyond {@code rows}
+     *                  (e.g. {@link #deleteByUploader}, whose rows may span more than one entity).
+     */
+    private void sweepBlobs(List<MediaFile> rows, List<String> extraKeys, EntityType evictType, UUID evictId) {
+        if (rows.isEmpty() && extraKeys.isEmpty()) {
             return;
         }
 
-        // Step 2 — R2 deletes OUTSIDE any transaction. A single row's failure must not
-        // abort the sweep — log and continue.
+        // R2 deletes OUTSIDE any transaction, batched into as few DeleteObjects round-trips as
+        // R2StorageService#deleteFiles allows (Phase 268 perf follow-up — was one HTTP round-trip
+        // per key). Extra keys first, then rows, matching the pre-batching order.
+        List<String> allKeys = new ArrayList<>(extraKeys.size() + rows.size());
+        allKeys.addAll(extraKeys);
         for (MediaFile row : rows) {
-            try {
-                r2.deleteFile(row.getR2Key());
-            } catch (RuntimeException ex) {
-                // Key encodes the user UUID — omit from WARN log to avoid PII in log aggregators.
-                log.warn("R2 delete failed during deleteByUploader sweep (uploader={}, key=[key omitted]): {}",
-                        uploaderId, ex.getClass().getSimpleName());
-            }
+            allKeys.add(row.getR2Key());
         }
 
-        // Step 3 — write tx: batch delete every row.
-        txWrite.execute(status -> {
-            mediaRepo.deleteAll(rows);
-            return null;
-        });
+        // r2.deleteFiles never throws for a delete failure, partial or total (see its Javadoc) —
+        // it returns the subset of keys it could not delete. A single object's failure must not
+        // abort the sweep, so that returned set is only logged, never re-thrown; the DB rows are
+        // still dropped below regardless of which keys failed — same accepted-orphan policy the
+        // per-key loop this replaced already had.
+        Set<String> failedKeys = r2.deleteFiles(allKeys);
+        for (String ignored : failedKeys) {
+            // Key may encode an entity UUID — omit from WARN log to avoid PII in log aggregators.
+            log.warn("R2 delete failed during media sweep (key=[key omitted])");
+        }
 
-        // Step 4 — Phase 7.8/7.9: evict every distinct (entityType, entityId) portfolio
-        // cache entry AFTER the write tx commits. Without this, a future user-deletion
-        // flow would leave deleted portfolio entries readable from the cache for up to
-        // the 5-min TTL. Uses the same String key as evictPortfolioCache (PERF-M3).
+        // Write tx: batch delete every media_files row. Skipped when there are none — extraKeys
+        // alone never touch mediaRepo.
+        if (!rows.isEmpty()) {
+            txWrite.execute(status -> {
+                mediaRepo.deleteAll(rows);
+                return null;
+            });
+        }
+
+        // Post-commit portfolio-cache eviction — every distinct (entityType, entityId) the rows
+        // themselves carry, PLUS the caller's explicit (evictType, evictId) when given (covers the
+        // rows-empty, extraKeys-only case, where nothing in `rows` would otherwise name the entity).
         Set<String> distinctKeys = new HashSet<>();
         for (MediaFile row : rows) {
             distinctKeys.add(portfolioCacheKey(row.getEntityType(), row.getEntityId()));
         }
-        Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
-        if (cache != null) {
-            for (String key : distinctKeys) {
-                cache.evictIfPresent(key);
+        if (evictType != null && evictId != null) {
+            distinctKeys.add(portfolioCacheKey(evictType, evictId));
+        }
+        if (!distinctKeys.isEmpty()) {
+            Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
+            if (cache != null) {
+                for (String key : distinctKeys) {
+                    cache.evictIfPresent(key);
+                }
+            }
+        }
+    }
+
+    /**
+     * Purges a salon's imagery from R2 permanently — the Phase 268 D2/D3 sweep called by
+     * {@code SalonService} AFTER its deletion transaction commits (D4/D8: never inline inside that
+     * transaction, since {@link #txRead}/{@link #txWrite} would otherwise join it and hold a
+     * connection across dozens of sequential R2 round-trips).
+     *
+     * <p>Covers all three imagery sets a deleted salon can carry (phase doc D2 table):
+     * <ul>
+     *   <li>every {@code media_files} row with {@code entity_type = SALON, entity_id = salonId}
+     *       (the portfolio) — {@code preReadRows}, already collected by the caller INSIDE the
+     *       deletion transaction, before {@code deleteSalonStaff} could hard-delete a staff
+     *       uploader and cascade the row away (the gap the phase doc did not cover — see
+     *       {@code SalonService.deactivateSalon}'s Javadoc);</li>
+     *   <li>{@code salons.avatar_url} — recovered to a key via {@link
+     *       R2StorageService#extractKeyFromPublicUrl}, since (unlike a user) a salon stores only
+     *       the public URL, never the raw key;</li>
+     *   <li>{@code salons.cover_image_url} — same recovery.</li>
+     * </ul>
+     *
+     * <p>A {@code null} or foreign-prefixed URL yields no key (D2 safety guard) and is silently
+     * skipped — never guessed at. The DB pointer columns themselves are nulled by the caller
+     * ({@code SalonRepository#nullImageUrls}) AFTER this method returns, preserving the D4
+     * R2-first-then-DB ordering at the SalonService level exactly as this method preserves it
+     * internally for {@code media_files} rows.
+     *
+     * @param salonId       the deleted salon's id, used only to name the explicit cache-eviction
+     *                      entry (D3) — every row in {@code preReadRows} is already scoped to it
+     * @param avatarUrl     the salon's {@code avatar_url} at the moment it was deactivated, or
+     *                      {@code null}
+     * @param coverImageUrl the salon's {@code cover_image_url} at the moment it was deactivated, or
+     *                      {@code null}
+     * @param preReadRows   the salon's {@code media_files} rows, read by the caller before any
+     *                      staff hard-delete could cascade one away
+     */
+    public void deleteBySalon(UUID salonId, String avatarUrl, String coverImageUrl, List<MediaFile> preReadRows) {
+        List<String> extraKeys = new ArrayList<>(2);
+        r2.extractKeyFromPublicUrl(avatarUrl).ifPresent(extraKeys::add);
+        r2.extractKeyFromPublicUrl(coverImageUrl).ifPresent(extraKeys::add);
+
+        sweepBlobs(preReadRows, extraKeys, EntityType.SALON, salonId);
+    }
+
+    /**
+     * Permanently purges a self-deleted CLIENT's R2 blobs — the Phase 300 D4/§9 counterpart of
+     * {@link #deleteBySalon}, called by {@code ClientAccountDeletionService} AFTER its deletion
+     * transaction commits (mirroring {@code SalonService}'s {@code purgeSalonMediaAfterCommit}
+     * registration shape exactly).
+     *
+     * <p><b>R2-ONLY — deliberately does NOT reuse {@link #sweepBlobs}.</b> {@code sweepBlobs} also
+     * issues a DB {@code mediaRepo.deleteAll(rows)}, which is exactly right for {@link
+     * #deleteBySalon} (a salon's OWN portfolio rows do not automatically cascade away — only a
+     * hard-deleted STAFF uploader's rows do) but is WRONG here: {@code media_files.uploader_id}
+     * {@code ON DELETE CASCADE}s directly off {@code users.id} (V37:8), so by the time this
+     * {@code afterCommit} callback runs, {@code preReadRows} and the caller's own avatar-column
+     * update have ALREADY vanished from the database — {@code preReadRows} are DETACHED entities
+     * pointing at rows that no longer exist. Calling {@code mediaRepo.deleteAll} on them would
+     * either no-op or throw ({@code merge()} tries to reload a row that is gone), for zero benefit:
+     * the only thing actually left to clean up is the R2 BLOBS themselves, which are outside the
+     * transaction and were never touched by the CASCADE.
+     *
+     * <p><b>Do NOT call {@link #deleteByUploader} inline instead</b> — see that method's own
+     * Javadoc and this class's caller's Javadoc: it opens its OWN {@code PROPAGATION_REQUIRES_NEW}
+     * transactions, so calling it from inside {@code ClientAccountDeletionService}'s own {@code
+     * @Transactional} would let an outer rollback leave the blobs already destroyed.
+     *
+     * <p>Best-effort throughout, same policy as every other sweep in this class: a partial or
+     * total R2 failure is logged at WARN (key omitted) and never re-thrown — the {@code users} row
+     * is already gone by the time this runs, so there is nothing left to roll back to.
+     *
+     * @param clientUserId  the deleted client's id, used only to name the portfolio-cache eviction
+     *                      entry for each distinct {@code (entityType, entityId)} in {@code
+     *                      preReadRows} — a CLIENT never legitimately owns a portfolio entry today
+     *                      (only SALON_OWNER/INDEPENDENT_MASTER/SALON_ADMIN upload one), but this
+     *                      stays correct if that ever changes
+     * @param avatarR2Key   the deleted client's {@code users.avatar_r2_key} at the moment of
+     *                      deletion, pre-read by the caller before the row vanished, or {@code
+     *                      null} if the client never had an avatar
+     * @param preReadRows   the client's {@code media_files} rows, pre-read by the caller (via
+     *                      {@code mediaRepo.findByUploaderId}) before the {@code users} DELETE
+     *                      cascaded them away
+     */
+    public void purgeUserBlobsAfterCommit(UUID clientUserId, String avatarR2Key, List<MediaFile> preReadRows) {
+        List<String> keys = new ArrayList<>(preReadRows.size() + 1);
+        if (avatarR2Key != null) {
+            keys.add(avatarR2Key);
+        }
+        for (MediaFile row : preReadRows) {
+            keys.add(row.getR2Key());
+        }
+        if (keys.isEmpty()) {
+            return;
+        }
+
+        Set<String> failedKeys = r2.deleteFiles(keys);
+        for (String ignored : failedKeys) {
+            // Key may encode an entity UUID — omit from WARN log to avoid PII in log aggregators.
+            log.warn("R2 delete failed during client self-delete blob purge (client={}, key=[key omitted])",
+                    clientUserId);
+        }
+
+        Set<String> distinctCacheKeys = new HashSet<>();
+        for (MediaFile row : preReadRows) {
+            distinctCacheKeys.add(portfolioCacheKey(row.getEntityType(), row.getEntityId()));
+        }
+        if (!distinctCacheKeys.isEmpty()) {
+            Cache cache = cacheManager.getCache(PORTFOLIO_CACHE);
+            if (cache != null) {
+                for (String key : distinctCacheKeys) {
+                    cache.evictIfPresent(key);
+                }
             }
         }
     }

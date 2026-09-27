@@ -59,8 +59,8 @@ class ServicePricingMigrationTest extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active) VALUES (?, ?, ?, ?)",
-                salonId, ownerId, "V67 Test Salon", true);
+                "INSERT INTO salons (id, owner_id, name, is_active, city_id) VALUES (?, ?, ?, ?, ?)",
+                salonId, ownerId, "V67 Test Salon", true, testCityId());
         return salonId;
     }
 

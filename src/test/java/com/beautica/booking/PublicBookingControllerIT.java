@@ -155,9 +155,9 @@ class PublicBookingControllerIT extends AbstractIntegrationTest {
 
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update("""
-                INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at)
-                VALUES (?, ?, 'Test Salon', ?, NOW(), NOW())
-                """, salonId, ownerId, salonActive);
+                INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id)
+                VALUES (?, ?, 'Test Salon', ?, NOW(), NOW(), ?)
+                """, salonId, ownerId, salonActive, testCityId());
 
         UUID staffUserId = UUID.randomUUID();
         jdbcTemplate.update("""

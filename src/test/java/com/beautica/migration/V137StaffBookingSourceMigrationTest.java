@@ -105,6 +105,13 @@ class V137StaffBookingSourceMigrationTest extends AbstractIntegrationTest {
                 .isEqualTo(ids.staffUserId());
     }
 
+    /**
+     * The constraint NAME asserted here is {@code fk_bookings_created_by}, not V137's
+     * auto-generated {@code bookings_created_by_user_id_fkey}:
+     * {@code V157__masters_detachable_and_staff_delete_fks.sql} § 5 drops V137's inline FK and
+     * re-adds it under an explicit name. The FK itself — the property this test exists to prove —
+     * is unchanged; only its name and its {@code ON DELETE} action moved.
+     */
     @Test
     @DisplayName("created_by_user_id is a real FK — an id that is not a users row is rejected")
     void should_rejectStaffBooking_when_createdByUserIdIsNotAUser() {
@@ -114,67 +121,71 @@ class V137StaffBookingSourceMigrationTest extends AbstractIntegrationTest {
                 UUID.randomUUID(), null, ids.masterId(), ids.masterServiceId(),
                 "STAFF", "Олена", "Коваль", "+380501234567", null, UUID.randomUUID()))
                 .isInstanceOf(DataIntegrityViolationException.class)
-                .hasMessageContaining("bookings_created_by_user_id_fkey");
+                .hasMessageContaining("fk_bookings_created_by");
     }
 
     /**
      * !! THIS TEST RECORDS A DECISION — DO NOT "KEEP IT GREEN" BLINDLY. !!
      *
-     * <p>V137 declares {@code created_by_user_id ... ON DELETE RESTRICT}. It originally declared
-     * {@code SET NULL}; the security finding that reversed it argued that the column exists purely
-     * for attribution, that {@code SET NULL} makes that attribution destructible by deleting the
-     * very account under suspicion, and that the resulting NULL is indistinguishable from a
-     * pre-V137 row that never had a creator at all — a repudiation path. This test was rewritten
-     * with that change, deliberately, and asserts the new behaviour directly: the {@code DELETE} is
-     * <em>rejected</em>, and the attribution is still intact afterwards.
+     * <p><b>Reversed by V157 (Phase 294 D5, 2026-09-04).</b> V137 originally declared
+     * {@code SET NULL}; a security finding flipped it to {@code RESTRICT}, arguing the column
+     * exists purely for attribution and that {@code SET NULL} makes that attribution destructible
+     * by deleting the very account under suspicion. That rationale was written when NOTHING in the
+     * codebase deleted a user ("RESTRICT matches the codebase's actual lifecycle, which is
+     * deactivate-never-delete", V137:129) and it explicitly deferred the case to "a future
+     * right-to-erasure flow". {@code V157__masters_detachable_and_staff_delete_fks.sql} § 5 IS that
+     * flow: the salon/staff hard-delete track needs the {@code users} row to actually go, so the FK
+     * is back to {@code ON DELETE SET NULL} under the explicit name
+     * {@code fk_bookings_created_by}. Read V157 § 5's header comment before touching this again —
+     * reverting to RESTRICT re-blocks the whole deletion track.
      *
-     * <p>Both halves are load-bearing. "The DELETE threw" alone would also be satisfied by a
-     * {@code CASCADE} that ran into some unrelated constraint, and "the booking still exists" alone
-     * would be satisfied by the very {@code SET NULL} this replaced. Do not relax either half.
+     * <p>Both halves stay load-bearing, only inverted. "The DELETE succeeded" alone would be
+     * satisfied by a {@code CASCADE} that took the booking with it, and "the booking still exists"
+     * alone would be satisfied by {@code RESTRICT} on a delete that never ran. Asserting the row
+     * SURVIVES with a NULLed creator is what pins {@code SET NULL} specifically.
      *
      * <p>The creator here is {@code staffUserId} (a SALON_OWNER that owns nothing else in the
      * fixture), not the client and not the master's user. The client is the wrong actor — V137's
-     * whole point is that the creator is staff — and {@code masterUserId} is unusable: nothing
-     * clears {@code masters.user_id}, whose FK carries no {@code ON DELETE} clause
-     * (V4__Patch_salons_add_masters.sql:12), so the {@code DELETE} would be rejected by
-     * <em>that</em> constraint and this column's delete action would never be exercised at all.
-     * That is also why the rejection is asserted BY CONSTRAINT NAME: an unnamed
-     * {@code DataIntegrityViolationException} here would prove nothing about this column's FK.
+     * whole point is that the creator is staff — and {@code masterUserId} is unusable: its
+     * {@code masters} row would trip {@code chk_masters_detachment_coherent}
+     * (V157 § 4) the moment the FK's SET NULL blanks {@code masters.user_id} without a name
+     * snapshot, so the {@code DELETE} would fail for a reason that has nothing to do with this
+     * column.
      */
     @Test
-    @DisplayName("should REJECT deleting a staff user whose bookings still attribute to them")
-    void should_rejectStaffUserDelete_when_bookingAttributionExists() {
+    @DisplayName("should NULL the attribution (not reject) when a staff user with bookings is deleted")
+    void should_nullBookingAttribution_when_staffUserDeleted() {
         BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
         UUID bookingId = insertStaffWalkIn(ids, ids.staffUserId());
 
-        assertThatThrownBy(() -> jdbcTemplate.update("DELETE FROM users WHERE id = ?", ids.staffUserId()))
-                .isInstanceOf(DataIntegrityViolationException.class)
-                .hasMessageContaining("bookings_created_by_user_id_fkey");
+        jdbcTemplate.update("DELETE FROM users WHERE id = ?", ids.staffUserId());
 
-        UUID survivingCreator = jdbcTemplate.queryForObject(
+        Integer surviving = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM bookings WHERE id = ?", Integer.class, bookingId);
+        assertThat(surviving)
+                .as("SET NULL, never CASCADE: the booking itself must outlive its creator's account")
+                .isEqualTo(1);
+
+        UUID clearedCreator = jdbcTemplate.queryForObject(
                 "SELECT created_by_user_id FROM bookings WHERE id = ?", UUID.class, bookingId);
-        assertThat(survivingCreator)
-                .as("the attribution must survive the rejected delete un-NULLed, actual=%s", survivingCreator)
-                .isEqualTo(ids.staffUserId());
+        assertThat(clearedCreator)
+                .as("the attribution must be NULLed by the FK, not left dangling, actual=%s", clearedCreator)
+                .isNull();
     }
 
     /**
-     * The catalog twin of {@link #should_rejectStaffUserDelete_when_bookingAttributionExists()}:
-     * asserts the declared delete action directly rather than inferring it from an observed row.
-     * Behaviour and declaration are asserted separately on purpose — {@code confdeltype = 'a'}
-     * (NO ACTION) and {@code 'r'} (RESTRICT) are indistinguishable from each other through a
-     * single-statement {@code DELETE}, so only this test can tell them apart. That distinction is
-     * exactly why this test survived the SET NULL → RESTRICT rewrite instead of being folded into
-     * its twin: {@code RESTRICT} checks immediately and cannot be deferred, {@code NO ACTION} can
-     * be, and a future {@code SET CONSTRAINTS ... DEFERRED} would silently change what the twin
-     * proves while this test stays honest.
+     * The catalog twin of {@link #should_nullBookingAttribution_when_staffUserDeleted()}: asserts
+     * the declared delete action directly rather than inferring it from an observed row. Behaviour
+     * and declaration are asserted separately on purpose — this test is what distinguishes a
+     * deliberate {@code SET NULL} from a column that merely happens to be NULL after some other
+     * statement touched it.
      *
-     * <p>Changed from {@code 'n'} (SET NULL) deliberately, as the record of the security decision
-     * described on the twin — never because the build went red.
+     * <p>Changed back to {@code 'n'} (SET NULL) deliberately by V157 § 5 / Phase 294 D5, as the
+     * record of the decision described on the twin — never because the build went red.
      */
     @Test
-    @DisplayName("created_by_user_id's FK declares ON DELETE RESTRICT ('r' in pg_constraint)")
-    void should_declareRestrictDeleteAction_when_migrationApplied() {
+    @DisplayName("created_by_user_id's FK declares ON DELETE SET NULL ('n' in pg_constraint) after V157")
+    void should_declareSetNullDeleteAction_when_v157Applied() {
         String deleteAction = jdbcTemplate.queryForObject("""
                 SELECT confdeltype FROM pg_constraint
                 WHERE conrelid = 'bookings'::regclass AND contype = 'f'
@@ -184,7 +195,7 @@ class V137StaffBookingSourceMigrationTest extends AbstractIntegrationTest {
 
         assertThat(deleteAction)
                 .as("'n' = SET NULL, 'r' = RESTRICT, 'a' = NO ACTION, 'c' = CASCADE; actual=%s", deleteAction)
-                .isEqualTo("r");
+                .isEqualTo("n");
     }
 
     // ── chk_bookings_source ────────────────────────────────────────────────────

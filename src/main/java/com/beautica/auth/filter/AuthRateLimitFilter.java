@@ -37,6 +37,15 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String RESET_PASSWORD_PATH = "/api/v1/auth/reset-password";
     private static final String CHANGE_PASSWORD_OTP_PATH = "/api/v1/users/me/change-password/request-otp";
     private static final String INVITE_PATH = "/api/v1/auth/invite";
+    // The two invite-TOKEN endpoints an invitee (not the inviting SALON_OWNER/SALON_ADMIN) hits
+    // directly from the emailed link — both permitAll() in SecurityConfig, both exact matches so
+    // neither can collide with INVITE_PATH ("/api/v1/auth/invite", no trailing segment) or with
+    // each other. See INVITE_VALIDATE_CAPACITY / INVITE_ACCEPT_CAPACITY for why each has its own
+    // bucket and sizing rather than sharing inviteBuckets above (that bucket protects an
+    // AUTHENTICATED admin's send-invite action; these protect an UNAUTHENTICATED invitee's
+    // read-then-write flow — different actor population, different risk).
+    private static final String INVITE_VALIDATE_PATH = "/api/v1/auth/invite/validate";
+    private static final String INVITE_ACCEPT_PATH = "/api/v1/auth/invite/accept";
     private static final String LOGOUT_PATH = "/api/v1/auth/logout";
     // The two master-availability READ endpoints, which share ONE bucket (slotsBuckets) because they are
     // the same class of request from the same screen: the client booking calendar fetches
@@ -80,9 +89,30 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     //      — one prefix covers the update, photo-update and deactivate routes. It cannot collide
     //        with /api/v1/service-categories/** or /api/v1/service-types/**, which do not start
     //        with the literal "services/" segment.
+    //
+    // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
+    // management read) at the SAME prefix+suffix as shape 2's salon single-create POST. It does
+    // NOT join serviceWriteBuckets: every branch below that matches SALON_SINGLE_SERVICE_PREFIX/
+    // SUFFIX is additionally gated on HttpMethod.POST.matches(method), so the GET falls through
+    // unthrottled, same as every other authenticated read on this controller. Noted here only so
+    // this inventory stays truthful about every route living at this path.
+    //
+    // Phase 314 audit gave the SIBLING public read — GET /api/v1/salons/{salonId}/services (shape
+    // 2's OTHER route, the 2-segment one) — its own bucket, catalogueBrowseBuckets (see that
+    // field's javadoc + RateLimitConfig#catalogueBrowseCapacity). It reuses these SAME
+    // SALON_SINGLE_SERVICE_PREFIX/SUFFIX constants but is matched via
+    // isSalonCatalogueServicesPath, which additionally checks the middle segment is a bare
+    // {salonId} with no further "/" — precisely so it does NOT also catch the Phase 309 GET two
+    // paragraphs above, which stays the documented accepted-risk exception it always was.
     private static final String IM_SINGLE_SERVICE_PATH = "/api/v1/independent-masters/me/services";
     private static final String SALON_SINGLE_SERVICE_PREFIX = "/api/v1/salons/";
     private static final String SALON_SINGLE_SERVICE_SUFFIX = "/services";
+    // GET /api/v1/masters/{masterId}/services — the public master-catalogue read, matched by
+    // prefix + suffix (same technique as SALON_SINGLE_SERVICE, {masterId} is one path segment).
+    // Reuses MASTER_AVAILABILITY_PATH_PREFIX ("/api/v1/masters/") for the prefix half. No other
+    // route under that prefix ends in the literal "/services" (unlike the salon side), so a plain
+    // prefix+suffix check is unambiguous here — no disambiguation helper needed.
+    private static final String MASTER_SERVICES_PATH_SUFFIX = "/services";
     private static final String SERVICE_DEF_WRITE_PATH_PREFIX = "/api/v1/services/";
     // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
     // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
@@ -120,6 +150,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // independent masters, so an unthrottled crawler could bulk-harvest home addresses;
     // this is the IP-layer defence against that scraping.
     private static final String SEARCH_PATH_PREFIX = "/api/v1/search/";
+    // Phase 326 settlement autocomplete (GET, permitAll): GET /api/v1/settlements.
+    // Matched EXACTLY, not by prefix: there is one route here and no /settlements/** subtree,
+    // so a prefix match would silently adopt any future child route into this bucket's budget.
+    private static final String SETTLEMENT_SEARCH_PATH = "/api/v1/settlements";
+    // Phase 331 search-suggestions autocomplete (GET, permitAll): GET /api/v1/search/suggestions.
+    // Matched EXACTLY and checked BEFORE the SEARCH_PATH_PREFIX branch below — this path also
+    // starts with "/api/v1/search/", so if this check ran AFTER the prefix branch it would never
+    // be reached (the prefix branch returns unconditionally) and suggestions would silently spend
+    // the results-search (searchBuckets) budget instead of its own. See the SEARCH_PATH_PREFIX
+    // branch's amended comment in doFilterInternal.
+    private static final String SEARCH_SUGGESTIONS_PATH = "/api/v1/search/suggestions";
     // Remove-admin DELETE carries both {salonId} and {userId} path variables, with the literal
     // "/admins/" segment between them: /api/v1/salons/{salonId}/admins/{userId}. Neither variable
     // can itself contain a "/" (both are UUIDs), so prefix + contains(segment) uniquely identifies
@@ -262,6 +303,107 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final long SEARCH_TOKENS_FIRST_PAGE = 1;
     private static final long SEARCH_TOKENS_DEEP_PAGE = 2;
     private static final String SEARCH_PAGE_PARAM = "page";
+    // Per-IP cap for GET /api/v1/settlements (240 / 60 s) — the Phase 326 settlement
+    // autocomplete. permitAll, because the «Населений пункт» field is reached during
+    // registration before a token exists (phase-326 D7).
+    //
+    // WHY IT NEEDS A BUCKET AT ALL, when the sibling locality cascade has none. The cascade's
+    // documented exemption (SecurityConfig, Phase 10.7) rests on a fully static dataset served
+    // behind a long-lived @Cacheable with no write path: after one cold miss per JVM its
+    // uncached surface is bounded by deploy frequency, not request volume. That argument ends
+    // exactly where a caller-supplied parameter begins. Only the pre-typing major list is
+    // cached here; every typed keystroke runs a real GIN bitmap scan over 25 698 rows, and the
+    // key space is every prefix a user can type, so caching the results is not an option
+    // either (it would be an anonymous-fillable Caffeine cache). The per-IP ceiling is the
+    // control that fits that shape. The cascade's note anticipated this: "revisit only if Part
+    // B adds a dynamic/parameterised locality query."
+    //
+    // WHY NOT FOLD INTO searchBuckets. Same starvation argument salonBoardReadCapacity records,
+    // one level over: /search/** is a DISCOVERY search the user runs while browsing, and this
+    // is an ADDRESS field the user fills while registering or editing a profile. Sharing one
+    // 240-token budget would let a long browsing session 429 an unrelated registration from
+    // the same carrier-grade-NAT egress — and CGNAT is the norm on Ukrainian mobile networks,
+    // so "same IP" says nothing about "same person". searchBuckets' own comment forbids a
+    // second bucket for /search/**; this is not one, it is a different route.
+    //
+    // SIZING: 240/min, deliberately identical to SEARCH_CAPACITY, because the traffic SHAPE is
+    // identical — an incremental field that fires a request per settled keystroke. The reasoning
+    // recorded there transfers verbatim: 40/min was measured to be below real usage for a box
+    // that emits ~1 request per settle point, and a shared CGNAT egress multiplies that across
+    // unrelated subscribers. There is no token-cost function here — every request costs 1 —
+    // because this endpoint has no COUNT companion and no deep-paging surcharge.
+    //
+    // WHAT "CHEAPER PER REQUEST" IS WORTH, MEASURED ADVERSARIALLY. The original note asserted this
+    // endpoint was cheaper per request than discovery search and derived 240 from that, on FRIENDLY
+    // inputs only. The arithmetic under that heading has now been restated twice and been wrong
+    // twice — both times for the same two reasons, which is why this block records the INVARIANT
+    // and not only the numbers:
+    //
+    //  * THE BENIGN WORST CASE WAS THE WRONG TERM. «нов» was chosen for having the most PREFIX
+    //    hits (1 065). The cost does not live in the prefix tier. It lives in the SIMILARITY
+    //    tier's candidate count, where every candidate pays a similarity() recheck: «вка» alone
+    //    yields 6 672 candidates, and the measured benign worst is «іванівка» — 5 102 rechecks,
+    //    10.9 ms — roughly 3x the term that was being quoted as the ceiling.
+    //  * THE ADVERSARIAL WORST WAS MEASURED AGAINST WHATEVER ATTACK WAS KNOWN THAT WEEK. Each
+    //    revision re-measured the input the previous fix had just closed: 119 ms for a zero-trigram
+    //    term, then 52 ms for «ка »x17 once a whole-term trigram guard landed, then 22 ms for
+    //    «•к»x25 once a per-token floor landed. Three proxies, three bypasses, three sizing notes
+    //    that were stale the day after they were written.
+    //
+    // CURRENT SIZING:
+    //
+    //   benign worst       «іванівка»   5 102 similarity rechecks        10.9 ms
+    //   adversarial worst  best input still admitted by the run guard    10.1 ms
+    //   240 x ~10 ms                                                   ~ 2.4 s of DB time /IP-minute
+    //
+    // The two worst cases are now within 10 % OF EACH OTHER, and that is the durable part of this
+    // note rather than a coincidence to re-measure next time. Admission is decided by ONE property:
+    // the term must carry an uninterrupted alphanumeric RUN of at least MIN_QUERY_LENGTH characters
+    // (NormalizedSearchQuery#hasIndexServableRun). pg_trgm's key set — hence the candidate count,
+    // hence the recheck cost — is a function of the DISTINCT trigrams in the term, and repeating a
+    // fragment contributes no distinct key. Padding therefore cannot buy an attacker a statement
+    // more expensive than some real Ukrainian word of the same run length already costs: the
+    // adversarial ceiling is pinned to the benign one BY CONSTRUCTION. ~2.4 s per IP-minute is
+    // stable for as long as that predicate is what admits a term.
+    //
+    // 240 is KEPT at that cost. 2.4 s of statement time is bounded to ~4 % of one connection
+    // because the greedy refill spreads it across the 60 s window it was sized for, and the
+    // first-contact burst is separately bounded to a quarter of the budget — see
+    // settlementSearchBandwidth for both. The @Size(50) ceiling still does independent work: it
+    // bounds normalisation and the bound-parameter size, and once bounded the run guard is what
+    // bounds the STATEMENT.
+    //
+    // IF YOU ARE ABOUT TO RE-DERIVE THIS NUMBER: do not re-measure "the worst attack I can think of
+    // today", and do not pick the benign term with the most prefix hits. Measure the highest-
+    // candidate SIMILARITY term, and then check whether the run-length invariant above still holds —
+    // if it does, the adversarial figure follows from the benign one and needs no fresh attack. Both
+    // earlier revisions failed by measuring correctly on the wrong input.
+    private static final long SETTLEMENT_SEARCH_CAPACITY = 240;
+    private static final Duration SETTLEMENT_SEARCH_WINDOW = Duration.ofMinutes(1);
+    // FIRST-CONTACT BUDGET — a quarter of the capacity. Bucket4j initialises a bandwidth FULL
+    // unless told otherwise, so without this a never-seen IP holds all 240 tokens the instant it
+    // arrives and can spend ~2.4 s of database work in one breath at pool-limited concurrency. The
+    // greedy refill alone does not fix that; it only governs what happens after the first budget is
+    // spent, so it bought roughly 2x, not the ~35x the older note implied.
+    //
+    // WHY A QUARTER rather than a smaller slice. The drip is SETTLEMENT_SEARCH_CAPACITY per window
+    // = 4 tokens/s, which already exceeds the ~1 request/settled-keystroke a human generates, so the
+    // initial grant is pure burst headroom, not throughput. 60 tokens covers several settlement
+    // names typed end to end plus a mistyped retry before the drip has to carry the session — while
+    // capping the cold-start burst at ~0.6 s of database time, a quarter of what it was.
+    private static final long SETTLEMENT_SEARCH_INITIAL_TOKENS = SETTLEMENT_SEARCH_CAPACITY / 4;
+    // Per-IP cap for GET /api/v1/search/suggestions (Phase 331) — its OWN bucket, a clone of
+    // settlementSearchBuckets' shape (same capacity, same greedy refill, same quarter first-
+    // contact grant), because the traffic SHAPE is identical: an incremental autocomplete box
+    // that fires roughly one request per settled keystroke. Not folded into searchBuckets
+    // (SEARCH_CAPACITY) — that bucket's own comment ("This is the ONLY search bucket") is about
+    // /search/masters and /search/salons sharing ONE result-page budget; typing traffic on the
+    // suggestions box must not starve a concurrent results-page read from the same IP, the exact
+    // reasoning settlementSearchBuckets already records for why it is not folded into
+    // searchBuckets either. 240/60s per IP.
+    private static final long SEARCH_SUGGESTIONS_CAPACITY = 240;
+    private static final Duration SEARCH_SUGGESTIONS_WINDOW = Duration.ofMinutes(1);
+    private static final long SEARCH_SUGGESTIONS_INITIAL_TOKENS = SEARCH_SUGGESTIONS_CAPACITY / 4;
     // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
     // unthrottled surface. This is both the residual enumeration/timing surface left after the
     // InviteService 409->idempotent fix (the already-registered and active-invite branches do
@@ -276,6 +418,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // slice/regression tests — stays unchanged.
     private static final long INVITE_CAPACITY = 15;
     private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
+    // Capacity/window for GET /api/v1/auth/invite/validate and POST /api/v1/auth/invite/accept
+    // are @Value-configurable in RateLimitConfig (inviteValidateBuckets() / inviteAcceptBuckets(),
+    // defaults 30/60s and 20/15min) — UNLIKE inviteBuckets/salonInviteBuckets above, which are
+    // built internally. Reason for the split: InviteControllerIT alone drives dozens of real HTTP
+    // calls against these two exact endpoints from 127.0.0.1 across its test methods (unlike the
+    // send-invite path, which existing integration coverage reaches only a handful of times), so a
+    // fixed low cap would make the test suite itself trip the throttle. Making the cap
+    // @Value-configurable lets application-test.yml raise it the same way it already does for
+    // register/login/service-write/etc., without weakening the production default. See
+    // RateLimitConfig#inviteValidateCapacity / #inviteAcceptCapacity for the full sizing rationale
+    // (both are pure load/replay bounds — the 256-bit hashed token makes guessing infeasible
+    // regardless, and acceptInvite sends no email/SMS).
+    //
+    // Retry-After for the accept bucket must reflect its OWN 15-minute window (mirrors
+    // CANCEL_POST_RETRY_AFTER_SECONDS / GUEST_BOOKING_RETRY_AFTER_SECONDS below) — otherwise a
+    // client honouring Retry-After would spin-retry every 60 s against a budget that will not
+    // have refilled. The validate bucket reuses RETRY_AFTER_SECONDS (its window is 60 s).
+    private static final int INVITE_ACCEPT_RETRY_AFTER_SECONDS = 900;
     // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors INVITE_CAPACITY
     // / INVITE_WINDOW above (kept as its own dedicated constants, not shared, so the two
     // endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
@@ -405,11 +565,44 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Built internally rather than injected so the public 16-arg constructor stays stable for
     // the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> searchBuckets;
+    // Per-IP bucket for GET /api/v1/settlements — the Phase 326 settlement autocomplete's
+    // flood/enumeration guard. Built internally rather than injected so the public constructor
+    // stays stable for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> settlementSearchBuckets;
+    // Per-IP bucket for GET /api/v1/search/suggestions — the Phase 331 search-suggestions
+    // autocomplete's own budget, carved out of searchBuckets so typing in the suggestions box
+    // cannot starve a concurrent /search/masters or /search/salons read from the same IP. Built
+    // internally rather than injected so the public constructor stays stable for the
+    // slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> searchSuggestionBuckets;
     // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
     // timing oracle in InviteService.sendInvite (the already-registered / active-invite
     // branches return fast). Built internally rather than injected so the public 16-arg
     // constructor stays stable for the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> inviteBuckets;
+    // Per-IP bucket for GET /api/v1/auth/invite/validate — the LOW-fix flood guard for the
+    // permitAll() invite-preview read that previously fell through the unconditional non-POST
+    // early return with no throttle at all. UNLIKE most buckets below, this one IS an injected
+    // @Qualifier bean (RateLimitConfig#inviteValidateBuckets) rather than built internally — see
+    // the comment on INVITE_ACCEPT_RETRY_AFTER_SECONDS above for why.
+    private final LoadingCache<String, Bucket> inviteValidateBuckets;
+    // Per-IP bucket for POST /api/v1/auth/invite/accept — the LOW-fix flood guard for the
+    // permitAll() invite-acceptance write that previously fell through to the unmatched-POST
+    // else branch with no throttle at all. UNLIKE most buckets below, this one IS an injected
+    // @Qualifier bean (RateLimitConfig#inviteAcceptBuckets) — same reason as inviteValidateBuckets
+    // above.
+    private final LoadingCache<String, Bucket> inviteAcceptBuckets;
+    // Per-IP bucket for the two public catalogue-browse reads — GET /api/v1/salons/{salonId}/services
+    // and GET /api/v1/masters/{masterId}/services (Phase 314 audit finding, MEDIUM). Both are
+    // permitAll() and were previously unthrottled anywhere in this filter: ServiceCatalogService's
+    // @Cacheable only absorbs repeat hits on the SAME id, so a caller sweeping distinct ids forced
+    // an unbounded stream of cache misses plus a full per-master N+1 read on every request. Like
+    // inviteValidateBuckets/inviteAcceptBuckets above, this is an injected @Qualifier bean
+    // (RateLimitConfig#catalogueBrowseBuckets) rather than built internally, so integration tests
+    // hitting these paths many times from 127.0.0.1 can raise the cap via
+    // app.rate-limit.catalogue-browse-capacity — see that field's javadoc for the full sizing
+    // rationale (60/min, mirroring slotsBuckets).
+    private final LoadingCache<String, Bucket> catalogueBrowseBuckets;
     // Per-IP bucket for POST /api/v1/salons/{salonId}/invite — the SEC-fix compensating control
     // closing the gap left when this path (the actual HTTP surface for SalonController.inviteMaster,
     // reachable by SALON_OWNER and, since Phase 21.1, SALON_ADMIN) fell through to the unmatched
@@ -457,7 +650,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("otpSendBuckets") LoadingCache<String, Bucket> otpSendBuckets,
             @Qualifier("verifyPasswordResetOtpBuckets") LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets,
             @Qualifier("changePasswordOtpBuckets") LoadingCache<String, Bucket> changePasswordOtpBuckets,
-            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets) {
+            @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
+            @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
+            @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -477,6 +673,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.verifyPasswordResetOtpBuckets = verifyPasswordResetOtpBuckets;
         this.changePasswordOtpBuckets = changePasswordOtpBuckets;
         this.serviceWriteBuckets = serviceWriteBuckets;
+        this.inviteValidateBuckets = inviteValidateBuckets;
+        this.inviteAcceptBuckets = inviteAcceptBuckets;
+        this.catalogueBrowseBuckets = catalogueBrowseBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -506,6 +705,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(SEARCH_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(searchBandwidth())
+                        .build());
+        this.settlementSearchBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SETTLEMENT_SEARCH_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(settlementSearchBandwidth())
+                        .build());
+        this.searchSuggestionBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SEARCH_SUGGESTIONS_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(searchSuggestionBandwidth())
                         .build());
         this.inviteBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -567,10 +778,83 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
+    /**
+     * Step refill and a full initial budget, unlike its {@link #settlementSearchBandwidth()}
+     * neighbour. That asymmetry is deliberate and the reason is a property of the route, not an
+     * unmeasured surface.
+     *
+     * <p>{@code /search/**} parses its {@code q} through
+     * {@link com.beautica.search.service.NormalizedSearchQuery#of(String)}, which keeps at most
+     * {@link com.beautica.search.service.NormalizedSearchQuery#MAX_TOKENS} (4) whitespace tokens and
+     * runs nothing at all unless one of those four is trigram-servable — at least
+     * {@link com.beautica.search.service.NormalizedSearchQuery#MIN_QUERY_LENGTH} (3) characters AND
+     * trigram-bearing. So the predicate this route can be made to issue is bounded at four terms no
+     * matter how long the input is, and the padding shapes that drove the settlement fix («ка »x17
+     * and friends) are refused before any SQL: repeating a 2-character fragment produces four
+     * unservable tokens and an empty page. Its tables are also low thousands of providers, orders of
+     * magnitude under the 25 698-row settlement taxonomy.
+     *
+     * <p>Both halves of the settlement problem — a worst-case statement far above the benign one,
+     * and a per-request cost an attacker could inflate with input length — are therefore absent
+     * here, which is what a burst control would have been bounding. "Not measured" was the reason
+     * recorded previously and it was the wrong one.
+     */
     private static Bandwidth searchBandwidth() {
         return BandwidthBuilder.builder()
                 .capacity(SEARCH_CAPACITY)
                 .refillIntervally(SEARCH_CAPACITY, SEARCH_WINDOW)
+                .build();
+    }
+
+    /**
+     * GREEDY and NOT initially full, unlike every sibling here — the one bucket in this filter that
+     * is neither a step refill nor a full first-contact grant. Both departures bound the same thing,
+     * the instantaneous BURST, and neither is sufficient alone.
+     *
+     * <p><b>Greedy refill</b> — {@code refillIntervally} hands the whole capacity back at once when
+     * the window rolls, so a recharged budget is spendable as fast as the client can open sockets.
+     * For a 15-token invite bucket that is irrelevant; for 240 tokens against this endpoint it is
+     * the attack. {@code refillGreedy} drips the same 240/min back continuously — ~1 token per
+     * 250 ms — so a recharged budget is spent over the minute it was sized for. The sustained rate,
+     * and therefore every legitimate typing session, is unchanged.
+     *
+     * <p><b>{@link #SETTLEMENT_SEARCH_INITIAL_TOKENS}</b> — greedy refill governs only the SECOND
+     * budget onward. Bucket4j initialises a bandwidth at full capacity, so without an explicit
+     * initial-token count a first-seen IP still holds all 240 tokens the moment it arrives and
+     * spends ~2.4 s of database work in one breath at pool-limited concurrency — and a rotating
+     * source address is free. Greedy refill alone was therefore worth roughly 2x, not the ~35x the
+     * earlier note here implied. A quarter of the capacity caps that cold-start burst at ~0.6 s
+     * while leaving more headroom than a human typist can consume; the sizing argument is on the
+     * constant.
+     */
+    // Package-private, unlike its siblings: SettlementSearchGetRateLimitRegressionTest builds a
+    // bucket from this EXACT Bandwidth over a controllable TimeMeter to assert the greedy drip and
+    // the first-contact grant, neither of which is observable through doFilterInternal without
+    // sleeping (banned) or waiting out a real 60-second window. Widening the method is cheaper than
+    // a reflective read and says out loud that the refill strategy is a tested property, not an
+    // incidental one.
+    static Bandwidth settlementSearchBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SETTLEMENT_SEARCH_CAPACITY)
+                .refillGreedy(SETTLEMENT_SEARCH_CAPACITY, SETTLEMENT_SEARCH_WINDOW)
+                .initialTokens(SETTLEMENT_SEARCH_INITIAL_TOKENS)
+                .build();
+    }
+
+    /**
+     * A clone of {@link #settlementSearchBandwidth()}'s shape (greedy refill + a quarter
+     * first-contact grant) for the same reason: {@code GET /api/v1/search/suggestions} is another
+     * per-settled-keystroke autocomplete box, so the same burst-vs-sustained-rate argument
+     * applies verbatim. Package-private for the same reason as its sibling —
+     * {@code SearchSuggestionsGetRateLimitRegressionTest} builds a bucket from this EXACT
+     * Bandwidth over a controllable {@code TimeMeter} to assert the refill strategy, which is not
+     * observable through {@code doFilterInternal} without a banned sleep or a real 60s wait.
+     */
+    static Bandwidth searchSuggestionBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SEARCH_SUGGESTIONS_CAPACITY)
+                .refillGreedy(SEARCH_SUGGESTIONS_CAPACITY, SEARCH_SUGGESTIONS_WINDOW)
+                .initialTokens(SEARCH_SUGGESTIONS_INITIAL_TOKENS)
                 .build();
     }
 
@@ -665,16 +949,82 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Search-suggestions rate-limit: GET /api/v1/search/suggestions (Phase 331) — checked
+        // BEFORE the SEARCH_PATH_PREFIX branch below on purpose. That branch matches by prefix on
+        // "/api/v1/search/", which this exact path also starts with; if this check ran after it,
+        // the prefix branch would already have returned and this one would NEVER run, silently
+        // spending the results-search (searchBuckets) budget instead of its own. Cap: 240 / 60 s
+        // per IP, its own bucket (searchSuggestionBuckets) — see SEARCH_SUGGESTIONS_CAPACITY for
+        // why it is a separate budget from searchBuckets.
+        // FALSIFY: move this branch after the SEARCH_PATH_PREFIX branch below and
+        // SearchSuggestionsGetRateLimitRegressionTest's carve-out test must go red.
+        if (HttpMethod.GET.matches(method)
+                && path.equals(SEARCH_SUGGESTIONS_PATH)) {
+            applyRateLimit(request, response, filterChain, searchSuggestionBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
         // before the POST-only guard so these GET reads are covered. These permitAll() paths
         // expose authed-only independent-master street addresses, so the throttle is the
         // IP-layer ceiling on sustained scraping and DB amplification. Cap: 240 / 60 s per IP
-        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY search bucket — do
-        // not add a second one; both /search/masters and /search/salons share it by design.
+        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY bucket for RESULT reads
+        // — do not add a second one for /search/masters or /search/salons, which still share it
+        // by design. GET /api/v1/search/suggestions is deliberately carved OUT of this prefix by
+        // the branch above: it is typing traffic, not a result-page read, and must not compete
+        // with it for the same 240-token budget (Phase 331).
         if (HttpMethod.GET.matches(method)
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,
                     searchTokenCost(request));
+            return;
+        }
+
+        // Settlement-autocomplete rate-limit: GET /api/v1/settlements (Phase 326) — checked
+        // before the POST-only guard so this GET read is covered at all. permitAll, reached
+        // during registration, and unlike the locality cascade its response depends on caller
+        // input, so request volume reaches the database instead of a static cache. Cap:
+        // 240 / 60 s per IP, one token per request (see SETTLEMENT_SEARCH_CAPACITY for why it
+        // matches /search/**'s cap and why it is nevertheless a SEPARATE bucket).
+        if (HttpMethod.GET.matches(method)
+                && path.equals(SETTLEMENT_SEARCH_PATH)) {
+            applyRateLimit(request, response, filterChain, settlementSearchBuckets,
+                    RETRY_AFTER_SECONDS);
+            return;
+        }
+
+        // Catalogue-browse rate-limit: GET /api/v1/salons/{salonId}/services AND
+        // GET /api/v1/masters/{masterId}/services — checked before the POST-only guard so these
+        // GET reads are covered. Phase 314 audit finding (MEDIUM): both are permitAll() and were
+        // previously unthrottled anywhere in this filter, letting a caller sweeping distinct
+        // salon/master ids force a cache miss plus a full per-master N+1 read on every request.
+        // Cap: 60 / 60 s per IP (catalogueBrowseBuckets) — see RateLimitConfig#catalogueBrowseCapacity
+        // for the sizing.
+        //
+        // The salon half is matched via isSalonCatalogueServicesPath rather than a bare
+        // prefix+suffix check, because the THIRD route living at this prefix+suffix —
+        // GET /api/v1/salons/{salonId}/masters/{masterId}/services (Phase 309/310's salon-management
+        // read, TWO path variables not one) — is matched by its own named helper below. The master
+        // half needs no such helper: no other route under MASTER_AVAILABILITY_PATH_PREFIX ends in
+        // "/services".
+        //
+        // 2026-09-13 audit (P5/S3): the management read
+        // GET /api/v1/salons/{salonId}/masters/{masterId}/services is no longer the "accepted
+        // risk" exception it was documented as on RateLimitConfig#serviceWriteCapacity — but it is
+        // NOT throttled here. Cycle 1 routed it into catalogueBrowseBuckets, an ANONYMOUS per-IP
+        // bucket; under carrier-grade NAT (the norm on Ukrainian mobile networks) the aggregate
+        // anonymous browse traffic leaving one egress IP would then 429 a salon owner's management
+        // UI (cycle-2 audit, B8). It is an AUTHENTICATED route, so it belongs on a per-PRINCIPAL
+        // bucket, and this filter runs BEFORE JwtAuthenticationFilter — the principal does not
+        // exist yet here. It is therefore throttled by BookingRateLimitFilter, which runs AFTER
+        // the JWT filter and is the app's only per-authenticated-user Bucket4j mechanism (the same
+        // reason DELETE /api/v1/users/me lives there), against its own salonMasterServicesRead
+        // bucket at the same 60/min capacity.
+        if (HttpMethod.GET.matches(method)
+                && (isSalonCatalogueServicesPath(path)
+                        || (path.startsWith(MASTER_AVAILABILITY_PATH_PREFIX)
+                                && path.endsWith(MASTER_SERVICES_PATH_SUFFIX)))) {
+            applyRateLimit(request, response, filterChain, catalogueBrowseBuckets, RETRY_AFTER_SECONDS);
             return;
         }
 
@@ -807,6 +1157,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Invite-validate rate-limit: GET /api/v1/auth/invite/validate — a single literal
+        // equality check on the exact path, checked before the unconditional non-POST bypass
+        // immediately below. Before this branch the endpoint fell straight through that bypass
+        // with NO throttle at all (backlog LOW finding). This does NOT widen the bypass itself —
+        // every other GET in the app still falls through unmatched, exactly as before; this rule
+        // can only ever match the one literal path. See INVITE_VALIDATE_CAPACITY for sizing.
+        if (HttpMethod.GET.matches(method) && INVITE_VALIDATE_PATH.equals(path)) {
+            applyRateLimit(request, response, filterChain, inviteValidateBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         if (!HttpMethod.POST.matches(method)) {
             filterChain.doFilter(request, response);
             return;
@@ -841,6 +1202,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             retryAfterSeconds = FORGOT_PASSWORD_RETRY_AFTER_SECONDS;
         } else if (INVITE_PATH.equals(path)) {
             cache = inviteBuckets;
+        } else if (INVITE_ACCEPT_PATH.equals(path)) {
+            cache = inviteAcceptBuckets;
+            retryAfterSeconds = INVITE_ACCEPT_RETRY_AFTER_SECONDS;
         } else if (LOGOUT_PATH.equals(path)) {
             cache = logoutBuckets;
         } else if (CATEGORY_REQUEST_PATH.equals(path)) {
@@ -931,6 +1295,27 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return SEARCH_TOKENS_FIRST_PAGE;
         }
     }
+
+    /**
+     * True only for {@code /api/v1/salons/{salonId}/services} — the public catalogue-browse GET —
+     * never for {@code /api/v1/salons/{salonId}/masters/{masterId}/services} (Phase 309's
+     * authenticated salon-management read), even though both share the literal
+     * {@link #SALON_SINGLE_SERVICE_PREFIX} prefix and {@link #SALON_SINGLE_SERVICE_SUFFIX} suffix.
+     * The two are told apart by the segment BETWEEN prefix and suffix: for the catalogue route it
+     * is a bare {@code {salonId}} (no further "/"); for the management route it is
+     * {@code {salonId}/masters/{masterId}} (contains "/"). Callers must still check
+     * {@code startsWith}/{@code endsWith} themselves — this method assumes both already hold.
+     */
+    private static boolean isSalonCatalogueServicesPath(String path) {
+        if (!path.startsWith(SALON_SINGLE_SERVICE_PREFIX) || !path.endsWith(SALON_SINGLE_SERVICE_SUFFIX)) {
+            return false;
+        }
+        String middle = path.substring(
+                SALON_SINGLE_SERVICE_PREFIX.length(),
+                path.length() - SALON_SINGLE_SERVICE_SUFFIX.length());
+        return !middle.isEmpty() && middle.indexOf('/') < 0;
+    }
+
 
     private void applyRateLimit(HttpServletRequest request,
                                 HttpServletResponse response,

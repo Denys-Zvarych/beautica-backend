@@ -308,9 +308,9 @@ class FavoriteSalonServiceIT extends AbstractIntegrationTest {
                 ownerId, ownerEmail);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, 'Test Salon', true, NOW(), NOW())",
-                salonId, ownerId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, 'Test Salon', true, NOW(), NOW(), ?)",
+                salonId, ownerId, testCityId());
         return salonId;
     }
 

@@ -9,6 +9,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.Set;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -27,11 +28,14 @@ class SalonRequestControlCharValidationTest {
     private static final String DEL = "\u007F";
 
     // Phase 10.6 reversal: street + buildingNo are now @NotBlank on both DTOs. The
-    // builders below supply a valid pair so validator.validate(...) surfaces ONLY the
-    // description violation under test — otherwise the .isEmpty() positive assertions
-    // would fail on unrelated street/buildingNo violations (de-vacuuming).
+    // builders below supply a valid pair (plus, for CreateSalonRequest, a valid cityId —
+    // now @NotNull, closing the "a salon must always have a city" contract gap) so
+    // validator.validate(...) surfaces ONLY the description violation under test —
+    // otherwise the .isEmpty() positive assertions would fail on unrelated
+    // street/buildingNo/cityId violations (de-vacuuming).
     private static final String VALID_STREET = "вул. Хрещатик";
     private static final String VALID_BUILDING_NO = "1";
+    private static final UUID VALID_CITY_ID = UUID.randomUUID();
 
     private static Validator validator;
 
@@ -45,7 +49,7 @@ class SalonRequestControlCharValidationTest {
     private static CreateSalonRequest createWithDescription(String description) {
         return new CreateSalonRequest(
                 "My Salon", description, null, null, null, null, null,
-                null, null, VALID_STREET, VALID_BUILDING_NO, null);
+                VALID_CITY_ID, null, VALID_STREET, VALID_BUILDING_NO, null);
     }
 
     private static UpdateSalonRequest updateWithDescription(String description) {

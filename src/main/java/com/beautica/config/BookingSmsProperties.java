@@ -219,5 +219,49 @@ public class BookingSmsProperties {
         public void setDeclineReason(String declineReason) {
             this.declineReason = declineReason;
         }
+
+        /**
+         * Salon-closure template for a GUEST (LINK) visit (Phase 269/293). Like {@link #decline},
+         * this is the ONLY channel that reaches a guest — they have no account for email/push.
+         * Placeholders: {@code {subject}} (the service name for a single-service visit, or the
+         * «N послуг(и)» numeral phrase for a multi-service one — resolved in Java by
+         * {@code NotificationService#bookedSubject}, never here), {@code {date}}, {@code {time}}.
+         * Carries no reason clause and no client name — the SALON closed, there is no provider
+         * note to attach (D10: {@code BookingVisit} exposes no note accessor at all).
+         */
+        private String salonClosed =
+                "Beautica: На жаль, салон закрився і більше не приймає записи.\n"
+                        + "Ваше бронювання на {subject}\n"
+                        + "{date} о {time} скасовано.";
+
+        public String getSalonClosed() {
+            return salonClosed;
+        }
+
+        public void setSalonClosed(String salonClosed) {
+            this.salonClosed = salonClosed;
+        }
+
+        /**
+         * Master-removal template for a GUEST (LINK) visit (Phase 298). Like {@link #salonClosed},
+         * this is the ONLY channel that reaches a guest — they have no account for email/push.
+         * Placeholders: {@code {subject}} (resolved in Java by {@code
+         * NotificationService#bookedSubject}, never here), {@code {date}}, {@code {time}}.
+         * Deliberately NOT a reuse of {@link #salonClosed}'s copy — the salon did not close, only
+         * the master left it. Carries no reason clause and no client name — there is no provider
+         * note to attach (D10: {@code BookingVisit} exposes no note accessor at all).
+         */
+        private String masterRemoved =
+                "Beautica: На жаль, майстер більше не працює в цьому салоні.\n"
+                        + "Ваше бронювання на {subject}\n"
+                        + "{date} о {time} скасовано.";
+
+        public String getMasterRemoved() {
+            return masterRemoved;
+        }
+
+        public void setMasterRemoved(String masterRemoved) {
+            this.masterRemoved = masterRemoved;
+        }
     }
 }

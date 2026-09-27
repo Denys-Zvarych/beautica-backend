@@ -392,7 +392,40 @@ public class AppointmentTransitionService {
         // Same projection-only, authz-before-any-load ordering as declineAppointmentItem (cycle-4
         // audit finding 2) — never an entity load before authorization has already succeeded.
         authz.enforceCanManageAppointment(actorId, appointmentId);
+        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+    }
 
+    /**
+     * Cascade-scoped overload of {@link #declineAppointmentItems(UUID, UUID, List,
+     * AppointmentProviderNoteRequest, boolean)} (perf finding 2, 2026-09 re-audit) — used ONLY by
+     * {@code BookingService#declineFutureConfirmedBookingsForSalonClosure}'s appointment-visit
+     * loop, which calls this method once per appointment-visit found at the deleted salon. Routes
+     * authorization through {@link AuthorizationService#enforceCanManageAppointment(UUID, UUID, Map)}
+     * instead of the 2-arg overload so a {@code managementAccessMemo} shared across every visit of
+     * the SAME cascade call pays the SALON_OWNER ownership check at most once per distinct salon,
+     * not once per visit — see that overload's own Javadoc for the full rationale and the memo's
+     * lifetime contract. Every other step — load, validate, lock, batched freshness recheck, write,
+     * collapse, evict — is the EXACT SAME {@link #declineAppointmentItemsAfterAuth} core the 5-arg
+     * overload runs, so the two can never drift on anything but how they authorize.
+     *
+     * @param managementAccessMemo see {@link AuthorizationService#enforceCanManageAppointment(UUID,
+     *                              UUID, Map)} — owned by the caller, never retained here
+     */
+    List<Booking> declineAppointmentItems(
+            UUID actorId, UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
+            boolean evictAfterCommit, Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo) {
+        authz.enforceCanManageAppointment(actorId, appointmentId, managementAccessMemo);
+        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+    }
+
+    /**
+     * Shared post-authorization core of both {@link #declineAppointmentItems(UUID, UUID, List,
+     * AppointmentProviderNoteRequest, boolean)} overloads (perf finding 2, 2026-09 re-audit split)
+     * — everything the original single method did AFTER its authorization check, unchanged.
+     */
+    private List<Booking> declineAppointmentItemsAfterAuth(
+            UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
+            boolean evictAfterCommit) {
         List<Booking> items = loadItemsOrThrow(appointmentId);
         Map<UUID, Booking> itemsById = items.stream().collect(Collectors.toMap(Booking::getId, b -> b));
 

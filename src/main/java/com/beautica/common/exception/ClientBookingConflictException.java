@@ -1,6 +1,7 @@
 package com.beautica.common.exception;
 
 import com.beautica.booking.entity.Booking;
+import com.beautica.master.entity.Master;
 import com.beautica.user.User;
 import java.time.OffsetDateTime;
 import java.util.UUID;
@@ -43,14 +44,16 @@ public class ClientBookingConflictException extends BusinessException {
         super(HttpStatus.CONFLICT, "Client already has an overlapping booking");
         this.conflictingBookingId = conflictingBooking.getId();
         this.serviceName = conflictingBooking.getMasterService().getServiceDefinition().getName();
-        this.masterName = displayName(conflictingBooking.getMaster().getUser());
+        // V157 / phase 294 D3 — the conflicting row is a HISTORICAL booking, so its master may be
+        // detached (staff account hard-deleted) and carry only the name snapshot.
+        this.masterName = displayName(conflictingBooking.getMaster());
         this.startsAt = conflictingBooking.getStartsAt();
         this.endsAt = conflictingBooking.getEndsAt();
     }
 
-    private static String displayName(User user) {
-        String firstName = user.getFirstName() != null ? user.getFirstName() : "";
-        String lastName = user.getLastName() != null ? user.getLastName() : "";
+    private static String displayName(Master master) {
+        String firstName = master.displayFirstName() != null ? master.displayFirstName() : "";
+        String lastName = master.displayLastName() != null ? master.displayLastName() : "";
         String combined = (firstName + " " + lastName).trim();
         return combined.isEmpty() ? "" : combined;
     }

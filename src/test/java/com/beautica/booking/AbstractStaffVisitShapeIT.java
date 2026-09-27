@@ -466,6 +466,11 @@ abstract class AbstractStaffVisitShapeIT extends AbstractStaffBookingIT {
         void should_return400_when_providerReviewsAWalkInBooking() throws Exception {
             Visit visit = threeServiceVisit();
             markCompleted(visit.booking(0));
+            // Phase 320 NOTE — providerToken() is the salon OWNER, and this still clears
+            // @authz.canReviewClient because seedSalon() builds an OWNER-AS-MASTER row
+            // (master_type = 'SALON_OWNER', user_id = the owner), so the owner IS this booking's
+            // masters.user_id. That is the one shape in which an owner keeps the review right, and
+            // it is what keeps this 400 the walk-in rule speaking rather than a 403 in disguise.
             String token = providerToken();
 
             ResponseEntity<String> resp = restTemplate.exchange(

@@ -156,8 +156,31 @@ public class ScheduleDateMath {
      * never reaches this method at all).
      */
     public void assertSpanWithinMax(LocalDate from, LocalDate to) {
-        if (ChronoUnit.DAYS.between(from, to) > MAX_EXPANSION_SPAN_DAYS) {
-            throw new BusinessException("Date range exceeds the maximum of 366 days");
+        assertSpanWithinMax(from, to, MAX_EXPANSION_SPAN_DAYS);
+    }
+
+    /**
+     * Phase 321: the same span-only guard with a caller-chosen ceiling, for a read whose cost is not
+     * one row per date but a PRODUCT — {@code GET /salons/{salonId}/masters/effective-schedule}
+     * materialises {@code roster × days} {@code EffectiveDayResponse} objects, so a salon of 30
+     * masters over the 366-day default would fold ~11 000 days into one response body. That endpoint
+     * passes 61 (i.e. 62 inclusive days, two months of board scrolling).
+     *
+     * <p><b>Deliberately a parameter, not a second constant and not a second method body.</b> The
+     * no-arg overload above delegates here with {@link #MAX_EXPANSION_SPAN_DAYS}, so the 366-day
+     * bound still has exactly one literal in this codebase and the two callers cannot drift onto
+     * different arithmetic. The message is derived from the ceiling ({@code max + 1}, because the
+     * bound is on the span BETWEEN endpoints and the endpoints are inclusive), so the existing
+     * "maximum of 366 days" wording is reproduced byte-for-byte by the delegating overload.
+     *
+     * <p>Like the no-arg form, this does NOT null-check, order-check, or bound the window against
+     * the past floor / future cap — callers that need those call {@link #assertExpandable} first
+     * and then narrow with this.
+     */
+    public void assertSpanWithinMax(LocalDate from, LocalDate to, long maxSpanDays) {
+        if (ChronoUnit.DAYS.between(from, to) > maxSpanDays) {
+            throw new BusinessException(
+                    "Date range exceeds the maximum of " + (maxSpanDays + 1) + " days");
         }
     }
 

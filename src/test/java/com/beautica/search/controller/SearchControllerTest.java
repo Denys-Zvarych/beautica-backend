@@ -201,7 +201,9 @@ class SearchControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/search/masters — 400 when location.cityId is not a valid UUID (generic 400, no surface leak)")
+    @DisplayName("GET /api/v1/search/masters — 400 when location.cityId is not a valid UUID (generic 400, no surface leak); "
+            + "Phase 331 audit — the GlobalExceptionHandler typeMismatch genericization applies to EVERY "
+            + "@ModelAttribute endpoint, not only /search/suggestions, so this pins the raw value is never echoed here too")
     void should_return400_when_locationCityIdMalformed() throws Exception {
         log.debug("Act: GET {} with location.cityId=not-a-uuid — binder must reject with a generic 400", MASTERS_URL);
         mockMvc.perform(get(MASTERS_URL)
@@ -210,7 +212,11 @@ class SearchControllerTest {
                         .param("size", "20")
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false));
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("not-a-uuid"))))
+                .andExpect(jsonPath("$.errors['location.cityId']").value(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("not-a-uuid"))));
     }
 
     @Test

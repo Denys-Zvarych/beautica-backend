@@ -497,7 +497,7 @@ class ReviewEventListenerTest {
 
             UUID reviewedSalon = UUID.randomUUID();
             UUID bystanderSalon = UUID.randomUUID();
-            // Key shape is SalonService#getSalonEntity's `key = "#salonId"` — the raw UUID.
+            // Key shape is SalonService#getPublicSalon's `key = "#salonId"` — the raw UUID.
             detail.put(reviewedSalon, "cached-salon-entity");
             detail.put(bystanderSalon, "cached-bystander-salon-entity");
 

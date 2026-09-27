@@ -53,6 +53,9 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> verifyPasswordResetOtpBuckets;
     @Mock private LoadingCache<String, Bucket> changePasswordOtpBuckets;
     @Mock private LoadingCache<String, Bucket> serviceWriteBuckets;
+    @Mock private LoadingCache<String, Bucket> inviteValidateBuckets;
+    @Mock private LoadingCache<String, Bucket> inviteAcceptBuckets;
+    @Mock private LoadingCache<String, Bucket> catalogueBrowseBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -66,7 +69,8 @@ class AuthRateLimitFilterTest {
                 resendVerificationBuckets, forgotPasswordBuckets, resetPasswordBuckets,
                 categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
                 supportContactBuckets, otpSendBuckets, verifyPasswordResetOtpBuckets,
-                changePasswordOtpBuckets, serviceWriteBuckets);
+                changePasswordOtpBuckets, serviceWriteBuckets,
+                inviteValidateBuckets, inviteAcceptBuckets, catalogueBrowseBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -2166,9 +2170,18 @@ class AuthRateLimitFilterTest {
         @Test
         @DisplayName("no over-matching — an encoded path that decodes to something unrelated is NOT throttled")
         void should_notThrottle_when_encodedPathDecodesToUnrelatedRoute() throws Exception {
-            // /serv%69ces decodes to /services — must NOT be caught by the /slots or /working-days
-            // availability rule (guards against the fix over-matching after decoding).
-            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID() + "/serv%69ces");
+            // /eff%65ctive-schedule decodes to /effective-schedule — the SAME literal
+            // should_notConsumeSlotsBucket_when_otherMasterReadRequested (above) already proves is
+            // caught by NO bucket in this filter, so it must NOT be caught by the /slots or
+            // /working-days availability rule either (guards against the fix over-matching after
+            // decoding).
+            //
+            // NOT /serv%69ces (decodes to /services) as this test originally used: Phase 314 gave
+            // GET /api/v1/masters/{masterId}/services its OWN bucket (catalogueBrowseBuckets), so
+            // that path is no longer unrelated to every bucket in this filter — reusing it here
+            // would make this test assert something false.
+            var request = getRequest("/api/v1/masters/" + java.util.UUID.randomUUID()
+                    + "/eff%65ctive-schedule");
             var response = new MockHttpServletResponse();
             var chain = new MockFilterChain();
 
@@ -2176,6 +2189,7 @@ class AuthRateLimitFilterTest {
 
             verifyNoInteractions(slotsBuckets);
             verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(catalogueBrowseBuckets);
             assertThat(chain.getRequest())
                     .as("an unrelated decoded path must pass through untouched")
                     .isNotNull();

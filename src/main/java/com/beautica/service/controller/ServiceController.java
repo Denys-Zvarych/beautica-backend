@@ -9,18 +9,24 @@ import com.beautica.service.dto.DuplicateServiceErrorResponse;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -29,6 +35,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -37,7 +44,29 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1")
 @RequiredArgsConstructor
+// @Validated activates the @Min/@Max on the loose @RequestParam pagination arguments of
+// getSalonMasterServices (2026-09-13 audit, P7). Bean Validation on a bare method parameter — as
+// opposed to a @Valid @RequestBody — only runs through the method-validation proxy this enables.
+@org.springframework.validation.annotation.Validated
 public class ServiceController {
+
+    /**
+     * Default page size for {@code GET /salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services}
+     * — the exact cap {@code ServiceCatalogService#getSalonMasterServices} used to hard-code, kept
+     * verbatim so adding {@link org.springframework.data.domain.Pageable} changed no existing
+     * caller's result (2026-09-13 audit, P7).
+     */
+    private static final int SALON_MASTER_SERVICES_DEFAULT_PAGE_SIZE = 200;
+
+    /**
+     * Hard ceiling on a CALLER-SUPPLIED {@code size} for the same route. The server-chosen default
+     * above is allowed to exceed it because it is not caller input; anything a client asks for is
+     * bounded here, which is the memory-exhaustion guard §J's global
+     * {@code spring.data.web.pageable.max-page-size} provides for {@code Pageable}-resolved
+     * endpoints. Enforced by {@code @Max} (a 400, not a silent clamp) so a client asking for 10 000
+     * is told it was wrong instead of quietly getting a different page than it requested.
+     */
+    private static final int SALON_MASTER_SERVICES_MAX_PAGE_SIZE = 200;
 
     /**
      * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on every write
@@ -56,6 +85,42 @@ public class ServiceController {
             "The owner already offers an active service of this type. One active service per "
                     + "(owner, service type); price and duration are irrelevant. Branch on "
                     + "`data.code` == DUPLICATE_SERVICE, never on `message`.";
+
+    /**
+     * Description attached to the {@code 409 DUPLICATE_SERVICE} declaration on the salon-master
+     * bulk endpoint specifically (Phase 305 D3). Phase 302 D4 narrowed this endpoint's conflict
+     * scope from per-SALON to per-MASTER: two different masters in the same salon can both offer
+     * the same service type — the second reuses the salon's existing definition and gets its own
+     * assignment, {@code 201}, not {@code 409} — a breaking behavioural change to a shipped
+     * endpoint (a call that used to return 409 for the second master now returns 201). The 409
+     * fires ONLY when THIS master already has an active assignment for the type.
+     *
+     * <p>Declared separately from {@link #DUPLICATE_SERVICE_409} (used by every other write
+     * endpoint here) because that shared text describes the still-accurate per-OWNER conflict for
+     * every other path; only this endpoint's semantics changed with Phase 302 D4.
+     */
+    private static final String DUPLICATE_SERVICE_PER_MASTER_409 =
+            "The service type is already assigned to THIS master (Phase 302 D4 — the conflict is "
+                    + "per-MASTER, not per-salon: another master in the same salon already offering "
+                    + "this type is NOT a conflict here, the salon's existing definition is reused "
+                    + "and this call returns 201). One active assignment per (master, service "
+                    + "type); price and duration are irrelevant. Branch on `data.code` == "
+                    + "DUPLICATE_SERVICE, never on `message`.";
+
+    /**
+     * Description attached to {@link #getSalonServiceCatalog}'s {@code @Operation} (Phase 305 D2):
+     * states the five-condition visibility rule directly in the published spec so a mobile engineer
+     * reading {@code /api-docs} sees it without spelunking the service layer.
+     */
+    private static final String SALON_CATALOGUE_VISIBILITY_RULE =
+            "A service appears here iff ALL of: (1) its definition is owner_type=SALON with "
+                    + "owner_id=salonId; (2) the definition is active; (3) at least one master_services "
+                    + "assignment for it is active; (4) that assignment's master belongs to this salon "
+                    + "and is active; (5) that master has a free future slot for the service's "
+                    + "effective duration. Condition 5 is DELIBERATE, not a bug: a master with no "
+                    + "working hours configured has none of their services listed here, because this "
+                    + "endpoint answers \"what can a client book right now\", not \"what does the "
+                    + "staff list on paper\".";
 
     /**
      * Description attached to the {@code 503} declaration on the two BULK endpoints — the only
@@ -127,7 +192,10 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/salons/{salonId}/services")
-    @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId)")
+    // Phase 306 D4 — role-only conjunct dropped; @authz.canManageSalon already admits both
+    // SALON_OWNER (by ownership) and SALON_ADMIN (by salon assignment), matching the bulk
+    // on-behalf endpoint below, which never had the extra hasRole conjunct.
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId)")
     public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> addServiceToSalon(
             @PathVariable UUID salonId,
             @Valid @RequestBody CreateServiceDefinitionRequest request
@@ -140,24 +208,233 @@ public class ServiceController {
     // master row (master_type = SALON_OWNER): that row's salon_id equals #salonId, so
     // masterBelongsToSalon resolves true. No owner-specific branch is required.
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
-            // Same lone-@ApiResponse guard as every other write endpoint in this file: the 429
-            // alone would be read by springdoc as the COMPLETE response set and drop the
-            // auto-derived typed 200, regenerating the mobile client to Response<void>.
+            // Same lone-@ApiResponse guard as every other write endpoint in this file: an
+            // explicit set without the 200 would be read by springdoc as the COMPLETE response
+            // set and drop the auto-derived typed 200, regenerating the mobile client to
+            // Response<void>. Phase 313 D4 adds the 409: springdoc does not scan
+            // GlobalExceptionHandler, so DuplicateServiceException's schema needs declaring here.
+            // Reuses DUPLICATE_SERVICE_PER_MASTER_409 and DuplicateServiceErrorResponse verbatim
+            // from the bulk endpoint below — same per-master conflict, same body shape.
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = DUPLICATE_SERVICE_PER_MASTER_409,
+                    content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @PostMapping("/salons/{salonId}/masters/{masterId}/services")
-    @PreAuthorize("hasRole('SALON_OWNER') and @authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    // Phase 306 D4 — role-only conjunct dropped; @authz.canManageSalon already admits both
+    // SALON_OWNER (by ownership) and SALON_ADMIN (by salon assignment), matching the bulk
+    // on-behalf endpoint below, which never had the extra hasRole conjunct. masterBelongsToSalon
+    // is unchanged — it closes the timing-oracle IDOR regardless of caller role.
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<MasterServiceResponse>> assignServiceToMaster(
             @PathVariable UUID salonId,
-            @PathVariable UUID masterId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
             @Valid @RequestBody AssignServiceToMasterRequest request
     ) {
         MasterServiceResponse response =
                 serviceCatalogService.assignServiceToMaster(salonId, masterId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
+    }
+
+    /**
+     * Edits ONE master's OWN price band and/or duration override (Phase 311) — the only
+     * {@code PATCH}/{@code PUT} anywhere on {@code master_services}. Same path as
+     * {@link #unassignServiceFromMaster}'s {@code DELETE}, one verb apart (D1):
+     * {@code POST .../services} assigns, this {@code PATCH} edits the assignment's band, and
+     * {@code DELETE .../services/{serviceDefId}} unassigns.
+     *
+     * <p><b>D5 — narrows the "SALON_MASTER is read-only" invariant for ONE row and ONE column
+     * group.</b> Unlike every other write in this controller, {@code @authz.canEditMasterServiceBand}
+     * ALSO admits the {@code SALON_MASTER} whose own {@code masters} row is {@code #masterId} —
+     * they may edit their own band and nothing else (Phase 306 D6 / Phase 310 D5 still hold for
+     * every other endpoint). The predicate is a NEW, independent entry point from
+     * {@code canReadSalonMasterServices}; it does not reuse or widen that read gate, and
+     * {@code canManageServiceDefinition} — which still fast-rejects {@code SALON_MASTER} — is
+     * untouched.
+     *
+     * <p><b>D4 — {@code null} means "leave unchanged"; {@code clearBand}/{@code
+     * clearDurationOverride} are the explicit reverts.</b> See
+     * {@link UpdateMasterServiceBandRequest}'s javadoc for the full request contract.
+     *
+     * <p><b>D3 — no envelope against the salon definition's band.</b> Every {@code 400} below is
+     * the standard bean-validation envelope; {@code SERVICE_PRICE_SHAPE_MISMATCH} is never raised
+     * by this endpoint (that code means "cannot be represented against the salon's definition", a
+     * condition this phase abolishes).
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId}. An
+     * INACTIVE assignment is {@code 404}, not silently reactivated — reactivation is
+     * {@code POST .../services}'s job (Phase 307 D6).
+     */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Same lone-@ApiResponse guard as every other write endpoint in this file — see
+            // assignServiceToMaster above.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "400", description = "Incoherent band, partial band, a "
+                            + "contradictory clearBand/clearDurationOverride combination, or an "
+                            + "entirely empty patch — standard validation envelope (Phase 311 D3, "
+                            + "D4). SERVICE_PRICE_SHAPE_MISMATCH is never raised here."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "No ACTIVE assignment for (masterId, "
+                            + "serviceDefId) — also returned when master/definition are missing, "
+                            + "in another salon, or the assignment is inactive."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
+    @PatchMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
+    @PreAuthorize("@authz.canEditMasterServiceBand(authentication, #salonId, #masterId)")
+    public ResponseEntity<ApiResponse<MasterServiceResponse>> updateMasterServiceBand(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            @PathVariable UUID serviceDefId,
+            @Valid @RequestBody UpdateMasterServiceBandRequest request,
+            Authentication authentication
+    ) {
+        MasterServiceResponse response = serviceCatalogService.updateMasterServiceBand(
+                AuthenticationUtils.userId(authentication), salonId, masterId, serviceDefId, request);
+        return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    /**
+     * Unassigns ONE master from ONE service — NOT {@link #deactivateServiceDefinition}, which
+     * deactivates the shared definition and removes it from EVERY master in the salon at once.
+     * This is the surgical, per-master counterpart (Phase 307): different path, different row,
+     * different blast radius, neither replaces the other.
+     *
+     * <p>Soft-unassigns only — {@code master_services.is_active} flips to {@code false}; the row,
+     * the shared {@link com.beautica.service.entity.ServiceDefinition}, and every other master's
+     * assignment are untouched (D1/D2). A future {@code CONFIRMED} booking through this exact
+     * assignment refuses the call with {@code 409} and writes nothing (D4 — the shipping contract;
+     * Phase 308's cancel-and-notify cascade was deferred by the user). A second call against an
+     * already-inactive pair is a plain {@code 404} (D7).
+     *
+     * <p>Guard mirrors {@link #assignServiceToMaster}: {@code canManageSalon} admits the salon's
+     * owner and admin, {@code masterBelongsToSalon} closes the same timing-oracle IDOR. Service-
+     * layer re-validation still runs — the SpEL gate is never trusted alone.
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} — passing a
+     * user id yields {@code 404}, not {@code 403}.
+     */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Same lone-@ApiResponse guard as every other write endpoint in this file — see
+            // assignServiceToMaster above.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "409", description = "The master has a future CONFIRMED booking "
+                            + "for this exact service; nothing was written. Cancel or decline it "
+                            + "first, or wait for it to pass."),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
+    @DeleteMapping("/salons/{salonId}/masters/{masterId}/services/{serviceDefId}")
+    @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
+    public ResponseEntity<Void> unassignServiceFromMaster(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            @PathVariable UUID serviceDefId,
+            Authentication authentication
+    ) {
+        serviceCatalogService.unassignServiceFromMaster(
+                AuthenticationUtils.userId(authentication), salonId, masterId, serviceDefId);
+        return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * Returns the full service list of one master in {@code salonId} — the management read for the
+     * salon's OWNER/ADMIN (Phase 309), widened by Phase 310 to also admit the master's OWN
+     * {@code SALON_MASTER} reading their own row.
+     *
+     * <p><strong>Not a substitute route for {@link #getMasterServices}.</strong> That route is
+     * {@code permitAll} and cached per {@code masterId} across every caller including anonymous
+     * ones; this one is authorization-gated and uncached. The DTO shape is now identical on both
+     * (2026-09-13 audit, S5 retired {@code MasterServiceResponse.fromPublic}, whose
+     * {@code priceOverride} mask was recoverable by subtraction from {@code effectivePrice} and the
+     * nested definition's {@code priceMin}); what separates the two routes is the AUDIENCE and the
+     * cache, not a masked field. The public route was still deliberately rejected as the
+     * SALON_MASTER path (Phase 310 background) — a cache shared with anonymous callers is the wrong
+     * place for a provider's management read.
+     *
+     * <p><strong>Who is admitted (Phase 310 D2).</strong> {@code @authz.canReadSalonMasterServices}
+     * grants: (1) {@code SALON_OWNER} / {@code SALON_ADMIN} managing {@code salonId} — Phase 309's
+     * behaviour, unchanged; (2) a {@code SALON_MASTER} whose {@code masters} row IS {@code
+     * masterId}, provided {@code salonId} actually owns that row ({@code masterBelongsToSalon},
+     * D2.4) — a {@code SALON_MASTER} reading a PEER master, in their own salon or any other, is
+     * refused. {@code CLIENT} is rejected on a role fast path before any DB hit.
+     *
+     * <p><strong>Authorization diverges from {@link #unassignServiceFromMaster}'s failure code
+     * on purpose (Phase 309 D2) — unchanged by Phase 310.</strong> That DELETE's {@code
+     * @PreAuthorize} also carries {@code @authz.masterBelongsToSalon(#masterId, #salonId)}, so a
+     * cross-salon {@code masterId} 403s there. Here that conjunct is deliberately NOT in the
+     * owner/admin branch of the SpEL gate — a cross-salon or nonexistent {@code masterId} for an
+     * OWNER/ADMIN caller is resolved INSIDE {@link ServiceCatalogService#getSalonMasterServices}
+     * and denied with a plain 404, so the response body cannot distinguish "belongs to another
+     * salon" from "no such master". Phase 310 does not touch this: the new own-row branch runs
+     * its OWN {@code masterBelongsToSalon} check inside the SpEL predicate instead (D2.4), so a
+     * {@code SALON_MASTER} passing a foreign {@code salonId} alongside their own {@code masterId}
+     * is refused at the gate, before the D3 404 path is ever reached.
+     *
+     * <p>{@code masterId} is the {@code masters} row primary key, NOT a {@code userId} (D3) — a
+     * user id also 404s.
+     *
+     * <p><strong>NOT cached (D4).</strong> Mirrors {@link #getMyServices}; the public {@code
+     * masterServices} cache that backs {@link #getMasterServices} is never read, populated or
+     * evicted by this endpoint.
+     */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            // Explicit 200 so springdoc does not drop the typed body — see the note on
+            // addIndependentMasterService above; omitting this regenerates the mobile Dart
+            // client to Response<void> and breaks res.data?.data.
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", useReturnTypeSchema = true),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "404", description = "No master with this id in this salon — "
+                            + "also returned when masterId belongs to a different salon, or is a "
+                            + "user id rather than a masters row id (D3); the body never "
+                            + "distinguishes these cases. Note: the sibling DELETE on this same "
+                            + "path (unassign) returns 403, not 404, for the identical "
+                            + "cross-salon-master fact — this GET intentionally uses 404 instead "
+                            + "so an unauthorized caller cannot tell a master belonging to "
+                            + "another salon from one that does not exist at all.")
+            // No 429 here — unlike the write endpoints on this path (POST/DELETE), this GET is
+            // not matched by AuthRateLimitFilter's method-gated serviceWriteBuckets check
+            // (HttpMethod.POST.matches(method) guards that branch), so documenting RATE_LIMITED_429
+            // would claim a status this read never actually returns.
+    })
+    @GetMapping("/salons/{salonId}/masters/{masterId}/services")
+    @PreAuthorize("@authz.canReadSalonMasterServices(authentication, #salonId, #masterId)")
+    public ApiResponse<List<MasterServiceResponse>> getSalonMasterServices(
+            @PathVariable UUID salonId,
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            // ADDITIVE pagination (2026-09-13 audit, P7). The service used to hard-code
+            // PageRequest.of(0, 200) and only log.warn on exact-cap: truncation was DETECTED, never
+            // escapable. Omitting both params reproduces that byte-identically, so the mobile
+            // client — which sends neither — is unaffected; a caller that DOES hit the cap can now
+            // page past it. The response stays List<MasterServiceResponse>, not PageResponse:
+            // switching the wire shape would be a coordinated mobile change, which this is not.
+            //
+            // NOT @PageableDefault, deliberately. Spring's PageableHandlerMethodArgumentResolver
+            // clamps the resolved size to spring.data.web.pageable.max-page-size (100, §J) — the
+            // ANNOTATION DEFAULT included, not just caller input. @PageableDefault(size = 200)
+            // therefore silently resolves to 100 and HALVES the historic cap for every existing
+            // caller, which is precisely the non-additive change this finding forbids (proven by
+            // ServiceControllerTest#should_useTheHistoricPageCap_when_noPageableParamsAreSent).
+            // Two explicit optional params keep the 200 server-chosen default while still bounding
+            // caller input — see SALON_MASTER_SERVICES_MAX_PAGE_SIZE.
+            @RequestParam(required = false) @Min(0) Integer page,
+            @RequestParam(required = false) @Min(1) @Max(SALON_MASTER_SERVICES_MAX_PAGE_SIZE) Integer size,
+            Authentication authentication
+    ) {
+        UUID actorId = AuthenticationUtils.userId(authentication);
+        Pageable pageable = PageRequest.of(
+                page != null ? page : 0,
+                size != null ? size : SALON_MASTER_SERVICES_DEFAULT_PAGE_SIZE);
+        return ApiResponse.ok(
+                serviceCatalogService.getSalonMasterServices(actorId, salonId, masterId, pageable));
     }
 
     /**
@@ -203,6 +480,8 @@ public class ServiceController {
      * authenticated CLIENT sees {@code true}/{@code false} per service; every other caller
      * (anonymous, or any other role) sees {@code null}.
      */
+    @Operation(summary = "Salon's public bookable service catalog",
+            description = SALON_CATALOGUE_VISIBILITY_RULE)
     @GetMapping("/salons/{salonId}/services")
     public ApiResponse<SalonServiceCatalogResponse> getSalonServiceCatalog(
             @PathVariable UUID salonId, Authentication authentication) {
@@ -339,8 +618,17 @@ public class ServiceController {
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
-                    responseCode = "409", description = DUPLICATE_SERVICE_409,
+                    responseCode = "409", description = DUPLICATE_SERVICE_PER_MASTER_409,
                     content = @Content(schema = @Schema(implementation = DuplicateServiceErrorResponse.class))),
+            // Phase 312 D3/D4 — the 400 SERVICE_PRICE_SHAPE_MISMATCH declaration that used to sit
+            // here is RETIRED: Phase 311's V165 gives master_services its own shape and ceiling,
+            // so no batch item's price shape is unrepresentable any more (it is stored, not
+            // rejected — see ServiceCatalogService#resolveBulkReuseBand). The exception, its
+            // response DTOs and the GlobalExceptionHandler arm are kept (not deleted) and marked
+            // @Deprecated: Step 0's mobile grep found a live consumer (service_repository.dart /
+            // failures.dart / service_setup_screen.dart branch on this code), so removing the
+            // wire contract here is safe (the endpoint simply never raises it again), but deleting
+            // the Java types is not — that is a mobile-side follow-up phase's job.
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "503", description = BULK_LOCK_TIMEOUT_503),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
@@ -350,11 +638,12 @@ public class ServiceController {
     @PreAuthorize("@authz.canManageSalon(authentication, #salonId) and @authz.masterBelongsToSalon(#masterId, #salonId)")
     public ResponseEntity<ApiResponse<List<MasterServiceResponse>>> bulkCreateMasterServices(
             @PathVariable UUID salonId,
-            @PathVariable UUID masterId,
-            @Valid @RequestBody BulkCreateServicesRequest request
+            @Parameter(description = "Master row id (NOT a user id)") @PathVariable UUID masterId,
+            @Valid @RequestBody BulkCreateServicesRequest request,
+            Authentication authentication
     ) {
-        List<MasterServiceResponse> response =
-                serviceCatalogService.bulkCreateSalonMasterServices(salonId, masterId, request);
+        List<MasterServiceResponse> response = serviceCatalogService.bulkCreateSalonMasterServices(
+                AuthenticationUtils.userId(authentication), salonId, masterId, request);
         return ResponseEntity.status(201).body(ApiResponse.ok(response));
     }
 
@@ -369,10 +658,13 @@ public class ServiceController {
                     responseCode = "429", description = RATE_LIMITED_429)
     })
     @DeleteMapping("/services/{serviceDefId}")
-    // Role-only fast gate here; ownership is enforced once inside the service against the
-    // already-needed findOwnerUserId projection (anti-bug §D split — no duplicate SpEL
-    // canManage* lookup that would issue a second round-trip).
-    @PreAuthorize("hasAnyRole('SALON_OWNER','INDEPENDENT_MASTER')")
+    // Role-only fast gate here; salon-management/ownership is enforced once inside the service
+    // against the already-needed findOwnerUserId projection (anti-bug §D split — no duplicate
+    // SpEL canManage* lookup that would issue a second round-trip). Phase 306 D5 — SALON_ADMIN
+    // added for full parity with the other service-management writes; the salon-scoping that
+    // keeps this safe lives in enforceCanManageServiceDefinition (D3), which this role-only gate
+    // shares with PATCH.
+    @PreAuthorize("hasAnyRole('SALON_OWNER','SALON_ADMIN','INDEPENDENT_MASTER')")
     public ResponseEntity<Void> deactivateServiceDefinition(
             @PathVariable UUID serviceDefId,
             Authentication authentication

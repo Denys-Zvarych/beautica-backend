@@ -35,8 +35,22 @@ class FavoriteServiceResponseTest {
 
     // ── fixtures ───────────────────────────────────────────────────────────────
 
+    /**
+     * Inherited-price convenience: no {@code priceTypeOverride} / {@code priceMaxOverride}.
+     * Delegates to the full helper below — the price triple is all-or-nothing (V165's
+     * {@code chk_master_service_price_mode}), so a partial triple is unrepresentable here too.
+     */
     private static MasterServiceAssignment assignment(ServiceDefinition sd,
                                                       BigDecimal priceOverride,
+                                                      Integer durationOverrideMinutes,
+                                                      String avatarUrl) {
+        return assignment(sd, null, priceOverride, null, durationOverrideMinutes, avatarUrl);
+    }
+
+    private static MasterServiceAssignment assignment(ServiceDefinition sd,
+                                                      PriceType priceTypeOverride,
+                                                      BigDecimal priceOverride,
+                                                      BigDecimal priceMaxOverride,
                                                       Integer durationOverrideMinutes,
                                                       String avatarUrl) {
         User user = new User("master@beautica.test", "hash",
@@ -49,7 +63,9 @@ class FavoriteServiceResponseTest {
                 .id(MASTER_SERVICE_ID)
                 .master(master)
                 .serviceDefinition(sd)
+                .priceTypeOverride(priceTypeOverride)
                 .priceOverride(priceOverride)
+                .priceMaxOverride(priceMaxOverride)
                 .durationOverrideMinutes(durationOverrideMinutes)
                 .isActive(true)
                 .build();
@@ -117,19 +133,45 @@ class FavoriteServiceResponseTest {
         }
 
         @Test
-        @DisplayName("keeps the advertised band coherent when a RANGE service also has a price override")
-        void should_keepMinBelowMax_when_rangeServiceHasPriceOverride() {
-            // The trap: there is NO priceMaxOverride. Pairing an override-aware floor (1000)
-            // with the raw ceiling (900) would emit priceMin > priceMax and a nonsense band.
+        @DisplayName("surfaces the master's OWN band when the assignment overrides the whole price triple")
+        void should_carryOwnBand_when_assignmentOverridesWholePriceTriple() {
+            // Phase 311 D9: a complete override triple (type + min + max — the only shape
+            // V165's chk_master_service_price_mode admits alongside "all null") resolves
+            // every component from the assignment, never the definition.
             var msa = assignment(
                     definition(PriceType.RANGE, new BigDecimal("600.00"), new BigDecimal("900.00")),
-                    new BigDecimal("1000.00"), null, null);
+                    PriceType.RANGE, new BigDecimal("1000.00"), new BigDecimal("1400.00"),
+                    null, null);
 
             FavoriteServiceResponse response = map(msa);
 
+            assertThat(response.priceType()).isEqualTo(PriceType.RANGE);
             assertThat(response.priceMin())
-                    .as("display band stays the definition's advertised band, not the override")
+                    .as("D9: priceMin = COALESCE(priceOverride, basePrice) — the master's own floor")
+                    .isEqualByComparingTo("1000.00");
+            assertThat(response.priceMax())
+                    .as("an own band takes its ceiling from priceMaxOverride, not the definition's 900")
+                    .isEqualByComparingTo("1400.00");
+            assertThat(response.priceMin()).isLessThanOrEqualTo(response.priceMax());
+            assertThat(response.priceDisplay()).isEqualTo("від 1000 до 1400 ₴");
+        }
+
+        @Test
+        @DisplayName("surfaces the definition's band when the assignment inherits (all three overrides null)")
+        void should_carryDefinitionBand_when_assignmentInheritsPrice() {
+            var msa = assignment(
+                    definition(PriceType.RANGE, new BigDecimal("600.00"), new BigDecimal("900.00")),
+                    null, null, null, null, null);
+
+            FavoriteServiceResponse response = map(msa);
+
+            assertThat(response.priceType()).isEqualTo(PriceType.RANGE);
+            assertThat(response.priceMin())
+                    .as("D9: priceOverride is null, so priceMin coalesces to the definition's basePrice")
                     .isEqualByComparingTo("600.00");
+            assertThat(response.priceMax())
+                    .as("an Inherited assignment shows the definition's own ceiling")
+                    .isEqualByComparingTo("900.00");
             assertThat(response.priceMin()).isLessThanOrEqualTo(response.priceMax());
             assertThat(response.priceDisplay()).isEqualTo("від 600 до 900 ₴");
         }

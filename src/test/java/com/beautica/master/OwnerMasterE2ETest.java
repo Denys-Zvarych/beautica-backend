@@ -23,8 +23,6 @@ import com.beautica.service.entity.PriceType;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -39,7 +37,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
@@ -97,12 +94,6 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
     @MockBean
     private NotificationOutboxService notificationOutboxService;
 
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
     // ── E2E happy path ────────────────────────────────────────────────────────
 
     @Test
@@ -132,8 +123,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         // ── Step 2: create salon ──────────────────────────────────────────────
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
-        UUID vinnytsiaCityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID vinnytsiaCityId = majorCityIdByName("Вінниця");
         // street + buildingNo are now @NotBlank on CreateSalonRequest (Phase 10.6 reversal);
         // supply a valid pair so the POST clears the @Valid boundary and returns 201.
         var createSalonReq = new CreateSalonRequest("E2E Owner Studio", null, "Kyiv", null, null, null, null,
@@ -238,7 +228,7 @@ class OwnerMasterE2ETest extends AbstractIntegrationTest {
         log.debug("Step 5 complete — serviceDefId={}", serviceDefId);
 
         // ── Step 6: assign the service to the owner-master ────────────────────
-        var assignReq = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignReq = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         ResponseEntity<String> assignResp = restTemplate.exchange(
                 SALONS_URL + "/" + salonId + "/masters/" + masterId + "/services", HttpMethod.POST,
                 new HttpEntity<>(assignReq, bearerHeaders(ownerToken)),

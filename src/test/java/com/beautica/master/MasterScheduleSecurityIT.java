@@ -121,8 +121,8 @@ class MasterScheduleSecurityIT extends AbstractIntegrationTest {
         Actor owner = seedUser(Role.SALON_OWNER);
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, owner.userId(), "S5 positive-branch salon " + salonId);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, owner.userId(), "S5 positive-branch salon " + salonId, testCityId());
         Actor invitedMasterUser = seedUser(Role.SALON_MASTER);
         UUID masterId = UUID.randomUUID();
         jdbcTemplate.update(

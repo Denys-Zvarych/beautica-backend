@@ -149,6 +149,7 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         User owner = persistUser(Role.SALON_OWNER, "owner");
         em.persist(owner);
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(owner)
                 .name("Salon " + UUID.randomUUID())
                 .districtId(salonDistrictId)
@@ -424,36 +425,28 @@ class ClientAggregationRepositoryTest extends AbstractDataJpaTest {
         assertThat(top.get(1).count()).isEqualTo(1L);
     }
 
-    @Test
-    @DisplayName("findTopCities — salon presence wins outright even when the salon's own city is NULL: "
-            + "must NOT fall through to the salon master's (possibly stale) personal user-row city "
-            + "— CASE WHEN, not COALESCE")
-    void should_preferSalonCity_when_masterUserCityIsStale() {
-        UUID staleMasterUserCity = seededCityIds.get(1);
-        UUID indepCity = seededCityIds.get(2);
-
-        // The salon row exists (LEFT JOIN matches) but carries city_id = NULL, while the
-        // salon-employed master's own user row still mirrors a city from salon-creation time.
-        Master salonMaster = persistSalonMasterWithCity(null, staleMasterUserCity);
-        MasterServiceAssignment salonService = persistService(salonMaster, "Salon Manicure", "MANICURE", "500");
-        // Control: an independent master with a real city still counts normally.
-        Master indepMaster = persistIndependentMasterWithCity(indepCity);
-        MasterServiceAssignment indepService = persistService(indepMaster, "Indep Manicure", "MANICURE", "300");
-
-        persistBooking(client, salonMaster, salonService, BookingStatus.COMPLETED, "500", slot());
-        persistBooking(client, indepMaster, indepService, BookingStatus.COMPLETED, "300", slot());
-        em.flush();
-        em.clear();
-
-        List<CityCount> top = repository.findTopCities(client.getId(), TOP_3);
-
-        assertThat(top)
-                .as("the cityless-salon booking is dropped (null resolved city), never attributed to "
-                        + "the master's own stale personal city")
-                .hasSize(1);
-        assertThat(top.get(0).cityId()).isEqualTo(indepCity);
-        assertThat(top).extracting(CityCount::cityId).doesNotContain(staleMasterUserCity);
-    }
+    // REMOVED (V150, "a salon must always have a city"): should_preferSalonCity_when_master
+    // UserCityIsStale used to prove CASE WHEN (salon presence), not COALESCE (fall through on a
+    // null value), by persisting a salon with city_id = NULL. That premise is now physically
+    // unreachable — salons.city_id is a DB-level NOT NULL as of V150, so
+    // persistSalonMasterWithCity(null, ...) would throw a DataIntegrityViolationException on
+    // em.flush() instead of exercising the query.
+    //
+    // CORRECTION (QA review, backend-qa): an earlier version of this comment claimed the
+    // CASE-WHEN-on-presence semantic was "still covered by the sibling above"
+    // (should_rankByCompletedCount_when_multipleCities). That is not accurate as reasoning: the
+    // sibling only exercises s.cityId non-null, and whenever s.cityId is non-null, CASE WHEN
+    // s.id IS NOT NULL THEN s.cityId ELSE mu.cityId END and COALESCE(s.cityId, mu.cityId)
+    // produce the IDENTICAL result (both simply return s.cityId), so that test would pass
+    // unchanged even if findTopCities were rewritten to use COALESCE — it never distinguished
+    // the two formulas. The real reason no coverage gap remains: because salons.city_id can
+    // never be null again, the ONLY state where CASE WHEN and COALESCE could ever diverge for
+    // this column (s.id IS NOT NULL but s.cityId IS NULL) is now permanently unreachable, so the
+    // two expressions are provably equivalent for findTopCities going forward — there is
+    // nothing left for a test to distinguish. district_id stays genuinely nullable (out of
+    // scope for V150), so CASE WHEN vs. COALESCE remains a live, testable distinction there, and
+    // the equivalent findTopDistricts "districtless salon" test above this one is untouched and
+    // still valid.
 
     @Test
     @DisplayName("findTopCities — a booking whose master has no salon and no user city is excluded")

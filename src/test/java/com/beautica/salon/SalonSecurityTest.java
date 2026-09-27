@@ -10,9 +10,7 @@ import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -26,7 +24,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -60,12 +57,6 @@ class SalonSecurityTest extends AbstractIntegrationTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
-
-    @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     @AfterEach
     void cleanUp() {
@@ -180,8 +171,7 @@ class SalonSecurityTest extends AbstractIntegrationTest {
     private UUID createSalon(String ownerToken, String salonName) throws Exception {
         // Vinnytsia has no urban districts in the official KATOTTH classifier, so
         // no districtId is required — only cityId is mandatory for provider locality.
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var request = new CreateSalonRequest(salonName, null, null, null, null, null, null, cityId, null,
                 VALID_STREET, VALID_BUILDING_NO, null);
         ResponseEntity<String> resp = restTemplate.exchange(

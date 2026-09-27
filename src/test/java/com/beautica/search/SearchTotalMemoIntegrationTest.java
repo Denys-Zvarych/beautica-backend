@@ -6,8 +6,8 @@ import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.search.service.SearchService;
+import com.beautica.support.HibernateStatistics;
 import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -60,9 +60,7 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
     private EntityManagerFactory emf;
 
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     // ── 1. Statement-count assertion (load-bearing) ───────────────────────────
@@ -242,19 +240,13 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
     // ── seed + request helpers ────────────────────────────────────────────────
 
     private MasterSearchRequest masterRequest(String cityName) {
-        return new MasterSearchRequest(new LocationFilter(cityIdByName(cityName), null), null, null,
+        return new MasterSearchRequest(new LocationFilter(majorCityIdByName(cityName), null), null, null,
                 null, null, null, null, null, null, null);
     }
 
     private SalonSearchRequest salonRequest(String cityName) {
-        return new SalonSearchRequest(new LocationFilter(cityIdByName(cityName), null), null, null,
+        return new SalonSearchRequest(new LocationFilter(majorCityIdByName(cityName), null), null, null,
                 null, null, null, null, null, null);
-    }
-
-    private UUID cityIdByName(String nameUk) {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = ? ORDER BY katotth_code LIMIT 1",
-                UUID.class, nameUk);
     }
 
     /**
@@ -264,7 +256,7 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
      * deterministically; no test in this suite asserts row identity/order, only counts.
      */
     private void seedMasters(String city, int count) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
         for (int i = 0; i < count; i++) {
             UUID masterUserId = UUID.randomUUID();
             jdbcTemplate.update(
@@ -287,7 +279,7 @@ class SearchTotalMemoIntegrationTest extends AbstractIntegrationTest {
      * SALON_OWNER per salon, exactly like that helper).
      */
     private void seedSalons(String city, int count) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
         for (int i = 0; i < count; i++) {
             UUID ownerId = UUID.randomUUID();
             jdbcTemplate.update(

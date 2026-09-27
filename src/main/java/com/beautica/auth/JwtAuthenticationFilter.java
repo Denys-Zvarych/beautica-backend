@@ -18,7 +18,6 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 @Component
@@ -65,14 +64,37 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
                 UUID userId = jwtTokenProvider.getUserIdFromToken(claims);
 
-                Optional<Instant> tokensValidAfter = tokensValidAfterCache.get(userId);
-                if (tokensValidAfter.isPresent()) {
-                    Instant issuedAt = jwtTokenProvider.getIssuedAt(claims);
-                    if (issuedAt == null || issuedAt.isBefore(tokensValidAfter.get())) {
-                        log.debug("JWT issued before the user's tokensValidAfter — skipping "
-                                + "authentication (password reset since token was issued)");
+                // Three-state, deliberately (phase 295 audit HIGH-1). The ABSENT arm is the one
+                // that closes the fail-open: the cache used to answer Optional.empty() for BOTH
+                // "row exists, never reset" and "no row at all", and this guard's `isPresent()`
+                // read that single empty as "no check applies". Phase 295 hard-deletes staff
+                // `users` rows, so from then on a deleted account's already-issued access token
+                // authenticated for the rest of its 3600s TTL, SecurityContextHolder carrying its
+                // role. SalonService evicts each deleted user's entry after commit, so the
+                // rejection is effective on the very next request rather than after the 60s TTL.
+                //
+                // No `default` arm: the switch is exhaustive over a sealed type, so a fourth state
+                // breaks the build here instead of silently landing in a catch-all that
+                // authenticates.
+                switch (tokensValidAfterCache.get(userId)) {
+                    case TokenValidityState.Absent ignored -> {
+                        log.debug("JWT subject has no users row — skipping authentication "
+                                + "(account deleted since the token was issued)");
                         filterChain.doFilter(request, response);
                         return;
+                    }
+                    case TokenValidityState.PresentAt(Instant tokensValidAfter) -> {
+                        Instant issuedAt = jwtTokenProvider.getIssuedAt(claims);
+                        if (issuedAt == null || issuedAt.isBefore(tokensValidAfter)) {
+                            log.debug("JWT issued before the user's tokensValidAfter — skipping "
+                                    + "authentication (password reset since token was issued)");
+                            filterChain.doFilter(request, response);
+                            return;
+                        }
+                    }
+                    case TokenValidityState.PresentNoReset ignored -> {
+                        // Row exists and no reset has ever invalidated its tokens — the common
+                        // case. Fall through to the email/role extraction below.
                     }
                 }
 

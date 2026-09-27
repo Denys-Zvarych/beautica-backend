@@ -17,12 +17,12 @@ import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.core.context.SecurityContextHolder;
 
 import java.time.Instant;
-import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -49,11 +49,15 @@ class JwtAuthenticationFilterTest {
     @BeforeEach
     void setUp() {
         SecurityContextHolder.clearContext();
-        // Default: no password reset has ever occurred for any user. Marked lenient()
+        // Default: the users row exists and no password reset has ever occurred for it.
+        // NOT the old Optional.empty() — since the phase 295 audit that state is ABSENT, which
+        // refuses authentication, and would have silently inverted every positive case below.
+        // Marked lenient()
         // because most tests below short-circuit (bad token, wrong type, jti denylisted,
         // etc.) before this cache is ever consulted, and MockitoExtension's strict-stubs
         // mode would otherwise flag the stub as unnecessary on those tests.
-        lenient().when(tokensValidAfterCache.get(any(UUID.class))).thenReturn(Optional.empty());
+        lenient().when(tokensValidAfterCache.get(any(UUID.class)))
+                .thenReturn(TokenValidityState.PRESENT_NO_RESET);
     }
 
     @AfterEach
@@ -199,7 +203,8 @@ class JwtAuthenticationFilterTest {
         when(jwtTokenProvider.parseAllClaims("preResetToken")).thenReturn(mockClaims);
         when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
         when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(userId);
-        when(tokensValidAfterCache.get(userId)).thenReturn(Optional.of(tokensValidAfter));
+        when(tokensValidAfterCache.get(userId))
+                .thenReturn(new TokenValidityState.PresentAt(tokensValidAfter));
         when(jwtTokenProvider.getIssuedAt(mockClaims)).thenReturn(issuedAt);
 
         filter.doFilterInternal(request, response, chain);
@@ -212,6 +217,83 @@ class JwtAuthenticationFilterTest {
                 .isNull();
         // The request must never progress to role/email extraction once rejected.
         verify(jwtTokenProvider, times(0)).getRoleFromToken(mockClaims);
+    }
+
+    /**
+     * The phase 295 audit HIGH-1 arm, at unit level. Until this test the {@code Absent} branch was
+     * exercised ONLY end-to-end, by {@code SalonStaffHardDeleteIT} case 3b — and the sealed
+     * {@code switch} makes a regression a compile error only for a NEW state, never for someone
+     * rewriting THIS arm's body to fall through. That is precisely the fail-open the audit closed:
+     * a hard-deleted staff account's already-issued access token authenticating for the rest of
+     * its 3600s TTL with its role in {@code SecurityContextHolder}.
+     *
+     * <p>The {@code never()} verifications are the load-bearing half — an assertion that
+     * authentication is null would also pass if the arm merely stopped short of setting it. These
+     * pin that the request never reaches claim extraction at all.
+     */
+    @Test
+    @DisplayName("should_refuseAuthentication_when_tokensValidAfterCacheReportsAbsentUsersRow")
+    void should_refuseAuthentication_when_tokensValidAfterCacheReportsAbsentUsersRow() throws Exception {
+        var userId = UUID.randomUUID();
+
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer tokenOfDeletedAccount");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("tokenOfDeletedAccount")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(userId);
+        when(tokensValidAfterCache.get(userId)).thenReturn(TokenValidityState.ABSENT);
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(chain.getRequest())
+                .as("chain must still be called — the filter refuses by passing through "
+                        + "unauthenticated, it never writes a 401 itself")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("a token whose sub names no users row must NOT authenticate — this is the "
+                        + "phase 295 hard-delete fail-open (audit HIGH-1)")
+                .isNull();
+        verify(jwtTokenProvider, never()).getIssuedAt(mockClaims);
+        verify(jwtTokenProvider, never()).getEmailFromToken(mockClaims);
+        verify(jwtTokenProvider, never()).getRoleFromToken(mockClaims);
+    }
+
+    /**
+     * The companion negative to the ABSENT case above: the SAME cache, answering
+     * {@code PRESENT_NO_RESET}, must authenticate. Without this pairing an "always refuse"
+     * regression in the cache or the switch would leave the ABSENT test green while silently
+     * locking every user out. The setUp default supplies the state, so this test names the
+     * discriminator explicitly rather than relying on it.
+     */
+    @Test
+    @DisplayName("should_authenticate_when_tokensValidAfterCacheReportsPresentNoReset")
+    void should_authenticate_when_tokensValidAfterCacheReportsPresentNoReset() throws Exception {
+        var userId = UUID.randomUUID();
+
+        var request  = new MockHttpServletRequest();
+        request.addHeader("Authorization", "Bearer liveAccountToken");
+        var response = new MockHttpServletResponse();
+        var chain    = new MockFilterChain();
+
+        when(jwtTokenProvider.parseAllClaims("liveAccountToken")).thenReturn(mockClaims);
+        when(jwtTokenProvider.isAccessToken(mockClaims)).thenReturn(true);
+        when(jwtTokenProvider.getUserIdFromToken(mockClaims)).thenReturn(userId);
+        when(tokensValidAfterCache.get(userId)).thenReturn(TokenValidityState.PRESENT_NO_RESET);
+        when(jwtTokenProvider.getEmailFromToken(mockClaims)).thenReturn("live@beautica.com");
+        when(jwtTokenProvider.getRoleFromToken(mockClaims)).thenReturn(Role.SALON_MASTER);
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(SecurityContextHolder.getContext().getAuthentication())
+                .as("PRESENT_NO_RESET is the overwhelmingly common state and must authenticate — "
+                        + "the ABSENT refusal must not have been widened to every state")
+                .isNotNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication().getDetails())
+                .as("details must carry the userId the cache was keyed on")
+                .isEqualTo(userId);
     }
 
     @Test

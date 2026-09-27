@@ -99,8 +99,32 @@ public class SecurityConfig {
                         auth.requestMatchers("/api-docs/**", "/api-docs").permitAll();
                     }
                     auth.requestMatchers(HttpMethod.GET, "/actuator/health").permitAll();
+                    // Audit cycle-3 (finding 3) — MUST stay ABOVE the "/salons/{salonId}" matcher
+                    // below, for the same reason "/masters/me" and "/reviews/me" stay above their
+                    // wildcard siblings: a PathPattern "{var}" matches ANY single segment, so
+                    // "/api/v1/salons/{salonId}" pattern-matches the literal "/api/v1/salons/mine"
+                    // too. Spring Security takes the FIRST matching rule, so without this line an
+                    // anonymous request for an owner's full salon list is permitAll at the filter
+                    // chain and @PreAuthorize("hasRole('SALON_OWNER')") (SalonController#getOwnedSalons)
+                    // is its SOLE gate. MVC still routes "mine" to getOwnedSalons (a literal
+                    // @GetMapping beats "/{salonId}"), so the mismatch stays invisible until method
+                    // security is loosened or fails open. Defense in depth (§K): the chain rejects
+                    // anonymous callers BEFORE the DispatcherServlet.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/mine").authenticated();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/salons/{salonId}/masters").permitAll();
+                    // Audit fix (finding 5) — MUST stay ABOVE the "{masterId}" matcher below.
+                    // A PathPattern "{var}" matches ANY single segment, so
+                    // "/api/v1/masters/{masterId}" pattern-matches the literal
+                    // "/api/v1/masters/me" as well. Spring Security takes the FIRST matching
+                    // rule, so without this line the authenticated self-read GET /masters/me is
+                    // permitAll at the filter-chain level and its @PreAuthorize is the SOLE gate
+                    // — the endpoint Phase 265 just widened to SALON_OWNER. MVC still routes
+                    // "me" to getMyProfile (a literal @GetMapping beats "/{masterId}"), so the
+                    // mismatch is invisible until method security is loosened or fails open.
+                    // Defense in depth (§K): the chain now rejects anonymous callers BEFORE the
+                    // DispatcherServlet, instead of relying on the annotation alone.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/me").authenticated();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/services").permitAll();
                     // Phase 8.10 — master review summary. Needs its own matcher: the
@@ -109,6 +133,18 @@ public class SecurityConfig {
                     // Mirrors the salon "/reviews/summary" precedent further down.
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews/summary").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/masters/{masterId}/reviews").permitAll();
+                    // Audit cycle-2 (finding 4) — MUST stay ABOVE the "/reviews/**" matcher below,
+                    // for the same reason "/masters/me" stays above "/masters/{masterId}": a
+                    // trailing "**" matches "/api/v1/reviews/me" too, Spring Security takes the
+                    // FIRST matching rule, and the self-read would then be permitAll at the filter
+                    // chain with @PreAuthorize("hasRole('CLIENT')") (ReviewController#getMyReviews)
+                    // as its SOLE gate. MVC still routes "me" to getMyReviews (a literal
+                    // @GetMapping beats "/reviews/{reviewId}"), so the mismatch stays invisible
+                    // until method security is loosened or fails open. Defense in depth (§K): the
+                    // chain rejects anonymous callers BEFORE the DispatcherServlet. It matters more
+                    // since V157 — a detached master's snapshotted name is reachable through this
+                    // endpoint's review rows.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/me").authenticated();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/reviews/**").permitAll();
                     // Phase 13.6 (Public Salon Profile). "/reviews/summary" is registered
                     // BEFORE "/reviews" defensively; in practice PathPattern matching for
@@ -171,6 +207,28 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts/{oblastId}/cities").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/cities/{cityId}/districts").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();
+
+                    // Phase 326 settlement autocomplete — GET /api/v1/settlements?query=...
+                    // This is the "dynamic/parameterised locality query" the Phase 10.7 note
+                    // above says to revisit on, and it is revisited: unlike the three cascade
+                    // GETs, this endpoint IS throttled per IP (AuthRateLimitFilter's
+                    // SETTLEMENT_SEARCH_PATH branch).
+                    //
+                    // permitAll because the «Населений пункт» field is reached during
+                    // registration, before any token exists (phase-326 D7). The response is a
+                    // public government reference list — settlement id + name + type + the
+                    // parent oblast's name — with no owner UUIDs, no provider counts and no PII
+                    // (§I). GET-only and exact-path scoped; settlement rows are written by
+                    // Flyway alone (V53 / V170 / V171), so there is no mutation surface to
+                    // widen onto.
+                    //
+                    // Why it is not covered by the cascade's exemption: that argument rests on
+                    // a fully static dataset behind a long-lived @Cacheable, so the uncached
+                    // surface is bounded by deploy frequency. Here only the pre-typing major
+                    // list is cached — the per-keystroke results deliberately are not (the key
+                    // space is every prefix a user can type), so request volume DOES reach the
+                    // database and a per-IP ceiling is the right control.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/settlements").permitAll();
                     // Phase 13.1 — Guest Booking Link. The public booking page
                     // (beautica.app/book/{slug}) is opened by unauthenticated clients
                     // from a shared link, so GET /api/v1/book/** is permitAll. Placed

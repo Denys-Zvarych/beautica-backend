@@ -29,8 +29,10 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 import org.hibernate.annotations.DynamicUpdate;
 import org.springframework.http.HttpStatus;
+import org.springframework.lang.Nullable;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
@@ -116,6 +118,77 @@ import java.util.UUID;
                 // master's TOTAL row count, not the service's). Converts that shape to a direct
                 // index-range seek on (master_id, master_service_id).
                 @Index(name = "idx_bookings_master_service_starts_at", columnList = "master_id, master_service_id, starts_at"),
+                // composite index (V166, REPLACED by V169): the SALON-scope twin of the index
+                // directly above — GET /bookings/salon/{salonId}?serviceId=... (Phase 319). The
+                // master-scope index cannot serve it (master_id is not a prefix of the salon
+                // query's predicate), and without this one the planner leads with
+                // idx_bookings_master_service_id (V18, the bare FK index) whenever the filtered
+                // service is a small slice of the salon's volume — the normal case — discarding the
+                // salon scope to a post-scan Filter and losing LIMIT pushdown to a blocking Sort.
+                // V166 carries the measured EXPLAIN on both sides.
+                //
+                // V169 (the salon `partition=` + `serviceId=` index-gap finding, backend-perf
+                // 2026-09-20) EXTENDS that shape with `status` and `ends_at` as an INCLUDE payload
+                // and DROPS V166's index. V169's KEY list is IDENTICAL to V166's, not merely a
+                // strict prefix of it — same columns, same order, same DESC — and an INCLUDE column
+                // lives on leaf pages only and is never a scan key. So every access path V166
+                // served, V169 serves with the same cost profile (seek, range, backward scan,
+                // index-only eligibility); the DROP removes a duplicate, not a capability. The
+                // reason
+                // is the corner V168 never measured: `?partition=` and `?serviceId=` are accepted on
+                // the SAME request (BookingController:290, :309), and with neither V166 nor V168's
+                // indexes covering both columns the planner abandoned both and fell back onto V18's
+                // bare FK index with a Bitmap Heap Scan — one random heap fetch per matched row,
+                // exactly the pathology V168 fixed for the masterId chip. Measured: the COUNT
+                // companion for partition=HISTORY + one serviceId went 103 buffers (Bitmap Heap,
+                // Heap Blocks exact=100) -> 5 (Index Only Scan, Heap Fetches 0), because the
+                // partition predicate is now evaluated as a Filter against the INCLUDE payload in
+                // the index tuple. V169 carries the full before/after table, the rejected
+                // trailing-key-column variant, and the INSERT-buffer measurement behind the DROP.
+                //
+                // JPA can encode neither the DESC sort direction NOR the INCLUDE payload; V169
+                // declares (salon_id, master_service_id, starts_at DESC) INCLUDE (status, ends_at)
+                // and this annotation mirrors the KEY columns only, for reader accuracy —
+                // ddl-auto=validate does NOT check @Table(indexes=...) against the real schema (see
+                // the V118 note above), so the absent INCLUDE cannot cause a validation failure.
+                //
+                // The two OTHER salon-scope indexes on this table — idx_bookings_salon_starts_at
+                // (V19) and idx_bookings_salon_status_starts_at (V22/V113) — have never been
+                // mirrored here. That is a PRE-EXISTING gap, not a statement that they do not
+                // exist; do not infer from their absence that a salon-scope index is missing from
+                // the schema.
+                @Index(name = "idx_bookings_salon_service_partition_starts_at",
+                        columnList = "salon_id, master_service_id, starts_at"),
+                // composite index (V168, Phase 322): GET /bookings/salon/{salonId}?partition= — the
+                // mobile salon «Архів» page. BookingSpecifications#partition compares `status` AND
+                // `ends_at` (the latter against a RUNTIME instant), and every salon-scope index
+                // before this one stopped at starts_at, so `ends_at` could only be read from the
+                // HEAP — turning BookingRepositoryCustomImpl#countMatching (which runs on every FULL
+                // page) into a Bitmap Heap Scan over every heap page the salon touches. Measured on
+                // 60k salon rows: HISTORY/PAST count 1694 buffers with Heap Blocks exact=1396 — the
+                // salon's WHOLE physical footprint — against 299 for the unfiltered call this
+                // endpoint already permits. Carrying status+ends_at AFTER the starts_at sort key
+                // makes it an Index Only Scan, Heap Fetches 0, at 495. V168 carries the full
+                // before/after table and the rejected alternatives.
+                //
+                // starts_at comes BEFORE the two filter columns and that order is LOAD-BEARING, not
+                // cosmetic: starts_at is the ORDER BY key, so putting status/ends_at ahead of it
+                // would stop the index serving `ORDER BY starts_at DESC` and turn the Incremental
+                // Sort into a blocking one. JPA cannot encode the DESC direction — V168 declares
+                // (salon_id, starts_at DESC, status, ends_at) and this annotation mirrors the
+                // columns for reader accuracy only (see the V118 note above).
+                @Index(name = "idx_bookings_salon_partition_starts_at", columnList = "salon_id, starts_at, status, ends_at"),
+                // composite index (V168, Phase 322): the master-chip twin of the index directly
+                // above, and a REPLACEMENT for idx_bookings_salon_master_starts_at (V148) — of which
+                // it is a strict superset, so V168 drops V148's index rather than carrying both.
+                // This is the load-bearing half of that migration: with V148's narrower shape the
+                // master chip paid ONE RANDOM HEAP FETCH PER ROW, costing 1420 buffers to return
+                // 2826 rows where the salon-wide count paid 1694 for 56516 — 20x worse per row than
+                // the shape it exists to narrow. Measured 1420 -> 35 (Index Only Scan, Heap Fetches
+                // 0). Same column-order reasoning as above; V148's own javadoc-style header explains
+                // why master_id sits between the salon_id equality and the starts_at sort key.
+                @Index(name = "idx_bookings_salon_master_partition_starts_at",
+                        columnList = "salon_id, master_id, starts_at, status, ends_at"),
                 // partial index (V112, predicate narrowed by V113): client-scoped cross-master/salon
                 // overlap check (BookingRepository.findFirstConflictingClientBookingId[Excluding]).
                 // JPA cannot encode WHERE status = 'CONFIRMED' AND client_id IS NOT NULL — the
@@ -297,6 +370,54 @@ public class Booking extends AuditableEntity {
     @Column(name = "guest_phone", length = 20)
     private String guestPhone;
 
+    // ── Client-detachment snapshot (V162, phase 300 D4) ───────────────────────
+    //
+    // Written ONCE, by ClientAccountDeletionService, at the moment the client's `users` row is
+    // hard-deleted; never synced afterwards. NULL <=> attached. This column — not client_id alone
+    // — is the state discriminator in chk_bookings_guest_fields: booking_source is NEVER
+    // rewritten, because it records how the visit was booked and overwriting it would falsify
+    // every source-keyed query. Mirrors masters.detached_at (V157, phase 294).
+    //
+    // No @Setter(AccessLevel.NONE) override needed here: unlike Master, this class carries no
+    // class-level @Setter, so simply not annotating this field already means no public setter is
+    // generated. The only writer is detachClient(...) below, which the DB CHECK
+    // chk_bookings_guest_fields (V162) makes the sole way to leave a satisfiable row.
+    @Nullable
+    @Column(name = "client_detached_at")
+    private Instant clientDetachedAt;
+
+    /**
+     * {@code true} once this booking has been detached from its (now hard-deleted) client
+     * account — mirrors {@code Master#isDetached()}.
+     */
+    public boolean isClientDetached() {
+        return clientDetachedAt != null;
+    }
+
+    /**
+     * Snapshots the sentinel display name and severs the client link — the ONLY writer of
+     * {@link #clientDetachedAt}. Mirrors {@code Master#detach} (:228-235): the sentinel, the
+     * severed association and the stamp are written together as ONE state change, because the
+     * whole-row {@code chk_bookings_guest_fields} CHECK (V162) is evaluated against the result —
+     * splitting this into two statements leaves an intermediate row no arm of the CHECK accepts.
+     *
+     * <p>{@code guestPhone} is deliberately left untouched: every row this method is ever called
+     * on is currently ATTACHED ({@code client} non-null), and every attached arm of the CHECK
+     * already requires {@code guest_phone IS NULL} — there is no PII in this column to scrub.
+     *
+     * @param label the fixed Ukrainian sentinel («Видалений клієнт») — always the same literal,
+     *              never user-supplied, so (unlike {@code Master.detach}'s blank-name fallback)
+     *              no normalization is needed here
+     * @param at    the detachment instant, from the injected {@code Clock} — never
+     *              {@code Instant.now()}
+     */
+    public void detachClient(String label, Instant at) {
+        this.guestName = label;
+        this.guestSurname = null;
+        this.client = null;
+        this.clientDetachedAt = at;
+    }
+
     // Uniqueness is enforced by the V90 partial-unique index (UNIQUE only over non-NULL
     // rows). `unique = true` here would direct Hibernate ddl-auto to recreate the full
     // unique constraint V90 deliberately dropped, so it is intentionally omitted.
@@ -325,14 +446,22 @@ public class Booking extends AuditableEntity {
      * <p>Stored as a raw id, deliberately NOT a {@code @ManyToOne User} — nothing on the
      * booking read path renders the creating staff member, so an association here would only
      * add a lazy proxy (and an N+1 risk) to every booking load. The FK integrity lives in the
-     * DB ({@code REFERENCES users(id) ON DELETE RESTRICT}, V137).
+     * DB ({@code REFERENCES users(id) ON DELETE SET NULL}, V157 — was {@code ON DELETE RESTRICT}
+     * in V137).
      *
-     * <p>{@code RESTRICT}, not {@code SET NULL}: the column exists for attribution, and a NULLed
-     * creator is indistinguishable from a pre-V137 row that never had one — so {@code SET NULL}
-     * would let deleting the account under suspicion erase the audit trail undetectably. Nothing
-     * in the app hard-deletes a user today (accounts are deactivated), so this constraint is
-     * unreachable in practice; a future GDPR erasure flow must anonymise the creating user rather
-     * than delete the row. See V137's comment for the full rationale.
+     * <p><b>V157 / phase 294 D5 — the RESTRICT rationale below is SUPERSEDED, keep it only as
+     * history.</b> V137 argued {@code RESTRICT}, not {@code SET NULL}: the column exists for
+     * attribution, and a NULLed creator is indistinguishable from a pre-V137 row that never had
+     * one — so {@code SET NULL} would let deleting the account under suspicion erase the audit
+     * trail undetectably. That argument was explicitly conditioned on "nothing in the app
+     * hard-deletes a user today", and deferred the case to "a future GDPR erasure flow". The
+     * 2026-09-04 reversal (salon deletion HARD-DELETES staff) is that flow, and this FK was the
+     * last constraint standing in its way. The attribution being relaxed is "which staff member of
+     * this now-deleted salon rang up this walk-in" — a fact about a salon that no longer exists.
+     *
+     * <p>Practical consequence for readers: this id was already nullable, and is now nullable for a
+     * second reason — the creating account may have been deleted. Never assume a non-null value
+     * resolves to a live {@code users} row.
      *
      * <p>Nullability is deliberately NOT enforced by {@code chk_bookings_guest_fields} — it is
      * a soft, application-layer expectation for STAFF rows only.

@@ -45,8 +45,10 @@ public class InvitePersistenceService {
     private final Clock clock;
 
     /**
-     * Atomically recycles any expired-but-unused token holding the active slot, inserts the new
-     * invite token, and enqueues the outbox notification — all in a fresh transaction.
+     * Atomically retires any expired-but-unused token holding the active slot (marking it
+     * {@link com.beautica.user.RevocationReason#SUPERSEDED} rather than deleting it, so the
+     * salon's invite history stays complete), inserts the new invite token, and enqueues the
+     * outbox notification — all in a fresh transaction.
      *
      * @throws DataIntegrityViolationException when a concurrent active invite for the same
      *                                         {@code (salon, lower(email))} already occupies the
@@ -65,14 +67,34 @@ public class InvitePersistenceService {
 
         // Recycle ONLY an expired token occupying the partial-unique slot. A still-active token
         // here means a concurrent request won the race — leave it untouched so the saveAndFlush
-        // below trips the unique guard and the caller resolves idempotently. Flush the DELETE
-        // before the INSERT: Hibernate orders inserts ahead of deletes within a flush by default,
-        // which would otherwise collide the fresh row against the very row being replaced.
-        inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalse(email, salonId)
-                .filter(existing -> existing.getExpiresAt().isBefore(clock.instant()))
+        // below trips the unique guard and the caller resolves idempotently.
+        //
+        // The expired row is SUPERSEDED, not deleted: hard-deleting it erased the invite from the
+        // salon's history, which GET /salons/{salonId}/invites now surfaces. Setting revoked_at
+        // releases the ux_invite_tokens_active slot (its V153 predicate is
+        // `is_used = false AND revoked_at IS NULL`) while the row survives, classified EXPIRED.
+        //
+        // THE EXPLICIT FLUSH IS STILL REQUIRED — delete->update does NOT retire it. Hibernate's
+        // ActionQueue executes EntityInsertAction BEFORE EntityUpdateAction, so an unflushed
+        // supersede would let the INSERT below hit the unique index while the row being retired
+        // still holds the slot: a spurious DataIntegrityViolationException, silently swallowed by
+        // the caller as an "idempotent" success, and no invite is ever sent. saveAndFlush pushes
+        // the UPDATE out first.
+        // ONE instant for the whole operation. Reading the clock twice judged expiry at t1 and
+        // stamped revoked_at at t2, so the row could be classified EXPIRED against one instant and
+        // retired against a later one — and no test could pin both.
+        Instant now = clock.instant();
+
+        inviteTokenRepository.findByEmailAndSalonIdAndIsUsedFalseAndRevokedAtIsNull(email, salonId)
+                // The SAME canonical predicate acceptInvite uses (InviteToken#isExpired). It used
+                // to be an open-coded isBefore, which was strictly narrower: at the exact instant
+                // expiresAt == now the token was already un-acceptable but NOT recyclable, so a
+                // re-invite fired at that instant tripped ux_invite_tokens_active, was swallowed as
+                // an idempotent 201, and no email was ever sent. Sharing the predicate closes it.
+                .filter(existing -> existing.isExpiredAt(now))
                 .ifPresent(expired -> {
-                    inviteTokenRepository.delete(expired);
-                    inviteTokenRepository.flush();
+                    expired.markSuperseded(now);
+                    inviteTokenRepository.saveAndFlush(expired);
                 });
 
         var inviteToken = new InviteToken(hashedToken, email, salonId, role, expiresAt);

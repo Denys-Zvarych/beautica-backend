@@ -97,26 +97,51 @@ class V139AppointmentsStaffSourceMigrationTest extends AbstractIntegrationTest {
                 .hasMessageContaining("fk_appointments_created_by");
     }
 
+    /**
+     * !! THIS TEST RECORDS A DECISION — DO NOT "KEEP IT GREEN" BLINDLY. !!
+     *
+     * <p><b>Reversed by V157 (Phase 294 D5, 2026-09-04).</b> V139:60 carried V137:129's
+     * attribution argument for {@code ON DELETE RESTRICT} verbatim, and it is superseded here on
+     * identical grounds: that argument was written when no code path deleted a user and it deferred
+     * exactly this case to a future erasure flow. The salon/staff hard-delete track IS that flow,
+     * so {@code V157__masters_detachable_and_staff_delete_fks.sql} § 6 re-adds
+     * {@code fk_appointments_created_by} as {@code ON DELETE SET NULL}. Header and children must
+     * never diverge on this clause — the matching booking-side test is
+     * {@code V137StaffBookingSourceMigrationTest#should_nullBookingAttribution_when_staffUserDeleted}.
+     *
+     * <p>Both halves are load-bearing: the surviving-row assertion rules out {@code CASCADE}, and
+     * the NULLed-creator assertion rules out a {@code RESTRICT} whose delete simply never ran.
+     */
     @Test
-    @DisplayName("should REJECT deleting a staff user whose appointments still attribute to them")
-    void should_restrictUserDelete_when_appointmentReferencesCreator() {
+    @DisplayName("should NULL the attribution (not reject) when a staff user with appointments is deleted")
+    void should_nullAppointmentAttribution_when_staffUserDeleted() {
         BookingMigrationFixtures.Ids ids = BookingMigrationFixtures.seedBookingGraph(jdbcTemplate);
         UUID appointmentId = insertStaffWalkIn(ids.staffUserId());
 
-        assertThatThrownBy(() -> jdbcTemplate.update("DELETE FROM users WHERE id = ?", ids.staffUserId()))
-                .isInstanceOf(DataIntegrityViolationException.class)
-                .hasMessageContaining("fk_appointments_created_by");
+        jdbcTemplate.update("DELETE FROM users WHERE id = ?", ids.staffUserId());
 
-        UUID survivingCreator = jdbcTemplate.queryForObject(
+        Integer surviving = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM appointments WHERE id = ?", Integer.class, appointmentId);
+        assertThat(surviving)
+                .as("SET NULL, never CASCADE: the appointment header must outlive its creator's account")
+                .isEqualTo(1);
+
+        UUID clearedCreator = jdbcTemplate.queryForObject(
                 "SELECT created_by_user_id FROM appointments WHERE id = ?", UUID.class, appointmentId);
-        assertThat(survivingCreator)
-                .as("the attribution must survive the rejected delete un-NULLed, actual=%s", survivingCreator)
-                .isEqualTo(ids.staffUserId());
+        assertThat(clearedCreator)
+                .as("the attribution must be NULLed by the FK, not left dangling, actual=%s", clearedCreator)
+                .isNull();
     }
 
+    /**
+     * The catalog twin of {@link #should_nullAppointmentAttribution_when_staffUserDeleted()}:
+     * asserts the declared delete action directly rather than inferring it from an observed row.
+     * Changed back to {@code 'n'} (SET NULL) deliberately by V157 § 6 / Phase 294 D5 — never
+     * because the build went red.
+     */
     @Test
-    @DisplayName("created_by_user_id's FK declares ON DELETE RESTRICT ('r' in pg_constraint)")
-    void should_declareRestrictDeleteAction_when_migrationApplied() {
+    @DisplayName("created_by_user_id's FK declares ON DELETE SET NULL ('n' in pg_constraint) after V157")
+    void should_declareSetNullDeleteAction_when_v157Applied() {
         String deleteAction = jdbcTemplate.queryForObject("""
                 SELECT confdeltype FROM pg_constraint
                 WHERE conrelid = 'appointments'::regclass AND contype = 'f'
@@ -126,7 +151,7 @@ class V139AppointmentsStaffSourceMigrationTest extends AbstractIntegrationTest {
 
         assertThat(deleteAction)
                 .as("'n' = SET NULL, 'r' = RESTRICT, 'a' = NO ACTION, 'c' = CASCADE; actual=%s", deleteAction)
-                .isEqualTo("r");
+                .isEqualTo("n");
     }
 
     // ── V140: NOT VALID → VALIDATE actually ran ────────────────────────────────

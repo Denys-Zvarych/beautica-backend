@@ -336,9 +336,9 @@ class SalonCatalogueFavoriteDecorationIT extends AbstractIntegrationTest {
     private UUID createSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, city, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 'Kyiv', true, NOW(), NOW())",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, city, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, 'Kyiv', true, NOW(), NOW(), ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 

@@ -157,8 +157,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 "INSERT INTO oblasts (id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?)")
                 .setParameter(1, oblastId).setParameter(2, randomKatotthCode())
                 .setParameter(3, "Oblast").setParameter(4, "Oblast").executeUpdate();
+        // settlement_type is NOT NULL with NO default as of V170 (it adds the column with a 'CITY'
+        // default to backfill V53's rows, then drops the default so every later insert states the
+        // type). A raw-SQL fixture must therefore name it explicitly.
         em.getEntityManager().createNativeQuery(
-                "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?, ?)")
+                "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en, settlement_type) "
+                        + "VALUES (?, ?, ?, ?, ?, 'CITY')")
                 .setParameter(1, cityId).setParameter(2, oblastId).setParameter(3, randomKatotthCode())
                 .setParameter(4, "City").setParameter(5, "City").executeUpdate();
         em.getEntityManager().createNativeQuery(
@@ -591,17 +595,22 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
     // now agrees with the entity path.
 
     @Test
-    @DisplayName("projection returns NULL locality/address fields — never the master's own — "
-            + "when the salon-employed master's salon has no note/address set")
+    @DisplayName("projection returns NULL district/address fields — never the master's own — "
+            + "when the salon-employed master's salon has no district/note/address set")
     void should_returnNullFields_when_salonEmployedAndSalonFieldsAreNull() {
         User ownerUser = new User(
                 "owner-" + UUID.randomUUID() + "@test.com",
                 "$2a$10$hash", Role.SALON_OWNER, "Owner", "Person", "+380503333333");
         em.persist(ownerUser);
 
-        // Salon deliberately leaves cityId/districtId/street/buildingNo/locationNote unset
-        // (NULL) — the common case for a salon that never filled in its address.
+        // Salon deliberately leaves districtId/street/buildingNo/locationNote unset (NULL) —
+        // the common case for a salon that never filled in the rest of its address. cityId
+        // CANNOT be left unset here (V150: salons.city_id is NOT NULL — this em.persist/flush
+        // would throw a DataIntegrityViolationException with a null cityId), so
+        // discoveryCityId below is asserted against the real resolved value, not null.
+        UUID cityId = testCityId();
         Salon salon = Salon.builder()
+                .cityId(cityId)
                 .owner(ownerUser)
                 .name("Bare Studio")
                 .isActive(true)
@@ -638,7 +647,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         ClientBookingDetailProjection::locationNote)
                 .containsExactly(
                         "Bare Studio",
-                        null,
+                        cityId,
                         null,
                         null,
                         null,
@@ -656,6 +665,7 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
         em.persist(ownerUser);
 
         Salon salon = Salon.builder()
+                .cityId(testCityId())
                 .owner(ownerUser)
                 .name("Parity Studio")
                 .isActive(true)
@@ -684,7 +694,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         // awaitingClosure derivation itself (covered by BookingDetailResponseTest);
                         // an arbitrary fixed instant well before every seeded booking's startsAt
                         // keeps both response paths' awaitingClosure identically false.
-                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
+                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC),
+                        // Phase 317 — reviewByClient. This suite pins entity-vs-projection parity,
+                        // and BOTH paths serve null for this field by contract (it is fetched only
+                        // by BookingService#getBooking, not by either mapper), so null on the entity
+                        // side is what parity REQUIRES here, not a shortcut.
+                        null);
 
         em.clear();
 
@@ -773,7 +788,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                         // awaitingClosure derivation itself (covered by BookingDetailResponseTest);
                         // an arbitrary fixed instant well before every seeded booking's startsAt
                         // keeps both response paths' awaitingClosure identically false.
-                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC));
+                        OffsetDateTime.of(2020, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC),
+                        // Phase 317 — reviewByClient. This suite pins entity-vs-projection parity,
+                        // and BOTH paths serve null for this field by contract (it is fetched only
+                        // by BookingService#getBooking, not by either mapper), so null on the entity
+                        // side is what parity REQUIRES here, not a shortcut.
+                        null);
         em.clear();
 
         Page<ClientBookingDetailProjection> page = findClientBookingDetails(

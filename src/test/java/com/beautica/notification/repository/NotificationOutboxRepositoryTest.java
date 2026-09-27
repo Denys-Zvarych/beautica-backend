@@ -520,6 +520,100 @@ class NotificationOutboxRepositoryTest extends AbstractDataJpaTest {
         jdbcTemplate.update("DELETE FROM notification_outbox WHERE id = ?", id);
     }
 
+    // ── deleteByAggregateIdIn (self-delete orphan-outbox fix, Phase 300) ────────
+
+    /**
+     * Regression test for {@link NotificationOutboxRepository#deleteByAggregateIdIn}'s row-level
+     * semantics. Before this test the method was exercised ONLY through Mockito call-argument
+     * verification in {@code ClientAccountDeletionServiceTest} — that proves the call happens with
+     * the right argument list, but never runs the derived query against a real database, so a
+     * subtly wrong predicate (e.g. matching on {@code id} instead of {@code aggregate_id}, or an
+     * unconditional delete) would still pass there.
+     *
+     * <p>Five rows with five DISTINCT {@code aggregate_id}s, differing event types and statuses so
+     * an over-broad delete cannot hide behind identical fixture values (Anti-Bug
+     * §fixture-values-can-defang-assertions). Two are targeted; the other three — plus the total
+     * row count — must be completely untouched.
+     */
+    @Test
+    @DisplayName("should_deleteOnlyMatchingRows_when_deleteByAggregateIdInCalledWithSubset")
+    void should_deleteOnlyMatchingRows_when_deleteByAggregateIdInCalledWithSubset() {
+        // Arrange
+        UUID toDelete1 = UUID.randomUUID();
+        UUID toDelete2 = UUID.randomUUID();
+        UUID surviveA = UUID.randomUUID();
+        UUID surviveB = UUID.randomUUID();
+        UUID surviveC = UUID.randomUUID();
+
+        UUID rowToDelete1 = insertOutboxRowWithAggregate(OutboxEventType.STATUS_CHANGED, "PENDING", toDelete1);
+        UUID rowToDelete2 = insertOutboxRowWithAggregate(OutboxEventType.NEW_BOOKING, "PENDING", toDelete2);
+        UUID rowSurviveA = insertOutboxRowWithAggregate(OutboxEventType.STATUS_CHANGED, "PENDING", surviveA);
+        UUID rowSurviveB = insertOutboxRowWithAggregate(OutboxEventType.REVIEW_REQUESTED, "SENT", surviveB);
+        UUID rowSurviveC = insertOutboxRowWithAggregate(OutboxEventType.CLIENT_CANCELLED, "DEAD", surviveC);
+
+        // Act — deleteByAggregateIdIn is now a @Modifying bulk JPQL DELETE (perf audit, 2026-09,
+        // staff self-delete Finding B) that goes straight to the DB in a single statement; it
+        // never stages per-entity Hibernate remove()s to flush. The rows here were inserted via
+        // raw JDBC (insertOutboxRowWithAggregate), never loaded into the persistence context, so
+        // there is nothing for a bulk DELETE to leave stale. flush() is kept only to force this
+        // test's own pending work (none, currently) out before the raw-JDBC assertions below
+        // (deliberately bypassing Hibernate, to prove DB state rather than an in-memory echo) run
+        // — it is a no-op today, not load-bearing for this assertion.
+        repo.deleteByAggregateIdIn(List.of(toDelete1, toDelete2));
+        repo.flush();
+
+        // Assert — exactly the 2 matching rows are gone.
+        assertThat(rowExists(rowToDelete1)).as("row for toDelete1 must be deleted").isFalse();
+        assertThat(rowExists(rowToDelete2)).as("row for toDelete2 must be deleted").isFalse();
+
+        // Assert — every non-matching row survives, by id, proving the predicate is
+        // `aggregate_id IN (...)` restricted to the given ids, not something broader.
+        assertThat(rowExists(rowSurviveA)).as("surviveA row must NOT be deleted").isTrue();
+        assertThat(rowExists(rowSurviveB)).as("surviveB row must NOT be deleted").isTrue();
+        assertThat(rowExists(rowSurviveC)).as("surviveC row must NOT be deleted").isTrue();
+
+        // Total row count catches an over-broad delete that happens to spare the specific ids
+        // asserted above by accident (e.g. deletes everything then something re-inserts).
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(*) FROM notification_outbox", Integer.class))
+                .as("exactly 3 of the original 5 rows must remain")
+                .isEqualTo(3);
+    }
+
+    /**
+     * {@code ClientAccountDeletionService} guards the empty-collection case itself (skips the call
+     * entirely inside its {@code if (!futureBookingIds.isEmpty())} block) — but a derived-query
+     * {@code IN ()} on Postgres is well-defined (matches nothing), so calling this method directly
+     * with an empty collection must be a safe no-op, not an error, for any other caller.
+     */
+    @Test
+    @DisplayName("should_deleteNothing_when_calledWithEmptyCollection")
+    void should_deleteNothing_when_calledWithEmptyCollection() {
+        // Arrange
+        UUID survivor = UUID.randomUUID();
+        UUID row = insertOutboxRowWithAggregate(OutboxEventType.STATUS_CHANGED, "PENDING", survivor);
+
+        // Act
+        repo.deleteByAggregateIdIn(List.of());
+        repo.flush();
+
+        // Assert
+        assertThat(rowExists(row)).as("empty IN-collection must delete nothing").isTrue();
+    }
+
+    /**
+     * Inserts a row with an explicit {@code aggregate_id}, unlike {@link #insertOutboxRow} which
+     * always generates a random one via {@code gen_random_uuid()} — needed here because the
+     * {@code deleteByAggregateIdIn} tests must target specific, known aggregate ids.
+     */
+    private UUID insertOutboxRowWithAggregate(OutboxEventType eventType, String status, UUID aggregateId) {
+        UUID id = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO notification_outbox (id, event_type, aggregate_id, status, attempts) "
+                        + "VALUES (?, ?, ?, ?, 0)",
+                id, eventType.name(), aggregateId, status);
+        return id;
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /**

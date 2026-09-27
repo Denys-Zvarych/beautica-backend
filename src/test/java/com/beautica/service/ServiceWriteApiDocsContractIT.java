@@ -76,7 +76,7 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
             "post,  /api/v1/independent-masters/me/services/bulk,               409",
             "post,  /api/v1/salons/{salonId}/masters/{masterId}/services/bulk,  409",
             "patch, /api/v1/services/{serviceDefId},                            409",
-            "post,  /api/v1/salons/{salonId}/masters/{masterId}/services,       429",
+            "post,  /api/v1/salons/{salonId}/masters/{masterId}/services,       409",
             "patch, /api/v1/services/{serviceDefId}/photo,                      429"
     })
     @DisplayName("each typed service write endpoint documents a schema-bearing 200 response")
@@ -164,6 +164,178 @@ class ServiceWriteApiDocsContractIT extends AbstractIntegrationTest {
                         + "endpoint belongs in the typed parameterized case instead, content=%s",
                         openApiPath, successContent)
                 .isTrue();
+    }
+
+    // ── Phase 305 D3 — 409 DUPLICATE_SERVICE is published as PER-MASTER on the salon-master bulk
+    // endpoint, not the generic per-owner text every other write endpoint carries. Phase 302 D4
+    // narrowed this endpoint's conflict scope: a call that used to 409 for a salon's SECOND master
+    // now returns 201 (the salon's existing definition is reused). The mobile client's error
+    // handling must be regenerated against the true, per-master semantics.
+
+    @Test
+    @DisplayName("Phase 305 D3: POST .../masters/{masterId}/services/bulk documents its 409 "
+            + "DUPLICATE_SERVICE as PER-MASTER (Phase 302 D4), not the generic per-owner text")
+    void should_documentDuplicateServiceAsPerMaster_when_salonMasterBulkEndpointPublishesSpec()
+            throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services/bulk").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services/bulk must exist in /api-docs")
+                .isFalse();
+
+        String description = operation.path("responses").path("409").path("description").asText();
+
+        assertThat(description)
+                .as("the 409 description must name the conflict as PER-MASTER — a dropped or "
+                        + "reverted annotation would fall back to the generic per-owner "
+                        + "DUPLICATE_SERVICE_409 text, which says nothing about Phase 302 D4's "
+                        + "narrowing; description was: %s", description)
+                .contains("per-MASTER")
+                .contains("another master in the same salon");
+    }
+
+    // ── Phase 313 D4 — single-assign declares its 409 DUPLICATE_SERVICE schema AND keeps its
+    // typed 200 alongside the pre-existing 429. springdoc does not scan GlobalExceptionHandler, so
+    // without the endpoint-level @ApiResponse the 409 body has no schema in /api-docs at all
+    // (case 11); the lone-@ApiResponse trap would otherwise drop the auto-derived typed 200 the
+    // moment the annotation set became "409, 429" without an explicit 200 entry (case 12).
+
+    @Test
+    @DisplayName("Phase 313 case 11: POST .../masters/{masterId}/services declares a 409 whose "
+            + "schema $refs DuplicateServiceErrorResponse, reusing the bulk endpoint's schema")
+    void should_documentDuplicateServiceSchema_when_singleAssignEndpointPublishesSpec() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services must exist in /api-docs")
+                .isFalse();
+
+        JsonNode response409 = operation.path("responses").path("409");
+        assertThat(response409.isMissingNode())
+                .as("Phase 313 D4 — the single-assign endpoint must declare a 409 response")
+                .isFalse();
+
+        JsonNode schema409 = response409.path("content").elements().hasNext()
+                ? response409.path("content").elements().next().path("schema")
+                : com.fasterxml.jackson.databind.node.MissingNode.getInstance();
+        assertThat(schema409.path("$ref").asText())
+                .as("the 409 schema must $ref DuplicateServiceErrorResponse, the same schema the "
+                        + "bulk endpoint declares — no parallel error DTO; schema was: %s", schema409)
+                .endsWith("/DuplicateServiceErrorResponse");
+    }
+
+    @Test
+    @DisplayName("Phase 313 case 12: POST .../masters/{masterId}/services still declares a typed "
+            + "200 AND its pre-existing 429, alongside the new 409 — the lone-@ApiResponse "
+            + "regression guard for a THREE-entry @ApiResponses set")
+    void should_keepTyped200And429_when_singleAssignEndpointGains409() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services must exist in /api-docs")
+                .isFalse();
+
+        JsonNode responses = operation.path("responses");
+        JsonNode successContent = responses.path("200").path("content");
+        assertThat(successContent.isMissingNode() || successContent.isEmpty())
+                .as("200 response MUST carry a content block — an empty/void success means "
+                        + "springdoc dropped the typed return schema; responses were: %s", responses)
+                .isFalse();
+        assertThat(responses.has("429"))
+                .as("the pre-existing 429 rate-limit response must survive alongside the new 409; "
+                        + "responses were: %s", responses)
+                .isTrue();
+        assertThat(responses.has("409"))
+                .as("the new 409 must be present too; responses were: %s", responses)
+                .isTrue();
+    }
+
+    // ── Phase 305 D4 — every {masterId} in this track documents that it is a `masters` row id,
+    // NOT a userId. Passing a userId yields 404 "Master not found", which reads like a missing
+    // master rather than a wrong identifier — a live footgun on the exact screens this track
+    // unblocks (ServiceCatalogService.java masterRepository.findById call sites).
+
+    @ParameterizedTest(name = "{0} {1} — masterId parameter documents \"Master row id (NOT a user id)\"")
+    @CsvSource({
+            "post, /api/v1/salons/{salonId}/masters/{masterId}/services",
+            "post, /api/v1/salons/{salonId}/masters/{masterId}/services/bulk"
+    })
+    @DisplayName("Phase 305 D4: every {masterId} path parameter documents it is a master ROW id, "
+            + "not a userId — asserted so it cannot be dropped in a later annotation tidy-up")
+    void should_documentMasterIdAsRowIdNotUserId_when_endpointTakesMasterIdPathParam(
+            String httpMethod, String openApiPath) throws Exception {
+
+        JsonNode operation = fetchApiDocs().path("paths").path(openApiPath).path(httpMethod);
+        assertThat(operation.isMissingNode())
+                .as("operation %s %s must exist in /api-docs", httpMethod, openApiPath)
+                .isFalse();
+
+        JsonNode masterIdParam = findParameterByName(operation.path("parameters"), "masterId");
+        assertThat(masterIdParam)
+                .as("%s %s must publish a masterId path parameter", httpMethod, openApiPath)
+                .isNotNull();
+
+        assertThat(masterIdParam.path("description").asText())
+                .as("masterId's @Parameter description must state it is a master row id, not a "
+                        + "userId — the exact footgun documented in Phase 305 D4; node=%s",
+                        masterIdParam)
+                .isEqualTo("Master row id (NOT a user id)");
+    }
+
+    // ── Phase 312 D3 — the retired SERVICE_PRICE_SHAPE_MISMATCH 400 no longer appears in the
+    // published spec at all, and its removal did not collapse the bulk endpoint's other
+    // declarations (case 18 + the case 19 lone-@ApiResponse regression guard, doubly-checked here
+    // even though the parameterized case above already exercises the same endpoint).
+
+    @Test
+    @DisplayName("Phase 312 case 18: POST .../masters/{masterId}/services/bulk no longer declares "
+            + "a 400 SERVICE_PRICE_SHAPE_MISMATCH response at all")
+    void should_notDeclare400ShapeMismatch_when_bulkEndpointPublishesSpec() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services/bulk").path("post");
+
+        assertThat(operation.isMissingNode())
+                .as("POST .../masters/{masterId}/services/bulk must exist in /api-docs")
+                .isFalse();
+
+        JsonNode responses = operation.path("responses");
+        assertThat(responses.has("400"))
+                .as("Phase 311's V165 makes every batch item's price shape representable, so this "
+                        + "endpoint never 400s on shape any more — the retired @ApiResponse must "
+                        + "not reappear; responses were: %s", responses)
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("Phase 312 case 19: POST .../masters/{masterId}/services/bulk still declares a "
+            + "typed 200 alongside its remaining 409/503/429 after the 400 was removed — removing "
+            + "one @ApiResponse entry must not collapse the set")
+    void should_keepTyped200And409And503And429_when_shapeMismatch400IsRemoved() throws Exception {
+        JsonNode operation = fetchApiDocs()
+                .path("paths").path("/api/v1/salons/{salonId}/masters/{masterId}/services/bulk").path("post");
+
+        JsonNode responses = operation.path("responses");
+        JsonNode successContent = responses.path("200").path("content");
+        assertThat(successContent.isMissingNode() || successContent.isEmpty())
+                .as("200 response MUST carry a content block — an empty/void success means "
+                        + "springdoc dropped the typed return schema after the 400 was removed; "
+                        + "responses were: %s", responses)
+                .isFalse();
+        assertThat(responses.has("409")).isTrue();
+        assertThat(responses.has("503")).isTrue();
+        assertThat(responses.has("429")).isTrue();
+    }
+
+    private static JsonNode findParameterByName(JsonNode parameters, String name) {
+        for (JsonNode param : parameters) {
+            if (name.equals(param.path("name").asText())) {
+                return param;
+            }
+        }
+        return null;
     }
 
     private JsonNode fetchApiDocs() throws Exception {

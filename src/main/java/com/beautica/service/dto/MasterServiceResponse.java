@@ -89,35 +89,39 @@ public record MasterServiceResponse(
 ) {
     public static MasterServiceResponse from(MasterServiceAssignment msa) {
         // ServiceDefinitionResponse.from already runs ServicePricing.ofDefinition internally, so
-        // sdResponse ALREADY carries the derived display band.
+        // sdResponse carries the SHARED DEFINITION's band — used here only for the nested
+        // serviceDefinition object and the service-type fields, never for this response's own
+        // top-level priceType/priceMin/priceMax/priceDisplay (see below).
         var sdResponse = ServiceDefinitionResponse.from(msa.getServiceDefinition());
 
-        // Money and duration are derived in exactly one place — ServicePricing (Phase 31.4 D2) —
-        // so this menu DTO and the BEAUTY WISH LIST (FavoriteServiceResponse) can never print
-        // different prices for the same service. effectivePrice = COALESCE(priceOverride,
-        // base_price) (null when both are null — no @NotNull on the basePrice entity field, so
-        // callers must still null-check).
+        // Phase 311 D9 — REVERSES the pre-311 perf shortcut this comment used to document. Before
+        // V165, master_services had no per-master ceiling or shape, so ofAssignment's band was
+        // wholly the definition's band by construction — lifting it from sdResponse instead of
+        // re-deriving it via ServicePricing.ofAssignment was a pure perf win (2026-08 perf audit
+        // F4): it saved a second, discarded PriceDisplayFormatter.format call.
         //
-        // The band below is lifted from sdResponse rather than re-derived via
-        // ServicePricing.ofAssignment. The two are identical BY CONSTRUCTION — ofAssignment
-        // sources priceType/priceMin/priceMax/priceDisplay wholly from the definition and applies
-        // the override only to effectivePrice — so calling it here would run
-        // PriceDisplayFormatter.format a second time per row and discard the result (2026-08 perf
-        // audit F4). effectivePriceOf/effectiveDurationMinutesOf are the same formulas ServicePricing
-        // .derive itself calls, not a second implementation.
+        // That premise died with V165: an assignment holding its OWN band (Phase 311 D2) now
+        // legitimately disagrees with the definition's band, and sdResponse's band is the
+        // definition's — exactly the value that would render a STALE price here. ofAssignment is
+        // no longer a duplicate computation; it is the only correct one. Money and duration are
+        // still derived in exactly one place (ServicePricing, Phase 31.4 D2), so this menu DTO and
+        // the wish list (FavoriteServiceResponse, which already called ofAssignment) can never
+        // print different prices for the same assignment.
+        ServicePricing pricing = ServicePricing.ofAssignment(msa);
+
         return new MasterServiceResponse(
                 msa.getId(),
                 msa.getMaster().getId(),
                 sdResponse,
                 msa.getPriceOverride(),
                 msa.getDurationOverrideMinutes(),
-                ServicePricing.effectivePriceOf(msa),
-                ServicePricing.effectiveDurationMinutesOf(msa),
+                pricing.effectivePrice(),
+                pricing.effectiveDurationMinutes(),
                 msa.isActive(),
-                sdResponse.priceType(),
-                sdResponse.priceMin(),
-                sdResponse.priceMax(),
-                sdResponse.priceDisplay(),
+                pricing.priceType(),
+                pricing.priceMin(),
+                pricing.priceMax(),
+                pricing.priceDisplay(),
                 sdResponse.serviceTypeId(),
                 sdResponse.serviceTypeNameUk(),
                 sdResponse.serviceTypeSlug(),
@@ -140,45 +144,28 @@ public record MasterServiceResponse(
     }
 
     /**
-     * Masked variant for the {@code permitAll} browse route
-     * ({@code GET /masters/&#123;masterId&#125;/services}), mirroring the
-     * {@code MasterDetailResponse#fromPublic} precedent.
+     * <b>RETIRED (2026-09-13 audit, S5): there is no masked public variant any more.</b>
      *
-     * <p><b>What is stripped and why.</b> {@code priceOverride} is a PROVIDER-INTERNAL bookkeeping
-     * field: it is non-null exactly when this master charges something other than the salon's
-     * definition price, so serving it raw to an anonymous caller discloses whether — and by how
-     * much — a master deviates from their salon's list price. That is commercially sensitive and
-     * has no consumer: the discovery flow prices off {@code effectivePrice} (the
-     * {@code COALESCE(priceOverride, base_price)} floor) and renders bands off
-     * {@code priceMin}/{@code priceMax}/{@code priceDisplay}, all of which are retained here. The
-     * masked field is the only one dropped; nothing else about the row changes.
+     * <p>{@code fromPublic} used to null {@code priceOverride} on the {@code permitAll} browse
+     * route ({@code GET /masters/&#123;masterId&#125;/services}), calling it "commercially
+     * sensitive". <b>The control did not control.</b> The same response kept {@code effectivePrice}
+     * — {@code COALESCE(priceOverride, base_price)} — and the nested
+     * {@link ServiceDefinitionResponse#priceMin()}, which IS {@code base_price}. Any anonymous
+     * caller recovered the masked value, and its deviation from the salon's list price, by
+     * subtraction. Phase 311 widened the leak further: {@code priceType} and {@code priceMax} now
+     * carry the master's OWN band on the same public route.
      *
-     * <p><b>Wire compatibility.</b> {@code priceOverride} is already absent from the vast majority
-     * of responses today — any master who has NOT set an override serialises it as null — and it
-     * is not a required property in the generated OpenAPI schema. Masking therefore emits a shape
-     * clients already handle, and does not alter the schema: the property stays declared and
-     * optional, only the runtime value becomes absent on this one anonymous route. Authenticated
-     * routes ({@code GET /masters/me/services} and every write path) keep the full
-     * {@link #from} variant, so a provider still sees their own override.
+     * <p>The contradiction is resolved in the direction the product already settled: a salon's
+     * catalogue prices, per master, ARE public — that is what the discovery and booking flows
+     * render, and the salon-search price band
+     * ({@code SalonSearchSql}'s {@code pr} lateral) publishes the same numbers to unauthenticated
+     * callers anyway. So the ineffective mask and its confidentiality claim are gone rather than
+     * kept as a guarantee that does not hold. Fields the mobile client consumes are all retained.
+     *
+     * <p><b>Do not re-add a partial mask here.</b> A mask on this DTO is only meaningful if it
+     * also removes {@code effectivePrice} and the nested definition band, which the client needs;
+     * "hide one derivable field" is theatre, and shipping it as a security control is worse than
+     * shipping neither. If public price visibility ever becomes a product question, it is a
+     * question about the ROUTE, not about one field on this record.
      */
-    public static MasterServiceResponse fromPublic(MasterServiceResponse full) {
-        return new MasterServiceResponse(
-                full.id(),
-                full.masterId(),
-                full.serviceDefinition(),
-                null,             // priceOverride — provider-internal, masked for anonymous callers
-                full.durationOverrideMinutes(),
-                full.effectivePrice(),
-                full.effectiveDurationMinutes(),
-                full.isActive(),
-                full.priceType(),
-                full.priceMin(),
-                full.priceMax(),
-                full.priceDisplay(),
-                full.serviceTypeId(),
-                full.serviceTypeNameUk(),
-                full.serviceTypeSlug(),
-                full.isFavorite()   // passed through verbatim, never hardcoded — see field javadoc
-        );
-    }
 }

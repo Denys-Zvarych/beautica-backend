@@ -1,5 +1,6 @@
 package com.beautica.auth;
 
+import com.beautica.user.TokensValidAfterRow;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -48,32 +49,59 @@ class TokensValidAfterCacheTest {
         var userId = UUID.randomUUID();
         Instant resetInstant = Instant.parse("2025-06-01T12:00:00Z");
         log.debug("Arrange: repository has a stamped tokensValidAfter for userId={}", userId);
-        when(userRepository.findTokensValidAfterById(userId)).thenReturn(Optional.of(resetInstant));
+        when(userRepository.findTokensValidAfterRowById(userId))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userId, resetInstant)));
 
-        Optional<Instant> result = cache.get(userId);
+        TokenValidityState result = cache.get(userId);
 
         assertThat(result)
                 .as("get() must return exactly what the repository returned on a miss")
-                .contains(resetInstant);
+                .isEqualTo(new TokenValidityState.PresentAt(resetInstant));
     }
 
     @Test
-    @DisplayName("get caches an empty Optional (never-reset user) so the repository is hit only once")
-    void should_cacheEmptyOptional_when_userNeverReset() {
+    @DisplayName("get caches PRESENT_NO_RESET (never-reset user) so the repository is hit only once")
+    void should_cachePresentNoReset_when_userNeverReset() {
         var userId = UUID.randomUUID();
-        log.debug("Arrange: repository reports no reset has ever occurred for userId={}", userId);
-        when(userRepository.findTokensValidAfterById(userId)).thenReturn(Optional.empty());
+        log.debug("Arrange: repository reports the row exists but has never been reset, userId={}", userId);
+        when(userRepository.findTokensValidAfterRowById(userId))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userId, null)));
 
-        Optional<Instant> first = cache.get(userId);
-        Optional<Instant> second = cache.get(userId);
+        TokenValidityState first = cache.get(userId);
+        TokenValidityState second = cache.get(userId);
 
-        assertThat(first).isEmpty();
-        assertThat(second).isEmpty();
-        // This is the whole point of caching Optional rather than a bare nullable value:
+        assertThat(first).isEqualTo(TokenValidityState.PRESENT_NO_RESET);
+        assertThat(second).isEqualTo(TokenValidityState.PRESENT_NO_RESET);
+        // This is the whole point of caching a value object rather than a bare nullable:
         // Caffeine's Cache#get(key, mappingFunction) does not cache a null return, which
         // would otherwise defeat the cache for every user who has never reset a password.
         verify(userRepository, times(1))
-                .findTokensValidAfterById(userId);
+                .findTokensValidAfterRowById(userId);
+    }
+
+    /**
+     * The phase 295 audit's HIGH-1 case at the cache boundary: a HARD-DELETED account must be
+     * reported as {@link TokenValidityState#ABSENT}, distinct from the never-reset state above,
+     * and that answer must itself be CACHED — a {@code null} mapping-function return would not be,
+     * turning every replayed token from a deleted account into an uncached DB round trip.
+     */
+    @Test
+    @DisplayName("get returns a CACHED ABSENT — never null — when the users row does not exist")
+    void should_cacheAbsent_when_userRowDoesNotExist() {
+        var userId = UUID.randomUUID();
+        when(userRepository.findTokensValidAfterRowById(userId)).thenReturn(Optional.empty());
+
+        TokenValidityState first = cache.get(userId);
+        TokenValidityState second = cache.get(userId);
+
+        assertThat(first).isEqualTo(TokenValidityState.ABSENT);
+        assertThat(second).isEqualTo(TokenValidityState.ABSENT);
+        assertThat(first)
+                .as("ABSENT must be distinguishable from the never-reset state — collapsing the "
+                        + "two is what let a deleted account keep authenticating")
+                .isNotEqualTo(TokenValidityState.PRESENT_NO_RESET);
+        verify(userRepository, times(1))
+                .findTokensValidAfterRowById(userId);
     }
 
     @Test
@@ -81,14 +109,15 @@ class TokensValidAfterCacheTest {
     void should_hitRepositoryOnlyOnce_when_getCalledRepeatedlyForSameUser() {
         var userId = UUID.randomUUID();
         Instant resetInstant = Instant.parse("2025-06-01T12:00:00Z");
-        when(userRepository.findTokensValidAfterById(userId)).thenReturn(Optional.of(resetInstant));
+        when(userRepository.findTokensValidAfterRowById(userId))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userId, resetInstant)));
 
         cache.get(userId);
         cache.get(userId);
         cache.get(userId);
 
         verify(userRepository, times(1))
-                .findTokensValidAfterById(userId);
+                .findTokensValidAfterRowById(userId);
     }
 
     @Test
@@ -98,22 +127,22 @@ class TokensValidAfterCacheTest {
         Instant firstValue = Instant.parse("2025-06-01T12:00:00Z");
         Instant secondValue = Instant.parse("2025-06-02T08:30:00Z");
         log.debug("Arrange: repository returns firstValue, then secondValue after invalidate, for userId={}", userId);
-        when(userRepository.findTokensValidAfterById(userId))
-                .thenReturn(Optional.of(firstValue))
-                .thenReturn(Optional.of(secondValue));
+        when(userRepository.findTokensValidAfterRowById(userId))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userId, firstValue)))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userId, secondValue)));
 
-        Optional<Instant> beforeInvalidate = cache.get(userId);
+        TokenValidityState beforeInvalidate = cache.get(userId);
         cache.invalidate(userId);
-        Optional<Instant> afterInvalidate = cache.get(userId);
+        TokenValidityState afterInvalidate = cache.get(userId);
 
-        assertThat(beforeInvalidate).contains(firstValue);
+        assertThat(beforeInvalidate).isEqualTo(new TokenValidityState.PresentAt(firstValue));
         assertThat(afterInvalidate)
                 .as("after invalidate(), the very next get() must re-read the fresh DB value "
                         + "rather than serve the stale cached one — this is the mechanism "
                         + "PasswordResetService relies on to make a reset take effect immediately")
-                .contains(secondValue);
+                .isEqualTo(new TokenValidityState.PresentAt(secondValue));
         verify(userRepository, times(2))
-                .findTokensValidAfterById(userId);
+                .findTokensValidAfterRowById(userId);
     }
 
     @Test
@@ -123,8 +152,10 @@ class TokensValidAfterCacheTest {
         var userB = UUID.randomUUID();
         Instant valueA = Instant.parse("2025-06-01T12:00:00Z");
         Instant valueB = Instant.parse("2025-06-03T00:00:00Z");
-        when(userRepository.findTokensValidAfterById(userA)).thenReturn(Optional.of(valueA));
-        when(userRepository.findTokensValidAfterById(userB)).thenReturn(Optional.of(valueB));
+        when(userRepository.findTokensValidAfterRowById(userA))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userA, valueA)));
+        when(userRepository.findTokensValidAfterRowById(userB))
+                .thenReturn(Optional.of(new TokensValidAfterRow(userB, valueB)));
 
         cache.get(userA);
         cache.get(userB);
@@ -134,7 +165,7 @@ class TokensValidAfterCacheTest {
 
         // userA was re-read after invalidation (2 calls); userB's cached entry was
         // untouched (still just 1 call).
-        verify(userRepository, times(2)).findTokensValidAfterById(userA);
-        verify(userRepository, times(1)).findTokensValidAfterById(userB);
+        verify(userRepository, times(2)).findTokensValidAfterRowById(userA);
+        verify(userRepository, times(1)).findTokensValidAfterRowById(userB);
     }
 }

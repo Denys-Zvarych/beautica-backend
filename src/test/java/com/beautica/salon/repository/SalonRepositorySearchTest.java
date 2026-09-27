@@ -64,19 +64,28 @@ class SalonRepositorySearchTest extends AbstractDataJpaTest {
         );
         em.persist(owner);
 
-        kyivCityId = cityIdByName("Київ");
-        lvivCityId = cityIdByName("Львів");
+        kyivCityId = cityIdByKatotthCode(KYIV_CITY_CODE);
+        lvivCityId = cityIdByKatotthCode(LVIV_CITY_CODE);
     }
 
+    private static final String KYIV_CITY_CODE = "UA80000000000093317";
+    private static final String LVIV_CITY_CODE = "UA46060250010015970";
+
     /**
-     * Resolves a Flyway-seeded {@code cities.id} by canonical Ukrainian name
-     * (V53). Reference data — present in the slice context, never rolled back.
+     * Resolves a Flyway-seeded {@code cities.id} by KATOTTH code.
+     *
+     * <p>Reference data — present in the slice context, never rolled back.
+     *
+     * <p>This used to resolve by {@code name_uk} with {@code ORDER BY katotth_code LIMIT 1}, which
+     * was unambiguous only while {@code cities} held 356 category-M rows. Phase 325 imported the
+     * full settlement taxonomy, and «Київ» is now also a VILLAGE in Миколаївська oblast
+     * ({@code UA48040230080020671}) whose code sorts FIRST — so the name lookup silently resolved
+     * the district test onto a settlement with no urban districts. The code is the key.
      */
-    private UUID cityIdByName(String nameUk) {
+    private UUID cityIdByKatotthCode(String katotthCode) {
         return (UUID) em.getEntityManager()
-                .createNativeQuery(
-                        "SELECT id FROM cities WHERE name_uk = :n ORDER BY katotth_code LIMIT 1")
-                .setParameter("n", nameUk)
+                .createNativeQuery("SELECT id FROM cities WHERE katotth_code = :c")
+                .setParameter("c", katotthCode)
                 .getSingleResult();
     }
 

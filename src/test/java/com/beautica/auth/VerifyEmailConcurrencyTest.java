@@ -1,12 +1,12 @@
 package com.beautica.auth;
 
+import com.beautica.support.TestHttpClients;
 import com.beautica.auth.dto.RegisterRequest;
 import com.beautica.auth.dto.ResendVerificationRequest;
 import com.beautica.auth.dto.SelfRegistrationRole;
 import com.beautica.auth.dto.VerifyEmailRequest;
 import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.EmailNotificationService;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -20,7 +20,6 @@ import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -79,8 +78,7 @@ class VerifyEmailConcurrencyTest {
 
     @BeforeEach
     void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+        restTemplate.getRestTemplate().setRequestFactory(TestHttpClients.timeoutBoundedRequestFactory());
     }
 
     @AfterEach

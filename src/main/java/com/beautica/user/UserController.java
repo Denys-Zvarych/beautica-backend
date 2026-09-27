@@ -1,12 +1,16 @@
 package com.beautica.user;
 
 import com.beautica.auth.PasswordResetService;
+import com.beautica.auth.Role;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.security.AuthenticationUtils;
+import com.beautica.common.security.BearerTokenExtractor;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -22,10 +26,16 @@ public class UserController {
 
     private final UserService userService;
     private final PasswordResetService passwordResetService;
+    private final ClientAccountDeletionService clientAccountDeletionService;
+    private final StaffAccountSelfDeletionService staffAccountSelfDeletionService;
 
-    public UserController(UserService userService, PasswordResetService passwordResetService) {
+    public UserController(UserService userService, PasswordResetService passwordResetService,
+                           ClientAccountDeletionService clientAccountDeletionService,
+                           StaffAccountSelfDeletionService staffAccountSelfDeletionService) {
         this.userService = userService;
         this.passwordResetService = passwordResetService;
+        this.clientAccountDeletionService = clientAccountDeletionService;
+        this.staffAccountSelfDeletionService = staffAccountSelfDeletionService;
     }
 
     @GetMapping("/me")
@@ -81,5 +91,41 @@ public class UserController {
         UUID userId = AuthenticationUtils.userId(authentication);
         passwordResetService.requestResetForUserId(userId);
         return ResponseEntity.ok(ApiResponse.ok(null, "A reset code has been sent to your email."));
+    }
+
+    /**
+     * Self-deletion (Phase 300 D1/D2 for CLIENT; widened to {@code SALON_ADMIN}/{@code
+     * SALON_MASTER}/{@code INDEPENDENT_MASTER} by Phase 301). Bearer token only, no confirmation
+     * body — the irreversibility warning lives in the mobile UI. {@code SALON_OWNER} is refused by
+     * this method's own {@code @PreAuthorize} gate and never reaches either service below.
+     *
+     * <p>Dispatches on the authority already present in {@code Authentication} — no extra DB read:
+     * {@code CLIENT} → {@link ClientAccountDeletionService#deleteOwnAccount}, byte-for-byte
+     * unchanged by this widening (its own defence-in-depth guard is simply never reached by a
+     * staff caller, since they are routed to the other branch entirely); every other admitted role
+     * → {@link StaffAccountSelfDeletionService#deleteOwnAccount}. Hard-deletes the caller's {@code
+     * users} row; see either service for its full cascade.
+     *
+     * <p>{@code 204 No Content}, {@code ResponseEntity<Void>} — no {@code ApiResponse<T>}
+     * envelope, mirroring the existing {@code DELETE /salons/{salonId}} shape
+     * ({@code SalonController#deactivateSalon}), the closest existing precedent for a
+     * bearer-token-only, no-body delete endpoint.
+     *
+     * <p>The caller's own bearer token is denylisted as part of the deletion (see the services),
+     * so it is extracted here via the SAME {@link BearerTokenExtractor} {@code AuthController
+     * #logout} and {@link com.beautica.auth.JwtAuthenticationFilter} already use — never a second
+     * ad hoc header parse.
+     */
+    @DeleteMapping("/me")
+    @PreAuthorize("hasAnyRole('CLIENT','SALON_ADMIN','SALON_MASTER','INDEPENDENT_MASTER')")
+    public ResponseEntity<Void> deleteMyAccount(HttpServletRequest request, Authentication authentication) {
+        UUID userId = AuthenticationUtils.userId(authentication);
+        String accessToken = BearerTokenExtractor.extract(request);
+        if (AuthenticationUtils.role(authentication) == Role.CLIENT) {
+            clientAccountDeletionService.deleteOwnAccount(userId, accessToken);
+        } else {
+            staffAccountSelfDeletionService.deleteOwnAccount(userId, accessToken);
+        }
+        return ResponseEntity.noContent().build();
     }
 }

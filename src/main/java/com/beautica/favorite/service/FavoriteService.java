@@ -23,7 +23,9 @@ import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
+import com.beautica.service.dto.ServicePricing;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServiceCatalogService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -36,6 +38,7 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -96,6 +99,7 @@ public class FavoriteService {
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final FavoritePersistenceService favoritePersistenceService;
     private final FavoriteCategoryResolver favoriteCategoryResolver;
+    private final ServiceCatalogService serviceCatalogService;
 
     /**
      * Favorites the target for {@code clientUserId} (the authenticated principal).
@@ -212,22 +216,97 @@ public class FavoriteService {
      *
      * <p>Each row carries what the card renders (service name, master OR salon identity,
      * duration, price band) and, for a MASTER row, the two ids {@code POST /bookings} needs, so
-     * «Записатись» costs no extra call. Money is derived from the same three
-     * {@code service_definitions} columns {@code ServicePricing.ofDefinition} reads, for both
-     * arms, so the wish list and the master's own menu (or the salon catalogue) can never print
-     * different prices.
+     * «Записатись» costs no extra call.
      *
-     * <p>Rows whose assignment, service definition, performing master, <b>or (for a SALON row)
-     * owning salon</b> went inactive are filtered out by the query, not deleted: the favourite
+     * <p><b>Money is derived exactly once, per arm, by the same code the destination screen uses.</b>
+     * A MASTER row's band is {@code ServicePricing}'s resolution of the projection's raw definition
+     * + override columns — byte-for-byte what {@code MasterServiceResponse} prints on the master's
+     * own menu (Phase 311 D9). A SALON row's band is the salon-catalogue HULL across that salon's
+     * bookable masters, fetched for the whole page in ONE batched aggregation
+     * ({@code ServiceCatalogService#hullsForSalonServices}) and overlaid by
+     * {@code FavoriteServiceResponse#withSalonHull} — byte-for-byte what
+     * {@code GET /salons/&#123;salonId&#125;/services} prints. Neither arm re-implements a price
+     * formula, so a saved card and the screen it links to cannot advertise different money.
+     *
+     * <p><b>Statement cost.</b> One content statement (plus Spring Data's count statement on a full
+     * page), then — only when the page actually holds a SALON row — three more for the hull,
+     * regardless of how many SALON rows or how many distinct salons the page spans. There is no
+     * per-row and no per-salon query.
+     *
+     * <p>Rows whose assignment, service definition, performing master, <b>or (for a SALON row)</b>
+     * owning salon went inactive are filtered out by the query, not deleted: the favourite
      * row survives (consistent with MASTER/SALON/SERVICE), it simply stops appearing rather than
      * offering a dead CTA — and reappears if a master is re-assigned to the service, since
      * nothing was ever deleted.
+     *
+     * <p><b>ACCEPTED-LOW: the read transaction's hold (2026-09-15 perf audit, cycle 2).</b> Recorded
+     * here so the acceptance is documented rather than silent — this is deliberately NOT
+     * restructured.
+     * <ul>
+     *   <li><b>What the transaction spans.</b> {@code @Transactional(readOnly = true)} wraps the
+     *       whole method, so one pooled connection is held across: the content statement, Spring
+     *       Data's count statement on a full page, the SALON arm's candidate-master load, the three
+     *       bookability-gate statements behind {@code hullsForSalonServices}, and the in-memory
+     *       fold/hull walk between them. Seven statements plus CPU on one connection, not one.</li>
+     *   <li><b>Why that is acceptable today.</b> It is read-only (no write locks, no row contention),
+     *       the statement count is flat in page size and in the number of distinct salons (see
+     *       "Statement cost" above), the route is CLIENT-only and page size is globally capped at
+     *       {@code spring.data.web.pageable.max-page-size} = 100, and the in-memory portion — the
+     *       dominant term before the 2026-09-15 fold bound — is now ~180x shorter because the
+     *       bookability gate stops at each master's first bookable day
+     *       ({@code MasterScheduleService#reduceEffectiveRangeBatch}) instead of materialising 181
+     *       days per candidate master.</li>
+     *   <li><b>What would make it NOT acceptable.</b> Pool pressure showing up in
+     *       {@code hikaricp_connections_pending} (Actuator/Micrometer) against the 10-connection
+     *       HikariCP ceiling — the Neon free-tier hard limit, {@code application.yml:13}. That is
+     *       the trigger to split the read into a gate-then-project shape that releases the
+     *       connection across the in-memory walk, not a reason to raise the pool.</li>
+     * </ul>
      */
     @Transactional(readOnly = true)
     public Page<FavoriteServiceResponse> listServiceFavorites(UUID clientUserId, Pageable pageable) {
-        Page<Object[]> rows = favoriteRepository.findFavoriteServiceRows(
-                clientUserId, SortWhitelist.stripSort(pageable));
-        return rows.map(FavoriteServiceResponse::fromRow);
+        Page<FavoriteServiceResponse> rows = favoriteRepository
+                .findFavoriteServiceRows(clientUserId, SortWhitelist.stripSort(pageable))
+                .map(FavoriteServiceResponse::fromRow);
+
+        Map<UUID, ServicePricing.Hull> hulls =
+                serviceCatalogService.hullsForSalonServices(salonServiceDefIds(rows.getContent()));
+
+        return hulls.isEmpty() ? rows : rows.map(row -> priceBySalonHull(row, hulls));
+    }
+
+    /**
+     * The distinct {@code service_definitions.id}s of the SALON rows on this page — the whole
+     * argument to the ONE batched hull aggregation. Deliberately a {@link LinkedHashSet}: a client
+     * can wish-list the same salon service only once, but two rows on one page may still share a
+     * definition through different salons' arms in future, and an {@code IN} list must not repeat.
+     * An empty set short-circuits inside
+     * {@code ServiceCatalogService#hullsForSalonServices} before any query, so a page of MASTER
+     * rows costs exactly what it did before this became hull-priced.
+     */
+    private static Set<UUID> salonServiceDefIds(List<FavoriteServiceResponse> rows) {
+        Set<UUID> ids = new LinkedHashSet<>();
+        for (FavoriteServiceResponse row : rows) {
+            if (row.sourceType() == FavoriteServiceResponse.SourceType.SALON) {
+                ids.add(row.serviceDefId());
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Overlays the salon-catalogue hull on a SALON row. A MASTER row is returned untouched — its
+     * band is already the performing master's RESOLVED band, derived by {@code ServicePricing}
+     * from the projection's raw columns. A SALON row with no hull entry (no currently-bookable
+     * master in that salon) keeps the definition's own band, the documented fallback.
+     */
+    private static FavoriteServiceResponse priceBySalonHull(
+            FavoriteServiceResponse row, Map<UUID, ServicePricing.Hull> hulls) {
+        if (row.sourceType() != FavoriteServiceResponse.SourceType.SALON) {
+            return row;
+        }
+        ServicePricing.Hull hull = hulls.get(row.serviceDefId());
+        return hull == null ? row : row.withSalonHull(hull);
     }
 
     // ── target validation ─────────────────────────────────────────────────────

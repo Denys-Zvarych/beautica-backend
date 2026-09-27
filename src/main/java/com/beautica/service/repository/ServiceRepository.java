@@ -22,9 +22,50 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     List<ServiceDefinition> findByOwnerTypeAndOwnerIdAndIsActiveTrue(OwnerType ownerType, UUID ownerId);
 
     /**
-     * Resolves the owner's user UUID in a single query, avoiding the two-query
-     * chain (load ServiceDefinition + load Salon or Master) previously used in
+     * Owner-access projection for a {@link ServiceDefinition} — Phase 306 D3.
+     *
+     * <p>{@code ownerUserId} is the definition owner's user UUID (SALON → the salon's
+     * {@code owner.id}; INDEPENDENT_MASTER → the master's {@code user.id}) — unchanged from the
+     * original single-column projection and still the sole answer for the INDEPENDENT_MASTER
+     * identity arm.
+     *
+     * <p>{@code salonId} is non-null iff the definition is SALON-owned, null for an
+     * INDEPENDENT_MASTER-owned definition. It lets {@code AuthorizationService} resolve a
+     * {@code SALON_ADMIN} through {@code hasManagementAccess(salonId, actorId, actorRole)} —
+     * the existing salon-management rule {@code canManageSalon} already delegates to — without a
+     * second query. An admin's actor id never equals {@code ownerUserId} (that is always the
+     * owner's id), which is exactly the bug this projection extension fixes.
+     *
+     * <p>{@code salonOwnerId} (Phase 306 audit fix #1, backend-perf MEDIUM) is the salon's
+     * {@code owner.id}, named distinctly from {@code ownerUserId} so the SALON_OWNER identity
+     * check does not have to reason about {@code ownerUserId}'s polymorphic meaning (salon owner
+     * OR independent master, depending on {@code ownerType}). It is non-null exactly when
+     * {@code salonId} is non-null, and always equal to {@code ownerUserId} on that branch — it
+     * rides the SAME {@code LEFT JOIN Salon s} used to resolve {@code salonId}, so adding it costs
+     * no extra join and no extra query.
+     */
+    interface ServiceOwnerAccess {
+        UUID getOwnerUserId();
+
+        UUID getSalonId();
+
+        UUID getSalonOwnerId();
+    }
+
+    /**
+     * Resolves the {@link ServiceOwnerAccess} projection in a single query, avoiding the
+     * two-query chain (load ServiceDefinition + load Salon or Master) previously used in
      * AuthorizationService.canManageServiceDefinition.
+     *
+     * <p>Phase 306 D3 — extended beyond the bare owner user UUID to also project the definition's
+     * salon id (see {@link ServiceOwnerAccess}), so {@code canManageServiceDefinition} and
+     * {@code enforceCanManageServiceDefinition} can resolve a SALON_ADMIN via salon-management
+     * access in the SAME query, not a second round-trip.
+     *
+     * <p>{@code salonId} and {@code salonOwnerId} ride for free on the existing {@code Salon s}
+     * LEFT JOIN: {@code s} is only non-null when {@code sd.ownerType = SALON} (the join's own
+     * {@code ON} condition), so both are already null on the INDEPENDENT_MASTER branch with no
+     * extra CASE needed.
      *
      * Returns empty when no ServiceDefinition with the given id exists.
      */
@@ -32,13 +73,15 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             SELECT CASE sd.ownerType
                 WHEN 'SALON' THEN s.owner.id
                 ELSE m.user.id
-            END
+            END AS ownerUserId,
+            s.id AS salonId,
+            s.owner.id AS salonOwnerId
             FROM ServiceDefinition sd
             LEFT JOIN Salon s ON s.id = sd.ownerId AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
             LEFT JOIN Master m ON m.id = sd.ownerId AND sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
             WHERE sd.id = :serviceDefId
             """)
-    Optional<UUID> findOwnerUserId(@Param("serviceDefId") UUID serviceDefId);
+    Optional<ServiceOwnerAccess> findOwnerUserId(@Param("serviceDefId") UUID serviceDefId);
 
     /**
      * Loads a ServiceDefinition together with its serviceType in a single JOIN FETCH
@@ -58,6 +101,30 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     @Modifying
     @Query("UPDATE ServiceDefinition sd SET sd.isActive = false WHERE sd.id = :id")
     int deactivateById(@Param("id") UUID id);
+
+    /**
+     * Bulk-deactivates every ACTIVE service definition owned by {@code (ownerType, ownerId)} —
+     * used by {@code SalonService.deactivateSalon} (Phase 268 D1) to close the direct
+     * salon-owned-catalogue read path when a salon is deleted, on top of the
+     * every-master-deactivated mechanism the staff cascade already provides (the two must agree,
+     * see the phase doc D1).
+     *
+     * <p>Mirrors {@link #deactivateById}'s bulk-JPQL idiom exactly, including its caveat: a bulk
+     * {@code UPDATE} bypasses the persistence context and {@code AuditableEntity}'s
+     * {@code @LastModifiedDate}, so {@code updated_at} is NOT bumped by this call. Not fixed here —
+     * consistent with the existing single-row sibling.
+     *
+     * <p>Scoped by BOTH {@code ownerType} and {@code ownerId} — {@code ownerId} alone is not
+     * unique across owner types (a salon and an independent master can share a UUID only by
+     * astronomical coincidence, but the predicate is cheap and removes the theoretical case
+     * entirely, matching every other owner-scoped finder in this interface).
+     */
+    @Modifying
+    @Query("""
+            UPDATE ServiceDefinition sd SET sd.isActive = false
+            WHERE sd.ownerType = :ownerType AND sd.ownerId = :ownerId AND sd.isActive = true
+            """)
+    int deactivateAllByOwner(@Param("ownerType") OwnerType ownerType, @Param("ownerId") UUID ownerId);
 
     /**
      * Finds the id of an existing ACTIVE {@link ServiceDefinition} that would collide with a
@@ -130,6 +197,91 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
     List<ActiveDuplicateProjection> findActiveDuplicateTypeIds(
             @Param("ownerType") OwnerType ownerType,
             @Param("ownerId") UUID ownerId,
+            @Param("typeIds") Collection<UUID> typeIds);
+
+    /**
+     * Phase 302 — the ONE query the salon-branch bulk-create critical section runs: every ACTIVE
+     * {@link ServiceDefinition} the batch's service types could collide with or reuse, each paired
+     * with the target master's ACTIVE assignment id (or {@code null} when they do not perform it).
+     *
+     * <p><b>Three round-trips collapsed into one (perf LOW-3).</b> The salon branch previously ran
+     * {@code MasterServiceRepository#findActiveAssignedServiceTypeIds} (the per-master conflict),
+     * then {@link #findActiveDuplicateTypeIds} (the salon's reusable definition ids), then
+     * {@code findAllById} to re-fetch definitions the second query had already joined. All three
+     * answers live in this one row shape. It matters because the advisory lock guarding this
+     * section is keyed on the SALON (audit HIGH-2): the serialized window is salon-wide, so every
+     * extra round-trip inside it multiplies across every concurrent master setup in the salon.
+     *
+     * <p>Batched over {@code typeIds}, never per item. The bulk endpoint accepts up to 100 items,
+     * and the cost of a per-item {@code exists} is <b>100 serialized round-trips held inside the
+     * advisory lock</b> — that, not a flush interaction, is the argument (audit INFO-7 corrected an
+     * earlier comment here that blamed a Hibernate AUTO flush defeating JDBC insert batching: this
+     * guard runs strictly BEFORE any {@code save()}, so nothing is pending to flush).
+     *
+     * <p><b>Salon-scoped, and that scoping is the security fix (audit HIGH-1).</b> The deleted
+     * per-master finder filtered on {@code master_id} ALONE. {@code MasterService.rotateMasterToSalon}
+     * moves {@code masters.salon_id} and never touches {@code master_services}, so a rotated master
+     * keeps ACTIVE assignments to the SOURCE salon's SALON-owned definitions — the "rotated-master
+     * leak" {@code SalonSearchSql} names and every other read query here compensates for. Unscoped,
+     * the destination salon's first bulk-create for such a type answered
+     * {@code 409 DUPLICATE_SERVICE} carrying a SOURCE-salon {@code existingServiceDefId}: a wrong
+     * answer AND a cross-tenant id disclosed to an actor authorised only for the destination. The
+     * owner predicate below is what confines both the conflict and the reuse to definitions this
+     * salon can legitimately be in conflict with.
+     *
+     * <p>The {@code INDEPENDENT_MASTER}/{@code :masterId} arm is deliberate, not incidental: ~60
+     * pre-Phase-302 rows are still master-owned (phase 303 backfills them), and a master who
+     * already performs a type through one of those must keep getting the clean, item-naming 409
+     * rather than a raced V121 violation. Such a row is a CONFLICT, never a reuse candidate — the
+     * caller reuses only {@code ownerType = SALON} rows, since an insert here writes
+     * {@code (SALON, salonId)}.
+     *
+     * <p>The join is {@code LEFT} so a definition the salon offers but this master does not perform
+     * still comes back — that is precisely the reuse row. It cannot multiply rows:
+     * {@code master_services} is {@code UNIQUE (master_id, service_def_id)}, so at most one
+     * assignment matches per definition. Bounded by construction (§E-3) — {@code typeIds} is the
+     * caller's own validated, deduplicated request set, and at most two owners can answer for a
+     * type.
+     *
+     * <p>Read-then-write like every guard on this path (§E-4 — unscoped by role, the caller must
+     * already hold write access to both salon and master): the partial unique index
+     * {@code ux_service_def_owner_service_type_active} and {@code master_services}' unique key stay
+     * the actual guarantees; the salon-keyed advisory lock is what turns ordinary contention into
+     * the clean 409 instead of a constraint violation.
+     *
+     * <p><b>The join is NOT filtered on {@code msa.isActive} (Phase 307 D6).</b> It used to be —
+     * {@code AND msa.isActive = true} in the {@code ON} clause — which made an INACTIVE
+     * (previously-unassigned, see {@code ServiceCatalogService#unassignServiceFromMaster}) row
+     * invisible to this query entirely: the candidate came back with a {@code null}
+     * {@code masterAssignmentId}, {@link #findSalonBulkSetupCandidates}'s caller read that as "no
+     * assignment", the reuse branch inserted a SECOND {@code master_services} row for the same
+     * {@code (master_id, service_def_id)} pair, and — because that unique key is NOT partial —
+     * the insert tripped it at flush and surfaced as an opaque 409. The join now returns the row
+     * regardless of its {@code is_active} state, and {@code msa.isActive} is projected alongside
+     * the id so {@link SalonBulkSetupCandidate#assignedToMaster()} /
+     * {@link SalonBulkSetupCandidate#hasInactiveAssignment()} can tell "already offered" (ACTIVE —
+     * still a conflict) apart from "previously unassigned" (INACTIVE — a reactivation candidate,
+     * not a conflict and not a fresh insert). Cardinality is unaffected: {@code master_services}'
+     * unique key still bounds the join to at most one row per definition regardless of its active
+     * state.
+     */
+    @Query("""
+            SELECT new com.beautica.service.repository.SalonBulkSetupCandidate(
+                       sd.serviceType.id, sd, msa.id, msa.isActive)
+            FROM ServiceDefinition sd
+            LEFT JOIN MasterServiceAssignment msa
+                   ON msa.serviceDefinition = sd
+                  AND msa.master.id = :masterId
+            WHERE sd.isActive = true
+              AND sd.serviceType.id IN :typeIds
+              AND ((sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+                        AND sd.ownerId = :salonId)
+                OR (sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
+                        AND sd.ownerId = :masterId))
+            """)
+    List<SalonBulkSetupCandidate> findSalonBulkSetupCandidates(
+            @Param("salonId") UUID salonId,
+            @Param("masterId") UUID masterId,
             @Param("typeIds") Collection<UUID> typeIds);
 
     /**

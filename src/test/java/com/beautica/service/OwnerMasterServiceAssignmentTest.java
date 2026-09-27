@@ -8,7 +8,6 @@ import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.MasterServiceResponse;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -19,7 +18,6 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -47,9 +45,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
     private ServiceTestFixtures fixtures;
 
     @BeforeEach
-    void configureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
+    void seedFixtures() {
         fixtures = new ServiceTestFixtures(restTemplate, jdbcTemplate, objectMapper, passwordEncoder);
     }
 
@@ -88,7 +84,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterId = enableOwnerMaster(ownerToken, salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Haircut");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // Act
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -133,7 +129,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterIdInSalonB = enableOwnerMaster(ownerBToken, salonBId);
         UUID serviceDefInSalonB = fixtures.createServiceDefinition(ownerBToken, salonBId, "Pedicure");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null, null, null);
 
         // Act — owner A tries to assign into salon B's master (which owner A does not own)
         ResponseEntity<String> resp = restTemplate.exchange(
@@ -158,7 +154,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterId = enableOwnerMaster(ownerToken, salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Threading");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
         ResponseEntity<String> assignResp = restTemplate.exchange(
                 "/api/v1/salons/" + salonId + "/masters/" + masterId + "/services",
                 HttpMethod.POST,
@@ -196,7 +192,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID masterId = enableOwnerMaster(ownerToken, salonId);
         UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Waxing");
 
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefId, null, null, null, null);
 
         // First assignment — must succeed
         ResponseEntity<String> firstResp = restTemplate.exchange(
@@ -237,7 +233,7 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
         UUID serviceDefInSalonB = fixtures.createServiceDefinition(ownerBToken, salonBId, "BotoxInject");
 
         // Act — owner A uses their own valid salonAId + masterAId but injects salonB's serviceDefId
-        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null);
+        var assignRequest = new AssignServiceToMasterRequest(serviceDefInSalonB, null, null, null, null);
         ResponseEntity<String> resp = restTemplate.exchange(
                 "/api/v1/salons/" + salonAId + "/masters/" + masterAId + "/services",
                 HttpMethod.POST,

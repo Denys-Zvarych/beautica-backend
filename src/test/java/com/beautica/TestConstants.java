@@ -1,5 +1,7 @@
 package com.beautica;
 
+import java.util.UUID;
+
 /**
  * Shared constants for the test suite.
  *
@@ -47,4 +49,19 @@ public final class TestConstants {
      */
     public static final String HASHED_TEST_PASSWORD =
             "$2b$04$hdRHhf50.zg190tE2wHX1OAdI5qUSG/zroaKUKvRr3IVLpexsXAR6";
+
+    /**
+     * Placeholder {@code cityId} for pure Mockito unit tests that build a
+     * {@code Salon}/{@code SalonResponse}/etc. in-memory fixture and never persist it — no real
+     * {@code cities} row is required because nothing reaches the database. As of V150,
+     * {@code salons.city_id} is {@code NOT NULL}, so every such fixture must set a non-null value
+     * regardless; a random UUID is safe here specifically because it is never flushed against the
+     * {@code fk_salons_city_id} constraint.
+     *
+     * <p>Tests that DO persist a {@code Salon} (repository / integration tests) must NOT use this
+     * constant — they need a real, seeded {@code cities.id} row and should call
+     * {@code AbstractDataJpaTest#testCityId()} or {@code AbstractIntegrationTest#testCityId()}
+     * instead, since the FK check runs on flush/insert.
+     */
+    public static final UUID DEFAULT_TEST_CITY_ID = UUID.randomUUID();
 }

@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -57,6 +58,17 @@ public interface PasswordResetTicketRepository extends JpaRepository<PasswordRes
     @Modifying
     @Query("UPDATE PasswordResetTicket t SET t.isUsed = true WHERE t.userId = :userId AND t.isUsed = false")
     void markAllUsedByUserId(@Param("userId") UUID userId);
+
+    /**
+     * Bulk sibling of {@link #markAllUsedByUserId} — marks every unused reset ticket used for
+     * every user in {@code userIds} in ONE statement. Added for the salon-deletion staff cascade
+     * (Phase 290 perf finding #1): {@code SalonService.deleteSalonStaff} previously called
+     * {@link #markAllUsedByUserId} once per staff member (N single-row round trips); this
+     * collapses that to exactly one bulk {@code UPDATE ... WHERE user_id IN (...)}.
+     */
+    @Modifying
+    @Query("UPDATE PasswordResetTicket t SET t.isUsed = true WHERE t.userId IN :userIds AND t.isUsed = false")
+    void markAllUsedByUserIdIn(@Param("userIds") Collection<UUID> userIds);
 
     /**
      * Bounded hard-delete of stale reset tickets whose TTL elapsed before {@code cutoff}.

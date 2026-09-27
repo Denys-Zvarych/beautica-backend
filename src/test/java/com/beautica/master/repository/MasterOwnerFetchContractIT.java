@@ -2,10 +2,10 @@ package com.beautica.master.repository;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.master.entity.Master;
+import com.beautica.support.HibernateStatistics;
 import jakarta.persistence.EntityManagerFactory;
 import org.assertj.core.api.SoftAssertions;
 import org.hibernate.Hibernate;
-import org.hibernate.SessionFactory;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -109,9 +109,7 @@ class MasterOwnerFetchContractIT extends AbstractIntegrationTest {
     // ── fixtures ──────────────────────────────────────────────────────────────
 
     private Statistics statistics() {
-        Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
-        statistics.setStatisticsEnabled(true);
-        return statistics;
+        return HibernateStatistics.enabledOn(emf);
     }
 
     private UUID insertUser(String role) {
@@ -128,9 +126,9 @@ class MasterOwnerFetchContractIT extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, "MOFC Salon");
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "MOFC Salon", testCityId());
         return salonId;
     }
 

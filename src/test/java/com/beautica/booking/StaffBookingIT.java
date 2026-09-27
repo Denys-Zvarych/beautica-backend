@@ -716,11 +716,20 @@ class StaffBookingIT extends AbstractIntegrationTest {
          * from the per-item column into this one (see {@link #CREATE_PER_ITEM_STATEMENTS}). No
          * statement was added that is not named above.
          *
+         * <p><b>Re-baselined again (V150, "a salon must always have a city"), 13 &rarr; 14.</b>
+         * Every salon test fixture now sets a real, non-null {@code cityId} ({@code
+         * seedSalonMaster}'s salon previously left it {@code NULL}), so item 9's {@code
+         * resolveLabels} city batch — skipped whenever its input set is empty — is now ALWAYS
+         * exercised, exactly as it will be in production for every real salon post-V150. Fixed, not
+         * per-item: both this test and its N=10 sibling below moved from 13 to 14 together, so the
+         * anti-N+1 property the pair exists to pin (N=10 costs exactly what N=1 costs) is
+         * unaffected.
+         *
          * <p>Measured against an isolated, freshly-seeded master per N (own salon, own working-hours
          * row, distinct guest phone) so no fixture reuse across N could shift the count via warm
          * caches or an already-loaded row.
          */
-        private static final long CREATE_FIXED_STATEMENTS = 13L;
+        private static final long CREATE_FIXED_STATEMENTS = 14L;
 
         /**
          * Per-CHAINED-ITEM cost: <b>ZERO</b>. Adding a service to the visit must not add a single
@@ -1010,8 +1019,8 @@ class StaffBookingIT extends AbstractIntegrationTest {
     private Seed seedSalonMaster() {
         UUID ownerId = insertUser("SALON_OWNER", null);
         UUID salonId = UUID.randomUUID();
-        jdbc.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                + "VALUES (?, ?, ?, true, NOW(), NOW())", salonId, ownerId, "Salon-" + salonId);
+        jdbc.update("INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                + "VALUES (?, ?, ?, true, NOW(), NOW(), ?)", salonId, ownerId, "Salon-" + salonId, testCityId());
         UUID masterId = UUID.randomUUID();
         jdbc.update("INSERT INTO masters (id, user_id, salon_id, master_type, is_active, created_at, updated_at) "
                 + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())", masterId, ownerId, salonId);

@@ -1,0 +1,144 @@
+-- Phase 322 audit fix (Finding 1 — MEDIUM, backend-perf; closes Finding 2 as a byproduct):
+-- GET /bookings/salon/{salonId}?partition= (the mobile salon «Архів» page) shipped with NO index
+-- covering its predicate, on the security-pass claim that `partition=HISTORY` is "no worse than the
+-- already-permitted unfiltered call". Measured, that claim is FALSE.
+--
+-- WHY THE PARTITION PREDICATE IS DIFFERENT IN KIND from the `?status=` filter it sits beside.
+-- BookingSpecifications#partition renders a predicate over TWO columns, one of which is compared to
+-- a RUNTIME instant:
+--   UPCOMING  status IN ('CONFIRMED') AND ends_at >= :now
+--   HISTORY   NOT (status IN ('CONFIRMED') AND ends_at >= :now)        <- the archive default
+--   PAST      status IN ('COMPLETED','NOT_COMPLETED','CONFIRMED')
+--             AND (status IN ('COMPLETED','NOT_COMPLETED')
+--                  OR (status IN ('CONFIRMED') AND ends_at < :now))
+-- Every pre-existing salon-scope index stops at `starts_at`, so `ends_at` can only ever be read
+-- FROM THE HEAP. That single missing column is what turns the COUNT companion
+-- (BookingRepositoryCustomImpl#countMatching, which runs on every FULL page) from an Index Only
+-- Scan into a Bitmap Heap Scan over every heap page the salon touches:
+--   * idx_bookings_salon_starts_at         (V19:  salon_id, starts_at DESC)
+--   * idx_bookings_salon_status_starts_at  (V22, narrowed by V113: salon_id, status, starts_at DESC
+--                                           WHERE status IN ('CONFIRMED','COMPLETED')) — carries
+--     `status` but not `ends_at`, and its partial predicate excludes CANCELLED/DECLINED, which
+--     HISTORY must return; so it cannot serve HISTORY at all.
+--   * idx_bookings_salon_master_starts_at  (V148: salon_id, master_id, starts_at DESC)
+--   * idx_bookings_salon_service_starts_at (V166: salon_id, master_service_id, starts_at DESC)
+--
+-- MEASURED BEFORE. Throwaway `perf322b` database, PG 16.13, 480 000 bookings / 60 000 in the target
+-- salon / 20 masters / 3 484 future CONFIRMED rows, full production index set + V167's extended
+-- statistics mirrored, ANALYZEd, `max_parallel_workers_per_gather = 0`, page 1 size 20,
+-- `ORDER BY starts_at DESC, id`, 3rd warm run. Shared buffers, id page + COUNT companion listed
+-- separately because one request issues BOTH:
+--
+--   shape                          id page          COUNT                        total
+--   baseline (no partition)         14 IdxScan       299 IdxOnly  HeapFetch 0      313
+--   ?status=COMPLETED                5 IdxScan       335 IdxOnly  HeapFetch 0      340
+--   partition=UPCOMING               5 IdxScan       678 BitmapHeap HeapBlk  647    683
+--   partition=HISTORY              103 IdxScan      1694 BitmapHeap HeapBlk 1396   1797
+--   partition=PAST                 103 IdxScan      1694 BitmapHeap HeapBlk 1396   1797
+--   partition=HISTORY + masterId    96 IdxScan      1420 BitmapHeap HeapBlk 1396   1516
+--
+-- `Heap Blocks: exact=1396` is EVERY heap page holding a row of this salon — the count reads the
+-- salon's whole physical footprint, not a page of it. That is 5.4x the unfiltered call this endpoint
+-- already permits (1797 vs 313), which is what falsifies the "no worse than unfiltered" claim. The
+-- master-chip row is the load-bearing one: it pays 1420 buffers to return 2 826 rows (one random
+-- heap fetch per row through V148's index) where the salon-wide count pays 1694 for 56 516 — 20x
+-- worse PER ROW than the shape it is supposed to narrow, and mobile Phase 343's archive makes it the
+-- DEFAULT chip interaction rather than an edge case. By this table's own shipped bar — V166 for
+-- 82 -> 4 and V167 for 2362 -> 441 — this clears it.
+--
+-- FIX: extend both salon-scope shapes past `starts_at` with the two columns the partition predicate
+-- actually reads, so `status` and `ends_at` are evaluated against the INDEX TUPLE and the COUNT
+-- becomes an Index Only Scan. `starts_at DESC` stays third/second (immediately before them) because
+-- it is the sort key: the filter columns must go AFTER it or the index stops serving
+-- `ORDER BY starts_at DESC` and the Incremental Sort becomes a blocking one.
+--
+-- MEASURED AFTER (same fixture, same methodology):
+--
+--   shape                          id page          COUNT                        total     delta
+--   baseline (no partition)         14 IdxScan       299 IdxOnly  HeapFetch 0      313    unchanged
+--   ?status=COMPLETED                5 IdxScan       335 IdxOnly  HeapFetch 0      340    unchanged
+--   partition=UPCOMING               5 IdxScan       495 IdxOnly  HeapFetch 0      500     -27%
+--   partition=HISTORY              103 IdxScan       495 IdxOnly  HeapFetch 0      598     -67%
+--   partition=PAST                 103 IdxScan       495 IdxOnly  HeapFetch 0      598     -67%
+--   partition=HISTORY + masterId    97 IdxScan        35 IdxOnly  HeapFetch 0      132     -91%
+--
+-- Cost: +31 MB for the new salon-wide index; 27 MB -> 39 MB for the rebuilt salon+master one, at
+-- 480 000 rows.
+--
+-- ── V19 IS DELIBERATELY KEPT, NOT SUPERSEDED ──────────────────────────────────────────────────────
+-- (salon_id, starts_at DESC) is a strict leading PREFIX of the new (salon_id, starts_at DESC,
+-- status, ends_at), so dropping it looks free. Measured, it is not: with V19 dropped, the baseline
+-- COUNT does NOT fall onto the new wider index — the planner picks
+-- idx_bookings_salon_service_starts_at (V166) instead and the baseline regresses 299 -> 432 buffers
+-- (+44%). The narrow index is the cheapest Index Only Scan for the no-filter shape precisely BECAUSE
+-- it is narrow (19 MB of leaf pages against 31 MB), and the no-filter shape is the salon «Записи»
+-- board's default request. Do NOT "clean up" V19 in a later migration without re-running this
+-- measurement.
+--
+-- V148 IS a strict prefix of the new salon+master index AND has no such counter-measurement (its
+-- shape is only ever reached WITH a master_id equality, which the wider index answers identically),
+-- so that one is REPLACED rather than kept — carrying both would be pure write amplification.
+--
+-- ── REJECTED ALTERNATIVE: V130's partial-index shape, at salon scope ──────────────────────────────
+-- V130 solved the MASTER-scope partition=PAST case with a partial index
+-- (master_id, starts_at DESC, id) WHERE status IN ('COMPLETED','NOT_COMPLETED','CONFIRMED'), which
+-- is why BookingSpecifications#partition's PAST arm carries its redundant outer `statusIn` conjunct.
+-- The salon twin of that index was built and measured here, and it buys NOTHING:
+--   * HISTORY — completely unaffected (103 / 1694, byte-identical to no index at all). HISTORY
+--     admits CANCELLED and DECLINED, so it cannot imply that partial WHERE, and HISTORY is the
+--     archive's DEFAULT partition.
+--   * PAST — id page 103 -> 111 (marginally WORSE), COUNT still 1694 BitmapHeap HeapBlk 1396
+--     (UNCHANGED). Without `ends_at` in the index the CONFIRMED-and-elapsed OR-leg still needs the
+--     heap, so the Index Only Scan never materialises.
+-- 25 MB of write amplification for a measured zero. The covering shape below is what the predicate
+-- actually needs; a partial predicate is the wrong tool for a filter over a RUNTIME instant.
+--
+-- ── NOT FIXED HERE, and deliberately so: the id page's future-tail walk ───────────────────────────
+-- The id page stays at 103 buffers / 3 484 Rows Removed by Filter for HISTORY and PAST, because
+-- `ORDER BY starts_at DESC` walks newest-first and EVERY future booking is newest — so any partition
+-- that excludes the future book must skip past all of it before its first row. Its cost tracks how
+-- far ahead the salon books, not how much history it has. Measured: a variant of both indexes with a
+-- trailing `id` column DOES halve that (103 -> 40, Index Only Scan, Heap Fetches 0), and it is still
+-- the wrong trade — the wider index inflates the COUNT half more than it saves on the id page
+-- (HISTORY total 598 -> 668) and drags `?status=COMPLETED`'s id page off V113's index (5 -> 40). A
+-- partial index excluding future rows cannot exist: its predicate would have to reference `now()`,
+-- which is not IMMUTABLE (same constraint V145 documents). Accepted at 103 buffers — 17x smaller
+-- than the COUNT it accompanies, and bounded by the future book rather than by history volume.
+--
+-- ── Plain CREATE/DROP INDEX, no CONCURRENTLY ──────────────────────────────────────────────────────
+-- Matching every prior index migration on this table (V112, V138, V142, V145, V148, V166) and this
+-- repo's only convention: Flyway runs each migration inside a transaction, and neither CREATE INDEX
+-- CONCURRENTLY nor DROP INDEX CONCURRENTLY can run inside one. No migration in this project uses
+-- CONCURRENTLY anywhere, so introducing it here would be an unestablished one-off.
+--
+-- Same lock argument, same table and the same 5s/1min values as V138:61 — CREATE INDEX takes SHARE
+-- on `bookings` (conflicts with ROW EXCLUSIVE, so it blocks every write for the whole build) and the
+-- DROP takes ACCESS EXCLUSIVE (V118:22); Postgres lock requests are FIFO, so a pending request
+-- queues every subsequent reader behind it while the old instance still serves a Railway rolling
+-- deploy, and Hikari's pool-size 10 / 20s connection timeout surfaces that as app-wide 500s within
+-- seconds. Fail fast; Flyway rolls this transaction back cleanly and the next deploy retries it.
+--
+-- Read the unit literally (V120:42, V121:47, V137:28, V138:50): statement_timeout is applied PER
+-- STATEMENT and re-armed for each one — there is no transaction-wide equivalent. THREE statements
+-- follow here, not V138's one, so the literal ceiling is 3x1min, not 1min. That is still the right
+-- bound: each individual statement is a single index build or unlink on one table, so 1min each is
+-- the per-operation ceiling being expressed, and lowering it to fit a 1min total would risk aborting
+-- a legitimately slow index build on a large production table — which crash-loops the deploy instead
+-- of converging (memory `project_flyway_checksum_recovery.md`).
+--
+-- SET LOCAL: scoped to Flyway's per-migration transaction, so neither value leaks to the pooled
+-- connection once this migration commits.
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '1min';
+
+-- (1) NEW, salon-wide. Serves partition= with no master chip. V19 is kept (see above).
+CREATE INDEX idx_bookings_salon_partition_starts_at
+    ON bookings (salon_id, starts_at DESC, status, ends_at);
+
+-- (2) REPLACES idx_bookings_salon_master_starts_at (V148), of which it is a strict superset.
+-- Created BEFORE the drop so the prefix shape is never absent from the catalog, even though
+-- Flyway's single transaction makes the pair atomic anyway.
+CREATE INDEX idx_bookings_salon_master_partition_starts_at
+    ON bookings (salon_id, master_id, starts_at DESC, status, ends_at);
+
+DROP INDEX IF EXISTS idx_bookings_salon_master_starts_at;

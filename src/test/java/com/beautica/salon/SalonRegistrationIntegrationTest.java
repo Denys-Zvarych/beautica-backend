@@ -10,6 +10,7 @@ import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.SalonService;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
+import com.beautica.user.UserService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -55,6 +56,10 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    /** Phase 265 — the service that derives {@code hasMasterProfile} on the GET-profile path. */
+    @Autowired
+    private UserService userService;
+
     @AfterEach
     void cleanUp() {
         // FK order: masters → salons → users (parent rows)
@@ -72,8 +77,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     void should_autoCreateOwnerMaster_on_firstSalonCreation() {
         // Arrange
         UUID ownerId = persistOwner("owner-first@beautica.test");
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var request = new CreateSalonRequest(
                 "Velvet Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
 
@@ -114,8 +118,7 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
     void should_notAutoCreateMaster_on_secondSalonCreation() {
         // Arrange
         UUID ownerId = persistOwner("owner-second@beautica.test");
-        UUID cityId = jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        UUID cityId = majorCityIdByName("Вінниця");
         var firstRequest = new CreateSalonRequest(
                 "First Studio", null, "Kyiv", null, null, null, null, cityId, null, VALID_STREET, VALID_BUILDING_NO, null);
         var secondRequest = new CreateSalonRequest(
@@ -140,6 +143,37 @@ class SalonRegistrationIntegrationTest extends AbstractIntegrationTest {
         assertThat(masterCount)
                 .as("owner must still have exactly one master row after creating a second salon")
                 .isEqualTo(1);
+    }
+
+    // ── Phase 265 — the derived flag reads the auto-created row ────────────────
+
+    @Test
+    @DisplayName("Phase 265 D2 — hasMasterProfile reads true immediately after first-salon "
+            + "registration, with no explicit opt-in")
+    void should_readHasMasterProfileTrue_when_ownerRegistersTheirFirstSalon() {
+        // Arrange — Phase 265 test case 8. The test above pins that createSalon WRITES the
+        // owner-master row; this one pins that GET /users/me's derived hasMasterProfile READS it.
+        // The two are separately breakable and the gap between them is exactly D2: mobile renders
+        // «Я також працюю як майстер» CHECKED on first paint for every owner registered to date.
+        // If createSalon ever stops auto-calling createMasterForOwner, D2 silently becomes false
+        // and every existing owner is shown an unchecked box describing a state they are not in —
+        // a defect no repository-level assertion above would notice.
+        UUID ownerId = persistOwner("owner-defaulton@beautica.test");
+        UUID cityId = majorCityIdByName("Вінниця");
+        var request = new CreateSalonRequest(
+                "Default On Studio", null, "Kyiv", null, null, null, null, cityId, null,
+                VALID_STREET, VALID_BUILDING_NO, null);
+
+        // Act — registration ONLY. The owner-as-master toggle endpoints are never called.
+        salonService.createSalon(ownerId, request);
+
+        // Assert
+        assertThat(userService.getProfile(ownerId).hasMasterProfile())
+                .as("createSalon auto-creates the active SALON_OWNER master row, so the derived "
+                        + "flag must read true without any explicit opt-in (Phase 265 D2) — a "
+                        + "client that assumes false-until-proven-otherwise is wrong for every "
+                        + "owner registered to date")
+                .isTrue();
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

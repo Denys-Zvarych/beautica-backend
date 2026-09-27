@@ -495,9 +495,9 @@ class BookingMasterServiceIT extends AbstractIntegrationTest {
                 ownerId, "owner-" + System.nanoTime() + "@beautica.test");
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, ?, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + salonId, active);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, ?, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + salonId, active, testCityId());
         return salonId;
     }
 

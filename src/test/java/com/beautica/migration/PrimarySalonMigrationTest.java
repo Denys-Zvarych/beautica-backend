@@ -68,8 +68,8 @@ class PrimarySalonMigrationTest extends AbstractIntegrationTest {
 
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active) VALUES (?, ?, ?, ?)",
-                salonId, userId, "Migration Test Salon", true);
+                "INSERT INTO salons (id, owner_id, name, is_active, city_id) VALUES (?, ?, ?, ?, ?)",
+                salonId, userId, "Migration Test Salon", true, testCityId());
 
         Boolean isPrimary = jdbcTemplate.queryForObject(
                 "SELECT is_primary FROM salons WHERE id = ?", Boolean.class, salonId);
@@ -135,13 +135,13 @@ class PrimarySalonMigrationTest extends AbstractIntegrationTest {
 
         UUID firstSalonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, is_primary) VALUES (?, ?, ?, ?, ?)",
-                firstSalonId, userId, "First Primary Salon", true, true);
+                "INSERT INTO salons (id, owner_id, name, is_active, is_primary, city_id) VALUES (?, ?, ?, ?, ?, ?)",
+                firstSalonId, userId, "First Primary Salon", true, true, testCityId());
 
         assertThatThrownBy(() ->
                 jdbcTemplate.update(
-                        "INSERT INTO salons (id, owner_id, name, is_active, is_primary) VALUES (?, ?, ?, ?, ?)",
-                        UUID.randomUUID(), userId, "Second Primary Salon", true, true))
+                        "INSERT INTO salons (id, owner_id, name, is_active, is_primary, city_id) VALUES (?, ?, ?, ?, ?, ?)",
+                        UUID.randomUUID(), userId, "Second Primary Salon", true, true, testCityId()))
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .as("idx_salons_owner_primary must reject a second is_primary=true row for the same owner");
     }
@@ -158,11 +158,11 @@ class PrimarySalonMigrationTest extends AbstractIntegrationTest {
                 "SALON_OWNER");
 
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, is_primary) VALUES (?, ?, ?, ?, ?)",
-                UUID.randomUUID(), userId, "Non-Primary One", true, false);
+                "INSERT INTO salons (id, owner_id, name, is_active, is_primary, city_id) VALUES (?, ?, ?, ?, ?, ?)",
+                UUID.randomUUID(), userId, "Non-Primary One", true, false, testCityId());
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, is_primary) VALUES (?, ?, ?, ?, ?)",
-                UUID.randomUUID(), userId, "Non-Primary Two", true, false);
+                "INSERT INTO salons (id, owner_id, name, is_active, is_primary, city_id) VALUES (?, ?, ?, ?, ?, ?)",
+                UUID.randomUUID(), userId, "Non-Primary Two", true, false, testCityId());
 
         Integer count = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM salons WHERE owner_id = ? AND is_primary = false",

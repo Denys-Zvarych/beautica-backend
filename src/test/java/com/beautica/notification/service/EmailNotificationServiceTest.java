@@ -39,6 +39,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -408,6 +409,164 @@ class EmailNotificationServiceTest {
         assertThat(toHeader).doesNotContain("\r");
         assertThat(toHeader).doesNotContain("\n");
         assertThat(toHeader).contains("master@example.com");
+    }
+
+    // -------------------------------------------------------------------------
+    // sendSalonClosedEmail (Phase 269/293)
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("sendSalonClosedEmail renders the salon-closed template with all vars and a formatted startsAt")
+    void should_callMailSenderSend_when_sendSalonClosedEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>salon-closed</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendSalonClosedEmail("client@example.com", BookingVisit.single(booking));
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        verify(mailSender).send(realMessage);
+
+        assertThat(templateCaptor.getValue()).isEqualTo("email/salon-closed");
+        assertThat(realMessage.getSubject()).isEqualTo("Салон закрито — ваше бронювання скасовано");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
+        assertThat(captured.getVariable("visitDuration")).isNull();
+        // UTC 09:00 on 2025-07-01 = Kyiv (UTC+3) 12:00 same date
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
+        // D10 pin (mutation-checked, Phase 269 test case 14): per the locked track-25 rule, notes
+        // are never rendered into a notification — this template must not carry
+        // providerComment/clientComment/clientCancellationNote at all.
+        assertThat(captured.getVariable("providerComment")).isNull();
+        assertThat(captured.getVariable("clientComment")).isNull();
+        assertThat(captured.getVariable("clientCancellationNote")).isNull();
+        // Structural half of the same pin — a value-only assertion above would stay green even
+        // if a mutant wired in a booking whose note happens to be null too (an unstubbed mock
+        // already returns null for every method). Asserting the ACCESSOR is never called is what
+        // actually catches "notes wired in" mutants regardless of the stubbed value.
+        verify(booking, never()).getProviderComment();
+        verify(booking, never()).getClientComment();
+        verify(booking, never()).getClientCancellationNote();
+    }
+
+    @Test
+    @DisplayName("sendSalonClosedEmail passes EVERY declined service of a multi-service visit into "
+            + "the template context, with the plural label and the visit-level duration (D12)")
+    void should_passEveryService_when_sendSalonClosedEmailCalledForVisit() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>visit</html>");
+        OffsetDateTime start = OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Манікюр", start);
+        lenient().when(lead.getEndsAt()).thenReturn(start.plusMinutes(45));
+        lenient().when(lead.getDurationMinutesAtBooking()).thenReturn(45);
+        Booking second = buildVisitItemMock("Педикюр", start.plusMinutes(45), 45);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendSalonClosedEmail("client@example.com", BookingVisit.of(lead, List.of(lead, second)));
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
+        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
+    }
+
+    @Test
+    @DisplayName("sendSalonClosedEmail strips CRLF from the To address before setTo is called")
+    void should_stripCrlf_when_sendSalonClosedEmailCalledWithInjectedNewline() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>salon-closed</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+
+        service.sendSalonClosedEmail("client@example.com\r\n", BookingVisit.single(booking));
+
+        assertThat(realMessage.getRecipients(Message.RecipientType.TO))
+                .isNotNull()
+                .hasSize(1);
+        String toHeader = realMessage.getRecipients(Message.RecipientType.TO)[0].toString();
+        assertThat(toHeader).doesNotContain("\r");
+        assertThat(toHeader).doesNotContain("\n");
+        assertThat(toHeader).contains("client@example.com");
+    }
+
+    // -------------------------------------------------------------------------
+    // sendMasterRemovedEmail (Phase 298) — sibling of sendSalonClosedEmail, deliberately NOT a
+    // reuse (the salon did not close, only the master left it).
+    // -------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("sendMasterRemovedEmail renders the master-removed template (not salon-closed) "
+            + "with all vars and a formatted startsAt")
+    void should_callMailSenderSend_when_sendMasterRemovedEmailCalled() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>master-removed</html>");
+        Booking booking = buildBookingMock(
+                "Тест", "Клієнт", "Майстер", "Іванов", "Тест послуга",
+                OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC)
+        );
+        ArgumentCaptor<String> templateCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendMasterRemovedEmail("client@example.com", BookingVisit.single(booking));
+
+        verify(templateEngine).process(templateCaptor.capture(), contextCaptor.capture());
+        verify(mailSender).send(realMessage);
+
+        assertThat(templateCaptor.getValue()).isEqualTo("email/master-removed");
+        assertThat(realMessage.getSubject())
+                .isEqualTo("Майстра більше немає в салоні — ваше бронювання скасовано");
+
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("clientName")).isEqualTo("Тест Клієнт");
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Тест послуга"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуга");
+        assertThat(captured.getVariable("visitDuration")).isNull();
+        assertThat((String) captured.getVariable("startsAt")).isEqualTo("12:00, 1 липня 2025");
+        // D10 pin, same posture as sendSalonClosedEmail's own case 14.
+        assertThat(captured.getVariable("providerComment")).isNull();
+        assertThat(captured.getVariable("clientComment")).isNull();
+        assertThat(captured.getVariable("clientCancellationNote")).isNull();
+        verify(booking, never()).getProviderComment();
+        verify(booking, never()).getClientComment();
+        verify(booking, never()).getClientCancellationNote();
+    }
+
+    @Test
+    @DisplayName("sendMasterRemovedEmail passes EVERY declined service of a multi-service visit "
+            + "into the template context, with the plural label and the visit-level duration (D12)")
+    void should_passEveryService_when_sendMasterRemovedEmailCalledForVisit() throws Exception {
+        MimeMessage realMessage = new MimeMessage(Session.getInstance(new Properties()));
+        when(mailSender.createMimeMessage()).thenReturn(realMessage);
+        when(templateEngine.process(anyString(), any(IContext.class))).thenReturn("<html>visit</html>");
+        OffsetDateTime start = OffsetDateTime.of(2025, 7, 1, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking lead = buildBookingMock("Тест", "Клієнт", "Майстер", "Іванов", "Манікюр", start);
+        lenient().when(lead.getEndsAt()).thenReturn(start.plusMinutes(45));
+        lenient().when(lead.getDurationMinutesAtBooking()).thenReturn(45);
+        Booking second = buildVisitItemMock("Педикюр", start.plusMinutes(45), 45);
+        ArgumentCaptor<IContext> contextCaptor = ArgumentCaptor.forClass(IContext.class);
+
+        service.sendMasterRemovedEmail("client@example.com", BookingVisit.of(lead, List.of(lead, second)));
+
+        verify(templateEngine).process(anyString(), contextCaptor.capture());
+        Context captured = (Context) contextCaptor.getValue();
+        assertThat(captured.getVariable("serviceNames")).isEqualTo(List.of("Манікюр", "Педикюр"));
+        assertThat(captured.getVariable("serviceLabel")).isEqualTo("Послуги");
+        assertThat((String) captured.getVariable("visitDuration")).isEqualTo("1 год 30 хв (до 13:30)");
     }
 
     // -------------------------------------------------------------------------
@@ -1038,8 +1197,10 @@ class EmailNotificationServiceTest {
         lenient().when(masterUser.getFirstName()).thenReturn(masterFirstName);
         lenient().when(masterUser.getLastName()).thenReturn(masterLastName);
 
-        Master master = mock(Master.class);
-        lenient().when(master.getUser()).thenReturn(masterUser);
+        // A REAL Master, not a mock (phase 294): the email templates read the provider's name via
+        // Master#displayFirstName()/#displayLastName(). Only a real instance runs that
+        // attached-vs-detached branch; stubbing the accessors would assert the fixture, not the code.
+        Master master = Master.builder().user(masterUser).build();
 
         ServiceDefinition serviceDefinition = mock(ServiceDefinition.class);
         when(serviceDefinition.getName()).thenReturn(serviceName);

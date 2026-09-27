@@ -74,9 +74,9 @@ public abstract class AbstractRatingVisibilityIT extends AbstractIntegrationTest
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, avg_rating, review_count, is_active, "
-                        + "created_at, updated_at) "
-                        + "VALUES (?, ?, ?, 0.00, 0, true, NOW(), NOW())",
-                salonId, ownerId, "Salon-" + ownerId);
+                        + "created_at, updated_at, city_id) "
+                        + "VALUES (?, ?, ?, 0.00, 0, true, NOW(), NOW(), ?)",
+                salonId, ownerId, "Salon-" + ownerId, testCityId());
         return salonId;
     }
 

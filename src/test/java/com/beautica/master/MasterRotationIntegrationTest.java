@@ -9,7 +9,6 @@ import com.beautica.master.dto.MasterDetailResponse;
 import com.beautica.master.dto.RotateMasterRequest;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -21,10 +20,8 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.util.UUID;
 
@@ -57,24 +54,6 @@ class MasterRotationIntegrationTest extends AbstractIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
-
-    @BeforeEach
-    void resetRestTemplate() {
-        // The Spring test context is cached across test classes with identical configuration
-        // (this class and SalonAdminRotationIntegrationTest both @Import(TestSecurityConfig.class)),
-        // so when both run in the same JVM the singleton TestRestTemplate bean is SHARED. Plain
-        // JDK-backed SimpleClientHttpRequestFactory (the framework default when nothing else
-        // configures the factory) does not support PATCH at all on this JDK (HttpURLConnection
-        // rejects it with ProtocolException: "Invalid HTTP method: PATCH"), so this class cannot
-        // just "reset to the default" — it must pin an explicit factory that (a) actually supports
-        // PATCH and (b) is deterministic no matter what a sibling test class wired onto the shared
-        // bean beforehand or afterward. Explicitly (re)configure the same Apache HttpClient5-backed
-        // factory SalonAdminRotationIntegrationTest uses, in every @BeforeEach, so every test in
-        // this class runs against a known, working, freshly-built HTTP client regardless of
-        // execution order relative to sibling classes sharing the same context.
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
 
     @Test
     @DisplayName("200 when SALON_OWNER rotates a SALON_MASTER between two salons they own; master-detail cache reflects the new salon immediately")
@@ -522,16 +501,16 @@ class MasterRotationIntegrationTest extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, true, NOW(), NOW())",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, true, NOW(), NOW(), ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 
     private UUID insertInactiveSalon(UUID ownerId, String name) {
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at) VALUES (?, ?, ?, false, NOW(), NOW())",
-                salonId, ownerId, name);
+                "INSERT INTO salons (id, owner_id, name, is_active, created_at, updated_at, city_id) VALUES (?, ?, ?, false, NOW(), NOW(), ?)",
+                salonId, ownerId, name, testCityId());
         return salonId;
     }
 

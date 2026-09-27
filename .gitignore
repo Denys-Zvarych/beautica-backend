@@ -119,3 +119,24 @@ logs/
 CLAUDE.md
 PLAN-backend.md
 memory/
+
+# ============================================================
+# Locality classifier snapshots (Phase 325)
+# ============================================================
+# The regenerated KATOTTH snapshot is a 5.6 MB intermediate of
+# scripts/locality/build_settlement_import.py. NOTHING reads it at build or at
+# runtime -- V171 reads only src/main/resources/db/data/settlements.csv, which
+# this snapshot is one input to. Committing it would put a multi-megabyte blob
+# in every clone for zero consumers. Regenerate it on demand:
+#   python3 scripts/locality/build_settlement_import.py
+docs/backend-phases/data/katottg-2025-07-02-free.json
+# Phase 10.2 raw classifier snapshot (V53's source). UNTRACKED under the occupied-territory
+# data ban (tier 1: raw snapshots are never committed): it was only oblast-prefix-filtered and
+# still carries ~1 100 codes of Phase 324's per-settlement exclusion set. Nothing reads it at
+# build, test or runtime — V53 is the authoritative artefact and extract_katotth_seed.py takes
+# the snapshot path as an argument. OccupiedSettlementCodesGuardTest scans EVERY committable
+# file (git ls-files --cached --others --exclude-standard: tracked + untracked-not-ignored, any
+# path, any extension) and fails if one carries an excluded code beyond its exact-count
+# allow-list entry. Ignoring this file is what keeps it out of that scan -- un-ignore it and
+# the guard goes red.
+docs/backend-phases/data/katottg-2025-05-16.json

@@ -101,9 +101,9 @@ class V105SalonInstagramConstraintMigrationTest extends AbstractIntegrationTest 
     private UUID insertSalon(UUID ownerId, String instagramUrl) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, instagram_url) "
-                        + "VALUES (?, ?, ?, true, ?)",
-                id, ownerId, "V105 Test Salon", instagramUrl);
+                "INSERT INTO salons (id, owner_id, name, is_active, instagram_url, city_id) "
+                        + "VALUES (?, ?, ?, true, ?, ?)",
+                id, ownerId, "V105 Test Salon", instagramUrl, testCityId());
         return id;
     }
 }

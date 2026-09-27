@@ -285,9 +285,9 @@ class V102HardeningConstraintsMigrationTest extends AbstractIntegrationTest {
     private UUID insertSalon(UUID ownerId, String street, String buildingNo, String locationNote) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO salons (id, owner_id, name, is_active, street, building_no, location_note) "
-                        + "VALUES (?, ?, ?, true, ?, ?, ?)",
-                id, ownerId, "V102 Test Salon", street, buildingNo, locationNote);
+                "INSERT INTO salons (id, owner_id, name, is_active, street, building_no, location_note, city_id) "
+                        + "VALUES (?, ?, ?, true, ?, ?, ?, ?)",
+                id, ownerId, "V102 Test Salon", street, buildingNo, locationNote, testCityId());
         return id;
     }
 
@@ -372,10 +372,19 @@ class V102HardeningConstraintsMigrationTest extends AbstractIntegrationTest {
         return id;
     }
 
+    /**
+     * V170 added {@code cities.settlement_type} as {@code NOT NULL} and then deliberately dropped
+     * its {@code 'CITY'} DEFAULT, so every insert must now state the type. Omitting it made this
+     * helper die on {@code null value in column "settlement_type"} BEFORE
+     * {@code chk_cities_katotth_code_format} could fire — which is exactly why both callers assert
+     * the CHECK constraint by NAME rather than on a bare {@code DataIntegrityViolationException}:
+     * the weaker assertion would have gone green against the wrong constraint. Keep it named.
+     */
     private UUID insertCity(UUID oblastId, String katotthCode) {
         UUID id = UUID.randomUUID();
         jdbcTemplate.update(
-                "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en, settlement_type) "
+                        + "VALUES (?, ?, ?, ?, ?, 'CITY')",
                 id, oblastId, katotthCode, LOCALITY_MARKER + "-city-" + id, "V102 Test City");
         return id;
     }

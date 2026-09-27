@@ -1,6 +1,10 @@
 package com.beautica.salon.dto;
 
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.salon.entity.Salon;
+
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -15,15 +19,34 @@ import java.util.UUID;
  * nothing but the legacy free-text {@code city} / {@code region} / {@code address} fields,
  * which {@code SalonService} stopped writing as of Phase 10.6 — every salon created/edited
  * since then showed no location at all on its public profile. The legacy fields are kept on
- * the wire for backward-compatible clients. No name resolution is done here — like
- * {@code SalonResponse} and {@code MasterDetailResponse}, only raw taxonomy UUIDs are
- * returned; the client resolves human-readable names via {@code /locations/*}.
+ * the wire for backward-compatible clients. The settlement's display parts
+ * ({@code citySettlementType}, ambiguous-only {@code cityHromadaNameUk}) are resolved by the
+ * caller and passed in, so the client can compose the full settlement label beside
+ * {@code city}/{@code region}.
  *
  * <p>No masking is applied to the locality fields, unlike
  * {@link com.beautica.master.dto.MasterDetailResponse#fromPublic}, which masks a
  * salon-affiliated master's precise address because that address is the salon's own business
  * address duplicated onto the master. A salon's business address IS the thing salon
  * discovery exists to surface — masking it here would defeat the endpoint's purpose.
+ *
+ * <p>{@code oblastId} was added as a follow-up to the {@code SalonResponse#oblastId} rollout:
+ * {@code GET /salons/{salonId}} (unauthenticated, {@code permitAll}) is the ONLY load path the
+ * mobile owner/admin salon-management screen actually uses, so leaving {@code oblastId} off this
+ * DTO stranded the field the address-edit cascade needs. Not a disclosure concern (§I) — this
+ * DTO already exposes {@code cityId}/{@code districtId} unmasked, and oblast is simply the
+ * public, static parent tier of an already-public city in the government-territory taxonomy; see
+ * {@code backend-security} audit note on commit {@code f00b6f1}. Like {@code SalonResponse}, it
+ * is derived from {@code cityId} at read time (never stored) — callers pass the resolved value
+ * in; see {@link #from(Salon, UUID, SettlementDisplayNames)}.
+ *
+ * <p>{@code phone} was added for the same reason as {@code oblastId}: this endpoint is the ONLY
+ * load path the mobile owner/admin salon-profile screen uses, so omitting the phone left the
+ * «Контакти» block blank on a freshly registered salon until the owner happened to PATCH the
+ * contacts form (which returns {@link SalonResponse}, where {@code phone} has always been
+ * present). Exposing it is deliberate, not a §I regression — the salon phone is a business
+ * contact published to clients, the direct analogue of the {@code instagramUrl} already on this
+ * DTO, and carries no natural-person identity. Do not "harden" this by stripping it again.
  */
 public record PublicSalonResponse(
         UUID id,
@@ -32,30 +55,82 @@ public record PublicSalonResponse(
         String city,
         String region,
         String address,
+        @Schema(
+                format = "uuid",
+                requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Taxonomy city. Every salon has one — salons.city_id is DB-level "
+                        + "NOT NULL (V150/V151) and application-enforced from Phase 10.6 "
+                        + "(LocalityWriteValidator). Never null on the wire.")
         UUID cityId,
+        @Schema(
+                format = "uuid",
+                requiredMode = Schema.RequiredMode.REQUIRED,
+                description = "Parent oblast of cityId, resolved at read time (see #from). "
+                        + "cities.oblast_id is itself DB-level NOT NULL with a FK to oblasts, "
+                        + "and cityId is guaranteed non-null and FK-valid, so resolution always "
+                        + "succeeds. Never null on the wire.")
+        UUID oblastId,
+        // Optional — a city without urban districts legitimately has none (§ locked decision).
         UUID districtId,
         String street,
         String buildingNo,
         String locationNote,
+        @Schema(
+                description = "Salon's public business contact number. Intentionally exposed on "
+                        + "this permitAll path: it is the contact clients are meant to call, the "
+                        + "same value already returned by GET /salons/mine and rendered in the "
+                        + "app's «Контакти» block alongside instagramUrl. Not personal data of a "
+                        + "natural person, so §I does not apply. Optional — a salon may have none.")
+        String phone,
         String instagramUrl,
         String avatarUrl,
         String coverImageUrl,
         BigDecimal avgRating,
-        int reviewCount
+        int reviewCount,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Kind of the settlement behind cityId, so the client can prefix "
+                        + "the saved-locality label (м./смт/с./с-ще) exactly as for a "
+                        + "GET /settlements row. Resolved at read time; null only if cityId "
+                        + "does not resolve.")
+        SettlementType citySettlementType,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Bare hromada adjective of the settlement behind cityId, populated "
+                        + "ONLY when its name is ambiguous within its oblast (same rule as "
+                        + "GET /settlements hromadaNameUk); null otherwise. The oblast half of "
+                        + "the label is `region`.")
+        String cityHromadaNameUk
 ) {
-    public static PublicSalonResponse from(Salon salon) {
+    /**
+     * @param salon    the salon entity
+     * @param oblastId the PK of the Oblast that owns {@code salon.getCityId()}, resolved by
+     *                 the caller (see {@code SalonService#resolveOblastId}). Never {@code null}
+     *                 for a persisted salon — {@code cityId} is DB-level NOT NULL (V150/V151)
+     *                 and FK-valid, and {@code cities.oblast_id} is itself NOT NULL with a FK
+     *                 to {@code oblasts}, so the resolution always succeeds.
+     * @param settlement resolved label parts of {@code salon.getCityId()} (see
+     *                   {@code SettlementDisplayNameResolver}), or {@code null} when unresolved —
+     *                   supplies {@code citySettlementType} and {@code cityHromadaNameUk}
+     */
+    public static PublicSalonResponse from(
+            Salon salon, UUID oblastId, SettlementDisplayNames settlement) {
         return new PublicSalonResponse(
                 salon.getId(),
                 salon.getName(),
                 salon.getDescription(),
                 salon.getCity(),
                 salon.getRegion(),
-                salon.getAddress(),
+                legacyAddress(salon),
                 salon.getCityId(),
+                oblastId,
                 salon.getDistrictId(),
                 salon.getStreet(),
                 salon.getBuildingNo(),
                 salon.getLocationNote(),
+                salon.getPhone(),
                 salon.getInstagramUrl(),
                 salon.getAvatarUrl(),
                 salon.getCoverImageUrl(),
@@ -63,7 +138,26 @@ public record PublicSalonResponse(
                 // regardless of what happens to be persisted in the column (anti-bug §A/§I
                 // spirit: never surface a fabricated "0.00" rating on a public DTO).
                 salon.getReviewCount() == 0 ? null : salon.getAvgRating(),
-                salon.getReviewCount()
+                salon.getReviewCount(),
+                settlement == null ? null : settlement.settlementType(),
+                settlement == null ? null : settlement.hromadaNameUk()
         );
+    }
+
+    /**
+     * The legacy free-text {@code address}, or {@code null} once the salon has a structured
+     * {@code street}. Create no longer stores {@code address} and Update never could, so an owner
+     * cannot correct or remove it — yet it was served publicly. Mobile renders it only as the
+     * fallback line when {@code street} is absent, so suppressing it whenever {@code street} is
+     * present changes nothing visible while stopping the leak. The column itself is untouched
+     * (clearing it is destructive and left to a product decision). Shared with
+     * {@link SalonResponse#from} so both shapes apply one rule.
+     *
+     * @param salon the salon entity
+     * @return the legacy address, or {@code null} when a structured street supersedes it
+     */
+    public static String legacyAddress(Salon salon) {
+        String street = salon.getStreet();
+        return street != null && !street.isBlank() ? null : salon.getAddress();
     }
 }

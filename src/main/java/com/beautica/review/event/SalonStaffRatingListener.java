@@ -60,7 +60,7 @@ public class SalonStaffRatingListener {
 
     private static final Logger log = LoggerFactory.getLogger(SalonStaffRatingListener.class);
 
-    /** Public profile of one salon, keyed by salonId — see {@code SalonService#getSalonEntity}. */
+    /** Public profile of one salon, keyed by salonId — see {@code SalonService#getPublicSalon}. */
     private static final String SALON_DETAIL_CACHE = "salon-detail";
     /** Salon review pages, keyed {@code "salon:<uuid>:sort:<sort>:page:<n>:size:<m>"}. */
     private static final String REVIEWS_BY_SALON_CACHE = "reviews-by-salon";
@@ -88,9 +88,10 @@ public class SalonStaffRatingListener {
         // `salon-detail` had already been dropped: the two caches disagreeing is strictly worse
         // than either staleness alone. Registered separately, each is contained on its own.
         //
-        // salons.avg_rating / review_count live on the Salon ENTITY this cache stores
-        // (SalonService#getSalonEntity), which PublicSalonResponse.from reads. Per-key, never
-        // allEntries: one salon's staff change must not flush every other salon.
+        // salons.avg_rating / review_count feed the PublicSalonResponse DTO this cache stores
+        // (SalonService#getPublicSalon — Phase 240 CRITICAL fix moved the @Cacheable boundary
+        // here from the now-uncached SalonService#getSalonEntity, see its Javadoc). Per-key,
+        // never allEntries: one salon's staff change must not flush every other salon.
         evictAfterCompletion(() -> evictSalonDetail(salonId));
         // The salon review LIST is not itself filtered by staff membership, but its cached pages
         // are the surface a client sees next to the rating that just moved; dropping them keeps

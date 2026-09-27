@@ -40,6 +40,167 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.slots-capacity:60}")
     private long slotsCapacity;
 
+    /**
+     * Per-IP cap for the two public catalogue-browse reads (60-second window):
+     * <ul>
+     *   <li>{@code GET /api/v1/salons/{salonId}/services}</li>
+     *   <li>{@code GET /api/v1/masters/{masterId}/services}</li>
+     * </ul>
+     * Phase 314 audit finding (MEDIUM). Both are {@code permitAll()} in {@code SecurityConfig}.
+     * {@code ServiceCatalogService}'s {@code @Cacheable(key = "#salonId"/"#masterId")} only
+     * absorbs repeat hits on the SAME id — a caller sweeping distinct salon/master ids forces a
+     * cache miss plus a full per-master N+1 read (3 SQL statements per master) on every request,
+     * previously with no throttle anywhere in {@link com.beautica.auth.filter.AuthRateLimitFilter}
+     * at all. The per-master N+1 itself is a separate, already-tracked fix (Phase 315) — this
+     * bucket bounds the RATE at which one source can trigger it in the meantime.
+     *
+     * <p>Deliberately does NOT cover {@code GET /api/v1/salons/{salonId}/masters/{masterId}/services}
+     * (Phase 309's authenticated salon-management read) — that route stays the documented
+     * ACCEPTED RISK on {@link #serviceWriteCapacity}'s javadoc, unthrottled like every other
+     * authenticated GET in this class. It is a different route (4 path segments after
+     * {@code /salons/}, not 2) reachable only by an already-authorized SALON_OWNER/SALON_ADMIN/
+     * self-SALON_MASTER, not the anonymous catalogue read this bucket protects — see
+     * {@code AuthRateLimitFilter#isSalonCatalogueServicesPath} for how the matcher tells the two
+     * apart despite both ending in the literal {@code "/services"}. It has its OWN per-principal
+     * bucket, {@link #salonMasterServicesReadCapacity}, and must never rejoin this one: a per-IP
+     * budget shared with anonymous traffic starves authenticated tenants behind a CGNAT egress
+     * (cycle-2 audit, B8).
+     *
+     * <p><b>Sizing (60/min, same as {@link #slotsCapacity}).</b> Both target reads are
+     * ONE-PER-PAGE-VIEW on the mobile client: opening a salon's detail page fetches its service
+     * catalogue exactly once, and opening a master's public profile fetches theirs exactly once
+     * (unlike the discovery search box, which fires a request per settled keystroke — see
+     * {@code searchBandwidth}'s {@code SEARCH_CAPACITY} javadoc for that different traffic shape).
+     * A human rapidly opening a dozen distinct salon/master pages in one minute — an aggressive
+     * browsing session, not a realistic one — still uses well under a fifth of this budget. 60/min
+     * mirrors {@code slotsCapacity}'s own reasoning (a user paging months + tapping days makes a
+     * handful of requests per minute, nowhere near the cap) and is generous enough that it should
+     * never surface to a real user; it exists to cap sustained per-IP enumeration across many
+     * distinct ids, not to throttle legitimate page views. IP-keyed for consistency with every
+     * other bucket in this filter (JWT is not yet parsed when AuthRateLimitFilter runs, and both
+     * routes are permitAll anyway) — Ukrainian mobile users sharing one CGNAT egress still fit
+     * comfortably under this ceiling for the same reason a shared booking link does (see
+     * {@code GUEST_AVAILABILITY_CAPACITY}). Configurable so integration tests on 127.0.0.1 (which
+     * fire many real HTTP GETs against these two paths, e.g. {@code ServicesIntegrationTest},
+     * {@code SalonCatalogueAggregatePriceIT}, {@code SalonSearchPriceBandIT}) can raise the cap —
+     * see {@code application-test.yml}'s {@code catalogue-browse-capacity} override, mirroring
+     * {@code service-write-capacity}.
+     */
+    @Value("${app.rate-limit.catalogue-browse-capacity:60}")
+    private long catalogueBrowseCapacity;
+
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) for
+     * {@code GET /api/v1/salons/&#123;salonId&#125;/masters/&#123;masterId&#125;/services} — Phase
+     * 309/310's salon-management read, consumed by {@link BookingRateLimitFilter}.
+     *
+     * <p><b>Why not {@link #catalogueBrowseCapacity} (2026-09-13 cycle-2 audit, B8).</b> Cycle 1
+     * gave this route its first bucket by pointing it at {@code catalogueBrowseBuckets}, which is
+     * keyed on the client IP and shared with two {@code permitAll} anonymous reads. Under
+     * carrier-grade NAT — the norm on Ukrainian mobile networks — every subscriber behind one
+     * egress IP draws from the same 60/min budget, so ordinary anonymous browsing could 429 a
+     * salon owner's management UI that happened to share that IP. This route is authenticated, so
+     * it is keyed on the principal instead and one tenant's traffic can no longer starve another's.
+     *
+     * <p><b>Sizing: 60/min, identical to {@code catalogueBrowseCapacity}</b> — the unit of work is
+     * unchanged (one authorization traversal plus one graph fetch of a master's active menu), only
+     * the key is. A salon owner opening a dozen staff menus in a minute uses a fifth of it.
+     */
+    @Value("${app.rate-limit.salon-master-services-read-capacity:60}")
+    private long salonMasterServicesReadCapacity;
+
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) for the three EXPENSIVE reads behind the mobile salon
+     * «Записи» / «Архів» board, consumed by {@link BookingRateLimitFilter} (the unthrottled
+     * salon-board reads finding, backend-security 2026-09-20 —
+     * backend-security):
+     * <ul>
+     *   <li>{@code GET /api/v1/salons/&#123;salonId&#125;/masters/effective-schedule} (phase 321) —
+     *       materialises {@code |roster| x up-to-62} {@code EffectiveDayResponse} objects into one
+     *       response body, at 9-19 statements per call.</li>
+     *   <li>{@code GET /api/v1/bookings/salon/&#123;salonId&#125;/booked-days} (phase 319) — a
+     *       status-unfiltered {@code SELECT DISTINCT} over every booking the salon has inside the
+     *       window.</li>
+     *   <li>{@code GET /api/v1/bookings/salon/&#123;salonId&#125;} (phase 23.4, widened by 319 and
+     *       322) — the board/archive list, whose {@code COUNT} companion runs on every FULL page.</li>
+     * </ul>
+     *
+     * <p><b>Why a separate bucket rather than folding into {@link #catalogueBrowseCapacity}</b> —
+     * the same reasoning {@link #salonMasterServicesReadCapacity} records, and it applies here
+     * verbatim. {@code catalogueBrowseBuckets} is keyed on the client IP and shared with two
+     * {@code permitAll} anonymous reads. Under carrier-grade NAT — the norm on Ukrainian mobile
+     * networks — every subscriber behind one egress IP draws from the same 60/min budget, so
+     * ordinary anonymous browsing could 429 a salon owner's board that happened to share that IP.
+     * All three routes here are authenticated, so they are keyed on the PRINCIPAL instead and one
+     * tenant's traffic can no longer starve another's. (Mechanically it could not live there
+     * anyway: {@code AuthRateLimitFilter} runs BEFORE {@code JwtAuthenticationFilter}, so no
+     * principal exists at that point.)
+     *
+     * <p><b>Why not fold into {@link #salonMasterServicesReadCapacity} either.</b> That bucket is
+     * one salon owner opening staff menus; these three are one screen's periodic refresh. Sharing
+     * would make a board refresh and a menu tap contend for the same 60 tokens, so a busy board
+     * could 429 an unrelated management action — the same starvation argument, one level down.
+     *
+     * <p><b>Sizing: 60/min, identical to {@code catalogueBrowseCapacity} and
+     * {@code slotsCapacity}.</b> One board refresh spends at most three tokens (schedule + dots +
+     * first page), so 60/min is twenty full refreshes a minute per account — far beyond any human
+     * scroll, and beyond the client's own refresh cadence, while still bounding the roster
+     * {@code |masters| x |days|} product and the booked-days scan that are the reason this bucket
+     * exists. Overridden to {@code 100000} in {@code application-test.yml} for the same reason its
+     * two siblings are: ITs drive many real GETs as one owner token.
+     */
+    @Value("${app.rate-limit.salon-board-read-capacity:60}")
+    private long salonBoardReadCapacity;
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // ACCEPTED RISK — 2026-09-15, architect sign-off (wish-list hull audit, cycle 2, perf LOW).
+    // GET /api/v1/favorites/** — and GET /api/v1/favorites/services in particular — carries NO
+    // bucket, in this class or any other filter. Listed here only so this inventory stays truthful
+    // about every route that is deliberately unthrottled.
+    //
+    // THE MEASURED FIGURE. The wish list's SALON arm prices each saved row by the salon-catalogue
+    // HULL, which runs the bookability gate over every candidate master of every salon on the page.
+    // Favouriting deliberately requires no bookability (phase-246 D3 validates active-ness only), so
+    // a client may save 100 services belonging to salons whose masters have no schedule at all — and
+    // a negative verdict has no shorter proof than the whole horizon. At the 100-row page cap
+    // (spring.data.web.pageable.max-page-size) that is ~100 salons x ~20 masters x 181 days
+    // ≈ 362 000 folded day objects in ONE request. The 2026-09-15 lazy fold bound
+    // (MasterScheduleService#reduceEffectiveRangeBatch) collapses the TYPICAL page by two orders of
+    // magnitude — a bookable master resolves on its first or second day — but it is an early exit,
+    // not a shorter horizon, so it cannot touch this all-negative worst case. Pinned by
+    // SalonCatalogueBatchLoadIT's case 15b (one master, all 181 days) and case 15c (the per-master
+    // arithmetic across three masters).
+    //
+    // WHY IT IS ACCEPTED. Every route on FavoriteController is @PreAuthorize("hasRole('CLIENT')"),
+    // so there is no anonymous reach: each request is attributable to a registered, verified,
+    // BANNABLE account. Abuse is therefore an account-level moderation problem with a real lever
+    // already in place, not an open-to-the-internet amplifier. The route is also not yet in front of
+    // real traffic (pre-release), so there is no abuse signal to size a bucket against.
+    //
+    // REOPEN TRIGGER — whichever comes FIRST:
+    //   (a) observed abuse (latency or connection-pool pressure traceable to this route);
+    //   (b) the route, or its authorization predicate, opening to a role below CLIENT — anonymous or
+    //       guest reach removes the whole "bannable account" premise this acceptance rests on;
+    //   (c) public launch.
+    // Unlike the Phase 309 acceptance above, (b) has NOT fired: the gate is a plain role check with
+    // no ownership predicate that could quietly widen.
+    //
+    // DO NOT PATCH A ONE-OFF BUCKET IN HERE. Rejected explicitly by the architect — see the
+    // `service/controller/ServiceController.java` INFO row in docs/backend-phases/backlog.md, under
+    // "Performance findings (backend-perf)", Phase 309: "Resolved this chain as a documented
+    // ACCEPTED RISK (dated sign-off in RateLimitConfig.java), not by adding a one-off bucket."
+    // That chain was resolved exactly as this one is. Cited by CONTENT, not by line number:
+    // backlog.md is append-only, so every line number into it goes stale on the next insertion —
+    // which is how the reference this comment replaced went stale inside a single session. The
+    // throttle SHAPE is already pre-decided in phase-247 D8 and must be implemented as written when
+    // a trigger fires: per-PRINCIPAL (JWT userId, IP fallback only for anonymous), a new filter
+    // registered AFTER JwtAuthenticationFilter, key "fav:" + userId, 60 per 60 s via
+    // app.rate-limit.*-capacity, 429 documented on every list endpoint, pinned by a regression test
+    // mirroring ServiceWriteRateLimitRegressionTest — and scoped to ALL authenticated reads that fan
+    // out over other users' data, not /favorites/** alone. D8 also records the cheaper lever to
+    // evaluate FIRST: caching the per-master bookability verdict at {masterId, duration, from, to}.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
     @Value("${app.rate-limit.device-token-capacity:30}")
     private long deviceTokenCapacity;
 
@@ -153,6 +314,40 @@ public class RateLimitConfig {
     //   - PATCH  /api/v1/services/{serviceDefId}/photo
     //   - DELETE /api/v1/services/{serviceDefId}
     //
+    // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
+    // management read) at this same path+suffix, but it is a read — AuthRateLimitFilter's
+    // method-gated match on this prefix+suffix rule is POST-only, so the GET does NOT share
+    // this bucket.
+    //
+    // IT IS NO LONGER UNTHROTTLED (2026-09-13 audit, P5/S3). It used to be carried here as an
+    // ACCEPTED RISK (2026-09-10, Phase 309 audit-fix cycle 1, LOW-2) on two stated grounds, and
+    // BOTH have since become false:
+    //
+    //   (a) "Trusted callers: only SALON_OWNER or SALON_ADMIN for the target salonId — both gated
+    //       by @PreAuthorize's role check + @authz.canManageSalon." Factually wrong since Phase
+    //       310: the gate is @authz.canReadSalonMasterServices, not canManageSalon, and it
+    //       deliberately admits the SALON_MASTER whose own masters row is {masterId}.
+    //   (b) "What would flip this decision: ... this route (or its authorization predicate) ever
+    //       opening to a less-trusted role than SALON_OWNER/SALON_ADMIN, e.g. exposing it to
+    //       SALON_MASTER." That is precisely what (a) describes, so the acceptance's own
+    //       flip-condition had already fired and the acceptance had lapsed.
+    //
+    // The route therefore now consumes salonMasterServicesReadBuckets (see
+    // salonMasterServicesReadCapacity), matched in BookingRateLimitFilter — NOT here, and NOT in
+    // catalogueBrowseBuckets. Cycle 1 of the audit-fix put it in catalogueBrowseBuckets, which is
+    // keyed on the client IP and shared with two permitAll anonymous reads; under carrier-grade NAT
+    // (the norm on Ukrainian mobile networks) anonymous browse traffic from one egress IP could
+    // exhaust that budget and 429 a salon owner's management UI behind the same address (cycle-2
+    // audit, B8). The route is authenticated, so it is keyed on the PRINCIPAL, at the same 60/min
+    // capacity; AuthRateLimitFilter runs before JwtAuthenticationFilter and has no principal to key
+    // on, which is why the bucket lives in the per-user filter alongside DELETE /api/v1/users/me.
+    //
+    // Listed here only so this inventory stays truthful about every route living at this path.
+    //
+    // Phase 314 audit added catalogueBrowseCapacity (see that field's javadoc) for the SIBLING
+    // public reads GET /api/v1/salons/{salonId}/services and GET /api/v1/masters/{masterId}/services;
+    // the management read above joined them in the 2026-09-13 audit-fix cycle.
+    //
     // Every one of these fell through to the unmatched else/non-POST branch of
     // AuthRateLimitFilter with NO bucket at all, which undercut bulkServiceSetupCapacity's own
     // stated rationale: the bulk bucket is capped to bound service_definitions row growth, but an
@@ -177,6 +372,47 @@ public class RateLimitConfig {
     // integration tests on 127.0.0.1 can raise the cap.
     @Value("${app.rate-limit.service-write-capacity:60}")
     private long serviceWriteCapacity;
+
+    // Per-IP cap for GET /api/v1/auth/invite/validate (60-second window). This permitAll() read
+    // is the FIRST thing an invitee's browser hits from the emailed link, and previously had no
+    // throttle at all — it fell through AuthRateLimitFilter's unconditional non-POST early return.
+    // previewInvite is a single row lookup keyed by a SHA-256-hashed 256-bit SecureRandom token
+    // (InviteService / SecureTokenGenerator), so brute force is infeasible regardless of any rate
+    // limit — this bucket bounds LOAD and unlimited-speed REPLAY of an already-leaked link, not
+    // guessing. Sized for the real traffic this endpoint serves: one page load per invitee, plus
+    // the occasional refresh after a network blip, with several people at the SAME office/family
+    // behind one NAT egress doing that for their own separate invites within the same minute.
+    // 30/min clears that comfortably while still capping a scripted flood to half a request per
+    // second. @Value-configurable (unlike the sibling inviteBuckets/salonInviteBuckets, which stay
+    // internal to the filter) because InviteControllerIT alone drives several dozen real HTTP
+    // calls against this exact path from 127.0.0.1 across its test methods — a fixed cap would
+    // make the test suite itself trip the throttle. Raised in application-test.yml, mirroring
+    // register-capacity/login-capacity/etc. above.
+    @Value("${app.rate-limit.invite-validate-capacity:30}")
+    private long inviteValidateCapacity;
+
+    private static final Duration INVITE_VALIDATE_WINDOW = Duration.ofMinutes(1);
+
+    // Per-IP cap for POST /api/v1/auth/invite/accept (15-minute window). Same permitAll(),
+    // previously-unthrottled gap as invite-validate-capacity above (this write fell through to
+    // AuthRateLimitFilter's unmatched-POST else branch). acceptInvite sends no email or SMS
+    // (verification here is structural, not mailed — see InviteService#acceptInvite's Javadoc)
+    // and the token is single-use (a second attempt against the same token fails fast with
+    // INVITE_USED, before any write), so this is purely a load/replay bound too — the 256-bit
+    // hashed token already makes guessing infeasible.
+    //
+    // 15-minute window, not the 60-second window the SEND-invite buckets use, because the
+    // legitimate traffic here is an ONBOARDING SESSION rather than a rapid-fire admin action:
+    // several staff at one salon, behind one shared NAT egress, each tapping their OWN emailed
+    // link and accepting it (plus the occasional retry after a network blip or a duplicate
+    // submit) within the same sitting. 20 requests / 15 min clears a realistic multi-person
+    // office onboarding burst with comfortable headroom while still bounding a scripted replay
+    // of one leaked accept-link to roughly one attempt every 45 seconds. @Value-configurable for
+    // the same InviteControllerIT reason as invite-validate-capacity above.
+    @Value("${app.rate-limit.invite-accept-capacity:20}")
+    private long inviteAcceptCapacity;
+
+    private static final Duration INVITE_ACCEPT_WINDOW = Duration.ofMinutes(15);
 
     // Per-IP cap for POST /api/v1/support/contact (60-minute window).
     // Each successful call sends an email to the support inbox, so this is an
@@ -278,6 +514,33 @@ public class RateLimitConfig {
     private long staffBookingSmsCapacity;
 
     private static final Duration STAFF_BOOKING_SMS_WINDOW = Duration.ofSeconds(60);
+
+    /**
+     * Per-user cap for {@code DELETE /api/v1/users/me} (Phase 300, perf/security finding 2, 2026-09
+     * audit — MEDIUM, raised independently by both auditors). Before this the endpoint had NO rate
+     * limit at all: {@link com.beautica.auth.filter.AuthRateLimitFilter} only covers {@code
+     * /auth/*}, so a handful of authenticated CLIENTs could each repeatedly open the self-delete
+     * cascade's {@code PESSIMISTIC_WRITE} lock on their own {@code users} row and hold a Hikari
+     * connection for up to the 30s transaction timeout, on the 10-connection pool
+     * ({@code application.yml}) shared by every other tenant.
+     *
+     * <p>User-keyed (not IP-keyed), unlike every bucket built directly in
+     * {@code AuthRateLimitFilter}: this route requires authentication, so — exactly like every other
+     * bucket in {@link #bookingRateLimitFilter}'s {@code BookingRateLimitFilter} — it is throttled
+     * per CALLER, never per source IP (which an authenticated attacker can rotate trivially and which
+     * would incorrectly co-throttle unrelated CLIENTs sharing one NAT egress).
+     *
+     * <p>Sized deliberately small and hourly: a legitimate CLIENT self-deletes their account exactly
+     * ONCE. 3/hour comfortably covers a legitimate retry after a transient failure (network blip, the
+     * {@link com.beautica.user.ClientAccountDeletionService#MAX_FUTURE_BOOKINGS_PER_SELF_DELETE}
+     * cap rejecting a first attempt while the client cancels bookings and retries) without leaving
+     * meaningful headroom for scripted abuse of an irreversible, lock-holding cascade. Configurable
+     * so integration tests can raise the cap.
+     */
+    @Value("${app.rate-limit.self-delete-capacity:3}")
+    private long selfDeleteCapacity;
+
+    private static final Duration SELF_DELETE_WINDOW = Duration.ofMinutes(60);
 
     // Per-user cap for PUT /api/v1/masters/{masterId}/overrides/{date} (the schedule-override
     // write). Own bucket, deliberately NOT shared with bookingDeclineBuckets above (2026-07-26
@@ -411,6 +674,31 @@ public class RateLimitConfig {
     @Bean
     public LoadingCache<String, Bucket> slotsBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, slotsCapacity, ONE_MINUTE);
+    }
+
+    @Bean
+    public LoadingCache<String, Bucket> catalogueBrowseBuckets() {
+        return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, catalogueBrowseCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-user bucket (see {@link #salonMasterServicesReadCapacity}) for the authenticated
+     * salon-master-services management read, consumed by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> salonMasterServicesReadBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, salonMasterServicesReadCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-user bucket (see {@link #salonBoardReadCapacity}) for the three expensive authenticated
+     * salon-board reads, consumed by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> salonBoardReadBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, salonBoardReadCapacity, ONE_MINUTE);
     }
 
     @Bean
@@ -624,6 +912,39 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-IP bucket for {@code GET /api/v1/auth/invite/validate}. See
+     * {@link #inviteValidateCapacity}'s field javadoc for sizing and for why this bucket is
+     * {@code @Value}-configurable rather than built internally like its sibling
+     * {@code inviteBuckets} / {@code salonInviteBuckets} in {@code AuthRateLimitFilter}.
+     * {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket
+     * entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> inviteValidateBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                INVITE_VALIDATE_WINDOW.plus(EVICTION_GRACE),
+                inviteValidateCapacity,
+                INVITE_VALIDATE_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/auth/invite/accept}. See
+     * {@link #inviteAcceptCapacity}'s field javadoc for sizing and for why this bucket is
+     * {@code @Value}-configurable rather than built internally. {@code expireAfterAccess} gives
+     * a 5-minute grace past the 15-minute window so a bucket entry is not evicted the instant
+     * the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> inviteAcceptBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                INVITE_ACCEPT_WINDOW.plus(EVICTION_GRACE),
+                inviteAcceptCapacity,
+                INVITE_ACCEPT_WINDOW);
+    }
+
+    /**
      * Per-IP bucket for {@code POST /api/v1/support/contact}.
      *
      * <p>Cap: 5 requests per 60-minute window per source IP. Every successful request
@@ -712,6 +1033,21 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-user bucket (see {@link #selfDeleteCapacity} field javadoc) for
+     * {@code DELETE /api/v1/users/me}, consumed by {@link BookingRateLimitFilter}'s flat
+     * one-token-per-request entry charge. {@code expireAfterAccess} gives a 5-minute grace past
+     * the 60-minute window so a bucket entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> selfDeleteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                SELF_DELETE_WINDOW.plus(EVICTION_GRACE),
+                selfDeleteCapacity,
+                SELF_DELETE_WINDOW);
+    }
+
+    /**
      * Per-user bucket (see {@link #scheduleOverrideWriteCapacity} field javadoc) for
      * {@code PUT /api/v1/masters/{masterId}/overrides/{date}}, consumed by
      * {@link com.beautica.booking.filter.BookingRateLimitFilter}'s flat one-token-per-request entry
@@ -772,7 +1108,8 @@ public class RateLimitConfig {
         // singletons — unambiguous by construction.
         return new BookingRateLimitFilter(
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
-                staffBookingSmsBuckets(), objectMapper);
+                staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
+                salonBoardReadBuckets(), objectMapper);
     }
 
     /**

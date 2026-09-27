@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.location.entity.SettlementType;
 import com.beautica.auth.Role;
 import com.beautica.common.RatingBucket;
 import com.beautica.common.exception.BusinessException;
@@ -7,12 +8,14 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteInput;
 import com.beautica.location.LocalityWriteValidator;
-import com.beautica.location.entity.City;
-import com.beautica.location.entity.Oblast;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.repository.CityDistrictRepository;
 import com.beautica.location.repository.CityRepository;
+import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.MasterProfileUpdateRequest;
 import com.beautica.master.dto.MasterPublicProfileResponse;
+import com.beautica.master.entity.MasterType;
+import com.beautica.master.repository.MasterRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import com.beautica.review.repository.RatingCountProjection;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,6 +41,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -57,18 +61,25 @@ class UserServiceTest {
     private CityDistrictRepository cityDistrictRepository;
 
     @Mock
+    private LocationQueryService locationQueryService;
+
+    @Mock
     private CacheManager cacheManager;
 
     @Mock
     private ClientReviewRepository clientReviewRepository;
+
+    @Mock
+    private MasterRepository masterRepository;
 
     private UserService userService;
 
     @BeforeEach
     void setUp() {
         userService = new UserService(
-                userRepository, localityWriteValidator, cityRepository, cityDistrictRepository, cacheManager,
-                clientReviewRepository);
+                userRepository, localityWriteValidator,
+                new com.beautica.location.SettlementDisplayNameResolver(cityRepository), cityDistrictRepository,
+                locationQueryService, cacheManager, clientReviewRepository, masterRepository);
     }
 
     @Test
@@ -157,9 +168,18 @@ class UserServiceTest {
         verify(cityDistrictRepository, times(1)).findNameUkById(districtId);
     }
 
+    /**
+     * Phase 325 perf LOW: this read used to call {@code cityRepository.findOblastIdById} directly
+     * and so bypassed the {@code cityOblastId} cache that exists for exactly this question, while
+     * SalonService and MasterService already asked it through the shared resolver. The
+     * {@code never()} checks on the repository's oblast finders are the half of this test that
+     * would go red on a regression to a direct call — asserting the returned value alone would
+     * not. (Not {@code verifyNoInteractions}: the label-part lookup now legitimately touches
+     * {@code cityRepository} once, through {@code SettlementDisplayNameResolver}.)
+     */
     @Test
-    @DisplayName("getProfile resolves oblastId via findOblastIdById exactly once when cityId is set")
-    void should_resolveOblastId_when_cityIdSet() {
+    @DisplayName("getProfile resolves oblastId through the SHARED cached resolver, not the repository")
+    void should_resolveOblastIdViaLocationQueryService_when_cityIdSet() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         UUID oblastId = UUID.randomUUID();
@@ -167,14 +187,49 @@ class UserServiceTest {
         user.setCityId(cityId);
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.of(oblastId));
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(oblastId);
 
         UserProfileResponse response = userService.getProfile(userId);
 
         assertThat(response.oblastId())
-                .as("oblastId is the parent oblast id resolved by findOblastIdById for the set cityId")
+                .as("oblastId is whatever the shared resolver returns for the set cityId")
                 .isEqualTo(oblastId);
-        verify(cityRepository, times(1)).findOblastIdById(cityId);
+        verify(locationQueryService, times(1)).resolveCityOblastId(cityId);
+        // The direct oblast query must stay unused. (cityRepository IS now touched once, by the
+        // shared SettlementDisplayNameResolver for the label parts — so not verifyNoInteractions.)
+        verify(cityRepository, never()).findByIdWithOblast(any());
+    }
+
+    @Test
+    @DisplayName("getProfile carries the saved settlement's type + ambiguous-only hromada from the shared resolver")
+    void should_returnSettlementParts_when_cityIdSet() {
+        UUID userId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User user = buildUser(userId, "village@example.com", Role.CLIENT, "Has", "Village", "+380501111111");
+        user.setCityId(cityId);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+        when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.of(new SettlementDisplayNames(
+                "Іванівка", "Полтавська", com.beautica.location.entity.SettlementType.VILLAGE, "Шишацька")));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.citySettlementType())
+                .isEqualTo(com.beautica.location.entity.SettlementType.VILLAGE);
+        assertThat(response.cityHromadaNameUk()).isEqualTo("Шишацька");
+    }
+
+    @Test
+    @DisplayName("getProfile returns null settlement parts, and issues no lookup, when no cityId is set")
+    void should_returnNullSettlementParts_when_cityIdNull() {
+        UUID userId = UUID.randomUUID();
+        User user = buildUser(userId, "noparts@example.com", Role.CLIENT, "No", "City", "+380501111111");
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.citySettlementType()).isNull();
+        assertThat(response.cityHromadaNameUk()).isNull();
+        verify(cityRepository, never()).findDisplayNamesById(any());
     }
 
     @Test
@@ -191,11 +246,11 @@ class UserServiceTest {
         assertThat(response.oblastId())
                 .as("no cityId set → oblastId stays null and no query is issued")
                 .isNull();
-        verify(cityRepository, never()).findOblastIdById(any());
+        verifyNoInteractions(locationQueryService, cityRepository);
     }
 
     @Test
-    @DisplayName("getProfile returns null oblastId when the city lookup resolves empty (orElse(null) arm)")
+    @DisplayName("getProfile returns null oblastId when the shared resolver cannot resolve the city")
     void should_returnNullOblastId_when_lookupEmpty() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
@@ -203,14 +258,164 @@ class UserServiceTest {
         user.setCityId(cityId);
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-        when(cityRepository.findOblastIdById(cityId)).thenReturn(Optional.empty());
+        when(locationQueryService.resolveCityOblastId(cityId)).thenReturn(null);
 
         UserProfileResponse response = userService.getProfile(userId);
 
         assertThat(response.oblastId())
-                .as("an unresolved cityId falls back to null via orElse(null), never throws")
+                .as("a stale cityId resolves to null and is surfaced as null, never thrown")
                 .isNull();
-        verify(cityRepository, times(1)).findOblastIdById(cityId);
+        verify(locationQueryService, times(1)).resolveCityOblastId(cityId);
+    }
+
+    // ── Phase 265 — hasMasterProfile (the owner-as-master toggle, derived on read) ─────
+    //
+    // The active/inactive DISCRIMINATION itself is a WHERE clause and is pinned where a WHERE
+    // clause can be observed: MasterRepositoryOwnerMasterFlagTest (a real @DataJpaTest query
+    // test). A Mockito stub cannot see a predicate. What these unit tests pin instead is the
+    // wiring UserService controls — WHICH finder is called, with WHICH arguments, for WHICH
+    // roles, and that its answer reaches the DTO unmodified.
+
+    @Test
+    @DisplayName("getProfile reads hasMasterProfile=true from the ACTIVE SALON_OWNER-type finder for an owner")
+    void should_returnHasMasterProfileTrue_when_ownerHasAnActiveOwnerMasterRow() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Olha", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(true);
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile())
+                .as("the owner-as-master toggle is ON — the flag must echo the active row's existence")
+                .isTrue();
+        // Pins the finder by name and by argument: the SALON-SCOPED sibling
+        // (existsByUserIdAndSalonIdAndMasterTypeAndIsActiveTrue) must never be used here, since
+        // GET /users/me has no path salon and users.salon_id would answer the wrong question.
+        verify(masterRepository, times(1))
+                .existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER);
+    }
+
+    @Test
+    @DisplayName("getProfile reads hasMasterProfile=false when the owner has no active owner-master row")
+    void should_returnHasMasterProfileFalse_when_salonOwnerHasNoActiveOwnerMasterRow() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "solo@example.com", Role.SALON_OWNER, "Ola", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(false);
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile())
+                .as("no row, or a deactivated one — either way the toggle reads OFF and the client "
+                        + "must not fire GET /masters/me, which would 404")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("getProfile short-circuits hasMasterProfile to false for a CLIENT without querying masters")
+    void should_returnHasMasterProfileFalse_when_callerIsClient() {
+        UUID userId = UUID.randomUUID();
+        User client = buildUser(userId, "client@example.com", Role.CLIENT, "Kate", "Client", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile()).isFalse();
+        verify(masterRepository, never()).existsByUserIdAndMasterTypeAndIsActiveTrue(any(), any());
+    }
+
+    @Test
+    @DisplayName("getProfile short-circuits hasMasterProfile to false for a SALON_ADMIN without querying masters")
+    void should_returnHasMasterProfileFalse_when_callerIsSalonAdmin() {
+        UUID userId = UUID.randomUUID();
+        User admin = buildUser(userId, "admin@example.com", Role.SALON_ADMIN, "Ada", "Admin", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(admin));
+
+        UserProfileResponse response = userService.getProfile(userId);
+
+        assertThat(response.hasMasterProfile())
+                .as("an admin has no owner-master row by construction — createMasterForOwner "
+                        + "throws ForbiddenException for every role but SALON_OWNER")
+                .isFalse();
+        verify(masterRepository, never()).existsByUserIdAndMasterTypeAndIsActiveTrue(any(), any());
+    }
+
+    // ── Audit fix, finding 1 — the PATCH write-back resolves the flag for real ────────
+    //
+    // These three replace an earlier test that PINNED the defect ("updateProfile always returns
+    // hasMasterProfile=false"). PATCH /users/me returns a full UserProfileResponse on the same
+    // wire type as GET /users/me, so a hard-coded false handed an opted-in owner a body that
+    // contradicted the read they had just made. IndependentMasterController#updateLocality
+    // serialises the same DTO by delegating to this same method, so it is fixed by the same edit
+    // — there is one write path, not two.
+
+    @Test
+    @DisplayName("updateProfile returns hasMasterProfile=true for an opted-in owner — the PATCH body must not contradict GET /users/me")
+    void should_returnHasMasterProfileTrue_when_optedInOwnerPatchesProfile() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "owner@example.com", Role.SALON_OWNER, "Olha", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(true);
+
+        UserProfileResponse response = userService.updateProfile(
+                userId,
+                new UpdateProfileRequest("Olha", "Owner", null, null, null, null, null, null, null, null));
+
+        assertThat(response.hasMasterProfile())
+                .as("the owner-as-master toggle is ON — PATCH must report the same truth GET does, "
+                        + "not a hard-coded false")
+                .isTrue();
+        // Same finder, same arguments as the read path: the salon-scoped sibling must never be
+        // substituted here either (users.salon_id would answer the wrong question).
+        verify(masterRepository, times(1))
+                .existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER);
+    }
+
+    @Test
+    @DisplayName("updateProfile returns hasMasterProfile=false for an opted-out owner")
+    void should_returnHasMasterProfileFalse_when_optedOutOwnerPatchesProfile() {
+        UUID userId = UUID.randomUUID();
+        User owner = buildUser(userId, "solo@example.com", Role.SALON_OWNER, "Ola", "Owner", "+380671234567");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(owner));
+        when(masterRepository.existsByUserIdAndMasterTypeAndIsActiveTrue(userId, MasterType.SALON_OWNER))
+                .thenReturn(false);
+
+        UserProfileResponse response = userService.updateProfile(
+                userId,
+                new UpdateProfileRequest("Ola", "Owner", null, null, null, null, null, null, null, null));
+
+        assertThat(response.hasMasterProfile())
+                .as("no active owner-master row — the flag is false on BOTH verbs, and it is false "
+                        + "because it was resolved, not because it was hard-coded")
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("updateProfile keeps the role short-circuit — a CLIENT PATCH never queries masters")
+    void should_notQueryMasterRepository_when_clientPatchesProfile() {
+        UUID userId = UUID.randomUUID();
+        User client = buildUser(userId, "client@example.com", Role.CLIENT, "Kate", "Client", "+380501111111");
+
+        when(userRepository.findById(userId)).thenReturn(Optional.of(client));
+
+        UserProfileResponse response = userService.updateProfile(
+                userId,
+                new UpdateProfileRequest("Kate", "Client", null, null, null, null, null, null, null, null));
+
+        assertThat(response.hasMasterProfile()).isFalse();
+        // Resolving the flag on the write path must not cost the hottest non-owner roles a query:
+        // resolveHasMasterProfile short-circuits on role before touching the repository.
+        verify(masterRepository, never()).existsByUserIdAndMasterTypeAndIsActiveTrue(any(), any());
     }
 
     @Test
@@ -362,12 +567,8 @@ class UserServiceTest {
         UUID districtId = UUID.randomUUID();
         User user = buildUser(userId, "im@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
 
-        City mockCity = mock(City.class);
-        Oblast mockOblast = mock(Oblast.class);
-        when(mockOblast.getNameUk()).thenReturn("Київська область");
-        when(mockCity.getNameUk()).thenReturn("Київ");
-        when(mockCity.getOblast()).thenReturn(mockOblast);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+        when(cityRepository.findDisplayNamesById(cityId))
+                .thenReturn(Optional.of(new SettlementDisplayNames("Київ", "Київська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -394,12 +595,8 @@ class UserServiceTest {
         UUID districtId = UUID.randomUUID();
         User user = buildUser(userId, "c@example.com", Role.CLIENT, "Cli", "Ent", "+380501111111");
 
-        City mockCity = mock(City.class);
-        Oblast mockOblast = mock(Oblast.class);
-        when(mockOblast.getNameUk()).thenReturn("Київська область");
-        when(mockCity.getNameUk()).thenReturn("Київ");
-        when(mockCity.getOblast()).thenReturn(mockOblast);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+        when(cityRepository.findDisplayNamesById(cityId))
+                .thenReturn(Optional.of(new SettlementDisplayNames("Київ", "Київська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -426,10 +623,8 @@ class UserServiceTest {
         UUID cityId = UUID.randomUUID();
         User user = buildUser(userId, "c6@example.com", Role.CLIENT, "Test", "Client", "+380501111111");
 
-        City mockCity = mock(City.class);
-        when(mockCity.getNameUk()).thenReturn("Одеса");
-        when(mockCity.getOblast()).thenReturn(null);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+        when(cityRepository.findDisplayNamesById(cityId))
+                .thenReturn(Optional.of(new SettlementDisplayNames("Одеса", "Одеська", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -487,8 +682,11 @@ class UserServiceTest {
         assertThat(user.getRegion())
                 .as("denormalized region text is left untouched when cityId is omitted")
                 .isEqualTo("Вінницька область");
-        // writeCityDisplayStrings is reached ONLY when cityId is non-null — never queried here.
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        // writeCityDisplayStrings is reached ONLY when cityId is non-null. The ONE lookup left is
+        // the response's label-part resolution for the RETAINED id; the unstubbed lookup answers
+        // empty, which WOULD have cleared city/region had the write path applied it — the two
+        // label assertions above are what exclude that.
+        verify(cityRepository, times(1)).findDisplayNamesById(existingCityId);
         // street/buildingNo/locationNote are null in the request — Optional.ifPresent skips them → retained.
         assertThat(user.getStreet()).isEqualTo("Old Street");
         assertThat(user.getBuildingNo()).isEqualTo("1");
@@ -526,7 +724,9 @@ class UserServiceTest {
         assertThat(user.getStreet())
                 .as("the street IS updated by the PATCH")
                 .isEqualTo("вул. Нова");
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        // Response-side label-part lookup only (see the sibling test above for why the city
+        // assertion, not a never(), is what proves the write path stayed out).
+        verify(cityRepository, times(1)).findDisplayNamesById(hnivanCityId);
     }
 
     @Test
@@ -537,12 +737,8 @@ class UserServiceTest {
         UUID districtId = UUID.randomUUID();
         User user = buildUser(userId, "happy@example.com", Role.CLIENT, "Happy", "Path", "+380501111111");
 
-        City mockCity = mock(City.class);
-        Oblast mockOblast = mock(Oblast.class);
-        when(mockOblast.getNameUk()).thenReturn("Львівська область");
-        when(mockCity.getNameUk()).thenReturn("Львів");
-        when(mockCity.getOblast()).thenReturn(mockOblast);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+        when(cityRepository.findDisplayNamesById(cityId))
+                .thenReturn(Optional.of(new SettlementDisplayNames("Львів", "Львівська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -574,12 +770,8 @@ class UserServiceTest {
         // Pre-existing district must be OVERWRITTEN to null when a real cityId carries a null district.
         user.setDistrictId(UUID.randomUUID());
 
-        City mockCity = mock(City.class);
-        Oblast mockOblast = mock(Oblast.class);
-        when(mockOblast.getNameUk()).thenReturn("Одеська область");
-        when(mockCity.getNameUk()).thenReturn("Одеса");
-        when(mockCity.getOblast()).thenReturn(mockOblast);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
+        when(cityRepository.findDisplayNamesById(cityId))
+                .thenReturn(Optional.of(new SettlementDisplayNames("Одеса", "Одеська область", SettlementType.CITY, null)));
 
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
@@ -630,7 +822,11 @@ class UserServiceTest {
         assertThat(user.getStreet())
                 .as("the street IS updated")
                 .isEqualTo("вул. Хрещатик");
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        assertThat(user.getCity())
+                .as("denormalised city is untouched — the response-side lookup answers empty and "
+                        + "would have cleared it had the write path applied it")
+                .isEqualTo("Київ");
+        verify(cityRepository, times(1)).findDisplayNamesById(existingCityId);
     }
 
     @Test
@@ -641,7 +837,7 @@ class UserServiceTest {
         User user = buildUser(userId, "c4@example.com", Role.CLIENT, "Oksana", "P", "+380671234567");
         user.setStreet("вул. Науки");
 
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
+        when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         // PATCH sends only cityId — street, buildingNo, locationNote all null.
@@ -661,7 +857,7 @@ class UserServiceTest {
         User user = buildUser(userId, "im3@example.com", Role.INDEPENDENT_MASTER, "Ira", "M", "+380631111111");
         user.setBuildingNo("5B");
 
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
+        when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         // PATCH sends cityId and street but omits buildingNo — null-guard must retain the pre-existing value.
@@ -709,30 +905,24 @@ class UserServiceTest {
     }
 
     @Test
-    @DisplayName("writeCityDisplayStrings — sets city name but leaves region null when city has no oblast association")
-    void should_setOnlyCityName_when_oblastAssociationIsNull() {
+    @DisplayName("writeCityDisplayStrings — CLEARS a stale city/region when the new cityId does not resolve (same rule as salons)")
+    void should_clearStaleCityAndRegion_when_newCityIdDoesNotResolve() {
         UUID userId = UUID.randomUUID();
         UUID cityId = UUID.randomUUID();
         User user = buildUser(userId, "im4@example.com", Role.INDEPENDENT_MASTER, "Vira", "K", "+380631111111");
-
-        City mockCity = mock(City.class);
-        when(mockCity.getNameUk()).thenReturn("Харків");
-        when(mockCity.getOblast()).thenReturn(null);
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.of(mockCity));
-
+        user.setCity("Мелітополь");
+        user.setRegion("Запорізька");
+        when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
-
         var request = new UpdateProfileRequest(null, null, null,
                 cityId, null, null, null, null, null, null);
 
         userService.updateProfile(userId, request);
 
         assertThat(user.getCity())
-                .as("city display string must be set even when oblast is absent")
-                .isEqualTo("Харків");
-        assertThat(user.getRegion())
-                .as("region must remain null when the city has no oblast association")
+                .as("a stale label must never survive next to a new cityId")
                 .isNull();
+        assertThat(user.getRegion()).isNull();
     }
 
     @Test
@@ -742,7 +932,7 @@ class UserServiceTest {
         UUID cityId = UUID.randomUUID();
         User user = buildUser(userId, "c5@example.com", Role.CLIENT, "Empty", "City", "+380501111111");
 
-        when(cityRepository.findByIdWithOblast(cityId)).thenReturn(Optional.empty());
+        when(cityRepository.findDisplayNamesById(cityId)).thenReturn(Optional.empty());
         when(userRepository.findById(userId)).thenReturn(Optional.of(user));
 
         var request = new UpdateProfileRequest(null, null, null,
@@ -773,7 +963,7 @@ class UserServiceTest {
 
         verify(localityWriteValidator, never()).validateProviderLocality(any());
         verify(localityWriteValidator, never()).validateClientLocality(any());
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        verify(cityRepository, never()).findDisplayNamesById(any());
         assertThat(user.getCityId()).isNull();
         assertThat(user.getCity()).isNull();
         assertThat(user.getRegion()).isNull();
@@ -794,7 +984,7 @@ class UserServiceTest {
 
         verify(localityWriteValidator, never()).validateProviderLocality(any());
         verify(localityWriteValidator, never()).validateClientLocality(any());
-        verify(cityRepository, never()).findByIdWithOblast(any());
+        verify(cityRepository, never()).findDisplayNamesById(any());
         assertThat(user.getCityId()).isNull();
         assertThat(user.getCity()).isNull();
         assertThat(user.getRegion()).isNull();

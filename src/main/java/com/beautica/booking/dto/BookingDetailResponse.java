@@ -9,6 +9,7 @@ import com.beautica.master.entity.Master;
 import com.beautica.salon.entity.Salon;
 import com.beautica.user.User;
 import io.swagger.v3.oas.annotations.media.Schema;
+import org.springframework.lang.Nullable;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -142,11 +143,22 @@ import java.util.UUID;
  * <p><b>{@code providerCanReviewClient}</b> (extends track 27.x / Phase 27.5) — the PROVIDER-side
  * mirror of {@code canReview}, gating the "Залишити відгук про клієнта" CTA on
  * {@code GET /bookings/{id}} AND on every provider row of {@code GET /bookings/me} (see below).
- * {@code true} iff ALL of: (1) the CURRENT authenticated viewer has provider review-authority over THIS
- * booking, computed by {@code AuthorizationService#hasProviderAuthorityOverBooking(UUID, Booking)}
- * — byte-for-byte the predicate {@code enforceCanReviewClient} throws on inside
- * {@code ClientReviewService.create}, so this flag and the service-layer arm of
- * {@code POST /client-reviews} can never disagree; (2)
+ * {@code true} iff ALL of: (1) the CURRENT authenticated viewer IS the booking's PERFORMING MASTER,
+ * computed by {@code AuthorizationService#isPerformingMasterOfBooking(UUID, Booking)} — byte-for-byte
+ * the predicate {@code enforceCanReviewClient} throws on inside {@code ClientReviewService.create},
+ * so this flag and the service-layer arm of {@code POST /client-reviews} can never disagree. <b>Phase
+ * 320 narrowed this term to that ONE comparison</b> (locked product decision: "salon owner or salon
+ * admin can complete the booking, and after it only salon master can leave the feedback"); it used
+ * to be a union with {@code AuthorizationService#hasProviderAuthorityOverBooking}, so a
+ * {@code SALON_OWNER} or {@code SALON_ADMIN} read {@code true} on any completed booking at their
+ * salon. They now read {@code false} on a booking one of their MASTERS performed — while keeping
+ * {@code /complete}, {@code /not-complete}, {@code /decline} and {@code /reschedule}, which run off
+ * the untouched {@code hasProviderAuthorityOverBooking}. An owner-as-master row
+ * ({@code master_type = 'SALON_OWNER'}, {@code MasterService#createMasterForOwner}) still reads
+ * {@code true} on the bookings that owner personally performed, because the comparison is against
+ * {@code booking.master.user_id} and never consults a role or a salon. A booking whose performing
+ * master has been DEACTIVATED reads {@code false} for everyone — {@code masters.is_active} is a
+ * conjunct of the term and there is no longer an owner arm behind it; (2)
  * {@link com.beautica.booking.domain.BookingClosureRule#isProviderReviewEligible} —
  * {@code status == COMPLETED}, STRICTLY. Unlike the client-side {@code canReview} flag (which uses
  * {@link com.beautica.booking.domain.BookingClosureRule#isReviewEligible} and also admits an
@@ -155,8 +167,8 @@ import java.util.UUID;
  * review CTA before that action lets them rate a visit they have not yet attested happened — see
  * {@code BookingClosureRule#isProviderReviewEligible}'s javadoc for the full rationale; (3) the
  * booking has a real client (not a guest/LINK booking); (4) no {@code ClientReview} already
- * exists for this booking. A CLIENT or
- * SALON_MASTER viewer, or a provider with no authority over this specific booking, always reads
+ * exists for this booking. A CLIENT viewer, a SALON_MASTER viewing a booking they did NOT perform,
+ * and a SALON_OWNER or SALON_ADMIN viewing a booking one of their masters performed, all read
  * {@code false} here — never a thrown exception; the viewer either sees the detail (already gated
  * by {@code enforceCanViewBooking}) with this flag honestly {@code false}, or never reaches this
  * DTO at all. TWO callers compute this for real, through ONE shared conjunction
@@ -174,25 +186,22 @@ import java.util.UUID;
  * structurally excluded from provider authority). See each of those sites' own comment before
  * "optimising" this away.
  *
- * <p><b>Precisely how far the "agrees with the write endpoint" claim reaches (phase-27.x security
- * audit, LOW 3).</b> An earlier revision of this javadoc asserted the flag "can never disagree" with
- * {@code @authz.canReviewClient} as well. That is NOT true in general, and the weaker claim above is
- * the accurate one. {@code POST /client-reviews} is gated TWICE — the SpEL {@code @PreAuthorize}
- * {@code @authz.canReviewClient} and then {@code enforceCanReviewClient} in the service — and the
- * two derive "is this an independent-master booking" from different sources. The SpEL arm reads the
- * {@code BookingCompletionAccess} projection and takes {@code salonId == null}; the entity arm (and
- * therefore this flag) takes {@code masterType == INDEPENDENT_MASTER}. Those coincide on every
- * production-normal row but not on all of them, because {@code masters.salon_id} is
- * {@code ON DELETE SET NULL} ({@code V4__Patch_salons_add_masters.sql:13}) and neither the schema nor
- * {@code Master} constrains {@code master_type} against it: a salon-typed master whose salon row was
- * deleted has {@code salonId == null} with {@code masterType != INDEPENDENT_MASTER}, so the SpEL arm
- * grants that master authority over their own booking while this flag reads {@code false}. What
- * still holds — and is what the CTA depends on — is that the endpoint accepts only the CONJUNCTION
- * of both arms, so a viewer this flag shows {@code true} to is never rejected on authority grounds
- * by the service arm, and the divergent row above is fail-closed for the UI (no CTA offered, and
- * none would have succeeded). The mirror case (an {@code INDEPENDENT_MASTER}-typed master carrying a
- * non-null {@code salon_id}) would invert that and over-offer the CTA into a 403; no writer produces
- * that shape today, but nothing structurally forbids it either.
+ * <p><b>Phase 320 — the flag now agrees with BOTH gates of the write endpoint, exactly.</b> This
+ * used to be a deliberately weakened claim (phase-27.x security audit, LOW 3): {@code
+ * POST /client-reviews} is gated TWICE — the SpEL {@code @PreAuthorize} {@code
+ * @authz.canReviewClient} and then {@code enforceCanReviewClient} in the service — and the two used
+ * to derive "is this an independent-master booking" from different sources ({@code salonId == null}
+ * off a projection vs {@code masterType == INDEPENDENT_MASTER} off the entity), which diverged on a
+ * salon-typed master whose salon row had been deleted ({@code masters.salon_id} is
+ * {@code ON DELETE SET NULL}, {@code V4__Patch_salons_add_masters.sql:13}, and nothing constrains
+ * {@code master_type} against it). That divergence is GONE with the {@code
+ * hasProviderAuthorityOverBooking} disjunct that owned it. All three sites — this flag, {@code
+ * AuthorizationService#canReviewClient} and {@code AuthorizationService#enforceCanReviewClient} —
+ * now evaluate the SAME two columns, {@code masters.user_id} and {@code masters.is_active}, one
+ * through the {@code BookingReviewAccess} projection and two through the hydrated entity. Neither
+ * reads {@code salon_id} or {@code master_type} at all, so no schema shape can split them. Keep it
+ * that way: if a future phase re-adds a salon-derived arm to any ONE of the three, this paragraph's
+ * guarantee dies with it.
  *
  * <p><b>Why the two derivations were NOT unified.</b> Unifying means putting {@code masterType} into
  * {@code BookingCompletionAccess} and switching the projection-based predicates to it. That
@@ -338,7 +347,10 @@ public record BookingDetailResponse(
                 + "booking, the booking is COMPLETED (strictly — unlike the client-side canReview "
                 + "flag, an elapsed-but-unclosed CONFIRMED booking does NOT qualify here; see "
                 + "BookingClosureRule#isProviderReviewEligible), it has a real (non-guest) "
-                + "client, and no ClientReview exists for it yet. FALSE for a CLIENT/SALON_MASTER viewer, an "
+                + "client, and no ClientReview exists for it yet. A SALON_MASTER reads TRUE only on a "
+                + "booking they themselves performed (phase 316) and FALSE on a colleague's; this is "
+                + "the ONLY booking write that role holds — decline/not-complete/complete/reschedule "
+                + "still 403 for them. FALSE for a CLIENT viewer, an "
                 + "unauthorized provider, or any row of the CLIENT listing path of "
                 + "GET /bookings/me (which hardcodes false). The PROVIDER rows of "
                 + "GET /bookings/me carry the real per-row value — see "
@@ -455,7 +467,26 @@ public record BookingDetailResponse(
                         + "(Beauty Timeline). Prefer this over categoryName for icon resolution — "
                         + "categoryName is for display only. Never a fallback/placeholder value: a "
                         + "null here must render no icon, not a guessed one.")
-        String categoryKey
+        String categoryKey,
+        // Phase 317. Appended LAST for the same compile-time-slip-detection reason as every field
+        // above it — and here the protection is real rather than incidental: this is the first
+        // NON-scalar component on the record, so no reordering against any existing field can
+        // survive compilation.
+        @Schema(nullable = true,
+                description = "The review THIS booking's client left about the master — rating "
+                        + "plus the full comment (phase 317 D2: the text is already world-readable "
+                        + "through the permitAll GET /masters/{id}/reviews listing, so withholding "
+                        + "it here would be theatre). Null when the booking carries no review. "
+                        + "SERVED ONLY BY GET /bookings/{id}: every listing surface — the provider "
+                        + "and CLIENT branches of GET /bookings/me, GET /bookings/salon/{salonId}, "
+                        + "and the create/reschedule mutation responses — sends null unconditionally, "
+                        + "because a booking CARD renders no review body and paying a per-page "
+                        + "review fetch for a field nothing draws is not worth the statement. Do NOT "
+                        + "read a null on a list row as 'this booking has no review'; re-read the "
+                        + "booking through GET /bookings/{id} to learn that. This is the same "
+                        + "explicitly-surface-scoped contract providerCanReviewClient already "
+                        + "documents on this DTO.")
+        ClientAuthoredReviewResponse reviewByClient
 ) {
 
     /**
@@ -559,9 +590,16 @@ public record BookingDetailResponse(
             boolean providerCanReviewClient,
             String cityLabel,
             String districtLabel,
-            OffsetDateTime now
+            OffsetDateTime now,
+            @Nullable ClientAuthoredReviewResponse reviewByClient
     ) {
         Master master = booking.getMaster();
+        // V157 / phase 294 D3 — NULLABLE. A booking is a HISTORICAL record: the staff account behind
+        // its master may have been hard-deleted, leaving a detached masters stub (user_id = NULL +
+        // a first/last-name snapshot). The client's own past receipt must still render who performed
+        // the service, so the NAME comes from master.displayFirstName()/displayLastName() below, and
+        // every other property read off this reference is null-guarded. Do NOT collapse these guards
+        // back into direct masterUser.getX() calls.
         User masterUser = master.getUser();
         // Phase 242 — the BOOKING's own salon snapshot (bookings.salon_id), NEVER
         // master.getSalon() (the master's LIVE affiliation). See this class's javadoc: after a
@@ -570,9 +608,12 @@ public record BookingDetailResponse(
         Salon salon = booking.getSalon();
         User client = booking.getClient();
 
-        String resolvedStreet = salon != null ? salon.getStreet() : masterUser.getStreet();
-        String resolvedBuildingNo = salon != null ? salon.getBuildingNo() : masterUser.getBuildingNo();
-        String resolvedLocationNote = salon != null ? salon.getLocationNote() : masterUser.getLocationNote();
+        String resolvedStreet = salon != null ? salon.getStreet()
+                : (masterUser != null ? masterUser.getStreet() : null);
+        String resolvedBuildingNo = salon != null ? salon.getBuildingNo()
+                : (masterUser != null ? masterUser.getBuildingNo() : null);
+        String resolvedLocationNote = salon != null ? salon.getLocationNote()
+                : (masterUser != null ? masterUser.getLocationNote() : null);
 
         return new BookingDetailResponse(
                 booking.getId(),
@@ -593,14 +634,16 @@ public record BookingDetailResponse(
                 // a name on their calendar instead of null — guestPhone is intentionally excluded.
                 client != null ? client.getFirstName() : booking.getGuestName(),
                 client != null ? client.getLastName() : booking.getGuestSurname(),
-                masterUser.getFirstName(),
-                masterUser.getLastName(),
-                masterUser.getProfessionalTitle(),
+                master.displayFirstName(),
+                master.displayLastName(),
+                masterUser != null ? masterUser.getProfessionalTitle() : null,
                 booking.getClientComment(),
                 booking.getProviderComment(),
                 booking.getClientCancellationNote(),
-                masterUser.getAvatarUrl(),
-                masterUser.getRole(),
+                // A detached master has no account and therefore no avatar and no role — the stub
+                // carries a name and nothing else. Null here, never a fabricated placeholder.
+                masterUser != null ? masterUser.getAvatarUrl() : null,
+                masterUser != null ? masterUser.getRole() : null,
                 salon != null ? salon.getName() : null,
                 cityLabel,
                 districtLabel,
@@ -639,7 +682,12 @@ public record BookingDetailResponse(
                 // Derived from the SAME serviceDefinition.getCategory() read as categoryName above
                 // — no second lazy-graph walk, no widening of this factory's documented hydration
                 // contract. See categoryKeyOrNull's javadoc.
-                categoryKeyOrNull(booking.getMasterService().getServiceDefinition().getCategory())
+                categoryKeyOrNull(booking.getMasterService().getServiceDefinition().getCategory()),
+                // Phase 317 — supplied by the caller, never derived here: the review lives in a
+                // different aggregate (reviews), is reachable from no association on Booking, and
+                // only the DETAIL call path pays the statement that fetches it. Every other caller
+                // of this factory passes null on purpose; see the component's own @Schema.
+                reviewByClient
         );
     }
 }

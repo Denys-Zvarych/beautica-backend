@@ -7,7 +7,6 @@ import com.beautica.search.dto.MasterSearchRequest;
 import com.beautica.search.dto.SalonSearchRequest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -20,7 +19,6 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 
 import java.lang.reflect.RecordComponent;
 import java.nio.file.Files;
@@ -98,28 +96,21 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @SpyBean
     private DiscoveryLocationResolver discoveryLocationResolver;
 
-    private void ensureHttpClient() {
-        restTemplate.getRestTemplate().setRequestFactory(
-                new HttpComponentsClientHttpRequestFactory(HttpClients.createDefault()));
-    }
-
     private static HttpEntity<Void> anonymous() {
         HttpHeaders headers = new HttpHeaders();
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
         return new HttpEntity<>(headers);
     }
 
-    private UUID cityIdByName(String nameUk) {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = ? ORDER BY katotth_code LIMIT 1",
-                UUID.class, nameUk);
-    }
-
     private UUID districtIdInCity(String cityNameUk, int index) {
         return jdbcTemplate.queryForObject(
                 "SELECT cd.id FROM city_districts cd "
                         + "JOIN cities c ON c.id = cd.city_id "
-                        + "WHERE c.name_uk = ? ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
+                        // settlement_type = 'CITY' drops the namesake VILLAGES Phase 325
+                        // imported («Київ» in Миколаївська, «Львів» in Дніпропетровська),
+                        // which sort FIRST by katotth_code and carry no districts.
+                        + "WHERE c.name_uk = ? AND c.settlement_type = 'CITY' "
+                        + "ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
                 UUID.class, cityNameUk, index);
     }
 
@@ -128,8 +119,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("regression — a salon is found by its taxonomy city_id even though its legacy free-text city holds the Russian spelling 'Киев' (old AND city = :city path is gone)")
     void should_findSalonByCityId_regardlessOfLegacyFreeTextSpelling() throws Exception {
-        ensureHttpClient();
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         // The salon's legacy free-text column is the WRONG spelling on purpose
         // ("Киев" — Russian; the old code did `WHERE city = :city` so a Київ
@@ -170,8 +160,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("regression — an INDEPENDENT_MASTER is found by city_id even though its user-row legacy city is an arbitrary free-text spelling (FK discovery, not the old string path)")
     void should_findMasterByCityId_regardlessOfLegacyUserRowSpelling() throws Exception {
-        ensureHttpClient();
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         // Phase 19.7: /search/masters returns INDEPENDENT_MASTER only. The
         // "Київ ≠ Киев ≠ kyiv" regression under test is role-agnostic — it is
@@ -209,9 +198,8 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("M2 — every master & salon search routes locality through DiscoveryLocationResolver.resolveFilter (seam is on the call path)")
     void should_invokeResolverSeam_when_searchPerformed() {
-        ensureHttpClient();
         Mockito.clearInvocations(discoveryLocationResolver);
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         restTemplate.exchange(
                 MASTERS_URL + "?location.cityId=" + kyivCityId + "&page=0&size=20",
@@ -322,8 +310,7 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         // while an independent master in district A is still discovered via its
         // own user-row locality. This pins that the role predicate lives on both
         // the data and the count path across a multi-salon owner context.
-        ensureHttpClient();
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
         UUID districtA = districtIdInCity("Київ", 0);
         UUID districtB = districtIdInCity("Київ", 1);
 
@@ -377,15 +364,19 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
     // ── salon-employed master's own locality onto discovery ─────────────────
 
     @Test
-    @DisplayName("Anti-Bug LOW-1 — a legacy salon with NULL city_id/district_id (predates the Phase 10.3 "
-            + "locality columns) never resurrects its employed SALON_MASTER on /search/masters via the "
-            + "master's own personal city/district, even though the DISCOVERY_CITY_EXPR/DISCOVERY_DISTRICT_EXPR "
-            + "COALESCE is data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is "
-            + "the actual guard, not the salon's locality data")
+    @DisplayName("Anti-Bug LOW-1 — a salon with no district_id (a legitimate state — districtless "
+            + "cities exist — the DB no longer permits a null city_id at all as of V150) never "
+            + "resurrects its employed SALON_MASTER on /search/masters via the master's own personal "
+            + "city/district, even though the DISCOVERY_CITY_EXPR/DISCOVERY_DISTRICT_EXPR COALESCE is "
+            + "data-independent of salon.city_id — the u.role = 'INDEPENDENT_MASTER' predicate is the "
+            + "actual guard, not the salon's locality data")
     void should_neverSurfaceSalonMasterUnderOwnPersonalLocality_when_salonIsCityLess() throws Exception {
-        ensureHttpClient();
-        UUID ownerPersonalCity = cityIdByName("Київ");
+        UUID ownerPersonalCity = majorCityIdByName("Київ");
         UUID ownerPersonalDistrict = districtIdInCity("Київ", 0);
+        // The salon's OWN real city — deliberately NOT Kyiv, so a search scoped to the master's
+        // personal city/district can only return this master if the (broken) guard fell through
+        // to the master's own row instead of the salon's.
+        UUID salonOwnCity = testCityId();
 
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
@@ -394,15 +385,20 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
                 ownerId, "ms-cityless-owner-" + UUID.randomUUID() + "@beautica.test",
                 "$2a$04$placeholdervaluefortestonlydigest");
 
-        // Legacy salon: city_id/district_id both NULL (never migrated / never updated
-        // since Phase 10.3 added the columns) — SalonService.createSalon/updateSalon
-        // would reject this via LocalityWriteValidator today, but a pre-existing row
-        // can still carry it, per Salon.java §67-72 / LocalityWriteValidator §35-39.
+        // salons.city_id is DB-level NOT NULL as of V150 ("a salon must always have a city"), so
+        // the legacy "both city_id and district_id NULL" premise this test used to seed is no
+        // longer constructible — that INSERT would now throw a DataIntegrityViolationException.
+        // district_id alone stays genuinely nullable (cities without urban districts, e.g.
+        // Vinnytsia — see LocalityWriteValidator), which is exactly what is seeded here: a real
+        // city, no district. The invariant under test — a SALON_MASTER's discovery locality is
+        // never sourced from their own personal city/district — is unaffected by which locality
+        // field is missing; the master's personal Kyiv city/district below is still a DIFFERENT
+        // city than the salon's own, so the assertion is just as sharp as when city_id was null.
         UUID salonId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO salons (id, owner_id, name, city_id, district_id, is_active, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, NULL, NULL, true, NOW(), NOW())",
-                salonId, ownerId, "CitylessLegacySalon");
+                        + "VALUES (?, ?, ?, ?, NULL, true, NOW(), NOW())",
+                salonId, ownerId, "DistrictlessSalon", salonOwnCity);
 
         // Worst-case simulation: the employed SALON_MASTER's OWN user row carries a real
         // personal city/district. The live write path (UserService.applyLocality) never
@@ -431,8 +427,10 @@ class SearchReworkRegressionTest extends AbstractIntegrationTest {
         JsonNode page = objectMapper.readTree(underPersonalDistrict.getBody()).path("data");
 
         assertThat(page.path("totalElements").asLong())
-                .as("the SALON_MASTER's own personal district must never resurface them on the public "
-                        + "grid, regardless of the salon's (missing) locality data")
+                .as("the SALON_MASTER's own personal city/district must never resurface them on the "
+                        + "public grid — discovery is keyed on the SALON's own locality, not the "
+                        + "employed master's personal one, regardless of which salon locality field "
+                        + "(here, district_id) happens to be unset")
                 .isZero();
     }
 
