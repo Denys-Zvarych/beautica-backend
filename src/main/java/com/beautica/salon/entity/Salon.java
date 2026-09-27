@@ -1,6 +1,7 @@
 package com.beautica.salon.entity;
 
 import com.beautica.common.AuditableEntity;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.user.User;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -142,4 +143,17 @@ public class Salon extends AuditableEntity {
     // and the JVM already defaults a primitive boolean to false — which is the intent here.
     @Column(name = "is_primary", nullable = false)
     private boolean isPrimary;
+
+    /**
+     * Denormalises a settlement's labels into the legacy {@code city}/{@code region} columns
+     * whenever {@code cityId} is written. {@code null} (the id did not resolve) CLEARS both — a
+     * stale label must never sit beside a new id. Same rule as
+     * {@link User#applySettlementDisplayNames(SettlementDisplayNames)}.
+     *
+     * @param names the resolved labels, or {@code null} to clear
+     */
+    public void applySettlementDisplayNames(SettlementDisplayNames names) {
+        this.city = names == null ? null : names.city();
+        this.region = names == null ? null : names.region();
+    }
 }

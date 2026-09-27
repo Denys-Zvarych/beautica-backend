@@ -166,7 +166,7 @@ class SalonControllerTest {
         // oblastId (derived from cityId, never stored) added after cityId; null is the safe
         // default for stubs with no cityId set.
         return new SalonResponse(salonId, null, name, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, true, false, null);
+                null, null, null, null, null, null, null, null, null, true, false, null, null, null);
     }
 
     // ── POST /api/v1/salons ───────────────────────────────────────────────────
@@ -249,7 +249,7 @@ class SalonControllerTest {
         var salon = buildSalonEntity(salonId, "Public Salon");
         // Controller now calls SalonService#getPublicSalon directly — DTO assembly (including
         // the oblastId resolution) moved into the service so it isn't duplicated per-controller.
-        when(salonService.getPublicSalon(salonId)).thenReturn(PublicSalonResponse.from(salon, null));
+        when(salonService.getPublicSalon(salonId)).thenReturn(PublicSalonResponse.from(salon, null, null));
 
         log.debug("Act: GET {}/{} without credentials — public endpoint", SALONS_URL, salonId);
         mockMvc.perform(get(SALONS_URL + "/" + salonId)

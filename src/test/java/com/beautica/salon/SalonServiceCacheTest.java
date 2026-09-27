@@ -117,6 +117,7 @@ class SalonServiceCacheTest {
     // slice's Salon mocks return a null cityId by default, so resolveOblastId short-circuits
     // and neither mock is exercised beyond satisfying Spring's bean graph.
     @MockBean CityRepository cityRepository;
+    @MockBean com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
     @MockBean com.beautica.location.service.LocationQueryService locationQueryService;
     // Phase 23.1: SalonService now constructor-depends on InviteTokenRepository
     // (listSalonInvites/cancelInvite) and Clock (§G — no bare Instant.now()). This slice does
@@ -449,5 +450,356 @@ class SalonServiceCacheTest {
         assertThat(cacheManager.getCache("search:salons:browse").get(sentinelKey))
                 .as("search:salons:browse cache must be fully cleared after deactivateSalon (blanket eviction)")
                 .isNull();
+    }
+
+    // ── PERF-LOW-2: a later salon create rewrites the owner's users.city/region/cityId ──────────
+    // MasterDetailResponse reads those columns and is cached under masterId (master-detail) and
+    // userId (master-detail-by-user); both must be evicted after commit or the owner's detail
+    // keeps serving the previous city for the TTL.
+
+    private User ownerForCreate(UUID ownerId) {
+        User owner = new User("owner-" + ownerId + "@beautica.test", "hash", Role.SALON_OWNER, null, null, null);
+        org.springframework.test.util.ReflectionTestUtils.setField(owner, "id", ownerId);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.save(org.mockito.ArgumentMatchers.any(Salon.class))).thenAnswer(inv -> {
+            Salon saved = inv.getArgument(0);
+            org.springframework.test.util.ReflectionTestUtils.setField(saved, "id", UUID.randomUUID());
+            org.springframework.test.util.ReflectionTestUtils.setField(saved, "createdAt", Instant.now());
+            return saved;
+        });
+        return owner;
+    }
+
+    private static com.beautica.salon.dto.CreateSalonRequest createRequest(UUID cityId) {
+        return new com.beautica.salon.dto.CreateSalonRequest("Second Salon", null, null, null, null, null, null,
+                cityId, null, "Shevchenka St", "5A", null);
+    }
+
+    @Test
+    @DisplayName("createSalon (second salon) — leaves the owner's master-detail entries alone: a non-primary salon no longer rewrites the owner row")
+    void should_notEvictOwnerMasterDetailCaches_when_secondSalonCreated() {
+        // Replaces should_evictOwnerMasterDetailCaches_when_secondSalonCreatedWithCityId, which
+        // pinned the old behaviour: a second salon used to overwrite the owner's users.city/…,
+        // so the owner-master's cached detail had to go. Only the first (primary) salon syncs now.
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        ownerForCreate(ownerId);
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        cacheManager.getCache("master-detail").put(ownerMasterId, "owner-detail");
+        cacheManager.getCache("master-detail-by-user").put(ownerId, "owner-me");
+
+        salonService.createSalon(ownerId, createRequest(UUID.randomUUID()));
+
+        verify(masterRepository, Mockito.never()).findIdByUserId(ownerId);
+        assertThat(cacheManager.getCache("master-detail").get(ownerMasterId)).isNotNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(ownerId)).isNotNull();
+    }
+
+    @Test
+    @DisplayName("createSalon (first salon) — does not look up an owner master that does not exist yet")
+    void should_notLookUpOwnerMaster_when_firstSalonCreated() {
+        UUID ownerId = UUID.randomUUID();
+        ownerForCreate(ownerId);
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+
+        salonService.createSalon(ownerId, createRequest(UUID.randomUUID()));
+
+        verify(masterRepository, Mockito.never()).findIdByUserId(ownerId);
+    }
+
+    // ── updateSalon cityId change → affiliated masters' detail entries (fix cycle 1, perf LOW) ──
+    // Every affiliated master's MasterDetailResponse embeds a PublicSalonResponse whose city /
+    // region / citySettlementType / cityHromadaNameUk follow the salon's cityId.
+
+    private static UpdateSalonRequest moveTo(UUID cityId) {
+        return new UpdateSalonRequest(null, null, null, null, null,
+                cityId, null, "Shevchenka St", "5A", null, null, null);
+    }
+
+    @Test
+    @DisplayName("updateSalon changing cityId evicts every affiliated master's master-detail + master-detail-by-user entry, per key, after commit")
+    void should_evictAffiliatedMasterDetailCaches_when_updateSalonChangesCityId() {
+        UUID salonId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(UUID.randomUUID());
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        UUID masterA = UUID.randomUUID();
+        UUID userA = UUID.randomUUID();
+        UUID detachedMaster = UUID.randomUUID();
+        UUID bystanderMaster = UUID.randomUUID();
+        UUID bystanderUser = UUID.randomUUID();
+        when(masterRepository.findCacheKeysBySalonId(salonId)).thenReturn(List.of(
+                new com.beautica.master.repository.MasterCacheKeys(masterA, userA),
+                new com.beautica.master.repository.MasterCacheKeys(detachedMaster, null)));
+        cacheManager.getCache("master-detail").put(masterA, "stale-a");
+        cacheManager.getCache("master-detail").put(detachedMaster, "stale-detached");
+        cacheManager.getCache("master-detail").put(bystanderMaster, "other-salon");
+        cacheManager.getCache("master-detail-by-user").put(userA, "stale-me-a");
+        cacheManager.getCache("master-detail-by-user").put(bystanderUser, "other-salon-me");
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(UUID.randomUUID()));
+
+        assertThat(cacheManager.getCache("master-detail").get(masterA)).isNull();
+        assertThat(cacheManager.getCache("master-detail").get(detachedMaster))
+                .as("a detached master (null userId) still has its masterId entry evicted").isNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(userA)).isNull();
+        assertThat(cacheManager.getCache("master-detail").get(bystanderMaster))
+                .as("per-key evict, never clear() (§F-6)").isNotNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(bystanderUser))
+                .as("per-key evict, never clear() (§F-6)").isNotNull();
+    }
+
+    @Test
+    @DisplayName("updateSalon resending the SAME cityId, or omitting it, never loads the roster's cache keys")
+    void should_notLoadMasterCacheKeys_when_cityIdUnchangedOrOmitted() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(cityId);
+        // The salon already carries the street/building every moveTo(...) resends — so this is a
+        // true resend, not an (incidental) street edit, which would now rightly sweep the roster.
+        when(salon.getStreet()).thenReturn("Shevchenka St");
+        when(salon.getBuildingNo()).thenReturn("5A");
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        // master-detail is keyed by MASTER id. The roster lookup is stubbed to name this master, so
+        // the entry would be evicted if either call ever reached the roster — the isNotNull below
+        // is then a real signal, not a key that no eviction could ever target.
+        UUID affiliatedMaster = UUID.randomUUID();
+        when(masterRepository.findCacheKeysBySalonId(salonId)).thenReturn(List.of(
+                new com.beautica.master.repository.MasterCacheKeys(affiliatedMaster, UUID.randomUUID())));
+        cacheManager.getCache("master-detail").put(affiliatedMaster, "untouched");
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(cityId));
+        salonService.updateSalon(UUID.randomUUID(), salonId, renameTo("Renamed"));
+
+        verify(masterRepository, Mockito.never()).findCacheKeysBySalonId(salonId);
+        assertThat(cacheManager.getCache("master-detail").get(affiliatedMaster))
+                .as("an affiliated master's entry survives an unchanged/omitted locality").isNotNull();
+    }
+
+    @Test
+    @DisplayName("updateSalon with a cityId resolves the settlement ONCE and reuses it for the response")
+    void should_resolveSettlementOnce_when_updateSalonCarriesCityId() {
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(newCityId);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(newCityId));
+
+        verify(settlementDisplayNameResolver, times(1)).resolve(newCityId);
+    }
+
+    // ── updateSalon cityId change → discovery caches (fix cycle 2, LOW-1) ─────────────────────
+    // A salon's city is both a discovery filter key and the cityLabel on its search card — and,
+    // via COALESCE(sal.city_id, u.city_id), the city of every one of its masters in master search.
+
+    private static final List<String> DISCOVERY_CACHES = List.of(
+            "search:salons:browse", "search:salons:q", "search:masters:browse", "search:masters:q");
+
+    private void seedDiscoveryCaches(Object key) {
+        DISCOVERY_CACHES.forEach(name -> cacheManager.getCache(name).put(key, "stale-" + name));
+    }
+
+    @Test
+    @DisplayName("updateSalon changing cityId clears all four discovery caches (search:salons:* and search:masters:*) after commit")
+    void should_clearSalonAndMasterSearchCaches_when_updateSalonChangesCityId() {
+        UUID salonId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(UUID.randomUUID());
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(masterRepository.findCacheKeysBySalonId(salonId)).thenReturn(List.of());
+        Object sentinelKey = "city-change-sentinel-" + salonId;
+        seedDiscoveryCaches(sentinelKey);
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(UUID.randomUUID()));
+
+        for (String name : DISCOVERY_CACHES) {
+            assertThat(cacheManager.getCache(name).get(sentinelKey))
+                    .as("%s must be cleared when the salon's city changes", name)
+                    .isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("updateSalon with an unchanged or omitted cityId leaves every discovery cache intact")
+    void should_keepSearchCaches_when_cityIdUnchangedOrOmitted() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(cityId);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        Object sentinelKey = "city-kept-sentinel-" + salonId;
+        seedDiscoveryCaches(sentinelKey);
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(cityId));
+        salonService.updateSalon(UUID.randomUUID(), salonId, renameTo("Renamed"));
+
+        for (String name : DISCOVERY_CACHES) {
+            assertThat(cacheManager.getCache(name).get(sentinelKey))
+                    .as("%s must survive a PATCH that does not move the salon", name)
+                    .isNotNull();
+        }
+    }
+
+    // ── district-only locality change (fix cycle 3, LOW-2) ──────────────────────────────────
+    // The locality is a (cityId, districtId) pair: the embedded salon block and the discovery
+    // district bucket / districtLabel move with the district even when the city stays put.
+
+    private static UpdateSalonRequest moveTo(UUID cityId, UUID districtId) {
+        return new UpdateSalonRequest(null, null, null, null, null,
+                cityId, districtId, "Shevchenka St", "5A", null, null, null);
+    }
+
+    @Test
+    @DisplayName("updateSalon changing ONLY districtId (same city) evicts affiliated master-detail keys and every discovery cache")
+    void should_evictMasterDetailAndSearchCaches_when_onlyDistrictChanges() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(cityId);
+        when(salon.getDistrictId()).thenReturn(UUID.randomUUID());
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        when(masterRepository.findCacheKeysBySalonId(salonId)).thenReturn(List.of(
+                new com.beautica.master.repository.MasterCacheKeys(masterId, userId)));
+        cacheManager.getCache("master-detail").put(masterId, "stale-district");
+        cacheManager.getCache("master-detail-by-user").put(userId, "stale-district-me");
+        Object sentinelKey = "district-change-sentinel-" + salonId;
+        seedDiscoveryCaches(sentinelKey);
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(cityId, UUID.randomUUID()));
+
+        assertThat(cacheManager.getCache("master-detail").get(masterId)).isNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(userId)).isNull();
+        for (String name : DISCOVERY_CACHES) {
+            assertThat(cacheManager.getCache(name).get(sentinelKey))
+                    .as("%s must be cleared when only the salon's district changes", name)
+                    .isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("updateSalon resending the SAME city AND the SAME district evicts nothing")
+    void should_evictNothing_when_sameCityAndSameDistrictResent() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(cityId);
+        when(salon.getDistrictId()).thenReturn(districtId);
+        // The salon already carries the street/building every moveTo(...) resends — so this is a
+        // true resend, not an (incidental) street edit, which would now rightly sweep the roster.
+        when(salon.getStreet()).thenReturn("Shevchenka St");
+        when(salon.getBuildingNo()).thenReturn("5A");
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        Object sentinelKey = "same-locality-sentinel-" + salonId;
+        seedDiscoveryCaches(sentinelKey);
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, moveTo(cityId, districtId));
+
+        verify(masterRepository, Mockito.never()).findCacheKeysBySalonId(salonId);
+        for (String name : DISCOVERY_CACHES) {
+            assertThat(cacheManager.getCache(name).get(sentinelKey))
+                    .as("%s must survive an identical locality resend", name)
+                    .isNotNull();
+        }
+    }
+
+    // ── owner-address sync on a PRIMARY salon's street-only edit (extra pass, MEDIUM) ─────────
+
+    @Test
+    @DisplayName("updateSalon street-only change on the PRIMARY salon evicts the owner's user-profile and owner-master keys, but no discovery cache")
+    void should_evictOwnerCachesButNotSearch_when_primarySalonStreetOnlyChanges() {
+        UUID ownerId = UUID.randomUUID();
+        UUID ownerMasterId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(ownerId);
+        when(salon.isPrimary()).thenReturn(true);
+        when(salon.getCityId()).thenReturn(cityId);
+        when(salon.getStreet()).thenReturn("Old St");
+        when(salon.getBuildingNo()).thenReturn("5A");
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        // The owner-master is affiliated with its primary salon, so the salon-wide sweep (now run
+        // on ANY address change) is what evicts its keys — no separate owner-master path.
+        when(masterRepository.findCacheKeysBySalonId(salonId)).thenReturn(List.of(
+                new com.beautica.master.repository.MasterCacheKeys(ownerMasterId, ownerId)));
+        cacheManager.getCache("master-detail").put(ownerMasterId, "stale-owner-street");
+        cacheManager.getCache("master-detail-by-user").put(ownerId, "stale-owner-street-me");
+        Object sentinelKey = "street-only-sentinel-" + salonId;
+        seedDiscoveryCaches(sentinelKey);
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, new UpdateSalonRequest(
+                null, null, null, null, null, cityId, null, "New St", "5A", null, null, null));
+
+        verify(userProfileCacheEvictor).evictAfterCommit(ownerId);
+        assertThat(cacheManager.getCache("master-detail").get(ownerMasterId)).isNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(ownerId)).isNull();
+        for (String name : DISCOVERY_CACHES) {
+            assertThat(cacheManager.getCache(name).get(sentinelKey))
+                    .as("%s stays tied to a city/district change, not a street edit", name)
+                    .isNotNull();
+        }
+    }
+
+    // ── street / building / note edits → affiliated master-detail (last fix, pre-existing LOW) ──
+    // Every affiliated master's cached detail embeds the salon's street/buildingNo/locationNote,
+    // not only its locality. Run on a NON-primary salon so the owner-sync path is not involved.
+
+    @Test
+    @DisplayName("updateSalon changing ONLY the street of a NON-primary salon evicts every affiliated master's detail keys, but no discovery cache")
+    void should_evictAffiliatedMasterDetail_when_salonStreetOnlyChanges() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.isPrimary()).thenReturn(false);
+        when(salon.getCityId()).thenReturn(cityId);
+        when(salon.getStreet()).thenReturn("Old St");
+        when(salon.getBuildingNo()).thenReturn("5A");
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        UUID masterId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        when(masterRepository.findCacheKeysBySalonId(salonId)).thenReturn(List.of(
+                new com.beautica.master.repository.MasterCacheKeys(masterId, userId)));
+        cacheManager.getCache("master-detail").put(masterId, "stale-street");
+        cacheManager.getCache("master-detail-by-user").put(userId, "stale-street-me");
+        Object sentinelKey = "salon-street-sentinel-" + salonId;
+        seedDiscoveryCaches(sentinelKey);
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, new UpdateSalonRequest(
+                null, null, null, null, null, cityId, null, "New St", "5A", null, null, null));
+
+        assertThat(cacheManager.getCache("master-detail").get(masterId)).isNull();
+        assertThat(cacheManager.getCache("master-detail-by-user").get(userId)).isNull();
+        verify(userProfileCacheEvictor, Mockito.never()).evictAfterCommit(org.mockito.ArgumentMatchers.any());
+        for (String name : DISCOVERY_CACHES) {
+            assertThat(cacheManager.getCache(name).get(sentinelKey))
+                    .as("%s does not carry the street — a street edit must not clear it", name)
+                    .isNotNull();
+        }
+    }
+
+    @Test
+    @DisplayName("updateSalon re-sending an UNCHANGED full address (city, district, street, building, note) evicts no master-detail key")
+    void should_evictNoMasterDetail_when_unchangedAddressResent() {
+        UUID salonId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        UUID districtId = UUID.randomUUID();
+        Salon salon = salonOwnedBy(UUID.randomUUID());
+        when(salon.getCityId()).thenReturn(cityId);
+        when(salon.getDistrictId()).thenReturn(districtId);
+        when(salon.getStreet()).thenReturn("Same St");
+        when(salon.getBuildingNo()).thenReturn("5A");
+        when(salon.getLocationNote()).thenReturn("same note");
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(UUID.randomUUID(), salonId, new UpdateSalonRequest(
+                null, null, null, null, null, cityId, districtId, "Same St", "5A", "same note",
+                null, null));
+
+        verify(masterRepository, Mockito.never()).findCacheKeysBySalonId(salonId);
     }
 }

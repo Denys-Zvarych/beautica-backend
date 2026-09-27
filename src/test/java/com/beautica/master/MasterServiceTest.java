@@ -48,6 +48,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
@@ -57,6 +60,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -111,6 +115,9 @@ class MasterServiceTest {
     // the REAL CacheConfig in OwnerMasterCacheTest and UserCacheEvictionIT, where a cache
     // actually exists to observe; verifying a mock call here would only restate the source.
     @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+    // Settlement label parts on MasterDetailResponse — default answer is Optional.empty(), so an
+    // unstubbed resolve() yields null parts, never an NPE on a missing collaborator.
+    @Mock private com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
     // Phase 29.2 fallout: getMasterCalendar now resolves an absolute-instant "now" for
     // BookingResponse.awaitingClosure. A real fixed-value Clock (not a bare @Mock, which would
     // return null from #instant() and NPE) — the exact instant is irrelevant to every test in
@@ -1763,5 +1770,70 @@ class MasterServiceTest {
                         theCall.getOrigin().getOwner().getFullName())
                 .isTrue();
         assertThat(theCall.getOrigin().getName()).isEqualTo("removeMaster");
+    }
+
+    // ── Qase defect #25: «Записів місяця» counter ─────────────────────────────
+
+    /**
+     * The month window must be resolved in Kyiv, not in the JVM/JDBC zone.
+     *
+     * <p>The clock is pinned to {@code 2026-06-30T22:30Z}, which is {@code 2026-07-01T01:30}
+     * in Kyiv (UTC+3 in summer). UTC still says June; Kyiv has already rolled into July. A
+     * window built from {@code LocalDate.now()} on a UTC JVM — or from SQL {@code CURRENT_DATE}
+     * on a UTC connection — would count JUNE's bookings and show the master a figure their own
+     * July calendar contradicts. Asserting the captured bounds is what pins the zone: a count
+     * assertion alone passes under either interpretation whenever the fixture happens to sit
+     * inside both windows.
+     */
+    @Test
+    @DisplayName("bookings-this-month window is anchored to Kyiv, not UTC")
+    void bookingsThisMonthWindowIsKyivAnchored() {
+        clock = Clock.fixed(Instant.parse("2026-06-30T22:30:00Z"), ZoneOffset.UTC);
+        ReflectionTestUtils.setField(masterService, "clock", clock);
+
+        UUID masterId = UUID.randomUUID();
+        when(bookingRepository.countActiveByMasterIdAndStartsAtBetween(
+                eq(masterId), any(), any())).thenReturn(7L);
+
+        int count = masterService.countBookingsInCurrentKyivMonth(masterId);
+
+        ArgumentCaptor<OffsetDateTime> from = ArgumentCaptor.forClass(OffsetDateTime.class);
+        ArgumentCaptor<OffsetDateTime> to = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(bookingRepository).countActiveByMasterIdAndStartsAtBetween(
+                eq(masterId), from.capture(), to.capture());
+
+        assertThat(count).isEqualTo(7);
+        assertThat(from.getValue().toInstant())
+                .as("July in Kyiv starts at 2026-06-30T21:00Z, NOT at 2026-07-01T00:00Z")
+                .isEqualTo(Instant.parse("2026-06-30T21:00:00Z"));
+        assertThat(to.getValue().toInstant())
+                .as("and ends where August begins in Kyiv")
+                .isEqualTo(Instant.parse("2026-07-31T21:00:00Z"));
+    }
+
+    /**
+     * A booking at exactly Kyiv midnight on the 1st belongs to the month that starts then, and
+     * to exactly one month — the half-open range the repository query documents.
+     */
+    @Test
+    @DisplayName("bookings-this-month window is half-open [from, to)")
+    void bookingsThisMonthWindowIsHalfOpen() {
+        clock = Clock.fixed(Instant.parse("2026-02-14T12:00:00Z"), ZoneOffset.UTC);
+        ReflectionTestUtils.setField(masterService, "clock", clock);
+
+        UUID masterId = UUID.randomUUID();
+        when(bookingRepository.countActiveByMasterIdAndStartsAtBetween(
+                eq(masterId), any(), any())).thenReturn(0L);
+
+        masterService.countBookingsInCurrentKyivMonth(masterId);
+
+        ArgumentCaptor<OffsetDateTime> from = ArgumentCaptor.forClass(OffsetDateTime.class);
+        ArgumentCaptor<OffsetDateTime> to = ArgumentCaptor.forClass(OffsetDateTime.class);
+        verify(bookingRepository).countActiveByMasterIdAndStartsAtBetween(
+                eq(masterId), from.capture(), to.capture());
+
+        // February 2026 in Kyiv: winter, UTC+2.
+        assertThat(from.getValue().toInstant()).isEqualTo(Instant.parse("2026-01-31T22:00:00Z"));
+        assertThat(to.getValue().toInstant()).isEqualTo(Instant.parse("2026-02-28T22:00:00Z"));
     }
 }

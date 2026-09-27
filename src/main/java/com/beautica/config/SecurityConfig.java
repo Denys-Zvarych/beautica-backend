@@ -207,6 +207,28 @@ public class SecurityConfig {
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/oblasts/{oblastId}/cities").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/locations/cities/{cityId}/districts").permitAll();
                     auth.requestMatchers(HttpMethod.GET, "/api/v1/search/**").permitAll();
+
+                    // Phase 326 settlement autocomplete — GET /api/v1/settlements?query=...
+                    // This is the "dynamic/parameterised locality query" the Phase 10.7 note
+                    // above says to revisit on, and it is revisited: unlike the three cascade
+                    // GETs, this endpoint IS throttled per IP (AuthRateLimitFilter's
+                    // SETTLEMENT_SEARCH_PATH branch).
+                    //
+                    // permitAll because the «Населений пункт» field is reached during
+                    // registration, before any token exists (phase-326 D7). The response is a
+                    // public government reference list — settlement id + name + type + the
+                    // parent oblast's name — with no owner UUIDs, no provider counts and no PII
+                    // (§I). GET-only and exact-path scoped; settlement rows are written by
+                    // Flyway alone (V53 / V170 / V171), so there is no mutation surface to
+                    // widen onto.
+                    //
+                    // Why it is not covered by the cascade's exemption: that argument rests on
+                    // a fully static dataset behind a long-lived @Cacheable, so the uncached
+                    // surface is bounded by deploy frequency. Here only the pre-typing major
+                    // list is cached — the per-keystroke results deliberately are not (the key
+                    // space is every prefix a user can type), so request volume DOES reach the
+                    // database and a per-IP ceiling is the right control.
+                    auth.requestMatchers(HttpMethod.GET, "/api/v1/settlements").permitAll();
                     // Phase 13.1 — Guest Booking Link. The public booking page
                     // (beautica.app/book/{slug}) is opened by unauthenticated clients
                     // from a shared link, so GET /api/v1/book/** is permitAll. Placed

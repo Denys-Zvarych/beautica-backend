@@ -5,7 +5,8 @@ import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.location.LocalityWriteValidator;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.KeyedSettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterService;
 import com.beautica.salon.dto.CreateSalonRequest;
@@ -28,6 +29,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -68,13 +70,10 @@ class SalonServiceMultiTest {
     @Mock
     private CacheManager cacheManager;
 
-    // CRITICAL: must be declared so @InjectMocks can satisfy the CityRepository constructor
-    // parameter — without it the field receives null and resolveOblastId throws NPE whenever
-    // getCityId() returns a non-null value (mirrors MasterServiceTest). CityRepository backs
-    // ONLY the batch resolveOblastIdsByCityIds sibling now (getOwnerSalons) — the single-row
-    // resolveOblastId delegates to the shared LocationQueryService below (Phase 240 perf fix).
+    // Shared city/region label lookup (salon + owner denorm). Declared so @InjectMocks does not
+    // pass null; the default Optional.empty() stub is a no-op resolution.
     @Mock
-    private CityRepository cityRepository;
+    private com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
 
     @Mock
     private com.beautica.location.service.LocationQueryService locationQueryService;
@@ -195,10 +194,10 @@ class SalonServiceMultiTest {
                 .thenReturn(List.of(salonA, salonB));
         // Row order deliberately reversed vs. salon list order — a map-based lookup must not
         // depend on the repository returning rows in salon-list order.
-        when(cityRepository.findOblastIdsByIdIn(Set.of(cityA, cityB)))
-                .thenReturn(List.of(
-                        new Object[] {cityB, oblastB},
-                        new Object[] {cityA, oblastA}));
+        when(settlementDisplayNameResolver.resolveAll(Set.of(cityA, cityB)))
+                .thenReturn(Map.of(
+                        cityB, keyed(cityB, oblastB),
+                        cityA, keyed(cityA, oblastA)));
 
         List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
 
@@ -206,15 +205,17 @@ class SalonServiceMultiTest {
                 .as("each salon must carry its OWN oblastId, not a swapped/shared one")
                 .extracting(SalonResponse::cityId, SalonResponse::oblastId)
                 .containsExactlyInAnyOrder(tuple(cityA, oblastA), tuple(cityB, oblastB));
-        // Gap 2 (verifier/perf-flagged): the batch method is the entire point of
-        // resolveOblastIdsByCityIds — a regression back to a per-salon N+1 call must fail this.
+        // Gap 2 (verifier/perf-flagged): ONE batch call carries both the oblastId and the label
+        // parts — a regression back to a per-salon N+1 call must fail this.
         // any() (not the exact combined set) is deliberate: an N+1 regression calls the method
         // once PER SALON with a smaller, DIFFERENT argument each time (e.g. Set.of(cityA) then
         // Set.of(cityB)) — an exact-args verify would not even see those extra calls, since
         // Mockito counts invocations per distinct argument match, not total calls to the method.
-        verify(cityRepository, times(1)).findOblastIdsByIdIn(any());
+        verify(settlementDisplayNameResolver, times(1)).resolveAll(any());
         // The one call that does happen must carry the full combined city-id set.
-        verify(cityRepository).findOblastIdsByIdIn(Set.of(cityA, cityB));
+        verify(settlementDisplayNameResolver).resolveAll(Set.of(cityA, cityB));
+        // No second, oblast-only lookup path survives beside the batch (perf LOW, fix cycle 1).
+        verify(locationQueryService, never()).resolveCityOblastId(any());
     }
 
     @Test
@@ -234,8 +235,8 @@ class SalonServiceMultiTest {
         when(salonRepository.findAllByOwnerIdAndIsActiveTrue(ownerId))
                 .thenReturn(List.of(salonWithCity, salonNoCity));
         // Only the non-null cityId may appear in the batch query's input set.
-        when(cityRepository.findOblastIdsByIdIn(Set.of(cityA)))
-                .thenReturn(List.<Object[]>of(new Object[] {cityA, oblastA}));
+        when(settlementDisplayNameResolver.resolveAll(Set.of(cityA)))
+                .thenReturn(new java.util.HashMap<>(Map.of(cityA, keyed(cityA, oblastA))));
 
         List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
 
@@ -260,9 +261,9 @@ class SalonServiceMultiTest {
         List<SalonResponse> responses = salonService.getOwnerSalons(ownerId);
 
         assertThat(responses).extracting(SalonResponse::oblastId).containsOnlyNulls();
-        // CRITICAL guard-branch assertion (Q6): the empty-cityIds short-circuit must never
-        // reach the DB — verifies resolveOblastIdsByCityIds' cityIds.isEmpty() branch.
-        verify(cityRepository, never()).findOblastIdsByIdIn(any());
+        // CRITICAL guard-branch assertion (Q6): only an EMPTY id set reaches the batch resolver;
+        // its no-query short-circuit on empty input is pinned in SettlementDisplayNameResolverTest.
+        verify(settlementDisplayNameResolver).resolveAll(Set.of());
     }
 
     // -------------------------------------------------------------------------
@@ -382,5 +383,10 @@ class SalonServiceMultiTest {
         ReflectionTestUtils.setField(salon, "id", id);
         ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
         return salon;
+    }
+
+    private static KeyedSettlementDisplayNames keyed(UUID cityId, UUID oblastId) {
+        return new KeyedSettlementDisplayNames(
+                cityId, oblastId, "Місто", "Область", SettlementType.CITY, null);
     }
 }

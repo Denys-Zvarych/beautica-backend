@@ -132,6 +132,10 @@ class CachePrefixEvictionKeyShapeTest {
     // Phase 240 perf MEDIUM fix: MasterService no longer depends on CityRepository — resolveOblastId
     // now delegates to the shared cached resolver (LocationQueryService#resolveCityOblastId).
     @MockBean LocationQueryService locationQueryService;
+    // MasterService ctor dependency (saved-settlement label parts). A mock is right here: these
+    // tests observe the master caches, not the resolver's own cache, and its default
+    // Optional.empty() answer simply yields null label parts.
+    @MockBean com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
     @MockBean BookingSlugService bookingSlugService;
     @MockBean AuthorizationService authorizationService;
     @MockBean SalonCatalogCacheEvictor salonCatalogCacheEvictor;

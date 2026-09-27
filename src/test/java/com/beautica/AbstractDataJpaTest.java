@@ -85,7 +85,12 @@ public abstract class AbstractDataJpaTest {
      * own javadoc on cross-slice sharing).
      */
     protected UUID testCityId() {
+        // Keyed on the KATOTTH code, not on name_uk. Phase 325 widened `cities` from 356 rows to
+        // 25 698, and 2 990 distinct names are now shared by 12 833 rows — «Київ» is both the
+        // capital and a village in Миколаївська oblast. «Вінниця» happens to still be unique, so
+        // this resolves the same row it always did, but a `WHERE name_uk = ? LIMIT 1` fixture is
+        // one classifier update away from silently pointing ~50 salon fixtures at a village.
         return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+                "SELECT id FROM cities WHERE katotth_code = 'UA05020030010063857'", UUID.class);
     }
 }

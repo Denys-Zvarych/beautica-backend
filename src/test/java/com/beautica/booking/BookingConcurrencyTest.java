@@ -1,5 +1,6 @@
 package com.beautica.booking;
 
+import com.beautica.support.LocalityTestLookup;
 import com.beautica.support.TestHttpClients;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
@@ -96,12 +97,12 @@ class BookingConcurrencyTest {
     /**
      * Resolves a real {@code cities.id} row for the salon fixture below — this class does not
      * extend {@code AbstractIntegrationTest} (it runs its own standalone {@code PostgreSQLContainer}),
-     * so {@code AbstractIntegrationTest#testCityId()} is duplicated here rather than inherited.
+     * so it cannot inherit {@code majorCityIdByName}; it calls the shared {@link LocalityTestLookup}
+     * the base class itself delegates to, rather than re-copying the SQL.
      * {@code salons.city_id} is {@code NOT NULL} as of V150 and carries an FK to {@code cities(id)}.
      */
     private UUID testCityId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        return LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
     }
 
     @MockBean

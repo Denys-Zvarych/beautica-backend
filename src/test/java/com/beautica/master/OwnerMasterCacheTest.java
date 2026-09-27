@@ -117,6 +117,10 @@ class OwnerMasterCacheTest {
     @MockBean ScheduleExceptionRepository scheduleExceptionRepository;
     @MockBean BookingRepository bookingRepository;
     @MockBean LocationQueryService locationQueryService;
+    // MasterService ctor dependency (saved-settlement label parts). A mock is right here: these
+    // tests observe the master caches, not the resolver's own cache, and its default
+    // Optional.empty() answer simply yields null label parts.
+    @MockBean com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
     // Phase 13.1: MasterService now constructor-depends on BookingSlugService.
     @MockBean com.beautica.booking.service.BookingSlugService bookingSlugService;
     // Phase 21.3: MasterService now constructor-depends on AuthorizationService (rotateMasterToSalon).

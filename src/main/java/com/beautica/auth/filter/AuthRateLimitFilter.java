@@ -150,6 +150,17 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // independent masters, so an unthrottled crawler could bulk-harvest home addresses;
     // this is the IP-layer defence against that scraping.
     private static final String SEARCH_PATH_PREFIX = "/api/v1/search/";
+    // Phase 326 settlement autocomplete (GET, permitAll): GET /api/v1/settlements.
+    // Matched EXACTLY, not by prefix: there is one route here and no /settlements/** subtree,
+    // so a prefix match would silently adopt any future child route into this bucket's budget.
+    private static final String SETTLEMENT_SEARCH_PATH = "/api/v1/settlements";
+    // Phase 331 search-suggestions autocomplete (GET, permitAll): GET /api/v1/search/suggestions.
+    // Matched EXACTLY and checked BEFORE the SEARCH_PATH_PREFIX branch below — this path also
+    // starts with "/api/v1/search/", so if this check ran AFTER the prefix branch it would never
+    // be reached (the prefix branch returns unconditionally) and suggestions would silently spend
+    // the results-search (searchBuckets) budget instead of its own. See the SEARCH_PATH_PREFIX
+    // branch's amended comment in doFilterInternal.
+    private static final String SEARCH_SUGGESTIONS_PATH = "/api/v1/search/suggestions";
     // Remove-admin DELETE carries both {salonId} and {userId} path variables, with the literal
     // "/admins/" segment between them: /api/v1/salons/{salonId}/admins/{userId}. Neither variable
     // can itself contain a "/" (both are UUIDs), so prefix + contains(segment) uniquely identifies
@@ -292,6 +303,107 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final long SEARCH_TOKENS_FIRST_PAGE = 1;
     private static final long SEARCH_TOKENS_DEEP_PAGE = 2;
     private static final String SEARCH_PAGE_PARAM = "page";
+    // Per-IP cap for GET /api/v1/settlements (240 / 60 s) — the Phase 326 settlement
+    // autocomplete. permitAll, because the «Населений пункт» field is reached during
+    // registration before a token exists (phase-326 D7).
+    //
+    // WHY IT NEEDS A BUCKET AT ALL, when the sibling locality cascade has none. The cascade's
+    // documented exemption (SecurityConfig, Phase 10.7) rests on a fully static dataset served
+    // behind a long-lived @Cacheable with no write path: after one cold miss per JVM its
+    // uncached surface is bounded by deploy frequency, not request volume. That argument ends
+    // exactly where a caller-supplied parameter begins. Only the pre-typing major list is
+    // cached here; every typed keystroke runs a real GIN bitmap scan over 25 698 rows, and the
+    // key space is every prefix a user can type, so caching the results is not an option
+    // either (it would be an anonymous-fillable Caffeine cache). The per-IP ceiling is the
+    // control that fits that shape. The cascade's note anticipated this: "revisit only if Part
+    // B adds a dynamic/parameterised locality query."
+    //
+    // WHY NOT FOLD INTO searchBuckets. Same starvation argument salonBoardReadCapacity records,
+    // one level over: /search/** is a DISCOVERY search the user runs while browsing, and this
+    // is an ADDRESS field the user fills while registering or editing a profile. Sharing one
+    // 240-token budget would let a long browsing session 429 an unrelated registration from
+    // the same carrier-grade-NAT egress — and CGNAT is the norm on Ukrainian mobile networks,
+    // so "same IP" says nothing about "same person". searchBuckets' own comment forbids a
+    // second bucket for /search/**; this is not one, it is a different route.
+    //
+    // SIZING: 240/min, deliberately identical to SEARCH_CAPACITY, because the traffic SHAPE is
+    // identical — an incremental field that fires a request per settled keystroke. The reasoning
+    // recorded there transfers verbatim: 40/min was measured to be below real usage for a box
+    // that emits ~1 request per settle point, and a shared CGNAT egress multiplies that across
+    // unrelated subscribers. There is no token-cost function here — every request costs 1 —
+    // because this endpoint has no COUNT companion and no deep-paging surcharge.
+    //
+    // WHAT "CHEAPER PER REQUEST" IS WORTH, MEASURED ADVERSARIALLY. The original note asserted this
+    // endpoint was cheaper per request than discovery search and derived 240 from that, on FRIENDLY
+    // inputs only. The arithmetic under that heading has now been restated twice and been wrong
+    // twice — both times for the same two reasons, which is why this block records the INVARIANT
+    // and not only the numbers:
+    //
+    //  * THE BENIGN WORST CASE WAS THE WRONG TERM. «нов» was chosen for having the most PREFIX
+    //    hits (1 065). The cost does not live in the prefix tier. It lives in the SIMILARITY
+    //    tier's candidate count, where every candidate pays a similarity() recheck: «вка» alone
+    //    yields 6 672 candidates, and the measured benign worst is «іванівка» — 5 102 rechecks,
+    //    10.9 ms — roughly 3x the term that was being quoted as the ceiling.
+    //  * THE ADVERSARIAL WORST WAS MEASURED AGAINST WHATEVER ATTACK WAS KNOWN THAT WEEK. Each
+    //    revision re-measured the input the previous fix had just closed: 119 ms for a zero-trigram
+    //    term, then 52 ms for «ка »x17 once a whole-term trigram guard landed, then 22 ms for
+    //    «•к»x25 once a per-token floor landed. Three proxies, three bypasses, three sizing notes
+    //    that were stale the day after they were written.
+    //
+    // CURRENT SIZING:
+    //
+    //   benign worst       «іванівка»   5 102 similarity rechecks        10.9 ms
+    //   adversarial worst  best input still admitted by the run guard    10.1 ms
+    //   240 x ~10 ms                                                   ~ 2.4 s of DB time /IP-minute
+    //
+    // The two worst cases are now within 10 % OF EACH OTHER, and that is the durable part of this
+    // note rather than a coincidence to re-measure next time. Admission is decided by ONE property:
+    // the term must carry an uninterrupted alphanumeric RUN of at least MIN_QUERY_LENGTH characters
+    // (NormalizedSearchQuery#hasIndexServableRun). pg_trgm's key set — hence the candidate count,
+    // hence the recheck cost — is a function of the DISTINCT trigrams in the term, and repeating a
+    // fragment contributes no distinct key. Padding therefore cannot buy an attacker a statement
+    // more expensive than some real Ukrainian word of the same run length already costs: the
+    // adversarial ceiling is pinned to the benign one BY CONSTRUCTION. ~2.4 s per IP-minute is
+    // stable for as long as that predicate is what admits a term.
+    //
+    // 240 is KEPT at that cost. 2.4 s of statement time is bounded to ~4 % of one connection
+    // because the greedy refill spreads it across the 60 s window it was sized for, and the
+    // first-contact burst is separately bounded to a quarter of the budget — see
+    // settlementSearchBandwidth for both. The @Size(50) ceiling still does independent work: it
+    // bounds normalisation and the bound-parameter size, and once bounded the run guard is what
+    // bounds the STATEMENT.
+    //
+    // IF YOU ARE ABOUT TO RE-DERIVE THIS NUMBER: do not re-measure "the worst attack I can think of
+    // today", and do not pick the benign term with the most prefix hits. Measure the highest-
+    // candidate SIMILARITY term, and then check whether the run-length invariant above still holds —
+    // if it does, the adversarial figure follows from the benign one and needs no fresh attack. Both
+    // earlier revisions failed by measuring correctly on the wrong input.
+    private static final long SETTLEMENT_SEARCH_CAPACITY = 240;
+    private static final Duration SETTLEMENT_SEARCH_WINDOW = Duration.ofMinutes(1);
+    // FIRST-CONTACT BUDGET — a quarter of the capacity. Bucket4j initialises a bandwidth FULL
+    // unless told otherwise, so without this a never-seen IP holds all 240 tokens the instant it
+    // arrives and can spend ~2.4 s of database work in one breath at pool-limited concurrency. The
+    // greedy refill alone does not fix that; it only governs what happens after the first budget is
+    // spent, so it bought roughly 2x, not the ~35x the older note implied.
+    //
+    // WHY A QUARTER rather than a smaller slice. The drip is SETTLEMENT_SEARCH_CAPACITY per window
+    // = 4 tokens/s, which already exceeds the ~1 request/settled-keystroke a human generates, so the
+    // initial grant is pure burst headroom, not throughput. 60 tokens covers several settlement
+    // names typed end to end plus a mistyped retry before the drip has to carry the session — while
+    // capping the cold-start burst at ~0.6 s of database time, a quarter of what it was.
+    private static final long SETTLEMENT_SEARCH_INITIAL_TOKENS = SETTLEMENT_SEARCH_CAPACITY / 4;
+    // Per-IP cap for GET /api/v1/search/suggestions (Phase 331) — its OWN bucket, a clone of
+    // settlementSearchBuckets' shape (same capacity, same greedy refill, same quarter first-
+    // contact grant), because the traffic SHAPE is identical: an incremental autocomplete box
+    // that fires roughly one request per settled keystroke. Not folded into searchBuckets
+    // (SEARCH_CAPACITY) — that bucket's own comment ("This is the ONLY search bucket") is about
+    // /search/masters and /search/salons sharing ONE result-page budget; typing traffic on the
+    // suggestions box must not starve a concurrent results-page read from the same IP, the exact
+    // reasoning settlementSearchBuckets already records for why it is not folded into
+    // searchBuckets either. 240/60s per IP.
+    private static final long SEARCH_SUGGESTIONS_CAPACITY = 240;
+    private static final Duration SEARCH_SUGGESTIONS_WINDOW = Duration.ofMinutes(1);
+    private static final long SEARCH_SUGGESTIONS_INITIAL_TOKENS = SEARCH_SUGGESTIONS_CAPACITY / 4;
     // Per-IP cap for POST /api/v1/auth/invite (15 / 60 s) — the FIRST bound on a previously
     // unthrottled surface. This is both the residual enumeration/timing surface left after the
     // InviteService 409->idempotent fix (the already-registered and active-invite branches do
@@ -453,6 +565,16 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // Built internally rather than injected so the public 16-arg constructor stays stable for
     // the slice/regression tests that construct this filter directly.
     private final LoadingCache<String, Bucket> searchBuckets;
+    // Per-IP bucket for GET /api/v1/settlements — the Phase 326 settlement autocomplete's
+    // flood/enumeration guard. Built internally rather than injected so the public constructor
+    // stays stable for the slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> settlementSearchBuckets;
+    // Per-IP bucket for GET /api/v1/search/suggestions — the Phase 331 search-suggestions
+    // autocomplete's own budget, carved out of searchBuckets so typing in the suggestions box
+    // cannot starve a concurrent /search/masters or /search/salons read from the same IP. Built
+    // internally rather than injected so the public constructor stays stable for the
+    // slice/regression tests that construct this filter directly.
+    private final LoadingCache<String, Bucket> searchSuggestionBuckets;
     // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
     // timing oracle in InviteService.sendInvite (the already-registered / active-invite
     // branches return fast). Built internally rather than injected so the public 16-arg
@@ -584,6 +706,18 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build(key -> Bucket.builder()
                         .addLimit(searchBandwidth())
                         .build());
+        this.settlementSearchBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SETTLEMENT_SEARCH_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(settlementSearchBandwidth())
+                        .build());
+        this.searchSuggestionBuckets = Caffeine.newBuilder()
+                .maximumSize(100_000)
+                .expireAfterAccess(SEARCH_SUGGESTIONS_WINDOW.plusMinutes(5))
+                .build(key -> Bucket.builder()
+                        .addLimit(searchSuggestionBandwidth())
+                        .build());
         this.inviteBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
@@ -644,10 +778,83 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
+    /**
+     * Step refill and a full initial budget, unlike its {@link #settlementSearchBandwidth()}
+     * neighbour. That asymmetry is deliberate and the reason is a property of the route, not an
+     * unmeasured surface.
+     *
+     * <p>{@code /search/**} parses its {@code q} through
+     * {@link com.beautica.search.service.NormalizedSearchQuery#of(String)}, which keeps at most
+     * {@link com.beautica.search.service.NormalizedSearchQuery#MAX_TOKENS} (4) whitespace tokens and
+     * runs nothing at all unless one of those four is trigram-servable — at least
+     * {@link com.beautica.search.service.NormalizedSearchQuery#MIN_QUERY_LENGTH} (3) characters AND
+     * trigram-bearing. So the predicate this route can be made to issue is bounded at four terms no
+     * matter how long the input is, and the padding shapes that drove the settlement fix («ка »x17
+     * and friends) are refused before any SQL: repeating a 2-character fragment produces four
+     * unservable tokens and an empty page. Its tables are also low thousands of providers, orders of
+     * magnitude under the 25 698-row settlement taxonomy.
+     *
+     * <p>Both halves of the settlement problem — a worst-case statement far above the benign one,
+     * and a per-request cost an attacker could inflate with input length — are therefore absent
+     * here, which is what a burst control would have been bounding. "Not measured" was the reason
+     * recorded previously and it was the wrong one.
+     */
     private static Bandwidth searchBandwidth() {
         return BandwidthBuilder.builder()
                 .capacity(SEARCH_CAPACITY)
                 .refillIntervally(SEARCH_CAPACITY, SEARCH_WINDOW)
+                .build();
+    }
+
+    /**
+     * GREEDY and NOT initially full, unlike every sibling here — the one bucket in this filter that
+     * is neither a step refill nor a full first-contact grant. Both departures bound the same thing,
+     * the instantaneous BURST, and neither is sufficient alone.
+     *
+     * <p><b>Greedy refill</b> — {@code refillIntervally} hands the whole capacity back at once when
+     * the window rolls, so a recharged budget is spendable as fast as the client can open sockets.
+     * For a 15-token invite bucket that is irrelevant; for 240 tokens against this endpoint it is
+     * the attack. {@code refillGreedy} drips the same 240/min back continuously — ~1 token per
+     * 250 ms — so a recharged budget is spent over the minute it was sized for. The sustained rate,
+     * and therefore every legitimate typing session, is unchanged.
+     *
+     * <p><b>{@link #SETTLEMENT_SEARCH_INITIAL_TOKENS}</b> — greedy refill governs only the SECOND
+     * budget onward. Bucket4j initialises a bandwidth at full capacity, so without an explicit
+     * initial-token count a first-seen IP still holds all 240 tokens the moment it arrives and
+     * spends ~2.4 s of database work in one breath at pool-limited concurrency — and a rotating
+     * source address is free. Greedy refill alone was therefore worth roughly 2x, not the ~35x the
+     * earlier note here implied. A quarter of the capacity caps that cold-start burst at ~0.6 s
+     * while leaving more headroom than a human typist can consume; the sizing argument is on the
+     * constant.
+     */
+    // Package-private, unlike its siblings: SettlementSearchGetRateLimitRegressionTest builds a
+    // bucket from this EXACT Bandwidth over a controllable TimeMeter to assert the greedy drip and
+    // the first-contact grant, neither of which is observable through doFilterInternal without
+    // sleeping (banned) or waiting out a real 60-second window. Widening the method is cheaper than
+    // a reflective read and says out loud that the refill strategy is a tested property, not an
+    // incidental one.
+    static Bandwidth settlementSearchBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SETTLEMENT_SEARCH_CAPACITY)
+                .refillGreedy(SETTLEMENT_SEARCH_CAPACITY, SETTLEMENT_SEARCH_WINDOW)
+                .initialTokens(SETTLEMENT_SEARCH_INITIAL_TOKENS)
+                .build();
+    }
+
+    /**
+     * A clone of {@link #settlementSearchBandwidth()}'s shape (greedy refill + a quarter
+     * first-contact grant) for the same reason: {@code GET /api/v1/search/suggestions} is another
+     * per-settled-keystroke autocomplete box, so the same burst-vs-sustained-rate argument
+     * applies verbatim. Package-private for the same reason as its sibling —
+     * {@code SearchSuggestionsGetRateLimitRegressionTest} builds a bucket from this EXACT
+     * Bandwidth over a controllable {@code TimeMeter} to assert the refill strategy, which is not
+     * observable through {@code doFilterInternal} without a banned sleep or a real 60s wait.
+     */
+    static Bandwidth searchSuggestionBandwidth() {
+        return BandwidthBuilder.builder()
+                .capacity(SEARCH_SUGGESTIONS_CAPACITY)
+                .refillGreedy(SEARCH_SUGGESTIONS_CAPACITY, SEARCH_SUGGESTIONS_WINDOW)
+                .initialTokens(SEARCH_SUGGESTIONS_INITIAL_TOKENS)
                 .build();
     }
 
@@ -742,16 +949,47 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
+        // Search-suggestions rate-limit: GET /api/v1/search/suggestions (Phase 331) — checked
+        // BEFORE the SEARCH_PATH_PREFIX branch below on purpose. That branch matches by prefix on
+        // "/api/v1/search/", which this exact path also starts with; if this check ran after it,
+        // the prefix branch would already have returned and this one would NEVER run, silently
+        // spending the results-search (searchBuckets) budget instead of its own. Cap: 240 / 60 s
+        // per IP, its own bucket (searchSuggestionBuckets) — see SEARCH_SUGGESTIONS_CAPACITY for
+        // why it is a separate budget from searchBuckets.
+        // FALSIFY: move this branch after the SEARCH_PATH_PREFIX branch below and
+        // SearchSuggestionsGetRateLimitRegressionTest's carve-out test must go red.
+        if (HttpMethod.GET.matches(method)
+                && path.equals(SEARCH_SUGGESTIONS_PATH)) {
+            applyRateLimit(request, response, filterChain, searchSuggestionBuckets, RETRY_AFTER_SECONDS);
+            return;
+        }
+
         // Search rate-limit: GET /api/v1/search/** (discovery of masters + salons) — checked
         // before the POST-only guard so these GET reads are covered. These permitAll() paths
         // expose authed-only independent-master street addresses, so the throttle is the
         // IP-layer ceiling on sustained scraping and DB amplification. Cap: 240 / 60 s per IP
-        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY search bucket — do
-        // not add a second one; both /search/masters and /search/salons share it by design.
+        // (see SEARCH_CAPACITY for why 40 was too low). This is the ONLY bucket for RESULT reads
+        // — do not add a second one for /search/masters or /search/salons, which still share it
+        // by design. GET /api/v1/search/suggestions is deliberately carved OUT of this prefix by
+        // the branch above: it is typing traffic, not a result-page read, and must not compete
+        // with it for the same 240-token budget (Phase 331).
         if (HttpMethod.GET.matches(method)
                 && path.startsWith(SEARCH_PATH_PREFIX)) {
             applyRateLimit(request, response, filterChain, searchBuckets, RETRY_AFTER_SECONDS,
                     searchTokenCost(request));
+            return;
+        }
+
+        // Settlement-autocomplete rate-limit: GET /api/v1/settlements (Phase 326) — checked
+        // before the POST-only guard so this GET read is covered at all. permitAll, reached
+        // during registration, and unlike the locality cascade its response depends on caller
+        // input, so request volume reaches the database instead of a static cache. Cap:
+        // 240 / 60 s per IP, one token per request (see SETTLEMENT_SEARCH_CAPACITY for why it
+        // matches /search/**'s cap and why it is nevertheless a SEPARATE bucket).
+        if (HttpMethod.GET.matches(method)
+                && path.equals(SETTLEMENT_SEARCH_PATH)) {
+            applyRateLimit(request, response, filterChain, settlementSearchBuckets,
+                    RETRY_AFTER_SECONDS);
             return;
         }
 

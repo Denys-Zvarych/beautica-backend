@@ -424,6 +424,16 @@ public class GlobalExceptionHandler {
         // concern is enum constants, SQL fragments, and bound-value disclosure — those come
         // from HttpMessageNotReadableException / DataIntegrityViolationException, not from a
         // developer-authored @Size/@Pattern message on a declared field.
+        //
+        // ONE EXCEPTION (Phase 331 audit): a FieldError whose code is "typeMismatch" was NOT
+        // authored by a @Size/@Pattern message — it is Spring's DataBinder auto-generating a
+        // PropertyAccessException-derived default message that embeds the raw rejected value
+        // verbatim, e.g. malformed `location.cityId=not-a-uuid` on an @ModelAttribute-bound
+        // LocationFilter produced "...Invalid UUID string: not-a-uuid" in the response body —
+        // a bound-value echo the ConstraintViolationException handler two methods below
+        // explicitly promises NEVER to do (see its comment), and the same promise every
+        // MethodArgumentTypeMismatchException-bound caller relies on. This branch closes that
+        // gap without touching genuine Bean Validation messages, which stay verbatim.
         var fieldErrors = ex.getBindingResult().getFieldErrors();
         log.debug("Validation failed: {}", fieldErrors.stream()
                 .map(FieldError::getDefaultMessage)
@@ -432,7 +442,7 @@ public class GlobalExceptionHandler {
         Map<String, String> errors = fieldErrors.stream()
                 .collect(Collectors.toMap(
                         FieldError::getField,
-                        fe -> fe.getDefaultMessage() != null ? fe.getDefaultMessage() : "Invalid value",
+                        GlobalExceptionHandler::fieldErrorMessage,
                         // Two violations on the same field: keep the first, deterministic.
                         (first, second) -> first,
                         LinkedHashMap::new));
@@ -441,6 +451,19 @@ public class GlobalExceptionHandler {
         return ResponseEntity
                 .status(HttpStatus.BAD_REQUEST)
                 .body(ApiResponse.validationError(message, errors));
+    }
+
+    /**
+     * The client-facing message for one {@link FieldError} — the caller's own {@code @Size}/
+     * {@code @Pattern}/etc. message verbatim, EXCEPT a {@code "typeMismatch"}-coded error (a
+     * failed type conversion, never a Bean Validation annotation), whose Spring-generated default
+     * message embeds the raw rejected value and must not reach the client (§A/§N).
+     */
+    private static String fieldErrorMessage(FieldError fe) {
+        if ("typeMismatch".equals(fe.getCode())) {
+            return "Invalid value";
+        }
+        return fe.getDefaultMessage() != null ? fe.getDefaultMessage() : "Invalid value";
     }
 
     @ExceptionHandler(ConstraintViolationException.class)

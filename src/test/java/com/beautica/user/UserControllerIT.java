@@ -612,7 +612,7 @@ class UserControllerIT extends AbstractIntegrationTest {
                 .as("districtName is resolved via CityDistrictRepository.findNameUkById when a district is set")
                 .isNotBlank();
         assertThat(apiResponse.data().oblastId())
-                .as("oblastId is resolved via CityRepository.findOblastIdById and must equal the city's parent oblast")
+                .as("oblastId is resolved via LocationQueryService.resolveCityOblastId and must equal the city's parent oblast")
                 .isEqualTo(oblastIdOfCity(cityId));
     }
 

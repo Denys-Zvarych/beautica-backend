@@ -457,12 +457,17 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
     @DisplayName("SalonService.createSalon evicts the OWNER's user-profile entry — the stale "
             + "locality would otherwise report the address of the previous salon")
     void should_invalidateUserProfileCache_when_createSalonCommits() {
-        // Arrange — an owner who ALREADY has a salon (so isFirstSalon is false and no owner-master
-        // row is created by this call), with a known starting street on their users row.
+        // Arrange — an owner with NO salon yet, and a known starting street on their users row.
+        // Only the FIRST (primary) salon syncs onto the owner row; this test used to create a
+        // SECOND salon, which pinned the since-removed behaviour of a non-primary salon moving
+        // the owner's /users/me (see SalonServiceTest#should_notSyncOwnerLocality_when_nonFirstSalonCreated).
         UUID ownerId = UUID.randomUUID();
-        seedSalonOwnerWithMasterRow(ownerId, "owner-createsalon@beautica.test");
-        jdbcTemplate.update("UPDATE users SET city_id = ?, street = ?, building_no = ? WHERE id = ?",
-                testCityId(), OLD_STREET, "1", ownerId);
+        jdbcTemplate.update(
+                "INSERT INTO users (id, email, password_hash, role, first_name, last_name, "
+                        + "is_active, email_verified, city_id, street, building_no) "
+                        + "VALUES (?, ?, ?, 'SALON_OWNER', 'Owner', 'Ownerenko', true, true, ?, ?, '1')",
+                ownerId, "owner-createsalon@beautica.test", passwordEncoder.encode(TEST_PASSWORD),
+                testCityId(), OLD_STREET);
 
         UserProfileResponse warmed =
                 transactionTemplate.execute(status -> userService.getProfile(ownerId));
@@ -475,13 +480,13 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
                         + "makes the whole test vacuous")
                 .isNotNull();
 
-        // Act — a SECOND salon at a different street; the cityId is non-null so the locality sync
-        // onto the owner's users row actually runs.
+        // Act — the FIRST salon at a different street; the cityId is non-null so the locality
+        // sync onto the owner's users row actually runs.
         log.debug("Act: createSalon syncs the new salon's locality onto the owner's users row — "
                 + "the owner's cached GET /users/me must not survive the commit");
         transactionTemplate.executeWithoutResult(status ->
                 salonService.createSalon(ownerId, new CreateSalonRequest(
-                        "Second salon", null, null, null, null, null, null,
+                        "First salon", null, null, null, null, null, null,
                         testCityId(), null, NEW_STREET, "7", null)));
 
         // Assert
@@ -595,6 +600,41 @@ class UserCacheEvictionIT extends AbstractIntegrationTest {
                         + "VALUES (?, ?, ?, 'SALON_OWNER', true, NOW(), NOW())",
                 UUID.randomUUID(), ownerId, salonId);
         return salonId;
+    }
+
+    @Test
+    @DisplayName("a locality write evicts the PUBLIC master-detail entry (keyed by masterId) after commit — GET /masters/{id} shows the new settlement")
+    void should_evictPublicMasterDetail_when_independentMasterLocalityChangeCommits() {
+        UUID userId = UUID.randomUUID();
+        seedIndependentMaster(userId, "public-detail-evict-" + userId + "@beautica.test",
+                "Olha", "Moroz", OLD_BIO);
+        UUID masterId = jdbcTemplate.queryForObject(
+                "SELECT id FROM masters WHERE user_id = ?", UUID.class, userId);
+        UUID newCityId = jdbcTemplate.queryForObject("""
+                SELECT c.id FROM cities c
+                 WHERE c.settlement_type = 'CITY'
+                   AND NOT EXISTS (SELECT 1 FROM city_districts d WHERE d.city_id = c.id)
+                 ORDER BY c.katotth_code LIMIT 1
+                """, UUID.class);
+
+        // Warm the public cache under the masterId key — the key UserService never held before.
+        MasterDetailResponse warmed = masterService.getMasterDetail(masterId);
+        assertThat(warmed.cityId()).as("precondition: seeded master has no city yet").isNull();
+        Cache publicDetail = cacheManager.getCache("master-detail");
+        assertThat(publicDetail.get(masterId))
+                .as("warm read must populate master-detail — otherwise the eviction check is vacuous")
+                .isNotNull();
+
+        transactionTemplate.executeWithoutResult(status -> userService.updateProfile(userId,
+                new UpdateProfileRequest(null, null, null, newCityId, null, NEW_STREET, "7", null,
+                        null, null)));
+
+        assertThat(publicDetail.get(masterId))
+                .as("the public master-detail entry must be evicted after the locality commit")
+                .isNull();
+        MasterDetailResponse fresh = MasterDetailResponse.fromPublic(masterService.getMasterDetail(masterId));
+        assertThat(fresh.cityId()).as("fresh public read shows the new city").isEqualTo(newCityId);
+        assertThat(fresh.citySettlementType()).as("…and its settlement type").isNotNull();
     }
 
     private void seedIndependentMaster(UUID userId, String email, String firstName,

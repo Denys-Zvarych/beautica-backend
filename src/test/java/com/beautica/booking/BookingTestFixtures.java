@@ -4,6 +4,7 @@ import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
 import com.beautica.common.ApiResponse;
 import com.beautica.common.TimeZones;
+import com.beautica.support.LocalityTestLookup;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -83,15 +84,14 @@ public class BookingTestFixtures {
     }
 
     /**
-     * Resolves a real {@code cities.id} row for salon fixtures — mirrors
-     * {@code AbstractIntegrationTest#testCityId()}/{@code ServiceTestFixtures#createSalon}. This
-     * class does not extend {@code AbstractIntegrationTest} (by design, see the class javadoc), so
-     * the tiny query is duplicated here rather than inherited. {@code salons.city_id} is
+     * Resolves a real {@code cities.id} row for salon fixtures. This class does not extend
+     * {@code AbstractIntegrationTest} (by design, see the class javadoc), so it cannot inherit
+     * {@code majorCityIdByName}; it calls the shared {@link LocalityTestLookup} the base class
+     * itself delegates to, rather than re-copying the SQL. {@code salons.city_id} is
      * {@code NOT NULL} as of V150 and carries an FK to {@code cities(id)}.
      */
     private UUID testCityId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        return LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
     }
 
     public UUID createUser(String email, String role, UUID salonId) {

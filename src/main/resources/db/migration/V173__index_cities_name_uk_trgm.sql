@@ -1,0 +1,103 @@
+-- ============================================================================
+-- V173 — the text-search index behind the settlement autocomplete (Phase 326)
+-- ============================================================================
+-- V170's SECTION 4 deliberately shipped NO text-search index and left the
+-- choice to this phase, because the right shape is decided by the query that
+-- is actually written, not by guessing ahead of it. This is that index.
+--
+-- WHAT THE QUERY IS
+--   CityRepository#searchByName, behind the permitAll
+--   GET /api/v1/settlements?query=... — a THREE-TIER ranking over 25 698 rows:
+--
+--     WHERE c.name_uk ILIKE :prefixPattern                       -- tier 1
+--        OR (c.name_uk % :query                                  -- tier 2
+--            AND similarity(c.name_uk, :query) >= :minSimilarity)
+--     ORDER BY (CASE WHEN c.name_uk ILIKE :prefixPattern THEN 0 ELSE 1 END),
+--              c.is_major DESC,                                  -- tier 3
+--              similarity(c.name_uk, :query) DESC, ...
+--     LIMIT 20
+--
+-- WHY ONE GIN gin_trgm_ops INDEX SERVES BOTH PREDICATES (phase-326 D1)
+--   pg_trgm's GIN opclass declares BOTH the LIKE/ILIKE operators (~~, ~~*) and
+--   the similarity operator (%) as indexable. The planner therefore satisfies
+--   the OR with a single BitmapOr over TWO Bitmap Index Scans of the SAME
+--   index — no second index, and no sequential scan for either tier.
+--
+--   MEASURED on a throwaway PostgreSQL 16 database loaded with the identical
+--   25 698-row / 50-major dataset V170+V171 produce (ANALYZEd, warm cache):
+--
+--     query        before (no index)          after (this index)
+--     --------     -----------------------    -------------------------------
+--     'льв'        Seq Scan, 25 690 Rows      BitmapOr -> 2x Bitmap Index Scan
+--                  Removed by Filter,         on idx_cities_name_uk_trgm,
+--                  385 buffers, 28.4 ms       46 buffers, 0.27 ms
+--     'терноп'     (same seq scan shape)      138 buffers, 1.05 ms
+--     'іван фран'  (same seq scan shape)      242 buffers, 1.53 ms
+--     'нов'        (same seq scan shape)      355 buffers, 4.47 ms
+--                                             (worst measured 3-char query:
+--                                              1 065 candidate rows)
+--
+--   Index size: 1 136 kB.
+--
+-- WHY IT STILL HOLDS UNDER HIBERNATE'S BIND PARAMETERS
+--   The pattern and the query term are JDBC parameters, and pgJDBC promotes a
+--   statement to a server-side prepare after five executions, at which point
+--   PostgreSQL may switch to a GENERIC plan built with no knowledge of the
+--   values. A trigram index whose use depended on a constant pattern would
+--   silently fall back to the 28 ms sequential scan at that point, and nothing
+--   in a latency assertion would catch it.
+--
+--   Verified explicitly with `SET plan_cache_mode = force_generic_plan` and a
+--   PREPARE/EXECUTE of the same statement: the plan keeps
+--   `Bitmap Index Scan on idx_cities_name_uk_trgm` with
+--   `Index Cond: ((name_uk)::text ~~* $1)` and `... % $2`, at 0.74 ms / 5.54 ms
+--   for 'льв' / 'нов'. gin_trgm_ops extracts the query trigrams at EXECUTION
+--   time, so a parameterised pattern is indexable exactly like a literal one.
+--   {@code SettlementSearchIT} re-asserts the plan shape against the real
+--   migrated schema so this cannot regress unnoticed.
+--
+-- WHY NOT A text_pattern_ops B-TREE FOR THE PREFIX TIER
+--   It would serve tier 1 only, and only case-sensitively — the picker is
+--   case-insensitive («льв» must find «Львів»), so it would need
+--   `lower(name_uk) text_pattern_ops`, i.e. a SECOND index plus a `lower()`
+--   rewrite of the predicate, and tier 2 would still need this GIN index. One
+--   index that serves both tiers beats two that split them (§E-5/§O-6: an
+--   index that buys nothing is write amplification on every future settlement
+--   import).
+--
+-- WHY NOT PARTIAL
+--   Unlike idx_cities_major_name_uk (50 rows) and idx_cities_oblast_city_name
+--   (353 rows), this index has no predicate to mirror: the autocomplete
+--   searches EVERY settlement type. Villages are 24 013 of the 25 698 rows and
+--   are exactly what the phase exists to make findable, so there is no subset
+--   to restrict to.
+--
+-- NOTHING HERE FILTERS OCCUPIED TERRITORY (phase-325 D3, phase-326 D4)
+--   There is no occupation_status column and no occupied row to exclude: the
+--   Phase 324 exclusion set is applied to the import SOURCE, so no such row is
+--   ever offered to this table. This index makes rows findable; the ban is an
+--   ABSENCE invariant held by V171's pre-filtered CSV and asserted by
+--   SettlementImportCsvExclusionTest / LocalityTaxonomySeedMigrationTest.
+--
+-- IMMUTABILITY
+--   V170, V171 and V172 are applied; this ships forward as the next free
+--   version rather than editing V170's SECTION 4 (playbook §O-9).
+-- ============================================================================
+
+-- Already created by V12 and again by V98; repeated here so this migration is
+-- self-contained on a database that somehow lacks the extension, and because
+-- CREATE EXTENSION IF NOT EXISTS is a no-op when it is present.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- lock_timeout bounds the WAIT for the ACCESS SHARE/EXCLUSIVE this CREATE INDEX needs;
+-- statement_timeout bounds the BUILD once the lock is granted (V159:59, V165:32 — neither implies
+-- the other). Both SET LOCAL, so neither leaks past this migration's transaction; do NOT copy
+-- V83's bare SET. The statement_timeout line is load-bearing beyond convention now: the
+-- application pool sets a 5 s session default (spring.datasource.hikari.connection-init-sql), and
+-- under the `test` profile Flyway borrows that pool, so a GIN build over 25 698 rows would
+-- otherwise inherit a ceiling sized for request-path queries.
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '1min';
+
+CREATE INDEX idx_cities_name_uk_trgm
+    ON cities USING gin (name_uk gin_trgm_ops);

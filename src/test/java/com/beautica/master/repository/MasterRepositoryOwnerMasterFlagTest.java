@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@link #should_returnFalse_when_ownerMasterRowIsInactive} goes RED while everything else stays
  * green. Without that case, an owner who toggled OFF would read {@code true} forever.
  */
-@DisplayName("MasterRepository#existsByUserIdAndMasterTypeAndIsActiveTrue — owner-as-master flag (Phase 265)")
+@DisplayName("MasterRepository — owner-as-master flag (Phase 265) and the id-only owner lookup")
 class MasterRepositoryOwnerMasterFlagTest extends AbstractDataJpaTest {
 
     @Autowired
@@ -119,6 +119,32 @@ class MasterRepositoryOwnerMasterFlagTest extends AbstractDataJpaTest {
                 .as("repository finders are unscoped by default (§E-4) — this one must at least "
                         + "key on the user it was asked about")
                 .isFalse();
+    }
+
+    // ── findIdByUserId — id-only lookup behind SalonService's owner master-detail eviction ──
+
+    @Test
+    @DisplayName("findIdByUserId returns the id of the user's master row")
+    void should_returnMasterId_when_userOwnsAMasterRow() {
+        User owner = persistOwnerWithMaster(MasterType.SALON_OWNER, true);
+        UUID expected = masterRepository.findByUserId(owner.getId()).orElseThrow().getId();
+        em.clear();
+
+        var masterId = masterRepository.findIdByUserId(owner.getId());
+
+        assertThat(masterId).contains(expected);
+    }
+
+    @Test
+    @DisplayName("findIdByUserId is empty for a user with no master row")
+    void should_returnEmpty_when_userHasNoMasterRow() {
+        User owner = persistUser(Role.SALON_OWNER);
+        em.flush();
+        em.clear();
+
+        var masterId = masterRepository.findIdByUserId(owner.getId());
+
+        assertThat(masterId).isEmpty();
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────────────

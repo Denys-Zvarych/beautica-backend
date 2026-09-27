@@ -36,9 +36,20 @@ import java.util.UUID;
  *
  * <p>The cache key is the full {@code (cityId, districtId)} pair: the same
  * city resolved once with a {@code null} district and once with a concrete
- * district are distinct, correct cache entries. The taxonomy is small
- * (~600 cities + districts) so the {@code maximumSize ≈ 600} ceiling
- * comfortably holds every distinct pair a real client will submit.
+ * district are distinct, correct cache entries.
+ *
+ * <p><strong>{@code maximumSize = 600} is an admission FENCE, not a capacity
+ * estimate.</strong> This Javadoc used to justify it as "the taxonomy is small
+ * (~600 cities + districts)"; Phase 325's V170/V171 widened {@code cities} to
+ * 25 698 rows and killed that premise. The size is deliberately NOT raised to
+ * match, and that is the whole point: unlike the {@code location*} caches,
+ * whose keys come from stored FKs, this key comes straight off a CLIENT
+ * REQUEST BODY on the profile/salon write paths, and the "city does not exist"
+ * verdict is itself a cacheable result — so a caller posting random UUIDs
+ * mints a fresh entry on every request. A cap sized to the data would be a cap
+ * sized to the attacker. Exceeding the fence costs one 0.06 ms Index Only Scan
+ * (6 shared buffers) on the next write, which is why a tight fence is the
+ * right trade here.
  *
  * <p>This class is a pure read-only lookup: no {@code save}/{@code delete},
  * and the validator semantics (which exception, which message, which

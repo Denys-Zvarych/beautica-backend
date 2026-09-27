@@ -1,10 +1,13 @@
 package com.beautica.master.dto;
 
 import com.beautica.booking.dto.BookingDetailResponse;
+import com.beautica.location.SettlementDisplayNames;
+import com.beautica.location.entity.SettlementType;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.salon.dto.PublicSalonResponse;
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -40,7 +43,49 @@ public record MasterDetailResponse(
         // Null when the master has no location set or on the public endpoint.
         UUID cityId,
         UUID oblastId,
-        UUID districtId
+        UUID districtId,
+        /**
+         * Count of the master's CONFIRMED/COMPLETED bookings in the current Kyiv calendar month —
+         * the «Записів місяця» tile on the master hub (Qase defect #25).
+         *
+         * <p><b>Self-read only.</b> {@code null} on every path but {@code GET /masters/me}:
+         * {@link #from} never populates it and {@link #fromPublic} nulls it explicitly, so the
+         * {@code permitAll()} {@code GET /masters/{masterId}} cannot publish a master's trading
+         * volume to anonymous callers. Attach it with {@link #withBookingsThisMonth} at the point
+         * of use, never inside a factory that both paths share.
+         *
+         * <p>Deliberately NOT part of the {@code master-detail-by-user} cache entry: the profile
+         * is stable and the count changes with every booking, so it is resolved per request
+         * against a cached, booking-free DTO.
+         */
+        Integer bookingsThisMonth,
+        /**
+         * Parent oblast name ({@code oblasts.name_uk}) of the master's own settlement, resolved
+         * from {@code cityId} through {@code SettlementDisplayNameResolver} — never the legacy
+         * {@code users.region} text, which can outlive a cleared {@code cityId}. The oblast half
+         * of the saved-locality label. Masked exactly like {@link #city} on the public path.
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "Oblast name of the master's own settlement "
+                + "(cityId). Null when no city is set, and on the public path for salon-affiliated "
+                + "masters (masked like city).")
+        String region,
+        /**
+         * Kind of the master's own settlement ({@code cityId}), so the client can prefix the
+         * label («м.»/«смт»/«с.»/«с-ще») as for a {@code GET /settlements} row. Masked like
+         * {@link #city}.
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "Kind of the master's own settlement (cityId). "
+                + "Null when no city is set, and wherever cityId is masked.")
+        SettlementType citySettlementType,
+        /**
+         * Bare hromada adjective of the master's own settlement, populated ONLY when its name is
+         * ambiguous within its oblast (same rule as {@code GET /settlements}). Masked like
+         * {@link #city}.
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "Bare hromada adjective of the master's own "
+                + "settlement, populated only when its name is ambiguous within its oblast; null "
+                + "otherwise and wherever cityId is masked.")
+        String cityHromadaNameUk
 ) {
     /**
      * Builds a fully-populated response including locality cascade IDs.
@@ -56,9 +101,15 @@ public record MasterDetailResponse(
      *                      above — the master's own locality and the salon's business locality
      *                      are different cities in general (e.g. an admin editing before the
      *                      master's profile address is synced).
+     * @param settlement      resolved label parts of {@code master.getUser().getCityId()}, or
+     *                        {@code null} when no city is set / unresolved
+     * @param salonSettlement resolved label parts of the affiliated salon's {@code cityId}, or
+     *                        {@code null} when there is no salon / unresolved — resolved
+     *                        separately for the same reason as {@code salonOblastId}
      */
     public static MasterDetailResponse from(
-            Master master, List<WorkingHours> hours, UUID oblastId, UUID salonOblastId) {
+            Master master, List<WorkingHours> hours, UUID oblastId, UUID salonOblastId,
+            SettlementDisplayNames settlement, SettlementDisplayNames salonSettlement) {
         return new MasterDetailResponse(
                 master.getId(),
                 master.getUser().getFirstName(),
@@ -77,11 +128,22 @@ public record MasterDetailResponse(
                 master.getReviewCount(),
                 master.getMasterType(),
                 master.getSalon() != null
-                        ? PublicSalonResponse.from(master.getSalon(), salonOblastId) : null,
+                        ? PublicSalonResponse.from(master.getSalon(), salonOblastId, salonSettlement)
+                        : null,
                 hours.stream().map(WorkingHoursResponse::from).toList(),
                 master.getUser().getCityId(),
                 oblastId,
-                master.getUser().getDistrictId()
+                master.getUser().getDistrictId(),
+                // bookingsThisMonth — never populated here. Three call sites share this factory
+                // and all three are @Cacheable; a count baked in would be served stale. See the
+                // component's own doc and `withBookingsThisMonth`.
+                null,
+                // From the settlement lookup, NOT the legacy users.region free text: a master
+                // whose city_id is NULL can still hold a stale region string, which would break
+                // the "null when no city is set" contract and leak onto the public path.
+                settlement == null ? null : settlement.region(),
+                settlement == null ? null : settlement.settlementType(),
+                settlement == null ? null : settlement.hromadaNameUk()
         );
     }
 
@@ -89,7 +151,8 @@ public record MasterDetailResponse(
      * Returns a copy of {@code full} with PII masked for unauthenticated callers.
      * {@code phoneNumber} is always masked, regardless of master type.
      * <p>
-     * Address fields (city, street, buildingNo, locationNote, cityId, oblastId, districtId) are
+     * Address fields (city, region, citySettlementType, cityHromadaNameUk, street, buildingNo,
+     * locationNote, cityId, oblastId, districtId) are
      * masked for {@link MasterType#SALON_MASTER} / {@link MasterType#SALON_OWNER} — a salon master's
      * precise address is the salon's business address and is not surfaced on this public-by-id
      * path. For {@link MasterType#INDEPENDENT_MASTER}, the full address is returned unmasked,
@@ -122,7 +185,34 @@ public record MasterDetailResponse(
                 full.masterType(), full.salon(), full.workingHours(),
                 isIndependent ? full.cityId() : null,
                 isIndependent ? full.oblastId() : null,
-                isIndependent ? full.districtId() : null
+                isIndependent ? full.districtId() : null,
+                // bookingsThisMonth — ALWAYS null here, for every master type. This endpoint is
+                // `permitAll()`; a master's monthly trading volume is not public. Unlike the
+                // address fields above there is no disclosure case to gate on, so this is a
+                // constant, not a predicate.
+                null,
+                // The settlement label parts describe the SAME settlement as `city`/`cityId`, so
+                // they are gated on the same `isIndependent` predicate — masking the id and the
+                // name while publishing the oblast/hromada would leak the locality they hide.
+                isIndependent ? full.region() : null,
+                isIndependent ? full.citySettlementType() : null,
+                isIndependent ? full.cityHromadaNameUk() : null
         );
+    }
+
+    /**
+     * Returns a copy carrying {@code bookingsThisMonth} — the only supported way to populate it.
+     *
+     * <p>A wither rather than a {@link #from} parameter on purpose: {@code from} is shared by the
+     * public path and by three cached call sites, and a count threaded through it would be cached
+     * with the profile and served stale, or leaked by whichever caller forgot to pass null. Here
+     * the field can only be set by a caller that has already decided it is entitled to it.
+     */
+    public MasterDetailResponse withBookingsThisMonth(Integer bookingsThisMonth) {
+        return new MasterDetailResponse(
+                masterId, firstName, lastName, phoneNumber, city, street, buildingNo,
+                locationNote, bio, instagram, professionalTitle, avatarUrl, avgRating,
+                reviewCount, masterType, salon, workingHours, cityId, oblastId, districtId,
+                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk);
     }
 }

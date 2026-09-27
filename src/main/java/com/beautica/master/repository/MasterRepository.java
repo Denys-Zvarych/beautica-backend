@@ -19,6 +19,14 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<Master> findByUserId(UUID userId);
 
     /**
+     * The id of the {@code masters} row owned by a user, without loading the entity — for callers
+     * that only need a cache key (e.g. {@code SalonService}'s owner master-detail eviction).
+     * {@code masters.user_id} is unique, so at most one id comes back.
+     */
+    @Query("SELECT m.id FROM Master m WHERE m.user.id = :userId")
+    Optional<UUID> findIdByUserId(@Param("userId") UUID userId);
+
+    /**
      * Same as {@link #findByUserId} but also JOIN FETCH-es the {@code salon} association,
      * eliminating the extra {@code SELECT * FROM salons WHERE id = ?} fired when callers
      * dereference {@code master.getSalon().getId()} (MEDIUM F2+F3).
@@ -124,6 +132,23 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
      */
     @Query("SELECT m.id FROM Master m WHERE m.salon.id = :salonId AND m.isActive = true")
     List<UUID> findIdsBySalonIdAndIsActiveTrue(@Param("salonId") UUID salonId);
+
+    /**
+     * Cache keys of EVERY master row affiliated with {@code salonId} — active or not, since
+     * {@code GET /masters/{masterId}} carries no {@code isActive} predicate and may hold an
+     * inactive master's entry. Id-only constructor projection; the {@code LEFT JOIN} keeps a
+     * detached master (null {@code user}) in the result with a null {@code userId}.
+     *
+     * <p>Used by {@code SalonService#updateSalon} to evict the per-master detail entries whose
+     * embedded salon block changed with the salon's {@code cityId}. Bounded by the salon's
+     * roster, which is small by construction.
+     */
+    @Query("""
+            SELECT new com.beautica.master.repository.MasterCacheKeys(m.id, u.id)
+              FROM Master m LEFT JOIN m.user u
+             WHERE m.salon.id = :salonId
+            """)
+    List<MasterCacheKeys> findCacheKeysBySalonId(@Param("salonId") UUID salonId);
 
     boolean existsBySalonIdAndUserIdAndIsActiveTrue(UUID salonId, UUID userId);
 

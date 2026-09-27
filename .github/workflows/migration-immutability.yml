@@ -146,6 +146,8 @@ jobs:
           set -euo pipefail
 
           MIGRATION_PATH="src/main/resources/db/migration"
+          JAVA_MIGRATION_PATH="src/main/java/db/migration"
+          DATA_PATH="src/main/resources/db/data"
 
           # >>> SHARED-BLOCK:immutability:BEGIN
           # =========================================================
@@ -171,19 +173,34 @@ jobs:
           # migrations but are included for defensive completeness
           # (zero behaviour change for normal new-file adds).
           #
-          # The pathspec is scoped to '*.sql', NOT the whole migration
-          # directory. Only SQL scripts carry a Flyway checksum
-          # identity; housekeeping files that happen to live in the
-          # same directory (a '.gitkeep' placeholder, a README) are not
-          # migrations and removing one can never break 'flyway
-          # validate'. Scoping on the directory made the gate fail a
-          # dev->main PR purely because the original '.gitkeep' had
-          # been deleted once real migrations landed. Scenario 9 in the
-          # mirror pins this.
+          # The pathspec is scoped to the three file kinds that carry
+          # a Flyway checksum identity, NOT to whole directories:
+          #   "$MIGRATION_PATH/*.sql"        -- SQL scripts
+          #   "$JAVA_MIGRATION_PATH/V*.java" -- Java migrations (V171+)
+          #   "$DATA_PATH/*.csv"             -- data resources a Java
+          #                                     migration derives its
+          #                                     own checksum from
+          # Housekeeping files that happen to live in those directories
+          # (a '.gitkeep' placeholder, a README) carry no checksum
+          # identity, so removing one can never break 'flyway validate'.
+          # Scoping on the directory made the gate fail a dev->main PR
+          # purely because the original '.gitkeep' had been deleted once
+          # real migrations landed. Scenario 9 in the mirror pins this.
+          #
+          # The CSV arm is NOT cosmetic. V171__import_free_settlements
+          # overrides getChecksum() to return a CRC32 over the BYTES of
+          # db/data/settlements.csv, so editing that CSV silently
+          # mutates an already-applied migration's checksum -- the exact
+          # defect class that crash-looped Railway on V49. Refreshing
+          # the settlement list is ROUTINE maintenance (Order 376
+          # changes every few weeks), which makes the unguarded path the
+          # likely one to be taken. Scenarios 11 and 12 in the mirror
+          # pin the two new arms.
           run_gate() {
             local base_sha="$1"
             local changed
-            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH/*.sql")
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- \
+              "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -194,7 +211,8 @@ jobs:
           # =========================================================
           # >>> SHARED-BLOCK:immutability:END
 
-          CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- "$MIGRATION_PATH/*.sql")
+          CHANGED=$(git diff --name-status --diff-filter=MDRCT "$BASE_SHA...HEAD" -- \
+            "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
 
           if run_gate "$BASE_SHA"; then
             echo "No existing migration files were modified, deleted, or renamed. Check passed."
@@ -223,6 +241,8 @@ jobs:
           set -euo pipefail
 
           MIGRATION_PATH="src/main/resources/db/migration"
+          JAVA_MIGRATION_PATH="src/main/java/db/migration"
+          DATA_PATH="src/main/resources/db/data"
 
           # >>> SHARED-BLOCK:immutability:BEGIN
           # =========================================================
@@ -248,19 +268,34 @@ jobs:
           # migrations but are included for defensive completeness
           # (zero behaviour change for normal new-file adds).
           #
-          # The pathspec is scoped to '*.sql', NOT the whole migration
-          # directory. Only SQL scripts carry a Flyway checksum
-          # identity; housekeeping files that happen to live in the
-          # same directory (a '.gitkeep' placeholder, a README) are not
-          # migrations and removing one can never break 'flyway
-          # validate'. Scoping on the directory made the gate fail a
-          # dev->main PR purely because the original '.gitkeep' had
-          # been deleted once real migrations landed. Scenario 9 in the
-          # mirror pins this.
+          # The pathspec is scoped to the three file kinds that carry
+          # a Flyway checksum identity, NOT to whole directories:
+          #   "$MIGRATION_PATH/*.sql"        -- SQL scripts
+          #   "$JAVA_MIGRATION_PATH/V*.java" -- Java migrations (V171+)
+          #   "$DATA_PATH/*.csv"             -- data resources a Java
+          #                                     migration derives its
+          #                                     own checksum from
+          # Housekeeping files that happen to live in those directories
+          # (a '.gitkeep' placeholder, a README) carry no checksum
+          # identity, so removing one can never break 'flyway validate'.
+          # Scoping on the directory made the gate fail a dev->main PR
+          # purely because the original '.gitkeep' had been deleted once
+          # real migrations landed. Scenario 9 in the mirror pins this.
+          #
+          # The CSV arm is NOT cosmetic. V171__import_free_settlements
+          # overrides getChecksum() to return a CRC32 over the BYTES of
+          # db/data/settlements.csv, so editing that CSV silently
+          # mutates an already-applied migration's checksum -- the exact
+          # defect class that crash-looped Railway on V49. Refreshing
+          # the settlement list is ROUTINE maintenance (Order 376
+          # changes every few weeks), which makes the unguarded path the
+          # likely one to be taken. Scenarios 11 and 12 in the mirror
+          # pin the two new arms.
           run_gate() {
             local base_sha="$1"
             local changed
-            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH/*.sql")
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- \
+              "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
             if [ -z "$changed" ]; then
               return 0
             fi
@@ -277,9 +312,15 @@ jobs:
           git config user.email "ci@example.com"
           git config user.name "CI Self Test"
 
-          mkdir -p "$MIGRATION_PATH"
+          mkdir -p "$MIGRATION_PATH" "$JAVA_MIGRATION_PATH" "$DATA_PATH"
           printf 'CREATE TABLE existing (id int);\n' > "$MIGRATION_PATH/V1__existing.sql"
           printf 'CREATE TABLE other (id int);\n' > "$MIGRATION_PATH/V2__other.sql"
+          # A Java migration and the data resource it derives its own
+          # checksum from -- the V171 shape. Scenarios 11-13 pin them.
+          printf 'class V3__load {}\n' > "$JAVA_MIGRATION_PATH/V3__load.java"
+          printf 'class Helper {}\n' > "$JAVA_MIGRATION_PATH/Helper.java"
+          printf '"code","name"\n"UA1","A"\n' > "$DATA_PATH/rows.csv"
+          printf 'notes\n' > "$DATA_PATH/README.md"
           git add -A
           git commit -q -m "base: existing migrations"
           BASE_SHA="$(git rev-parse HEAD)"
@@ -422,6 +463,57 @@ jobs:
           git commit -q -m "delete .gitkeep AND an already-merged migration"
           if run_gate "$MIXED_BASE"; then fail ".gitkeep+V1 co-deletion must still fail on the V1 deletion (exit 1)"; fi
           echo "OK: co-deleted migration still caught alongside an ignored .gitkeep"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 11: MODIFY an already-merged data CSV -> exit 1 ---
+          # THE headline regression this arm exists for.
+          # V171__import_free_settlements derives getChecksum() from the
+          # BYTES of db/data/settlements.csv, so a routine "refresh the
+          # settlement list" edit mutates an applied migration's
+          # checksum and crash-loops Flyway on the next prod boot -- and
+          # the pre-Phase-325 pathspec ('*.sql' only) waved it through.
+          printf '"code","name"\n"UA1","A"\n"UA2","B"\n' > "$DATA_PATH/rows.csv"
+          git add -A && git commit -q -m "refresh the settlement CSV"
+          if run_gate "$BASE_SHA"; then fail "modified migration CSV should fail (exit 1)"; fi
+          echo "OK: modified data CSV fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 12: MODIFY an already-merged Java migration
+          # -> exit 1 ---
+          # A Java migration carries the same checksum identity as a
+          # V*.sql script (Flyway hashes the class via getChecksum()),
+          # so editing one after it has run is the same outage.
+          printf 'class V3__load { int x; }\n' > "$JAVA_MIGRATION_PATH/V3__load.java"
+          git add -A && git commit -q -m "edit an applied Java migration"
+          if run_gate "$BASE_SHA"; then fail "modified Java migration should fail (exit 1)"; fi
+          echo "OK: modified Java migration fails"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 13: the new arms did NOT over-scope -> exit 0 ---
+          # Three edits that carry no Flyway checksum identity must all
+          # still pass: a brand-new CSV + a brand-new Java migration
+          # (adds, filter 'A'), and an edit to a NON-V*.java helper that
+          # merely lives in the Java migration package. Without this the
+          # widened pathspec could block every legitimate PR that ships
+          # a new data-backed migration.
+          printf '"code","name"\n"UA9","Z"\n' > "$DATA_PATH/more.csv"
+          printf 'class V4__next {}\n' > "$JAVA_MIGRATION_PATH/V4__next.java"
+          printf 'class Helper { int y; }\n' > "$JAVA_MIGRATION_PATH/Helper.java"
+          git add -A && git commit -q -m "add a new CSV + new Java migration, edit a non-migration helper"
+          run_gate "$BASE_SHA" || fail "new CSV + new Java migration + helper edit must pass (exit 0)"
+          echo "OK: add-only CSV/Java migration and a non-V*.java helper edit pass"
+          git reset -q --hard "$BASE_SHA"
+
+          # --- Scenario 14: a CSV mutation hidden behind a legitimate
+          # new SQL migration -> exit 1 ---
+          # The realistic PR shape: "ship V172 AND refresh the CSV".
+          # Proves the add does not mask the co-located CSV mutation,
+          # exactly as scenario 8 proves it for V*.sql.
+          printf 'CREATE TABLE later (id int);\n' > "$MIGRATION_PATH/V5__later.sql"
+          printf '"code","name"\n"UA1","RENAMED"\n' > "$DATA_PATH/rows.csv"
+          git add -A && git commit -q -m "add V5 AND refresh the CSV in one commit"
+          if run_gate "$BASE_SHA"; then fail "new migration must not mask the CSV mutation (exit 1)"; fi
+          echo "OK: co-located CSV mutation still caught behind a legitimate add"
           git reset -q --hard "$BASE_SHA"
 
           echo "All self-test scenarios passed."
@@ -1098,6 +1190,8 @@ jobs:
           # >>> SHARED-BLOCK:baserev:END
 
           MIGRATION_PATH="src/main/resources/db/migration"
+          JAVA_MIGRATION_PATH="src/main/java/db/migration"
+          DATA_PATH="src/main/resources/db/data"
 
           # Local copy of the REAL immutability gate one-liner. This is
           # deliberately NOT wrapped in a SHARED-BLOCK:immutability
@@ -1107,12 +1201,13 @@ jobs:
           # genuine `git diff --diff-filter=MDRCT base...HEAD` behavior
           # end-to-end on a real V49 mutation -- the headline
           # regression that crash-looped Railway. Kept behaviourally
-          # in sync with the shared block, including the '*.sql'
-          # pathspec scoping.
+          # in sync with the shared block, including the three-arm
+          # pathspec scoping ('*.sql' + 'V*.java' + '*.csv').
           run_gate() {
             local base_sha="$1"
             local changed
-            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- "$MIGRATION_PATH/*.sql")
+            changed=$(git diff --name-status --diff-filter=MDRCT "${base_sha}...HEAD" -- \
+              "$MIGRATION_PATH/*.sql" "$JAVA_MIGRATION_PATH/V*.java" "$DATA_PATH/*.csv")
             if [ -z "$changed" ]; then
               return 0
             fi

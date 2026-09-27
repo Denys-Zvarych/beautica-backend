@@ -225,7 +225,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC1 — V54 idx_salons_city_id exists AND still serves the REAL production salon CITY-filter SQL as an Index Cond (capability probe, every competing salons index removed)")
     void should_useCityIndex_when_salonSearchFiltersByCity() {
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
 
         // Invoke the REAL production path. SearchService.searchSalons →
         // SalonRepository.findActiveByCityId — exactly the SQL Hibernate emits
@@ -268,7 +268,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
 
         String productionSql = captureSalonSearchSelect(
                 new SalonSearchRequest(
-                        new LocationFilter(cityIdByName("Київ"), districtId),
+                        new LocationFilter(majorCityIdByName("Київ"), districtId),
                         null, null, null, null, null, 0, 20, null));
 
         String plan = salonsProbe()
@@ -385,7 +385,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @DisplayName("AC2 — N rows on a search page trigger exactly ONE batched resolveLabels call, never one per row")
     void should_resolveLabelsOncePerPage_when_masterSearchReturnsManyRows() throws Exception {
         Mockito.clearInvocations(discoveryLocationResolver);
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
         for (int i = 0; i < 5; i++) {
             seedMaster("Київ", "4.0" + i);
         }
@@ -414,7 +414,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @DisplayName("AC2 (MEDIUM-4) — SALON path: N salons on a page trigger exactly ONE batched resolveLabels call, never one per row")
     void should_resolveLabelsOncePerPage_when_salonSearchReturnsManyRows() throws Exception {
         Mockito.clearInvocations(discoveryLocationResolver);
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
         for (int i = 0; i < 5; i++) {
             seedActiveSalon("Київ");
         }
@@ -491,7 +491,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("AC5 — warm median latency of a 10-row locality-filtered salon page is under a tight documented threshold and far under the recorded pre-rework baseline")
     void should_completeUnderWarmMedian_when_salonSearchFiltersByLocality() {
-        UUID kyivCityId = cityIdByName("Київ");
+        UUID kyivCityId = majorCityIdByName("Київ");
         for (int i = 0; i < 10; i++) {
             seedActiveSalon("Київ");
         }
@@ -674,7 +674,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * {@code SearchIntegrationTest.seedActiveSalon}.
      */
     private void seedActiveSalon(String city) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
         UUID ownerId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO users (id, email, password_hash, role, is_active, email_verified) "
@@ -688,16 +688,13 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
                 salonId, ownerId, "PerfActiveSalon-" + salonId, city, cityId);
     }
 
-    private UUID cityIdByName(String nameUk) {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = ? ORDER BY katotth_code LIMIT 1",
-                UUID.class, nameUk);
-    }
-
     private UUID oblastIdByCity(String cityNameUk) {
         return jdbcTemplate.queryForObject(
-                "SELECT c.oblast_id FROM cities c WHERE c.name_uk = ? "
-                        + "ORDER BY c.katotth_code LIMIT 1",
+                "SELECT c.oblast_id FROM cities c "
+                        // settlement_type = 'CITY' drops the namesake VILLAGES Phase 325
+                        // imported («Київ» in Миколаївська, «Львів» in Дніпропетровська),
+                        // which sort FIRST by katotth_code and carry no districts.
+                        + "WHERE c.name_uk = ? AND c.settlement_type = 'CITY'",
                 UUID.class, cityNameUk);
     }
 
@@ -705,7 +702,11 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT cd.id FROM city_districts cd "
                         + "JOIN cities c ON c.id = cd.city_id "
-                        + "WHERE c.name_uk = ? ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
+                        // settlement_type = 'CITY' drops the namesake VILLAGES Phase 325
+                        // imported («Київ» in Миколаївська, «Львів» in Дніпропетровська),
+                        // which sort FIRST by katotth_code and carry no districts.
+                        + "WHERE c.name_uk = ? AND c.settlement_type = 'CITY' "
+                        + "ORDER BY cd.katotth_code OFFSET ? LIMIT 1",
                 UUID.class, cityNameUk, index);
     }
 
@@ -716,7 +717,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * locality resolves through the salon link at query time.
      */
     private void seedMaster(String city, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         // Phase 19.7: /search/masters returns INDEPENDENT_MASTER only. The AC2
         // N+1 label-resolution contract is role-agnostic — it only needs N
@@ -752,7 +753,7 @@ class LocalityDiscoveryPerfHardeningTest extends AbstractIntegrationTest {
      * master-spine plan exercises the production predicate.
      */
     private void seedIndependentMasterInDistrict(String city, UUID districtId, String avgRating) {
-        UUID cityId = cityIdByName(city);
+        UUID cityId = majorCityIdByName(city);
 
         UUID masterUserId = UUID.randomUUID();
         jdbcTemplate.update(

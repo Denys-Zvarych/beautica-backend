@@ -110,6 +110,43 @@ public record NormalizedSearchQuery(List<String> tokens, boolean belowMinimumLen
 
     private static final String STRAIGHT_APOSTROPHE = "'";
 
+    /**
+     * One character that {@code pg_trgm} will actually extract a trigram from.
+     *
+     * <p><b>This is the predicate {@link #MIN_QUERY_LENGTH} was always meant to express and does
+     * not.</b> A length test is a PROXY for "the GIN index can serve this"; it is not the thing
+     * itself. {@code pg_trgm} tokenises on alphanumeric runs and treats every other character as a
+     * separator, so {@code show_trgm('•••')} is {@code {}} — an EMPTY key set. A query with an
+     * empty key set cannot be answered from a GIN index at all: the planner abandons
+     * {@code idx_cities_name_uk_trgm} / {@code idx_*_name_trgm} and falls back to a sequential
+     * scan that evaluates {@code similarity()} on every row.
+     *
+     * <p>Measured on the real 25 698-row {@code cities} table: {@code 'нов'} = 3.4 ms via
+     * BitmapOr; {@code "•".repeat(100)} = 119 ms, {@code Seq Scan}, {@code Rows Removed by Filter:
+     * 25697}. {@code pgbench -c 10 -t 24} over one IP's full 240-token minute saturated the whole
+     * Hikari pool for 6.02 s, on {@code permitAll} endpoints, unauthenticated — so the length
+     * floor alone was a denial-of-service surface on both {@code /search/**} and
+     * {@code /settlements}. ONE alphanumeric anywhere in the term restores the index scan
+     * ({@code "•".repeat(49) + "о"} re-measured at 3.5 ms, against 3.2 ms for the benign «нов»),
+     * which is why this asks for PRESENCE and not for a ratio or an all-characters test: one letter
+     * is genuinely enough to make the query cheap, and a stricter rule would start rejecting real
+     * input — «Кам’янка», «Івано-Франківськ», «с. Нове» — for no measurable benefit.
+     *
+     * <p>Alphabetic is deliberately the Unicode property, not {@code [a-z]}: Cyrillic is the
+     * primary alphabet here and {@code \p{Alnum}} is ASCII-only.
+     */
+    private static final Pattern TRIGRAM_BEARING =
+            Pattern.compile("[\\p{IsAlphabetic}\\p{IsDigit}]");
+
+    /**
+     * An alphanumeric run long enough for pg_trgm to extract one INTERIOR 3-gram from it — the
+     * predicate {@link #TRIGRAM_BEARING} is the weakened, defeatable form of. See
+     * {@link #hasIndexServableRun(String)} for the three measured inputs that walked through the
+     * weaker spellings of this check.
+     */
+    private static final Pattern TRIGRAM_RUN =
+            Pattern.compile("[\\p{IsAlphabetic}\\p{IsDigit}]{" + MIN_QUERY_LENGTH + ",}");
+
     /** Defensive copy — the token list is part of a value object and must be immutable. */
     public NormalizedSearchQuery {
         tokens = List.copyOf(tokens);
@@ -134,7 +171,13 @@ public record NormalizedSearchQuery(List<String> tokens, boolean belowMinimumLen
             // covered by String#isBlank — treat it as "nothing was typed".
             return ABSENT;
         }
-        boolean trigramServable = retained.stream().anyMatch(token -> token.length() >= MIN_QUERY_LENGTH);
+        // Trigram-servable means BOTH long enough AND trigram-bearing. The length half alone let
+        // `?q=•••` through to SearchService#likeContains, where it became a `%•••%` predicate with
+        // an empty GIN key set and a full sequential scan — see TRIGRAM_BEARING for the numbers.
+        // A token that fails only the second half is not "a short query", it is an unservable one,
+        // and BELOW_MINIMUM is already the state for "typed, but cannot be run": an explicit empty
+        // page plus the hint, never the unfiltered set and never a scan.
+        boolean trigramServable = retained.stream().anyMatch(NormalizedSearchQuery::isServableToken);
         return trigramServable ? new NormalizedSearchQuery(retained, false) : BELOW_MINIMUM;
     }
 
@@ -157,6 +200,90 @@ public record NormalizedSearchQuery(List<String> tokens, boolean belowMinimumLen
      */
     public static String foldApostrophes(String value) {
         return CURLY_APOSTROPHES.matcher(value).replaceAll(STRAIGHT_APOSTROPHE);
+    }
+
+    /**
+     * Whether {@code pg_trgm} can extract at least one trigram from {@code term} — i.e. whether a
+     * GIN {@code gin_trgm_ops} index can serve a predicate built from it at all.
+     *
+     * <p>Exposed for the same reason {@link #foldApostrophes(String)} is: a SECOND surface needs
+     * the identical answer. {@code SettlementSearchService} does not route through
+     * {@link #of(String)} — it has its own three-state routing over a different table and a
+     * different apostrophe fold — but it guards the same GIN index against the same empty-key-set
+     * scan. Two copies of a regex that decides whether an unauthenticated request can saturate the
+     * connection pool is exactly the drift this project has shipped bugs from; one definition, two
+     * readers.
+     *
+     * @param term a single already-trimmed term or token; must not be {@code null}
+     * @return {@code true} when the term contains at least one alphanumeric character
+     */
+    public static boolean bearsTrigrams(String term) {
+        return TRIGRAM_BEARING.matcher(term).find();
+    }
+
+    /**
+     * Whether ONE whitespace-delimited token can drive a {@code gin_trgm_ops} index scan on its own
+     * — long enough to yield a full 3-gram AND carrying an alphanumeric run for pg_trgm to tokenise.
+     *
+     * <p>Both halves, together, in one place. {@link #of(String)} applied them as an inline
+     * conjunction and {@code SettlementSearchService} applied them as two separate statements over
+     * the WHOLE term rather than per token — the drift that shipped defect 2 (see
+     * {@link #hasIndexServableRun(String)}).
+     *
+     * @param token a single whitespace-free term; must not be {@code null}
+     * @return {@code true} when a GIN trigram index can serve a predicate built from this token
+     */
+    public static boolean isServableToken(String token) {
+        return token.length() >= MIN_QUERY_LENGTH && bearsTrigrams(token);
+    }
+
+    /**
+     * Whether a raw term contains at least one uninterrupted alphanumeric RUN of
+     * {@link #MIN_QUERY_LENGTH} characters — i.e. whether pg_trgm can extract a single interior
+     * 3-gram from it, rather than only the padded boundary keys of short fragments.
+     *
+     * <h4>Why the run, and not the term's length, and not a token's length</h4>
+     * Three successively weaker proxies each admitted the input the next one had to catch, on the
+     * same {@code permitAll} endpoint, measured on the real 25 697-row table:
+     *
+     * <table><caption>measured</caption>
+     *   <tr><th>term</th><th>proxy that admitted it</th><th>similarity() rechecks</th><th>ms</th></tr>
+     *   <tr><td>{@code "•".repeat(50)}</td><td>whole-term length &ge; 3</td>
+     *       <td>Seq Scan, 25 697 rows</td><td>92.5</td></tr>
+     *   <tr><td>{@code "ка ".repeat(17)}</td><td>+ {@link #bearsTrigrams(String)} on the term</td>
+     *       <td>10 070</td><td>47.5</td></tr>
+     *   <tr><td>{@code "•к".repeat(25)}</td><td>+ a 3-character TOKEN floor</td>
+     *       <td>3 022</td><td>21.7</td></tr>
+     * </table>
+     *
+     * <p>Every one of those clears {@code @Size(50)}, the 3-character floor and a
+     * "carries an alphanumeric somewhere" test, because none of those measures the thing that
+     * decides selectivity. pg_trgm tokenises on alphanumeric runs and pads each one, so a run of
+     * length L contributes L+1 keys of which only L-2 are interior; runs of length 1 and 2
+     * contribute boundary keys ONLY, which are shared by thousands of names. At the 0.3 threshold a
+     * term with three distinct keys needs just one to match, and «ка» alone put 10 070 rows into
+     * the recheck. The run length is the only property an attacker cannot inflate by padding —
+     * repeating a 2-character fragment fifty times adds no distinct key at all.
+     *
+     * <p><b>It costs no legitimate caller anything.</b> Exactly two of the 25 697 settlements have
+     * no 3-character run — the two villages named «Яр» — and both are already unreachable under the
+     * {@link #MIN_QUERY_LENGTH} floor that predates this. «Кам’янка», «Івано-Франківськ»,
+     * «с. Нове» and «112» all carry a qualifying run and are unaffected; the measured worst
+     * ADMITTED adversarial term after this change (a repeated 4-letter fragment) costs 10.1 ms
+     * against 10.9 ms for the benign «іванівка», so an anonymous caller can no longer buy more work
+     * than a real user already does.
+     *
+     * <p><b>Scope.</b> {@link #of(String)} deliberately still applies the weaker per-token rule:
+     * it serves {@code /search/**} over the masters and salons tables, a different surface on a
+     * different branch with three orders of magnitude fewer rows. Adopting this predicate there is
+     * the right follow-up, not a change to smuggle through a Phase 326 audit.
+     *
+     * @param term a raw or normalised term; must not be {@code null}
+     * @return {@code true} when a GIN trigram index can serve a predicate built from this term
+     *         selectively
+     */
+    public static boolean hasIndexServableRun(String term) {
+        return TRIGRAM_RUN.matcher(term).find();
     }
 
     /** {@code true} when no query was supplied — the {@code q} predicate is omitted entirely. */

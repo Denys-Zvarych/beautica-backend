@@ -2,7 +2,12 @@ package com.beautica.config;
 
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
+import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.service.SettlementSearchService;
 import com.beautica.search.service.SearchCacheNames;
+import com.beautica.search.service.SearchSuggestionActivePlaces;
+import com.beautica.search.service.SearchSuggestionAvailability;
+import com.beautica.search.service.SearchSuggestionCatalogue;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.binder.cache.CaffeineCacheMetrics;
@@ -162,10 +167,19 @@ public class CacheConfig {
      *   locationOblasts        — full serviced-oblast list (single entry) — 24 h TTL, max 4 entries
      *   locationCitiesByOblast — cities (+hasDistricts) per oblast — 24 h TTL, max 50 entries
      *   locationDistrictsByCity— urban districts per city — 24 h TTL, max 200 entries
-     *   cityOblastId            — shared cityId -> oblastId resolver (SalonService/MasterService) —
-     *                             24 h TTL, max 400 entries; no eviction path (static reference data)
+     *   settlementMajors       — the 50 curated is_major settlements shown before the user
+     *                            types in the Phase 326 autocomplete — 24 h TTL, max 2 entries
+     *                            (the method takes no arguments: ONE entry in practice)
+     *   settlementSearch       — Phase 329: per-query settlement autocomplete results, keyed by
+     *                            the normalised lower-cased term — 24 h TTL, max 1024 entries
+     *                            (bounded; supersedes phase 326's "per-query NOT cached")
+     *   cityOblastId            — shared cityId -> oblastId resolver
+     *                             (SalonService/MasterService/UserService) — 24 h TTL,
+     *                             max 2000 entries; negatives not cached; no eviction path
+     *                             (static reference data)
      *   localityTaxonomyFacts  — fused city-exists/has-districts/district-child resolution
-     *                            per (cityId,districtId) write-validation pair — 24 h TTL, max 600 entries
+     *                            per (cityId,districtId) write-validation pair — 24 h TTL,
+     *                            max 600 entries (an admission FENCE, not a capacity estimate)
      *
      * <p>Note on {@code search:*}: short TTL is preferred over explicit
      * {@code @CacheEvict} on master/salon write paths because discovery results
@@ -536,24 +550,154 @@ public class CacheConfig {
                         .maximumSize(200)
                         .expireAfterWrite(24, TimeUnit.HOURS)
                         .build());
+        // Phase 326 — the settlement autocomplete's PRE-TYPING list only: the 50 curated
+        // is_major settlements (SettlementSearchService#listMajorSettlements). Same static
+        // reference data and the same 24h-TTL / no-@CacheEvict contract as the three
+        // location* caches above — the rows are written by Flyway alone (V53/V170/V171), so
+        // the only invalidation is a redeploy, which is also the only time they can change.
+        //
+        // maximumSize(2), not 50: this cache holds ONE entry — the whole 50-row list under
+        // @Cacheable's SimpleKey.EMPTY, because the method takes no arguments. 2 leaves room
+        // for the key to gain a dimension later without silently thrashing at 1.
+        manager.registerCustomCache("settlementMajors",
+                Caffeine.newBuilder()
+                        .maximumSize(2)
+                        .expireAfterWrite(24, TimeUnit.HOURS)
+                        .build());
+        // Phase 329 — per-query settlement autocomplete results
+        // (SettlementSearchService#runIndexedSearch), keyed by the normalised, LOWER-CASED term so
+        // «Льв» and «льв» share one entry.
+        //
+        // THIS DELIBERATELY OVERTURNS phase 326's "per-query results are NOT cached". Its sole
+        // rationale was the unbounded key space on a permitAll endpoint (§A, Caffeine slot
+        // exhaustion). maximumSize(1024) removes that premise: an attacker cycling unique terms
+        // can only EVICT entries, and each miss costs exactly what every request cost before
+        // this cache existed. None of the three
+        // phase-326/327 DoS controls moves: the 3-alnum-run admission and the 50-char cap run
+        // BEFORE the cache (a refused term never reaches it), the 20-row LIMIT bounds each value,
+        // and the per-IP bucket in AuthRateLimitFilter runs before the controller, so cache HITS
+        // are charged a token too.
+        //
+        // 24h TTL with no @CacheEvict path: the same static Flyway-seed contract as
+        // settlementMajors above — CityRepository has no write method, so a redeploy (JVM
+        // restart) is the only invalidation, and the only time the rows can change. Metered so
+        // the 1024 sizing can be checked against the real hit ratio rather than argued.
+        //
+        // Worst case ~4.4 MB (1024 keys x ~140 B + 1024 x <=20 rows x ~200 B). The @Cacheable is
+        // deliberately NOT sync = true: this cache misses on every new prefix, and a sync load
+        // holds Caffeine's synchronized bin lock across the whole miss, pinning a virtual-thread
+        // carrier (see the advisor-order note above) — a duplicate concurrent miss costs ~1 ms.
+        registerMetered(manager, meterRegistry, SettlementSearchService.CACHE_SETTLEMENT_SEARCH,
+                Caffeine.newBuilder()
+                        .maximumSize(1024)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
+        // Phase 331 — the search-suggestions catalogue (SearchSuggestionCatalogue#snapshot),
+        // every selectable category + active service type with NO availability applied. ONE
+        // entry (the method takes no arguments — SimpleKey.EMPTY), 10-minute TTL (shorter than
+        // the 60-min service-types/platform-category-order caches it is built from, since this
+        // is a convenience autocomplete list, not authoritative catalogue data). sync = true on
+        // the bean itself (§F-7): the single hottest key behind an unauthenticated per-keystroke
+        // endpoint must collapse a TTL-expiry herd to one reload. maximumSize(4), not 1: mirrors
+        // approved-categories' own headroom for a future argument the method might gain.
+        manager.registerCustomCache(SearchSuggestionCatalogue.CACHE_NAME,
+                Caffeine.newBuilder()
+                        .maximumSize(4)
+                        .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
+        // Phase 331 — per-place availability for search suggestions
+        // (SearchSuggestionAvailability#forPlace), keyed by the district-primary-normalised
+        // SuggestionPlaceKey(cityId, districtId). D5 sizing: cities holds 25 698 settlements
+        // since V170, but availability only exists where providers are — realistically a few
+        // hundred distinct keys per 10-minute TTL (the pre-widening ~356 cities + 76 districts).
+        // maximumSize(1000) bounds worst case at ~15 MB (≤~200 UUIDs + ~21 short strings per
+        // entry), ~1 MB typical. Deliberately NOT sync = true — unlike the catalogue's one hot
+        // key, this cache misses on every new place, and a sync load would hold Caffeine's bin
+        // lock (pinning a virtual-thread carrier) across the whole miss, the same reasoning as
+        // settlementSearch above. Metered so the 1000 sizing can be checked against the real hit
+        // ratio.
+        registerMetered(manager, meterRegistry, SearchSuggestionAvailability.CACHE_NAME,
+                Caffeine.newBuilder()
+                        .maximumSize(1000)
+                        .expireAfterWrite(10, TimeUnit.MINUTES));
+        // Audit-fix cycle 1, finding 2 (LOW security + perf) — the active-places short-circuit
+        // gate consulted by SearchSuggestionService BEFORE calling
+        // SearchSuggestionAvailability#forPlace. Without this, searchSuggestionAvailability's
+        // 1 000-slot cache was keyed on an attacker-choosable (cityId, districtId) pair: any
+        // well-formed but unknown UUID minted one repository query AND one new per-place cache
+        // entry, and cycling ids could evict real places' hot entries. This cache holds ONE
+        // entry (the method takes no arguments — SimpleKey.EMPTY): the full set of city/district
+        // ids that have >=1 bookable offer, computed by SearchSuggestionAvailabilityRepository
+        // #findActivePlaces() with the SAME D3 predicates the per-place query uses. A request
+        // whose place is absent from this set short-circuits to PlaceAvailability.EMPTY without
+        // ever touching the per-place cache or the DB. Same 10-minute TTL as the two caches
+        // above (the national key is exempt from this gate and still resolves through
+        // searchSuggestionAvailability directly). sync = true: unlike the per-place cache, this
+        // one is now consulted on EVERY non-national request, so a TTL-expiry herd must collapse
+        // to one reload, mirroring searchSuggestionCatalogue's reasoning. maximumSize(4) mirrors
+        // that cache's own headroom for a future argument the method might gain.
+        manager.registerCustomCache(SearchSuggestionActivePlaces.CACHE_NAME,
+                Caffeine.newBuilder()
+                        .maximumSize(4)
+                        .expireAfterWrite(10, TimeUnit.MINUTES)
+                        .build());
         // Phase 240 perf MEDIUM — shared cityId -> oblastId resolver
         // (LocationQueryService#resolveCityOblastId) backing SalonService/MasterService's
         // per-request oblastId resolution. Same static-reference-data rationale as the
-        // locationOblasts/* caches above: ~356 cities is the realistic ceiling, so 400 entries
-        // comfortably covers every distinct city ever resolved, with the same 24h TTL / no
-        // @CacheEvict contract (data is Flyway-seed-only, never mutated at runtime).
-        manager.registerCustomCache("cityOblastId",
+        // locationOblasts/* caches above: 24h TTL, no @CacheEvict contract (data is
+        // Flyway-seed-only, never mutated at runtime).
+        //
+        // SIZING — 2 000. This was briefly 26 000 on a WRONG premise: that Phase 325's widening of
+        // `cities` from 356 rows to 25 698 had widened this cache's key space to match, making 400
+        // "1.5% of the key space". It had not. Every caller keys on a STORED FK — SalonService on
+        // `salons.city_id`, MasterService on the master's city, UserService#getProfile on
+        // `users.city_id` — so the reachable key space is CITIES-THAT-HOST-A-PROVIDER, which
+        // tracks provider growth, not the settlement table. Importing 25 342 villages nobody has
+        // registered in created no new keys.
+        //
+        // 26 000 was also 52% of every maximumSize in this file combined, for a cache whose live
+        // working set is in the hundreds — and the "~100 bytes/entry -> ~2.5 MB" arithmetic that
+        // justified it was low: a Caffeine bounded entry holding UUID -> UUID measures ~158 B, so
+        // 26 000 reserves ~4.1 MB of heap ceiling.
+        //
+        // 2 000 is ~10x the realistic distinct-provider-city count with room for years of growth,
+        // costs ~315 kB fully populated, and keeps the §F-5 bound meaningful. Negatives are not
+        // cached (`unless = "#result == null"` on the resolver), so an enumeration of random UUIDs
+        // cannot occupy entries at all — the cap no longer has to double as that defence.
+        registerMetered(manager, meterRegistry, "cityOblastId",
                 Caffeine.newBuilder()
-                        .maximumSize(400)
-                        .expireAfterWrite(24, TimeUnit.HOURS)
-                        .build());
+                        .maximumSize(2_000)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
+        // Phase 346 — shared cityId -> (city name, oblast name) labels
+        // (SettlementDisplayNameResolver#resolve) denormalised into users/salons city/region on
+        // every cityId write. Sibling of cityOblastId above: static Flyway-seed data, 24h TTL, no
+        // @CacheEvict contract. Negatives are not cached (`unless = "#result == null"`), so only
+        // ids that name a real settlement occupy entries — the key space is bounded by the
+        // settlement table itself, and in practice by the cities users/providers actually pick.
+        // 2 000 matches cityOblastId's sizing argument; an entry (UUID -> two short strings) is a
+        // few hundred bytes, and a miss is one PK lookup.
+        // Metered (hit ratio / size / evictions) so the 2 000 sizing above can be checked
+        // against a real working set rather than argued; same for cityOblastId.
+        registerMetered(manager, meterRegistry, SettlementDisplayNameResolver.CACHE_SETTLEMENT_DISPLAY_NAMES,
+                Caffeine.newBuilder()
+                        .maximumSize(2_000)
+                        .expireAfterWrite(24, TimeUnit.HOURS));
         // Phase 10.6 — fused write-path taxonomy resolution per (cityId, districtId)
         // pair, backing LocalityWriteValidator. Same static-reference-data rationale
         // as the locationOblasts/* read caches above: KATOTTH rows are Flyway-seed
         // only and never mutate at runtime, so a long 24-hour TTL with NO @CacheEvict
         // path is correct (the only invalidation is JVM restart / redeploy — also
-        // the only time the seed can change). 600 entries comfortably hold every
-        // distinct (city, district) pair a real client submits (~600 taxonomy rows).
+        // the only time the seed can change).
+        //
+        // 600 IS A FENCE, NOT A CAPACITY ESTIMATE. The comment here used to justify it as
+        // "~600 taxonomy rows"; Phase 325 killed that premise (25 698 cities x districts is a far
+        // larger pair space). It is deliberately NOT resized to match, because unlike every other
+        // cache in this file the key is not derived from a stored FK: `(cityId, districtId)` comes
+        // straight off a CLIENT REQUEST BODY on the profile/salon write paths, and the
+        // CITY_ABSENT verdict is itself cached — so a caller posting random UUIDs mints a new,
+        // cacheable entry every time. A cap sized to the data would be a cap sized to the
+        // attacker. 600 bounds that at a few tens of kB while still holding every pair a real
+        // client population submits, and the cost of exceeding it is one 0.06 ms Index Only Scan
+        // (6 buffers) — a miss here is cheap, which is exactly why the fence can be tight.
         manager.registerCustomCache("localityTaxonomyFacts",
                 Caffeine.newBuilder()
                         .maximumSize(600)

@@ -72,34 +72,59 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
                 "SELECT id FROM oblasts WHERE name_uk = ?", UUID.class, nameUk);
     }
 
-    private UUID cityIdByNameUk(String nameUk) {
+    /**
+     * Resolves a city by its KATOTTH code, never by name.
+     *
+     * <p>Phase 325 made {@code name_uk} ambiguous: the taxonomy now holds a VILLAGE called «Київ»
+     * in Миколаївська oblast and three settlements called «Львів». The previous
+     * {@code WHERE name_uk = ? LIMIT 1} helper picked whichever row the planner returned first and
+     * silently resolved the Kyiv district test onto the Mykolaiv village. That ambiguity is the
+     * whole reason phase-325 D1 keeps {@code oblast_id} — so the fixture keys on the code.
+     */
+    private UUID cityIdByKatotthCode(String katotthCode) {
         return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = ? LIMIT 1", UUID.class, nameUk);
+                "SELECT id FROM cities WHERE katotth_code = ?", UUID.class, katotthCode);
     }
+
+    private static final String KYIV_CITY_CODE = "UA80000000000093317";
+    private static final String KHARKIV_CITY_CODE = "UA63120270010096107";
 
     // ── /oblasts — territory exclusion + ordering against real seed ───────────
 
     @Test
-    @DisplayName("GET /oblasts — excludes Донецька/Луганська/Крим/Севастополь and is name_uk-ordered")
-    void should_excludeOccupiedAndBeNameUkOrdered_when_getOblasts() throws Exception {
+    @DisplayName("GET /oblasts — excludes Крим/Севастополь and the dead-end Луганська, INCLUDES Донецька, name_uk-ordered")
+    void should_excludeWholesaleExcludedAndBeNameUkOrdered_when_getOblasts() throws Exception {
         log.debug("Act: GET {} against the real V53 seed — assert exclusion + ordering", OBLASTS_URL);
 
         JsonNode data = getData(OBLASTS_URL);
 
         assertThat(data.isArray()).isTrue();
         assertThat(data.size())
-                .as("V53 seeds 23 serviced oblasts (22 category-O + Kyiv special-status)")
-                .isEqualTo(23);
+                .as("24 offered oblasts — the 25 seeded rows minus Луганська, which holds no "
+                        + "CITY row and so leads to an unconditionally empty second tier")
+                .isEqualTo(24);
 
         List<String> names = new ArrayList<>();
         data.forEach(n -> names.add(n.path("nameUk").asText()));
 
         assertThat(names)
-                .as("occupied / non-serviced oblasts must never be exposed")
-                .noneMatch(n -> n.startsWith("Донецька")
-                        || n.startsWith("Луганська")
-                        || n.contains("Крим")
-                        || n.contains("Севастополь"));
+                .as("Crimea and Sevastopol are excluded wholesale (phase-325 D1) and must never "
+                        + "be exposed")
+                .noneMatch(n -> n.contains("Крим") || n.contains("Севастополь"));
+
+        assertThat(names)
+                .as("Донецька IS served: Краматорськ and Слов'янськ are cities, so picking the "
+                        + "oblast leads somewhere. The occupied settlements inside it were never "
+                        + "imported (D3), so there is nothing for the oblast row to leak.")
+                .contains("Донецька");
+
+        assertThat(names)
+                .as("Луганська is seeded — V170 adds the row so V171 can resolve its 13 free "
+                        + "settlements' oblast_id — but NOT offered: all 13 are villages/селища, "
+                        + "so the CITY-bounded second tier returns [] and the user is stranded "
+                        + "one tap in with nothing explaining why. The full-settlement surface is "
+                        + "Phase 326's search endpoint, not this cascade.")
+                .doesNotContain("Луганська");
 
         List<String> sorted = new ArrayList<>(names);
         sorted.sort(String::compareTo);
@@ -111,6 +136,35 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
         assertThat(first.path("id").asText()).isNotBlank();
         assertThat(first.path("katotthCode").asText()).startsWith("UA");
         assertThat(first.path("nameEn").asText()).isNotBlank();
+    }
+
+    /**
+     * The positive control for the exclusion above: Луганська must be ABSENT FROM THE RESPONSE
+     * but PRESENT IN THE TABLE. Without this, deleting the oblast row outright — which would
+     * break V171's oblast_id resolution for its 13 free settlements and lose them from Phase
+     * 326's search — would also make the exclusion assertion pass.
+     */
+    @Test
+    @DisplayName("GET /oblasts — Луганська is seeded and holds settlements; it is filtered, not deleted")
+    void should_keepLuhanskSeeded_when_itIsWithheldFromThePicker() {
+        Integer oblastRows = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM oblasts WHERE name_uk = ?", Integer.class, "Луганська");
+        Integer settlements = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM cities c JOIN oblasts o ON o.id = c.oblast_id "
+                        + "WHERE o.name_uk = ?", Integer.class, "Луганська");
+        Integer cities = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM cities c JOIN oblasts o ON o.id = c.oblast_id "
+                        + "WHERE o.name_uk = ? AND c.settlement_type = 'CITY'",
+                Integer.class, "Луганська");
+
+        assertThat(oblastRows).as("V170 adds the row; V171 needs it to resolve oblast_id").isOne();
+        assertThat(settlements)
+                .as("its free settlements were imported and stay discoverable through Phase 326")
+                .isEqualTo(13);
+        assertThat(cities)
+                .as("and none of them is a CITY — which is precisely why the cascade withholds "
+                        + "the oblast")
+                .isZero();
     }
 
     // ── /oblasts/{id}/cities — hasDistricts flag against real seed ────────────
@@ -138,12 +192,39 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
                 .isTrue();
     }
 
+    @Test
+    @DisplayName("GET /oblasts/{id}/cities — returns CITY rows only, never the oblast's villages")
+    void should_returnOnlyCitySettlements_when_getCitiesForTheLargestOblast() throws Exception {
+        // The worst case on purpose: whichever oblast holds the most settlements after V170+V171.
+        UUID largestOblastId = jdbcTemplate.queryForObject(
+                "SELECT oblast_id FROM cities GROUP BY oblast_id ORDER BY COUNT(*) DESC LIMIT 1",
+                UUID.class);
+        Integer allSettlements = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM cities WHERE oblast_id = ?", Integer.class, largestOblastId);
+        Integer cityTypeOnly = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM cities WHERE oblast_id = ? AND settlement_type = 'CITY'",
+                Integer.class, largestOblastId);
+
+        JsonNode data = getData("/api/v1/locations/oblasts/" + largestOblastId + "/cities");
+
+        // Guard the guard: if the taxonomy ever shrinks back to V53's scale this assertion's
+        // premise is gone and the test below would pass vacuously.
+        assertThat(allSettlements)
+                .as("premise — Phase 325 put four figures' worth of settlements in this oblast")
+                .isGreaterThan(1_000);
+        assertThat(data.size())
+                .as("the cascading picker's second tier is bounded to settlement_type = 'CITY'; "
+                        + "unfiltered it would ship all %d settlements of this oblast", allSettlements)
+                .isEqualTo(cityTypeOnly)
+                .isLessThan(100);
+    }
+
     // ── /cities/{id}/districts — documented per-city counts ───────────────────
 
     @Test
     @DisplayName("GET /cities/{id}/districts — Kyiv returns 10 districts, name_uk-ordered")
     void should_returnTenDistrictsOrdered_when_cityIsKyiv() throws Exception {
-        UUID kyivCityId = cityIdByNameUk("Київ");
+        UUID kyivCityId = cityIdByKatotthCode(KYIV_CITY_CODE);
         log.debug("Act: GET /cities/{}/districts — Kyiv must return 10 ordered districts", kyivCityId);
 
         JsonNode data = getData("/api/v1/locations/cities/" + kyivCityId + "/districts");
@@ -169,7 +250,7 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @Test
     @DisplayName("GET /cities/{id}/districts — Kharkiv returns 9 districts")
     void should_returnNineDistricts_when_cityIsKharkiv() throws Exception {
-        UUID kharkivCityId = cityIdByNameUk("Харків");
+        UUID kharkivCityId = cityIdByKatotthCode(KHARKIV_CITY_CODE);
         log.debug("Act: GET /cities/{}/districts — Kharkiv must return 9 districts", kharkivCityId);
 
         JsonNode data = getData("/api/v1/locations/cities/" + kharkivCityId + "/districts");
@@ -222,7 +303,7 @@ class LocationIntegrationTest extends AbstractIntegrationTest {
     @DisplayName("Security — all 3 locality GETs reachable unauthenticated; a protected endpoint still 401")
     void should_allowLocalityGetsUnauthenticated_andStillProtectOtherEndpoints() throws Exception {
         UUID kyivOblastId = oblastIdByNameUk("Київ");
-        UUID kyivCityId = cityIdByNameUk("Київ");
+        UUID kyivCityId = cityIdByKatotthCode(KYIV_CITY_CODE);
 
         log.debug("Act: hit all 3 locality GETs anonymously, then a protected endpoint anonymously");
         assertThat(restTemplate.exchange(OBLASTS_URL, HttpMethod.GET, anonymous(), String.class)

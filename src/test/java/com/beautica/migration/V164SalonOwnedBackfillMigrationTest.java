@@ -144,8 +144,18 @@ class V164SalonOwnedBackfillMigrationTest {
         return id;
     }
 
+    /**
+     * DELIBERATELY NOT {@code LocalityTestLookup.majorCityIdByName} — this class caps Flyway at
+     * {@code target(164)} (see {@code migrate()} above), and {@code cities.settlement_type} is not
+     * added until V170. The shared helper's {@code AND settlement_type = 'CITY'} predicate is a
+     * {@code BadSqlGrammarException} against a V164-era schema. At V164 the table still holds only
+     * V53's 356 category-M cities, so «Вінниця» is unambiguous here and {@code LIMIT 1} is safe by
+     * construction rather than by luck — a property that holds for this pinned-schema test and for
+     * no other fixture in the suite.
+     */
     private static UUID testCityId() {
-        return jdbc.queryForObject("SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        return jdbc.queryForObject(
+                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
     }
 
     private static UUID insertSalon(UUID ownerId) {

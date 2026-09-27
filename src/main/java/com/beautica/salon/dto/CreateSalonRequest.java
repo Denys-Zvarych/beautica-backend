@@ -1,6 +1,7 @@
 package com.beautica.salon.dto;
 
 import com.beautica.location.LocalityWriteInput;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
@@ -49,12 +50,25 @@ public record CreateSalonRequest(
         @Pattern(regexp = "^[^\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]*$",
                 message = "Description must not contain control characters other than line breaks and tabs")
         String description,
+        // Accepted for old clients, validated, then IGNORED: the persisted city is derived from
+        // cityId (SalonService#writeSettlementLabels). Kept so an old payload still parses.
+        @Deprecated
+        @Schema(deprecated = true, description = "Ignored — derived from cityId")
         @Size(max = 100, message = "City must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "City must not contain control characters")
         String city,
+        // Accepted for old clients, validated, then IGNORED: the persisted region is derived from
+        // cityId (SalonService#writeSettlementLabels). Kept so an old payload still parses.
+        @Deprecated
+        @Schema(deprecated = true, description = "Ignored — derived from cityId")
         @Size(max = 100, message = "Region must be at most 100 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Region must not contain control characters")
         String region,
+        // Accepted for old clients, validated, then IGNORED: free-text address is no longer
+        // persisted (it is served publicly and Update could never correct or remove it). The
+        // structured street/buildingNo/locationNote fields replace it. Existing rows are kept.
+        @Deprecated
+        @Schema(deprecated = true, description = "Ignored — use street/buildingNo/locationNote")
         @Size(max = 500, message = "Address must be at most 500 characters")
         @Pattern(regexp = "^[^\\p{Cntrl}]*$", message = "Address must not contain control characters")
         String address,

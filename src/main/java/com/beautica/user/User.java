@@ -2,6 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.Role;
 import com.beautica.common.AuditableEntity;
+import com.beautica.location.SettlementDisplayNames;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -526,6 +527,19 @@ public class User extends AuditableEntity {
 
     public void setRegion(String region) {
         this.region = region;
+    }
+
+    /**
+     * Denormalises a settlement's labels into the legacy {@code city}/{@code region} columns.
+     * Called on every {@code cityId} write (profile PATCH and the salon-create owner sync) so
+     * the text can never drift from the FK. {@code null} (the id did not resolve) CLEARS both
+     * — a stale label must never sit beside a new id; {@code Salon} applies the same rule.
+     *
+     * @param names the resolved labels, or {@code null} to clear
+     */
+    public void applySettlementDisplayNames(SettlementDisplayNames names) {
+        this.city = names == null ? null : names.city();
+        this.region = names == null ? null : names.region();
     }
 
     public UUID getCityId() {

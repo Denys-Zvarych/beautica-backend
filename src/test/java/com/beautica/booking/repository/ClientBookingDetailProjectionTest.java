@@ -157,8 +157,12 @@ class ClientBookingDetailProjectionTest extends AbstractDataJpaTest {
                 "INSERT INTO oblasts (id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?)")
                 .setParameter(1, oblastId).setParameter(2, randomKatotthCode())
                 .setParameter(3, "Oblast").setParameter(4, "Oblast").executeUpdate();
+        // settlement_type is NOT NULL with NO default as of V170 (it adds the column with a 'CITY'
+        // default to backfill V53's rows, then drops the default so every later insert states the
+        // type). A raw-SQL fixture must therefore name it explicitly.
         em.getEntityManager().createNativeQuery(
-                "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en) VALUES (?, ?, ?, ?, ?)")
+                "INSERT INTO cities (id, oblast_id, katotth_code, name_uk, name_en, settlement_type) "
+                        + "VALUES (?, ?, ?, ?, ?, 'CITY')")
                 .setParameter(1, cityId).setParameter(2, oblastId).setParameter(3, randomKatotthCode())
                 .setParameter(4, "City").setParameter(5, "City").executeUpdate();
         em.getEntityManager().createNativeQuery(

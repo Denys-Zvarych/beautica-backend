@@ -79,6 +79,11 @@ class SalonServicePrimaryTest {
     @Mock
     private CityRepository cityRepository;
 
+    // Shared city/region label lookup (salon + owner denorm). Declared so @InjectMocks does not
+    // pass null; the default Optional.empty() stub is a no-op resolution.
+    @Mock
+    private com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
+
     @Mock
     private com.beautica.location.service.LocationQueryService locationQueryService;
 

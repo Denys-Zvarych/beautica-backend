@@ -13,6 +13,25 @@ spring:
       maximum-pool-size: 10        # Neon free tier hard ceiling — do not raise without a plan upgrade
       connection-timeout: 20000    # Fail faster under pool saturation; 30s was masking exhaustion (was 30000)
       leak-detection-threshold: 10000  # Alert on connections held > 10 s — indicates a blocking or long-running query
+      # Server-side ceiling on EVERY application statement — the backstop this pool never had.
+      # statement_timeout previously appeared only inside individual migrations (SET LOCAL in
+      # V139/V159/V165 and friends), so no runtime query had any ceiling at all: a single
+      # pathological plan (the Phase 326 zero-trigram sequential scan was one, at 119 ms x 240
+      # requests/minute/IP) could hold all 10 connections until the client gave up, and
+      # connection-timeout above then queues logins and booking writes behind it. leak-detection
+      # only LOGS at 10 s; this one actually aborts, and it does so in the database, where a
+      # runaway statement keeps burning CPU long after the JVM has walked away.
+      #
+      # 5 s is ~40x the slowest legitimate statement measured on this schema (the salon-board
+      # partition reads, low tens of ms) and well inside connection-timeout, so an abort surfaces
+      # as one failed request instead of pool-wide starvation.
+      #
+      # Does NOT reach Flyway on prod/local: FlywayDataSourceConfig builds its own HikariConfig
+      # and never reads spring.datasource.hikari.*. It DOES reach Flyway under the `test` profile
+      # (that config is @Profile("!test"), so Flyway borrows the Testcontainers-backed main pool)
+      # — which is safe because migrations that need longer already SET LOCAL statement_timeout
+      # inside their own transaction, overriding this session default; V173 does the same.
+      connection-init-sql: SET statement_timeout = '5s'
 
   jpa:
     open-in-view: false

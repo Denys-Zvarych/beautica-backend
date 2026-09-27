@@ -1,5 +1,6 @@
 package com.beautica.user;
 
+import com.beautica.support.LocalityTestLookup;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
@@ -33,8 +34,7 @@ public class ClientSelfDeleteTestFixtures {
     }
 
     private UUID testCityId() {
-        return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+        return LocalityTestLookup.majorCityIdByName(jdbcTemplate, "Вінниця");
     }
 
     public UUID createUser(String email, String role, UUID salonId, String firstName, String lastName) {

@@ -123,6 +123,11 @@ class SalonServiceTest {
     @Mock
     private com.beautica.location.repository.CityRepository cityRepository;
 
+    // Shared city/region label lookup (salon + owner denorm). Declared so @InjectMocks does not
+    // pass null; the default Optional.empty() stub is a no-op resolution.
+    @Mock
+    private com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
+
     // Phase 240 perf MEDIUM fix: resolveOblastId now delegates to the shared cached resolver
     // (LocationQueryService#resolveCityOblastId) instead of calling CityRepository directly —
     // must be declared so @InjectMocks can satisfy the constructor parameter (mirrors
@@ -203,6 +208,7 @@ class SalonServiceTest {
         assertThat(response.ownerId()).isEqualTo(ownerId);
         verify(salonRepository).save(any(Salon.class));
         // cityId is null in the request above — the locality sync guard must not fire
+        assertThat(owner.getCityId()).isNull();
         verify(userRepository, never()).save(any(User.class));
         // second-salon path must NOT trigger master auto-creation
         verify(masterService, never()).createMasterForOwner(any(User.class), any(Salon.class));
@@ -227,7 +233,6 @@ class SalonServiceTest {
         when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
         when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
         when(salonRepository.save(any(Salon.class))).thenReturn(savedSalon);
-        when(userRepository.save(owner)).thenReturn(owner);
 
         // Act
         salonService.createSalon(ownerId, request);
@@ -238,8 +243,9 @@ class SalonServiceTest {
         assertThat(owner.getBuildingNo()).isEqualTo("5A");
         assertThat(owner.getLocationNote()).isEqualTo("2nd floor");
         assertThat(owner.getDistrictId()).isEqualTo(districtId);
-        // userRepository.save must be called exactly once (inside the cityId guard)
-        verify(userRepository).save(owner);
+        // No save(): `owner` is managed (loaded under the create lock in this transaction), so
+        // dirty-checking flushes the sync — an explicit save was a redundant write (INFO-3).
+        verify(userRepository, never()).save(any(User.class));
         // Locality validation must have been invoked
         verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
         // first-salon path (existsByOwnerId=false) must trigger master auto-creation
@@ -536,6 +542,195 @@ class SalonServiceTest {
         verify(localityWriteValidator).validateProviderLocality(request.toLocalityInput());
     }
 
+    // ── salons.city/region + owner denormalisation (Phase 346 blocker) ─────────────────
+    // SalonResponse.city/region read the salon columns verbatim and mobile seeds «Населений
+    // пункт» from city, so every cityId write must re-derive the labels from the taxonomy —
+    // never from the request's legacy free text. The owner row synced on create gets the same
+    // labels UserService writes on a profile cityId write (shared SettlementDisplayNameResolver).
+
+    @Test
+    @DisplayName("createSalon — persists settlement city + oblast region on the salon, ignoring the request's free text")
+    void should_setCityAndRegionFromSettlement_when_createSalonWithCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Geo Salon", null, "Stale city", "Stale region", null, null, null,
+                cityId, null, "Shevchenka St", "5A", null);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
+            Salon s = inv.getArgument(0);
+            ReflectionTestUtils.setField(s, "id", UUID.randomUUID());
+            ReflectionTestUtils.setField(s, "createdAt", Instant.now());
+            return s;
+        });
+        when(settlementDisplayNameResolver.resolve(cityId)).thenReturn(Optional.of(VINNYTSIA));
+        ArgumentCaptor<Salon> saved = ArgumentCaptor.forClass(Salon.class);
+
+        SalonResponse response = salonService.createSalon(ownerId, request);
+
+        verify(salonRepository).save(saved.capture());
+        assertThat(saved.getValue().getCity()).isEqualTo("Вінниця");
+        assertThat(saved.getValue().getRegion()).isEqualTo("Вінницька");
+        assertThat(response.city()).isEqualTo("Вінниця");
+        assertThat(response.region()).isEqualTo("Вінницька");
+    }
+
+    @Test
+    @DisplayName("createSalon — does NOT persist the deprecated free-text address (served publicly, uneditable)")
+    void should_notPersistFreeTextAddress_when_createSalonRequestCarriesOne() {
+        UUID ownerId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        var request = new CreateSalonRequest("Geo Salon", null, null, null, "вул. Домашня 1, кв. 5", null, null,
+                UUID.randomUUID(), null, "Shevchenka St", "5A", null);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class))).thenAnswer(inv -> {
+            Salon s = inv.getArgument(0);
+            ReflectionTestUtils.setField(s, "id", UUID.randomUUID());
+            ReflectionTestUtils.setField(s, "createdAt", Instant.now());
+            return s;
+        });
+        ArgumentCaptor<Salon> saved = ArgumentCaptor.forClass(Salon.class);
+
+        salonService.createSalon(ownerId, request);
+
+        verify(salonRepository).save(saved.capture());
+        assertThat(saved.getValue().getAddress()).isNull();
+        assertThat(saved.getValue().getStreet()).isEqualTo("Shevchenka St");
+    }
+
+    @Test
+    @DisplayName("createSalon — a NON-first salon never moves the owner's own locality onto itself")
+    void should_notSyncOwnerLocality_when_nonFirstSalonCreated() {
+        UUID ownerId = UUID.randomUUID();
+        UUID primaryCityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        // The owner's row mirrors the PRIMARY salon (created first).
+        owner.setCityId(primaryCityId);
+        owner.setCity("Київ");
+        owner.setRegion("Київ");
+        owner.setStreet("Primary St");
+        owner.setBuildingNo("1");
+        owner.setLocationNote("primary note");
+        var request = new CreateSalonRequest("Salon B", null, null, null, null, null, null,
+                UUID.randomUUID(), UUID.randomUUID(), "Second St", "2", "second note");
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(true);
+        when(salonRepository.save(any(Salon.class)))
+                .thenReturn(buildSalon(UUID.randomUUID(), owner, "Salon B"));
+
+        salonService.createSalon(ownerId, request);
+
+        assertThat(owner.getCityId()).isEqualTo(primaryCityId);
+        assertThat(owner.getDistrictId()).isNull();
+        assertThat(owner.getCity()).isEqualTo("Київ");
+        assertThat(owner.getRegion()).isEqualTo("Київ");
+        assertThat(owner.getStreet()).isEqualTo("Primary St");
+        assertThat(owner.getBuildingNo()).isEqualTo("1");
+        assertThat(owner.getLocationNote()).isEqualTo("primary note");
+    }
+
+    @Test
+    @DisplayName("createSalon — the owner sync writes the settlement city + region next to the owner's new cityId")
+    void should_syncSettlementLabelsToOwner_when_createSalonWithCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID cityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        owner.setCity("Kyiv");
+        owner.setRegion("Kyiv oblast");
+        var request = new CreateSalonRequest("Geo Salon", null, null, null, null, null, null,
+                cityId, null, "Shevchenka St", "5A", null);
+        when(userRepository.findByIdForUpdate(ownerId)).thenReturn(Optional.of(owner));
+        // FIRST salon: only the first (primary) salon syncs onto the owner row — a later salon
+        // must not move the owner's locality (see should_notSyncOwnerLocality_when_nonFirstSalonCreated).
+        when(salonRepository.existsByOwnerId(ownerId)).thenReturn(false);
+        when(salonRepository.save(any(Salon.class))).thenReturn(buildSalon(UUID.randomUUID(), owner, "Geo Salon"));
+        when(settlementDisplayNameResolver.resolve(cityId)).thenReturn(Optional.of(VINNYTSIA));
+
+        salonService.createSalon(ownerId, request);
+
+        assertThat(owner.getCityId()).isEqualTo(cityId);
+        assertThat(owner.getCity()).as("owner's previous 'Kyiv' must not survive").isEqualTo("Вінниця");
+        assertThat(owner.getRegion()).isEqualTo("Вінницька");
+        verify(settlementDisplayNameResolver).resolve(cityId);
+    }
+
+    @Test
+    @DisplayName("updateSalon — overwrites stale legacy city + region with the new settlement's labels when cityId changes")
+    void should_setCityAndRegionFromSettlement_when_updateSalonChangesCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        salon.setCity("Kyiv");
+        salon.setRegion("Kyiv oblast");
+        var request = new UpdateSalonRequest(null, null, "Lviv", "Lviv oblast", null,
+                newCityId, null, "Shevchenka St", "12", null, null, null);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(settlementDisplayNameResolver.resolve(newCityId)).thenReturn(Optional.of(VINNYTSIA));
+
+        SalonResponse response = salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getCity())
+                .as("neither the PREVIOUS free text ('Kyiv') nor the request's ('Lviv') may survive")
+                .isEqualTo("Вінниця");
+        assertThat(salon.getRegion()).isEqualTo("Вінницька");
+        assertThat(response.city()).isEqualTo("Вінниця");
+        assertThat(response.region()).isEqualTo("Вінницька");
+    }
+
+    @Test
+    @DisplayName("updateSalon — clears city + region rather than keep stale text when the settlement does not resolve")
+    void should_clearCityAndRegion_when_settlementDoesNotResolve() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        salon.setCity("Kyiv");
+        salon.setRegion("Kyiv oblast");
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                newCityId, null, "Shevchenka St", "12", null, null, null);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(settlementDisplayNameResolver.resolve(newCityId)).thenReturn(Optional.empty());
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getCity()).isNull();
+        assertThat(salon.getRegion()).isNull();
+    }
+
+    @Test
+    @DisplayName("updateSalon — leaves city + region untouched when cityId is omitted, even though the response resolves label parts")
+    void should_keepCityAndRegion_when_updateSalonOmitsCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        salon.setCity("Вінниця");
+        salon.setRegion("Вінницька");
+        var request = new UpdateSalonRequest("Renamed", null, "Lviv", "Lviv oblast", null,
+                null, null, "Shevchenka St", "12", null, null, null);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        // The response now resolves the settlement's label parts on every update. A DIFFERENT
+        // settlement is returned here, so a write path that wrongly re-applied the resolution
+        // would overwrite the labels below — strictly stronger than the old never()-resolve check.
+        when(settlementDisplayNameResolver.resolve(any())).thenReturn(Optional.of(
+                new com.beautica.location.SettlementDisplayNames("Львів", "Львівська",
+                        com.beautica.location.entity.SettlementType.CITY, null)));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(salon.getCity()).isEqualTo("Вінниця");
+        assertThat(salon.getRegion()).isEqualTo("Вінницька");
+    }
+
+    private static final com.beautica.location.SettlementDisplayNames VINNYTSIA =
+            new com.beautica.location.SettlementDisplayNames("Вінниця", "Вінницька",
+                    com.beautica.location.entity.SettlementType.CITY, null);
+
     @Test
     @DisplayName("updateSalon — applies patch when salon exists (authorization delegated to @PreAuthorize on controller)")
     void should_updateSalon_when_salonExists_regardlessOfOwner() {
@@ -555,6 +750,197 @@ class SalonServiceTest {
         SalonResponse response = salonService.updateSalon(actorId, salonId, request);
 
         assertThat(response.name()).isEqualTo("Updated Name");
+    }
+
+    // ── updateSalon — owner-row locality sync on a PRIMARY salon's cityId change ────────
+    // updateSalon never mirrored createSalon's owner sync (see that method's Phase 10.3
+    // comment), so /users/me kept the owner's PRE-move city/region/citySettlementType after a
+    // PATCH moved the primary salon to a new locality — see SalonLocalityChangeLabelPartsIT.
+
+    @Test
+    @DisplayName("updateSalon — moving the PRIMARY salon re-syncs the owner's users row (locality, labels, address) and evicts /users/me")
+    void should_syncOwnerLocality_when_primarySalonCityIdChanges() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        UUID newDistrictId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        ReflectionTestUtils.setField(salon, "isPrimary", true);
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                newCityId, newDistrictId, "Hrushevskoho St", "12", "2nd floor", null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(settlementDisplayNameResolver.resolve(newCityId)).thenReturn(Optional.of(VINNYTSIA));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(owner.getCityId()).isEqualTo(newCityId);
+        assertThat(owner.getDistrictId()).isEqualTo(newDistrictId);
+        assertThat(owner.getCity()).isEqualTo("Вінниця");
+        assertThat(owner.getRegion()).isEqualTo("Вінницька");
+        assertThat(owner.getStreet()).isEqualTo("Hrushevskoho St");
+        assertThat(owner.getBuildingNo()).isEqualTo("12");
+        assertThat(owner.getLocationNote()).isEqualTo("2nd floor");
+        // The users row stores no type/hromada — GET /users/me derives them per read from the
+        // owner's cityId through the same resolver (UserService#resolveSettlement). So what must
+        // hold is: the SYNCED cityId resolves to VINNYTSIA's parts on the owner's own response.
+        var ownerView = com.beautica.user.UserProfileResponse.from(owner, null, null, false,
+                settlementDisplayNameResolver.resolve(owner.getCityId()).orElse(null));
+        assertThat(ownerView.citySettlementType()).isEqualTo(VINNYTSIA.settlementType());
+        assertThat(ownerView.cityHromadaNameUk()).isEqualTo(VINNYTSIA.hromadaNameUk());
+        verify(userProfileCacheEvictor).evictAfterCommit(ownerId);
+    }
+
+    @Test
+    @DisplayName("updateSalon — moving a NON-primary salon leaves the owner's users row and /users/me cache alone")
+    void should_leaveOwnerRowUntouched_when_nonPrimarySalonCityIdChanges() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        // buildSalon defaults isPrimary to false (Lombok @Builder default) — a second/third
+        // salon, never the one the owner's users row mirrors.
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                newCityId, null, "Hrushevskoho St", "12", null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(settlementDisplayNameResolver.resolve(newCityId)).thenReturn(Optional.of(VINNYTSIA));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(owner.getCityId()).isNull();
+        assertThat(owner.getStreet()).isNull();
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — a street-only change on the PRIMARY salon (same city/district) syncs the owner's address and evicts /users/me")
+    void should_syncOwnerAddress_when_primarySalonStreetChangesSameCity() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        owner.setCityId(TestConstants.DEFAULT_TEST_CITY_ID);
+        owner.setStreet("Old St");
+        owner.setBuildingNo("1");
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        ReflectionTestUtils.setField(salon, "isPrimary", true);
+        salon.setStreet("Old St");
+        salon.setBuildingNo("1");
+        // Same cityId (buildSalon → DEFAULT_TEST_CITY_ID) and same (absent) district — only the
+        // street and building move. localityChanged is false; the owner's address still changed.
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                TestConstants.DEFAULT_TEST_CITY_ID, null, "Hrushevskoho St", "12", null, null, null);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(owner.getStreet()).isEqualTo("Hrushevskoho St");
+        assertThat(owner.getBuildingNo()).isEqualTo("12");
+        assertThat(owner.getCityId()).isEqualTo(TestConstants.DEFAULT_TEST_CITY_ID);
+        verify(userProfileCacheEvictor).evictAfterCommit(ownerId);
+        // The owner-master key eviction (and search caches staying intact) is observed against a
+        // real cache + transaction in SalonServiceCacheTest — a unit test has no synchronization.
+    }
+
+    @Test
+    @DisplayName("updateSalon — resending the primary salon's SAME city, district, street and building does not re-sync the owner row")
+    void should_leaveOwnerRowUntouched_when_primarySalonAddressResentUnchanged() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        ReflectionTestUtils.setField(salon, "isPrimary", true);
+        salon.setStreet("Hrushevskoho St");
+        salon.setBuildingNo("12");
+        salon.setLocationNote("2nd floor");
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                TestConstants.DEFAULT_TEST_CITY_ID, null, "Hrushevskoho St", "12", "2nd floor",
+                null, null);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(owner.getCityId()).isNull();
+        assertThat(owner.getStreet()).isNull();
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — moving the PRIMARY salon with locationNote omitted keeps the owner's existing note")
+    void should_keepOwnerLocationNote_when_primaryMovePatchOmitsNote() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        owner.setLocationNote("Owner's own landmark");
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        ReflectionTestUtils.setField(salon, "isPrimary", true);
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                newCityId, null, "Hrushevskoho St", "12", null, null, null);
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(settlementDisplayNameResolver.resolve(newCityId)).thenReturn(Optional.of(VINNYTSIA));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(owner.getCityId()).as("the move itself is synced").isEqualTo(newCityId);
+        assertThat(owner.getLocationNote())
+                .as("an omitted locationNote is 'not in this update', never 'clear it'")
+                .isEqualTo("Owner's own landmark");
+    }
+
+    @Test
+    @DisplayName("updateSalon — a rename-only PATCH (cityId omitted) on the primary salon does not touch the owner row")
+    void should_leaveOwnerRowUntouched_when_primarySalonPatchOmitsCityId() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        ReflectionTestUtils.setField(salon, "isPrimary", true);
+        // A rename-only PATCH: cityId omitted means "locality not in this update" (PATCH
+        // semantics pinned above at should_notValidateOrTouchLocality_when_updateSalonOmitsCityId).
+        // street/buildingNo are @NotBlank so the client always resends them — here UNCHANGED,
+        // which is what makes this a rename-only PATCH rather than an address edit.
+        salon.setStreet("Hrushevskoho St");
+        salon.setBuildingNo("12");
+        var request = new UpdateSalonRequest("Renamed", null, null, null, null,
+                null, null, "Hrushevskoho St", "12", null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+
+        salonService.updateSalon(ownerId, salonId, request);
+
+        assertThat(owner.getCityId()).isNull();
+        assertThat(owner.getStreet()).isNull();
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(any());
+    }
+
+    @Test
+    @DisplayName("updateSalon — a SALON_ADMIN moving the primary salon syncs the OWNER's row, never the acting admin's")
+    void should_syncTheOwnersRowNotTheActors_when_salonAdminPatchesPrimarySalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID adminActorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID newCityId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Salon");
+        ReflectionTestUtils.setField(salon, "isPrimary", true);
+        // @PreAuthorize("... @authz.canManageSalon(...)") also admits the salon's assigned
+        // SALON_ADMIN — actorId here is that admin, deliberately distinct from salon.getOwner().
+        var request = new UpdateSalonRequest(null, null, null, null, null,
+                newCityId, null, "Hrushevskoho St", "12", null, null, null);
+
+        when(salonRepository.findById(salonId)).thenReturn(Optional.of(salon));
+        when(settlementDisplayNameResolver.resolve(newCityId)).thenReturn(Optional.of(VINNYTSIA));
+
+        salonService.updateSalon(adminActorId, salonId, request);
+
+        assertThat(owner.getCityId())
+                .as("the OWNER's row (salon.getOwner()), never the acting admin's")
+                .isEqualTo(newCityId);
+        verify(userProfileCacheEvictor).evictAfterCommit(ownerId);
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(adminActorId);
     }
 
     // ── updateSalon — Phase 20.x instagram widened validation + normalisation ──

@@ -19,6 +19,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -73,6 +74,10 @@ class SalonServiceSiblingSalonsTest {
      */
     @Mock
     private CityRepository cityRepository;
+
+    // The batch settlement/oblast resolver GET /salons/mine uses — the picker must never reach it.
+    @Mock
+    private com.beautica.location.SettlementDisplayNameResolver settlementDisplayNameResolver;
 
     // Audit-fix cycle 2: SalonService evicts the affected user's cached profile after commit
     // (createSalon, removeAdmin, rotateAdmin all mutate a `users` row). @InjectMocks passes null
@@ -165,7 +170,8 @@ class SalonServiceSiblingSalonsTest {
 
         // Assert
         assertThat(result).hasSize(2);
-        verify(cityRepository, never()).findOblastIdsByIdIn(anyCollection());
+        verify(settlementDisplayNameResolver, never()).resolveAll(anyCollection());
+        verifyNoInteractions(cityRepository);
     }
 
     @Test

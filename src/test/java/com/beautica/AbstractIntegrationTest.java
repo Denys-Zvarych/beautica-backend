@@ -3,6 +3,7 @@ package com.beautica;
 import com.beautica.config.TestAsyncConfig;
 import com.beautica.notification.EmailService;
 import com.beautica.notification.service.EmailNotificationService;
+import com.beautica.support.LocalityTestLookup;
 import com.beautica.support.SlowTestExtension;
 import com.beautica.support.TestHttpClients;
 import org.junit.jupiter.api.AfterEach;
@@ -168,8 +169,40 @@ public abstract class AbstractIntegrationTest {
      * test; call this instead.
      */
     protected UUID testCityId() {
+        // Keyed on the KATOTTH code, not on name_uk. Phase 325 widened `cities` from 356 rows to
+        // 25 698, and 2 990 distinct names are now shared by 12 833 rows — «Київ» is both the
+        // capital and a village in Миколаївська oblast. «Вінниця» happens to still be unique, so
+        // this resolves the same row it always did, but a `WHERE name_uk = ? LIMIT 1` fixture is
+        // one classifier update away from silently pointing ~50 salon fixtures at a village.
         return jdbcTemplate.queryForObject(
-                "SELECT id FROM cities WHERE name_uk = 'Вінниця' LIMIT 1", UUID.class);
+                "SELECT id FROM cities WHERE katotth_code = 'UA05020030010063857'", UUID.class);
+    }
+
+    /**
+     * Resolves the {@code cities.id} of a well-known CITY by its Ukrainian name.
+     *
+     * <p>The single shared replacement for the four hand-copied
+     * {@code cityIdByName(name) -> "... WHERE name_uk = ? ORDER BY katotth_code LIMIT 1"} helpers
+     * the search suites carried. Phase 325 widened {@code cities} from 356 category-M rows to
+     * 25 698 settlements, and 2 990 names are now shared by 12 833 rows — «Київ» is also a village
+     * in Миколаївська oblast and «Львів» is also villages in Дніпропетровська and Миколаївська.
+     * Both of those villages sort BEFORE the real city by {@code katotth_code}, so the old helper
+     * silently resolved onto a village with no districts and no salons.
+     *
+     * <p>Two deliberate choices make this hard to defang again: the {@code settlement_type = 'CITY'}
+     * predicate drops the namesake villages, and there is NO {@code LIMIT} — a name that is still
+     * ambiguous among cities raises {@code IncorrectResultSizeDataAccessException} instead of
+     * quietly picking one.
+     *
+     * <p>The query itself lives in {@link LocalityTestLookup} so the fixture classes that do not
+     * extend this base (they run their own containers, or are plain collaborator objects) share the
+     * one definition instead of re-copying the SQL.
+     *
+     * @param nameUk canonical Ukrainian city name, e.g. {@code "Київ"}
+     * @return the id of the one CITY with that name
+     */
+    protected UUID majorCityIdByName(String nameUk) {
+        return LocalityTestLookup.majorCityIdByName(jdbcTemplate, nameUk);
     }
 
     protected UUID resolveUnusedServiceTypeId(String ownerType, UUID ownerId) {

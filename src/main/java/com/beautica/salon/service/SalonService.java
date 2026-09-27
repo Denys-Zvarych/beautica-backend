@@ -16,12 +16,15 @@ import com.beautica.common.security.AuthorizationService;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.repository.FavoriteRepository;
 import com.beautica.location.LocalityWriteValidator;
-import com.beautica.location.repository.CityRepository;
+import com.beautica.location.KeyedSettlementDisplayNames;
+import com.beautica.location.SettlementDisplayNameResolver;
+import com.beautica.location.SettlementDisplayNames;
 import com.beautica.location.service.LocationQueryService;
 import com.beautica.master.dto.EffectiveDayResponse;
 import com.beautica.master.dto.MasterSummaryResponse;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
+import com.beautica.master.repository.MasterCacheKeys;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
@@ -76,7 +79,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -103,7 +105,7 @@ public class SalonService {
     // home for the range guards (Kyiv civil dates, past floor, future cap, span ceiling).
     private final MasterScheduleService masterScheduleService;
     private final ScheduleDateMath scheduleDateMath;
-    private final CityRepository cityRepository;
+    private final SettlementDisplayNameResolver settlementDisplayNameResolver;
     private final LocationQueryService locationQueryService;
     private final CacheManager cacheManager;
     private final AuthorizationService authorizationService;
@@ -255,6 +257,14 @@ public class SalonService {
      */
     public static final int MAX_ACTIVE_SALONS_PER_OWNER = 50;
 
+    private static final String MASTER_DETAIL_CACHE = "master-detail";
+
+    /** Discovery caches a salon's locality change invalidates: its own and its masters'. */
+    private static final List<String> SEARCH_CACHES_ON_LOCALITY_CHANGE = java.util.stream.Stream
+            .concat(SearchCacheNames.SALONS_ALL.stream(), SearchCacheNames.MASTERS_ALL.stream())
+            .toList();
+    private static final String MASTER_DETAIL_BY_USER_CACHE = "master-detail-by-user";
+
     @Transactional
     public SalonResponse createSalon(UUID ownerId, CreateSalonRequest request) {
         // PESSIMISTIC_WRITE, not a plain findById (Perf LOW-A). The portfolio cap below is a
@@ -292,14 +302,14 @@ public class SalonService {
         // at creation only to be blocked later at update. Runs before save() so nothing is
         // persisted on rejection.
         localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+        // Resolved once, written to BOTH the salon row and the owner sync below.
+        SettlementDisplayNames settlementNames =
+                settlementDisplayNameResolver.resolve(request.cityId()).orElse(null);
 
         var salon = Salon.builder()
                 .owner(owner)
                 .name(request.name())
                 .description(request.description())
-                .city(request.city())
-                .region(request.region())
-                .address(request.address())
                 .cityId(request.cityId())
                 .districtId(request.districtId())
                 .street(request.street())
@@ -310,21 +320,31 @@ public class SalonService {
                 .isActive(true)
                 .isPrimary(isFirstSalon)
                 .build();
+        salon.applySettlementDisplayNames(settlementNames);
 
         Salon savedSalon = salonRepository.save(salon);
 
         // Phase 10.3: sync location to owner's User row so /users/me reflects the salon
         // address. Locality validation already ran unconditionally above (Phase 12.1) —
-        // this guard now only governs the User-row sync. userRepository.save is intentionally
-        // scoped inside the guard: when no structured location is provided there is nothing to
-        // sync, and the multi-salon test asserts that save(owner) is never called unconditionally.
-        if (request.cityId() != null) {
+        // this guard now only governs the User-row sync. No userRepository.save: `owner` was
+        // loaded by lockOwnerForCreate (findByIdForUpdate) inside THIS transaction, so it is a
+        // managed entity and dirty-checking flushes these setters on commit.
+        //
+        // FIRST salon only: that salon is the PRIMARY one (isPrimary = isFirstSalon above, and it
+        // is never reassigned), and /users/me mirrors the primary salon's address — updateSalon's
+        // syncOwnerAddressFromPrimarySalon keeps it in step afterwards. A second salon must not
+        // move the owner's own locality onto itself. No master-detail eviction is needed: a first
+        // salon has no owner-master row yet (createMasterForOwner below creates it and evicts its
+        // own keys).
+        if (isFirstSalon && request.cityId() != null) {
             owner.setCityId(request.cityId());
             owner.setDistrictId(request.districtId());
+            // Same denorm UserService applies on a profile cityId write — without it the owner's
+            // /users/me kept its previous city/region text next to the salon's new cityId.
+            owner.applySettlementDisplayNames(settlementNames);
             owner.setStreet(request.street());
             owner.setBuildingNo(request.buildingNo());
             owner.setLocationNote(request.locationNote());
-            userRepository.save(owner);
         }
 
         // Evict ownerSalons cache after commit so a concurrent reader cannot repopulate
@@ -357,19 +377,144 @@ public class SalonService {
         // idempotent per-key evicts.)
         userProfileCacheEvictor.evictAfterCommit(ownerIdOf(savedSalon));
 
-        return SalonResponse.from(savedSalon, resolveOblastId(savedSalon.getCityId()));
+        // settlementNames was resolved above for this very cityId — reused, not re-looked-up.
+        return SalonResponse.from(
+                savedSalon, resolveOblastId(savedSalon.getCityId()), settlementNames);
+    }
+
+    /**
+     * Re-derives the legacy {@code salons.city}/{@code salons.region} labels from the settlement
+     * taxonomy whenever {@code cityId} is written, via the shared
+     * {@link SettlementDisplayNameResolver} ({@code UserService} uses the same one for users).
+     *
+     * <p>{@code SalonResponse}/{@code PublicSalonResponse} read both columns verbatim and the
+     * mobile address screen seeds «Населений пункт» from {@code city}. Writing only
+     * {@code cityId} left a post-Phase-10.6 salon with {@code null} labels and an older salon
+     * showing its PREVIOUS free text next to the new id. V177/V178 backfill existing rows.
+     * An unresolvable id clears both labels (same rule as users) — unreachable in practice,
+     * since {@code validateProviderLocality} rejects an unknown city before this runs.
+     */
+    private SettlementDisplayNames writeSettlementLabels(Salon salon, UUID cityId) {
+        SettlementDisplayNames names = settlementDisplayNameResolver.resolve(cityId).orElse(null);
+        salon.applySettlementDisplayNames(names);
+        return names;
+    }
+
+    /**
+     * Whether an {@code updateSalon} PATCH actually changes any part of the salon's ADDRESS — the
+     * fields every affiliated master's cached detail embeds (the {@code PublicSalonResponse}
+     * block) and that the owner's {@code users} row mirrors for the PRIMARY salon. Per-field PATCH
+     * omit semantics, identical to the salon's own writes:
+     * <ul>
+     *   <li>{@code cityId}/{@code districtId} — a PAIR, considered only when {@code cityId} is
+     *       present (a null {@code cityId} means "locality not in this update"; a lone
+     *       {@code districtId} is rejected before this runs); with {@code cityId} present a null
+     *       {@code districtId} clears it, so it is compared verbatim;</li>
+     *   <li>{@code street}/{@code buildingNo}/{@code locationNote} — {@code null} means omitted and
+     *       never counts as a change.</li>
+     * </ul>
+     * Must be called BEFORE the setters run.
+     */
+    private static boolean addressChanges(Salon salon, UpdateSalonRequest request) {
+        boolean locality = request.cityId() != null
+                && (!Objects.equals(request.cityId(), salon.getCityId())
+                        || !Objects.equals(request.districtId(), salon.getDistrictId()));
+        return locality
+                || changes(request.street(), salon.getStreet())
+                || changes(request.buildingNo(), salon.getBuildingNo())
+                || changes(request.locationNote(), salon.getLocationNote());
+    }
+
+    private static boolean changes(String requested, String current) {
+        return requested != null && !requested.equals(current);
+    }
+
+    /**
+     * Mirrors the PRIMARY salon's address onto its owner's {@code users} row, so
+     * {@code GET /users/me} (and the owner-master's own locality) follow a salon address edit —
+     * {@code createSalon} performs the same sync for the first salon. Writes only the fields the
+     * PATCH carries (same omit semantics as {@link #addressChanges}), so an omitted
+     * {@code locationNote} keeps the owner's existing note.
+     *
+     * <p>The target is {@code salon.getOwner()}, never the actor: {@code @authz.canManageSalon}
+     * also admits the salon's SALON_ADMIN, whose own row must never be rewritten.
+     *
+     * <p>Evicts {@code user-profile} after commit. The owner-master's
+     * {@code master-detail}/{@code master-detail-by-user} keys need nothing extra here: every
+     * address change already runs {@link #evictAffiliatedMasterDetailCachesAfterCommit}, and the
+     * owner-master's {@code salon_id} is this primary salon (both are fixed at first-salon
+     * creation and never reassigned).
+     */
+    private void syncOwnerAddressFromPrimarySalon(Salon salon, UpdateSalonRequest request,
+            SettlementDisplayNames writtenSettlement) {
+        User owner = salon.getOwner();
+        if (request.cityId() != null) {
+            owner.setCityId(request.cityId());
+            owner.setDistrictId(request.districtId());
+            owner.applySettlementDisplayNames(writtenSettlement);
+        }
+        if (request.street() != null) {
+            owner.setStreet(request.street());
+        }
+        if (request.buildingNo() != null) {
+            owner.setBuildingNo(request.buildingNo());
+        }
+        if (request.locationNote() != null) {
+            owner.setLocationNote(request.locationNote());
+        }
+        userProfileCacheEvictor.evictAfterCommit(ownerIdOf(salon));
+    }
+
+    /**
+     * After commit, evicts the {@code master-detail} (by masterId) and
+     * {@code master-detail-by-user} (by userId) entries of every master affiliated with
+     * {@code salonId}. Their DTO embeds a {@code PublicSalonResponse} carrying the salon's whole
+     * address — locality ({@code cityId}/{@code districtId}, city, region,
+     * {@code citySettlementType}, {@code cityHromadaNameUk}) and {@code street}/{@code buildingNo}/
+     * {@code locationNote}; without this they served the old salon address for the full TTL.
+     *
+     * <p>Keys come from an id-only projection loaded INSIDE the transaction (no entities); the
+     * sweep is per-key, never {@code cache.clear()} (§F-6), and bounded by the salon's roster.
+     * Same register-after-commit shape as {@link #evictSalonDetailCacheAfterCommit}. Triggered by
+     * ANY address change ({@link #addressChanges}) — street, building and note included, not only
+     * the locality — on any salon, primary or not; it also covers the owner-master.
+     */
+    private void evictAffiliatedMasterDetailCachesAfterCommit(UUID salonId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        List<MasterCacheKeys> keys = masterRepository.findCacheKeysBySalonId(salonId);
+        if (keys.isEmpty()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                Cache detail = cacheManager.getCache(MASTER_DETAIL_CACHE);
+                Cache detailByUser = cacheManager.getCache(MASTER_DETAIL_BY_USER_CACHE);
+                for (MasterCacheKeys key : keys) {
+                    if (detail != null) {
+                        detail.evict(key.masterId());
+                    }
+                    if (detailByUser != null && key.userId() != null) {
+                        detailByUser.evict(key.userId());
+                    }
+                }
+            }
+        });
     }
 
     /**
      * Resolves the parent oblast id of a single city by its id, for the {@code oblastId}
      * surfaced on {@link SalonResponse}. Delegates to the SHARED cached resolver
      * {@link LocationQueryService#resolveCityOblastId(UUID)} (Phase 240 perf MEDIUM finding)
-     * rather than querying {@link CityRepository} directly — that method mirrors
+     * rather than querying {@code CityRepository} directly — that method mirrors
      * {@code MasterService#resolveOblastId(UUID)}, which delegates to the exact same shared
      * resolver (REUSE-FIRST: one cached implementation, not two private per-service copies).
      * Single-row by PK — the create/update paths touch exactly one salon, so this is not the §E
      * "per-row in a collection" concern; {@link #getOwnerSalons} uses the batch
-     * {@link CityRepository#findOblastIdsByIdIn(java.util.Collection)} instead.
+     * {@link SettlementDisplayNameResolver#resolveAll(java.util.Collection)} instead, whose one
+     * join also carries each city's {@code oblastId}.
      *
      * <p>The {@code cityId == null} guard MUST stay here, in front of the call: the shared
      * resolver's {@code @Cacheable} proxy cannot accept a {@code null} Caffeine key.
@@ -383,6 +528,18 @@ public class SalonService {
             return null;
         }
         return locationQueryService.resolveCityOblastId(cityId);
+    }
+
+    /**
+     * The settlement label parts ({@code citySettlementType}, ambiguous-only hromada) for a
+     * single-salon response, through the shared cached {@link SettlementDisplayNameResolver} —
+     * the same lookup {@link #writeSettlementLabels} denormalises from. List paths use the batch
+     * {@code resolveAll} instead (see {@link #toSalonResponses}).
+     *
+     * @return the parts, or {@code null} when {@code cityId} is {@code null} or unknown
+     */
+    private SettlementDisplayNames resolveSettlement(UUID cityId) {
+        return settlementDisplayNameResolver.resolve(cityId).orElse(null);
     }
 
     // Eviction helpers are registered as post-commit callbacks rather than via @CacheEvict.
@@ -516,14 +673,21 @@ public class SalonService {
         });
     }
 
-    private void evictSearchSalonsCacheAfterCommit() {
+    /**
+     * After commit, clears the given discovery caches ({@link SearchCacheNames#SALONS_ALL} and/or
+     * {@link SearchCacheNames#MASTERS_ALL} — the same partition lists {@code UserService} iterates
+     * for {@code search:masters}). A blanket {@code clear()} is the only option here: discovery
+     * keys are filter tuples, not salon ids, so the entries a salon appears in cannot be addressed
+     * per key. Callers register it LAST among their cache evictions.
+     */
+    private void evictSearchCachesAfterCommit(List<String> cacheNames) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                for (String cacheName : SearchCacheNames.SALONS_ALL) {
+                for (String cacheName : cacheNames) {
                     Cache cache = cacheManager.getCache(cacheName);
                     if (cache != null) {
                         cache.clear();
@@ -544,8 +708,10 @@ public class SalonService {
         // Phase 10.6: a salon is a discoverable provider — its persisted
         // locality must satisfy the most-specific-node rule (city mandatory;
         // district mandatory iff the city has urban districts; district a child
-        // of the city). The legacy free-text city/region/address are NO LONGER
-        // written (kept nullable per Phase 10.3, no longer the source of truth).
+        // of the city). The legacy free-text address is NO LONGER written (kept
+        // nullable per Phase 10.3, no longer the source of truth). `city`/`region` are
+        // re-derived from the taxonomy (never from the request's free text) whenever
+        // cityId is written — see writeSettlementLabels.
         //
         // PATCH semantics: a null cityId means "locality not included in this update", NOT
         // "clear my city". Validating/writing the FK pair unconditionally against the raw
@@ -566,10 +732,34 @@ public class SalonService {
             throw new BusinessException(
                     "Changing districtId requires supplying cityId in the same request");
         }
+        // Resolved once on a cityId write and reused for the response below (as createSalon does),
+        // instead of a second resolve of the same id.
+        SettlementDisplayNames writtenSettlement = null;
+        boolean settlementResolved = false;
+        // The locality is a (cityId, districtId) PAIR: both halves feed the discovery filter
+        // buckets / labels (search caches below; street/building/note never reach search). Computed
+        // BEFORE the setters, and only inside the cityId != null branch — an omitted cityId means
+        // "locality not in this update" (and a lone districtId was rejected above), so an omitted
+        // field can never fire it. With cityId present, districtId is written verbatim (null
+        // clears it), so a null-vs-set district difference IS a real change and must count.
+        boolean localityChanged = false;
+        // Address-change gate: computed here, BEFORE any setter, from the same per-field PATCH
+        // semantics the salon's own writes use (see addressChanges). It drives the affiliated
+        // masters' detail sweep (their DTO embeds street/buildingNo/locationNote as well as the
+        // locality) for ANY salon, and — for the primary salon only — the owner-row sync.
+        boolean addressChanged = addressChanges(salon, request);
+        boolean ownerAddressChanged = salon.isPrimary() && addressChanged;
         if (request.cityId() != null) {
             localityWriteValidator.validateProviderLocality(request.toLocalityInput());
+            localityChanged = !Objects.equals(request.cityId(), salon.getCityId())
+                    || !Objects.equals(request.districtId(), salon.getDistrictId());
             salon.setCityId(request.cityId());
             salon.setDistrictId(request.districtId());
+            writtenSettlement = writeSettlementLabels(salon, request.cityId());
+            settlementResolved = true;
+        }
+        if (addressChanged) {
+            evictAffiliatedMasterDetailCachesAfterCommit(salonId);
         }
 
         if (request.name() != null) {
@@ -591,6 +781,9 @@ public class SalonService {
         if (request.locationNote() != null) {
             salon.setLocationNote(request.locationNote());
         }
+        if (ownerAddressChanged) {
+            syncOwnerAddressFromPrimarySalon(salon, request, writtenSettlement);
+        }
         if (request.phone() != null) {
             salon.setPhone(request.phone());
         }
@@ -602,7 +795,11 @@ public class SalonService {
         // Hibernate dirty-checking flushes the setter mutations on commit. The explicit save()
         // was a redundant no-op write (PERF-LOW); save() returned the same managed instance, so
         // mapping the in-memory `salon` is equivalent. The findById load is retained (existence).
-        SalonResponse result = SalonResponse.from(salon, resolveOblastId(salon.getCityId()));
+        SalonResponse result = SalonResponse.from(
+                salon, resolveOblastId(salon.getCityId()),
+                // A flag, not a null check: an unresolvable id legitimately yields null and must
+                // not trigger a second lookup of the same id.
+                settlementResolved ? writtenSettlement : resolveSettlement(salon.getCityId()));
 
         // Evict after commit so a concurrent reader cannot repopulate stale data within the
         // commit window. Replaces the @CacheEvict annotations that fired pre-commit (PERF-MEDIUM-2).
@@ -612,6 +809,14 @@ public class SalonService {
         // `actorId` was the wrong cache key on every admin PATCH (Phase 283).
         evictOwnerSalonsCacheAfterCommit(ownerIdOf(salon));
         evictSalonDetailCacheAfterCommit(salonId);
+        // A city OR district change moves the salon between discovery filter buckets and changes
+        // its cityLabel/districtLabel — and every salon master's too, since master discovery
+        // locates a salon master by the salon's locality (SearchService.DISCOVERY_CITY_EXPR / DISCOVERY_DISTRICT_EXPR).
+        // Registered LAST, after the per-key evictions. An unchanged or omitted locality touches no
+        // discovery cache.
+        if (localityChanged) {
+            evictSearchCachesAfterCommit(SEARCH_CACHES_ON_LOCALITY_CHANGE);
+        }
 
         return result;
     }
@@ -659,7 +864,7 @@ public class SalonService {
      * {@link #createSalon}/{@link #updateSalon}, which likewise resolve {@code oblastId} before
      * handing back the response. Single-row: this endpoint returns exactly one salon, so the
      * per-row {@link #resolveOblastId(UUID)} is correct here — {@link #getOwnerSalons} is the
-     * only caller that needs the batch {@link #resolveOblastIdsByCityIds(Set)} sibling.
+     * only caller that needs the batch {@link SettlementDisplayNameResolver#resolveAll} sibling.
      *
      * <p>{@code @Cacheable} lives HERE, not on {@link #getSalonEntity(UUID)} (Phase 240 CRITICAL
      * fix — see that method's Javadoc for the self-invocation bug this replaces). This is the
@@ -675,7 +880,8 @@ public class SalonService {
     @Cacheable(value = "salon-detail", key = "#salonId", sync = true)
     public PublicSalonResponse getPublicSalon(UUID salonId) {
         Salon salon = getSalonEntity(salonId);
-        return PublicSalonResponse.from(salon, resolveOblastId(salon.getCityId()));
+        return PublicSalonResponse.from(
+                salon, resolveOblastId(salon.getCityId()), resolveSettlement(salon.getCityId()));
     }
 
     @Transactional
@@ -996,8 +1202,10 @@ public class SalonService {
     /**
      * {@code Salon -> SalonResponse} mapping for {@link #getOwnerSalons} ({@code GET /salons/mine}).
      *
-     * <p>Batch-resolves {@code oblastId} for the whole list in ONE query rather than one
-     * {@code findByIdWithOblast} per salon (§E — never a per-element repository call in a loop).
+     * <p>Batch-resolves {@code oblastId} AND the settlement label parts for the whole list in ONE
+     * query ({@link SettlementDisplayNameResolver#resolveAll}) rather than one lookup per salon
+     * (§E — never a per-element repository call in a loop), and rather than two batches (an
+     * oblast-only one and a label one) joining the same ids twice.
      *
      * <p>Kept as a named method rather than inlined back into its single caller: it also documents
      * the batch-vs-per-row contract in one place. {@link #getSiblingSalons} no longer routes
@@ -1010,35 +1218,19 @@ public class SalonService {
                 .map(Salon::getCityId)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
-        Map<UUID, UUID> oblastIdByCityId = resolveOblastIdsByCityIds(cityIds);
+        // ONE join resolves both the oblastId and the settlement label parts for every distinct
+        // city — never a per-salon resolve() (§E), and no second oblast-only batch over the same ids.
+        Map<UUID, KeyedSettlementDisplayNames> settlementByCityId =
+                settlementDisplayNameResolver.resolveAll(cityIds);
 
         return salons.stream()
-                .map(salon -> SalonResponse.from(salon, oblastIdByCityId.get(salon.getCityId())))
+                .map(salon -> {
+                    KeyedSettlementDisplayNames row = settlementByCityId.get(salon.getCityId());
+                    return row == null
+                            ? SalonResponse.from(salon, null, null)
+                            : SalonResponse.from(salon, row.oblastId(), row.names());
+                })
                 .toList();
-    }
-
-    /**
-     * Batch sibling of {@link #resolveOblastId(UUID)} — resolves every distinct city id in
-     * one {@code IN (...)} query via {@link CityRepository#findOblastIdsByIdIn(java.util.Collection)}
-     * instead of one {@code findByIdWithOblast} per salon, so {@link #getOwnerSalons} issues
-     * exactly one oblast-resolution query regardless of how many salons the owner has.
-     *
-     * @param cityIds distinct, non-null city ids appearing across the owner's salons
-     * @return a {@code cityId -> oblastId} map; empty when {@code cityIds} is empty
-     */
-    private Map<UUID, UUID> resolveOblastIdsByCityIds(Set<UUID> cityIds) {
-        // A plain HashMap throughout — including the empty-input short-circuit — is deliberate:
-        // Map.of() rejects a null get() key with an NPE (Objects.requireNonNull on lookup), and
-        // salon.getCityId() is null for any salon with no locality set, so the caller's
-        // oblastIdByCityId.get(salon.getCityId()) must tolerate a null key.
-        Map<UUID, UUID> result = new HashMap<>();
-        if (cityIds.isEmpty()) {
-            return result;
-        }
-        for (Object[] row : cityRepository.findOblastIdsByIdIn(cityIds)) {
-            result.put((UUID) row[0], (UUID) row[1]);
-        }
-        return result;
     }
 
     /**
@@ -1185,7 +1377,7 @@ public class SalonService {
         // keyed on an actor again.
         evictOwnerSalonsCacheAfterCommit(ownerIdOf(salon));
         evictSalonDetailCacheAfterCommit(salonId);
-        evictSearchSalonsCacheAfterCommit();
+        evictSearchCachesAfterCommit(SearchCacheNames.SALONS_ALL);
 
         // Phase 268 D2-D4/D8 — registered LAST, after the cache evictions, so a synchronization
         // ordering hiccup among the cheap in-memory evictions above can never prevent the R2 sweep
