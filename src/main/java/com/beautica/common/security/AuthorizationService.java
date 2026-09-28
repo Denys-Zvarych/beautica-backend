@@ -920,44 +920,66 @@ public class AuthorizationService {
         // Finding 2: role is derived from the SecurityContext (set by JwtAuthenticationFilter)
         // instead of from a cross-entity DB join, eliminating the Cartesian product.
         Role actorRole = roleFromAuthentication(auth);
-        return bookingRepository.findViewAccessById(bookingId).map(v -> {
-            // Management access: SALON_OWNER whose id matches the salon owner, or INDEPENDENT_MASTER
-            // whose user id matches the master's user id. Both checks use the projection fields
-            // resolved in a single JOIN — no second DB round-trip on any branch.
-            //
-            // SALON_OWNER-type master booking: both the salonOwnerUserId branch AND the masterUserId
-            // branch fire for the owner (the owner is the master's user), granting full client-data
-            // visibility under the salon-owner branch. There is no contradiction — both return true.
-            if (v.salonOwnerUserId() != null && v.salonOwnerUserId().equals(actorId)) {
-                return true;
-            }
-            // masterUserId null-guard: see canManageBooking above (V157 / phase 294 D1, 2026-09
-            // audit finding 7). Both reads in this method are guarded, not just the first.
-            if (v.masterUserId() != null && v.masterUserId().equals(actorId)
-                    && actorRole != Role.SALON_MASTER) {
-                return true;
-            }
-            if (actorRole == Role.CLIENT) {
-                // Guest (LINK) bookings have a null clientUserId (findViewAccessById now
-                // LEFT JOINs client, per the track 24.7 audit) — null-guard so a CLIENT
-                // probing a guest booking's id denies cleanly instead of NPEing.
-                return v.clientUserId() != null && v.clientUserId().equals(actorId);
-            }
-            if (actorRole == Role.SALON_MASTER) {
-                // SALON_MASTER may only view their own bookings — not all bookings at the salon,
-                // and only while they are still an ACTIVE master. masterIsActive leads for the
-                // same reason it leads in enforceCanViewBooking (whose javadoc carries the full
-                // rationale) and in isPerformingMasterOfRow: DELETE /masters/{masterId} flips
-                // masters.is_active and leaves the users row, its SALON_MASTER role and its login
-                // intact, so without this conjunct a deactivated stylist keeps reading every
-                // client name, phone and price they ever served. This is the ONLY branch of either
-                // BookingViewAccess consumer allowed to read that leg — the salon-owner arm above
-                // must keep admitting the owner of a deactivated master's booking.
-                return v.masterIsActive()
-                        && v.masterUserId() != null && v.masterUserId().equals(actorId);
-            }
-            return false;
-        }).orElse(false);
+        return bookingRepository.findViewAccessById(bookingId)
+                .map(v -> isViewAuthorized(actorRole, actorId, v.clientUserId(), v.masterUserId(),
+                        v.masterIsActive(), v.salonOwnerUserId()))
+                .orElse(false);
+    }
+
+    /**
+     * The pure booking-view decision {@link #canViewBooking} evaluates over a
+     * {@link com.beautica.booking.repository.BookingViewAccess} projection — extracted (audit-fix
+     * cycle 1, phase 334 finding 2) so {@code NotificationViewAssembler} can reuse the IDENTICAL
+     * rule over its own already-batch-loaded {@code Booking} entity graph instead of maintaining a
+     * hand-written copy that can silently drift from this one. No DB access — every fact the
+     * decision needs is a parameter.
+     *
+     * <p><b>Decision table (verbatim from {@code canViewBooking}, unchanged by this extraction):</b>
+     * <ul>
+     *   <li>{@code salonOwnerUserId == actorId} → admitted, any role (in practice only reachable by
+     *       {@code SALON_OWNER} — see {@code isAuthorizedToManageBooking}'s ID-based reasoning for
+     *       why no other role can satisfy this compare). Salon activity and the performing master's
+     *       {@code isActive} are NOT consulted — a salon owner keeps view over a booking whose
+     *       master has since been deactivated.</li>
+     *   <li>{@code masterUserId == actorId && actorRole != SALON_MASTER} → admitted (the
+     *       {@code INDEPENDENT_MASTER} arm, and the {@code SALON_OWNER}-type master's own booking,
+     *       already caught by the branch above). {@code masterIsActive} is NOT consulted here.</li>
+     *   <li>{@code actorRole == CLIENT} → {@code clientUserId == actorId} (null-safe: a guest/LINK
+     *       booking has no client).</li>
+     *   <li>{@code actorRole == SALON_MASTER} → {@code masterIsActive && masterUserId == actorId} —
+     *       the ONLY branch that reads {@code masterIsActive}, so a deactivated stylist loses view
+     *       of bookings they used to perform.</li>
+     *   <li>{@code SALON_ADMIN} → structurally excluded; no branch above admits it. Do NOT widen
+     *       this method to admit {@code SALON_ADMIN} — {@code NotificationViewAssembler} grants
+     *       admin visibility itself, via a live "still assigned to this salon" check that has no
+     *       equivalent here (see that class's {@code isVisible}/{@code managesSalon}), exactly the
+     *       divergence {@link #isAuthorizedToManageBooking}'s javadoc already documents between
+     *       "view" and "provider-action" authority.</li>
+     * </ul>
+     *
+     * <p><b>{@code NotificationViewAssembler} applies EXTRA, feed-specific liveness conditions on
+     * TOP of this predicate's result</b> (never by narrowing the predicate itself, which would
+     * change {@code canViewBooking}'s existing behaviour for every other caller): the feed also
+     * requires an {@code INDEPENDENT_MASTER}/{@code SALON_MASTER} recipient's master to be
+     * currently active, and a {@code SALON_OWNER} recipient's salon to be currently active —
+     * neither of which this method checks on those arms. See that class's {@code isVisible}.
+     */
+    public boolean isViewAuthorized(
+            Role actorRole, UUID actorId, UUID clientUserId, UUID masterUserId,
+            boolean masterIsActive, UUID salonOwnerUserId) {
+        if (salonOwnerUserId != null && salonOwnerUserId.equals(actorId)) {
+            return true;
+        }
+        if (masterUserId != null && masterUserId.equals(actorId) && actorRole != Role.SALON_MASTER) {
+            return true;
+        }
+        if (actorRole == Role.CLIENT) {
+            return clientUserId != null && clientUserId.equals(actorId);
+        }
+        if (actorRole == Role.SALON_MASTER) {
+            return masterIsActive && masterUserId != null && masterUserId.equals(actorId);
+        }
+        return false;
     }
 
     /**

@@ -231,6 +231,18 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private static final String DECLINE_SUFFIX = "/decline";
     private static final String NOT_COMPLETE_SUFFIX = "/not-complete";
 
+    /**
+     * Base path covering all FOUR in-app notification feed endpoints (phase 334): {@code GET
+     * /api/v1/notifications}, {@code GET /api/v1/notifications/unread-count}, {@code PATCH
+     * /api/v1/notifications/&#123;id&#125;/read}, {@code PATCH /api/v1/notifications/read-all} —
+     * every method on this path shares ONE bucket, per the phase-334 doc. Matched by exact
+     * equality OR a {@code "/"}-bounded prefix ({@link #isNotificationsPath}), never by a bare
+     * {@code startsWith}, so a hypothetical future {@code /api/v1/notifications-legacy} route
+     * could never be silently swallowed into this budget.
+     */
+    private static final String NOTIFICATIONS_PATH = "/api/v1/notifications";
+    private static final String NOTIFICATIONS_PATH_PREFIX = NOTIFICATIONS_PATH + "/";
+
     // Resolves the DECODED + NORMALIZED request path for rule matching (see resolveMatchPath).
     // urlDecode + removeSemicolonContent are UrlPathHelper defaults; set explicitly so the
     // security-critical decode step is self-documenting and cannot be silently disabled by a
@@ -269,6 +281,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     /** {@code Retry-After} for the salon-board read bucket — matches its 60s refill window. */
     private static final int SALON_BOARD_READ_RETRY_AFTER_SECONDS = 60;
 
+    /** {@code Retry-After} for the notification-feed bucket (phase 334) — matches its 60s window. */
+    private static final int NOTIFICATION_FEED_RETRY_AFTER_SECONDS = 60;
+
     /**
      * {@code Retry-After} for the CLIENT self-delete bucket — matches its 60-minute refill window
      * (see {@code RateLimitConfig#selfDeleteCapacity}'s javadoc for the sizing rationale).
@@ -282,6 +297,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> selfDeleteBuckets;
     private final LoadingCache<String, Bucket> salonMasterServicesReadBuckets;
     private final LoadingCache<String, Bucket> salonBoardReadBuckets;
+    private final LoadingCache<String, Bucket> notificationFeedBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -292,6 +308,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> selfDeleteBuckets,
             LoadingCache<String, Bucket> salonMasterServicesReadBuckets,
             LoadingCache<String, Bucket> salonBoardReadBuckets,
+            LoadingCache<String, Bucket> notificationFeedBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
@@ -300,6 +317,7 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         this.selfDeleteBuckets = selfDeleteBuckets;
         this.salonMasterServicesReadBuckets = salonMasterServicesReadBuckets;
         this.salonBoardReadBuckets = salonBoardReadBuckets;
+        this.notificationFeedBuckets = notificationFeedBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -390,6 +408,11 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         // intent rather than a correctness dependency.
         if (HttpMethod.GET.matches(method) && isSalonBoardReadPath(path)) {
             return new BucketRoute(salonBoardReadBuckets, SALON_BOARD_READ_RETRY_AFTER_SECONDS);
+        }
+        // All four in-app notification feed endpoints (phase 334) share ONE bucket regardless of
+        // HTTP method — GET (list, unread-count) and PATCH (mark read, mark all read) alike.
+        if (isNotificationsPath(path)) {
+            return new BucketRoute(notificationFeedBuckets, NOTIFICATION_FEED_RETRY_AFTER_SECONDS);
         }
         // POST /bookings (single-service create) and POST /appointments (BE-3 multi-service visit
         // create) share the bookingWriteBuckets budget: both take the per-client advisory lock, so a
@@ -528,6 +551,15 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         return segments.length == 2
                 && !segments[0].isEmpty()
                 && BOOKED_DAYS_SEGMENT.equals(segments[1]);                  // the day-rail dots
+    }
+
+    /**
+     * True for {@code /api/v1/notifications} itself and every path beneath it — see
+     * {@link #NOTIFICATIONS_PATH_PREFIX}'s javadoc for why this is a {@code "/"}-bounded prefix
+     * check, never a bare {@code startsWith}.
+     */
+    private static boolean isNotificationsPath(String path) {
+        return NOTIFICATIONS_PATH.equals(path) || path.startsWith(NOTIFICATIONS_PATH_PREFIX);
     }
 
     /** Pairs the bucket cache a request must consume from with its bucket-specific Retry-After. */

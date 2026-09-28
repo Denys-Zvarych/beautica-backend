@@ -43,6 +43,23 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
     long countByRecipientUserIdAndReadAtIsNull(UUID recipientUserId);
 
     /**
+     * Phase 334 — the bell red-dot count, bounded at the SOURCE rather than merely clamped after a
+     * full {@code COUNT(*)}: the driving subquery stops scanning
+     * {@code in_app_notification_unread_idx} at 100 matched rows, so a recipient with an
+     * unbounded backlog never pays for more than a 100-row index scan. {@code
+     * NotificationFeedService#unreadCount} clamps the result to 99 (so the wire value never
+     * silently implies "exactly 100" — the true count could be higher).
+     */
+    @Query(value = """
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM in_app_notification
+                 WHERE recipient_user_id = :recipientUserId AND read_at IS NULL
+                 LIMIT 100
+            ) capped
+            """, nativeQuery = true)
+    long countUnreadCapped(@Param("recipientUserId") UUID recipientUserId);
+
+    /**
      * Marks a single item read, scoped to its owning recipient so one user can never mark another
      * user's item read by guessing an id (Anti-Bug §B territory: this is the ownership guard, not
      * the caller's principal check). A no-op ({@code 0} rows) if the id does not exist, belongs to

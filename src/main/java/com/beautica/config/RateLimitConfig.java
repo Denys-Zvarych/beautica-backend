@@ -152,6 +152,21 @@ public class RateLimitConfig {
     @Value("${app.rate-limit.salon-board-read-capacity:60}")
     private long salonBoardReadCapacity;
 
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) shared by all FOUR in-app notification feed
+     * endpoints (phase 334): {@code GET /api/v1/notifications}, {@code GET
+     * /api/v1/notifications/unread-count}, {@code PATCH /api/v1/notifications/&#123;id&#125;/read},
+     * {@code PATCH /api/v1/notifications/read-all} — consumed by {@link BookingRateLimitFilter}.
+     *
+     * <p>Own bucket, NOT shared with {@link #salonBoardReadCapacity} (phase-334 doc: "does not
+     * share the salon-board budget") — different screen, different recipient population (every
+     * role, not just salon staff), different refresh cadence. Mobile polls unread-count at 1/min
+     * (mobile phase 360), so 60/min leaves &ge;50 req/min of headroom for the feed screen's own
+     * list/mark-read traffic on top of that steady poll.
+     */
+    @Value("${app.rate-limit.notification-feed-capacity:60}")
+    private long notificationFeedCapacity;
+
     // ══════════════════════════════════════════════════════════════════════════════════════════
     // ACCEPTED RISK — 2026-09-15, architect sign-off (wish-list hull audit, cycle 2, perf LOW).
     // GET /api/v1/favorites/** — and GET /api/v1/favorites/services in particular — carries NO
@@ -701,6 +716,16 @@ public class RateLimitConfig {
                 DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, salonBoardReadCapacity, ONE_MINUTE);
     }
 
+    /**
+     * Per-user bucket (see {@link #notificationFeedCapacity}) shared by all four in-app
+     * notification feed endpoints, consumed by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> notificationFeedBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, notificationFeedCapacity, ONE_MINUTE);
+    }
+
     @Bean
     public LoadingCache<String, Bucket> deviceTokenBuckets() {
         return bucketCache(DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, deviceTokenCapacity, ONE_MINUTE);
@@ -1109,7 +1134,7 @@ public class RateLimitConfig {
         return new BookingRateLimitFilter(
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
                 staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
-                salonBoardReadBuckets(), objectMapper);
+                salonBoardReadBuckets(), notificationFeedBuckets(), objectMapper);
     }
 
     /**

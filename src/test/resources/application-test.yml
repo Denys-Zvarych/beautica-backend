@@ -46,6 +46,13 @@ app:
     # hand with its own caches and is unaffected by this override, which is what keeps the 429
     # behaviour itself genuinely tested.
     salon-board-read-capacity: 100000
+    # Same reasoning again, for the four in-app notification feed endpoints (phase 334) sharing
+    # ONE per-user bucket: NotificationFeedControllerIT drives many real GETs/PATCHes as one
+    # recipient token across its test methods, which would otherwise 429 mid-class against the
+    # production 60/min default. BookingRateLimitFilterTest's notification-feed throttling
+    # assertions build the filter directly against a hand-built single-slot LoadingCache
+    # (bypassing this property entirely), so this override does not neuter that coverage.
+    notification-feed-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000
