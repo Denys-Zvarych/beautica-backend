@@ -154,8 +154,8 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     // those three.
 
     @Test
-    @DisplayName("should_existsOverlapReturnTrue_when_confirmedBookingConflicts")
-    void should_existsOverlapReturnTrue_when_confirmedBookingConflicts() {
+    @DisplayName("should_findPostLockBookabilityAndOverlapReturnOverlapTrue_when_confirmedBookingConflicts")
+    void should_findPostLockBookabilityAndOverlapReturnOverlapTrue_when_confirmedBookingConflicts() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
@@ -166,14 +166,17 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 10, 30, 0, 0, ZoneOffset.UTC);
         OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
 
-        boolean result = bookingRepository.existsOverlap(master.getId(), requestedStartsAt, requestedEndsAt);
+        PostLockSlotCheck result = bookingRepository
+                .findPostLockBookabilityAndOverlap(master.getId(), requestedStartsAt, requestedEndsAt)
+                .orElseThrow();
 
-        assertThat(result).isTrue();
+        assertThat(result.getMasterBookable()).isTrue();
+        assertThat(result.getOverlapExists()).isTrue();
     }
 
     @Test
-    @DisplayName("should_existsOverlapReturnFalse_when_noConflict")
-    void should_existsOverlapReturnFalse_when_noConflict() {
+    @DisplayName("should_findPostLockBookabilityAndOverlapReturnOverlapFalse_when_noConflict")
+    void should_findPostLockBookabilityAndOverlapReturnOverlapFalse_when_noConflict() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
@@ -184,9 +187,12 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 11, 30, 0, 0, ZoneOffset.UTC);
         OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 12, 30, 0, 0, ZoneOffset.UTC);
 
-        boolean result = bookingRepository.existsOverlap(master.getId(), requestedStartsAt, requestedEndsAt);
+        PostLockSlotCheck result = bookingRepository
+                .findPostLockBookabilityAndOverlap(master.getId(), requestedStartsAt, requestedEndsAt)
+                .orElseThrow();
 
-        assertThat(result).isFalse();
+        assertThat(result.getMasterBookable()).isTrue();
+        assertThat(result.getOverlapExists()).isFalse();
     }
 
     @Test
@@ -218,8 +224,8 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("should_existsOverlapReturnFalse_when_newBookingStartsExactlyAtExistingEnd")
-    void should_existsOverlapReturnFalse_when_newBookingStartsExactlyAtExistingEnd() {
+    @DisplayName("should_findPostLockBookabilityAndOverlapReturnOverlapFalse_when_newBookingStartsExactlyAtExistingEnd")
+    void should_findPostLockBookabilityAndOverlapReturnOverlapFalse_when_newBookingStartsExactlyAtExistingEnd() {
         OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime endsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
 
@@ -230,13 +236,145 @@ class BookingRepositoryTest extends AbstractDataJpaTest {
         OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
         OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 12, 0, 0, 0, ZoneOffset.UTC);
 
-        boolean result = bookingRepository.existsOverlap(master.getId(), requestedStartsAt, requestedEndsAt);
+        PostLockSlotCheck result = bookingRepository
+                .findPostLockBookabilityAndOverlap(master.getId(), requestedStartsAt, requestedEndsAt)
+                .orElseThrow();
 
-        assertThat(result).isFalse();
+        assertThat(result.getMasterBookable()).isTrue();
+        assertThat(result.getOverlapExists()).isFalse();
+    }
+
+    @Test
+    @DisplayName("should_findPostLockBookabilityAndOverlapReturnEmpty_when_masterDoesNotExist")
+    void should_findPostLockBookabilityAndOverlapReturnEmpty_when_masterDoesNotExist() {
+        OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        Optional<PostLockSlotCheck> result = bookingRepository
+                .findPostLockBookabilityAndOverlap(UUID.randomUUID(), requestedStartsAt, requestedEndsAt);
+
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    @DisplayName("should_findPostLockBookabilityAndOverlapReturnBookableFalse_when_masterIsInactive")
+    void should_findPostLockBookabilityAndOverlapReturnBookableFalse_when_masterIsInactive() {
+        User inactiveMasterUser = new User(
+                "inactive-master-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.INDEPENDENT_MASTER,
+                "Inactive",
+                "Master",
+                "+380503333333"
+        );
+        em.persist(inactiveMasterUser);
+        Master inactiveMaster = Master.builder()
+                .user(inactiveMasterUser)
+                .masterType(MasterType.INDEPENDENT_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(false)
+                .build();
+        em.persist(inactiveMaster);
+        em.flush();
+
+        OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        PostLockSlotCheck result = bookingRepository
+                .findPostLockBookabilityAndOverlap(inactiveMaster.getId(), requestedStartsAt, requestedEndsAt)
+                .orElseThrow();
+
+        assertThat(result.getMasterBookable()).isFalse();
     }
 
     // should_notReturnBooking_when_statusIsCancelled sat here — same deletion, same reason as the block
     // above; CANCELLED is covered by should_excludeTerminalStatuses_when_projectingActiveTimeRanges.
+
+    // ── findPostLockBookabilityAndOverlap — the two LEFT JOIN salons branches ────────────────────
+    //
+    // The javadoc on the query (BookingRepository#findPostLockBookabilityAndOverlap) calls out
+    // `LEFT JOIN salons, never an inner join` as load-bearing: an INDEPENDENT_MASTER has
+    // salon_id IS NULL, and an inner join would drop that row entirely, turning a bookable
+    // independent master's re-check into a false "master not found". These two tests pin both
+    // sides of `m.salon_id IS NULL OR s.is_active` directly, instead of relying on the other
+    // tests in this file to exercise the branch incidentally.
+
+    @Test
+    @DisplayName("should_findPostLockBookabilityAndOverlap_bookableTrue_when_independentMasterHasNoSalon")
+    void should_findPostLockBookabilityAndOverlap_bookableTrue_when_independentMasterHasNoSalon() {
+        // `master` (from setUp()) is an active INDEPENDENT_MASTER with salon_id IS NULL — the
+        // `m.salon_id IS NULL` short-circuit of the OR must alone make it bookable, without ever
+        // needing `s.is_active` to be evaluated (there is no salons row to LEFT JOIN against).
+        OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        PostLockSlotCheck result = bookingRepository
+                .findPostLockBookabilityAndOverlap(master.getId(), requestedStartsAt, requestedEndsAt)
+                .orElseThrow();
+
+        assertThat(result.getMasterBookable())
+                .as("salon_id IS NULL must alone satisfy the OR — no salons row is ever LEFT JOINed in")
+                .isTrue();
+        assertThat(result.getOverlapExists()).isFalse();
+    }
+
+    @Test
+    @DisplayName("should_findPostLockBookabilityAndOverlap_bookableFalse_when_salonClosed")
+    void should_findPostLockBookabilityAndOverlap_bookableFalse_when_salonClosed() {
+        User salonOwner = new User(
+                "owner-postlock-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_OWNER,
+                "PostLock",
+                "Owner",
+                "+380509000005"
+        );
+        em.persist(salonOwner);
+
+        Salon closedSalon = Salon.builder()
+                .cityId(testCityId())
+                .owner(salonOwner)
+                .name("Closed Salon")
+                .isActive(false)
+                .build();
+        em.persist(closedSalon);
+
+        User salonMasterUser = new User(
+                "smaster-postlock-" + UUID.randomUUID() + "@test.com",
+                "$2a$10$hash",
+                Role.SALON_MASTER,
+                "PostLock",
+                "SalonMaster",
+                "+380509000006"
+        );
+        em.persist(salonMasterUser);
+
+        // The master row itself is active — only the salon it belongs to is closed, isolating the
+        // `s.is_active` half of the OR (as opposed to should_..._when_masterIsInactive above, which
+        // pins `m.is_active`).
+        Master closedSalonMaster = Master.builder()
+                .user(salonMasterUser)
+                .salon(closedSalon)
+                .masterType(MasterType.SALON_MASTER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(closedSalonMaster);
+        em.flush();
+
+        OffsetDateTime requestedStartsAt = OffsetDateTime.of(2026, 6, 1, 10, 0, 0, 0, ZoneOffset.UTC);
+        OffsetDateTime requestedEndsAt = OffsetDateTime.of(2026, 6, 1, 11, 0, 0, 0, ZoneOffset.UTC);
+
+        PostLockSlotCheck result = bookingRepository
+                .findPostLockBookabilityAndOverlap(closedSalonMaster.getId(), requestedStartsAt, requestedEndsAt)
+                .orElseThrow();
+
+        assertThat(result.getMasterBookable())
+                .as("an active master at a closed (is_active = false) salon must not be bookable")
+                .isFalse();
+    }
 
     @Test
     @DisplayName("should_returnEmpty_when_idempotencyKeyNotFound")

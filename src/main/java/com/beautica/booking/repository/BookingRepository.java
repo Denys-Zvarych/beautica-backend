@@ -955,16 +955,44 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("windowEnd") OffsetDateTime windowEnd
     );
 
+    /**
+     * Fused post-advisory-lock check for every booking-CREATE path (Phase 337 QA follow-up, LOW
+     * perf) — replaces the TWO statements ({@code MasterRepository#isBookableFresh} then the former
+     * {@code existsOverlap}) that used to run back-to-back, immediately after the per-master
+     * advisory lock and before the insert, with ONE round trip that returns both facts as separate
+     * columns. See {@link PostLockSlotCheck} for the column-to-predicate mapping and
+     * {@code PostLockSlotGuard} (the sole caller, shared by all 4 create paths) for how the two
+     * facts are turned into the 404-vs-409 decision.
+     *
+     * <p><b>{@code LEFT JOIN salons}, never an inner join.</b> An {@code INDEPENDENT_MASTER} has
+     * {@code salon_id IS NULL}; an inner join would drop that row entirely and turn a bookable
+     * independent master's re-check into a false "master not found" — the exact native-SQL analogue
+     * of the {@code LEFT JOIN m.salon} rule {@code MasterRepository#isBookableFresh} (now deleted)
+     * and {@code MasterBookability} both documented for the JPQL/Java form of this same predicate.
+     *
+     * <p><b>Bookability is read from the SAME row the overlap {@code EXISTS} scans against</b> — one
+     * {@code masters} probe, one {@code bookings} probe, one round trip. A master row that does not
+     * exist at all (hard delete rather than detach) yields an empty {@link Optional}, which the
+     * caller treats identically to {@code masterBookable == false}.
+     *
+     * <p>Callers must already hold the per-master advisory lock (salt {@code 0}) before invoking —
+     * this is the atomic post-lock re-check, not a substitute for taking it.
+     */
     @Query(value = """
-            SELECT EXISTS (
-              SELECT 1 FROM bookings
-               WHERE master_id = :masterId
-                 AND status = 'CONFIRMED'
-                 AND starts_at < :requestedEndsAt
-                 AND ends_at   > :requestedStartsAt
-            )
+            SELECT
+              (m.is_active AND (m.salon_id IS NULL OR s.is_active)) AS master_bookable,
+              EXISTS (
+                SELECT 1 FROM bookings b
+                 WHERE b.master_id = :masterId
+                   AND b.status = 'CONFIRMED'
+                   AND b.starts_at < :requestedEndsAt
+                   AND b.ends_at   > :requestedStartsAt
+              ) AS overlap_exists
+            FROM masters m
+            LEFT JOIN salons s ON s.id = m.salon_id
+            WHERE m.id = :masterId
             """, nativeQuery = true)
-    boolean existsOverlap(
+    Optional<PostLockSlotCheck> findPostLockBookabilityAndOverlap(
             @Param("masterId") UUID masterId,
             @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt
@@ -974,8 +1002,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * Overlap check that excludes a single booking's own row — used by the reschedule
      * flow so a booking does not collide with itself when only its time changes.
      *
-     * <p>Same predicate as {@link #existsOverlap(UUID, OffsetDateTime, OffsetDateTime)}
-     * (CONFIRMED rows only, half-open interval overlap) plus
+     * <p>Same overlap predicate as the {@code overlap_exists} column of
+     * {@link #findPostLockBookabilityAndOverlap} (CONFIRMED rows only, half-open interval overlap) plus
      * {@code id <> :excludeBookingId}. Callers must hold the per-master advisory lock
      * (see {@link #acquireAdvisoryLock(UUID)}) before invoking, identical to create.
      */
@@ -1004,7 +1032,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * the new span can legitimately overlap several of the visit's OWN current rows.
      * {@code appointment_id IS DISTINCT FROM :appointmentId} is null-safe (legacy single-service
      * bookings carry a {@code NULL appointment_id} and are never excluded by this predicate).
-     * Same predicate otherwise as {@link #existsOverlap} (CONFIRMED rows only, half-open interval
+     * Same overlap predicate otherwise as the {@code overlap_exists} column of
+     * {@link #findPostLockBookabilityAndOverlap} (CONFIRMED rows only, half-open interval
      * overlap). Callers must hold the per-master advisory lock (see {@link #acquireAdvisoryLock(UUID)})
      * before invoking, identical to the single-booking reschedule flow.
      */
@@ -1029,7 +1058,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     /**
      * Id of the client's earliest {@code CONFIRMED} booking — with ANY
      * master/salon — that overlaps the requested {@code [requestedStartsAt, requestedEndsAt)}
-     * window. Half-open interval overlap, same predicate shape as {@link #existsOverlap}, but
+     * window. Half-open interval overlap, same predicate shape as the {@code overlap_exists} column
+     * of {@link #findPostLockBookabilityAndOverlap}, but
      * scoped by {@code client_id} instead of {@code master_id} so it catches a client double-
      * booking themselves across two different masters. {@code ORDER BY starts_at ASC LIMIT 1}
      * makes the earliest conflict deterministic when a client somehow holds more than one
@@ -1313,6 +1343,43 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             """)
     List<BookingCompletionAccess> findAllCompletionAccessByAppointmentId(
             @Param("appointmentId") UUID appointmentId);
+
+    /**
+     * Batched sibling of {@link #findAllCompletionAccessByAppointmentId} (perf MEDIUM, phase 337
+     * cycle-2 audit) — one query for MANY appointment-visits instead of one query per visit.
+     *
+     * <p>Added for {@code AuthorizationService.enforceCanManageAppointments}, backing the
+     * owner-initiated cascades ({@code BookingService
+     * #declineFutureConfirmedBookingsForSalonClosure}/{@code #declineFutureConfirmedBookingsForMasterRemoval}),
+     * which previously called the single-id overload once per distinct appointment-visit in the
+     * cascade — O(V) statements for a V-visit closure/removal. Each row carries its OWN {@code
+     * appointmentId} ({@link AppointmentCompletionAccess}, unlike {@link BookingCompletionAccess})
+     * so the caller can regroup this one result set back into per-appointment row lists and
+     * authorize each appointment against ONLY its own rows — never a sibling's.
+     *
+     * <p>Same join shape, same {@code LEFT JOIN bm.user} / {@code LEFT JOIN bm.salon} rationale, and
+     * the same "no existence oracle" contract as the single-id overload: an id in {@code
+     * appointmentIds} that is missing, itemless, or otherwise foreign simply contributes no rows to
+     * the result set, and the caller must treat that absence as a 403, identical to what calling the
+     * single-id overload for that one id would have thrown. Deterministically ordered by {@code
+     * (b.appointment.id, b.id)} so the caller's regroup is stable across runs, though the caller
+     * groups by {@code appointmentId} regardless of row order.
+     */
+    @Query("""
+            SELECT new com.beautica.booking.repository.AppointmentCompletionAccess(
+                b.appointment.id,
+                bm.user.id,
+                bs.id
+            )
+            FROM Booking b
+            JOIN b.master bm
+            LEFT JOIN bm.user
+            LEFT JOIN bm.salon bs
+            WHERE b.appointment.id IN :appointmentIds
+            ORDER BY b.appointment.id, b.id
+            """)
+    List<AppointmentCompletionAccess> findAllCompletionAccessByAppointmentIds(
+            @Param("appointmentIds") Collection<UUID> appointmentIds);
 
     /**
      * Scalar, entity-manager-bypassing projection of the CONFIRMED subset of an appointment's

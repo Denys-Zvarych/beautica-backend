@@ -40,7 +40,9 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -1364,5 +1366,85 @@ class AppointmentTransitionServiceTest {
         verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
         verify(slotCalculationService, never()).getAvailableSlots(
                 any(), any(), any(UUID.class), nullable(MasterServiceAssignment.class));
+    }
+
+    // ── declineAppointmentItemsBulk (perf re-audit, 2026-09, Finding 1) ─────────────────────────
+    // Unit-level proof that the batched leg issues exactly the 3 statements its own Javadoc
+    // promises and wires them together correctly; MasterSelfDeleteBookingDisposalIT's real-Postgres
+    // statement-count test is the end-to-end proof that the count stays flat as visit count grows.
+
+    @Test
+    @DisplayName("declineAppointmentItemsBulk — an empty map issues NO query at all")
+    void should_issueNoQuery_when_bookingIdsByAppointmentIdIsEmpty() {
+        var result = appointmentTransitionService.declineAppointmentItemsBulk(
+                Map.of(), CancellationReason.PROVIDER_UNAVAILABLE, OffsetDateTime.now(clock));
+
+        assertThat(result).isEmpty();
+        verifyNoInteractions(appointmentRepository, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItemsBulk — exactly 3 statements for the whole batch: bulk "
+            + "header lock (every appointmentId), bulk conditional write (every flattened bookingId), "
+            + "bulk collapse (only the ids the lock step actually locked)")
+    void should_issueExactlyThreeStatements_forTheWholeBatch() {
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID appointmentId2 = UUID.randomUUID();
+        UUID bookingId1 = UUID.randomUUID();
+        UUID bookingId2 = UUID.randomUUID();
+        UUID bookingId3 = UUID.randomUUID();
+        OffsetDateTime now = OffsetDateTime.now(clock);
+        Map<UUID, List<UUID>> bookingIdsByAppointmentId = Map.of(
+                appointmentId1, List.of(bookingId1, bookingId2),
+                appointmentId2, List.of(bookingId3));
+
+        when(appointmentRepository.lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet()))
+                .thenReturn(List.of(appointmentId1, appointmentId2));
+        when(bookingRepository.declineConfirmedBulk(
+                argThatContainsExactlyInAnyOrder(bookingId1, bookingId2, bookingId3),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE.name()), isNull(), eq(now.toInstant())))
+                .thenReturn(List.of(bookingId1, bookingId2, bookingId3));
+
+        var result = appointmentTransitionService.declineAppointmentItemsBulk(
+                bookingIdsByAppointmentId, CancellationReason.PROVIDER_UNAVAILABLE, now);
+
+        assertThat(result).containsExactlyInAnyOrder(bookingId1, bookingId2, bookingId3);
+        verify(appointmentRepository).lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet());
+        verify(bookingRepository).declineConfirmedBulk(any(), any(), isNull(), any());
+        verify(appointmentRepository).collapseHeadersIfNoConfirmedSiblingsRemainBulk(
+                eq(List.of(appointmentId1, appointmentId2)),
+                eq(BookingStatus.DECLINED.name()), eq(CancellationReason.PROVIDER_UNAVAILABLE.name()), isNull());
+        verifyNoMoreInteractions(appointmentRepository, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItemsBulk — when NOTHING was locked (every header already left "
+            + "CONFIRMED before this call), the collapse statement is skipped entirely — a 0-row "
+            + "collapse over an empty id set would be a wasted round trip")
+    void should_skipCollapseStatement_when_noHeaderWasLocked() {
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID bookingId1 = UUID.randomUUID();
+        OffsetDateTime now = OffsetDateTime.now(clock);
+        Map<UUID, List<UUID>> bookingIdsByAppointmentId =
+                Map.of(appointmentId1, List.of(bookingId1));
+
+        when(appointmentRepository.lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet()))
+                .thenReturn(List.of());
+        when(bookingRepository.declineConfirmedBulk(any(), any(), isNull(), any()))
+                .thenReturn(List.of());
+
+        var result = appointmentTransitionService.declineAppointmentItemsBulk(
+                bookingIdsByAppointmentId, CancellationReason.PROVIDER_UNAVAILABLE, now);
+
+        assertThat(result).isEmpty();
+        verify(appointmentRepository, never())
+                .collapseHeadersIfNoConfirmedSiblingsRemainBulk(any(), any(), any(), any());
+    }
+
+    /** {@code argThat} over a {@link Collection} that ignores element order. */
+    private static Collection<UUID> argThatContainsExactlyInAnyOrder(UUID... ids) {
+        return org.mockito.ArgumentMatchers.argThat(
+                actual -> actual != null && actual.size() == ids.length
+                        && actual.containsAll(List.of(ids)));
     }
 }

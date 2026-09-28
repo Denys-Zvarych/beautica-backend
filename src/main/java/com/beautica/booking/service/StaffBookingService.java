@@ -313,7 +313,8 @@ public class StaffBookingService {
         // AppointmentService#doCreateAppointment's overlap check. Holds only for THIS transaction; a
         // later per-item reschedule legally separates items with gaps, so this argument must never
         // be reused to justify a single span check on a read or reschedule path.
-        BookingSlotLockGuard.lockMasterAndAssertFree(bookingRepository, master.getId(), firstStart, lastEnd);
+        BookingSlotLockGuard.lockMasterAndAssertFree(
+                bookingRepository, master.getId(), firstStart, lastEnd);
 
         Appointment appointment = Appointment.staffAppointment(
                 master.getSalon(), guest.name(), guest.surname(), guestPhone, actorId);

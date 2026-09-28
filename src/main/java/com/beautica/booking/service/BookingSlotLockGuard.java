@@ -12,8 +12,9 @@ import java.util.UUID;
 
 /**
  * Shared double-book guard for the booking CREATE paths — the per-master advisory lock, the
- * {@code existsOverlap} check it makes atomic, and the {@code saveAndFlush} whose GIST
- * {@code no_overlapping_bookings} violation is the last line of defence behind both.
+ * post-lock bookability-and-overlap check ({@link PostLockSlotGuard}) it makes atomic, and the
+ * {@code saveAndFlush} whose GIST {@code no_overlapping_bookings} violation is the last line of
+ * defence behind both.
  *
  * <p><b>Why a static utility, not a bean.</b> Exactly the shape {@link BookingSlotAvailabilityGuard}
  * and {@link BookingTemporalGuard} already have in this package, and for the same reason: a package-
@@ -59,16 +60,24 @@ final class BookingSlotLockGuard {
      * <p>Callers must have already run the schedule-fit gate
      * ({@link BookingSlotAvailabilityGuard}) — an off-schedule request must never contend for the
      * lock every other client of a popular master is queued on.
+     *
+     * <p><b>Post-lock bookability + overlap re-check (Phase 337 QA, CRITICAL race; fused into one
+     * statement by the Phase 337 follow-up, LOW perf).</b> Runs
+     * {@link PostLockSlotGuard#assertStillFreeAfterLock} immediately after the lock is granted and
+     * before any insert — a create that queued behind a concurrent master self-delete on this SAME
+     * lock must not go on to insert against a master the self-delete just detached, and a create
+     * whose window collided with a booking committed while it waited on the lock must not go on to
+     * insert either. See that class's javadoc for why a re-fetched {@code Master} entity cannot
+     * substitute for this scalar re-check, and why the two facts are answered by one query rather
+     * than two.
      */
-    static void lockMasterAndAssertFree(BookingRepository bookingRepository, UUID masterId,
-                                        OffsetDateTime startsAt, OffsetDateTime endsAt) {
+    static void lockMasterAndAssertFree(BookingRepository bookingRepository,
+                                        UUID masterId, OffsetDateTime startsAt, OffsetDateTime endsAt) {
         Integer lock = bookingRepository.acquireAdvisoryLockWithTimeout(masterId);
         if (lock == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
-        if (bookingRepository.existsOverlap(masterId, startsAt, endsAt)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        PostLockSlotGuard.assertStillFreeAfterLock(bookingRepository, masterId, startsAt, endsAt);
     }
 
     /**

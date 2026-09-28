@@ -11,6 +11,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.TestPostLockSlotCheck;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -160,6 +161,14 @@ class StaffBookingServiceTest {
         // that pins WHICH overload is used and what it is handed.
         lenient().when(appointmentService.enrich(any(), any(), any()))
                 .thenReturn(stubAppointmentDetailResponse());
+
+        // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
+        // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
+        // since the Phase 337 follow-up with the overlap re-check into one statement. Defaulting to
+        // "still bookable, no overlap" here (lenient — only the create tests reach this call) keeps
+        // every pre-existing create-path test's intent unchanged.
+        lenient().when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
     }
 
     // ════════════════════════════════════════════════════════════════════════════════
@@ -446,7 +455,8 @@ class StaffBookingServiceTest {
             stubMasterAndAssignment(salonMaster(), assignment(null, null));
             stubStaffSlotAvailable(START);
             when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-            when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(true);
+            when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                    .thenReturn(Optional.of(new TestPostLockSlotCheck(true, true)));
 
             assertThatThrownBy(() -> create(command(guest(RAW_PHONE))))
                     .isInstanceOf(BusinessException.class)
@@ -537,7 +547,7 @@ class StaffBookingServiceTest {
                     .extracting(e -> ((BusinessException) e).getStatus())
                     .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
 
-            verify(bookingRepository, never()).existsOverlap(any(), any(), any());
+            verify(bookingRepository, never()).findPostLockBookabilityAndOverlap(any(), any(), any());
             verify(bookingRepository, never()).saveAll(any());
         }
 
@@ -559,7 +569,8 @@ class StaffBookingServiceTest {
             stubMasterAndAssignment(salonMaster(), assignment(null, null));
             stubStaffSlotAvailable(START);
             when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-            when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+            when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                    .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
             when(bookingRepository.saveAll(any()))
                     .thenThrow(new DataIntegrityViolationException("no_overlapping_bookings"));
 
@@ -1104,7 +1115,7 @@ class StaffBookingServiceTest {
             create(threeServiceCommand());
 
             OffsetDateTime lastEnd = START.plusMinutes(3L * (BASE_DURATION + BUFFER));
-            verify(bookingRepository).existsOverlap(eq(masterId), eq(START), eq(lastEnd));
+            verify(bookingRepository).findPostLockBookabilityAndOverlap(eq(masterId), eq(START), eq(lastEnd));
         }
 
         @Test
@@ -1157,7 +1168,8 @@ class StaffBookingServiceTest {
             stubMasterAndThreeAssignments();
             stubStaffSlotAvailable(START);
             when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-            when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+            when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                    .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
             when(bookingRepository.saveAll(any()))
                     .thenThrow(new DataIntegrityViolationException("no_overlapping_bookings"));
 
@@ -1412,7 +1424,8 @@ class StaffBookingServiceTest {
      */
     private void stubLockFreeAndSave() {
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> {
             List<Booking> bookings = inv.getArgument(0);
             // @CreationTimestamp is a Hibernate flush-time hook, so an unpersisted entity has none —

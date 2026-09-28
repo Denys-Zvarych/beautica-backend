@@ -2,6 +2,7 @@ package com.beautica.user;
 
 import com.beautica.auth.AuthService;
 import com.beautica.auth.Role;
+import com.beautica.booking.repository.SalonClosureBookingCandidate;
 import com.beautica.booking.service.BookingService;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
@@ -158,19 +159,20 @@ public class StaffAccountSelfDeletionService {
         //
         // Residual-race fix (2026-09 re-audit): the per-master advisory lock is acquired FIRST,
         // via BookingService#acquireMasterLockForSelfDelete, BEFORE the read below builds the
-        // fixed futureBookingIds list — not merely before the write at the bottom of this block.
-        // A booking that committed for this master between an unlocked read and a later-acquired
-        // lock would never appear in futureBookingIds; disposeFutureConfirmedForMasterSelfDelete's
-        // own internal re-scan only maps appointment ids for the already-fixed list, it never
-        // grows the list itself, so that booking would survive the cascade. Holding the lock
-        // across the read, the cap check below, and the eventual decline+delete call closes that
-        // gap. See BookingService#acquireMasterLockForSelfDelete's javadoc for the full mechanism.
-        List<UUID> futureBookingIds = List.of();
+        // fixed futureBookingCandidates list — not merely before the write at the bottom of this
+        // block. A booking that committed for this master between an unlocked read and a
+        // later-acquired lock would never appear in futureBookingCandidates; the write seam no
+        // longer re-scans at all (perf re-audit, 2026-09, Finding 2 — the candidate list read here
+        // is threaded straight through, never re-queried), so that booking would survive the
+        // cascade. Holding the lock across the read, the cap check below, and the eventual
+        // decline+delete call closes that gap. See BookingService#acquireMasterLockForSelfDelete's
+        // javadoc for the full mechanism.
+        List<SalonClosureBookingCandidate> futureBookingCandidates = List.of();
         if (master != null) {
             UUID masterId = master.getId();
             bookingService.acquireMasterLockForSelfDelete(masterId);
-            futureBookingIds = bookingService.findFutureConfirmedBookingIdsForMaster(masterId);
-            if (futureBookingIds.size() > MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE) {
+            futureBookingCandidates = bookingService.findFutureConfirmedBookingCandidatesForMaster(masterId);
+            if (futureBookingCandidates.size() > MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE) {
                 // Fails BEFORE any write — mirrors ClientAccountDeletionService's identical
                 // ordering. Two distinct messages (D5, Phase 301 Q3f/R4): a SALON_MASTER cannot
                 // cancel their own bookings (every existing decline seam 403s them), so they are
@@ -178,17 +180,18 @@ public class StaffAccountSelfDeletionService {
                 // self-remedy first.
                 String message = user.getRole() == Role.SALON_MASTER
                         ? ("Забагато майбутніх записів (%d). Зверніться до власника салону, щоб він "
-                                + "видалив вас у розділі «Команда».").formatted(futureBookingIds.size())
+                                + "видалив вас у розділі «Команда».").formatted(futureBookingCandidates.size())
                         : ("Забагато майбутніх записів (%d). Спочатку скасуйте або завершіть майбутні "
                                 + "записи (максимум %d) і спробуйте ще раз.")
-                                .formatted(futureBookingIds.size(), MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE);
+                                .formatted(futureBookingCandidates.size(), MAX_FUTURE_BOOKINGS_PER_STAFF_SELF_DELETE);
                 throw new BusinessException(HttpStatus.UNPROCESSABLE_ENTITY, message);
             }
 
             // Bulk-declines then hard-deletes every future CONFIRMED booking, collapses childless
             // appointment headers, and evicts the slot/calendar caches — see that method's own
             // javadoc for why this cannot reuse the shared salon/master-removal decline cascade.
-            bookingService.disposeFutureConfirmedForMasterSelfDelete(userId, masterId, salonId, futureBookingIds);
+            bookingService.disposeFutureConfirmedForMasterSelfDelete(
+                    userId, masterId, salonId, futureBookingCandidates);
         }
 
         // Step 7 — the account + masters-row hard delete itself (D1/D2), delegated to the SAME
@@ -213,6 +216,6 @@ public class StaffAccountSelfDeletionService {
         // Step 10 — audit trail. Ids and counts only, never an email or any other PII.
         log.info("Staff/independent-master account self-delete: user {} (role {}) deleted, "
                         + "{} future booking(s) disposed of",
-                userId, user.getRole(), futureBookingIds.size());
+                userId, user.getRole(), futureBookingCandidates.size());
     }
 }

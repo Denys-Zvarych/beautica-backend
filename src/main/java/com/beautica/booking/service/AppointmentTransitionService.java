@@ -419,6 +419,36 @@ public class AppointmentTransitionService {
     }
 
     /**
+     * No-authorization overload of {@link #declineAppointmentItems(UUID, UUID, List,
+     * AppointmentProviderNoteRequest, boolean)} (Phase 337) — used ONLY by {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete}'s appointment-visit leg, via {@code
+     * BookingService#declineFutureConfirmed}'s {@code skipProviderAuthorization} branch.
+     *
+     * <p><b>Why this overload has to exist.</b> A self-deleting {@code SALON_MASTER} is a
+     * READ-ONLY role and structurally fails EVERY provider-authority predicate in {@link
+     * AuthorizationService} — including {@link AuthorizationService#enforceCanManageAppointment},
+     * the check the other two overloads run — even over a visit that is entirely their OWN (see
+     * {@code StaffAccountSelfDeletionService}'s class Javadoc, "the structural surprise driving the
+     * booking-disposal design"). Its one caller has ALREADY established provider authority a
+     * different way before reaching here: ownership of the departing account's OWN {@code masters}
+     * row ({@code masterRepository.existsByIdAndUserId}), asserted once per self-delete in {@code
+     * BookingService#disposeFutureConfirmedForMasterSelfDelete}. Skips straight to {@link
+     * #declineAppointmentItemsAfterAuth} — the exact same load, header lock, batched freshness
+     * recheck, write, header collapse and (opt-in) eviction every other overload runs; only the
+     * authorization step is different, because it already happened, elsewhere, by a different
+     * predicate.
+     *
+     * <p>Do NOT widen this overload's visibility, and do not add a second caller. A future caller
+     * of this shape must ALSO have already proven provider authority by an equivalent ownership
+     * check of its own — this is never a generic "skip auth" escape hatch.
+     */
+    List<Booking> declineAppointmentItems(
+            UUID appointmentId, List<UUID> bookingIds, AppointmentProviderNoteRequest req,
+            boolean evictAfterCommit) {
+        return declineAppointmentItemsAfterAuth(appointmentId, bookingIds, req, evictAfterCommit);
+    }
+
+    /**
      * Shared post-authorization core of both {@link #declineAppointmentItems(UUID, UUID, List,
      * AppointmentProviderNoteRequest, boolean)} overloads (perf finding 2, 2026-09 re-audit split)
      * — everything the original single method did AFTER its authorization check, unchanged.
@@ -484,6 +514,96 @@ public class AppointmentTransitionService {
             registerEviction(targets, null);
         }
         return targets;
+    }
+
+    /**
+     * Batched multi-VISIT decline (Phase 337 perf re-audit, Finding 1) — the O(1)-statement analogue
+     * of {@link #declineAppointmentItemsAfterAuth} for every appointment-visit {@code
+     * BookingService#declineFutureConfirmed} needs to decline in ONE cascade call, instead of ~4
+     * round trips (load items, header {@code FOR UPDATE} lock, freshness re-check, header collapse)
+     * PER DISTINCT appointment. Shared by all three {@code declineFutureConfirmed} callers — salon
+     * closure, master removal, and master self-delete (Phase 337) — REUSE-FIRST: one batched leg,
+     * never a per-cascade near-duplicate.
+     *
+     * <p><b>No authorization of its own.</b> Exactly like the single-visit no-authorization overload
+     * ({@link #declineAppointmentItems(UUID, List, AppointmentProviderNoteRequest, boolean)}), this
+     * method trusts the caller completely: {@code BookingService#declineFutureConfirmed} either
+     * already authorized every appointment id in {@code bookingIdsByAppointmentId} (owner-initiated
+     * cascades, via ONE batched call to {@link AuthorizationService#enforceCanManageAppointments(UUID,
+     * java.util.Collection, Map)} BEFORE calling here — superseded from an earlier per-visit loop over
+     * the single-id {@link AuthorizationService#enforceCanManageAppointment(UUID, UUID, Map)} overload,
+     * see that batched method's own Javadoc) or has already established authority a different way
+     * ({@code skipProviderAuthorization} — the master self-delete cascade). Do not add a caller that
+     * skips that step.
+     *
+     * <p>Mechanism, mirroring {@link BookingRepository#declineConfirmedBulk}'s standalone-leg
+     * pattern, widened to also cover the header:
+     * <ol>
+     *   <li>ONE bulk header lock ({@link AppointmentRepository#lockHeadersIfConfirmedBulk}) — every
+     *       header in {@code bookingIdsByAppointmentId.keySet()}, locked in ascending id order so two
+     *       cascades racing over an overlapping header set can never deadlock against each other —
+     *       the same canonical appointments-before-bookings lock order every per-item path already
+     *       takes, just batched;</li>
+     *   <li>ONE bulk conditional write — reuses {@link BookingRepository#declineConfirmedBulk} AS-IS
+     *       (D5: the note is always {@code null} for this cascade, identical to the standalone leg)
+     *       over the FLATTENED set of every targeted child id across every visit; the {@code WHERE
+     *       status = 'CONFIRMED'} clause IS the freshness re-check, evaluated per row inside the one
+     *       statement — there is no separate {@code SELECT} the way the per-visit path's {@link
+     *       BookingRepository#findConfirmedIdsByAppointmentId} needed, because this statement folds
+     *       "check" and "act" together exactly as {@code declineConfirmedBulk}'s own Javadoc explains
+     *       for the standalone leg;</li>
+     *   <li>ONE bulk header collapse ({@link
+     *       AppointmentRepository#collapseHeadersIfNoConfirmedSiblingsRemainBulk}) over every header
+     *       this call actually locked in step 1.</li>
+     * </ol>
+     * Total: 3 statements for the WHOLE cascade, regardless of how many distinct appointment-visits
+     * it touches — down from {@code ~4 × V} for {@code V} distinct visits under the per-visit path.
+     *
+     * <p><b>Semantics preserved bit-for-bit against the per-visit path this replaces:</b> which legs
+     * get declined (a child is declined iff it was CONFIRMED at the write statement's own arrival at
+     * that row — the exact predicate the per-visit path's post-lock freshness recheck applied); header
+     * status transitions (a header collapses iff it was CONFIRMED and, after the write, has no
+     * CONFIRMED child left); no header note is ever written, no child note either (D5); eviction and
+     * the D12 outbox pick are untouched — this method returns only declined booking ids, never
+     * entities, and the caller performs its own representative pick and after-commit eviction exactly
+     * as before, unaffected by this change.
+     *
+     * @param bookingIdsByAppointmentId every appointment-visit to decline, appointmentId → its
+     *                                   targeted CONFIRMED child ids — every id already known
+     *                                   CONFIRMED at the caller's own candidate scan, moments earlier
+     *                                   in this SAME transaction; may be empty, in which case this
+     *                                   method issues NO query at all
+     * @param reason                     {@link CancellationReason#name()} stamped on every declined
+     *                                   child and every collapsed header — always {@code
+     *                                   PROVIDER_UNAVAILABLE} for this cascade's three callers
+     * @param now                        the SAME {@code now} the caller resolved once at the top of
+     *                                   its own scan (D3) — stamped onto every affected child's
+     *                                   {@code updated_at}, never re-read here
+     * @return every booking id, across every visit, that THIS CALL actually transitioned to {@code
+     *         DECLINED} — a subset of the union of {@code bookingIdsByAppointmentId}'s values, never
+     *         a superset
+     */
+    Set<UUID> declineAppointmentItemsBulk(
+            Map<UUID, List<UUID>> bookingIdsByAppointmentId, CancellationReason reason, OffsetDateTime now) {
+        if (bookingIdsByAppointmentId.isEmpty()) {
+            return Set.of();
+        }
+
+        List<UUID> lockedAppointmentIds =
+                appointmentRepository.lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet());
+
+        List<UUID> allBookingIds = bookingIdsByAppointmentId.values().stream()
+                .flatMap(List::stream)
+                .toList();
+        List<UUID> declinedIds = bookingRepository.declineConfirmedBulk(
+                allBookingIds, reason.name(), null, now.toInstant());
+
+        if (!lockedAppointmentIds.isEmpty()) {
+            appointmentRepository.collapseHeadersIfNoConfirmedSiblingsRemainBulk(
+                    lockedAppointmentIds, BookingStatus.DECLINED.name(), reason.name(), null);
+        }
+
+        return Set.copyOf(declinedIds);
     }
 
     /**

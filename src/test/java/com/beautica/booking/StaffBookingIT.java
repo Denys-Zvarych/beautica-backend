@@ -728,6 +728,21 @@ class StaffBookingIT extends AbstractIntegrationTest {
          * <p>Measured against an isolated, freshly-seeded master per N (own salon, own working-hours
          * row, distinct guest phone) so no fixture reuse across N could shift the count via warm
          * caches or an already-loaded row.
+         *
+         * <p><b>Re-baselined again (Phase 337 QA CRITICAL fix), 14 &rarr; 15, then back to 14.</b>
+         * {@code BookingSlotLockGuard.lockMasterAndAssertFree} first grew a SECOND statement here —
+         * {@code MasterBookabilityGuard#assertStillBookableAfterLock}, a scalar {@code
+         * MasterRepository#isBookableFresh} SELECT — immediately after the per-master advisory lock
+         * and before the former {@code existsOverlap}, closing a race where a create queued behind a
+         * concurrent self-delete on that SAME lock could otherwise insert a CONFIRMED booking for the
+         * master the self-delete had just detached. The Phase 337 follow-up (LOW perf) then fused
+         * that bookability re-check and the overlap re-check into ONE statement —
+         * {@code BookingRepository#findPostLockBookabilityAndOverlap}, run by
+         * {@code PostLockSlotGuard#assertStillFreeAfterLock} — so the count returns to 14 while the
+         * race-closing behaviour is unchanged (pinned by
+         * {@code MasterSelfDeleteCreateRaceConcurrencyIT}). Fixed, not per-item either way: this and
+         * its N=10 sibling moved together at each re-baseline, so the anti-N+1 property the pair
+         * exists to pin is unaffected.
          */
         private static final long CREATE_FIXED_STATEMENTS = 14L;
 

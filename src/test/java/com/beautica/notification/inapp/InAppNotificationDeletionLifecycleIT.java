@@ -34,6 +34,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * MasterSelfDeleteBookingDisposalIT} do — reusing {@link ClientSelfDeleteTestFixtures} and {@link
  * BookingTestFixtures} rather than hand-rolling parallel builders.
  *
+ * <p><b>Carry-over from Phase 332 — test 3 rewritten by Phase 337 (2026-09-28), not deleted.</b>
+ * Phase 332's original {@code should_deleteFeedRowsReferencingAppointment_when_
+ * masterSelfDeleteCollapsesOnlyLegHeader} pinned the THEN-current behaviour: a master self-delete
+ * hard-deleted every future booking (Phase 301 Q3), collapsing an only-leg appointment header and
+ * CASCADE-deleting any feed row that referenced it. Phase 337 reverses Q3 — future bookings are now
+ * DECLINED and KEPT, so an only-leg header is DECLINED and KEPT too, never deleted, and a feed row
+ * referencing it now SURVIVES instead of CASCADE-deleting. See {@link
+ * #should_keepFeedRowsReferencingAppointment_when_masterSelfDeleteDeclinesOnlyLegHeader} below —
+ * the assertion direction flipped, the test was not weakened or removed.
+ *
  * <p>Feed rows are seeded via a raw-SQL {@code INSERT} (the {@link #insertFeedRow} helper below),
  * mirroring {@link com.beautica.notification.inapp.repository.InAppNotificationRepository
  * #insertIgnoringDuplicate}'s exact column list and
@@ -60,8 +70,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       — if {@code booking_id} were {@code SET NULL} instead of {@code CASCADE}, the "future-booking
  *       row gone" assertion would fail (the row would survive with {@code booking_id = NULL} instead
  *       of disappearing).</li>
- *   <li>{@link #should_deleteFeedRowsReferencingAppointment_when_masterSelfDeleteCollapsesOnlyLegHeader}
- *       — same reasoning, for {@code appointment_id}.</li>
+ *   <li>{@link #should_keepFeedRowsReferencingAppointment_when_masterSelfDeleteDeclinesOnlyLegHeader}
+ *       — Phase 337: if the appointment header were still hard-deleted on this path (a Phase 337
+ *       regression back to Q3), the "row still exists" assertion on {@code appointmentRow} would
+ *       fail — the feed row would CASCADE-delete along with the header instead of surviving.</li>
  *   <li>{@link #should_hardDeleteRecipientRows_andNullSubjectUserId_when_ownerRemovesMasterFromSalon}
  *       — two independent flips: if {@code recipient_user_id} were not {@code CASCADE}, the removed
  *       master's own row would survive; if {@code subject_user_id} were {@code CASCADE} instead of
@@ -186,18 +198,19 @@ class InAppNotificationDeletionLifecycleIT extends AbstractIntegrationTest {
         assertThat(bookingIdOf(pastRow)).isEqualTo(pastBookingId);
     }
 
-    // ── 3. Master self-delete's booking disposal — appointment_id CASCADE ──────────────────────
+    // ── 3. Master self-delete's booking disposal — the header is KEPT (Phase 337), so the row
+    //        pointing at appointment_id SURVIVES too; no CASCADE is triggered on this path ────────
 
     @Test
-    @DisplayName("DELETE /api/v1/users/me (SALON_MASTER) — a feed row keyed by appointment_id is "
-            + "gone once its header collapses (the departing master's only leg); a sibling row "
-            + "about a past booking of the same recipient survives")
-    void should_deleteFeedRowsReferencingAppointment_when_masterSelfDeleteCollapsesOnlyLegHeader()
+    @DisplayName("DELETE /api/v1/users/me (SALON_MASTER) — Phase 337 reverses the old hard-delete: "
+            + "the departing master's only-leg header is DECLINED and KEPT, so a feed row keyed by "
+            + "appointment_id SURVIVES too, exactly like a sibling row about a past booking")
+    void should_keepFeedRowsReferencingAppointment_when_masterSelfDeleteDeclinesOnlyLegHeader()
             throws Exception {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         UUID clientId = csd.createClient();
         UUID appointmentId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
-        csd.insertBooking(clientId, salon, "CONFIRMED", FUTURE, appointmentId);
+        UUID onlyLegId = csd.insertBooking(clientId, salon, "CONFIRMED", FUTURE, appointmentId);
         UUID pastBookingId = csd.insertBooking(clientId, salon, "COMPLETED", PAST);
 
         UUID appointmentRow = UUID.randomUUID();
@@ -217,14 +230,20 @@ class InAppNotificationDeletionLifecycleIT extends AbstractIntegrationTest {
                 new HttpEntity<>(fixtures.bearerHeaders(token)), Void.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(csd.bookingExists(onlyLegId))
+                .as("sanity — Phase 337: the departing master's own leg is DECLINED and KEPT, "
+                        + "mirroring MasterSelfDeleteBookingDisposalIT")
+                .isTrue();
         assertThat(csd.appointmentExists(appointmentId))
-                .as("sanity — a header whose only leg belonged to the departing master is "
-                        + "collapsed (hard-deleted), mirroring MasterSelfDeleteBookingDisposalIT")
-                .isFalse();
+                .as("sanity — a header whose only leg belonged to the departing master is DECLINED "
+                        + "and KEPT (Phase 337), never collapsed/hard-deleted, since every declined "
+                        + "booking still exists")
+                .isTrue();
         assertThat(rowCount(appointmentRow))
-                .as("the feed row pointing at the now-collapsed appointment header must be gone "
-                        + "via appointment_id CASCADE")
-                .isZero();
+                .as("the feed row pointing at the still-existing appointment header must SURVIVE — "
+                        + "appointment_id CASCADE is never triggered, because the appointments row "
+                        + "is never deleted on this path")
+                .isEqualTo(1);
         assertThat(rowCount(pastRow))
                 .as("the sibling row about the untouched past booking must survive")
                 .isEqualTo(1);

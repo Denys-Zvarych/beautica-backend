@@ -18,6 +18,7 @@ import com.beautica.booking.enums.CancellationReason;
 import com.beautica.booking.repository.AppointmentRepository;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.SalonClosureBookingCandidate;
+import com.beautica.booking.repository.TestPostLockSlotCheck;
 import com.beautica.common.exception.BookingElapsedException;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ClientBookingConflictException;
@@ -66,6 +67,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
@@ -107,8 +109,6 @@ class BookingServiceTest {
     private AuthorizationService authz;
     @Mock
     private NotificationOutboxService outboxService;
-    @Mock
-    private com.beautica.notification.repository.NotificationOutboxRepository notificationOutboxRepository;
     @Mock
     private SlotCalculationService slotCalculationService;
     @Mock
@@ -159,7 +159,6 @@ class BookingServiceTest {
                 salonRepository,
                 authz,
                 outboxService,
-                notificationOutboxRepository,
                 slotCalculationService,
                 reviewRepository,
                 clientReviewRepository,
@@ -194,6 +193,15 @@ class BookingServiceTest {
         // is STRICT_STUBS) keeps every pre-existing standalone-path test's intent unchanged; the
         // dedicated negative tests for this recheck override it to false explicitly.
         lenient().when(bookingRepository.existsConfirmedById(any())).thenReturn(true);
+
+        // Phase 337 fix: doCreateBooking now re-checks bookability AFTER the advisory lock
+        // (PostLockSlotGuard, closing the self-delete-race CRITICAL) fused, since the Phase 337
+        // follow-up, with the overlap re-check into a single findPostLockBookabilityAndOverlap
+        // statement. Defaulting to "still bookable, no overlap" here (lenient — only the create
+        // tests reach this call) keeps every pre-existing create-path test's intent unchanged; the
+        // dedicated negative tests below override it per-scenario.
+        lenient().when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -339,7 +347,8 @@ class BookingServiceTest {
     void should_createBooking_when_slotAvailableAndNoConflict() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -365,7 +374,8 @@ class BookingServiceTest {
 
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(ownerMaster));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(ownerMsa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
 
         Booking saved = buildBooking(bookingId, client, ownerMaster, ownerMsa, BookingStatus.CONFIRMED);
@@ -408,7 +418,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(true);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, true)));
         stubCreateSlotAvailable();
 
         assertThatThrownBy(() -> bookingService.createBooking(clientId, null, validRequest()))
@@ -451,7 +462,7 @@ class BookingServiceTest {
         // every other client racing for the same popular master may be waiting on) is never
         // touched for a conflict that is entirely about this client's own calendar.
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
-        verify(bookingRepository, never()).existsOverlap(any(), any(), any());
+        verify(bookingRepository, never()).findPostLockBookabilityAndOverlap(any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
     }
 
@@ -462,7 +473,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(saved));
@@ -480,7 +492,7 @@ class BookingServiceTest {
         inOrder.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
         inOrder.verify(bookingRepository).findFirstConflictingClientBookingId(eq(clientId), any(), any());
         inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
-        inOrder.verify(bookingRepository).existsOverlap(eq(masterId), any(), any());
+        inOrder.verify(bookingRepository).findPostLockBookabilityAndOverlap(eq(masterId), any(), any());
 
         // The master lock still uses the PLAIN (non-fused) query — the 3s lock_timeout set by
         // acquireClientAdvisoryLockWithTimeout is transaction-scoped (set_config(..., true)),
@@ -576,7 +588,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(salonMaster));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, salonMaster, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -601,7 +614,8 @@ class BookingServiceTest {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId))
                 .thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -675,7 +689,8 @@ class BookingServiceTest {
     void should_proceedPastTimeCheck_when_startsAtIsExactly15MinutesFromNow() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -726,7 +741,8 @@ class BookingServiceTest {
                 masterServiceId, master, serviceDef, new BigDecimal("250.00"), 45);
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msaWithOverrides));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msaWithOverrides, BookingStatus.CONFIRMED);
         setField(saved, "priceAtBooking", new BigDecimal("250.00"));
@@ -749,7 +765,8 @@ class BookingServiceTest {
     void should_fallBackToBaseValues_when_noOverrides() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -770,7 +787,8 @@ class BookingServiceTest {
     void should_enqueueNewBookingNotification_when_bookingCreated() {
         when(masterRepository.findByIdWithUserAndSalon(masterId)).thenReturn(Optional.of(master));
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, masterServiceId)).thenReturn(Optional.of(msa));
-        when(bookingRepository.existsOverlap(any(), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(userRepository.findById(clientId)).thenReturn(Optional.of(client));
         Booking saved = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
         when(bookingRepository.saveAndFlush(any())).thenReturn(saved);
@@ -1079,15 +1097,13 @@ class BookingServiceTest {
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(earliestBookingId, appointmentId, masterId, earliestStart),
                         new SalonClosureBookingCandidate(laterBookingId, appointmentId, masterId, laterStart)));
-        Booking survivingSibling = buildBookingStartingAt(
-                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
-        // declineAppointmentItems' own G3 batched freshness recheck filters out whatever raced away
-        // internally — this simulates it returning ONLY the surviving sibling, i.e. the
+        // declineAppointmentItemsBulk's own batched freshness recheck filters out whatever raced
+        // away internally — this simulates it returning ONLY the surviving sibling, i.e. the
         // earliest-startsAt item (the pre-fix D12 pick) lost its own race.
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
-                any(), eq(false), any()))
-                .thenReturn(List.of(survivingSibling));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId, List.of(earliestBookingId, laterBookingId))),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE), any()))
+                .thenReturn(Set.of(laterBookingId));
 
         bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
 
@@ -1096,13 +1112,17 @@ class BookingServiceTest {
     }
 
     @Test
-    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — perf finding 2, 2026-09 re-audit: "
-            + "every appointment-visit in the cascade shares ONE management-access memo instance, "
-            + "never a fresh one per visit — the memo is what lets AuthorizationService answer the "
-            + "SALON_OWNER ownership question at most once per distinct salon for the WHOLE "
-            + "cascade instead of once per visit (see AuthorizationServiceTest for the "
-            + "existsByIdAndOwnerId query-count proof at the AuthorizationService layer itself)")
-    void should_shareOneManagementAccessMemo_when_cascadeSpansMultipleAppointmentVisits() {
+    @DisplayName("declineFutureConfirmedBookingsForSalonClosure — perf MEDIUM, phase 337 cycle-2 "
+            + "audit: the WHOLE cascade's appointment-visit authorization is now ONE call to "
+            + "enforceCanManageAppointments, carrying every distinct appointment-visit id AND the "
+            + "pre-seeded management-access memo — never one enforceCanManageAppointment call per "
+            + "visit (superseded: the memo instance used to be proven shared ACROSS repeated calls; "
+            + "now there is only one call, so there is nothing left to share it across — see "
+            + "AuthorizationServiceTest for the existsByIdAndOwnerId query-count proof, and its "
+            + "'agrees with the single-id overload' tests, at the AuthorizationService layer itself). "
+            + "Authorization still runs BEFORE the batched decline write (perf re-audit, 2026-09, "
+            + "Finding 1, unchanged by this fix)")
+    void should_issueOneBatchedAuthorizationCall_when_cascadeSpansMultipleAppointmentVisits() {
         UUID actorId = UUID.randomUUID();
         UUID salonId = UUID.randomUUID();
         UUID appointmentId1 = UUID.randomUUID();
@@ -1117,30 +1137,28 @@ class BookingServiceTest {
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(bookingId1, appointmentId1, masterId, start1),
                         new SalonClosureBookingCandidate(bookingId2, appointmentId2, masterId, start2)));
-        Booking declined1 = buildBookingStartingAt(bookingId1, client, master, msa, BookingStatus.CONFIRMED, start1);
-        Booking declined2 = buildBookingStartingAt(bookingId2, client, master, msa, BookingStatus.CONFIRMED, start2);
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId1), eq(List.of(bookingId1)), any(), eq(false), any()))
-                .thenReturn(List.of(declined1));
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId2), eq(List.of(bookingId2)), any(), eq(false), any()))
-                .thenReturn(List.of(declined2));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(any(), any(), any()))
+                .thenReturn(Set.of(bookingId1, bookingId2));
 
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Collection<UUID>> appointmentIdsCaptor = ArgumentCaptor.forClass(Collection.class);
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<AuthorizationService.MemoKey, Boolean>> memoCaptor = ArgumentCaptor.forClass(Map.class);
 
         bookingService.declineFutureConfirmedBookingsForSalonClosure(actorId, salonId);
 
-        verify(appointmentTransitionService, times(2)).declineAppointmentItems(
-                eq(actorId), any(), any(), any(), eq(false), memoCaptor.capture());
-        List<Map<AuthorizationService.MemoKey, Boolean>> memos = memoCaptor.getAllValues();
-        assertThat(memos.get(0))
-                .as("the SAME memo instance is threaded through every appointment-visit call in "
-                        + "one cascade — never a fresh map per visit")
-                .isSameAs(memos.get(1));
-        assertThat(memos.get(0).get(new AuthorizationService.MemoKey(actorId, salonId)))
+        verify(authz, times(1)).enforceCanManageAppointments(
+                eq(actorId), appointmentIdsCaptor.capture(), memoCaptor.capture());
+        verify(authz, never()).enforceCanManageAppointment(any(), any(), any());
+        assertThat(appointmentIdsCaptor.getValue())
+                .as("every distinct appointment-visit in the cascade is authorized in the ONE call")
+                .containsExactlyInAnyOrder(appointmentId1, appointmentId2);
+        assertThat(memoCaptor.getValue().get(new AuthorizationService.MemoKey(actorId, salonId)))
                 .as("pre-seeded true from the ownership self-assertion this method already ran")
                 .isTrue();
+        verify(appointmentTransitionService).declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId1, List.of(bookingId1), appointmentId2, List.of(bookingId2))),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE), any());
     }
 
     // ── declineFutureConfirmedBookingsForMasterRemoval (Phase 298 — master-removal sibling of the
@@ -1235,14 +1253,10 @@ class BookingServiceTest {
                 .thenReturn(List.of(
                         new SalonClosureBookingCandidate(earliestBookingId, appointmentId, targetMasterId, earliestStart),
                         new SalonClosureBookingCandidate(laterBookingId, appointmentId, targetMasterId, laterStart)));
-        Booking earliestBooking = buildBookingStartingAt(
-                earliestBookingId, client, master, msa, BookingStatus.CONFIRMED, earliestStart);
-        Booking laterBooking = buildBookingStartingAt(
-                laterBookingId, client, master, msa, BookingStatus.CONFIRMED, laterStart);
-        when(appointmentTransitionService.declineAppointmentItems(
-                eq(actorId), eq(appointmentId), eq(List.of(earliestBookingId, laterBookingId)),
-                any(), eq(false), any()))
-                .thenReturn(List.of(earliestBooking, laterBooking));
+        when(appointmentTransitionService.declineAppointmentItemsBulk(
+                eq(Map.of(appointmentId, List.of(earliestBookingId, laterBookingId))),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE), any()))
+                .thenReturn(Set.of(earliestBookingId, laterBookingId));
 
         bookingService.declineFutureConfirmedBookingsForMasterRemoval(actorId, salonId, targetMasterId);
 

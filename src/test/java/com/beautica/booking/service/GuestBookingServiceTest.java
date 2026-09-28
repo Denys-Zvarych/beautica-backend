@@ -7,6 +7,7 @@ import com.beautica.booking.entity.Booking;
 import com.beautica.booking.enums.BookingSource;
 import com.beautica.booking.enums.BookingStatus;
 import com.beautica.booking.repository.BookingRepository;
+import com.beautica.booking.repository.TestPostLockSlotCheck;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
@@ -79,6 +80,14 @@ class GuestBookingServiceTest {
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
                 java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC));
+
+        // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
+        // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused
+        // since the Phase 337 follow-up with the overlap re-check into one statement. Defaulting to
+        // "still bookable, no overlap" here (lenient — only the create-path tests reach this call)
+        // keeps every pre-existing create-path test's intent unchanged.
+        lenient().when(bookingRepository.findPostLockBookabilityAndOverlap(any(), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
     }
 
     /**
@@ -174,7 +183,8 @@ class GuestBookingServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(true);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, true)));
         // On schedule on purpose: the 409 this test asserts must come from the OVERLAP check, not
         // from the create-path schedule-fit gate (which would return the same status for the wrong
         // reason and defang the assertion).
@@ -324,7 +334,8 @@ class GuestBookingServiceTest {
                         masterService(secondServiceId, "Педикюр"),
                         masterService(thirdServiceId, "Брови")));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
         stubVisitSlotAvailable(startsAt, List.of(serviceId, secondServiceId, thirdServiceId));
 
@@ -358,7 +369,8 @@ class GuestBookingServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdInWithGraph(masterId, Set.of(serviceId)))
                 .thenReturn(List.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
         stubVisitSlotAvailable(startsAt, List.of(serviceId));
 
@@ -387,7 +399,8 @@ class GuestBookingServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService()));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         stubSlotAvailable(startsAt);
     }
 
@@ -435,7 +448,8 @@ class GuestBookingServiceTest {
         when(masterServiceRepository.findByMasterIdAndIdWithGraph(masterId, serviceId))
                 .thenReturn(Optional.of(masterService(serviceId, "Манікюр {cancelUrl} {date}")));
         when(bookingRepository.acquireAdvisoryLockWithTimeout(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlap(eq(masterId), any(), any())).thenReturn(false);
+        when(bookingRepository.findPostLockBookabilityAndOverlap(eq(masterId), any(), any()))
+                .thenReturn(Optional.of(new TestPostLockSlotCheck(true, false)));
         when(bookingRepository.saveAll(any())).thenAnswer(inv -> inv.getArgument(0));
         stubSlotAvailable(startsAt);
 

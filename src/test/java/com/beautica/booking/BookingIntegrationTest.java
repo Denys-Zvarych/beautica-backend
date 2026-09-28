@@ -509,7 +509,7 @@ class BookingIntegrationTest extends AbstractIntegrationTest {
         //                                        had the gate rejected, existsOverlap would never be reached
         //   * existsOverlap ran and rejected   → verify(existsOverlap), times(1) by default
         //   * the GIST backstop did NOT fire   → never(saveAndFlush): no INSERT was even attempted
-        verify(bookingRepository).existsOverlap(any(UUID.class), any(), any());
+        verify(bookingRepository).findPostLockBookabilityAndOverlap(any(UUID.class), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
 
         // The gate's own booking read, pinned by NAME (2026-08-11): it must be the two-column

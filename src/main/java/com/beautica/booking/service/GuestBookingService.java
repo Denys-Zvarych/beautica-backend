@@ -346,7 +346,8 @@ public class GuestBookingService {
         // lock/overlap/save sequence instead of becoming a third copy of it. Byte-for-byte the same
         // repository calls, the same 409 message and the same DataIntegrityViolationException
         // translation this method has always made — see that class's Javadoc.
-        BookingSlotLockGuard.lockMasterAndAssertFree(bookingRepository, master.getId(), startsAt, endsAt);
+        BookingSlotLockGuard.lockMasterAndAssertFree(
+                bookingRepository, master.getId(), startsAt, endsAt);
 
         // Freeze the RANGE ceiling beside the floor (V119), by the same rule and at the same
         // moment as the registered-client path (BookingService#doCreateBooking). Null = single

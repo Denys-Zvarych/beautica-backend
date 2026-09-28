@@ -344,19 +344,25 @@ public class AppointmentService {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
 
-        // Overlap against existing CONFIRMED bookings, checked ONCE over the whole visit span. The
-        // chained items are contiguous by construction AT CREATE TIME (assertContiguous:
-        // item[i].startsAt == item[i-1].endsAt, no gaps) — assertContiguous is never re-run after
-        // creation, so this holds only for THIS transaction, not for the visit's lifetime; a later
-        // per-item reschedule (phase 30.1) legally separates items with gaps — so the union of all
-        // per-item intervals is EXACTLY [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
+        // POST-LOCK BOOKABILITY + OVERLAP RE-CHECK (Phase 337 QA, CRITICAL race; fused into one
+        // statement, Phase 337 follow-up LOW perf) — the multi-service counterpart of the identical
+        // re-check in BookingService#doCreateBooking. `master` was resolved and bookability-filtered
+        // BEFORE this lock; if this create queued behind a concurrent self-delete for the SAME
+        // master on this SAME lock, `master` is now a stale, already-validated managed entity. See
+        // PostLockSlotGuard's javadoc for why a re-fetch of the entity would not observe the
+        // concurrent detach, and why bookability and overlap are now one query, not two.
+        //
+        // Overlap is checked ONCE over the whole visit span. The chained items are contiguous by
+        // construction AT CREATE TIME (assertContiguous: item[i].startsAt == item[i-1].endsAt, no
+        // gaps) — assertContiguous is never re-run after creation, so this holds only for THIS
+        // transaction, not for the visit's lifetime; a later per-item reschedule (phase 30.1)
+        // legally separates items with gaps — so the union of all per-item intervals is EXACTLY
+        // [firstStart, lastEnd) — a single span check is logically identical to N per-item checks,
         // but holds the contended per-master advisory lock for one round-trip instead of N. The
         // per-row no_overlapping_bookings GIST EXCLUDE remains the authoritative backstop on each
         // insert (see the DataIntegrityViolation→409 mapping below), so an overlapping chain still
         // yields the same 409; correctness is unchanged.
-        if (bookingRepository.existsOverlap(master.getId(), firstStart, lastEnd)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
-        }
+        PostLockSlotGuard.assertStillFreeAfterLock(bookingRepository, master.getId(), firstStart, lastEnd);
 
         Appointment appointment = Appointment.builder()
                 .client(client)
