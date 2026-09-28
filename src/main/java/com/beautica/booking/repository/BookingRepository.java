@@ -1652,15 +1652,16 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("from") OffsetDateTime from,
             @Param("to") OffsetDateTime to);
 
-    // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
+    // ── CLIENT account self-deletion booking cascade (Phase 338 — REVERSES Phase 300 D4's
+    // cancel-then-hard-delete; every future CONFIRMED booking is KEPT, cancelled and detached) ──
 
     /**
      * Client-scoped sibling of {@link #findConfirmedFutureBySalonId} / {@link
      * #findConfirmedFutureByMasterId} for the CLIENT account self-deletion cascade
-     * ({@code BookingService#findFutureConfirmedBookingIdsForClient}): every {@code CONFIRMED}
-     * booking of {@code clientId} whose {@code startsAt} is strictly after {@code now}. Reuses
-     * {@link SalonClosureBookingCandidate} as-is — same scope-agnostic shape, only the {@code
-     * WHERE} predicate differs, exactly as the master-removal sibling already does.
+     * ({@code BookingService#findFutureConfirmedBookingCandidatesForClient}): every {@code
+     * CONFIRMED} booking of {@code clientId} whose {@code startsAt} is strictly after {@code now}.
+     * Reuses {@link SalonClosureBookingCandidate} as-is — same scope-agnostic shape, only the
+     * {@code WHERE} predicate differs, exactly as the master-removal sibling already does.
      *
      * <p><b>Unlike the salon/master siblings, the caller does NOT reuse {@link
      * #declineConfirmedBulk} / the shared {@code declineFutureConfirmed} body.</b> A client
@@ -1691,10 +1692,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     /**
      * Every booking row still attached to {@code clientId} — the CLIENT account self-deletion
      * detach loop ({@code ClientAccountDeletionService}). Called AFTER the future-{@code
-     * CONFIRMED} bookings have already been cancelled and physically deleted
-     * ({@link #findConfirmedFutureByClientId} + {@code deleteAllByIdInBatch}), so every row this
-     * returns is, by construction, past or terminal — exactly the set D4 says to detach, never
-     * delete.
+     * CONFIRMED} bookings have already been cancelled through the ordinary client-cancel path
+     * (Phase 338 — KEPT, never physically deleted), so this now returns EVERY row the client ever
+     * held: past/terminal rows unchanged since Phase 300, plus the just-cancelled future rows —
+     * every one of them detached here, together, in the same uniform loop.
      *
      * <p>No {@code JOIN FETCH}: the caller only ever calls {@link
      * com.beautica.booking.entity.Booking#detachClient(String, java.time.Instant)} on each row,
@@ -1706,32 +1707,6 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
      * client, not a hot path a caller could abuse for repeated large scans.
      */
     List<Booking> findByClientId(UUID clientId);
-
-    /**
-     * The subset of {@code appointmentIds} that still have at least one surviving {@code bookings}
-     * row — the set-based childless-header probe the CLIENT self-deletion cascade uses to decide,
-     * for EVERY remaining visit header in one round trip, whether it survives (detach) or is
-     * physically deleted (Phase 300 D4), after its own future {@code CONFIRMED} legs have already
-     * been cancelled and deleted.
-     *
-     * <p><b>Perf finding 1 (2026-09 audit, HIGH).</b> Replaces a per-appointment {@code
-     * existsByAppointmentId} probe called once per surviving header inside a Java loop — one {@code
-     * SELECT EXISTS} round trip each, ~1.5-4.5s of sequential Neon latency for a client with 150
-     * appointment headers, all held inside the open write transaction's row lock on the {@code
-     * users} row. This method partitions in ONE query instead: the caller collects the result into a
-     * {@code Set<UUID>} and checks membership in memory. Already index-served by the partial index
-     * {@code idx_bookings_appointment} (V125) — same index the replaced method used.
-     *
-     * <p>Deliberately {@code DISTINCT}: a visit header can have several surviving child bookings, and
-     * the caller only needs the set of DISTINCT header ids that have at least one.
-     *
-     * <p><b>Guard the empty case at the call site.</b> An empty {@code appointmentIds} collection
-     * must never reach this query — {@code appointment_id IN ()} is either a SQL syntax error or an
-     * always-false predicate depending on dialect, and either way that round trip is wasted when the
-     * caller already knows the answer is "no surviving ids at all".
-     */
-    @Query("SELECT DISTINCT b.appointment.id FROM Booking b WHERE b.appointment.id IN :appointmentIds")
-    List<UUID> findAppointmentIdsWithSurvivingBookings(@Param("appointmentIds") Collection<UUID> appointmentIds);
 
     /**
      * Batched twin of {@link #findByIdWithFullGraph} for the salon-deletion booking cascade (perf

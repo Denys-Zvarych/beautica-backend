@@ -2098,37 +2098,130 @@ public class BookingService {
         declineFutureConfirmed(actorUserId, candidates, salonId, now, OutboxEventType.MASTER_REMOVED, false);
     }
 
-    // ── CLIENT account self-deletion booking cascade (Phase 300 D4) ───────────
+    // ── CLIENT account self-deletion booking cascade (Phase 338 — REVERSES Phase 300 D4's
+    // cancel-then-hard-delete; every future CONFIRMED booking is now CANCELLED and KEPT, detached
+    // with the same sentinel past bookings already get — mirrors the master self-delete reversal
+    // Phase 337 already made for DECLINED bookings) ───────────────────────────
+
+    /**
+     * Per-client advisory lock seam for {@code ClientAccountDeletionService} (Phase 338 — mirrors
+     * {@link #acquireMasterLockForSelfDelete}'s own mechanism verbatim, salt {@code 1} instead of
+     * salt {@code 0}). MUST be called BEFORE {@link #findFutureConfirmedBookingCandidatesForClient},
+     * not after, and held across that read, the caller's own cap check, and every {@link
+     * #cancelBooking(UUID, UUID, CancelBookingRequest)} call the cascade makes.
+     *
+     * <p><b>Why this is needed.</b> {@code ClientAccountDeletionService#deleteOwnAccount} takes a
+     * {@code SELECT ... FOR UPDATE} row lock on the client's OWN {@code users} row — a different
+     * Postgres primitive from the {@code pg_advisory_xact_lock} this method takes, and the two do
+     * NOT serialize against each other. Without this seam, a concurrent {@code POST /bookings} /
+     * {@code POST /appointments} for this SAME client — which already takes this SAME salt-1 lock
+     * (via {@link #acquireClientLock(UUID)}) before its own write — could commit a brand-new
+     * CONFIRMED booking in the gap between this cascade's candidate scan and the eventual {@code
+     * users} row hard-delete. The widened {@code chk_bookings_guest_fields} CHECK (V162) already
+     * stops that booking from silently SURVIVING attached to a deleted client — the FK's {@code ON
+     * DELETE SET NULL} action would write a half-detached row satisfying no arm of that CHECK,
+     * aborting the whole hard-delete with a constraint violation instead of a silent corruption —
+     * but that failure mode is a spurious 500 on an otherwise legitimate concurrent request, not a
+     * clean, expected outcome. Acquiring this lock first removes even that: the two requests now
+     * fully serialize on the SAME lock, exactly like the master path {@link
+     * #acquireMasterLockForSelfDelete} already protects.
+     *
+     * @param clientId the deleting client's own id
+     * @throws BusinessException ({@code 500}) the lock could not be acquired at all (mirrors {@link
+     *                            #acquireMasterLockForSelfDelete}); a contended lock surfaces as
+     *                            {@code CannotAcquireLockException} → {@code 409} instead, via
+     *                            {@code GlobalExceptionHandler}
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void acquireClientLockForSelfDelete(UUID clientId) {
+        acquireClientLock(clientId);
+    }
 
     /**
      * Read seam for {@code ClientAccountDeletionService}: every {@code CONFIRMED} booking of
-     * {@code clientId} whose {@code startsAt} is strictly after now, as bare ids ordered by {@code
-     * startsAt} then {@code bookingId} (a deterministic replay order, the same D12-style tie-break
-     * the salon/master closure cascades use for their own per-visit representative pick).
+     * {@code clientId} whose {@code startsAt} is strictly after now, as the rich {@link
+     * SalonClosureBookingCandidate} shape (Phase 338 — widened from a bare-id return so the caller
+     * can also group by {@link SalonClosureBookingCandidate#visitKey()} for the per-visit {@code
+     * CLIENT_CANCELLED} outbox enqueue, the same D12 shape every sibling cascade in this class
+     * already uses), ordered by {@code startsAt} then {@code bookingId} — a deterministic replay
+     * order.
      *
      * <p><b>Deliberately NOT a sibling of {@link #declineFutureConfirmedBookingsForSalonClosure} /
-     * {@link #declineFutureConfirmedBookingsForMasterRemoval}.</b> Those two share the bulk {@link
-     * #declineFutureConfirmed} body because a provider-initiated cascade always declines
-     * ({@code DECLINED} / {@code PROVIDER_UNAVAILABLE}) — wrong for a client self-delete, which is
-     * client-INITIATED and must travel the ordinary {@link #cancelBooking(UUID, UUID,
-     * CancelBookingRequest)} path ({@code CANCELLED} / {@code CLIENT_CANCELLED}), one booking at a
-     * time, so each visit's header collapse/lock logic runs exactly as it would for a normal client
-     * cancel. This method performs no mutation of its own — {@code ClientAccountDeletionService}
-     * loops the returned ids through {@link #cancelBooking(UUID, UUID, CancelBookingRequest)}
-     * itself, then physically deletes the now-{@code CANCELLED} rows.
+     * {@link #declineFutureConfirmedBookingsForMasterRemoval} / {@link
+     * #disposeFutureConfirmedForMasterSelfDelete}.</b> Those three share {@link
+     * #declineFutureConfirmed}, hardcoded end-to-end to {@code DECLINED}/{@code
+     * PROVIDER_UNAVAILABLE} (the transition-legality guard, the batched {@code declineConfirmedBulk}
+     * SQL UPDATE, and {@code AppointmentTransitionService#declineAppointmentItemsBulk} all assume the
+     * DECLINED target) — wrong for a client self-delete, which is client-INITIATED ({@code
+     * CANCELLED}/{@code CLIENT_CANCELLED}) and must travel the ordinary {@link #cancelBooking(UUID,
+     * UUID, CancelBookingRequest)} path, one booking at a time, so each visit's header collapse/lock
+     * logic runs exactly as it would for a normal client cancel. Parameterising {@link
+     * #declineFutureConfirmed}'s bulk write phase for a second target status would touch every one
+     * of those layers for a call site the 50-booking cap ({@link
+     * ClientAccountDeletionService#MAX_FUTURE_BOOKINGS_PER_SELF_DELETE}) already keeps small — not
+     * worth it. This method performs no mutation of its own — {@code ClientAccountDeletionService}
+     * loops the returned candidates through {@link #cancelBooking(UUID, UUID,
+     * CancelBookingRequest)} itself, then this class's {@link #enqueueClientCancelledPerVisit(List)}
+     * enqueues the per-visit notice.
      *
-     * @param clientId the deleting client's own id — the caller already holds a row lock on that
-     *                 user, so no ownership re-check is needed here (unlike the salon/master
-     *                 siblings, which re-assert ownership of a caller-supplied scope id)
+     * @param clientId the deleting client's own id — the caller already holds this client's row
+     *                 lock (step 1) AND, since Phase 338, this client's advisory lock (via {@link
+     *                 #acquireClientLockForSelfDelete}, called BEFORE this method), so no ownership
+     *                 re-check is needed here (unlike the salon/master siblings, which re-assert
+     *                 ownership of a caller-supplied scope id)
      */
     @Transactional(propagation = Propagation.MANDATORY, readOnly = true)
-    public List<UUID> findFutureConfirmedBookingIdsForClient(UUID clientId) {
+    public List<SalonClosureBookingCandidate> findFutureConfirmedBookingCandidatesForClient(UUID clientId) {
         OffsetDateTime now = resolveNow();
         return bookingRepository.findConfirmedFutureByClientId(clientId, now).stream()
                 .sorted(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
                         .thenComparing(SalonClosureBookingCandidate::bookingId))
-                .map(SalonClosureBookingCandidate::bookingId)
                 .toList();
+    }
+
+    /**
+     * Enqueues ONE {@code CLIENT_CANCELLED} outbox row per affected VISIT (D12 — the same
+     * deterministic representative pick — lowest {@code startsAt}, tied on {@code bookingId} —
+     * every sibling per-visit cascade in this class uses), for {@code
+     * ClientAccountDeletionService}'s future-booking self-delete cascade (Phase 338). Reuses the
+     * EXISTING {@code CLIENT_CANCELLED} event type {@link GuestVisitCancellationService#cancel}
+     * already writes for a guest's whole-visit cancel — never a new event type.
+     *
+     * <p><b>Every candidate is assumed already CANCELLED when this method is called.</b> Unlike the
+     * batched provider cascades ({@link #declineFutureConfirmed}), there is no partial-success set
+     * to filter against: the caller's own {@link #cancelBooking(UUID, UUID, CancelBookingRequest)}
+     * loop either transitions every candidate or throws (aborting the whole self-delete transaction,
+     * never silently skipping one) — see {@code ClientAccountDeletionService#deleteOwnAccount}'s own
+     * step ordering.
+     *
+     * <p><b>Caller MUST call this AFTER deleting the per-booking {@code STATUS_CHANGED} rows</b> the
+     * {@code cancelBooking} loop enqueued for these SAME booking ids — {@code
+     * NotificationOutboxRepository#deleteByAggregateIdIn} is a blunt delete-by-aggregate-id with no
+     * event-type filter, so calling this method FIRST would let that later delete remove the
+     * {@code CLIENT_CANCELLED} row this method just wrote (its {@code aggregateId} is one of the
+     * same booking ids). See that service's own step-ordering comment.
+     *
+     * @param candidates every future CONFIRMED booking candidate the caller's own {@link
+     *                   #cancelBooking} loop just transitioned to CANCELLED, from {@link
+     *                   #findFutureConfirmedBookingCandidatesForClient} — may be empty, in which
+     *                   case this method enqueues nothing
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void enqueueClientCancelledPerVisit(List<SalonClosureBookingCandidate> candidates) {
+        if (candidates.isEmpty()) {
+            return;
+        }
+        Map<UUID, List<SalonClosureBookingCandidate>> byVisit = candidates.stream()
+                .collect(Collectors.groupingBy(
+                        SalonClosureBookingCandidate::visitKey, LinkedHashMap::new, Collectors.toList()));
+        for (List<SalonClosureBookingCandidate> visit : byVisit.values()) {
+            UUID representativeId = visit.stream()
+                    .min(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
+                            .thenComparing(SalonClosureBookingCandidate::bookingId))
+                    .map(SalonClosureBookingCandidate::bookingId)
+                    .orElseThrow();
+            outboxService.enqueueClientCancelled(representativeId);
+        }
     }
 
     // ── SALON_MASTER / INDEPENDENT_MASTER account self-deletion booking cascade (Phase 301;
@@ -2176,7 +2269,7 @@ public class BookingService {
      * Read seam for {@code StaffAccountSelfDeletionService}: every {@code CONFIRMED} booking of
      * {@code masterId} whose {@code startsAt} is strictly after now, as the rich {@link
      * SalonClosureBookingCandidate} shape, ordered by {@code startsAt} then {@code bookingId} — the
-     * same deterministic tie-break {@link #findFutureConfirmedBookingIdsForClient(UUID)} uses, but
+     * same deterministic tie-break {@link #findFutureConfirmedBookingCandidatesForClient(UUID)} uses, but
      * scoped by MASTER rather than by client. Backed by the EXISTING {@link
      * BookingRepository#findConfirmedFutureByMasterId} — no new query.
      *
@@ -2291,7 +2384,7 @@ public class BookingService {
      * mechanism.
      *
      * @param actorUserId the deleting master's own id — the caller already holds a row lock on
-     *                    that user (mirrors {@link #findFutureConfirmedBookingIdsForClient}'s
+     *                    that user (mirrors {@link #findFutureConfirmedBookingCandidatesForClient}'s
      *                    identical no-extra-recheck rationale for the read seam; this write seam
      *                    still re-asserts ownership of {@code masterId} explicitly below, since
      *                    unlike the read seam it actually mutates rows)
@@ -2960,6 +3053,53 @@ public class BookingService {
      * to the round trips this method already makes.
      */
     private BookingResponse cancelBooking(UUID clientUserId, Booking booking, CancelBookingRequest req) {
+        Booking saved = cancelBookingCore(clientUserId, booking, req);
+        outboxService.enqueueStatusChanged(saved.getId());
+        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
+        evictMasterCalendarAfterCommit(saved.getMaster().getId());
+        return BookingResponse.from(saved, resolveNow());
+    }
+
+    /**
+     * Batched-cancel counterpart of {@link #cancelBooking(UUID, Booking, CancelBookingRequest)},
+     * for {@link #cancelFutureConfirmedBookingsForClientSelfDelete} (Phase 338 perf audit, item 3),
+     * mirroring {@link #declineBookingForBatch}'s identical split of {@link #declineBooking}
+     * (REUSE-FIRST — the same idiom already established in this class for the sibling provider
+     * transition). Runs the IDENTICAL mutation — via the shared {@link #cancelBookingCore} — but
+     * skips both of the ordinary wrapper's own post-mutation steps, each performed ONCE by the
+     * batch caller instead of once per booking:
+     * <ul>
+     *   <li>the {@code outboxService.enqueueStatusChanged} call — this batch caller never enqueues
+     *       a per-booking {@code STATUS_CHANGED} row at all; it enqueues exactly one {@code
+     *       CLIENT_CANCELLED} row per VISIT itself, via {@link #enqueueClientCancelledPerVisit},
+     *       after every booking in the cascade has been cancelled. Not writing the per-booking row
+     *       in the first place also removes the need to ever delete it afterwards — see {@link
+     *       #cancelFutureConfirmedBookingsForClientSelfDelete}'s own Javadoc for why this closes
+     *       the security finding a blunt delete-by-aggregate-id-with-no-event-type-filter left
+     *       open;</li>
+     *   <li>the {@code registerSlotEviction} / {@code evictMasterCalendarAfterCommit} pair — the
+     *       caller registers this pair at most once PER DISTINCT MASTER across the whole cascade
+     *       instead of once per booking.</li>
+     * </ul>
+     *
+     * <p>Package-private: its one caller lives in this same package.
+     */
+    Booking cancelBookingForBatch(UUID clientUserId, Booking booking, CancelBookingRequest req) {
+        return cancelBookingCore(clientUserId, booking, req);
+    }
+
+    /**
+     * The shared mutation body behind both {@link #cancelBooking(UUID, Booking,
+     * CancelBookingRequest)} and {@link #cancelBookingForBatch} (Phase 338 perf audit, item 2/3 —
+     * extracted so the two wrappers can diverge on notification/eviction shape without forking the
+     * transition logic itself). Everything through the header collapse is byte-for-byte what
+     * {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} used to do inline before this
+     * extraction — same guard order: ownership (403) → CONFIRMED-only status (400) →
+     * read-only-after-elapse (409) → the two-phase header lock/collapse → freshness re-check (G4)
+     * → mutation. See that method's own (longer) Javadoc, still attached above, for the full
+     * rationale behind each guard.
+     */
+    private Booking cancelBookingCore(UUID clientUserId, Booking booking, CancelBookingRequest req) {
         // Existence + ownership collapse to a single uniform 403 (Finding 8 — existence oracle):
         // a missing id, a guest (LINK, null-client) booking, and an existing-but-foreign booking
         // must all be indistinguishable to the caller. A prior 404-then-403 split let an
@@ -3017,10 +3157,94 @@ public class BookingService {
             appointmentTransitionService.collapseAppointmentHeaderAfterClientItemCancel(
                     appointmentId, headerWasLocked, saved.getClientCancellationNote());
         }
-        outboxService.enqueueStatusChanged(saved.getId());
-        registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
-        evictMasterCalendarAfterCommit(saved.getMaster().getId());
-        return BookingResponse.from(saved, resolveNow());
+        return saved;
+    }
+
+    /**
+     * Batched cancel entry point for {@code ClientAccountDeletionService}'s future-booking
+     * self-delete cascade (Phase 338 perf audit, MEDIUM item 2 — supersedes the former per-booking
+     * loop that called {@link #cancelBooking(UUID, UUID, CancelBookingRequest)} once per candidate).
+     *
+     * <p><b>ONE graph preload, not N (item 2).</b> {@link #cancelBooking(UUID, UUID,
+     * CancelBookingRequest)}'s own {@code findByIdWithFullGraph} round trip is issued once per
+     * booking; for a near-cap (50) self-delete that is 50 separate 5-join SELECTs, each one forcing
+     * an AUTO flush of the previous booking's still-pending UPDATE before it can run (defeating
+     * {@code hibernate.jdbc.batch_size}). This method preloads every candidate in {@code bookingIds}
+     * with ONE {@link BookingRepository#findAllByIdsWithGraph} call — the exact same graph shape
+     * {@code findByIdWithFullGraph} loads per row (both fetch {@code client}, {@code master},
+     * {@code master.user}, {@code salon}, {@code masterService}, {@code
+     * masterService.serviceDefinition} — see that method's own Javadoc) — then feeds each preloaded
+     * entity straight into {@link #cancelBookingForBatch}, which runs the SAME transition body
+     * {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} uses (REUSE-FIRST: ownership/
+     * status/elapsed guards, the two-phase header lock/collapse, the freshness recheck, the note —
+     * nothing about the per-booking transition semantics changes). The remaining per-booking
+     * statements ({@code existsConfirmedById}'s freshness recheck, the header lock/collapse for an
+     * appointment child, the {@code save} itself) are intrinsic to the per-booking business logic
+     * this cascade must run — see {@code ClientAccountDeletionService}'s own class Javadoc note on
+     * why {@code cancelBooking} cannot be reduced to a single bulk statement — only the GRAPH load
+     * is batchable, and this method batches it.
+     *
+     * <p><b>No per-booking {@code STATUS_CHANGED} outbox row (item 3 — LOW, resolves item 1 by
+     * construction).</b> See {@link #cancelBookingForBatch}'s own Javadoc: this cascade never calls
+     * {@code outboxService.enqueueStatusChanged} at all, so {@code ClientAccountDeletionService} no
+     * longer needs to delete anything from {@code notification_outbox} before calling {@link
+     * #enqueueClientCancelledPerVisit} — removing both the wasted enqueue-then-delete round trip
+     * AND the security finding a scope-free {@code deleteByAggregateIdIn} left open (it would have
+     * also destroyed any OTHER still-PENDING outbox row addressed to one of these same bookings,
+     * e.g. an undrained {@code BOOKING_RESCHEDULED}).
+     *
+     * <p><b>Eviction deduped per MASTER (item 5 — INFO).</b> Registers {@code registerSlotEviction}
+     * + {@code evictMasterCalendarAfterCommit} at most once per DISTINCT master across the whole
+     * cascade, mirroring exactly how {@link #declineFutureConfirmed} already dedupes its own
+     * per-visit decline loop — a client can hold several future bookings with the same master, and
+     * the ordinary per-booking {@link #cancelBooking(UUID, Booking, CancelBookingRequest)} wrapper
+     * would otherwise register the identical pair once per booking instead of once per master.
+     *
+     * @param clientUserId the deleting CLIENT's own id — ownership is re-derived per booking inside
+     *                      {@link #cancelBookingCore}, never trusted from the caller, exactly as
+     *                      every other {@code cancelBooking} entry point
+     * @param bookingIds    every future CONFIRMED booking id to cancel — the caller's own {@link
+     *                      #findFutureConfirmedBookingCandidatesForClient} result, already
+     *                      cap-checked by {@code ClientAccountDeletionService}; may be empty, in
+     *                      which case this method does nothing
+     * @param req           the SAME {@code CancelBookingRequest} (reason + note) applied to every
+     *                      booking in the batch
+     * @throws ForbiddenException a candidate id from the caller's own read no longer resolves
+     *                             against {@link BookingRepository#findAllByIdsWithGraph} —
+     *                             vanishingly unlikely, since the caller's advisory lock (held
+     *                             across its own read and this call) rules out a concurrent hard
+     *                             delete of its own booking; mirrors {@link
+     *                             #declineFutureConfirmed}'s identical defensive branch for the
+     *                             sibling provider cascade
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void cancelFutureConfirmedBookingsForClientSelfDelete(
+            UUID clientUserId, List<UUID> bookingIds, CancelBookingRequest req) {
+        if (bookingIds.isEmpty()) {
+            return;
+        }
+        Map<UUID, Booking> bookingsById = bookingRepository.findAllByIdsWithGraph(bookingIds).stream()
+                .collect(Collectors.toMap(Booking::getId, Function.identity()));
+
+        Map<UUID, UUID> salonIdByMasterId = new LinkedHashMap<>();
+        for (UUID bookingId : bookingIds) {
+            Booking booking = bookingsById.get(bookingId);
+            if (booking == null) {
+                throw new ForbiddenException("Access denied");
+            }
+            Booking saved = cancelBookingForBatch(clientUserId, booking, req);
+            UUID masterId = saved.getMaster().getId();
+            // containsKey guard, not computeIfAbsent: salonIdOf can return null for an
+            // independent master, and computeIfAbsent never stores a null mapping-function
+            // result, which would drop that master from the eviction loop below entirely.
+            if (!salonIdByMasterId.containsKey(masterId)) {
+                salonIdByMasterId.put(masterId, salonIdOf(saved));
+            }
+        }
+        for (Map.Entry<UUID, UUID> masterAndSalon : salonIdByMasterId.entrySet()) {
+            registerSlotEviction(masterAndSalon.getKey(), masterAndSalon.getValue());
+            evictMasterCalendarAfterCommit(masterAndSalon.getKey());
+        }
     }
 
     /**

@@ -39,19 +39,18 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
             @Param("clientId") UUID clientId,
             @Param("idempotencyKey") String idempotencyKey);
 
-    // ── CLIENT account self-deletion detach loop (Phase 300 D4) ───────────────
+    // ── CLIENT account self-deletion detach loop (Phase 338 — supersedes Phase 300 D4) ────────
 
     /**
      * Every visit header still attached to {@code clientId} — the header-side twin of {@link
      * com.beautica.booking.repository.BookingRepository#findByClientId}, used by {@code
      * ClientAccountDeletionService} AFTER the client's future {@code CONFIRMED} booking legs have
-     * already been cancelled and physically deleted. The caller resolves ALL headers' survivorship
-     * in ONE round trip via {@code BookingRepository#findAppointmentIdsWithSurvivingBookings}
-     * (perf finding 1, 2026-09 audit — replaces a per-header {@code existsByAppointmentId} probe): a
-     * header whose id is absent from that set is physically deleted, a header whose id is present
-     * (at least one surviving past/terminal child) is detached via
-     * {@link Appointment#detachClient(String, java.time.Instant)} — never both, never implicitly
-     * inferred from the header's own status.
+     * already been cancelled through the ordinary client-cancel path (Phase 338 — KEPT, never
+     * physically deleted). Every header this returns is therefore unconditionally detached via
+     * {@link Appointment#detachClient(String, java.time.Instant)} — a header can no longer end up
+     * CHILDLESS via this flow (every leg it ever had still exists, cancelled or otherwise), so the
+     * caller no longer needs to partition survivors from childless headers the way Phase 300 D4
+     * required.
      */
     List<Appointment> findByClientId(UUID clientId);
 

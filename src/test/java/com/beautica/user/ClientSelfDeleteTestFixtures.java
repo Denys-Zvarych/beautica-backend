@@ -299,4 +299,55 @@ public class ClientSelfDeleteTestFixtures {
         Integer value = jdbcTemplate.queryForObject(sql, Integer.class, arg);
         return value == null ? -1 : value;
     }
+
+    /**
+     * Extracted for {@code ClientAccountDeletionProviderVisibilityIT} (Phase 338 QA follow-up):
+     * this exact bare-SQL probe was already independently duplicated in {@code
+     * ClientAccountHardDeleteIT}, {@code ClientDetachCoherenceIT} and {@code
+     * ClientAccountDeletionFutureBookingsIT} — a 4th private copy crosses the QA playbook's Q4
+     * "3+ occurrences, extraction overdue" threshold. Those three pre-existing files are left as
+     * they are (out of scope for a QA-authored test addition); only the new IT below is wired to
+     * this shared copy.
+     */
+    public String bookingStatusOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    public UUID clientIdOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT client_id FROM bookings WHERE id = ?", UUID.class, bookingId);
+    }
+
+    public String guestNameOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT guest_name FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    public String cancellationReasonOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT cancellation_reason FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    /**
+     * {@code aggregate_id IN (...)} built from a literal placeholder run, mirroring the {@code
+     * IN (?, ?)} idiom {@code ClientAccountDeletionFutureBookingsIT}'s own multi-leg-visit test
+     * already uses for two ids — widened here to N so it also covers a THREE-booking (two-leg
+     * visit + one standalone) scenario without a Postgres array bind (JdbcTemplate does not bind a
+     * bare {@code UUID[]} to {@code = ANY(?)} without an explicit {@code createArrayOf}, so an
+     * IN-list is the simpler, already-proven idiom in this test family).
+     */
+    public long clientCancelledOutboxCount(UUID... bookingIds) {
+        String placeholders = String.join(",", java.util.Collections.nCopies(bookingIds.length, "?"));
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED' "
+                        + "AND aggregate_id IN (" + placeholders + ")",
+                Long.class, (Object[]) bookingIds);
+        return count == null ? -1 : count;
+    }
+
+    public UUID clientCancelledOutboxAggregateIdAmong(UUID... bookingIds) {
+        String placeholders = String.join(",", java.util.Collections.nCopies(bookingIds.length, "?"));
+        return jdbcTemplate.queryForObject(
+                "SELECT aggregate_id FROM notification_outbox WHERE event_type = 'CLIENT_CANCELLED' "
+                        + "AND aggregate_id IN (" + placeholders + ")",
+                UUID.class, (Object[]) bookingIds);
+    }
 }

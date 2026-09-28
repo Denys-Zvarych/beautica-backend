@@ -56,8 +56,9 @@ class ClientDetachCoherenceIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a partially-elapsed visit (one COMPLETED leg, one future CONFIRMED leg) leaves "
-            + "the appointment header DETACHED and SURVIVING, not deleted")
+    @DisplayName("Phase 338: a partially-elapsed visit (one COMPLETED leg, one future CONFIRMED "
+            + "leg) leaves the appointment header DETACHED and SURVIVING; the future leg is KEPT, "
+            + "CANCELLED and detached too, never deleted")
     void should_detachAppointmentHeader_when_oneLegSurvivesAndOneIsCancelled() throws Exception {
         UUID clientId = csd.createClient();
         String token = fixtures.tokenFor(emailOf(clientId));
@@ -78,14 +79,17 @@ class ClientDetachCoherenceIT extends AbstractIntegrationTest {
                 .as("the surviving (past) leg is detached, not deleted")
                 .isTrue();
         assertThat(csd.bookingExists(futureLeg))
-                .as("the future CONFIRMED leg was cancelled then physically deleted (D4)")
-                .isFalse();
+                .as("Phase 338 — the future CONFIRMED leg is cancelled and KEPT, never deleted")
+                .isTrue();
+        assertThat(bookingStatusOf(futureLeg)).isEqualTo("CANCELLED");
+        assertThat(clientIdOf(futureLeg)).isNull();
+        assertThat(guestNameOf(futureLeg)).isEqualTo("Видалений клієнт");
     }
 
     @Test
-    @DisplayName("a visit whose every leg was future-CONFIRMED (all cancelled + deleted) leaves "
-            + "the appointment header DELETED, not detached")
-    void should_deleteAppointmentHeader_when_everyLegWasFutureConfirmed() throws Exception {
+    @DisplayName("Phase 338: a visit whose every leg was future-CONFIRMED is CANCELLED and KEPT on "
+            + "every leg, and the appointment header is DETACHED, never deleted")
+    void should_detachAppointmentHeader_when_everyLegWasFutureConfirmed() throws Exception {
         UUID clientId = csd.createClient();
         String token = fixtures.tokenFor(emailOf(clientId));
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
@@ -97,10 +101,17 @@ class ClientDetachCoherenceIT extends AbstractIntegrationTest {
                 new HttpEntity<>(fixtures.bearerHeaders(token)), Void.class);
 
         assertThat(csd.appointmentExists(appointmentId))
-                .as("a CHILDLESS header (every leg deleted) is itself deleted, never left detached")
-                .isFalse();
-        assertThat(csd.bookingExists(legA)).isFalse();
-        assertThat(csd.bookingExists(legB)).isFalse();
+                .as("Phase 338 — a header can no longer end up childless via this flow; it is "
+                        + "always DETACHED, never deleted")
+                .isTrue();
+        assertThat(appointmentClientIdOf(appointmentId)).isNull();
+        assertThat(appointmentDetachedAtOf(appointmentId)).isNotNull();
+        assertThat(csd.bookingExists(legA)).isTrue();
+        assertThat(csd.bookingExists(legB)).isTrue();
+        assertThat(bookingStatusOf(legA)).isEqualTo("CANCELLED");
+        assertThat(bookingStatusOf(legB)).isEqualTo("CANCELLED");
+        assertThat(clientIdOf(legA)).isNull();
+        assertThat(clientIdOf(legB)).isNull();
     }
 
     @Test
@@ -146,6 +157,10 @@ class ClientDetachCoherenceIT extends AbstractIntegrationTest {
 
     private String guestNameOf(UUID bookingId) {
         return jdbcTemplate.queryForObject("SELECT guest_name FROM bookings WHERE id = ?", String.class, bookingId);
+    }
+
+    private String bookingStatusOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
     }
 
     private UUID appointmentClientIdOf(UUID appointmentId) {

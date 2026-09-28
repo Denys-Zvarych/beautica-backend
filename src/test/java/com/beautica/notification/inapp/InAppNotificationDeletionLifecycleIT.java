@@ -44,6 +44,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * #should_keepFeedRowsReferencingAppointment_when_masterSelfDeleteDeclinesOnlyLegHeader} below —
  * the assertion direction flipped, the test was not weakened or removed.
  *
+ * <p><b>Carry-over from Phase 332 — test 2 rewritten by Phase 338 (2026-09-28), not deleted.</b>
+ * Phase 332's original {@code should_deleteFeedRowsReferencingBooking_when_
+ * clientSelfDeleteHardDeletesFutureBooking} pinned the THEN-current behaviour: a client self-delete
+ * cancelled THEN hard-deleted every future booking (Phase 300 D4), CASCADE-deleting any feed row
+ * that referenced it. Phase 338 reverses D4 — future bookings are now CANCELLED and KEPT, so a feed
+ * row referencing one now SURVIVES instead of CASCADE-deleting. See {@link
+ * #should_keepFeedRowsReferencingBooking_when_clientSelfDeleteKeepsCancelledFutureBooking} below —
+ * the assertion direction flipped, the test was not weakened or removed.
+ *
  * <p>Feed rows are seeded via a raw-SQL {@code INSERT} (the {@link #insertFeedRow} helper below),
  * mirroring {@link com.beautica.notification.inapp.repository.InAppNotificationRepository
  * #insertIgnoringDuplicate}'s exact column list and
@@ -66,10 +75,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       {@code NO ACTION}, the "row A gone" assertion would fail (row A would survive with a null
  *       recipient, or the client hard-delete itself would 500 on an FK violation instead of
  *       returning 204).</li>
- *   <li>{@link #should_deleteFeedRowsReferencingBooking_when_clientSelfDeleteHardDeletesFutureBooking}
- *       — if {@code booking_id} were {@code SET NULL} instead of {@code CASCADE}, the "future-booking
- *       row gone" assertion would fail (the row would survive with {@code booking_id = NULL} instead
- *       of disappearing).</li>
+ *   <li>{@link #should_keepFeedRowsReferencingBooking_when_clientSelfDeleteKeepsCancelledFutureBooking}
+ *       — Phase 338: if the future booking were still hard-deleted on this path (a Phase 338
+ *       regression back to D4), the "row still exists" assertion on {@code futureRow} would fail —
+ *       the feed row would CASCADE-delete along with the booking instead of surviving.</li>
  *   <li>{@link #should_keepFeedRowsReferencingAppointment_when_masterSelfDeleteDeclinesOnlyLegHeader}
  *       — Phase 337: if the appointment header were still hard-deleted on this path (a Phase 337
  *       regression back to Q3), the "row still exists" assertion on {@code appointmentRow} would
@@ -151,13 +160,14 @@ class InAppNotificationDeletionLifecycleIT extends AbstractIntegrationTest {
         assertThat(bookingIdOf(rowB)).isEqualTo(pastBookingId);
     }
 
-    // ── 2. Client self-delete's future-booking hard-delete — booking_id CASCADE ────────────────
+    // ── 2. Client self-delete's future-booking cascade — Phase 338 KEEPS the booking, so no
+    //        booking_id CASCADE is ever triggered on this path any more ─────────────────────────
 
     @Test
-    @DisplayName("DELETE /api/v1/users/me (CLIENT) — a feed row about the client's FUTURE booking "
-            + "is gone once that booking is hard-deleted; a sibling row about a PAST booking of the "
-            + "same recipient survives")
-    void should_deleteFeedRowsReferencingBooking_when_clientSelfDeleteHardDeletesFutureBooking()
+    @DisplayName("DELETE /api/v1/users/me (CLIENT) — Phase 338 reverses the old hard-delete: the "
+            + "client's future booking is cancelled and KEPT, so a feed row pointing at booking_id "
+            + "SURVIVES too, exactly like a sibling row about a past booking")
+    void should_keepFeedRowsReferencingBooking_when_clientSelfDeleteKeepsCancelledFutureBooking()
             throws Exception {
         ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
         UUID clientId = csd.createClient();
@@ -185,13 +195,14 @@ class InAppNotificationDeletionLifecycleIT extends AbstractIntegrationTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(csd.bookingExists(futureBookingId))
-                .as("sanity — ClientAccountDeletionService step 5 really hard-deletes the future "
-                        + "booking (cancelled-then-deleted, D4)")
-                .isFalse();
+                .as("sanity — Phase 338: ClientAccountDeletionService keeps the future booking, "
+                        + "cancelled and detached, never hard-deleted")
+                .isTrue();
         assertThat(rowCount(futureRow))
-                .as("the feed row pointing at the now-hard-deleted future booking must be gone via "
-                        + "booking_id CASCADE")
-                .isZero();
+                .as("the feed row pointing at the still-existing future booking must SURVIVE — "
+                        + "booking_id CASCADE is never triggered, because the bookings row is "
+                        + "never deleted on this path")
+                .isEqualTo(1);
         assertThat(rowCount(pastRow))
                 .as("the sibling row about the untouched past booking must survive")
                 .isEqualTo(1);
