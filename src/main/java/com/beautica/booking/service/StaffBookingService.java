@@ -20,6 +20,8 @@ import com.beautica.config.BookingSmsProperties;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
@@ -118,9 +120,15 @@ import java.util.UUID;
  * method and {@link #MAX_WALK_INS_PER_PHONE_PER_WINDOW}.
  *
  * <h2>Not here</h2>
- * No notification. No outbox enqueue is specified for a staff booking by 22.4, and inventing one
- * would risk double-notifying a track that has not decided its provider-side copy. Flagged rather
- * than guessed.
+ * No OUTBOX notification (push/email/SMS beyond the walk-in confirmation SMS above). No outbox
+ * enqueue is specified for a staff booking by 22.4, and inventing one would risk double-notifying a
+ * track that has not decided its provider-side copy. Flagged rather than guessed.
+ *
+ * <p><b>Phase 333 exception — the in-app feed.</b> {@link #createStaffBooking} DOES write one
+ * {@code BOOKING_CREATED} in-app feed row, for the performing master only (matrix row 1w,
+ * user-decided 2026-09-28) — see {@link #registerInAppFeedNotification}. This is a SEPARATE seam
+ * from the outbox untouched above (see {@code InAppNotificationService}'s class javadoc); it does not
+ * revisit the "no outbox" decision this section otherwise still describes.
  */
 @Slf4j
 @Service
@@ -148,6 +156,9 @@ public class StaffBookingService {
      * {@code DiscoveryLocationResolver} lookup — see that method's Javadoc.
      */
     private final AppointmentService appointmentService;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // the (deliberately untouched, per this class's own "Not here" section) outbox.
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Per-recipient ceiling on walk-in confirmation SMS, mirroring {@code PhoneOtpService}'s
@@ -344,6 +355,7 @@ public class StaffBookingService {
         // ONCE per visit, not once per item: all N rows share one master and one salon, so N calls
         // would evict the same two keys N times for nothing.
         registerSlotEviction(master.getId(), salonIdOf(saved.get(0)));
+        registerInAppFeedNotification(appointment, saved.get(0), actorId);
         // Rendered NOW, inside the transaction, while `master` and `items` are still managed — the
         // callback runs after the persistence context closes, so touching a lazy association from
         // there would be a LazyInitializationException. EXACTLY ONE SMS for the whole visit, naming
@@ -481,6 +493,28 @@ public class StaffBookingService {
             case StaffClientRef.ExistingClient ignored -> throw new BusinessException(
                     HttpStatus.NOT_IMPLEMENTED, "Booking an existing client is not supported yet");
         };
+    }
+
+    /**
+     * Phase 333, matrix row 1w — a walk-in notifies ONLY the performing salon master, one item per
+     * visit, and never when the master is the one who keyed the booking in ({@code actorId} is
+     * excluded by {@link InAppNotificationService} itself). Owner/admins who did not act get
+     * nothing (architect decision — see the class javadoc's "Phase 333 exception" paragraph): the
+     * shared board already shows a colleague's walk-in, unlike the master's own read-only calendar,
+     * which they may not be looking at.
+     *
+     * <p>Routed through {@link InAppNotificationService#notifyVisitEvent} — the SAME entry point
+     * every other visit-level create uses ({@code AppointmentService#doCreateAppointment}, {@code
+     * GuestBookingService#createGuestVisit}) — which itself restricts a {@code STAFF}-source
+     * appointment to the master-only recipient set; this method does not duplicate that branch.
+     *
+     * <p>{@code firstItem} is {@code saved.get(0)} — already the fully managed, freshly-persisted
+     * first chained booking (carrying the real {@code master}/{@code salon} instances this method
+     * built, not proxies) — never reloaded (audit-fix cycle 1, finding 1).
+     */
+    private void registerInAppFeedNotification(Appointment appointment, Booking firstItem, UUID actorId) {
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_CREATED, appointment.getId(), firstItem, actorId);
     }
 
     private static UUID salonIdOf(Booking booking) {

@@ -21,6 +21,8 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
@@ -88,6 +90,9 @@ public class AppointmentTransitionService {
     private final AppointmentService appointmentService;
     private final ApplicationEventPublisher eventPublisher;
     private final Clock clock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // outboxService, never called from it.
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Client-initiated visit cancel — the visit HEADER and every item move to {@code CANCELLED}
@@ -130,6 +135,12 @@ public class AppointmentTransitionService {
         // No revenue eviction on a client cancel — a CANCELLED visit never enters revenue (mirrors
         // BookingService#cancelBooking).
         persistAndNotify(appointment, items, null);
+        // Phase 333, matrix row 2 — provider set (owner + admins + performing master); the CLIENT is
+        // the actor and is excluded. Once per appointment (visit granularity). `items.get(0)` is
+        // already the graph-fetched item loadItemsOrThrow loaded above — never reloaded (audit-fix
+        // cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, appointmentId, items.get(0), clientId);
     }
 
     /**
@@ -162,6 +173,12 @@ public class AppointmentTransitionService {
 
         // No revenue eviction on a decline (mirrors BookingService#declineBooking).
         persistAndNotify(ctx.appointment(), ctx.items(), null);
+        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. Once
+        // per appointment (visit granularity) — incl. walk-ins (restricted to the master cell inside
+        // InAppNotificationService, since a walk-in's clientId is always null). `ctx.firstItem()`
+        // is already loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_DECLINED, appointmentId, ctx.firstItem(), actorId);
     }
 
     /**
@@ -288,6 +305,10 @@ public class AppointmentTransitionService {
 
         // Reference the DECLINED CHILD (not item 0) so the client notification names the right service.
         outboxService.enqueueStatusChanged(target.getId());
+        // Phase 333, matrix row 3 — per-item, booking-keyed (visit granularity does not apply to a
+        // per-service decline): client (if registered) + performing master unless actor. `target` is
+        // already loaded (via loadItemsOrThrow above) — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, target, actorId);
 
         // Single-item availability eviction — reuse the whole-visit after-commit hook over a one-item
         // list; a declined child frees only its own slot. No revenue impact on a decline (null actor).
@@ -648,6 +669,10 @@ public class AppointmentTransitionService {
         // by construction. Guest visits have no client to review with — skip (mirrors the single path).
         if (ctx.appointment().getClient() != null) {
             outboxService.enqueueReviewRequested(ctx.firstItem().getId());
+            // Phase 333, matrix row 7 — client only. Once per appointment (visit granularity).
+            // `ctx.firstItem()` is already loaded — never reloaded (audit-fix cycle 1, finding 1).
+            inAppNotificationService.notifyVisitEvent(
+                    InAppNotificationType.REVIEW_REQUESTED, appointmentId, ctx.firstItem(), actorId);
         }
 
         // Announce the completion as a domain fact so other feature packages can react without
@@ -804,6 +829,12 @@ public class AppointmentTransitionService {
         // target and never one per service. See this method's own "Review prompt" Javadoc paragraph.
         if (visitClosed && items.get(0).getClient() != null) {
             outboxService.enqueueReviewRequested(items.get(0).getId());
+            // Phase 333, matrix row 7 — client only, once per VISIT (fires only when this call
+            // closed the whole visit, mirroring the review-prompt condition immediately above).
+            // `items.get(0)` is already loaded (via loadItemsOrThrow above) — never reloaded
+            // (audit-fix cycle 1, finding 1).
+            inAppNotificationService.notifyVisitEvent(
+                    InAppNotificationType.REVIEW_REQUESTED, appointmentId, items.get(0), actorId);
         }
 
         // Single-item availability eviction, PLUS the actor's revenue dashboard (a COMPLETED item
@@ -844,6 +875,10 @@ public class AppointmentTransitionService {
         // Evict the actor's revenue dashboard, keyed on the actor id exactly as
         // BookingService#notCompleteBooking does.
         persistAndNotify(ctx.appointment(), ctx.items(), actorId);
+        // Phase 333, matrix row 6 — client only (if registered). Once per appointment. `ctx.firstItem()`
+        // is already loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_NOT_COMPLETED, appointmentId, ctx.firstItem(), actorId);
     }
 
     /**
@@ -1027,6 +1062,10 @@ public class AppointmentTransitionService {
         // Phase 27.3 outbox family, reused verbatim: referencing the FIRST (confirmed) item only
         // (never one per service) — the drain worker addresses the OTHER party from that one booking.
         outboxService.enqueueBookingRescheduled(saved.get(0).getId(), initiatedByProvider);
+        // Phase 333, matrix row 4 — once per appointment (visit granularity). `saved.get(0)` is the
+        // same managed item instance already loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyRescheduledVisit(
+                appointmentId, saved.get(0), initiatedByProvider, newFirstStart.toInstant(), actorUserId);
 
         registerRescheduleEviction(masterId, salonIdOfMaster(master));
 
@@ -1247,6 +1286,11 @@ public class AppointmentTransitionService {
 
         // Reference the MOVED CHILD (never item 0) so the notification names the right service.
         outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+        // Phase 333, matrix row 4 — per-item, booking-keyed (a per-item reschedule stays per-booking,
+        // never visit-level). `saved` is `target` post-reschedule (same managed instance) — never
+        // reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyRescheduled(
+                saved, initiatedByProvider, newStartsAt.toInstant(), actorUserId);
 
         registerRescheduleEviction(masterId, salonIdOfMaster(master));
 

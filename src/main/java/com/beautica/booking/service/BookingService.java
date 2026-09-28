@@ -40,6 +40,8 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.notification.entity.OutboxEventType;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.repository.MasterServiceRepository;
@@ -119,6 +121,10 @@ public class BookingService {
     // Javadoc (phase 30.6 D1) — do not "move this to where it looks like it belongs".
     private final AppointmentRepository appointmentRepository;
     private final ApplicationEventPublisher eventPublisher;
+    // Phase 333 — separate seam from outboxService (see InAppNotificationService's class javadoc for
+    // why it is never called FROM NotificationOutboxService). MANDATORY propagation: every call site
+    // below is already inside this class's own @Transactional method.
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Creates a booking (or replays an idempotent one) and returns the <b>enriched</b> detail view.
@@ -1860,6 +1866,10 @@ public class BookingService {
     public BookingResponse declineBooking(UUID actorUserId, UUID bookingId, StatusUpdateRequest req) {
         Booking saved = declineBookingCore(actorUserId, bookingId, req);
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 333, matrix row 3 — client (if registered) + performing master unless actor. `saved`
+        // is already the full graph loaded by declineBookingCore (audit-fix cycle 1, finding 1) —
+        // never reloaded here.
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_DECLINED, saved, actorUserId);
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved, resolveNow());
@@ -2214,6 +2224,7 @@ public class BookingService {
         Map<UUID, List<SalonClosureBookingCandidate>> byVisit = candidates.stream()
                 .collect(Collectors.groupingBy(
                         SalonClosureBookingCandidate::visitKey, LinkedHashMap::new, Collectors.toList()));
+        List<UUID> representativeIds = new ArrayList<>(byVisit.size());
         for (List<SalonClosureBookingCandidate> visit : byVisit.values()) {
             UUID representativeId = visit.stream()
                     .min(Comparator.comparing(SalonClosureBookingCandidate::startsAt)
@@ -2221,7 +2232,16 @@ public class BookingService {
                     .map(SalonClosureBookingCandidate::bookingId)
                     .orElseThrow();
             outboxService.enqueueClientCancelled(representativeId);
+            representativeIds.add(representativeId);
         }
+        // Phase 333, matrix row 2 — provider set (owner + admins + performing master); the deleting
+        // CLIENT is never in that set, so there is no actor to exclude (null is a safe no-op). ONE
+        // bulk statement for the WHOLE cascade, never a per-visit loop (perf re-audit 2026-09-28 —
+        // a per-representative Java loop here scaled this method's statement count with the number
+        // of standalone-booking "visits", caught by
+        // ClientSelfDeleteBatchedCancelPerfIT#should_lowerPerBookingStatementCost_when_graphPreloadIsBatched).
+        inAppNotificationService.notifyProviderSetBulk(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, representativeIds, null);
     }
 
     // ── SALON_MASTER / INDEPENDENT_MASTER account self-deletion booking cascade (Phase 301;
@@ -2586,6 +2606,22 @@ public class BookingService {
                         "declineFutureConfirmed does not support outbox event type " + eventType);
             }
         }
+        // Phase 333, matrix rows 9/10 — client only (registered), never the actor who triggered the
+        // closure/removal. ONE bulk statement for the WHOLE cascade, never a per-visit loop (perf
+        // re-audit 2026-09-28 — a per-representative Java loop here scaled this method's statement
+        // count with V, caught by
+        // MasterSelfDeleteBookingDisposalIT#should_keepStatementCountFlat_asDistinctAppointmentVisitCountGrows,
+        // which pins the appointment-visit decline leg FLAT at 3 bulk statements regardless of visit
+        // count — a 4th per-visit statement here would have broken that invariant). The SAME
+        // eventType selects the in-app type, so a salon closure and a master removal/self-delete
+        // (this shared body's 3 callers) can never diverge on which of the two rows they write.
+        InAppNotificationType inAppType = switch (eventType) {
+            case SALON_CLOSED -> InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED;
+            case MASTER_REMOVED -> InAppNotificationType.BOOKING_CANCELLED_MASTER_REMOVED;
+            default -> throw new IllegalStateException(
+                    "declineFutureConfirmed does not support outbox event type " + eventType);
+        };
+        inAppNotificationService.notifyClientOnlyBulk(inAppType, representativeIds, actorUserId);
 
         Set<UUID> masterIds = candidates.stream()
                 .map(SalonClosureBookingCandidate::masterId)
@@ -2867,6 +2903,11 @@ public class BookingService {
         // to leave a review with — skip the review prompt so the drain path never NPEs on getClient().
         if (saved.getClient() != null) {
             outboxService.enqueueReviewRequested(saved.getId());
+            // Phase 333, matrix row 7 — client only; the provider is the actor here regardless, and
+            // clientOnly's recipient set never includes them anyway. `saved` is the same full-graph
+            // instance `booking` was loaded as above — never reloaded (audit-fix cycle 1, finding 1).
+            inAppNotificationService.notifyBookingEvent(
+                    InAppNotificationType.REVIEW_REQUESTED, saved, actorUserId);
         }
         // COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so it FREES the
         // booking's window. assertElapsedForComplete only requires `now >= startsAt`, never
@@ -2933,6 +2974,11 @@ public class BookingService {
         booking.setProviderComment(BookingComments.normalize(req.comment()));
         Booking saved = bookingRepository.save(booking);
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 333, matrix row 6 — client only (if registered); the provider is the actor. `saved`
+        // is the same full-graph instance `booking` was loaded as above — never reloaded (audit-fix
+        // cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(
+                InAppNotificationType.BOOKING_NOT_COMPLETED, saved, actorUserId);
         // NOT_COMPLETED leaves the `status = 'CONFIRMED'` occupancy predicate, so it FREES the
         // booking's window. No-show carries NO temporal guard, so the booking may still be in the
         // future — its slot is then genuinely re-bookable and must return to the picker at once
@@ -3055,6 +3101,15 @@ public class BookingService {
     private BookingResponse cancelBooking(UUID clientUserId, Booking booking, CancelBookingRequest req) {
         Booking saved = cancelBookingCore(clientUserId, booking, req);
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 333, matrix row 2 — provider set (owner + admins + performing master); the CLIENT is
+        // the actor and is excluded. Shared by the standalone client-cancel entry point AND
+        // cancelAppointmentItem (the per-item client cancel within a visit) — never by
+        // cancelBookingForBatch, which the client-self-delete cascade uses instead (that cascade's
+        // own single per-visit row is written by enqueueClientCancelledPerVisit, above).
+        // `saved` is the same full-graph instance produced by cancelBookingCore — never reloaded
+        // (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, saved, clientUserId);
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         evictMasterCalendarAfterCommit(saved.getMaster().getId());
         return BookingResponse.from(saved, resolveNow());
@@ -3569,6 +3624,13 @@ public class BookingService {
         // address the notification to the OTHER party (client-initiated -> notify the provider,
         // unchanged; provider-initiated -> notify the client).
         outboxService.enqueueBookingRescheduled(saved.getId(), initiatedByProvider);
+        // Phase 333, matrix row 4 — performing master always (unless actor), plus the other party
+        // (client if provider-initiated, owner+admins if client-initiated); walk-ins restrict to the
+        // master cell only. See InAppNotificationService#notifyRescheduled.
+        // `saved` is `booking` post-reschedule (saveAndFlush of the same managed instance) — never
+        // reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyRescheduled(
+                saved, initiatedByProvider, newStartsAt.toInstant(), actorUserId);
         // Evict the freed old-day slots and the now-occupied new-day slots, plus the provider
         // calendar — after commit, so a parallel reader cannot repopulate stale data. One call
         // covers both days: the sweep is by master, so it drops every cached date for this master
@@ -3833,6 +3895,12 @@ public class BookingService {
         // is simply the client-facing half of the same create event, not a genuine transition.
         outboxService.enqueueNewBooking(saved.getId());
         outboxService.enqueueStatusChanged(saved.getId());
+        // Phase 333, matrix row 1 — provider set (owner + admins + performing master); the CLIENT
+        // is the actor and is excluded. Never fires for STAFF-source bookings (this method is the
+        // authenticated APP create path only — walk-ins are StaffBookingService#createStaffBooking).
+        // `saved` carries `master`/`salon`/`client` as the exact real instances this method already
+        // built/loaded — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, saved, clientId);
         registerSlotEviction(saved.getMaster().getId(), salonIdOf(saved));
         return BookingResponse.from(saved, resolveNow());
     }

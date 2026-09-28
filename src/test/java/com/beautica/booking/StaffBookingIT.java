@@ -744,6 +744,34 @@ class StaffBookingIT extends AbstractIntegrationTest {
          * its N=10 sibling moved together at each re-baseline, so the anti-N+1 property the pair
          * exists to pin is unaffected.
          */
+        // Re-baselined (Phase 333, in-app notification feed), 14 -> 16, THEN corrected by audit-fix
+        // cycle 1 (findings 1-3), 16 -> 14 (back to the pre-333 baseline, measured, not assumed).
+        //
+        // The 14 -> 16 re-baseline undercounted: the comment claimed "TWO fixed statements" (a visit-
+        // item reload plus the recipient insert), but InAppNotificationService#notifyVisitEvent's OLD
+        // implementation unconditionally ran a SECOND reload too --
+        // AppointmentRepository#findClientIdById -- even for this walk-in (BOOKING_CREATED, row 1w),
+        // whose masterOnly() recipient resolution never consumes clientId at all (finding 2). The
+        // real count under that code was 17, not 16, and the pin was silently wrong until this audit
+        // measured it directly rather than trusting the comment.
+        //
+        // Audit-fix cycle 1 (findings 1-3) removes BOTH reloads: StaffBookingService now calls
+        // notifyVisitEvent with `saved.get(0)` -- the already-persisted, already-managed first
+        // chained booking this method just built, carrying real (non-proxy) `master`/`salon`
+        // instances -- so notifyVisitEvent never touches BookingRepository or AppointmentRepository
+        // at all. AND, specific to THIS fixture (seedStatementCountMaster -> seedSalonMaster,
+        // master_type = SALON_OWNER): the acting staff user (seed.staffUserId()) IS the performing
+        // master's own user (seed.masterUserId()) -- an owner-operated salon booking their own
+        // calendar -- so masterOnly()'s one-recipient set is exactly {actorId} and is emptied by the
+        // uniform actor-exclusion step BEFORE any INSERT is attempted. Net: 14 (pre-333 baseline) + 0
+        // (no row is written at all for this specific self-booking fixture) = 14. A DIFFERENT fixture
+        // (a salon admin booking on behalf of an invited SALON_MASTER, e.g. this class's ordinary
+        // WalkInCreate fixtures) WOULD pay the one unavoidable INSERT -- see
+        // StaffBookingEndpointIT$InAppFeed#should_costPinnedStatementCount_when_adminCreatesWalkInForDifferentMaster
+        // (QA audit-fix, LOW perf) for that shape's own statement accounting, pinned at
+        // CREATE_FIXED_STATEMENTS + 1 there -- this ledger does not duplicate it. Fixed, not per-item:
+        // this and its N=10 sibling below moved together, 16 to 14, so the anti-N+1 property the pair
+        // exists to pin is unaffected.
         private static final long CREATE_FIXED_STATEMENTS = 14L;
 
         /**

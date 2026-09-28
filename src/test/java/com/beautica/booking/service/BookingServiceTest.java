@@ -30,6 +30,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.booking.service.SlotCalculationService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.entity.PriceType;
@@ -127,6 +128,8 @@ class BookingServiceTest {
     private AppointmentTransitionService appointmentTransitionService;
     @Mock
     private AppointmentRepository appointmentRepository;
+    @Mock
+    private InAppNotificationService inAppNotificationService;
 
     private Clock clock;
 
@@ -173,7 +176,8 @@ class BookingServiceTest {
                 dateMath,
                 appointmentTransitionService,
                 appointmentRepository,
-                eventPublisher
+                eventPublisher,
+                inAppNotificationService
         );
 
         clientId = UUID.randomUUID();

@@ -23,6 +23,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.dao.DataAccessException;
@@ -35,6 +36,8 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -167,6 +170,51 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
         return user;
     }
 
+    private User persistUser(String email, Role role, UUID salonId) {
+        User user = new User(email, "$2a$10$hashedpassword", role, "Anna", "Kovalenko", "+380501111111", salonId);
+        em.persist(user);
+        return user;
+    }
+
+    /**
+     * A fresh, self-contained {@link ServiceDefinition} owned by {@code master} — the bulk-insert
+     * tests need their OWN master service assignment (a different {@link Master} than
+     * {@link #setUp()}'s), so this builds the full category/type/definition chain rather than
+     * reusing {@code setUp()}'s locals, which are not fields.
+     */
+    private ServiceDefinition serviceDefinitionFor(Master master) {
+        CatalogCategory category = CatalogCategory.builder()
+                .nameUk("Брови")
+                .nameEn("Brows")
+                .sortOrder(SORT_ORDER_SEQ.getAndIncrement())
+                .build();
+        em.persist(category);
+        ServiceType serviceType = ServiceType.builder()
+                .category(category)
+                .nameUk("Корекція брів")
+                .nameEn("Brow shaping")
+                .slug("bulk-type-" + UUID.randomUUID())
+                // NAIL_SERVICE (not a brow-specific category) — the same pre-seeded (V75)
+                // platform_categories value setUp() already uses; this helper's fixture data does
+                // not need to be topically accurate, only FK-valid.
+                .platformCategoryName("NAIL_SERVICE")
+                .build();
+        em.persist(serviceType);
+        ServiceDefinition serviceDefinition = ServiceDefinition.builder()
+                .ownerType(OwnerType.INDEPENDENT_MASTER)
+                .ownerId(master.getId())
+                .name("Bulk Test Service")
+                .category("BROW")
+                .baseDurationMinutes(60)
+                .priceType(PriceType.FIXED)
+                .basePrice(new BigDecimal("450.00"))
+                .serviceType(serviceType)
+                .isActive(true)
+                .build();
+        em.persist(serviceDefinition);
+        return serviceDefinition;
+    }
+
     // ── Dedup (idempotency) ─────────────────────────────────────────────────
 
     @Test
@@ -248,6 +296,83 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
                 INSERT INTO in_app_notification (id, recipient_user_id, type, booking_id, dedup_key)
                 VALUES (?, ?, 'BOOKING_CREATED', ?, ?)
                 """, UUID.randomUUID(), client.getId(), booking.getId(), "client@example.com"))
+                .isInstanceOf(DataAccessException.class);
+    }
+
+    // ── dedup_key_chk V183 (cheaper split_part/ANY form) — accept/reject language parity ──────
+    //
+    // Extends the four tests immediately above (not a fork): those already prove the three
+    // documented formats and the email-rejection case through the REAL DB constraint, unchanged by
+    // V183's rewrite (same table, same constraint NAME, same call paths). The two tests below add
+    // the coverage the orchestrator asked for specifically because it moved with V183: every one of
+    // the 10 TYPE literals (not just the 2-3 spot-checked above), and the malformed-shape matrix
+    // ('@', spaces, '+', non-hex letters, wrong segment counts INCLUDING the "TYPE:uuid:" trailing-
+    // colon case the migration's own comment calls out, and an unknown TYPE prefix).
+
+    @ParameterizedTest
+    @EnumSource(InAppNotificationType.class)
+    @DisplayName("in_app_notification_dedup_key_chk (V183) — every one of the 10 TYPE literals accepts "
+            + "the common TYPE:uuid form, not just the 2-3 spot-checked above")
+    void should_acceptTypeColonUuid_when_everyEnumType(InAppNotificationType type) {
+        // INVITE_ACCEPTED alone needs salon_id OR subject_user_id set — an UNRELATED trigger
+        // (in_app_notification_reject_empty_invite_accepted_trg, V181), not dedup_key_chk, which
+        // this test is not exercising and must not trip on. Every other type is fine with neither.
+        UUID salonId = type == InAppNotificationType.INVITE_ACCEPTED ? salon.getId() : null;
+
+        int inserted = repository.insertIgnoringDuplicate(UUID.randomUUID(), client.getId(), type.name(),
+                booking.getId(), null, salonId, null, type.name() + ":" + booking.getId());
+
+        assertThat(inserted).as(type + " must be accepted by the ANY(ARRAY[...]) type-literal set").isEqualTo(1);
+    }
+
+    private static java.util.stream.Stream<org.junit.jupiter.params.provider.Arguments> rejectedDedupKeyShapes() {
+        String uuid = UUID.randomUUID().toString();
+        String uuid2 = UUID.randomUUID().toString();
+        return java.util.stream.Stream.of(
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "email address instead of a uuid", "BOOKING_CREATED:client@example.com"),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "space after the colon", "BOOKING_CREATED: " + uuid),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "plus sign in the id segment", "BOOKING_CREATED:+" + uuid.substring(1)),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "letters outside the hex alphabet (g-z)", "BOOKING_CREATED:zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "unknown TYPE prefix", "TOTALLY_UNKNOWN_TYPE:" + uuid),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "lowercase/mismatched TYPE prefix (case-sensitive membership)", "booking_created:" + uuid),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "too few segments — TYPE alone, no colon at all", "BOOKING_CREATED"),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "too many segments — a 4th, unexpected segment", "BOOKING_CREATED:" + uuid + ":" + uuid2 + ":extra"),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "trailing colon with an EMPTY third segment — split_part(...,3) = '' looks "
+                                + "identical to \"no third segment\" unless segment COUNT is checked "
+                                + "(V183 migration comment's own called-out edge case)",
+                        "BOOKING_CREATED:" + uuid + ":"),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "second segment too short to be a uuid", "BOOKING_CREATED:" + uuid.substring(0, 8)),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "newline embedded inside segment 1 (the TYPE literal) — split_part/ANY must not "
+                                + "be tricked by a value that CONTAINS a valid literal plus trailing "
+                                + "whitespace-like control characters",
+                        "BOOKING_CREATED\n:" + uuid),
+                org.junit.jupiter.params.provider.Arguments.of(
+                        "empty dedup_key — must not slip through as some degenerate zero-segment case",
+                        "")
+        );
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("rejectedDedupKeyShapes")
+    @DisplayName("in_app_notification_dedup_key_chk (V183) — every shape the OLD regex rejected is "
+            + "still rejected by the cheaper split_part/ANY form")
+    void should_rejectMalformedDedupKey_when_rawInsert(String description, String dedupKey) {
+        assertThatThrownBy(() -> jdbcTemplate.update("""
+                INSERT INTO in_app_notification (id, recipient_user_id, type, booking_id, dedup_key)
+                VALUES (?, ?, 'BOOKING_CREATED', ?, ?)
+                """, UUID.randomUUID(), client.getId(), booking.getId(), dedupKey))
+                .as(description + " — dedup_key=" + dedupKey)
                 .isInstanceOf(DataAccessException.class);
     }
 
@@ -539,16 +664,16 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
 
     @Test
     @DisplayName("should_keepTypeCheckDedupRegexAndEnumInSync — the 10 type literals in "
-            + "in_app_notification_type_chk, the TYPE alternation embedded in "
-            + "in_app_notification_dedup_key_chk's regex, and InAppNotificationType.values() are hand-kept "
-            + "in sync (migration comment); this makes any future drift between the three a red build "
-            + "instead of a silent runtime gap")
+            + "in_app_notification_type_chk, the TYPE literal set embedded in "
+            + "in_app_notification_dedup_key_chk's ANY(ARRAY[...]) (V183's cheaper form), and "
+            + "InAppNotificationType.values() are hand-kept in sync (migration comment); this makes "
+            + "any future drift between the three a red build instead of a silent runtime gap")
     void should_keepTypeCheckDedupRegexAndEnumInSync() {
         String typeChkDef = constraintDef("in_app_notification_type_chk");
         String dedupChkDef = constraintDef("in_app_notification_dedup_key_chk");
 
         Set<String> typeChkTypes = extractTypeChkLiterals(typeChkDef);
-        Set<String> dedupChkTypes = extractDedupChkAlternation(dedupChkDef);
+        Set<String> dedupChkTypes = extractDedupChkTypeArray(dedupChkDef);
         Set<String> enumTypes = Arrays.stream(InAppNotificationType.values())
                 .map(Enum::name)
                 .collect(Collectors.toSet());
@@ -559,7 +684,8 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
                 .hasSize(enumTypes.size())
                 .isEqualTo(enumTypes);
         assertThat(dedupChkTypes)
-                .as("in_app_notification_dedup_key_chk's regex TYPE alternation must exactly match the enum:\n" + dedupChkDef)
+                .as("in_app_notification_dedup_key_chk's ANY(ARRAY[...]) type set must exactly match "
+                        + "the enum:\n" + dedupChkDef)
                 .hasSize(enumTypes.size())
                 .isEqualTo(enumTypes);
     }
@@ -567,11 +693,15 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     /** Every {@code 'LITERAL'::character varying} element of an {@code IN (...)}-style CHECK's {@code ANY(ARRAY[...])}. */
     private static final Pattern TYPE_CHK_LITERAL = Pattern.compile("'([A-Z][A-Z0-9_]*)'::character varying");
 
-    /** Any single-quoted literal chunk, in appearance order — used to reconstruct a {@code ||}-concatenated regex. */
+    /** Any single-quoted literal chunk, in appearance order. */
     private static final Pattern QUOTED_LITERAL = Pattern.compile("'([^']*)'");
 
-    /** The {@code ^(A|B|C):} alternation at the head of the reconstructed dedup_key regex. */
-    private static final Pattern DEDUP_ALTERNATION = Pattern.compile("^\\^\\(([A-Z_|]+)\\):");
+    /**
+     * V183's {@code split_part(dedup_key, ':'::text, 1) = ANY (ARRAY['A'::text, 'B'::text, ...])} —
+     * the {@code ARRAY[...]} bracket, non-greedily, so a LATER {@code ARRAY}-free literal elsewhere
+     * in the same CHECK (the two anchored UUID/digit regexes on segments 2 and 3) is never pulled in.
+     */
+    private static final Pattern DEDUP_TYPE_ARRAY = Pattern.compile("ARRAY\\[(.*?)]");
 
     private String constraintDef(String conname) {
         return jdbcTemplate.queryForObject(
@@ -589,25 +719,24 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     }
 
     /**
-     * pg_get_constraintdef deparses a {@code ||} chain of string literals as separate quoted chunks
-     * (Postgres does not constant-fold them into one literal), so this reassembles the ORIGINAL regex
-     * text by concatenating every quoted chunk in the order it appears, then pulls the leading
-     * {@code ^(TYPE1|TYPE2|...):} alternation off the front of that reassembled string.
+     * Pulls every single-quoted literal OUT OF the {@code ARRAY[...]} bracket only (never the
+     * standalone {@code ~ '^[0-9a-fA-F]...'} regex literals elsewhere in the same CHECK, which are
+     * NOT inside an {@code ARRAY[...]} construct) — so this stays a pure "type literal set" extractor
+     * exactly like its V181/regex-based predecessor, just aimed at the new shape.
      */
-    private static Set<String> extractDedupChkAlternation(String constraintDef) {
-        StringBuilder reconstructed = new StringBuilder();
-        Matcher chunks = QUOTED_LITERAL.matcher(constraintDef);
-        while (chunks.find()) {
-            reconstructed.append(chunks.group(1));
-        }
-
-        Matcher alternation = DEDUP_ALTERNATION.matcher(reconstructed.toString());
-        if (!alternation.find()) {
+    private static Set<String> extractDedupChkTypeArray(String constraintDef) {
+        Matcher arrayBlock = DEDUP_TYPE_ARRAY.matcher(constraintDef);
+        if (!arrayBlock.find()) {
             throw new IllegalStateException(
-                    "could not locate the '^(TYPE|...):' alternation in the reconstructed dedup_key_chk "
-                            + "regex — has its shape changed?\nreconstructed: " + reconstructed);
+                    "could not locate the ANY(ARRAY[...]) type-literal block in dedup_key_chk — has "
+                            + "its shape changed?\nconstraintDef: " + constraintDef);
         }
-        return new HashSet<>(Arrays.asList(alternation.group(1).split("\\|")));
+        Set<String> result = new HashSet<>();
+        Matcher literals = QUOTED_LITERAL.matcher(arrayBlock.group(1));
+        while (literals.find()) {
+            result.add(literals.group(1));
+        }
+        return result;
     }
 
     // ── markRead ────────────────────────────────────────────────────────────
@@ -673,6 +802,296 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
         assertThat(em.find(InAppNotification.class, teammateRow).getReadAt())
                 .as("markAllRead for the client must not touch the teammate's row")
                 .isNull();
+    }
+
+    // ── bulk-insert recipient-resolution contract (audit-fix cycle 1, finding 6) ───────────────
+    //
+    // insertProviderSetBulk / insertClientOnlyBulk had zero tests: everything above exercises
+    // insertIgnoringDuplicate (the per-row primitive) or the JPQL read methods, never the two
+    // LATERAL/JOIN bulk statements the salon-closure/master-removal/master-self-delete and
+    // client-self-delete cascades actually run in production.
+
+    @Test
+    @DisplayName("insertProviderSetBulk matches InAppRecipientResolver#providerSet exactly — an "
+            + "owner who is ALSO the performing (SALON_OWNER-type) master is deduped to ONE row, an "
+            + "inactive admin of the SAME salon is excluded, an active admin of ANOTHER salon is "
+            + "excluded, and the actor is excluded")
+    void should_matchResolverRecipientSet_when_insertProviderSetBulkRuns() {
+        User ownerAsMaster = persistUser("bulk-owner-master-" + UUID.randomUUID() + "@example.com", Role.SALON_OWNER);
+        Salon ownSalon = Salon.builder()
+                .cityId(testCityId())
+                .owner(ownerAsMaster)
+                .name("Bulk Provider Salon " + UUID.randomUUID())
+                .isActive(true)
+                .build();
+        em.persist(ownSalon);
+        Master ownerMaster = Master.builder()
+                .user(ownerAsMaster)
+                .salon(ownSalon)
+                .masterType(MasterType.SALON_OWNER)
+                .avgRating(BigDecimal.ZERO)
+                .reviewCount(0)
+                .isActive(true)
+                .build();
+        em.persist(ownerMaster);
+        // Flushed here (finding: FK violation) — Hibernate's insert-ordering optimizer batches by
+        // entity type and does not guarantee this salon's INSERT precedes a later-persisted user's
+        // salon_id FK referencing it once a SECOND Salon (otherSalon, below) enters the same
+        // persistence-context flush.
+        em.flush();
+
+        User activeAdmin = persistUser(
+                "bulk-active-admin-" + UUID.randomUUID() + "@example.com", Role.SALON_ADMIN, ownSalon.getId());
+        User inactiveAdmin = persistUser(
+                "bulk-inactive-admin-" + UUID.randomUUID() + "@example.com", Role.SALON_ADMIN, ownSalon.getId());
+        // Already managed (persistUser returns the em.persist()-ed instance) — dirty-checked on
+        // the flush() below, no explicit merge needed.
+        inactiveAdmin.setActive(false);
+
+        Salon otherSalon = Salon.builder()
+                .cityId(testCityId())
+                .owner(persistUser("bulk-other-owner-" + UUID.randomUUID() + "@example.com", Role.SALON_OWNER))
+                .name("Other Salon " + UUID.randomUUID())
+                .isActive(true)
+                .build();
+        em.persist(otherSalon);
+        em.flush();
+        persistUser("bulk-other-admin-" + UUID.randomUUID() + "@example.com", Role.SALON_ADMIN, otherSalon.getId());
+
+        MasterServiceAssignment ownerMasterService = MasterServiceAssignment.builder()
+                .master(ownerMaster)
+                .serviceDefinition(serviceDefinitionFor(ownerMaster))
+                .isActive(true)
+                .build();
+        em.persist(ownerMasterService);
+
+        OffsetDateTime startsAt = OffsetDateTime.of(2026, 6, 2, 10, 0, 0, 0, ZoneOffset.UTC);
+        Booking ownerBooking = Booking.builder()
+                .client(client)
+                .master(ownerMaster)
+                .masterService(ownerMasterService)
+                .salon(ownSalon)
+                .status(BookingStatus.CONFIRMED)
+                .startsAt(startsAt)
+                .endsAt(startsAt.plusHours(1))
+                .priceAtBooking(new BigDecimal("450.00"))
+                .durationMinutesAtBooking(60)
+                .bufferMinutesAtBooking(0)
+                .idempotencyKey("bulk-provider-idem-" + UUID.randomUUID())
+                .build();
+        em.persist(ownerBooking);
+        em.flush();
+
+        int written = repository.insertProviderSetBulk(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT.name(),
+                List.of(ownerBooking.getId()), activeAdmin.getId());
+
+        assertThat(written)
+                .as("owner-as-master (1 deduped row) + active admin = 2, NOT 3 (no owner/master double-row) "
+                        + "and NOT the actor (activeAdmin excluded)")
+                .isEqualTo(1);
+        List<UUID> recipients = jdbcTemplate.queryForList(
+                "SELECT recipient_user_id FROM in_app_notification WHERE booking_id = ?", UUID.class,
+                ownerBooking.getId());
+        assertThat(recipients)
+                .as("owner-as-master deduped to ONE row; inactive admin, other-salon admin and the "
+                        + "actor (activeAdmin) all excluded")
+                .containsExactly(ownerAsMaster.getId());
+    }
+
+    @Test
+    @DisplayName("insertClientOnlyBulk excludes guest (LINK) and walk-in (STAFF) bookings — their "
+            + "client_id is NULL, so they contribute no row, while a normal client-owned booking in "
+            + "the SAME batch does")
+    void should_excludeGuestAndWalkInClientsBulkRuns_when_insertClientOnlyBulkRuns() {
+        OffsetDateTime guestStart = OffsetDateTime.of(2026, 6, 3, 9, 0, 0, 0, ZoneOffset.UTC);
+        Booking guestBooking = Booking.guestBooking(
+                booking.getMaster(), booking.getMasterService(), booking.getSalon(),
+                guestStart, guestStart.plusHours(1),
+                new BigDecimal("450.00"), null, 60, 0,
+                "Оксана", "Гончар", "+380501234567");
+        em.persist(guestBooking);
+
+        OffsetDateTime walkInStart = OffsetDateTime.of(2026, 6, 3, 11, 0, 0, 0, ZoneOffset.UTC);
+        Booking walkInBooking = Booking.staffBooking(
+                booking.getMaster(), booking.getMasterService(), booking.getSalon(),
+                walkInStart, walkInStart.plusHours(1),
+                new BigDecimal("450.00"), null, 60, 0,
+                "Ірина", "Бондар", "+380509876543", teammate.getId());
+        em.persist(walkInBooking);
+        em.flush();
+
+        int written = repository.insertClientOnlyBulk(
+                InAppNotificationType.BOOKING_CANCELLED_MASTER_REMOVED.name(),
+                List.of(booking.getId(), guestBooking.getId(), walkInBooking.getId()), null);
+
+        assertThat(written)
+                .as("only the registered-client booking contributes a row — the guest and walk-in "
+                        + "bookings have client_id = NULL and are silently excluded, never a row with a "
+                        + "null recipient_user_id")
+                .isEqualTo(1);
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT booking_id, recipient_user_id FROM in_app_notification");
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).get("booking_id")).isEqualTo(booking.getId());
+        assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(client.getId());
+    }
+
+    // ── users(salon_id) WHERE role='SALON_ADMIN' AND is_active index (audit-fix cycle 1, finding 4) ──
+
+    @Test
+    @DisplayName("acceptance criterion (finding 4) — EXPLAIN of the admin-fan-out predicate uses "
+            + "idx_users_salon_admin_active (V182)")
+    void should_useSalonAdminActiveIndex_when_explainingAdminFanOutQuery() {
+        // setUp() already persists no SALON_ADMIN row; this test only needs the index to be a legal,
+        // capability-proven candidate for the shape both InAppRecipientResolver's JPQL and
+        // insertProviderSetBulk's LATERAL subquery render — the probe drops every OTHER droppable
+        // index on `users` so the plan's choice is structural, never cost-based (see
+        // IndexCapabilityProbe's own javadoc).
+        IndexCapabilityProbe probe = new IndexCapabilityProbe(jdbcTemplate, "users");
+        String plan = probe.explainWithOnly("idx_users_salon_admin_active",
+                "SELECT id FROM users WHERE salon_id = '" + salon.getId()
+                        + "' AND role = 'SALON_ADMIN' AND is_active = true");
+
+        assertThat(plan)
+                .as("InAppRecipientResolver#addOwnerAndAdmins / insertProviderSetBulk's admin leg must "
+                        + "be able to use the partial salon-admin-active index:\n" + plan)
+                .contains("idx_users_salon_admin_active");
+    }
+
+    // ── dedup_key CHECK per-row cost (audit-fix cycle 1, finding 5) ────────────────────────────
+
+    /**
+     * V181's {@code in_app_notification_dedup_key_chk} is a deliberate PII guard (§A) and, per
+     * migration-immutability rule §O-9, cannot be altered now that it is committed — so this test
+     * measures its real MARGINAL per-row cost, isolated from the rest of the bulk INSERT statement
+     * (6 indexes, 2 other CHECKs, 2 FKs), rather than proposing a change to it.
+     *
+     * <p><b>Method.</b> The naive "just time one 2,000-row insertForRecipients call" measures the
+     * WHOLE statement, not the CHECK: a first pass at this test did exactly that and measured
+     * ~0.136 ms/row — over the finding's ~0.05 ms/row budget, but that number is dominated by index
+     * maintenance and FK validation, not the regex. So this version measures the DELTA between two
+     * 2,000-row inserts of the SAME shape, ONE with the CHECK present (the committed, real schema)
+     * and ONE with it temporarily dropped inside a transaction that always ends in {@code ROLLBACK}
+     * — the exact {@code DROP}-then-{@code ROLLBACK} technique {@link IndexCapabilityProbe} already
+     * uses for index capability, applied here to a CHECK constraint instead. Everything else (the 6
+     * indexes, the other 2 CHECKs, both FKs) is IDENTICAL in both passes, so it cancels out of the
+     * delta — what remains is the CHECK's own marginal cost.
+     *
+     * <p><b>V181 baseline (2026-09-28, local Testcontainers PG 16, 2,000 rows per pass, single
+     * run): 240.165 ms with the CHECK present, 69.100 ms without it &rarr; ~0.0855 ms/row marginal
+     * cost.</b> ABOVE finding 5's ~0.05 ms/row "negligible" bar — reported per the finding's own
+     * instruction, not applied in that cycle (V181 was still the committed schema).
+     *
+     * <p><b>V183 follow-up (orchestrator-directed, same day) — the cheaper CHECK APPLIED via a fresh
+     * migration, never editing V181 itself (§O-9).</b> {@code V183__cheaper_in_app_notification_dedup_key_chk.sql}
+     * {@code DROP}s and re-{@code ADD}s {@code in_app_notification_dedup_key_chk} under its ORIGINAL
+     * name with a {@code split_part}/array-membership form instead of the single ~10-way regex
+     * alternation:
+     * <pre>{@code
+     * CHECK (
+     *     split_part(dedup_key, ':', 1) = ANY (ARRAY[
+     *         'BOOKING_CREATED','BOOKING_CANCELLED_BY_CLIENT','BOOKING_DECLINED',
+     *         'BOOKING_NOT_COMPLETED','BOOKING_RESCHEDULED','REVIEW_REQUESTED',
+     *         'BOOKING_CANCELLED_SALON_CLOSED','BOOKING_CANCELLED_MASTER_REMOVED',
+     *         'REVIEW_RECEIVED','INVITE_ACCEPTED'])
+     *     AND split_part(dedup_key, ':', 2) ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+     *     AND CASE array_length(string_to_array(dedup_key, ':'), 1)
+     *             WHEN 2 THEN true
+     *             WHEN 3 THEN split_part(dedup_key, ':', 3) ~ '^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9]{1,10})$'
+     *             ELSE false
+     *         END
+     * )
+     * }</pre>
+     * {@code array_length(string_to_array(...))}, not a {@code split_part(...,3) = ''} shortcut — see
+     * the migration's own comment for why that shortcut would have silently ACCEPTED a
+     * {@code "TYPE:uuid:"} trailing-colon key the OLD regex rejected (a behavioural regression, not
+     * just a performance one). Language EQUIVALENCE (every documented format still accepted, every
+     * previously-rejected shape — {@code '@'}, spaces, {@code '+'}, non-hex letters, wrong segment
+     * counts INCLUDING that trailing-colon case, an unknown TYPE — still rejected) is proven by
+     * {@link #should_acceptTypeColonUuid_when_everyEnumType} and
+     * {@link #should_rejectMalformedDedupKey_when_rawInsert}, immediately below.
+     *
+     * <p><b>Re-measured after V183 (2026-09-28, same method, 3 runs): 0.0537, 0.0694, 0.0588 ms/row
+     * — average ~0.060 ms/row</b>, down from the V181 baseline's ~0.0855 ms/row (a ~30% reduction).
+     * Still hovering just above the ~0.05 ms/row bar — single-run JDBC/Postgres timing noise on this
+     * VM spans a wider band than the remaining gap (the three runs alone vary by ±30% around their
+     * own mean), so a fourth run landing at or under 0.05 would not mean a REAL further improvement
+     * either. A CHECK constraint's floor is bounded by how many string operations Postgres must run
+     * per row regardless of engine (here: one {@code split_part} + one anchored regex unconditionally,
+     * plus a conditional {@code string_to_array}/{@code split_part}/regex trio) — getting materially
+     * under ~0.05 ms/row reliably would need moving this validation OFF the per-row CHECK path
+     * entirely (e.g. an application-layer guard before the INSERT, trusted because this table is
+     * never written any other way), which is a design change beyond "swap the CHECK expression" and
+     * is left unrequested rather than applied speculatively.
+     *
+     * <p>The assertion below is deliberately set to a generous, CI-jitter-tolerant ceiling (well over
+     * the measured ~0.06 ms/row average) so ordinary noise cannot flip this red — it still catches a
+     * genuine order-of-magnitude regression (e.g. a future dedup_key shape that makes a regex branch
+     * backtrack pathologically).
+     */
+    @Test
+    @DisplayName("in_app_notification_dedup_key_chk's MARGINAL per-row cost (isolated from indexes/"
+            + "FKs/other CHECKs via a DROP-then-ROLLBACK differential) — V183's cheaper form measured "
+            + "~0.06 ms/row, down from V181's ~0.0855 ms/row, over 2,000 rows (audit-fix cycle 1)")
+    void should_measureNegligiblePerRowCost_when_insertingTwoThousandRowsThroughDedupKeyCheck() {
+        List<UUID> recipientIds = new java.util.ArrayList<>(2000);
+        for (int i = 0; i < 2000; i++) {
+            recipientIds.add(persistUser(
+                    "chk-perf-" + i + "-" + UUID.randomUUID() + "@example.com", Role.CLIENT).getId());
+        }
+        em.flush();
+        String recipientIdList = recipientIds.stream()
+                .map(id -> "'" + id + "'::uuid")
+                .collect(Collectors.joining(","));
+
+        long startWith = System.nanoTime();
+        int written = repository.insertForRecipients(
+                InAppNotificationType.BOOKING_CREATED.name(), recipientIds, booking.getId(), null, null, null,
+                "BOOKING_CREATED:" + booking.getId());
+        long elapsedWithCheckNanos = System.nanoTime() - startWith;
+        assertThat(written).isEqualTo(2000);
+
+        long elapsedWithoutCheckNanos = jdbcTemplate.execute(
+                (org.springframework.jdbc.core.ConnectionCallback<Long>) connection -> {
+                    boolean autoCommit = connection.getAutoCommit();
+                    connection.setAutoCommit(false);
+                    try (java.sql.Statement statement = connection.createStatement()) {
+                        statement.execute("SET LOCAL lock_timeout = '5s'");
+                        statement.execute(
+                                "ALTER TABLE in_app_notification DROP CONSTRAINT in_app_notification_dedup_key_chk");
+                        long start = System.nanoTime();
+                        statement.execute("""
+                                INSERT INTO in_app_notification
+                                    (id, recipient_user_id, type, booking_id, dedup_key)
+                                SELECT gen_random_uuid(), u.id, 'BOOKING_CREATED', '%s'::uuid,
+                                       'BOOKING_CREATED:%s:' || u.id
+                                  FROM users u
+                                 WHERE u.id IN (%s)
+                                """.formatted(booking.getId(), booking.getId(), recipientIdList));
+                        return System.nanoTime() - start;
+                    } finally {
+                        connection.rollback();
+                        connection.setAutoCommit(autoCommit);
+                    }
+                });
+
+        double deltaPerRowMs =
+                ((elapsedWithCheckNanos - elapsedWithoutCheckNanos) / 1_000_000.0) / 2000.0;
+        // V183 measured average ~0.060 ms/row over 3 runs (down from V181's ~0.0855 ms/row) — see
+        // this test's own javadoc for the full 3-run spread and why the ceiling here is generous
+        // rather than tight against that average: single-run timing noise on this VM is comparable
+        // in size to the remaining gap to the ~0.05 ms/row bar.
+        assertThat(deltaPerRowMs)
+                .as("in_app_notification_dedup_key_chk's OWN marginal cost (with-check %.3fms minus "
+                        + "without-check %.3fms, over 2,000 rows) — measured %.5f ms/row. V183's "
+                        + "measured average is ~0.060 ms/row (down from V181's ~0.0855 ms/row), already "
+                        + "reported in this test's javadoc. A rise PAST this generous ceiling means a "
+                        + "NEW, larger regression on top of that already-reported cost — re-measure and "
+                        + "update both this javadoc and the phase-333 doc",
+                        elapsedWithCheckNanos / 1_000_000.0, elapsedWithoutCheckNanos / 1_000_000.0,
+                        deltaPerRowMs)
+                .isLessThan(0.3);
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────

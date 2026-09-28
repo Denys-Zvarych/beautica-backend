@@ -19,6 +19,8 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -89,6 +91,9 @@ public class AppointmentService {
     private final DiscoveryLocationResolver discoveryLocationResolver;
     private final VisitPlanner visitPlanner;
     private final Clock clock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam from
+    // outboxService, never called from it.
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Creates a multi-service visit, or replays the idempotent one, and returns the enriched detail.
@@ -433,6 +438,13 @@ public class AppointmentService {
         // hold their lock for the same shape of work.
         outboxService.enqueueNewBooking(savedBookings.get(0).getId());
         outboxService.enqueueStatusChanged(savedBookings.get(0).getId());
+        // Phase 333, matrix row 1 — provider set (owner + admins + performing master); the CLIENT is
+        // the actor. Once per appointment (visit granularity). This path is always BookingSource.APP
+        // (see the builder above) — never a STAFF walk-in, which is StaffBookingService's own path.
+        // `savedBookings.get(0)` carries the real `master`/`salon`/`client` instances this method
+        // already built — never reloaded (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyVisitEvent(
+                InAppNotificationType.BOOKING_CREATED, appointment.getId(), savedBookings.get(0), clientId);
 
         registerSlotEviction(master.getId(), salonIdOf(master));
 

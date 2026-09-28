@@ -4,9 +4,13 @@ import com.beautica.config.TestSecurityConfig;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
 import com.fasterxml.jackson.databind.JsonNode;
+import jakarta.persistence.EntityManagerFactory;
+import org.hibernate.SessionFactory;
+import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
@@ -18,6 +22,7 @@ import org.springframework.http.ResponseEntity;
 import java.math.BigDecimal;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -71,6 +76,10 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
 
     @MockBean
     private NotificationOutboxService notificationOutboxService;
+
+    /** Statement-count gate only ({@code InAppFeed}'s own nested class below) — see that class. */
+    @Autowired
+    private EntityManagerFactory emf;
 
     // ════════════════════════════════════════════════════════════════════════════════
     // The admitted rows
@@ -160,18 +169,210 @@ class StaffBookingEndpointIT extends AbstractStaffBookingIT {
          * site fires with the right recipient without asserting anything about delivery, which is
          * {@code SmsFeatureGateTest}'s and {@code WalkInBookingSmsIT}'s subject.
          *
-         * <p>The notification half is UNCHANGED and still absolute: a staff booking enqueues no
-         * outbox row in any configuration.
+         * <p><b>Renamed from {@code should_sendWalkInSmsAndNoNotification_when_staffBookingSucceeds}
+         * (phase 333).</b> "NoNotification" would now be false: a walk-in DOES write one in-app feed
+         * row for the performing master (see the {@code InAppFeed} nested class below, whose tests
+         * assert that row positively). This test's own two assertions — the SMS send and the
+         * {@code notificationOutboxService} silence — are otherwise byte-for-byte unchanged; the
+         * outbox (push/email/SMS beyond this one confirmation) stays completely dark, which is the
+         * property this test still exists to prove.
          */
         @Test
-        @DisplayName("a successful staff create sends the walk-in SMS and enqueues no notification")
-        void should_sendWalkInSmsAndNoNotification_when_staffBookingSucceeds() {
+        @DisplayName("a successful staff create sends the walk-in SMS and enqueues no outbox row")
+        void should_sendWalkInSmsAndNoOutbox_when_staffBookingSucceeds() {
             ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
 
             assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
             // E.164, matching the guest_phone column — not the "050 123 45 67" that was posted.
             verify(smsService).send(eq(E164_PHONE), anyString());
             verifyNoInteractions(notificationOutboxService);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // Phase 333 — the in-app feed. InAppNotificationService is a REAL bean here (never
+    // @MockBean, unlike notificationOutboxService above), so every row below is asserted
+    // straight off the database — the same lens onlyBooking() uses for the bookings table.
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Nested
+    @DisplayName("In-app feed — matrix row 1w (walk-in create)")
+    class InAppFeed {
+
+        @Test
+        @DisplayName("admin creates a walk-in for an invited SALON_MASTER → one BOOKING_CREATED row, "
+                + "for the performing master only")
+        void should_writeOneFeedItemForPerformingMaster_when_adminCreatesWalkIn() {
+            InvitedWithService master = seedInvitedMasterWithService();
+            SeededUser admin = insertUser("SALON_ADMIN", salon.salonId());
+
+            ResponseEntity<String> resp =
+                    create(master.masterId(), master.masterServiceId(), tokenFor(admin.email()), tomorrowAtNoon());
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+            List<Map<String, Object>> rows = inAppNotificationRows();
+            assertThat(rows).hasSize(1);
+            assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(master.userId());
+            assertThat(rows.get(0).get("type")).isEqualTo("BOOKING_CREATED");
+        }
+
+        @Test
+        @DisplayName("admin creates a 2-service walk-in VISIT for an invited SALON_MASTER → exactly "
+                + "one BOOKING_CREATED row (never one per service), for the performing master")
+        void should_writeOneFeedItemForPerformingMaster_when_adminCreatesMultiServiceWalkInVisit() {
+            Invited master = seedInvitedMaster(salon);
+            UUID firstService = insertService(master.masterId(), "SALON", salon.salonId());
+            UUID secondService = insertService(master.masterId(), "SALON", salon.salonId());
+            giveWorkingHoursAsOwner(master.masterId());
+            SeededUser admin = insertUser("SALON_ADMIN", salon.salonId());
+
+            postWalkIn(master.masterId(), List.of(firstService, secondService), tokenFor(admin.email()), tomorrowAtNoon());
+
+            List<Map<String, Object>> rows = inAppNotificationRows();
+            assertThat(rows).hasSize(1);
+            assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(master.userId());
+            assertThat(rows.get(0).get("type")).isEqualTo("BOOKING_CREATED");
+            assertThat(rows.get(0).get("appointment_id")).isNotNull();
+            assertThat(rows.get(0).get("booking_id"))
+                    .as("a visit-level row is keyed to the appointment, never one of its bookings")
+                    .isNull();
+        }
+
+        @Test
+        @DisplayName("owner walks a client into their OWN day as the performing master → zero rows "
+                + "(actor exclusion)")
+        void should_writeNoFeedItem_when_ownerWalksInToOwnDayAsMaster() {
+            ResponseEntity<String> resp = create(salon.masterId(), tokenFor(salon.ownerEmail()), tomorrowAtNoon());
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+            assertThat(inAppNotificationRows()).isEmpty();
+        }
+
+        @Test
+        @DisplayName("admin creates a walk-in for an invited SALON_MASTER → the owner and the acting "
+                + "admin get NOTHING (walk-ins notify only the performing master)")
+        void should_notNotifyOwnerOrAdmins_when_adminCreatesWalkIn() {
+            InvitedWithService master = seedInvitedMasterWithService();
+            SeededUser admin = insertUser("SALON_ADMIN", salon.salonId());
+
+            ResponseEntity<String> resp =
+                    create(master.masterId(), master.masterServiceId(), tokenFor(admin.email()), tomorrowAtNoon());
+            assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+            List<UUID> recipients = inAppNotificationRows().stream()
+                    .map(row -> (UUID) row.get("recipient_user_id"))
+                    .toList();
+            assertThat(recipients).doesNotContain(salon.ownerId(), admin.id());
+        }
+
+        /** An {@link Invited} master plus a bookable service — local to this nested class since
+         * {@link Invited} itself is shared by every {@code Nested} class in this file and stays a
+         * narrow 3-field record for their sake. */
+        private record InvitedWithService(UUID userId, String email, UUID masterId, UUID masterServiceId) {
+        }
+
+        /** {@link #seedInvitedMaster(Salon)} plus a bookable service + working hours in one call. */
+        private InvitedWithService seedInvitedMasterWithService() {
+            Invited master = seedInvitedMaster(salon);
+            UUID masterServiceId = insertService(master.masterId(), "SALON", salon.salonId());
+            giveWorkingHoursAsOwner(master.masterId());
+            return new InvitedWithService(master.userId(), master.email(), master.masterId(), masterServiceId);
+        }
+
+        /**
+         * {@link #giveWorkingHours} for an INVITED {@code SALON_MASTER} target, which routes
+         * {@code AuthorizationService#enforceCanManageMasterSchedule} into the
+         * {@code hasManagementAccess(salonId, actorId)} branch — unlike the owner-operated /
+         * independent-master fixtures every OTHER test in this hierarchy schedules, that branch reads
+         * the acting ROLE off {@code SecurityContextHolder} (see that method's own javadoc), which a
+         * direct service call outside the HTTP filter chain never populates. Mirrors
+         * {@code MasterRemovalIT}/{@code SalonDeactivationCascadeIT}'s identical manually-pushed
+         * {@code SALON_OWNER} authentication for the same reason.
+         */
+        private void giveWorkingHoursAsOwner(UUID masterId) {
+            org.springframework.security.core.context.SecurityContextHolder.getContext().setAuthentication(
+                    new org.springframework.security.authentication.UsernamePasswordAuthenticationToken(
+                            salon.ownerEmail(), null,
+                            List.of(new org.springframework.security.core.authority.SimpleGrantedAuthority(
+                                    "ROLE_SALON_OWNER"))));
+            try {
+                giveWorkingHours(salon.ownerId(), masterId);
+            } finally {
+                org.springframework.security.core.context.SecurityContextHolder.clearContext();
+            }
+        }
+
+        private List<Map<String, Object>> inAppNotificationRows() {
+            return jdbcTemplate.queryForList("SELECT * FROM in_app_notification");
+        }
+
+        // ── statement-count gate (QA audit-fix, LOW perf) ───────────────────────────────
+
+        /**
+         * {@code StaffBookingIT.StatementCount.CREATE_FIXED_STATEMENTS} (14, direct-service-call
+         * baseline) is measured against {@code seedStatementCountMaster()} — an owner-operated
+         * {@code SALON_OWNER}-type master booking their OWN calendar, where
+         * {@code actorId == masterUserId}. That fixture's one {@code masterOnly()} recipient is
+         * therefore emptied by the uniform actor-exclusion step BEFORE {@code insertForRecipients}
+         * ever runs, so its pin nets zero extra statements for the in-app write — see that class's
+         * own javadoc, which explicitly says a DIFFERENT fixture (an admin walk-in for an invited
+         * {@code SALON_MASTER}, i.e. actor != performing master) WOULD pay the one unavoidable INSERT
+         * and points HERE for that shape's own accounting.
+         *
+         * <p><b>+1, not +0</b>: {@code admin} books the walk-in, {@code master} is an invited
+         * {@code SALON_MASTER} with their own user account — {@code actorId != masterUserId} — so
+         * {@code masterOnly()}'s one-recipient set survives actor exclusion and
+         * {@code InAppNotificationRepository#insertForRecipients} runs exactly once (audit-fix cycle
+         * 1, finding 3 — one INSERT for the whole recipient set, never per-recipient), on top of the
+         * {@code CREATE_FIXED_STATEMENTS} baseline every walk-in create already pays.
+         *
+         * <p><b>Measured over HTTP, not assumed.</b> This suite's lens is {@code TestRestTemplate}
+         * against the real filter chain (unlike {@code StaffBookingIT}'s direct service call, which
+         * never runs {@code JwtAuthenticationFilter} at all), so the pin is NOT simply
+         * {@code CREATE_FIXED_STATEMENTS + 1}: {@link Statistics#getPrepareStatementCount()} also
+         * captures whatever Hibernate-issued statements the authentication path itself runs to
+         * resolve {@code admin}'s principal for THIS request (the token was minted earlier, before
+         * {@code statistics.clear()}, but it is validated and the principal is loaded inside the
+         * window measured here). Measured directly at <b>20</b> — {@code CREATE_FIXED_STATEMENTS}
+         * (14) + 1 (the unavoidable {@code insertForRecipients} INSERT) + 5 (the HTTP-path
+         * authentication cost this specific lens pays that {@code StaffBookingIT}'s direct-call lens
+         * does not) — rather than assumed at 15, per this codebase's "measure, don't assume"
+         * convention for every statement-count gate. A rise here still means the SAME thing 15 would
+         * have: a new per-visit query, a lost fetch join, or the in-app write regressing off its
+         * one-statement shape; a fall means either the feed row or the walk-in create baseline itself
+         * shed a statement.
+         */
+        private static final long WALK_IN_CREATE_DIFFERENT_ACTOR_STATEMENTS = 20L;
+
+        @Test
+        @DisplayName("STATEMENT-COUNT GATE: admin creates a walk-in for a DIFFERENT performing master "
+                + "(an invited SALON_MASTER) — the one unavoidable insertForRecipients INSERT is "
+                + "pinned, on top of the pre-333 fixed baseline")
+        void should_costPinnedStatementCount_when_adminCreatesWalkInForDifferentMaster() {
+            InvitedWithService master = seedInvitedMasterWithService();
+            SeededUser admin = insertUser("SALON_ADMIN", salon.salonId());
+
+            Statistics statistics = emf.unwrap(SessionFactory.class).getStatistics();
+            statistics.setStatisticsEnabled(true);
+            statistics.clear();
+
+            ResponseEntity<String> resp =
+                    create(master.masterId(), master.masterServiceId(), tokenFor(admin.email()), tomorrowAtNoon());
+            long statements = statistics.getPrepareStatementCount();
+
+            assertThat(resp.getStatusCode())
+                    .as("premise — the call under measurement must actually succeed — body=%s", resp.getBody())
+                    .isEqualTo(HttpStatus.CREATED);
+            assertThat(inAppNotificationRows())
+                    .as("premise — this scenario must actually pay the one insertForRecipients INSERT, "
+                            + "or the gate silently stops covering that branch")
+                    .hasSize(1);
+            assertThat(statements)
+                    .as("a rise means either the pre-333 walk-in-create baseline regressed, or the "
+                            + "in-app write stopped being ONE insertForRecipients statement for this "
+                            + "actor != performing-master shape; a fall back to the plain baseline means "
+                            + "the feed row silently stopped being written")
+                    .isEqualTo(WALK_IN_CREATE_DIFFERENT_ACTOR_STATEMENTS);
         }
     }
 

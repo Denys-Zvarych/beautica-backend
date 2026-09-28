@@ -9,6 +9,7 @@ import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.UUID;
 
 /**
@@ -117,6 +118,138 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
             @Param("id") UUID id,
             @Param("recipientUserId") UUID recipientUserId,
             @Param("type") String type,
+            @Param("bookingId") UUID bookingId,
+            @Param("appointmentId") UUID appointmentId,
+            @Param("salonId") UUID salonId,
+            @Param("subjectUserId") UUID subjectUserId,
+            @Param("dedupKey") String dedupKey);
+
+    /**
+     * Phase 333 perf follow-up — bulk counterpart of {@link #insertIgnoringDuplicate} for the
+     * salon-closure / master-removal / master-self-delete cascades ({@code
+     * BookingService#declineFutureConfirmed}), recipient = the booking's client only (rows 9/10 of
+     * the matrix). ONE set-based statement writes a row for every {@code (booking, client)} pair in
+     * {@code bookingIds} at once, so a cascade touching V visits costs the SAME ONE statement
+     * whether V is 1, 20 or 60 — mirroring {@code BookingRepository#declineConfirmedBulk}'s
+     * "one UPDATE ... WHERE id IN" shape for the identical reason: this method exists ONLY because a
+     * per-visit Java loop calling {@code insertIgnoringDuplicate} once per representative id was
+     * caught scaling the whole cascade's JDBC statement count with V by {@code
+     * MasterSelfDeleteBookingDisposalIT#should_keepStatementCountFlat_asDistinctAppointmentVisitCountGrows}
+     * (2026-09-28) — never re-introduce that Java-side loop.
+     *
+     * <p>{@code b.client_id IS NOT NULL} — a guest/walk-in booking's client is null and contributes
+     * no row, exactly like {@link com.beautica.notification.inapp.service.InAppNotificationService}'s
+     * per-row path. {@code IS DISTINCT FROM :actorUserId} is defence-in-depth (the client is never
+     * the actor for any of this method's three callers — an owner/master closes/removes, never the
+     * client themselves), mirroring every other write path's actor-exclusion rule uniformly rather
+     * than special-casing this one as "structurally unreachable, so skip the guard".
+     *
+     * @return the number of rows actually inserted (may be less than {@code bookingIds.size()} —
+     *         a guest booking or a conflict-suppressed duplicate contributes 0)
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification (id, recipient_user_id, type, booking_id, salon_id, dedup_key)
+            SELECT gen_random_uuid(), b.client_id, :type, b.id, m.salon_id, :type || ':' || b.id
+              FROM bookings b
+              JOIN masters m ON m.id = b.master_id
+             WHERE b.id IN (:bookingIds)
+               AND b.client_id IS NOT NULL
+               AND b.client_id IS DISTINCT FROM :actorUserId
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertClientOnlyBulk(
+            @Param("type") String type,
+            @Param("bookingIds") Collection<UUID> bookingIds,
+            @Param("actorUserId") UUID actorUserId);
+
+    /**
+     * Phase 333 perf follow-up — bulk counterpart of {@link #insertIgnoringDuplicate} for the
+     * CLIENT self-delete cascade ({@code BookingService#enqueueClientCancelledPerVisit}), recipient
+     * = the provider set (salon owner + all active {@code SALON_ADMIN}s + the performing master's
+     * own user — row 2 of the matrix). Computes the SAME recipient set {@code
+     * InAppRecipientResolver#providerSet} does, per booking, entirely in SQL via a lateral join, so
+     * a self-delete cancelling V standalone bookings (each its own "visit" — see {@code
+     * SalonClosureBookingCandidate#visitKey()}) costs ONE statement regardless of V. See {@link
+     * #insertClientOnlyBulk}'s javadoc for why a per-visit Java loop is never acceptable here — the
+     * identical regression was caught on this method's own call site by {@code
+     * ClientSelfDeleteBatchedCancelPerfIT#should_lowerPerBookingStatementCost_when_graphPreloadIsBatched}.
+     *
+     * <p>The lateral subquery's three legs mirror {@code InAppRecipientResolver#addMasterUser} /
+     * {@code #addOwnerAndAdmins} exactly: the master's own user (if any — a detached master
+     * contributes nothing), the salon owner (if the master belongs to a salon), and every active
+     * {@code SALON_ADMIN} of that salon. {@code UNION} (not {@code UNION ALL}) de-duplicates within
+     * one booking's own recipient set — the "owner who is also the performing {@code SALON_OWNER}-
+     * type master gets ONE row, not two" rule — and the {@code (recipient_user_id, dedup_key)}
+     * unique constraint's {@code ON CONFLICT DO NOTHING} de-duplicates ACROSS a re-entrant call.
+     *
+     * @return the number of rows actually inserted
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification (id, recipient_user_id, type, booking_id, salon_id, dedup_key)
+            SELECT gen_random_uuid(), recipient.user_id, :type, b.id, m.salon_id, :type || ':' || b.id
+              FROM bookings b
+              JOIN masters m ON m.id = b.master_id
+              CROSS JOIN LATERAL (
+                  SELECT m.user_id AS user_id WHERE m.user_id IS NOT NULL
+                  UNION
+                  SELECT s.owner_id FROM salons s WHERE s.id = m.salon_id
+                  UNION
+                  SELECT u.id FROM users u
+                   WHERE u.salon_id = m.salon_id AND u.role = 'SALON_ADMIN' AND u.is_active = true
+              ) recipient
+             WHERE b.id IN (:bookingIds)
+               AND recipient.user_id IS DISTINCT FROM :actorUserId
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertProviderSetBulk(
+            @Param("type") String type,
+            @Param("bookingIds") Collection<UUID> bookingIds,
+            @Param("actorUserId") UUID actorUserId);
+
+    /**
+     * Audit-fix cycle 1 (findings 1 &amp; 3) — single-EVENT counterpart of {@link #insertProviderSetBulk}
+     * / {@link #insertClientOnlyBulk}, for every per-event write in {@code InAppNotificationService}
+     * ({@code notifyBookingEvent}, {@code notifyVisitEvent}, {@code notifyRescheduled}, {@code
+     * notifyReviewReceived}). ONE statement writes a row for every id in {@code recipientIds} at once,
+     * replacing the K-round-trip {@code insertIgnoringDuplicate} loop those methods used to run per
+     * event (master + owner + N admins) — caught scaling the JDBC statement count with the recipient
+     * count by {@code StaffBookingIT}'s {@code CREATE_FIXED_STATEMENTS} gate and {@code
+     * AppointmentItemCompleteIT#should_costPinnedStatementCount_when_completingSingleServiceVisit}.
+     *
+     * <p><b>Recipients are resolved in JAVA</b>, off the caller's own already-loaded {@code
+     * Booking}/{@code Appointment} graph (finding 1 — {@code InAppNotificationService} no longer
+     * reloads a booking/appointment by id at all), not re-derived in SQL from a booking id. This is
+     * the opposite division of labour from {@link #insertProviderSetBulk}'s LATERAL shape, which MUST
+     * compute recipients in SQL because its cascade callers ({@code
+     * BookingService#cancelFutureConfirmedBookingsForClientSelfDelete} and siblings) never load a
+     * {@code Booking} entity at all — reusing that LATERAL statement here would reintroduce the exact
+     * reload this method exists to avoid. This method's own job is therefore only "write K rows in one
+     * round trip", never "compute K rows from a booking id".
+     *
+     * <p>Driven by {@code users}, filtered by {@code IN (:recipientIds)} — every id the caller passes
+     * is already a resolved user id ({@code Master.user}, {@code Salon.owner}, an active {@code
+     * SALON_ADMIN} from {@code InAppRecipientResolver}), so the join is a cardinality-preserving
+     * filter (one row in, one row out per existing id), never a widening one; a stale/foreign id
+     * (defensive only — nothing in this codebase can produce one) simply contributes no row rather
+     * than failing the whole insert.
+     *
+     * @return the number of rows actually inserted (fewer than {@code recipientIds.size()} when a
+     *         conflict-suppressed duplicate or a stale id is present)
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO in_app_notification
+                (id, recipient_user_id, type, booking_id, appointment_id, salon_id, subject_user_id, dedup_key)
+            SELECT gen_random_uuid(), u.id, :type, :bookingId, :appointmentId, :salonId, :subjectUserId, :dedupKey
+              FROM users u
+             WHERE u.id IN (:recipientIds)
+            ON CONFLICT (recipient_user_id, dedup_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertForRecipients(
+            @Param("type") String type,
+            @Param("recipientIds") Collection<UUID> recipientIds,
             @Param("bookingId") UUID bookingId,
             @Param("appointmentId") UUID appointmentId,
             @Param("salonId") UUID salonId,

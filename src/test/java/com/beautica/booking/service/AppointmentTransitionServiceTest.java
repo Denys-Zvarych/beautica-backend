@@ -19,6 +19,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
@@ -109,6 +110,9 @@ class AppointmentTransitionServiceTest {
     @Mock
     private org.springframework.context.ApplicationEventPublisher eventPublisher;
 
+    @Mock
+    private InAppNotificationService inAppNotificationService;
+
     private Clock clock;
     private AppointmentTransitionService appointmentTransitionService;
 
@@ -128,7 +132,8 @@ class AppointmentTransitionServiceTest {
                 visitPlanner,
                 appointmentService,
                 eventPublisher,
-                clock
+                clock,
+                inAppNotificationService
         );
         appointmentId = UUID.randomUUID();
     }

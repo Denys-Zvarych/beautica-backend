@@ -12,6 +12,7 @@ import com.beautica.config.BookingSmsProperties;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -66,6 +67,7 @@ class GuestBookingServiceTest {
     @Mock private NotificationOutboxService outboxService;
     @Mock private SmsService smsService;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private InAppNotificationService inAppNotificationService;
 
     private GuestBookingService service;
 
@@ -79,7 +81,8 @@ class GuestBookingServiceTest {
                 appointmentRepository, slotCalculationService, outboxService, smsDispatcher(),
                 new BookingSmsProperties(), salonCatalogCacheEvictor,
                 new VisitPlanner(masterServiceRepository), FRONTEND,
-                java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC));
+                java.time.Clock.fixed(OffsetDateTime.parse("2026-06-01T10:00:00Z").toInstant(), ZoneOffset.UTC),
+                inAppNotificationService);
 
         // Phase 337 fix: BookingSlotLockGuard.lockMasterAndAssertFree now re-checks bookability
         // AFTER the advisory lock (PostLockSlotGuard, closing the self-delete-race CRITICAL), fused

@@ -18,6 +18,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.config.BookingSmsProperties;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.sms.SmsDeliveryException;
 import com.beautica.notification.sms.SmsService;
 import com.beautica.salon.entity.Salon;
@@ -113,6 +114,7 @@ class StaffBookingServiceTest {
      * header and the saved chain, not what it returns.
      */
     @Mock private AppointmentService appointmentService;
+    @Mock private InAppNotificationService inAppNotificationService;
 
     private StaffBookingService service;
 
@@ -146,7 +148,7 @@ class StaffBookingServiceTest {
                 masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                 salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
                 bookingSmsDispatcher(), new BookingSmsProperties(),
-                Clock.fixed(NOW, ZoneOffset.UTC), appointmentService);
+                Clock.fixed(NOW, ZoneOffset.UTC), appointmentService, inAppNotificationService);
         // Lenient: rejection-path tests never reach the enrich() call, and MockitoExtension's
         // default STRICT_STUBS would otherwise flag this as an unnecessary stub for every one of
         // them. The return value is a placeholder — no test in this suite asserts on its content;
@@ -833,7 +835,8 @@ class StaffBookingServiceTest {
             service = new StaffBookingService(
                     masterRepository, bookingRepository, appointmentRepository, slotCalculationService,
                     salonCatalogCacheEvictor, new VisitPlanner(masterServiceRepository),
-                    bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService);
+                    bookingSmsDispatcher(), properties, Clock.fixed(NOW, ZoneOffset.UTC), appointmentService,
+                    inAppNotificationService);
             stubHappyPath(salonMaster(), assignment(null, null));
 
             create(command(guest(RAW_PHONE)));
