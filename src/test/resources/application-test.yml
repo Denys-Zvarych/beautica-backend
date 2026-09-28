@@ -180,6 +180,18 @@ notification:
       # scheduler; unit/repository tests pass an explicit staleBefore Instant directly and never
       # read this property.
       stale-claim-threshold: 60m
+  inapp:
+    retention-days: 90
+    cleanup:
+      # Off by default in the test profile — every full @SpringBootTest context has real
+      # scheduling enabled (SchedulingConfig is not profile-gated), and phase-335's job checks
+      # this flag at the top of every run rather than gating bean creation, so a class that wants
+      # to exercise the real sweep flips it back on via @TestPropertySource (see
+      # InAppNotificationCleanupJobIT), the same posture ClosureReminderJobIT already uses for
+      # booking.closure-reminder.enabled.
+      enabled: false
+      batch-size: 1000
+      max-batches-per-run: 50
 
 management:
   health:

@@ -279,6 +279,17 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * clause of its own — mirroring the bounded-delete shape used elsewhere in this codebase for
      * housekeeping sweeps.
      *
+     * <p>{@code ORDER BY created_at, id} (audit-fix cycle 1, finding 4) — {@code id} is a tiebreak
+     * for deterministic batch membership when two or more rows share a {@code created_at} (same-
+     * millisecond writes inside one visit-level transaction, e.g. {@link #insertForRecipients}).
+     * Without it, Postgres may return an arbitrary subset of the tied rows for a given {@code LIMIT},
+     * which is harmless for correctness (every tied row is still {@code < cutoff} and eligible) but
+     * makes batch boundaries non-reproducible across repeated runs with the same inputs — undesirable
+     * for a query a test or an operator might want to reason about deterministically. {@code id} adds
+     * no extra index requirement: it is only a tiebreak for rows Postgres has already located via
+     * {@code in_app_notification_created_idx} on {@code created_at}, not a widening of the WHERE
+     * predicate.
+     *
      * @return the number of rows actually deleted (may be less than {@code limit})
      */
     @Modifying
@@ -287,7 +298,7 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
              WHERE id IN (
                  SELECT id FROM in_app_notification
                   WHERE created_at < :cutoff
-                  ORDER BY created_at
+                  ORDER BY created_at, id
                   LIMIT :limit
              )
             """, nativeQuery = true)

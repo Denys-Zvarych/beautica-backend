@@ -660,6 +660,30 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
                 .contains("in_app_notification_salon_idx");
     }
 
+    @Test
+    @DisplayName("acceptance criterion (phase 335) — EXPLAIN of deleteCreatedBefore's driving "
+            + "subquery uses in_app_notification_created_idx")
+    void should_useCreatedIndex_when_explainingRetentionSweepQuery() {
+        insert(client.getId(), InAppNotificationType.BOOKING_CREATED, booking.getId(), null, null, null,
+                "BOOKING_CREATED:" + UUID.randomUUID());
+
+        IndexCapabilityProbe probe = new IndexCapabilityProbe(jdbcTemplate, "in_app_notification");
+        // Mirrors InAppNotificationRepository#deleteCreatedBefore's driving subquery exactly —
+        // the DELETE itself cannot be EXPLAINed as a nominated-index probe (explainWithOnly needs
+        // a plain SELECT), but the subquery IS the statement whose plan decides whether the
+        // retention sweep scans by index or falls back to a full table scan on every run.
+        // ORDER BY created_at, id (audit-fix cycle 1, finding 4) — the trailing id tiebreak is a
+        // sort key only, not a WHERE predicate, so the single-column created_at index still drives
+        // this query; re-asserted here rather than assumed.
+        String plan = probe.explainWithOnly("in_app_notification_created_idx",
+                "SELECT id FROM in_app_notification WHERE created_at < now() "
+                        + "ORDER BY created_at, id LIMIT 1000");
+
+        assertThat(plan)
+                .as("the retention sweep's driving subquery must be able to use the created_at index:\n" + plan)
+                .contains("in_app_notification_created_idx");
+    }
+
     // ── type/dedup-regex/enum drift guard (audit-fix cycle 2, finding 2) ───────────────────────
 
     @Test

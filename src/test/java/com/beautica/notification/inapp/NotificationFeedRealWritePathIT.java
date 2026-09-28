@@ -19,7 +19,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.context.TestPropertySource;
 
+import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -40,9 +43,24 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>REUSE-FIRST: every fixture below is {@link BookingTestFixtures} (salon/visit/working-hours) or
  * the plain {@code jdbcTemplate}/{@code restTemplate} helpers this package's sibling ITs already use
  * — no parallel builder.
+ *
+ * <p><b>Gap 7 (phase 335 QA follow-up, 2026-09-28)</b> composes the same real write path with the
+ * retention sweep: {@code notification.inapp.cleanup.enabled=true} is flipped on for this whole
+ * class via {@code @TestPropertySource} (mirrors {@code InAppNotificationCleanupJobIT}'s posture —
+ * a separate context bucket, cheap since this class already pays for its own context) so {@link
+ * #should_dropSweptRowFromFeedAndUnreadCount_when_realEventRowIsBackdatedPastRetention} can inject
+ * {@link InAppNotificationCleanupJob} and prove the sweep, the feed read, and unread-count all agree
+ * about a row a real HTTP booking actually wrote — REUSE-FIRST: this file already carries every
+ * helper (salon rig, {@code createBooking}, {@code feedFor}, {@code unreadCountFor}) that test
+ * needs, so it is added here rather than as a third file duplicating them.
  */
 @Import(TestSecurityConfig.class)
-@DisplayName("Notification feed — real write path (333) composed with the real read API (334)")
+@TestPropertySource(properties = {
+        "notification.inapp.cleanup.enabled=true",
+        "notification.inapp.retention-days=90"
+})
+@DisplayName("Notification feed — real write path (333) composed with the real read API (334) and "
+        + "the retention sweep (335)")
 class NotificationFeedRealWritePathIT extends AbstractIntegrationTest {
 
     private static final String NOTIFICATIONS_URL = "/api/v1/notifications";
@@ -54,6 +72,8 @@ class NotificationFeedRealWritePathIT extends AbstractIntegrationTest {
     private ObjectMapper objectMapper;
     @Autowired
     private PasswordEncoder passwordEncoder;
+    @Autowired
+    private InAppNotificationCleanupJob cleanupJob;
 
     private BookingTestFixtures fixtures;
 
@@ -504,5 +524,65 @@ class NotificationFeedRealWritePathIT extends AbstractIntegrationTest {
         assertThat(feedB.get(0).path("target").path("bookingId").asText()).isEqualTo(bookingB.toString());
         assertThat(feedA.toString()).doesNotContain(bookingB.toString());
         assertThat(feedB.toString()).doesNotContain(bookingA.toString());
+    }
+
+    // ── gap 7 — the retention sweep (335) composed with the real write path + real read API ──────
+
+    @Test
+    @DisplayName("a real BOOKING_CREATED row backdated 91 days past retention is swept: GET "
+            + "/notifications and /unread-count for the recipient both drop it, while a second, "
+            + "recent real event survives untouched")
+    void should_dropSweptRowFromFeedAndUnreadCount_when_realEventRowIsBackdatedPastRetention() throws Exception {
+        SalonRig rig = seedSalonRig();
+        UUID oldClientId = createNamedClient("Максим", "Ткаченко");
+        UUID recentClientId = createNamedClient("Настя", "Романюк");
+        // A second, distinct service — otherwise the second booking's dedup_key would collide with
+        // the first's and insertForRecipients' ON CONFLICT DO NOTHING would silently write zero
+        // rows for it (see the pagination test's identical reasoning above).
+        UUID secondService = fixtures.createSalonService(rig.salonId(), rig.masterId());
+        String masterToken = fixtures.tokenFor(emailOf(rig.masterUserId()));
+
+        UUID oldBookingId = createBooking(
+                fixtures.tokenFor(emailOf(oldClientId)), rig.masterId(), rig.masterServiceId(), tomorrowAtNoon());
+        UUID recentBookingId = createBooking(
+                fixtures.tokenFor(emailOf(recentClientId)), rig.masterId(), secondService,
+                tomorrowAtNoon().plusHours(2));
+
+        assertThat(unreadCountFor(masterToken))
+                .as("sanity — both real BOOKING_CREATED rows land unread before any backdating")
+                .isEqualTo(2);
+
+        // Backdate ONLY the row about oldBookingId — a raw jdbcTemplate UPDATE, mirroring
+        // InAppNotificationCleanupJobIT#seedRow's own backdating convention (the repository's
+        // insert methods leave created_at to the column DEFAULT now(), so backdating an
+        // already-written real row requires a raw UPDATE).
+        int updated = jdbcTemplate.update(
+                "UPDATE in_app_notification SET created_at = ? WHERE recipient_user_id = ? AND booking_id = ?",
+                Timestamp.from(Instant.now().minus(Duration.ofDays(91))), rig.masterUserId(), oldBookingId);
+        assertThat(updated).as("exactly the one real row about oldBookingId must be backdated").isEqualTo(1);
+
+        cleanupJob.sweep();
+
+        JsonNode feedAfter = feedFor(masterToken);
+        assertThat(feedAfter)
+                .as("only the recent (never-backdated) real event survives the sweep")
+                .hasSize(1);
+        assertThat(feedAfter.get(0).path("target").path("bookingId").asText())
+                .isEqualTo(recentBookingId.toString());
+        assertThat(unreadCountFor(masterToken))
+                .as("unread-count must drop from 2 to 1 once the swept row's unread item is gone — "
+                        + "proving the sweep, the feed read and unread-count all agree about the SAME row")
+                .isEqualTo(1);
+
+        // Scoped to the MASTER recipient specifically — seedSalonRig's booking also notifies the
+        // owner and admin (the provider set), and their own rows about the SAME oldBookingId were
+        // never backdated, so a bare "WHERE booking_id = ?" would still find those 2 untouched
+        // sibling rows and pass vacuously even if the master's row were never actually deleted.
+        Long remainingOldRow = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM in_app_notification WHERE booking_id = ? AND recipient_user_id = ?",
+                Long.class, oldBookingId, rig.masterUserId());
+        assertThat(remainingOldRow)
+                .as("the master's swept row is hard-deleted from the table, not merely hidden from the feed")
+                .isZero();
     }
 }
