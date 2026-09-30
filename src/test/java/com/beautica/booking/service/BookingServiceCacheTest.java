@@ -126,6 +126,8 @@ class BookingServiceCacheTest {
     @MockBean SalonRepository salonRepository;
     @MockBean AuthorizationService authz;
     @MockBean NotificationOutboxService outboxService;
+    // Phase 333: every BookingService transition writes its in-app feed row through this collaborator.
+    @MockBean com.beautica.notification.inapp.service.InAppNotificationService inAppNotificationService;
     // Phase 301: the master self-delete cascade deletes the outbox rows whose aggregate (the
     // booking) it is about to hard-delete, so BookingService now constructor-depends on the
     // repository directly (parameter 7), not only on NotificationOutboxService above. WITHOUT

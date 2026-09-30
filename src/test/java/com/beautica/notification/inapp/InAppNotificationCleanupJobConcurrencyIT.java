@@ -11,6 +11,8 @@ import org.springframework.context.annotation.Import;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.TestPropertySource;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -20,23 +22,22 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
 /**
  * Phase 335 QA follow-up — two concurrent {@link InAppNotificationCleanupJob#sweep()} calls racing
  * the SAME backlog.
  *
- * <p>The job's own class javadoc claims this is safe by construction: {@code deleteCreatedBefore}
- * is a plain bounded {@code DELETE ... WHERE id IN (SELECT ... LIMIT :limit)} with no {@code FOR
- * UPDATE SKIP LOCKED} — under READ COMMITTED, when two overlapping transactions each select
- * (uncommitted-visibility) the same candidate id set and try to delete it, whichever commits second
- * simply finds its target rows already gone (Postgres re-checks the row's visibility after the lock
- * wait, sees the row deleted, and skips it) — never an exception, never a double logical delete,
- * never a young row touched. This class is the first test that actually drives two REAL, overlapping
- * {@code sweep()} calls against a shared backlog to pin that claim, rather than taking the javadoc's
- * word for it.
+ * <p>{@code deleteCreatedBefore} is a bounded {@code DELETE ... WHERE id IN (SELECT ... LIMIT :limit
+ * FOR UPDATE SKIP LOCKED)} (Phase 336): two overlapping sweeps each lock a DISJOINT batch, and a row
+ * locked by anything else (e.g. an in-flight mark-read UPDATE) is skipped this run and picked up by
+ * the next — never an exception, never a double delete, never a young row touched. This class drives
+ * two REAL, overlapping {@code sweep()} calls against a shared backlog, and a sweep against a row
+ * held by an uncommitted UPDATE, to pin those claims rather than taking the javadoc's word for them.
  *
  * <p>Runs at the {@code @SpringBootTest} level (not {@code @DataJpaTest}) because {@code sweep()}'s
  * batch loop only honours its {@code @Transactional(REQUIRES_NEW)} {@code deleteBatch} when called
@@ -129,6 +130,54 @@ class InAppNotificationCleanupJobConcurrencyIT extends AbstractIntegrationTest {
                 .as("only the 300 young rows remain — neither concurrent sweep touched a row inside "
                         + "the retention window")
                 .isEqualTo(youngCount);
+    }
+
+    @Test
+    @DisplayName("a row locked by a concurrent mark-read UPDATE is SKIPPED (sweep neither blocks nor "
+            + "fails) and is deleted by the NEXT run once the lock is released — no loss, no block")
+    void should_skipLockedRowThenDeleteItNextRun_when_markReadHoldsRowLock() throws Exception {
+        Instant oldCreatedAt = Instant.now().minus(Duration.ofDays(91));
+        seedBulkRows(oldCreatedAt, 3);
+        UUID lockedId = jdbcTemplate.queryForObject(
+                "SELECT id FROM in_app_notification WHERE recipient_user_id = ? ORDER BY id LIMIT 1",
+                UUID.class, userId);
+
+        Connection markRead = jdbcTemplate.getDataSource().getConnection();
+        markRead.setAutoCommit(false);
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        try {
+            try (PreparedStatement ps = markRead.prepareStatement(
+                    "UPDATE in_app_notification SET read_at = now() WHERE id = ?")) {
+                ps.setObject(1, lockedId);
+                assertThat(ps.executeUpdate()).as("the mark-read UPDATE must hold the row lock").isEqualTo(1);
+            }
+
+            Future<?> sweep = exec.submit(job::sweep);
+            try {
+                sweep.get(15, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                fail("sweep() blocked on a row locked by an in-flight mark-read — FOR UPDATE SKIP LOCKED "
+                        + "must skip it instead of waiting");
+            }
+
+            assertThat(countRowsForUser())
+                    .as("run 1 deletes the 2 unlocked old rows and skips the locked one")
+                    .isEqualTo(1);
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM in_app_notification WHERE id = ?", Long.class, lockedId))
+                    .as("the locked row survives run 1").isEqualTo(1L);
+
+            markRead.commit();
+        } finally {
+            markRead.close();
+            exec.shutdownNow();
+        }
+
+        job.sweep();
+
+        assertThat(countRowsForUser())
+                .as("run 2 (lock released) deletes the previously skipped row — nothing is lost")
+                .isZero();
     }
 
     // ── fixtures ─────────────────────────────────────────────────────────────

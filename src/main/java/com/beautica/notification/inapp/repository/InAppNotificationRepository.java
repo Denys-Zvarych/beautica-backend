@@ -290,6 +290,11 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
      * {@code in_app_notification_created_idx} on {@code created_at}, not a widening of the WHERE
      * predicate.
      *
+     * <p>{@code FOR UPDATE SKIP LOCKED} (Phase 336 audit-fix): two overlapping sweeps (multi-instance
+     * deploy, or a manual run racing the schedule) each lock a DISJOINT batch instead of contending for
+     * the same rows and deadlocking on the DELETE; a skipped (locked) row is simply picked up by the next
+     * batch/run. It does not change which index drives the subquery.
+     *
      * @return the number of rows actually deleted (may be less than {@code limit})
      */
     @Modifying
@@ -300,6 +305,7 @@ public interface InAppNotificationRepository extends Repository<InAppNotificatio
                   WHERE created_at < :cutoff
                   ORDER BY created_at, id
                   LIMIT :limit
+                  FOR UPDATE SKIP LOCKED
              )
             """, nativeQuery = true)
     int deleteCreatedBefore(@Param("cutoff") Instant cutoff, @Param("limit") int limit);

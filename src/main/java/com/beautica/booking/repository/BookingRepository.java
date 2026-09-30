@@ -999,59 +999,63 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
     );
 
     /**
-     * Overlap check that excludes a single booking's own row — used by the reschedule
-     * flow so a booking does not collide with itself when only its time changes.
-     *
-     * <p>Same overlap predicate as the {@code overlap_exists} column of
-     * {@link #findPostLockBookabilityAndOverlap} (CONFIRMED rows only, half-open interval overlap) plus
-     * {@code id <> :excludeBookingId}. Callers must hold the per-master advisory lock
-     * (see {@link #acquireAdvisoryLock(UUID)}) before invoking, identical to create.
+     * Post-advisory-lock re-check for the standalone / per-item reschedule paths, in ONE statement
+     * (it REPLACES the former {@code existsOverlapExcluding}, so the statement count is unchanged):
+     * {@code still_confirmed} re-reads the moving row's status from the database (a native scalar —
+     * never the persistence-context entity, which may be a stale pre-lock snapshot) and
+     * {@code overlap_exists} is the same CONFIRMED half-open overlap predicate as before, excluding
+     * only the moving row ({@code id <> :bookingId}, so a CONFIRMED sibling of the same visit IS
+     * caught). Closes the reschedule-vs-cascade race: a master self-delete / salon closure holding
+     * the master advisory lock can DECLINE the booking while a reschedule queues on that lock.
+     * Callers must hold the per-master advisory lock.
      */
     @Query(value = """
-            SELECT EXISTS (
-              SELECT 1 FROM bookings
-               WHERE master_id = :masterId
-                 AND id <> :excludeBookingId
-                 AND status = 'CONFIRMED'
-                 AND starts_at < :requestedEndsAt
-                 AND ends_at   > :requestedStartsAt
-            )
+            SELECT
+              EXISTS (SELECT 1 FROM bookings WHERE id = :bookingId AND status = 'CONFIRMED') AS still_confirmed,
+              EXISTS (
+                SELECT 1 FROM bookings
+                 WHERE master_id = :masterId
+                   AND id <> :bookingId
+                   AND status = 'CONFIRMED'
+                   AND starts_at < :requestedEndsAt
+                   AND ends_at   > :requestedStartsAt
+              ) AS overlap_exists
             """, nativeQuery = true)
-    boolean existsOverlapExcluding(
+    PostLockRescheduleCheck findPostLockConfirmedAndOverlapExcluding(
             @Param("masterId") UUID masterId,
             @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
-            @Param("excludeBookingId") UUID excludeBookingId
+            @Param("bookingId") UUID bookingId
     );
 
     /**
-     * Overlap check that excludes an ENTIRE visit's own chained rows — the appointment-level
-     * (BE-4 reschedule) analogue of {@link #existsOverlapExcluding}. A multi-service visit
-     * occupies N {@code bookings} rows (all sharing {@code appointment_id}), so a single
-     * {@code id <> :excludeBookingId} exclusion is not enough when re-planning the WHOLE block:
-     * the new span can legitimately overlap several of the visit's OWN current rows.
-     * {@code appointment_id IS DISTINCT FROM :appointmentId} is null-safe (legacy single-service
-     * bookings carry a {@code NULL appointment_id} and are never excluded by this predicate).
-     * Same overlap predicate otherwise as the {@code overlap_exists} column of
-     * {@link #findPostLockBookabilityAndOverlap} (CONFIRMED rows only, half-open interval
-     * overlap). Callers must hold the per-master advisory lock (see {@link #acquireAdvisoryLock(UUID)})
-     * before invoking, identical to the single-booking reschedule flow.
+     * Visit-level analogue of {@link #findPostLockConfirmedAndOverlapExcluding}: {@code still_confirmed}
+     * is true iff EVERY id in {@code targetIds} (the items being moved) is still CONFIRMED in the
+     * database (count of CONFIRMED rows among them equals {@code expectedCount}); the overlap half
+     * excludes the whole visit's rows ({@code appointment_id IS DISTINCT FROM :appointmentId},
+     * null-safe). Replaces the former {@code existsOverlapExcludingAppointment} — same single
+     * statement. Callers must hold the per-master advisory lock.
      */
     @Query(value = """
-            SELECT EXISTS (
-              SELECT 1 FROM bookings
-               WHERE master_id = :masterId
-                 AND appointment_id IS DISTINCT FROM :appointmentId
-                 AND status = 'CONFIRMED'
-                 AND starts_at < :requestedEndsAt
-                 AND ends_at   > :requestedStartsAt
-            )
+            SELECT
+              (SELECT COUNT(*) FROM bookings WHERE id IN (:targetIds) AND status = 'CONFIRMED')
+                  = :expectedCount AS still_confirmed,
+              EXISTS (
+                SELECT 1 FROM bookings
+                 WHERE master_id = :masterId
+                   AND appointment_id IS DISTINCT FROM :appointmentId
+                   AND status = 'CONFIRMED'
+                   AND starts_at < :requestedEndsAt
+                   AND ends_at   > :requestedStartsAt
+              ) AS overlap_exists
             """, nativeQuery = true)
-    boolean existsOverlapExcludingAppointment(
+    PostLockRescheduleCheck findPostLockAllConfirmedAndOverlapExcludingAppointment(
             @Param("masterId") UUID masterId,
             @Param("requestedStartsAt") OffsetDateTime requestedStartsAt,
             @Param("requestedEndsAt") OffsetDateTime requestedEndsAt,
-            @Param("appointmentId") UUID appointmentId
+            @Param("appointmentId") UUID appointmentId,
+            @Param("targetIds") Collection<UUID> targetIds,
+            @Param("expectedCount") long expectedCount
     );
 
     // ── Client-scoped conflict check (cross-master/salon double-booking) ─────────
@@ -1819,6 +1823,7 @@ public interface BookingRepository extends JpaRepository<Booking, UUID>, Booking
             @Param("providerComment") String providerComment,
             @Param("now") Instant now);
 
+    // Global lock order: client(1) → master(0) → appointment header → booking rows.
     // Hash collision risk: hashtextextended produces a 64-bit hash of the UUID text.
     // Birthday-paradox probability is negligible for current master counts (<10,000)
     // but should be revisited if the platform scales significantly.

@@ -47,7 +47,7 @@ public class NotificationFeedController {
     @PreAuthorize("isAuthenticated()")
     @Operation(summary = "The recipient's own notification feed, newest first")
     public PageResponse<NotificationResponse> listFeed(
-            @RequestParam(defaultValue = "0") @Min(0) int page,
+            @RequestParam(defaultValue = "0") @Min(0) @Max(10_000) int page,
             @RequestParam(defaultValue = "20") @Min(1) @Max(50) int size,
             Authentication authentication) {
         UUID recipientId = AuthenticationUtils.userId(authentication);

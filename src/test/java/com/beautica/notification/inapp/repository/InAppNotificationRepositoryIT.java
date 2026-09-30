@@ -1,6 +1,7 @@
 package com.beautica.notification.inapp.repository;
 
 import com.beautica.AbstractDataJpaTest;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Appointment;
 import com.beautica.booking.entity.Booking;
@@ -677,7 +678,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
         // this query; re-asserted here rather than assumed.
         String plan = probe.explainWithOnly("in_app_notification_created_idx",
                 "SELECT id FROM in_app_notification WHERE created_at < now() "
-                        + "ORDER BY created_at, id LIMIT 1000");
+                        + "ORDER BY created_at, id LIMIT 1000 FOR UPDATE SKIP LOCKED");
 
         assertThat(plan)
                 .as("the retention sweep's driving subquery must be able to use the created_at index:\n" + plan)
@@ -959,6 +960,24 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
         assertThat(rows).hasSize(1);
         assertThat(rows.get(0).get("booking_id")).isEqualTo(booking.getId());
         assertThat(rows.get(0).get("recipient_user_id")).isEqualTo(client.getId());
+    }
+
+    @Test
+    @DisplayName("Phase 336 audit-fix: the service chunks a bulk id list so 40,000 ids (over the JDBC "
+            + "32,767 bind-parameter ceiling an unchunked IN (:ids) would hit) still succeed against real "
+            + "Postgres, while a real booking inside the list still gets its row")
+    void should_succeedBeyondJdbcParameterLimit_when_serviceChunksBulkIds() {
+        InAppNotificationService service = new InAppNotificationService(repository, null, null);
+        List<UUID> ids = new java.util.ArrayList<>(
+                java.util.stream.Stream.generate(UUID::randomUUID).limit(40_000).toList());
+        ids.add(25_000, booking.getId());
+
+        service.notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_MASTER_REMOVED, ids, null);
+
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT booking_id, recipient_user_id FROM in_app_notification");
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).get("booking_id")).isEqualTo(booking.getId());
     }
 
     // ── users(salon_id) WHERE role='SALON_ADMIN' AND is_active index (audit-fix cycle 1, finding 4) ──

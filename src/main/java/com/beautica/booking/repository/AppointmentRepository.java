@@ -188,8 +188,11 @@ public interface AppointmentRepository extends JpaRepository<Appointment, UUID> 
      * precondition.
      *
      * <p><b>Lock order (cycle-2 audit finding 1 — lock-order inversion / deadlock risk).</b>
-     * Establishes the canonical {@code appointments}-row-before-{@code bookings}-rows lock order for
-     * the whole-visit family: the per-item paths ({@code BookingService#cancelBooking},
+     * Global lock order: client(1) advisory → master(0) advisory → {@code appointments} header row →
+     * {@code bookings} rows (the reschedule paths take the header AFTER both advisory locks; the
+     * header-only decline/cancel/complete paths take no advisory lock). Establishes the
+     * {@code appointments}-row-before-{@code bookings}-rows order for the whole-visit family: the
+     * per-item paths ({@code BookingService#cancelBooking},
      * {@code AppointmentTransitionService#declineAppointmentItem}) already lock the header before
      * writing their own single child row (via {@link #lockHeaderIfConfirmed}); this method gives the
      * whole-visit callers the identical ordering guarantee, taken explicitly and eagerly — a real,

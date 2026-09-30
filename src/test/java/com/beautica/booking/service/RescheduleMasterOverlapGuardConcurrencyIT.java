@@ -17,6 +17,8 @@ import com.beautica.common.TimeZones;
 import com.beautica.config.TestSecurityConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -24,6 +26,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -78,7 +81,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * same instant (immediately adjacent, same transaction, same lock held), no timing can ever separate
  * "the app guard rejected it" from "the app guard was skipped and the DB backstop caught it instead" —
  * the HTTP response is byte-for-byte identical either way. Each test below therefore asserts
- * {@code verify(bookingRepository).existsOverlapExcluding(...)} as the assertion that actually proves
+ * {@code verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(...)} as the assertion that actually proves
  * the guard ran rather than being bypassed by the flag; the 409/persistence assertions alongside it
  * document today's (correct, defense-in-depth) behaviour but would NOT go red under the mutation on
  * their own.
@@ -124,7 +127,26 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
     @SpyBean
     private AppointmentTransitionService appointmentTransitionService;
 
+    private static final String CLIENT_LOCK_SQL =
+            "SELECT pg_advisory_xact_lock(hashtextextended(CAST(? AS text), 1))";
+    private static final String ADVISORY_WAITER_SQL =
+            "SELECT count(*) FROM pg_stat_activity "
+                    + "WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND pid <> pg_backend_pid()";
+
     private BookingTestFixtures fixtures;
+
+    /** Polls {@code pg_stat_activity} until a backend is observably waiting on an advisory lock (10s cap). */
+    private boolean awaitAdvisoryWaiter() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            Integer waiters = jdbcTemplate.queryForObject(ADVISORY_WAITER_SQL, Integer.class);
+            if (waiters != null && waiters >= 1) {
+                return true;
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
+        }
+        return false;
+    }
 
     @BeforeEach
     void seedFixtures() {
@@ -224,7 +246,7 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
         // EXCLUDE constraint would produce the SAME 409 above even if this application-level guard
         // were skipped entirely, so this verify — not the status code — is what actually proves
         // existsOverlapExcluding ran rather than being bypassed by the flag.
-        verify(bookingRepository).existsOverlapExcluding(
+        verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(
                 eq(masterId), argThat(odt -> odt != null && odt.isEqual(occupiedSlot.toOffsetDateTime())),
                 any(OffsetDateTime.class), eq(clientBBookingId));
 
@@ -247,7 +269,7 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
     @Test
     @DisplayName("RESCHEDULE ITEM — the ONE THAT MATTERS for PATCH .../services/{bookingId}/reschedule: "
             + "a per-item reschedule that read the master's slot as FREE, then found it taken by "
-            + "client A by the time it reached its own header lock, must still 409 with "
+            + "client A by the time it reached its own lock acquisition, must still 409 with "
             + "allowClientOverlap=true — existsOverlapExcluding still RAN")
     void should_stillRejectDoubleBooking_when_reschedulingAppointmentItemIntoAnotherClientsMasterSlotEvenWithAllowClientOverlap()
             throws Exception {
@@ -256,7 +278,7 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
         String clientAToken = fixtures.tokenFor(clientAEmail);
 
         String clientBEmail = "rmog-itemresched-clientb-" + System.nanoTime() + "@beautica.test";
-        fixtures.createUser(clientBEmail, "CLIENT", null);
+        UUID clientBId = fixtures.createUser(clientBEmail, "CLIENT", null);
         String clientBToken = fixtures.tokenFor(clientBEmail);
 
         UUID masterId = fixtures.createIndependentMaster(
@@ -283,23 +305,17 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
         UUID appointmentId = UUID.fromString(visitData.path("id").asText());
         UUID itemBookingId = UUID.fromString(visitData.path("items").get(0).path("bookingId").asText());
 
-        // One-sided gate: AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule runs
-        // AFTER assertItemStartsOnAvailableSlot but BEFORE the client/master locks and
-        // existsOverlapExcluding — the reschedule thread's own (and ONLY, for this appointmentId)
-        // call to it pauses here, letting client A's occupying booking commit to full completion
-        // first. Package-private — reachable ONLY because this test lives in
-        // com.beautica.booking.service (see class Javadoc).
-        CountDownLatch rescheduleReachedGate = new CountDownLatch(1);
-        CountDownLatch occupierCommitted = new CountDownLatch(1);
-        doAnswer(invocation -> {
-            rescheduleReachedGate.countDown();
-            boolean released = occupierCommitted.await(10, TimeUnit.SECONDS);
-            if (!released) {
-                throw new IllegalStateException("occupier booking never committed — test setup is broken");
-            }
-            return invocation.callRealMethod();
-        }).when(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(eq(appointmentId));
-
+        // Deterministic pause with NO spy: the test holds client B's REAL salt-1 advisory lock on a raw
+        // JDBC connection, so the reschedule runs its (free) availability read and then queues on its
+        // FIRST lock — the client lock — holding NO advisory or header lock (global order client(1) ->
+        // master(0) -> header; a gate at the header lock would now sit AFTER both advisory locks and
+        // starve the occupier on the master lock). Client A's occupying booking commits meanwhile.
+        Connection clientLockHolder = jdbcTemplate.getDataSource().getConnection();
+        clientLockHolder.setAutoCommit(false);
+        try (PreparedStatement ps = clientLockHolder.prepareStatement(CLIENT_LOCK_SQL)) {
+            ps.setString(1, clientBId.toString());
+            ps.execute();
+        }
         CountDownLatch rescheduleDone = new CountDownLatch(1);
         AtomicReference<ResponseEntity<String>> rescheduleResponse = new AtomicReference<>();
         Thread.ofVirtual().start(() -> {
@@ -316,8 +332,8 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
             }
         });
 
-        assertThat(rescheduleReachedGate.await(10, TimeUnit.SECONDS))
-                .as("the reschedule thread must reach its own header-lock attempt within 10s")
+        assertThat(awaitAdvisoryWaiter())
+                .as("the reschedule must be observably queued on client B's advisory lock within 10s")
                 .isTrue();
 
         var clientARequest = new CreateBookingRequest(masterId, masterServiceId, occupiedSlot, null, null, false);
@@ -329,7 +345,8 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
                         + "paused — body: %s", respA.getBody())
                 .isEqualTo(HttpStatus.CREATED);
 
-        occupierCommitted.countDown();
+        clientLockHolder.commit();
+        clientLockHolder.close();
         assertThat(rescheduleDone.await(10, TimeUnit.SECONDS))
                 .as("the reschedule thread must finish within 10s once released")
                 .isTrue();
@@ -340,7 +357,7 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
                         rescheduleResponse.get().getBody())
                 .isEqualTo(HttpStatus.CONFLICT);
 
-        verify(bookingRepository).existsOverlapExcluding(
+        verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(
                 eq(masterId), argThat(odt -> odt != null && odt.isEqual(occupiedSlot.toOffsetDateTime())),
                 any(OffsetDateTime.class), eq(itemBookingId));
 
@@ -421,7 +438,7 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
         // Excluding), never by this one. Widening the `if` around this call to also test
         // req.allowClientOverlap() (the exact mutation this suite guards against) would short-
         // circuit this call entirely and this verify would see ZERO interactions.
-        verify(bookingRepository).existsOverlapExcluding(
+        verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(
                 eq(masterBId), argThat(odt -> odt != null && odt.isEqual(slotT1.toOffsetDateTime())),
                 any(OffsetDateTime.class), eq(bookingBId));
 
@@ -493,7 +510,7 @@ class RescheduleMasterOverlapGuardConcurrencyIT extends AbstractIntegrationTest 
                         rescheduleResponse.getBody())
                 .isEqualTo(HttpStatus.OK);
 
-        verify(bookingRepository).existsOverlapExcluding(
+        verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(
                 eq(masterBId), argThat(odt -> odt != null && odt.isEqual(slotT1.toOffsetDateTime())),
                 any(OffsetDateTime.class), eq(itemBookingId));
 

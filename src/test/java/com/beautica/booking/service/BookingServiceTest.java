@@ -1776,9 +1776,8 @@ class BookingServiceTest {
 
     @Test
     @DisplayName("rescheduling an appointment CHILD locks the visit header via "
-            + "AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule BEFORE the "
-            + "client/master advisory locks — canonical appointments-before-bookings lock order "
-            + "(phase 30.2, cycle-2 audit finding 1)")
+            + "AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule AFTER the "
+            + "client/master advisory locks — global lock order client -> master -> header")
     void should_lockAppointmentHeaderBeforeItemReschedule_when_reschedulingAppointmentChild() {
         UUID appointmentId = UUID.randomUUID();
         Appointment appointment = Appointment.builder().id(appointmentId).build();
@@ -1788,7 +1787,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         when(appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId))
                 .thenReturn(true);
@@ -1797,8 +1796,8 @@ class BookingServiceTest {
 
         assertThat(booking.getStartsAt()).isEqualTo(newStartsAt);
         InOrder inOrder = inOrder(appointmentTransitionService, bookingRepository);
-        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         inOrder.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        inOrder.verify(appointmentTransitionService).lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         inOrder.verify(bookingRepository).saveAndFlush(any());
         // No phase-2 collapse call exists for reschedule (phase 30.2 D2) — the item stays CONFIRMED.
         verify(appointmentTransitionService, never())
@@ -1815,7 +1814,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2051,7 +2050,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         BookingDetailResponse result = bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2094,7 +2093,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         BookingDetailResponse result = bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2233,6 +2232,28 @@ class BookingServiceTest {
     }
 
     @Test
+    @DisplayName("409 is thrown, with no mutation/save/outbox, when the booking was DECLINED by a cascade "
+            + "while the reschedule queued on the master lock (fused post-lock freshness re-check)")
+    void should_throw409AndNotMutate_when_rescheduleBookingDeclinedWhileQueuedOnMasterLock() {
+        Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
+        OffsetDateTime originalStart = booking.getStartsAt();
+        OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
+        RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
+        when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
+        stubRescheduleSlotAvailable(newStartsAt);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId)))
+                .thenReturn(PostLockRescheduleChecks.stale());
+
+        assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
+                .isInstanceOf(BusinessException.class)
+                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(booking.getStartsAt()).isEqualTo(originalStart);
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
+    }
+
+    @Test
     @DisplayName("409 is thrown when the new time overlaps another booking, with the booking's own row excluded via existsOverlapExcluding")
     void should_throw409_when_rescheduleOverlapsAnotherBooking() {
         Booking booking = buildBooking(bookingId, client, master, msa, BookingStatus.CONFIRMED);
@@ -2240,14 +2261,14 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(true);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.overlap());
 
         assertThatThrownBy(() -> bookingService.rescheduleBooking(clientId, bookingId, req))
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus())
                         .isEqualTo(HttpStatus.CONFLICT));
         // Self-exclusion: overlap is checked excluding this booking's own id
-        verify(bookingRepository).existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
+        verify(bookingRepository).findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId));
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
@@ -2284,7 +2305,7 @@ class BookingServiceTest {
         verify(bookingRepository).findFirstConflictingClientBookingIdExcluding(
                 eq(clientId), any(), any(), eq(bookingId));
         verify(bookingRepository, never()).acquireAdvisoryLock(any());
-        verify(bookingRepository, never()).existsOverlapExcluding(any(), any(), any(), any());
+        verify(bookingRepository, never()).findPostLockConfirmedAndOverlapExcluding(any(), any(), any(), any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), anyBoolean());
     }
@@ -2302,7 +2323,7 @@ class BookingServiceTest {
         RescheduleBookingRequest req = new RescheduleBookingRequest(newStartsAt, false);
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         bookingService.rescheduleBooking(clientId, bookingId, req);
@@ -2324,7 +2345,7 @@ class BookingServiceTest {
         OffsetDateTime newStartsAt = ZonedDateTime.now(clock).plusHours(4).toOffsetDateTime();
         when(bookingRepository.findByIdWithFullGraph(bookingId)).thenReturn(Optional.of(booking));
         stubRescheduleSlotAvailable(newStartsAt);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(bookingId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         bookingService.rescheduleBooking(clientId, bookingId, new RescheduleBookingRequest(newStartsAt, false));
         assertThat(booking.getStatus()).isEqualTo(BookingStatus.CONFIRMED);

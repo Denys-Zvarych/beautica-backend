@@ -241,6 +241,16 @@ class NotificationFeedControllerIT extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("should_return400_when_pageAboveUpperBound")
+    void should_return400_when_pageAboveUpperBound() {
+        String token = tokenFor(client.getEmail());
+
+        assertThat(getFeed(token, "?page=10001").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(getFeed(token, "?page=-1").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(getFeed(token, "?page=10000").getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
     @DisplayName("should_return401_when_anonymous")
     void should_return401_when_anonymous() {
         ResponseEntity<String> resp = restTemplate.getForEntity("/api/v1/notifications", String.class);

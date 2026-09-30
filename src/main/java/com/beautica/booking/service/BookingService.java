@@ -3421,8 +3421,8 @@ public class BookingService {
      * inverting the canonical appointments-before-bookings lock order (cycle-2 audit finding 1) for
      * this class of write. Fixed below: when {@code booking.getAppointment() != null}, the header is
      * locked via {@link AppointmentTransitionService#lockAppointmentHeaderBeforeItemReschedule} —
-     * AFTER guard resolution (never lock for a request about to 403/409) and BEFORE the client/master
-     * advisory locks (restoring the canonical order) — with ZERO extra statements on the legacy
+     * AFTER guard resolution (never lock for a request about to 403/409) and AFTER the client/master
+     * advisory locks (global order client → master → header → booking rows) — with ZERO extra statements on the legacy
      * standalone-booking path: {@code booking.getAppointment()} reads the FK id off the uninitialised
      * {@code @ManyToOne(LAZY)} proxy without a query, and a {@code null} appointment id (the common
      * case) short-circuits the call entirely. There is deliberately no phase-2 collapse call — a
@@ -3532,19 +3532,6 @@ public class BookingService {
         OffsetDateTime newEndsAt = newStartsAt.plusMinutes(
                 (long) booking.getDurationMinutesAtBooking() + booking.getBufferMinutesAtBooking());
 
-        // Phase 30.2 (cycle-2 audit finding 1 — lock-order fix): lock the visit HEADER, if this
-        // booking is one item of a multi-service visit, BEFORE the client/master advisory locks
-        // below — restoring the canonical appointments-before-bookings order that cancelBooking
-        // (:1119-1121) already established for the same class of write. getAppointment().getId() is
-        // served off the uninitialised @ManyToOne(LAZY) proxy without a statement, so a legacy
-        // standalone booking (appointmentId == null) short-circuits this call entirely — ZERO extra
-        // statements on that path. The boolean result is intentionally discarded (see this method's
-        // own Javadoc, "Phase 30.2"): no phase-2 collapse ever follows a reschedule.
-        UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
-        if (appointmentId != null) {
-            appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId);
-        }
-
         // Freshness re-check (G2, HIGH, cycle-7 audit 2026-08-03; widened to standalone bookings by
         // G4, cycle-7 audit 2026-08-03) — see this method's own "Freshness re-check" / "Unconditional,
         // including standalone bookings" Javadoc paragraphs above. Unconditional: this is the ONLY
@@ -3608,9 +3595,26 @@ public class BookingService {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "Advisory lock acquisition failed");
         }
 
-        if (bookingRepository.existsOverlapExcluding(masterId, newStartsAt, newEndsAt, bookingId)) {
-            throw new BusinessException(HttpStatus.CONFLICT, "Slot not available");
+        // Phase 30.2 lock-order fix (final form): the visit HEADER is locked AFTER the client(1) and
+        // master(0) advisory locks — global order client → master → appointment header → booking
+        // rows, matching every cascade (master self-delete/removal, schedule override, client
+        // self-delete), which take the advisory locks first. Locking the header first deadlocked
+        // against them. A legacy standalone booking (appointmentId == null) short-circuits with ZERO
+        // extra statements (getAppointment().getId() is served off the uninitialised LAZY proxy).
+        // The boolean result is intentionally discarded: the authoritative post-lock guard below
+        // re-reads this booking's CONFIRMED status fresh from the DB, and no phase-2 collapse ever
+        // follows a reschedule.
+        UUID appointmentId = booking.getAppointment() != null ? booking.getAppointment().getId() : null;
+        if (appointmentId != null) {
+            appointmentTransitionService.lockAppointmentHeaderBeforeItemReschedule(appointmentId);
         }
+
+        // Authoritative post-lock re-check: fresh-from-DB CONFIRMED status of THIS booking (a master
+        // self-delete / salon closure holding the lock may have DECLINED it while we queued) fused
+        // with the overlap check in one statement — see PostLockRescheduleGuard.
+        PostLockRescheduleGuard.assertBookingStillConfirmedAndFree(
+                bookingRepository, masterId, newStartsAt, newEndsAt, bookingId,
+                "Service changed concurrently — please retry");
 
         booking.reschedule(newStartsAt, newEndsAt);
         Booking saved;

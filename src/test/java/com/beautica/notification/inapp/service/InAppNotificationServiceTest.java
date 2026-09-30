@@ -343,4 +343,56 @@ class InAppNotificationServiceTest {
         assertThat(recipients.getValue()).containsExactlyInAnyOrder(ownerId, masterUserId);
         verify(userRepository, never()).findBySalonIdAndRoleAndIsActiveTrue(any(), any());
     }
+
+    // ── bulk-insert id chunking (Phase 336 audit-fix, INFO security) ─────────────────────────────
+
+    @Test
+    @DisplayName("notifyClientOnlyBulk: 2500 ids split into 1000/1000/500, one statement per chunk")
+    void should_chunkIdsAt1000_when_notifyClientOnlyBulkGetsMoreThanOneChunk() {
+        List<UUID> ids = java.util.stream.Stream.generate(UUID::randomUUID).limit(2500).toList();
+
+        service.notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED, ids, null);
+
+        ArgumentCaptor<Collection<UUID>> chunks = recipientsCaptor();
+        verify(repository, times(3)).insertClientOnlyBulk(eq("BOOKING_CANCELLED_SALON_CLOSED"), chunks.capture(), any());
+        assertThat(chunks.getAllValues()).extracting(Collection::size).containsExactly(1000, 1000, 500);
+        assertThat(chunks.getAllValues().stream().flatMap(Collection::stream)).containsExactlyElementsOf(ids);
+    }
+
+    @Test
+    @DisplayName("notifyProviderSetBulk: 2500 ids split into 1000/1000/500, one statement per chunk")
+    void should_chunkIdsAt1000_when_notifyProviderSetBulkGetsMoreThanOneChunk() {
+        List<UUID> ids = java.util.stream.Stream.generate(UUID::randomUUID).limit(2500).toList();
+
+        service.notifyProviderSetBulk(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, ids, null);
+
+        ArgumentCaptor<Collection<UUID>> chunks = recipientsCaptor();
+        verify(repository, times(3)).insertProviderSetBulk(eq("BOOKING_CANCELLED_BY_CLIENT"), chunks.capture(), any());
+        assertThat(chunks.getAllValues()).extracting(Collection::size).containsExactly(1000, 1000, 500);
+    }
+
+    @Test
+    @DisplayName("bulk notify: 1001 ids split into exactly 1000 + 1 (one past the chunk boundary), no id lost")
+    void should_splitIntoThousandPlusOne_when_bulkIdsExceedChunkByOne() {
+        List<UUID> ids = java.util.stream.Stream.generate(UUID::randomUUID).limit(1001).toList();
+
+        service.notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED, ids, null);
+
+        ArgumentCaptor<Collection<UUID>> chunks = recipientsCaptor();
+        verify(repository, times(2)).insertClientOnlyBulk(eq("BOOKING_CANCELLED_SALON_CLOSED"), chunks.capture(), any());
+        assertThat(chunks.getAllValues()).extracting(Collection::size).containsExactly(1000, 1);
+        assertThat(chunks.getAllValues().stream().flatMap(Collection::stream)).containsExactlyElementsOf(ids);
+    }
+
+    @Test
+    @DisplayName("bulk notify: up to 1000 ids stay ONE statement (statement count flat), an exact 1000 too")
+    void should_issueOneStatement_when_bulkIdsFitOneChunk() {
+        List<UUID> ids = java.util.stream.Stream.generate(UUID::randomUUID).limit(1000).toList();
+
+        service.notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_MASTER_REMOVED, ids, null);
+        service.notifyProviderSetBulk(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, ids, null);
+
+        verify(repository, times(1)).insertClientOnlyBulk(any(), any(), any());
+        verify(repository, times(1)).insertProviderSetBulk(any(), any(), any());
+    }
 }

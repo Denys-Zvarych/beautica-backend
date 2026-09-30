@@ -8,8 +8,10 @@ import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
@@ -70,6 +72,9 @@ import org.springframework.transaction.annotation.Transactional;
 @RequiredArgsConstructor
 @Slf4j
 public class InAppNotificationService {
+
+    /** Max ids per bulk-insert statement — far below the JDBC 32,767 bind-parameter limit. */
+    static final int BULK_ID_CHUNK_SIZE = 1000;
 
     private final InAppNotificationRepository repository;
     private final SalonRepository salonRepository;
@@ -346,7 +351,10 @@ public class InAppNotificationService {
         if (bookingIds.isEmpty()) {
             return;
         }
-        int written = repository.insertClientOnlyBulk(type.name(), bookingIds, actorUserId);
+        int written = 0;
+        for (List<UUID> chunk : chunked(bookingIds)) {
+            written += repository.insertClientOnlyBulk(type.name(), chunk, actorUserId);
+        }
         log.debug("in-app notify(bulk) type={} visits={} rowsWritten={}", type, bookingIds.size(), written);
     }
 
@@ -365,8 +373,26 @@ public class InAppNotificationService {
         if (bookingIds.isEmpty()) {
             return;
         }
-        int written = repository.insertProviderSetBulk(type.name(), bookingIds, actorUserId);
+        int written = 0;
+        for (List<UUID> chunk : chunked(bookingIds)) {
+            written += repository.insertProviderSetBulk(type.name(), chunk, actorUserId);
+        }
         log.debug("in-app notify(bulk) type={} visits={} rowsWritten={}", type, bookingIds.size(), written);
+    }
+
+    /**
+     * Splits {@code ids} into chunks of at most {@link #BULK_ID_CHUNK_SIZE} so a huge salon / master
+     * cascade can never exceed the JDBC 32,767 bind-parameter ceiling of the {@code IN (:bookingIds)}
+     * bulk inserts. At or below one chunk (the overwhelmingly common case) this yields exactly one
+     * chunk — the statement count is unchanged.
+     */
+    static List<List<UUID>> chunked(Collection<UUID> ids) {
+        List<UUID> all = ids instanceof List<UUID> list ? list : new ArrayList<>(ids);
+        List<List<UUID>> chunks = new ArrayList<>((all.size() + BULK_ID_CHUNK_SIZE - 1) / BULK_ID_CHUNK_SIZE);
+        for (int from = 0; from < all.size(); from += BULK_ID_CHUNK_SIZE) {
+            chunks.add(all.subList(from, Math.min(from + BULK_ID_CHUNK_SIZE, all.size())));
+        }
+        return chunks;
     }
 
     /**

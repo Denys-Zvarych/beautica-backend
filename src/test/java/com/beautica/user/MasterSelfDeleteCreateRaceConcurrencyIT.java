@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.awaitility.core.ConditionTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,6 +26,9 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -33,8 +37,10 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Concurrency regression for {@code BookingService#acquireMasterLockForSelfDelete} (Phase 337 QA
@@ -95,6 +101,15 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
     private static final String USERS_ME_URL = "/api/v1/users/me";
     private static final String LOCK_SQL =
             "SELECT pg_advisory_xact_lock(hashtextextended(CAST(? AS text), 0))";
+    private static final String DEADLOCK_COUNT_SQL =
+            "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()";
+    private static final String CLIENT_LOCK_SQL =
+            "SELECT pg_advisory_xact_lock(hashtextextended(CAST(? AS text), 1))";
+    // GlobalExceptionHandler sanitises every BusinessException(409) to this wire message — the
+    // guard's own text ("Visit is no longer CONFIRMED" / "Service changed concurrently — ...") is
+    // NOT observable over HTTP; the deadlock delta + declined-state assertions carry the proof.
+    private static final String MSG_VISIT_NOT_CONFIRMED = "Request could not be completed due to a conflict";
+    private static final String MSG_SERVICE_CHANGED = MSG_VISIT_NOT_CONFIRMED;
     private static final String WAITER_COUNT_SQL =
             "SELECT count(*) FROM pg_stat_activity "
                     + "WHERE wait_event_type = 'Lock' AND wait_event = 'advisory' AND pid <> pg_backend_pid()";
@@ -206,6 +221,406 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
         assertNoConfirmedBookingSurvived(fixture.masterId(), createResponse.get());
     }
 
+    // ── reschedule vs. self-delete cascade (Phase 336 audit-fix cycle 1, LOW security) ─────────
+
+    @Test
+    @DisplayName("a STANDALONE reschedule that passed its pre-lock freshness probe, then queued on the "
+            + "master's advisory lock behind self-delete (which DECLINES the booking), must be rejected "
+            + "409 — never move the declined row nor write a BOOKING_RESCHEDULED feed/outbox row")
+    void should_return409_when_rescheduleQueuedBehindMasterSelfDeleteCommits() throws Exception {
+        MasterAndBookableService fixture = seedDetachableMasterWithService("resched");
+        String clientEmail = "self-delete-race-resched-client-" + System.nanoTime() + "@beautica.test";
+        UUID clientId = fixtures.createUser(clientEmail, "CLIENT", null);
+        String clientToken = fixtures.tokenFor(clientEmail);
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder).insertBooking(
+                clientId, fixture.masterId(), fixture.masterServiceId(), null, "CONFIRMED",
+                startsAt.toOffsetDateTime());
+        Map<UUID, Instant> before = startsOf(List.of(bookingId));
+        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(12);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceSelfDeleteAgainstMasterCreate(
+                fixture.masterId(), fixture.masterToken(), () -> response.set(
+                        patch("/api/v1/bookings/" + bookingId + "/reschedule", clientToken,
+                                Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString(),
+                                        "allowClientOverlap", false)))));
+
+        assertRescheduleLostRace(response.get(), before, null, MSG_SERVICE_CHANGED);
+    }
+
+    @Test
+    @DisplayName("a WHOLE-VISIT reschedule queued on the master's advisory lock behind self-delete "
+            + "(which DECLINES the visit's items) must be rejected 409 with the items, feed and "
+            + "outbox untouched")
+    void should_return409_when_visitRescheduleQueuedBehindMasterSelfDeleteCommits() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("self-delete-race-vresched", 2);
+        addPastCompletedBooking(visit.masterId());
+        List<UUID> itemIds = itemIdsOf(visit.id());
+        Map<UUID, Instant> before = startsOf(itemIds);
+        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(4).withHour(11).withMinute(0).withSecond(0).withNano(0);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceSelfDeleteAgainstMasterCreate(
+                visit.masterId(), visit.masterToken(), () -> response.set(
+                        patch("/api/v1/appointments/" + visit.id() + "/reschedule", visit.clientToken(),
+                                Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
+
+        assertRescheduleLostRace(response.get(), before, visit.id(), MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a PER-ITEM reschedule queued on the master's advisory lock behind self-delete "
+            + "(which DECLINES the item) must be rejected 409 with the item, feed and outbox untouched")
+    void should_return409_when_itemRescheduleQueuedBehindMasterSelfDeleteCommits() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("self-delete-race-iresched", 2);
+        addPastCompletedBooking(visit.masterId());
+        List<UUID> itemIds = itemIdsOf(visit.id());
+        Map<UUID, Instant> before = startsOf(itemIds);
+        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(4).withHour(14).withMinute(0).withSecond(0).withNano(0);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceSelfDeleteAgainstMasterCreate(
+                visit.masterId(), visit.masterToken(), () -> response.set(
+                        patch("/api/v1/appointments/" + visit.id() + "/services/" + itemIds.get(0) + "/reschedule",
+                                visit.clientToken(),
+                                Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString(),
+                                        "allowClientOverlap", false)))));
+
+        assertRescheduleLostRace(response.get(), before, visit.id(), MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    // ── reschedule vs. OTHER cascades (lock-order deadlock regression) ─────────────────────────
+
+    @Test
+    @DisplayName("a provider's whole-visit reschedule racing the CLIENT's self-delete (which cancels the "
+            + "visit) must lose with a clean 409 and cause ZERO Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_visitRescheduleRacesClientSelfDelete() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("csd-race-vresched", 2);
+        List<UUID> itemIds = itemIdsOf(visit.id());
+        Map<UUID, Instant> before = startsOf(itemIds);
+        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(4).withHour(11).withMinute(0).withSecond(0).withNano(0);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(CLIENT_LOCK_SQL, visit.clientId(),
+                () -> deleteAs(USERS_ME_URL, visit.clientToken()), HttpStatus.NO_CONTENT,
+                () -> response.set(patch("/api/v1/appointments/" + visit.id() + "/reschedule",
+                        visit.masterToken(),
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
+
+        assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a provider's per-item reschedule racing the CLIENT's self-delete must lose with a "
+            + "clean 409 and cause ZERO Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_itemRescheduleRacesClientSelfDelete() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("csd-race-iresched", 2);
+        List<UUID> itemIds = itemIdsOf(visit.id());
+        Map<UUID, Instant> before = startsOf(itemIds);
+        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(4).withHour(14).withMinute(0).withSecond(0).withNano(0);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(CLIENT_LOCK_SQL, visit.clientId(),
+                () -> deleteAs(USERS_ME_URL, visit.clientToken()), HttpStatus.NO_CONTENT,
+                () -> response.set(patch(
+                        "/api/v1/appointments/" + visit.id() + "/services/" + itemIds.get(0) + "/reschedule",
+                        visit.masterToken(),
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString(),
+                                "allowClientOverlap", false)))));
+
+        assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a client's whole-visit reschedule racing the salon OWNER removing the master (which "
+            + "declines the visit) must lose with a clean 409 and cause ZERO Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_visitRescheduleRacesMasterRemoval() throws Exception {
+        ClientSelfDeleteTestFixtures csd = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder);
+        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
+        fixtures.addWorkingHoursForEveryDay(salon.masterId());
+        UUID clientId = csd.createClient();
+        UUID appointmentId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = csd.insertBooking(clientId, salon, "CONFIRMED", startsAt.toOffsetDateTime(), appointmentId);
+        Map<UUID, Instant> before = startsOf(List.of(bookingId));
+        String ownerToken = fixtures.tokenFor(emailOf(salon.ownerId()));
+        String clientToken = fixtures.tokenFor(emailOf(clientId));
+        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(12);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, salon.masterId(),
+                () -> deleteAs("/api/v1/salons/" + salon.salonId() + "/masters/" + salon.masterId(), ownerToken),
+                HttpStatus.NO_CONTENT,
+                () -> response.set(patch("/api/v1/appointments/" + appointmentId + "/reschedule", clientToken,
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
+
+        assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a client's per-item reschedule racing the salon OWNER removing the master must lose "
+            + "with a clean 409 and cause ZERO Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_itemRescheduleRacesMasterRemoval() throws Exception {
+        ClientSelfDeleteTestFixtures csd = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder);
+        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
+        fixtures.addWorkingHoursForEveryDay(salon.masterId());
+        UUID clientId = csd.createClient();
+        UUID appointmentId = csd.insertAppointmentHeader(clientId, salon.salonId(), "CONFIRMED");
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = csd.insertBooking(clientId, salon, "CONFIRMED", startsAt.toOffsetDateTime(), appointmentId);
+        Map<UUID, Instant> before = startsOf(List.of(bookingId));
+        String ownerToken = fixtures.tokenFor(emailOf(salon.ownerId()));
+        String clientToken = fixtures.tokenFor(emailOf(clientId));
+        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(14);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, salon.masterId(),
+                () -> deleteAs("/api/v1/salons/" + salon.salonId() + "/masters/" + salon.masterId(), ownerToken),
+                HttpStatus.NO_CONTENT,
+                () -> response.set(patch(
+                        "/api/v1/appointments/" + appointmentId + "/services/" + bookingId + "/reschedule",
+                        clientToken,
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString(),
+                                "allowClientOverlap", false)))));
+
+        assertRescheduleLost409(response.get(), before, MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a client's whole-visit reschedule racing the master's own schedule-override cascade "
+            + "(DAY_OFF + cancelOverlapping declines the visit) must lose with a clean 409 and cause "
+            + "ZERO Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_visitRescheduleRacesScheduleOverrideCascade() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("ovr-race-vresched", 2);
+        List<UUID> itemIds = itemIdsOf(visit.id());
+        Map<UUID, Instant> before = startsOf(itemIds);
+        LocalDate visitDay = jdbcTemplate.queryForObject(
+                "SELECT MIN(starts_at) FROM bookings WHERE appointment_id = ?", OffsetDateTime.class, visit.id())
+                .atZoneSameInstant(TimeZones.KYIV).toLocalDate();
+        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(5).withHour(11).withMinute(0).withSecond(0).withNano(0);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, visit.masterId(),
+                () -> putDayOffCancellingOverlaps(visit.masterId(), visit.masterToken(), visitDay),
+                HttpStatus.OK,
+                () -> response.set(patch("/api/v1/appointments/" + visit.id() + "/reschedule",
+                        visit.clientToken(),
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
+
+        assertRescheduleLostRace(response.get(), before, visit.id(), MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a client's per-item reschedule racing the master's schedule-override cascade must lose "
+            + "with a clean 409 and cause ZERO Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_itemRescheduleRacesScheduleOverrideCascade() throws Exception {
+        BookingTestFixtures.VisitFixture visit = fixtures.createConfirmedVisit("ovr-race-iresched", 2);
+        List<UUID> itemIds = itemIdsOf(visit.id());
+        Map<UUID, Instant> before = startsOf(itemIds);
+        LocalDate visitDay = jdbcTemplate.queryForObject(
+                "SELECT MIN(starts_at) FROM bookings WHERE appointment_id = ?", OffsetDateTime.class, visit.id())
+                .atZoneSameInstant(TimeZones.KYIV).toLocalDate();
+        ZonedDateTime newStartsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(5).withHour(14).withMinute(0).withSecond(0).withNano(0);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, visit.masterId(),
+                () -> putDayOffCancellingOverlaps(visit.masterId(), visit.masterToken(), visitDay),
+                HttpStatus.OK,
+                () -> response.set(patch(
+                        "/api/v1/appointments/" + visit.id() + "/services/" + itemIds.get(0) + "/reschedule",
+                        visit.clientToken(),
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString(),
+                                "allowClientOverlap", false)))));
+
+        assertRescheduleLostRace(response.get(), Map.of(itemIds.get(0), before.get(itemIds.get(0))), null,
+                MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("a provider's reschedule of a GUEST (no client, master lock only, no client lock) booking "
+            + "racing the salon OWNER removing the master must lose with a clean 409 and cause ZERO "
+            + "Postgres deadlocks")
+    void should_return409WithoutDeadlock_when_guestBookingRescheduleRacesMasterRemoval() throws Exception {
+        ClientSelfDeleteTestFixtures csd = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder);
+        ClientSelfDeleteTestFixtures.Salon salon = csd.createSalon();
+        fixtures.addWorkingHoursForEveryDay(salon.masterId());
+        ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
+                .plusDays(3).withHour(11).withMinute(0).withSecond(0).withNano(0);
+        UUID bookingId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO bookings (id, master_id, master_service_id, salon_id, status, starts_at, ends_at, "
+                        + "price_at_booking, duration_minutes_at_booking, buffer_minutes_at_booking, "
+                        + "booking_source, guest_name, guest_phone, cancel_token, reminder_sent, created_at, "
+                        + "updated_at) VALUES (?, ?, ?, ?, 'CONFIRMED', ?, ?, 350.00, 60, 0, 'LINK', 'Олена', "
+                        + "'+380671112233', ?, false, NOW(), NOW())",
+                bookingId, salon.masterId(), salon.masterServiceId(), salon.salonId(),
+                startsAt.toOffsetDateTime(), startsAt.plusMinutes(60).toOffsetDateTime(), UUID.randomUUID());
+        assertThat(csd.clientIdOf(bookingId)).as("fixture must be a genuine guest booking (no client)").isNull();
+        Map<UUID, Instant> before = startsOf(List.of(bookingId));
+        String ownerToken = fixtures.tokenFor(emailOf(salon.ownerId()));
+        ZonedDateTime newStartsAt = startsAt.plusDays(1).withHour(12);
+
+        AtomicReference<ResponseEntity<String>> response = new AtomicReference<>();
+        assertNoDeadlockDuring(() -> raceCascadeAgainstAction(LOCK_SQL, salon.masterId(),
+                () -> deleteAs("/api/v1/salons/" + salon.salonId() + "/masters/" + salon.masterId(), ownerToken),
+                HttpStatus.NO_CONTENT,
+                () -> response.set(patch("/api/v1/bookings/" + bookingId + "/reschedule", ownerToken,
+                        Map.of("newStartsAt", newStartsAt.toOffsetDateTime().toString())))));
+
+        assertRescheduleLostRace(response.get(), before, null, MSG_VISIT_NOT_CONFIRMED);
+    }
+
+    /** PUT /masters/{id}/overrides/{date} as DAY_OFF with cancelOverlapping=true — the override cascade. */
+    private ResponseEntity<Void> putDayOffCancellingOverlaps(UUID masterId, String masterToken, LocalDate day) {
+        try {
+            String body = objectMapper.writeValueAsString(Map.of(
+                    "date", day.toString(),
+                    "kind", "DAY_OFF",
+                    "mode", "INTERVAL",
+                    "intervals", List.of(),
+                    "cancelOverlapping", true));
+            HttpHeaders headers = fixtures.bearerHeaders(masterToken);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            return restTemplate.exchange("/api/v1/masters/" + masterId + "/overrides/" + day, HttpMethod.PUT,
+                    new HttpEntity<>(body, headers), Void.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private String emailOf(UUID userId) {
+        return jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, userId);
+    }
+
+    private ResponseEntity<Void> deleteAs(String url, String token) {
+        return restTemplate.exchange(url, HttpMethod.DELETE,
+                new HttpEntity<>(fixtures.bearerHeaders(token)), Void.class);
+    }
+
+    /** Exact 409 carrying the code's own message; the raced booking time is unchanged and no RESCHEDULED row exists. */
+    private void assertRescheduleLost409(ResponseEntity<String> response, Map<UUID, Instant> before, String message) {
+        assertThat(response.getStatusCode())
+                .as("a reschedule racing the cascade must lose with exactly 409 — body: %s", response.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).contains("\"message\":\"" + message + "\"");
+        for (Map.Entry<UUID, Instant> original : before.entrySet()) {
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, original.getKey())
+                    .toInstant()).as("the booking's time must be unchanged").isEqualTo(original.getValue());
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'BOOKING_RESCHEDULED' "
+                            + "AND aggregate_id = ?", Integer.class, original.getKey()))
+                    .as("no spurious BOOKING_RESCHEDULED outbox row").isZero();
+        }
+    }
+
+    private long deadlockCount() {
+        Long count = jdbcTemplate.queryForObject(DEADLOCK_COUNT_SQL, Long.class);
+        return count == null ? 0 : count;
+    }
+
+    @FunctionalInterface
+    private interface Race {
+        void run() throws Exception;
+    }
+
+    /**
+     * Runs {@code race} and asserts {@code pg_stat_database.deadlocks} did not move. The counter is
+     * flushed by the detecting backend asynchronously (~1s idle flush), so after the race it is polled
+     * for up to 3s — the loop exits early only if the counter moves (a failure).
+     */
+    private void assertNoDeadlockDuring(Race race) throws Exception {
+        long before = deadlockCount();
+        race.run();
+        try {
+            await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(6))
+                    .pollInterval(Duration.ofMillis(100)).until(() -> deadlockCount() == before);
+        } catch (ConditionTimeoutException moved) {
+            // the counter moved — the delta assertion below reports the failure
+        }
+        assertThat(deadlockCount() - before)
+                .as("the reschedule/cascade race must never trigger a Postgres deadlock (lock order is "
+                        + "client(1) -> master(0) -> appointment header -> booking rows)")
+                .isZero();
+    }
+
+    private void addPastCompletedBooking(UUID masterId) {
+        UUID masterServiceId = jdbcTemplate.queryForObject(
+                "SELECT id FROM master_services WHERE master_id = ? LIMIT 1", UUID.class, masterId);
+        ClientSelfDeleteTestFixtures csd = new ClientSelfDeleteTestFixtures(jdbcTemplate, passwordEncoder);
+        csd.insertBooking(csd.createClient(), masterId, masterServiceId, null, "COMPLETED",
+                OffsetDateTime.now().minusDays(3));
+    }
+
+    private List<UUID> itemIdsOf(UUID appointmentId) {
+        return jdbcTemplate.queryForList(
+                "SELECT id FROM bookings WHERE appointment_id = ? ORDER BY starts_at, id", UUID.class, appointmentId);
+    }
+
+    private Map<UUID, Instant> startsOf(List<UUID> bookingIds) {
+        Map<UUID, Instant> starts = new java.util.LinkedHashMap<>();
+        for (UUID id : bookingIds) {
+            starts.put(id, jdbcTemplate.queryForObject(
+                    "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, id).toInstant());
+        }
+        return starts;
+    }
+
+    /** Exact 409, every raced booking DECLINED by the cascade at its ORIGINAL time, no RESCHEDULED feed/outbox row. */
+    private void assertRescheduleLostRace(
+            ResponseEntity<String> response, Map<UUID, Instant> before, UUID appointmentId, String message) {
+        assertThat(response.getStatusCode())
+                .as("a reschedule queued behind the cascade must lose with exactly 409 — body: %s",
+                        response.getBody())
+                .isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody()).contains("\"message\":\"" + message + "\"");
+        for (Map.Entry<UUID, Instant> original : before.entrySet()) {
+            UUID id = original.getKey();
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT status FROM bookings WHERE id = ?", String.class, id))
+                    .as("the cascade must have declined booking %s (proves the race went the intended way)", id)
+                    .isEqualTo("DECLINED");
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT starts_at FROM bookings WHERE id = ?", OffsetDateTime.class, id).toInstant())
+                    .as("the declined booking's time must be unchanged").isEqualTo(original.getValue());
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'BOOKING_RESCHEDULED' "
+                            + "AND aggregate_id = ?", Integer.class, id))
+                    .as("no spurious BOOKING_RESCHEDULED outbox row").isZero();
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM in_app_notification WHERE type = 'BOOKING_RESCHEDULED' "
+                            + "AND booking_id = ?", Integer.class, id))
+                    .as("no spurious BOOKING_RESCHEDULED feed row").isZero();
+        }
+        if (appointmentId != null) {
+            assertThat(jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM in_app_notification WHERE type = 'BOOKING_RESCHEDULED' "
+                            + "AND appointment_id = ?", Integer.class, appointmentId))
+                    .as("no spurious visit-level BOOKING_RESCHEDULED feed row").isZero();
+        }
+    }
+
+    private ResponseEntity<String> patch(String url, String token, Map<String, Object> body) {
+        try {
+            HttpHeaders headers = fixtures.bearerHeaders(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            return restTemplate.exchange(url, HttpMethod.PATCH,
+                    new HttpEntity<>(objectMapper.writeValueAsString(body), headers), String.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     // ── shared race harness ────────────────────────────────────────────────────
 
     private record MasterAndBookableService(UUID masterId, String masterToken, UUID masterServiceId) {}
@@ -252,13 +667,26 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
      */
     private void raceSelfDeleteAgainstMasterCreate(UUID masterId, String masterToken, Runnable createAction)
             throws Exception {
+        raceCascadeAgainstAction(LOCK_SQL, masterId, () -> deleteAs(USERS_ME_URL, masterToken),
+                HttpStatus.NO_CONTENT, createAction);
+    }
+
+    /**
+     * The generalised harness behind {@link #raceSelfDeleteAgainstMasterCreate}: {@code cascade} (a
+     * master self-delete, a client self-delete, an owner's master removal, ...) is launched FIRST and
+     * {@code racer} second, both queue on the held advisory lock (salt 0 master lock or salt 1 client lock, per {@code lockSql}), then the lock is
+     * released so the cascade is granted it first.
+     */
+    private void raceCascadeAgainstAction(
+            String lockSql, UUID lockKey, Supplier<ResponseEntity<Void>> cascade, HttpStatus expectedCascadeStatus,
+            Runnable createAction) throws Exception {
         // Hold the REAL salt-0 advisory lock for this master via a raw, manually-committed
         // connection — neither self-delete nor create can proceed past their own lock statement
         // while this is open.
         Connection holder = jdbcTemplate.getDataSource().getConnection();
         holder.setAutoCommit(false);
-        try (PreparedStatement ps = holder.prepareStatement(LOCK_SQL)) {
-            ps.setString(1, masterId.toString());
+        try (PreparedStatement ps = holder.prepareStatement(lockSql)) {
+            ps.setString(1, lockKey.toString());
             ps.execute();
         }
 
@@ -268,12 +696,10 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
             // it to self-delete first, exactly the interleaving this test needs to exercise.
             CountDownLatch selfDeleteDone = new CountDownLatch(1);
             AtomicReference<ResponseEntity<Void>> selfDeleteResponse = new AtomicReference<>();
-            log.debug("Act: launch DELETE {} for the master — queues behind the held lock", USERS_ME_URL);
+            log.debug("Act: launch the cascade DELETE — queues behind the held lock");
             Thread.ofVirtual().start(() -> {
                 try {
-                    selfDeleteResponse.set(restTemplate.exchange(
-                            USERS_ME_URL, HttpMethod.DELETE,
-                            new HttpEntity<>(fixtures.bearerHeaders(masterToken)), Void.class));
+                    selfDeleteResponse.set(cascade.get());
                 } finally {
                     selfDeleteDone.countDown();
                 }
@@ -309,8 +735,8 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
                     .as("create must finish within 20s of self-delete releasing the real lock").isTrue();
 
             assertThat(selfDeleteResponse.get().getStatusCode())
-                    .as("self-delete itself must always succeed regardless of how the race resolves")
-                    .isEqualTo(HttpStatus.NO_CONTENT);
+                    .as("the cascade itself must always succeed regardless of how the race resolves")
+                    .isEqualTo(expectedCascadeStatus);
         } finally {
             if (!holder.isClosed()) {
                 holder.rollback();
@@ -369,16 +795,16 @@ class MasterSelfDeleteCreateRaceConcurrencyIT extends AbstractIntegrationTest {
 
     /** Polls {@code pg_stat_activity} until at least {@code expected} backends are observably
      * waiting on an advisory lock, or 10s elapse. */
-    private boolean awaitWaiterCount(int expected) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            Integer waiters = jdbcTemplate.queryForObject(WAITER_COUNT_SQL, Integer.class);
-            if (waiters != null && waiters >= expected) {
-                return true;
-            }
-            Thread.sleep(50);
+    private boolean awaitWaiterCount(int expected) {
+        try {
+            await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(50)).until(() -> {
+                Integer waiters = jdbcTemplate.queryForObject(WAITER_COUNT_SQL, Integer.class);
+                return waiters != null && waiters >= expected;
+            });
+            return true;
+        } catch (ConditionTimeoutException e) {
+            return false;
         }
-        return false;
     }
 
     private ResponseEntity<String> createBooking(
