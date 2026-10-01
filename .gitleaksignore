@@ -65,3 +65,11 @@ f263068a29b1767c6497391917c4ed9c0d97dffb:src/main/resources/application-local.ym
 # app.outbox.payload-key -- local dev AES key, carried an explicit
 # "Local dev only -- never use in prod" comment in the same commit.
 315065630f4a8afa379657580e66e19b114bcb61:src/main/resources/application-local.yml:generic-api-key:58
+
+# --- False positives: runtime-generated test keys ---------------------------
+#
+# FirebaseConfig unit tests (phase 340) generate throwaway RSA key pairs at
+# runtime using KeyPairGenerator. Only the literal PEM header/footer strings
+# are in source; the actual key material is never hardcoded or exposed.
+e318c1acca039d57e3506f858037d0de30ae7782:src/test/java/com/beautica/config/FirebaseLocalProfileContextTest.java:private-key:50
+e318c1acca039d57e3506f858037d0de30ae7782:src/test/java/com/beautica/config/FirebaseConfigTest.java:private-key:210
