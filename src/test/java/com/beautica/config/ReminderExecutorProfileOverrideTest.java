@@ -48,7 +48,7 @@ class ReminderExecutorProfileOverrideTest {
     private static final String SEND_BEAN = "smsReminderExecutor";
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
-            .withUserConfiguration(AsyncConfig.class, ReminderPools.Config.class);
+            .withUserConfiguration(AsyncConfig.class, FirebaseConfig.class, ReminderPools.Config.class);
 
     @Nested
     @DisplayName("test profile")

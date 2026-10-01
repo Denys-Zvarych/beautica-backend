@@ -46,7 +46,9 @@ app:
     bucket: beautica-media
     endpoint: http://localhost:9000
   firebase:
-    service-account: ""
+    # Empty by default (push stays dark). scripts/start-backend.sh exports FIREBASE_SERVICE_ACCOUNT
+    # (base64) + FIREBASE_ENABLED=true from the out-of-repo secrets dir when the file exists.
+    service-account: ${FIREBASE_SERVICE_ACCOUNT:}
   frontend:
     base-url: http://localhost:3000
   invite:

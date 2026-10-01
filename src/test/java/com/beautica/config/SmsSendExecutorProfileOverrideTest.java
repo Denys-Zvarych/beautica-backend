@@ -53,7 +53,7 @@ class SmsSendExecutorProfileOverrideTest {
     private static final String SEND_BEAN = "smsSendExecutor";
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
-            .withUserConfiguration(AsyncConfig.class, SendPool.Config.class);
+            .withUserConfiguration(AsyncConfig.class, FirebaseConfig.class, SendPool.Config.class);
 
     @Nested
     @DisplayName("test profile")

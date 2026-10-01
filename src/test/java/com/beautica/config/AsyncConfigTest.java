@@ -52,7 +52,7 @@ class AsyncConfigTest {
     @DisplayName("emailExecutor bean")
     class EmailExecutor {
 
-        private final ThreadPoolExecutor pool = unwrapJdkPool(asyncConfig.emailExecutor());
+        private final ThreadPoolExecutor pool = unwrapJdkPool(asyncConfig.emailExecutor(asyncConfig.emailTaskPool()));
 
         @Test
         @DisplayName("emailExecutor — core pool size is 2")
@@ -90,7 +90,7 @@ class AsyncConfigTest {
         @Test
         @DisplayName("emailExecutor — worker threads use the 'email-' name prefix")
         void should_nameWorkerThreadsWithEmailPrefix_when_taskSubmitted() throws InterruptedException {
-            assertThat(captureWorkerThreadName(asyncConfig.emailExecutor()))
+            assertThat(captureWorkerThreadName(asyncConfig.emailExecutor(asyncConfig.emailTaskPool())))
                     .as("emailExecutor worker thread name")
                     .startsWith("email-");
         }
@@ -100,7 +100,7 @@ class AsyncConfigTest {
     @DisplayName("pushExecutor bean")
     class PushExecutor {
 
-        private final ThreadPoolExecutor pool = unwrapJdkPool(asyncConfig.pushExecutor());
+        private final ThreadPoolExecutor pool = unwrapJdkPool(asyncConfig.pushExecutor(asyncConfig.pushTaskPool()));
 
         @Test
         @DisplayName("pushExecutor — core pool size is 4")
@@ -137,7 +137,7 @@ class AsyncConfigTest {
         @Test
         @DisplayName("pushExecutor — worker threads use the 'push-' name prefix")
         void should_nameWorkerThreadsWithPushPrefix_when_taskSubmitted() throws InterruptedException {
-            assertThat(captureWorkerThreadName(asyncConfig.pushExecutor()))
+            assertThat(captureWorkerThreadName(asyncConfig.pushExecutor(asyncConfig.pushTaskPool())))
                     .as("pushExecutor worker thread name")
                     .startsWith("push-");
         }
