@@ -12,7 +12,9 @@ import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.notification.inapp.dto.NotificationResponse;
+import com.beautica.notification.inapp.entity.InAppNotification;
 import com.beautica.notification.inapp.entity.InAppNotificationType;
+import com.beautica.notification.inapp.repository.InAppNotificationRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.CatalogCategory;
@@ -39,6 +41,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -57,6 +61,10 @@ class NotificationViewAssemblerStatementCountIT extends AbstractIntegrationTest 
 
     @Autowired
     private NotificationFeedService notificationFeedService;
+    @Autowired
+    private NotificationViewAssembler assembler;
+    @Autowired
+    private InAppNotificationRepository inAppNotificationRepository;
     @Autowired
     private UserRepository userRepository;
     @Autowired
@@ -411,5 +419,58 @@ class NotificationViewAssemblerStatementCountIT extends AbstractIntegrationTest 
                         + "statement (the sibling-booking fetch) over the booking-only baseline (%d), "
                         + "never one per visit row — measured %d", statementsBookingOnly, statementsMixed)
                 .isEqualTo(statementsBookingOnly + 1);
+    }
+
+    @Test
+    @DisplayName("assembleForRecipients (push drain, P2) resolves each row EXACTLY as the single-actor assemble "
+            + "does for that recipient — owner, assigned admin, unassigned admin and client in ONE batch — "
+            + "and costs the same statements as a single-recipient batch")
+    void should_matchPerActorAssemble_and_stayFlat_when_assemblingManyRecipientsAtOnce() {
+        User owner = persistUser(Role.SALON_OWNER);
+        SalonMasterFixture fixture = createSalonBoundMaster(owner);
+        User admin = userRepository.save(new User(
+                "stmt-count-admin-" + UUID.randomUUID() + "@example.com", "$2a$10$hashedpassword",
+                Role.SALON_ADMIN, "Anna", "Kovalenko", "+380501111111", fixture.salon().getId()));
+        User strangerAdmin = persistUser(Role.SALON_ADMIN);
+        seedSalonBookingNotification(fixture, owner.getId(), 0);
+        seedSalonBookingNotification(fixture, admin.getId(), 1);
+        seedSalonBookingNotification(fixture, strangerAdmin.getId(), 2);
+        seedBookingNotification(3);
+        List<InAppNotification> all = new java.util.ArrayList<>();
+        for (User recipient : List.of(owner, admin, strangerAdmin, client)) {
+            all.addAll(inAppNotificationRepository.findAllForPushDispatch(
+                    jdbcTemplate.queryForList(
+                            "SELECT id FROM in_app_notification WHERE recipient_user_id = ?",
+                            UUID.class, recipient.getId())));
+        }
+        Map<UUID, Role> roles = Map.of(owner.getId(), Role.SALON_OWNER, admin.getId(), Role.SALON_ADMIN,
+                strangerAdmin.getId(), Role.SALON_ADMIN, client.getId(), Role.CLIENT);
+        Statistics statistics = statistics();
+
+        statistics.clear();
+        Map<UUID, NotificationResponse> batch = assembler.assembleForRecipients(all, roles);
+        long batchStatements = statistics.getPrepareStatementCount();
+
+        assertThat(batch).hasSize(4);
+        for (InAppNotification row : all) {
+            UUID recipientId = row.getRecipientUserId();
+            NotificationResponse single =
+                    assembler.assemble(List.of(row), recipientId, roles.get(recipientId)).get(0);
+            assertThat(batch.get(row.getId())).as("recipient %s", roles.get(recipientId)).isEqualTo(single);
+        }
+        assertThat(batch.get(all.stream().filter(r -> r.getRecipientUserId().equals(owner.getId()))
+                .findFirst().orElseThrow().getId()).params()).as("owner sees their salon").isNotNull();
+        assertThat(batch.get(all.stream().filter(r -> r.getRecipientUserId().equals(admin.getId()))
+                .findFirst().orElseThrow().getId()).params()).as("assigned admin sees their salon").isNotNull();
+        assertThat(batch.get(all.stream().filter(r -> r.getRecipientUserId().equals(strangerAdmin.getId()))
+                .findFirst().orElseThrow().getId()).params()).as("unassigned admin lost access").isNull();
+
+        statistics.clear();
+        assembler.assembleForRecipients(all.subList(0, 1), Map.of(owner.getId(), Role.SALON_OWNER));
+        long singleRecipientStatements = statistics.getPrepareStatementCount();
+        assertThat(batchStatements)
+                .as("4 recipients of 3 different roles (%d) vs 1 owner recipient (%d): at most the owner "
+                        + "+ admin batch lookups more, never per recipient", batchStatements, singleRecipientStatements)
+                .isLessThanOrEqualTo(singleRecipientStatements + 2);
     }
 }

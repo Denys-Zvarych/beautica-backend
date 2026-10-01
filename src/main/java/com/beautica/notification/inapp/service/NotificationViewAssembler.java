@@ -76,7 +76,7 @@ import java.util.stream.Collectors;
  */
 @Component
 @RequiredArgsConstructor
-class NotificationViewAssembler {
+public class NotificationViewAssembler {
 
     private final BookingRepository bookingRepository;
     private final SalonRepository salonRepository;
@@ -85,11 +85,77 @@ class NotificationViewAssembler {
     private final AuthorizationService authorizationService;
     private final Clock clock;
 
-    List<NotificationResponse> assemble(List<InAppNotification> rows, UUID actorId, Role actorRole) {
+    /**
+     * Everything the resolution needs that does NOT depend on who is looking: the live booking graph,
+     * visits, invite subjects and review state of a set of rows, each fetched in one statement.
+     */
+    private record Hydrated(
+            Map<UUID, Booking> bookingsById, Map<UUID, BookingVisit> visitsByAppointment,
+            Map<UUID, User> subjectsById, Set<UUID> reviewedBookingIds) {
+    }
+
+    /**
+     * The per-actor salon facts the visibility rules read. {@code adminSalonMemo} is lazily filled by
+     * {@link #managesSalon}; the batch path pre-fills it so no admin pair costs its own statement.
+     */
+    private record ActorFacts(Set<UUID> ownedSalonIds, Map<UUID, Boolean> adminSalonMemo) {
+    }
+
+    /**
+     * Public since phase 339: {@code InAppPushDispatcher} reuses the read API's resolution so the
+     * push target and params are computed by the SAME code (never re-derived).
+     */
+    public List<NotificationResponse> assemble(List<InAppNotification> rows, UUID actorId, Role actorRole) {
         if (rows.isEmpty()) {
             return List.of();
         }
+        Hydrated hydrated = hydrate(rows);
+        ActorFacts facts = new ActorFacts(
+                actorRole == Role.SALON_OWNER
+                        ? Set.copyOf(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId))
+                        : Set.of(),
+                new HashMap<>());
+        OffsetDateTime now = OffsetDateTime.now(clock);
 
+        return rows.stream()
+                .map(row -> resolveOne(row, actorId, actorRole, hydrated, facts, now))
+                .toList();
+    }
+
+    /**
+     * Phase 339 (audit cycle 2, perf P2): resolves rows of MANY recipients at once for the push drain.
+     * The shared hydration (bookings, visits, subjects, review state) runs ONCE for the whole set, the
+     * per-recipient salon facts are batched (one statement for all owners, one for all admins), and each
+     * row is then resolved by the very same {@link #resolveOne} the single-actor {@link #assemble} uses
+     * — with ITS recipient's id and role, so visibility is decided per recipient exactly as in the feed.
+     * The statement count is therefore independent of the number of distinct recipients.
+     *
+     * @param rolesByRecipient role of every recipient present in {@code rows}; a row whose recipient is
+     *                         absent is skipped
+     * @return the resolved view keyed by feed-row id
+     */
+    public Map<UUID, NotificationResponse> assembleForRecipients(
+            List<InAppNotification> rows, Map<UUID, Role> rolesByRecipient) {
+        List<InAppNotification> known = rows.stream()
+                .filter(row -> rolesByRecipient.containsKey(row.getRecipientUserId()))
+                .toList();
+        if (known.isEmpty()) {
+            return Map.of();
+        }
+        Hydrated hydrated = hydrate(known);
+        Map<UUID, ActorFacts> factsByRecipient = batchActorFacts(known, rolesByRecipient, hydrated);
+        OffsetDateTime now = OffsetDateTime.now(clock);
+
+        Map<UUID, NotificationResponse> views = new HashMap<>();
+        for (InAppNotification row : known) {
+            UUID recipientId = row.getRecipientUserId();
+            views.put(row.getId(), resolveOne(row, recipientId, rolesByRecipient.get(recipientId),
+                    hydrated, factsByRecipient.get(recipientId), now));
+        }
+        return views;
+    }
+
+    private Hydrated hydrate(List<InAppNotification> rows) {
         Set<UUID> appointmentIds = idsOf(rows, InAppNotification::getAppointmentId);
         Map<UUID, BookingVisit> visitsByAppointment = appointmentIds.isEmpty()
                 ? Map.of()
@@ -116,48 +182,89 @@ class NotificationViewAssembler {
                 ? Set.of()
                 : Set.copyOf(reviewRepository.findReviewedBookingIds(List.copyOf(reviewRequestedBookingIds)));
 
-        Set<UUID> ownedSalonIds = actorRole == Role.SALON_OWNER
-                ? Set.copyOf(salonRepository.findIdsByOwnerIdAndIsActiveTrue(actorId))
-                : Set.of();
-        Map<UUID, Boolean> adminSalonMemo = new HashMap<>();
+        return new Hydrated(bookingsById, visitsByAppointment, subjectsById, reviewedBookingIds);
+    }
 
-        OffsetDateTime now = OffsetDateTime.now(clock);
+    /**
+     * One owner statement + one admin statement for the whole recipient set (each skipped when no
+     * recipient has that role). Admin memos are pre-filled for every salon the rows touch, so
+     * {@link #managesSalon} never falls through to a per-pair {@code adminBelongsToSalon} call.
+     */
+    private Map<UUID, ActorFacts> batchActorFacts(
+            List<InAppNotification> rows, Map<UUID, Role> rolesByRecipient, Hydrated hydrated) {
+        Set<UUID> recipients = rows.stream().map(InAppNotification::getRecipientUserId)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<UUID> owners = recipientsWithRole(recipients, rolesByRecipient, Role.SALON_OWNER);
+        Set<UUID> admins = recipientsWithRole(recipients, rolesByRecipient, Role.SALON_ADMIN);
 
-        return rows.stream()
-                .map(row -> resolveOne(row, actorId, actorRole, bookingsById, visitsByAppointment, subjectsById,
-                        reviewedBookingIds, ownedSalonIds, adminSalonMemo, now))
-                .toList();
+        Map<UUID, Set<UUID>> ownedByOwner = owners.isEmpty() ? Map.of()
+                : salonRepository.findOwnedActiveSalonPairs(owners).stream()
+                        .collect(Collectors.groupingBy(SalonRepository.OwnerSalonPair::getOwnerId,
+                                Collectors.mapping(SalonRepository.OwnerSalonPair::getSalonId, Collectors.toSet())));
+        Map<UUID, Set<UUID>> assignedByAdmin = admins.isEmpty() ? Map.of()
+                : userRepository.findSalonAssignments(admins, Role.SALON_ADMIN).stream()
+                        .collect(Collectors.groupingBy(UserRepository.UserSalonPair::getUserId,
+                                Collectors.mapping(UserRepository.UserSalonPair::getSalonId, Collectors.toSet())));
+        Set<UUID> touchedSalonIds = admins.isEmpty() ? Set.of() : touchedSalonIds(rows, hydrated);
+
+        Map<UUID, ActorFacts> facts = new HashMap<>();
+        for (UUID recipientId : recipients) {
+            Map<UUID, Boolean> adminMemo = new HashMap<>();
+            if (admins.contains(recipientId)) {
+                Set<UUID> assigned = assignedByAdmin.getOrDefault(recipientId, Set.of());
+                touchedSalonIds.forEach(salonId -> adminMemo.put(salonId, assigned.contains(salonId)));
+            }
+            facts.put(recipientId, new ActorFacts(ownedByOwner.getOrDefault(recipientId, Set.of()), adminMemo));
+        }
+        return facts;
+    }
+
+    private static Set<UUID> recipientsWithRole(Set<UUID> recipients, Map<UUID, Role> roles, Role role) {
+        return recipients.stream().filter(id -> roles.get(id) == role)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    /** Every salon id {@link #managesSalon} could be asked about for these rows. */
+    private static Set<UUID> touchedSalonIds(List<InAppNotification> rows, Hydrated hydrated) {
+        Set<UUID> salonIds = new LinkedHashSet<>();
+        rows.forEach(row -> {
+            if (row.getSalonId() != null) {
+                salonIds.add(row.getSalonId());
+            }
+        });
+        hydrated.bookingsById().values().forEach(booking -> {
+            if (booking.getSalon() != null) {
+                salonIds.add(booking.getSalon().getId());
+            }
+        });
+        return salonIds;
     }
 
     private NotificationResponse resolveOne(
-            InAppNotification row, UUID actorId, Role actorRole,
-            Map<UUID, Booking> bookingsById, Map<UUID, BookingVisit> visitsByAppointment,
-            Map<UUID, User> subjectsById, Set<UUID> reviewedBookingIds, Set<UUID> ownedSalonIds,
-            Map<UUID, Boolean> adminSalonMemo, OffsetDateTime now) {
+            InAppNotification row, UUID actorId, Role actorRole, Hydrated hydrated, ActorFacts facts,
+            OffsetDateTime now) {
 
         if (row.getType() == InAppNotificationType.INVITE_ACCEPTED) {
-            return resolveInviteAccepted(row, actorId, actorRole, subjectsById, ownedSalonIds, adminSalonMemo);
+            return resolveInviteAccepted(row, actorId, actorRole, hydrated.subjectsById(), facts);
         }
-        return resolveBookingEvent(row, actorId, actorRole, bookingsById, visitsByAppointment,
-                reviewedBookingIds, ownedSalonIds, adminSalonMemo, now);
+        return resolveBookingEvent(row, actorId, actorRole, hydrated, facts, now);
     }
 
     // ── booking/visit-keyed events (every type except INVITE_ACCEPTED) ─────────────────────────
 
     private NotificationResponse resolveBookingEvent(
-            InAppNotification row, UUID actorId, Role actorRole,
-            Map<UUID, Booking> bookingsById, Map<UUID, BookingVisit> visitsByAppointment,
-            Set<UUID> reviewedBookingIds, Set<UUID> ownedSalonIds, Map<UUID, Boolean> adminSalonMemo,
+            InAppNotification row, UUID actorId, Role actorRole, Hydrated hydrated, ActorFacts facts,
             OffsetDateTime now) {
 
         UUID resolvedBookingId = row.getBookingId();
-        BookingVisit visit = row.getAppointmentId() != null ? visitsByAppointment.get(row.getAppointmentId()) : null;
+        BookingVisit visit = row.getAppointmentId() != null
+                ? hydrated.visitsByAppointment().get(row.getAppointmentId()) : null;
         if (visit != null) {
             resolvedBookingId = visit.items().get(0).getId();
         }
-        Booking booking = resolvedBookingId != null ? bookingsById.get(resolvedBookingId) : null;
+        Booking booking = resolvedBookingId != null ? hydrated.bookingsById().get(resolvedBookingId) : null;
 
-        if (booking == null || !isVisible(booking, actorId, actorRole, ownedSalonIds, adminSalonMemo)) {
+        if (booking == null || !isVisible(booking, actorId, actorRole, facts)) {
             return new NotificationResponse(row.getId(), row.getType(), row.getCreatedAt(),
                     row.getReadAt() != null, NotificationTarget.none(row.getSalonId()), null);
         }
@@ -165,7 +272,7 @@ class NotificationViewAssembler {
         TargetKind kind = TargetKind.BOOKING;
         if (row.getType() == InAppNotificationType.REVIEW_REQUESTED) {
             boolean reviewable = BookingClosureRule.isReviewEligible(booking.getStatus(), booking.getEndsAt(), now)
-                    && !reviewedBookingIds.contains(booking.getId());
+                    && !hydrated.reviewedBookingIds().contains(booking.getId());
             kind = reviewable ? TargetKind.BOOKING_REVIEW : TargetKind.BOOKING;
         }
 
@@ -228,16 +335,14 @@ class NotificationViewAssembler {
      * class's javadoc for the split between the shared {@code isViewAuthorized} predicate and the
      * extra liveness conditions applied here.
      */
-    private boolean isVisible(
-            Booking booking, UUID actorId, Role actorRole, Set<UUID> ownedSalonIds,
-            Map<UUID, Boolean> adminSalonMemo) {
+    private boolean isVisible(Booking booking, UUID actorId, Role actorRole, ActorFacts facts) {
         if (actorRole == Role.SALON_ADMIN) {
             // canViewBooking/isViewAuthorized has no SALON_ADMIN branch at all (see this class's
             // javadoc) — the write path deliberately sends admins these rows, so this class grants
             // authority on its own, via the SAME "still assigned to this salon" rule INVITE_ACCEPTED
             // uses (managesSalon), rather than a second copy of it.
             return booking.getSalon() != null
-                    && managesSalon(actorRole, booking.getSalon().getId(), ownedSalonIds, adminSalonMemo, actorId);
+                    && managesSalon(actorRole, booking.getSalon().getId(), facts, actorId);
         }
 
         Master master = booking.getMaster();
@@ -257,7 +362,7 @@ class NotificationViewAssembler {
         // javadoc). CLIENT is already fully decided above; SALON_ADMIN never reaches this line.
         return switch (actorRole) {
             case SALON_MASTER, INDEPENDENT_MASTER -> master.isActive();
-            case SALON_OWNER -> salon != null && managesSalon(actorRole, salon.getId(), ownedSalonIds, adminSalonMemo, actorId);
+            case SALON_OWNER -> salon != null && managesSalon(actorRole, salon.getId(), facts, actorId);
             default -> true;
         };
     }
@@ -271,11 +376,10 @@ class NotificationViewAssembler {
      * in spirit (owner-by-ownership, admin-by-assignment) but reads from this page's already-batched
      * facts instead of issuing its own DB round trip per call.
      */
-    private boolean managesSalon(
-            Role actorRole, UUID salonId, Set<UUID> ownedSalonIds, Map<UUID, Boolean> adminSalonMemo, UUID actorId) {
+    private boolean managesSalon(Role actorRole, UUID salonId, ActorFacts facts, UUID actorId) {
         return switch (actorRole) {
-            case SALON_OWNER -> ownedSalonIds.contains(salonId);
-            case SALON_ADMIN -> adminSalonMemo.computeIfAbsent(
+            case SALON_OWNER -> facts.ownedSalonIds().contains(salonId);
+            case SALON_ADMIN -> facts.adminSalonMemo().computeIfAbsent(
                     salonId, sid -> authorizationService.adminBelongsToSalon(actorId, sid));
             default -> false;
         };
@@ -285,10 +389,10 @@ class NotificationViewAssembler {
 
     private NotificationResponse resolveInviteAccepted(
             InAppNotification row, UUID actorId, Role actorRole, Map<UUID, User> subjectsById,
-            Set<UUID> ownedSalonIds, Map<UUID, Boolean> adminSalonMemo) {
+            ActorFacts facts) {
 
         boolean stillManages = row.getSalonId() != null
-                && managesSalon(actorRole, row.getSalonId(), ownedSalonIds, adminSalonMemo, actorId);
+                && managesSalon(actorRole, row.getSalonId(), facts, actorId);
 
         NotificationTarget target = stillManages
                 ? new NotificationTarget(TargetKind.SALON_TEAM, null, null, row.getSalonId())

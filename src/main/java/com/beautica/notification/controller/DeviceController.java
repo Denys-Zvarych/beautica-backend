@@ -3,10 +3,7 @@ package com.beautica.notification.controller;
 import com.beautica.common.security.AuthenticationUtils;
 import com.beautica.notification.dto.RegisterDeviceTokenRequest;
 import com.beautica.notification.dto.UnregisterDeviceTokenRequest;
-import com.beautica.notification.entity.DeviceToken;
-import com.beautica.notification.entity.Platform;
 import com.beautica.notification.repository.DeviceTokenRepository;
-import com.beautica.user.UserRepository;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -27,7 +24,6 @@ import java.util.UUID;
 public class DeviceController {
 
     private final DeviceTokenRepository deviceTokenRepository;
-    private final UserRepository userRepository;
 
     @PostMapping("/token")
     @PreAuthorize("isAuthenticated()")
@@ -38,23 +34,11 @@ public class DeviceController {
     ) {
         UUID userId = AuthenticationUtils.userId(authentication);
 
-        // Idempotency pre-check: avoids the rollback-only transaction state caused by
-        // catching DataIntegrityViolationException after a UNIQUE-collision save().
-        // Race window: two concurrent registrations of the same (userId, token) may both
-        // pass this check; one save() will then surface DataIntegrityViolationException
-        // to GlobalExceptionHandler. Caller may retry.
-        if (deviceTokenRepository.existsByUserIdAndToken(userId, request.token())) {
-            return ResponseEntity.noContent().build();
-        }
-
-        DeviceToken deviceToken = DeviceToken.builder()
-                .user(userRepository.getReferenceById(userId))
-                .token(request.token())
-                .platform(Platform.valueOf(request.platform()))
-                .isActive(true)
-                .build();
-
-        deviceTokenRepository.save(deviceToken);
+        // D10 (phase 339): ONE atomic upsert by token. A token already bound to ANOTHER user (shared
+        // device switching accounts), deactivated, or registered under a different platform is
+        // rebound to the caller, re-activated and its platform refreshed — never duplicated, and no
+        // reassign/exists/save window for a concurrent registration to slip through.
+        deviceTokenRepository.upsertToken(request.token(), userId, request.platform());
         return ResponseEntity.noContent().build();
     }
 

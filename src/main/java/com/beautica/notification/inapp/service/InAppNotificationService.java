@@ -14,8 +14,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -69,7 +69,6 @@ import org.springframework.transaction.annotation.Transactional;
  * cancellation notes are never read by this class at all.
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class InAppNotificationService {
 
@@ -79,6 +78,26 @@ public class InAppNotificationService {
     private final InAppNotificationRepository repository;
     private final SalonRepository salonRepository;
     private final InAppRecipientResolver recipientResolver;
+
+    /**
+     * Phase 339 (D4) — when {@code true}, every write uses the CTE twin that also enqueues one
+     * {@code INAPP_PUSH} outbox row per inserted feed row, atomically. {@code false} (the default,
+     * and prod's value until release) writes the plain insert and touches the outbox not at all.
+     * Same property {@code FirebaseConfig} reads, so "push is live" has a single switch.
+     */
+    private final boolean pushEnabled;
+
+    // Explicit constructor — @RequiredArgsConstructor cannot bind the @Value flag.
+    public InAppNotificationService(
+            InAppNotificationRepository repository,
+            SalonRepository salonRepository,
+            InAppRecipientResolver recipientResolver,
+            @Value("${FIREBASE_ENABLED:false}") boolean pushEnabled) {
+        this.repository = repository;
+        this.salonRepository = salonRepository;
+        this.recipientResolver = recipientResolver;
+        this.pushEnabled = pushEnabled;
+    }
 
     /**
      * Rows 1/1w, 2, 3, 6, 7, 9, 10 of the matrix — every event keyed to ONE standalone booking (never
@@ -353,7 +372,9 @@ public class InAppNotificationService {
         }
         int written = 0;
         for (List<UUID> chunk : chunked(bookingIds)) {
-            written += repository.insertClientOnlyBulk(type.name(), chunk, actorUserId);
+            written += pushEnabled
+                    ? repository.insertClientOnlyBulkWithPush(type.name(), chunk, actorUserId)
+                    : repository.insertClientOnlyBulk(type.name(), chunk, actorUserId);
         }
         log.debug("in-app notify(bulk) type={} visits={} rowsWritten={}", type, bookingIds.size(), written);
     }
@@ -375,7 +396,9 @@ public class InAppNotificationService {
         }
         int written = 0;
         for (List<UUID> chunk : chunked(bookingIds)) {
-            written += repository.insertProviderSetBulk(type.name(), chunk, actorUserId);
+            written += pushEnabled
+                    ? repository.insertProviderSetBulkWithPush(type.name(), chunk, actorUserId)
+                    : repository.insertProviderSetBulk(type.name(), chunk, actorUserId);
         }
         log.debug("in-app notify(bulk) type={} visits={} rowsWritten={}", type, bookingIds.size(), written);
     }
@@ -404,6 +427,11 @@ public class InAppNotificationService {
     private void write(
             InAppNotificationType type, Set<UUID> recipients, UUID bookingId, UUID appointmentId,
             UUID salonId, UUID subjectUserId, String dedupKey) {
+        if (pushEnabled) {
+            repository.insertForRecipientsWithPush(
+                    type.name(), recipients, bookingId, appointmentId, salonId, subjectUserId, dedupKey);
+            return;
+        }
         repository.insertForRecipients(
                 type.name(), recipients, bookingId, appointmentId, salonId, subjectUserId, dedupKey);
     }

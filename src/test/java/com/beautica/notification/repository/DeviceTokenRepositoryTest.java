@@ -102,7 +102,7 @@ class DeviceTokenRepositoryTest extends AbstractDataJpaTest {
     }
 
     @Test
-    @DisplayName("Rejects a duplicate (user_id, token) pair via the UNIQUE constraint as DataIntegrityViolationException")
+    @DisplayName("Rejects a duplicate (user_id, token) pair via the token-unique index (V185) as DataIntegrityViolationException")
     void should_enforceUnique_sameUserAndToken() {
         DeviceToken first = DeviceToken.builder()
                 .user(user)
@@ -145,40 +145,6 @@ class DeviceTokenRepositoryTest extends AbstractDataJpaTest {
         // so it cannot distinguish hard delete from deactivation. em.find directly inspects the row.
         DeviceToken reloaded = em.find(DeviceToken.class, tokenId);
         assertThat(reloaded).isNull();
-    }
-
-    @Test
-    @DisplayName("Returns true when (userId, token) row exists for the given user")
-    void should_returnTrue_when_userTokenExists() {
-        DeviceToken token = DeviceToken.builder()
-                .user(user)
-                .token("present-token")
-                .platform(Platform.ANDROID)
-                .build();
-        em.persist(token);
-        em.flush();
-        em.clear();
-
-        boolean result = repo.existsByUserIdAndToken(user.getId(), "present-token");
-
-        assertThat(result).isTrue();
-    }
-
-    @Test
-    @DisplayName("Returns false when no (userId, token) row matches — different token, same user")
-    void should_returnFalse_when_userTokenAbsent() {
-        DeviceToken token = DeviceToken.builder()
-                .user(user)
-                .token("existing-token")
-                .platform(Platform.ANDROID)
-                .build();
-        em.persist(token);
-        em.flush();
-        em.clear();
-
-        boolean result = repo.existsByUserIdAndToken(user.getId(), "missing-token");
-
-        assertThat(result).isFalse();
     }
 
     @Test
@@ -296,6 +262,133 @@ class DeviceTokenRepositoryTest extends AbstractDataJpaTest {
         assertThat(result).hasSize(1);
         assertThat(result.get(0).getId()).isEqualTo(staleId);
         assertThat(result.get(0).getToken()).isEqualTo("ttl-stale-inactive-token");
+    }
+
+    // ── Phase 339 (D10) — a token belongs to exactly one user ───────────────────────────────────
+
+    private User otherUser() {
+        User other = new User("device-token-b-" + UUID.randomUUID() + "@test.com", "$2a$10$hash",
+                Role.CLIENT, "Other", "User", "+380502222222");
+        em.persist(other);
+        em.flush();
+        return other;
+    }
+
+    @Test
+    @DisplayName("D10: the same token cannot sit under two users (ux_device_tokens_token, V185)")
+    void should_rejectSameTokenForTwoUsers_when_inserted() {
+        User other = otherUser();
+        repo.saveAndFlush(DeviceToken.builder().user(user).token("shared-device-token")
+                .platform(Platform.ANDROID).build());
+
+        assertThatThrownBy(() -> repo.saveAndFlush(DeviceToken.builder().user(other)
+                .token("shared-device-token").platform(Platform.ANDROID).build()))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    private long tokenRows(String token) {
+        return ((Number) em.getEntityManager()
+                .createNativeQuery("SELECT count(*) FROM device_tokens WHERE token = ?1")
+                .setParameter(1, token).getSingleResult()).longValue();
+    }
+
+    @Test
+    @DisplayName("D10/upsert: a fresh token is inserted active for the caller")
+    void should_insertToken_when_upsertedForNewToken() {
+        int written = repo.upsertToken("fresh-device-token", user.getId(), "IOS");
+        em.clear();
+
+        assertThat(written).isEqualTo(1);
+        assertThat(repo.findActiveTokenSummaryByUserId(user.getId())).hasSize(1);
+        assertThat(tokenRows("fresh-device-token")).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("D10/upsert: token registered by user A then by user B leaves ONE row, owned by B")
+    void should_leaveOneRowOwnedByB_when_sameTokenRegisteredByAThenB() {
+        User other = otherUser();
+
+        repo.upsertToken("switch-device-token", user.getId(), "ANDROID");
+        repo.upsertToken("switch-device-token", other.getId(), "ANDROID");
+        em.clear();
+
+        assertThat(tokenRows("switch-device-token")).isEqualTo(1);
+        assertThat(repo.findActiveTokenSummaryByUserId(other.getId())).hasSize(1);
+        assertThat(repo.findActiveTokenSummaryByUserId(user.getId()))
+                .as("the previous owner must stop receiving pushes for this device").isEmpty();
+    }
+
+    @Test
+    @DisplayName("D10/upsert: repeating the registration by the same owner is idempotent — one active row")
+    void should_beIdempotent_when_sameOwnerRegistersTwice() {
+        User other = otherUser();
+        repo.upsertToken("switch-device-token", user.getId(), "ANDROID");
+        repo.upsertToken("switch-device-token", other.getId(), "ANDROID");
+
+        repo.upsertToken("switch-device-token", other.getId(), "ANDROID");
+        em.clear();
+
+        assertThat(tokenRows("switch-device-token")).isEqualTo(1);
+        assertThat(repo.findActiveTokenSummaryByUserId(other.getId())).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("D10/upsert: an inactive token re-registered by its own user is re-activated")
+    void should_reactivateToken_when_sameUserReRegistersInactiveToken() {
+        repo.saveAndFlush(DeviceToken.builder().user(user).token("revive-device-token")
+                .platform(Platform.ANDROID).isActive(false).build());
+
+        repo.upsertToken("revive-device-token", user.getId(), "ANDROID");
+        em.clear();
+
+        assertThat(tokenRows("revive-device-token")).isEqualTo(1);
+        assertThat(repo.findActiveTokenSummaryByUserId(user.getId())).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("ownership re-check: an active token of a DEACTIVATED user is not returned")
+    void should_returnNoTokens_when_ownerUserDeactivated() {
+        repo.upsertToken("deactivated-owner-token", user.getId(), "ANDROID");
+        user.setActive(false);
+        em.persistAndFlush(user);
+        em.clear();
+
+        assertThat(repo.findActiveTokenSummaryByUserId(user.getId())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("D10/upsert: the platform is refreshed explicitly when the token comes back under another platform")
+    void should_updatePlatform_when_tokenReRegisteredWithOtherPlatform() {
+        repo.upsertToken("platform-device-token", user.getId(), "ANDROID");
+
+        repo.upsertToken("platform-device-token", user.getId(), "IOS");
+        em.clear();
+
+        Object platform = em.getEntityManager()
+                .createNativeQuery("SELECT platform FROM device_tokens WHERE token = ?1")
+                .setParameter(1, "platform-device-token").getSingleResult();
+        assertThat(platform).isEqualTo("IOS");
+    }
+
+    @Test
+    @DisplayName("Batch lookup returns the ACTIVE tokens of every requested user, with the owner id, in one query")
+    void should_returnActiveTokensOfAllUsers_when_findActiveTokensByUserIdIn() {
+        User other = otherUser();
+        User third = otherUser();
+        repo.upsertToken("batch-token-a", user.getId(), "ANDROID");
+        repo.upsertToken("batch-token-b", other.getId(), "ANDROID");
+        repo.upsertToken("batch-token-c", third.getId(), "ANDROID");
+        repo.saveAndFlush(DeviceToken.builder().user(user).token("batch-token-inactive")
+                .platform(Platform.ANDROID).isActive(false).build());
+        em.clear();
+
+        List<DeviceTokenRepository.UserDeviceToken> found =
+                repo.findActiveTokensByUserIdIn(List.of(user.getId(), other.getId()));
+
+        assertThat(found).extracting(DeviceTokenRepository.UserDeviceToken::getToken)
+                .containsExactlyInAnyOrder("batch-token-a", "batch-token-b");
+        assertThat(found).extracting(DeviceTokenRepository.UserDeviceToken::getUserId)
+                .containsExactlyInAnyOrder(user.getId(), other.getId());
     }
 
     /**

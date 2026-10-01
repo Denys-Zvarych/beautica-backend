@@ -967,7 +967,7 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
             + "32,767 bind-parameter ceiling an unchunked IN (:ids) would hit) still succeed against real "
             + "Postgres, while a real booking inside the list still gets its row")
     void should_succeedBeyondJdbcParameterLimit_when_serviceChunksBulkIds() {
-        InAppNotificationService service = new InAppNotificationService(repository, null, null);
+        InAppNotificationService service = new InAppNotificationService(repository, null, null, false);
         List<UUID> ids = new java.util.ArrayList<>(
                 java.util.stream.Stream.generate(UUID::randomUUID).limit(40_000).toList());
         ids.add(25_000, booking.getId());
@@ -1153,6 +1153,187 @@ class InAppNotificationRepositoryIT extends AbstractDataJpaTest {
     private long countRows() {
         Long count = jdbcTemplate.queryForObject("SELECT count(*) FROM in_app_notification", Long.class);
         return count == null ? 0 : count;
+    }
+
+    // ── Phase 339 — push twins: one INAPP_PUSH outbox row per INSERTED feed row, atomically ──────
+
+    private long countPushRows() {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM notification_outbox WHERE event_type = 'INAPP_PUSH'", Long.class);
+        return count == null ? 0 : count;
+    }
+
+    /** Gives every existing user one active device token — the push twins only enqueue for those. */
+    private void giveEveryUserAToken() {
+        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform) "
+                + "SELECT id, 'it-token-' || id, 'ANDROID' FROM users");
+    }
+
+    private void giveUserAToken(UUID userId, boolean active) {
+        jdbcTemplate.update("INSERT INTO device_tokens (user_id, token, platform, is_active) "
+                + "VALUES (?, ?, 'ANDROID', ?)", userId, "it-token-" + userId, active);
+    }
+
+    @ParameterizedTest
+    @EnumSource(InAppNotificationType.class)
+    @DisplayName("insertForRecipientsWithPush writes exactly one INAPP_PUSH row per feed row, for every "
+            + "type — aggregate_id is the feed row id, status PENDING, NO payload (ids only)")
+    void should_writeOnePushRowPerFeedRow_when_insertForRecipientsWithPush(InAppNotificationType type) {
+        giveEveryUserAToken();
+        // V181's trigger requires salon_id + subject_user_id together on an INVITE_ACCEPTED insert.
+        UUID subject = type == InAppNotificationType.INVITE_ACCEPTED ? UUID.fromString(
+                jdbcTemplate.queryForObject("SELECT id FROM users LIMIT 1", String.class)) : null;
+        int written = repository.insertForRecipientsWithPush(
+                type.name(), List.of(client.getId(), teammate.getId()), booking.getId(), null, salon.getId(),
+                subject, type.name() + ":" + booking.getId());
+
+        assertThat(written).isEqualTo(2);
+        assertThat(countRows()).isEqualTo(2);
+        assertThat(countPushRows()).isEqualTo(2);
+        List<Map<String, Object>> push = jdbcTemplate.queryForList(
+                "SELECT aggregate_id, status, attempts, payload FROM notification_outbox "
+                        + "WHERE event_type = 'INAPP_PUSH'");
+        List<UUID> feedIds = jdbcTemplate.queryForList("SELECT id FROM in_app_notification", UUID.class);
+        assertThat(push).extracting(r -> r.get("aggregate_id")).containsExactlyInAnyOrderElementsOf(feedIds);
+        assertThat(push).allSatisfy(r -> {
+            assertThat(r.get("status")).isEqualTo("PENDING");
+            assertThat(((Number) r.get("attempts")).intValue()).isZero();
+            assertThat(r.get("payload")).as("ids only — nothing rendered or personal in the outbox").isNull();
+        });
+    }
+
+    @Test
+    @DisplayName("a duplicate write (same dedup key) writes ZERO feed rows and ZERO outbox rows")
+    void should_writeNoPushRow_when_dedupSuppressesFeedRow() {
+        giveEveryUserAToken();
+        String dedup = "BOOKING_CREATED:" + booking.getId();
+        repository.insertForRecipientsWithPush("BOOKING_CREATED", List.of(client.getId()), booking.getId(),
+                null, salon.getId(), null, dedup);
+
+        int second = repository.insertForRecipientsWithPush("BOOKING_CREATED", List.of(client.getId()),
+                booking.getId(), null, salon.getId(), null, dedup);
+
+        assertThat(second).isZero();
+        assertThat(countRows()).isEqualTo(1);
+        assertThat(countPushRows()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a partially-duplicate write enqueues a push ONLY for the newly inserted recipient")
+    void should_pushOnlyNewRecipient_when_oneOfTwoRecipientsAlreadyHasRow() {
+        giveEveryUserAToken();
+        String dedup = "BOOKING_CREATED:" + booking.getId();
+        repository.insertForRecipientsWithPush("BOOKING_CREATED", List.of(client.getId()), booking.getId(),
+                null, salon.getId(), null, dedup);
+
+        int written = repository.insertForRecipientsWithPush("BOOKING_CREATED",
+                List.of(client.getId(), teammate.getId()), booking.getId(), null, salon.getId(), null, dedup);
+
+        assertThat(written).isEqualTo(1);
+        assertThat(countRows()).isEqualTo(2);
+        assertThat(countPushRows()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("insertClientOnlyBulkWithPush: one push per inserted client row; a re-run adds none")
+    void should_writeOnePushRow_when_insertClientOnlyBulkWithPush() {
+        giveEveryUserAToken();
+        String type = InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED.name();
+
+        int first = repository.insertClientOnlyBulkWithPush(type, List.of(booking.getId()), null);
+        int rerun = repository.insertClientOnlyBulkWithPush(type, List.of(booking.getId()), null);
+
+        assertThat(first).isEqualTo(1);
+        assertThat(rerun).isZero();
+        assertThat(countRows()).isEqualTo(1);
+        assertThat(countPushRows()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("insertProviderSetBulkWithPush: one push per inserted provider row; a re-run adds none")
+    void should_writeOnePushRowPerProvider_when_insertProviderSetBulkWithPush() {
+        giveEveryUserAToken();
+        String type = InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT.name();
+
+        int first = repository.insertProviderSetBulkWithPush(type, List.of(booking.getId()), client.getId());
+        int rerun = repository.insertProviderSetBulkWithPush(type, List.of(booking.getId()), client.getId());
+
+        assertThat(first).isPositive();
+        assertThat(rerun).isZero();
+        assertThat(countPushRows()).isEqualTo(countRows());
+    }
+
+    @Test
+    @DisplayName("token-less recipient: the feed row is written but NO outbox row; a recipient with an "
+            + "active token gets exactly one")
+    void should_enqueuePushOnlyForRecipientWithActiveToken_when_insertForRecipientsWithPush() {
+        giveUserAToken(teammate.getId(), true);
+
+        int written = repository.insertForRecipientsWithPush("BOOKING_CREATED",
+                List.of(client.getId(), teammate.getId()), booking.getId(), null, salon.getId(), null,
+                "BOOKING_CREATED:" + booking.getId());
+
+        assertThat(written).as("push rows enqueued").isEqualTo(1);
+        assertThat(countRows()).as("feed rows are still written for both").isEqualTo(2);
+        assertThat(countPushRows()).isEqualTo(1);
+        UUID pushed = jdbcTemplate.queryForObject(
+                "SELECT n.recipient_user_id FROM notification_outbox o "
+                        + "JOIN in_app_notification n ON n.id = o.aggregate_id WHERE o.event_type = 'INAPP_PUSH'",
+                UUID.class);
+        assertThat(pushed).isEqualTo(teammate.getId());
+    }
+
+    @Test
+    @DisplayName("an INACTIVE device token does not count: no outbox row")
+    void should_enqueueNoPush_when_onlyInactiveTokenExists() {
+        giveUserAToken(client.getId(), false);
+
+        repository.insertForRecipientsWithPush("BOOKING_CREATED", List.of(client.getId()), booking.getId(),
+                null, salon.getId(), null, "BOOKING_CREATED:" + booking.getId());
+
+        assertThat(countRows()).isEqualTo(1);
+        assertThat(countPushRows()).isZero();
+    }
+
+    @Test
+    @DisplayName("client-only and provider-set twins also skip token-less recipients")
+    void should_enqueueNoPush_when_bulkTwinsHaveNoTokens() {
+        repository.insertClientOnlyBulkWithPush(
+                InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED.name(), List.of(booking.getId()), null);
+        repository.insertProviderSetBulkWithPush(
+                InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT.name(), List.of(booking.getId()), client.getId());
+
+        assertThat(countRows()).isPositive();
+        assertThat(countPushRows()).isZero();
+    }
+
+    @Test
+    @DisplayName("the plain (non-push) twins never touch the outbox — prod stays dark with zero churn")
+    void should_writeNoPushRow_when_plainInsertUsed() {
+        repository.insertForRecipients("BOOKING_CREATED", List.of(client.getId()), booking.getId(), null,
+                salon.getId(), null, "BOOKING_CREATED:" + booking.getId());
+        repository.insertClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED.name(),
+                List.of(booking.getId()), null);
+
+        assertThat(countRows()).isEqualTo(2);
+        assertThat(countPushRows()).isZero();
+    }
+
+    @Test
+    @DisplayName("the service gate: pushEnabled=true writes INAPP_PUSH rows, false writes none")
+    void should_gateOnFlag_when_serviceWritesBulk() {
+        giveEveryUserAToken();
+        new InAppNotificationService(repository, null, null, false)
+                .notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED,
+                        List.of(booking.getId()), null);
+        assertThat(countPushRows()).isZero();
+        jdbcTemplate.update("DELETE FROM in_app_notification");
+
+        new InAppNotificationService(repository, null, null, true)
+                .notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED,
+                        List.of(booking.getId()), null);
+
+        assertThat(countPushRows()).isEqualTo(1);
     }
 
     /** Inserts a row with an explicit {@code created_at}, bypassing the column's {@code DEFAULT now()}. */

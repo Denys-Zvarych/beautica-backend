@@ -76,7 +76,7 @@ class InAppNotificationServiceTest {
     @BeforeEach
     void setUp() {
         InAppRecipientResolver resolver = new InAppRecipientResolver(userRepository);
-        service = new InAppNotificationService(repository, salonRepository, resolver);
+        service = new InAppNotificationService(repository, salonRepository, resolver, false);
 
         ownerId = UUID.randomUUID();
         masterUserId = UUID.randomUUID();
@@ -95,6 +95,49 @@ class InAppNotificationServiceTest {
         org.mockito.Mockito.lenient()
                 .when(userRepository.findBySalonIdAndRoleAndIsActiveTrue(eq(salonId), eq(Role.SALON_ADMIN)))
                 .thenReturn(List.of());
+    }
+
+    // ── Phase 339 — the FIREBASE_ENABLED gate picks the push twin ────────────────────────────────
+
+    @Test
+    @DisplayName("pushEnabled=true routes a per-event write to the push twin and never the plain insert")
+    void should_useWithPushTwin_when_pushEnabledEventWrite() {
+        service = new InAppNotificationService(
+                repository, salonRepository, new InAppRecipientResolver(userRepository), true);
+        Booking booking = org.mockito.Mockito.mock(Booking.class);
+        org.mockito.Mockito.lenient().when(booking.getId()).thenReturn(UUID.randomUUID());
+        org.mockito.Mockito.lenient().when(booking.getMaster()).thenReturn(master);
+        org.mockito.Mockito.lenient().when(booking.getSalon()).thenReturn(salon);
+        org.mockito.Mockito.lenient().when(booking.getBookingSource()).thenReturn(BookingSource.APP);
+
+        service.notifyBookingEvent(InAppNotificationType.BOOKING_CREATED, booking, clientId);
+
+        org.mockito.Mockito.verify(repository).insertForRecipientsWithPush(
+                eq("BOOKING_CREATED"), any(), any(), any(), any(), any(), any());
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.never()).insertForRecipients(
+                any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    @DisplayName("pushEnabled=true routes both bulk writes to their push twins; false uses the plain ones")
+    void should_routeBulkWrites_when_pushFlagToggled() {
+        UUID bookingId = UUID.randomUUID();
+        InAppRecipientResolver resolver = new InAppRecipientResolver(userRepository);
+
+        new InAppNotificationService(repository, salonRepository, resolver, true)
+                .notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED, List.of(bookingId), null);
+        new InAppNotificationService(repository, salonRepository, resolver, true)
+                .notifyProviderSetBulk(InAppNotificationType.BOOKING_CANCELLED_BY_CLIENT, List.of(bookingId), null);
+        new InAppNotificationService(repository, salonRepository, resolver, false)
+                .notifyClientOnlyBulk(InAppNotificationType.BOOKING_CANCELLED_SALON_CLOSED, List.of(bookingId), null);
+
+        org.mockito.Mockito.verify(repository).insertClientOnlyBulkWithPush(
+                eq("BOOKING_CANCELLED_SALON_CLOSED"), any(), any());
+        org.mockito.Mockito.verify(repository).insertProviderSetBulkWithPush(
+                eq("BOOKING_CANCELLED_BY_CLIENT"), any(), any());
+        org.mockito.Mockito.verify(repository).insertClientOnlyBulk(
+                eq("BOOKING_CANCELLED_SALON_CLOSED"), any(), any());
+        org.mockito.Mockito.verify(repository, org.mockito.Mockito.never()).insertProviderSetBulk(any(), any(), any());
     }
 
     private static User userWithId(UUID id) {
