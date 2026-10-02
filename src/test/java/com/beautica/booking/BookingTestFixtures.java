@@ -434,7 +434,15 @@ public class BookingTestFixtures {
         }
     }
 
-    UUID createSalonService(UUID salonId, UUID masterId) {
+    /**
+     * Widened from package-private to {@code public} (mirroring {@link #createSalon(String)}'s own
+     * precedent, this class's javadoc) for {@code com.beautica.notification.inapp
+     * .NotificationFeedRealWritePathIT} — phase 334 QA follow-up, which composes a real salon
+     * booking write path with the real read API and lives outside {@code com.beautica.booking} for
+     * the same reason {@code InAppNotificationDeletionLifecycleIT} does (package by FEATURE, not by
+     * fixture ownership).
+     */
+    public UUID createSalonService(UUID salonId, UUID masterId) {
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "

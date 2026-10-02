@@ -283,4 +283,27 @@ class BookingNoteVisibilityIT extends AbstractIntegrationTest {
         headers.setBearerAuth(token);
         return headers;
     }
+
+    /**
+     * Phase 333 companion to this class's locked "notes are mutually visible" decision, from the
+     * OTHER direction: the in-app feed (a SEPARATE surface from the booking read paths this class
+     * otherwise covers) must never carry a note AT ALL, to either side. Schema-level, not a
+     * client-side redaction check — {@code in_app_notification} has no free-text column for a
+     * {@code providerComment}/{@code clientComment}/cancellation note to leak into in the first
+     * place, so there is no code path that COULD echo one, regardless of audience.
+     */
+    @Test
+    @DisplayName("in_app_notification has no free-text column — a note can never reach the feed, for "
+            + "either side, structurally")
+    void should_neverPersistNote_inFeedRow() {
+        var textColumns = jdbcTemplate.queryForList(
+                "SELECT column_name FROM information_schema.columns "
+                        + "WHERE table_name = 'in_app_notification' "
+                        + "AND data_type IN ('text', 'character varying') "
+                        + "AND column_name NOT IN ('type', 'dedup_key')",
+                String.class);
+        assertThat(textColumns)
+                .as("every column besides the closed-enum type/dedup_key is a UUID or timestamp")
+                .isEmpty();
+    }
 }

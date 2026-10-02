@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -58,6 +59,24 @@ public interface UserRepository extends JpaRepository<User, UUID> {
      * caller cannot use this predicate to probe non-admin users assigned to a salon.
      */
     boolean existsByIdAndSalonIdAndRole(UUID id, UUID salonId, Role role);
+
+    /** One (user, assigned salon) pair — the projection of {@link #findSalonAssignments}. */
+    interface UserSalonPair {
+        UUID getUserId();
+
+        UUID getSalonId();
+    }
+
+    /**
+     * Batch form of {@link #existsByIdAndSalonIdAndRole}: the salon assignment of EVERY user in
+     * {@code userIds} that has {@code role} and a salon, in ONE statement (same predicate — id, role,
+     * salon_id equality), so the push drain can answer "does this admin still belong to this salon" for
+     * all admin recipients without a statement per pair.
+     */
+    @Query("SELECT u.id AS userId, u.salonId AS salonId FROM User u "
+            + "WHERE u.id IN :userIds AND u.role = :role AND u.salonId IS NOT NULL")
+    List<UserSalonPair> findSalonAssignments(@Param("userIds") Collection<UUID> userIds,
+                                             @Param("role") Role role);
 
     /**
      * Backs {@link com.beautica.salon.service.SalonService#getSalonStaff} — the

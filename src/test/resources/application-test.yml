@@ -46,6 +46,13 @@ app:
     # hand with its own caches and is unaffected by this override, which is what keeps the 429
     # behaviour itself genuinely tested.
     salon-board-read-capacity: 100000
+    # Same reasoning again, for the four in-app notification feed endpoints (phase 334) sharing
+    # ONE per-user bucket: NotificationFeedControllerIT drives many real GETs/PATCHes as one
+    # recipient token across its test methods, which would otherwise 429 mid-class against the
+    # production 60/min default. BookingRateLimitFilterTest's notification-feed throttling
+    # assertions build the filter directly against a hand-built single-slot LoadingCache
+    # (bypassing this property entirely), so this override does not neuter that coverage.
+    notification-feed-capacity: 100000
     device-token-capacity: 100000
     media-upload-capacity: 100000
     verify-email-capacity: 100000
@@ -173,6 +180,18 @@ notification:
       # scheduler; unit/repository tests pass an explicit staleBefore Instant directly and never
       # read this property.
       stale-claim-threshold: 60m
+  inapp:
+    retention-days: 90
+    cleanup:
+      # Off by default in the test profile — every full @SpringBootTest context has real
+      # scheduling enabled (SchedulingConfig is not profile-gated), and phase-335's job checks
+      # this flag at the top of every run rather than gating bean creation, so a class that wants
+      # to exercise the real sweep flips it back on via @TestPropertySource (see
+      # InAppNotificationCleanupJobIT), the same posture ClosureReminderJobIT already uses for
+      # booking.closure-reminder.enabled.
+      enabled: false
+      batch-size: 1000
+      max-batches-per-run: 50
 
 management:
   health:

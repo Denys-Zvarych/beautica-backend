@@ -20,7 +20,9 @@ import org.springframework.context.annotation.Configuration;
         TurbosmsProperties.class,
         BookingSmsProperties.class,
         OutboxReclaimPolicyConfig.class,
-        ClosureReminderProperties.class
+        ClosureReminderProperties.class,
+        InAppNotificationRetentionProperties.class,
+        InAppNotificationCleanupProperties.class
 })
 public class AppConfigProperties {
 }

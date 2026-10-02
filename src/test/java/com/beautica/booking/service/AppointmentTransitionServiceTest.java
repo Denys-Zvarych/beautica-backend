@@ -19,6 +19,7 @@ import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.security.AuthorizationService;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.notification.service.NotificationOutboxService;
 import com.beautica.service.entity.MasterServiceAssignment;
 import com.beautica.service.service.SalonCatalogCacheEvictor;
@@ -40,13 +41,16 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
@@ -107,6 +111,9 @@ class AppointmentTransitionServiceTest {
     @Mock
     private org.springframework.context.ApplicationEventPublisher eventPublisher;
 
+    @Mock
+    private InAppNotificationService inAppNotificationService;
+
     private Clock clock;
     private AppointmentTransitionService appointmentTransitionService;
 
@@ -126,7 +133,8 @@ class AppointmentTransitionServiceTest {
                 visitPlanner,
                 appointmentService,
                 eventPublisher,
-                clock
+                clock,
+                inAppNotificationService
         );
         appointmentId = UUID.randomUUID();
     }
@@ -736,13 +744,17 @@ class AppointmentTransitionServiceTest {
     }
 
     @Test
-    @DisplayName("rescheduleAppointment — header lock runs BEFORE the client/master advisory locks "
-            + "(canonical appointments-before-bookings order, cycle-5 audit finding 1), and a false "
-            + "lock result is a clean 409 with NO advisory lock ever attempted and NOTHING mutated")
-    void should_throw409AndNeverAcquireAdvisoryLocks_when_headerLeftConfirmedBeforeWholeVisitReschedule() {
+    @DisplayName("rescheduleAppointment — header lock runs AFTER the client/master advisory locks "
+            + "(global lock order client -> master -> header), and a false lock result is a clean 409 "
+            + "with NOTHING mutated, saved or freshness-checked")
+    void should_throw409AndNotMutate_when_headerLeftConfirmedBeforeWholeVisitReschedule() {
         OffsetDateTime newFirstStart = OffsetDateTime.parse("2026-08-11T09:00:00Z");
         Booking item = setUpWholeVisitRescheduleUpToLock(newFirstStart);
         AppointmentRescheduleRequest req = new AppointmentRescheduleRequest(newFirstStart);
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcludingAppointment(
+                eq(clientId), any(), any(), eq(appointmentId))).thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointment(
@@ -753,60 +765,31 @@ class AppointmentTransitionServiceTest {
         assertThat(item.getStartsAt())
                 .as("a lock loss must mutate nothing")
                 .isEqualTo(OffsetDateTime.parse("2026-08-10T09:00:00Z"));
-        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
-        verify(bookingRepository, never()).acquireAdvisoryLock(any());
-        verify(bookingRepository, never()).findConfirmedIdsByAppointmentId(any());
+        InOrder order = inOrder(bookingRepository, appointmentRepository);
+        order.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
+        order.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        order.verify(appointmentRepository).lockHeaderIfConfirmed(appointmentId);
+        verify(bookingRepository, never()).findPostLockAllConfirmedAndOverlapExcludingAppointment(
+                any(), any(), any(), any(), any(), anyLong());
         verify(bookingRepository, never()).saveAll(any());
     }
 
     @Test
-    @DisplayName("rescheduleAppointment — post-lock freshness re-check (cycle-5 audit finding 1): "
-            + "the header lock alone succeeding is NOT enough if a target item already left CONFIRMED "
-            + "concurrently — a stale target is a clean 409, with NO advisory lock ever attempted and "
-            + "NOTHING mutated (this recheck is what rejects the whole transition rather than silently "
-            + "re-planning a leg that already left CONFIRMED — see G1, cycle-7 audit 2026-08-03, for "
-            + "why Booking's now-added @DynamicUpdate makes a stale save column-safe but does not make "
-            + "proceeding with it correct)")
-    void should_throw409AndNeverAcquireAdvisoryLocks_when_targetItemLeftConfirmedAfterHeaderLock() {
+    @DisplayName("rescheduleAppointment — lock order is client, THEN master, THEN header (global "
+            + "order), reusing lockAppointmentHeaderBeforeItemReschedule rather than a new mechanism, "
+            + "when every guard passes")
+    void should_lockClientThenMasterThenHeader_when_wholeVisitRescheduleSucceeds() {
         OffsetDateTime newFirstStart = OffsetDateTime.parse("2026-08-11T09:00:00Z");
         Booking item = setUpWholeVisitRescheduleUpToLock(newFirstStart);
         AppointmentRescheduleRequest req = new AppointmentRescheduleRequest(newFirstStart);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
-        // The header itself is still CONFIRMED (nothing collapsed it), but THIS item concurrently
-        // left CONFIRMED (e.g. a per-service decline) — the freshness projection reflects that by
-        // simply omitting its id, never returning a status value directly.
-        when(bookingRepository.findConfirmedIdsByAppointmentId(appointmentId)).thenReturn(java.util.Set.of());
-
-        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointment(
-                clientId, Role.CLIENT, appointmentId, req))
-                .isInstanceOf(BusinessException.class)
-                .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
-
-        assertThat(item.getStartsAt())
-                .as("a lost freshness race must mutate nothing")
-                .isEqualTo(OffsetDateTime.parse("2026-08-10T09:00:00Z"));
-        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
-        verify(bookingRepository, never()).acquireAdvisoryLock(any());
-        verify(bookingRepository, never()).saveAll(any());
-    }
-
-    @Test
-    @DisplayName("rescheduleAppointment — lock order is header, THEN client, THEN master (canonical "
-            + "appointments-before-bookings order), reusing lockAppointmentHeaderBeforeItemReschedule "
-            + "rather than a new mechanism, when every guard passes")
-    void should_lockHeaderBeforeClientThenMasterAdvisoryLocks_when_wholeVisitRescheduleSucceeds() {
-        OffsetDateTime newFirstStart = OffsetDateTime.parse("2026-08-11T09:00:00Z");
-        Booking item = setUpWholeVisitRescheduleUpToLock(newFirstStart);
-        AppointmentRescheduleRequest req = new AppointmentRescheduleRequest(newFirstStart);
-        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
-        when(bookingRepository.findConfirmedIdsByAppointmentId(appointmentId))
-                .thenReturn(java.util.Set.of(item.getId()));
         when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
         when(bookingRepository.findFirstConflictingClientBookingIdExcludingAppointment(
                 eq(clientId), any(), any(), eq(appointmentId))).thenReturn(Optional.empty());
         when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlapExcludingAppointment(eq(masterId), any(), any(), eq(appointmentId)))
-                .thenReturn(false);
+        when(bookingRepository.findPostLockAllConfirmedAndOverlapExcludingAppointment(
+                eq(masterId), any(), any(), eq(appointmentId), any(), anyLong()))
+                .thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAll(List.of(item))).thenReturn(List.of(item));
         when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
 
@@ -814,11 +797,42 @@ class AppointmentTransitionServiceTest {
 
         assertThat(item.getStartsAt()).isEqualTo(newFirstStart);
         InOrder order = inOrder(appointmentRepository, bookingRepository);
-        order.verify(appointmentRepository).lockHeaderIfConfirmed(appointmentId);
-        order.verify(bookingRepository).findConfirmedIdsByAppointmentId(appointmentId);
         order.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
         order.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        order.verify(appointmentRepository).lockHeaderIfConfirmed(appointmentId);
+        order.verify(bookingRepository).findPostLockAllConfirmedAndOverlapExcludingAppointment(
+                eq(masterId), any(), any(), eq(appointmentId), any(), anyLong());
         order.verify(bookingRepository).saveAll(List.of(item));
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointment — Phase 336 audit-fix: an item DECLINED by a cascade while this "
+            + "reschedule queued on the master lock is caught by the fused post-lock re-check: 409, "
+            + "no mutation, no save, no outbox/feed")
+    void should_throw409AndNotMutate_when_visitItemDeclinedWhileQueuedOnMasterLock() {
+        OffsetDateTime newFirstStart = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        Booking item = setUpWholeVisitRescheduleUpToLock(newFirstStart);
+        OffsetDateTime originalStart = item.getStartsAt();
+        AppointmentRescheduleRequest req = new AppointmentRescheduleRequest(newFirstStart);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcludingAppointment(
+                eq(clientId), any(), any(), eq(appointmentId))).thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockAllConfirmedAndOverlapExcludingAppointment(
+                eq(masterId), any(), any(), eq(appointmentId), eq(List.of(item.getId())), eq(1L)))
+                .thenReturn(PostLockRescheduleChecks.stale());
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointment(
+                clientId, Role.CLIENT, appointmentId, req))
+                .isInstanceOfSatisfying(BusinessException.class, ex -> {
+                    assertThat(ex.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+                    assertThat(ex.getMessage()).contains("Visit changed concurrently");
+                });
+
+        assertThat(item.getStartsAt()).isEqualTo(originalStart);
+        verify(bookingRepository, never()).saveAll(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), org.mockito.ArgumentMatchers.anyBoolean());
     }
 
     @Test
@@ -947,7 +961,7 @@ class AppointmentTransitionServiceTest {
 
     @Test
     @DisplayName("rescheduleAppointmentItem — CLIENT happy path: moves ONLY the target row, leaves "
-            + "the sibling byte-for-byte unchanged, locks header→client→master in order, notifies "
+            + "the sibling byte-for-byte unchanged, locks client→master→header in order, notifies "
             + "referencing the MOVED CHILD, and never collapses the header")
     void should_moveOnlyTargetAndLeaveSiblingUntouched_when_clientReschedulesConfirmedItem() {
         setUpRescheduleItemFixtures();
@@ -967,12 +981,11 @@ class AppointmentTransitionServiceTest {
         stubItemSlotAvailable(newStartsAt);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // F1 freshness re-check (cycle-6 audit 2026-08-03): target is still CONFIRMED post-lock.
-        when(bookingRepository.existsConfirmedById(targetId)).thenReturn(true);
         when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
         when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
                 .thenReturn(Optional.empty());
         when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(target)).thenReturn(target);
         when(appointmentService.enrich(eq(appointment), any())).thenReturn(enriched);
 
@@ -988,10 +1001,47 @@ class AppointmentTransitionServiceTest {
         verify(appointmentRepository, never()).collapseHeaderIfNoConfirmedSiblingsRemain(any(), any(), any(), any());
 
         InOrder order = inOrder(appointmentRepository, bookingRepository);
-        order.verify(appointmentRepository).lockHeaderIfConfirmed(appointmentId);
         order.verify(bookingRepository).acquireClientAdvisoryLockWithTimeout(clientId);
         order.verify(bookingRepository).acquireAdvisoryLock(masterId);
+        order.verify(appointmentRepository).lockHeaderIfConfirmed(appointmentId);
         order.verify(bookingRepository).saveAndFlush(target);
+    }
+
+    @Test
+    @DisplayName("rescheduleAppointmentItem — Phase 336 audit-fix: an item DECLINED by a cascade while "
+            + "this reschedule queued on the master lock is caught by the fused post-lock re-check: "
+            + "409, no mutation, no save, no outbox/feed")
+    void should_throw409AndNotMutate_when_itemDeclinedWhileQueuedOnMasterLock() {
+        setUpRescheduleItemFixtures();
+        UUID targetId = UUID.randomUUID();
+        UUID siblingId = UUID.randomUUID();
+        OffsetDateTime siblingStart = OffsetDateTime.parse("2026-08-10T09:00:00Z");
+        Booking sibling = confirmedItem(siblingId, siblingStart, siblingStart.plusHours(1));
+        Booking target = confirmedItem(targetId, siblingStart.plusHours(2), siblingStart.plusHours(3));
+        OffsetDateTime originalStart = target.getStartsAt();
+        Appointment appointment = Appointment.builder().id(appointmentId).client(itemClient).build();
+        OffsetDateTime newStartsAt = OffsetDateTime.parse("2026-08-11T09:00:00Z");
+        AppointmentItemRescheduleRequest req = new AppointmentItemRescheduleRequest(newStartsAt, false);
+        when(appointmentRepository.findById(appointmentId)).thenReturn(Optional.of(appointment));
+        when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
+        when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(sibling, target));
+        stubItemSlotAvailable(newStartsAt);
+        when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId)))
+                .thenReturn(PostLockRescheduleChecks.stale());
+
+        assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
+                clientId, Role.CLIENT, appointmentId, targetId, req))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getStatus()).isEqualTo(HttpStatus.CONFLICT));
+
+        assertThat(target.getStartsAt()).isEqualTo(originalStart);
+        verify(bookingRepository, never()).saveAndFlush(any());
+        verify(outboxService, never()).enqueueBookingRescheduled(any(), org.mockito.ArgumentMatchers.anyBoolean());
     }
 
     @Test
@@ -1012,12 +1062,11 @@ class AppointmentTransitionServiceTest {
         stubStaffItemSlotAvailable(newStartsAt);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // F1 freshness re-check (cycle-6 audit 2026-08-03): target is still CONFIRMED post-lock.
-        when(bookingRepository.existsConfirmedById(targetId)).thenReturn(true);
         when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
         when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
                 .thenReturn(Optional.empty());
         when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(target)).thenReturn(target);
         when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
 
@@ -1082,12 +1131,11 @@ class AppointmentTransitionServiceTest {
         stubItemSlotAvailable(siblingEnd);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // F1 freshness re-check (cycle-6 audit 2026-08-03): target is still CONFIRMED post-lock.
-        when(bookingRepository.existsConfirmedById(targetId)).thenReturn(true);
         when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
         when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
                 .thenReturn(Optional.empty());
         when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(target)).thenReturn(target);
         when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
 
@@ -1117,12 +1165,11 @@ class AppointmentTransitionServiceTest {
         stubItemSlotAvailable(newStartsAt);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // F1 freshness re-check (cycle-6 audit 2026-08-03): target is still CONFIRMED post-lock.
-        when(bookingRepository.existsConfirmedById(targetId)).thenReturn(true);
         when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
         when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
                 .thenReturn(Optional.empty());
         when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
-        when(bookingRepository.existsOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(false);
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId))).thenReturn(PostLockRescheduleChecks.free());
         when(bookingRepository.saveAndFlush(target)).thenReturn(target);
         when(appointmentService.enrich(any(), any())).thenReturn(org.mockito.Mockito.mock(AppointmentDetailResponse.class));
 
@@ -1148,6 +1195,10 @@ class AppointmentTransitionServiceTest {
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
         when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
         stubItemSlotAvailable(newStartsAt);
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
@@ -1155,25 +1206,25 @@ class AppointmentTransitionServiceTest {
                 .isInstanceOf(BusinessException.class)
                 .satisfies(ex -> assertThat(((BusinessException) ex).getStatus()).isEqualTo(HttpStatus.CONFLICT));
 
-        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
         verify(bookingRepository, never()).saveAndFlush(any());
     }
 
     /**
      * Regression test for QA cycle-8 finding 2 (LOW) — {@code rescheduleAppointmentItem}'s F1
-     * freshness-recheck-false branch (the {@code existsConfirmedById} → 409 path) previously had NO
-     * deterministic unit coverage; only {@code AppointmentCrossPathTransitionConcurrencyIT}'s
-     * (compromised, branch-on-the-guard-under-test) concurrency tests touched it at all. Distinct from
+     * freshness-recheck-false branch (now the fused {@code PostLockRescheduleGuard} statement's
+     * {@code still_confirmed=false} → 409 path) previously had NO deterministic unit coverage; only
+     * {@code AppointmentCrossPathTransitionConcurrencyIT}'s (compromised, branch-on-the-guard-under-test)
+     * concurrency tests touched it at all. Distinct from
      * {@code should_throw409_when_headerNoLongerConfirmed} above, which pins the LOCK's own false
      * branch ({@code lockHeaderIfConfirmed} empty) — here the lock SUCCEEDS (the header is still
-     * CONFIRMED) and it is F1's separate, item-scoped probe that fails.
+     * CONFIRMED) and it is the item-scoped fused guard that fails.
      */
     @Test
     @DisplayName("rescheduleAppointmentItem — F1 (cycle-6 audit 2026-08-03): the header lock succeeding "
             + "is NOT enough if the TARGET ITEM ITSELF already left CONFIRMED concurrently (e.g. a "
-            + "per-item cancel/decline of this SAME leg) — existsConfirmedById returning false is a "
-            + "clean 409, with NO advisory lock ever attempted and NOTHING mutated")
-    void should_throw409AndNeverAcquireAdvisoryLocks_when_targetItselfLeftConfirmedAfterHeaderLock() {
+            + "per-item cancel/decline of this SAME leg) — the fused post-lock guard reporting it stale is a "
+            + "clean 409 with NOTHING mutated")
+    void should_throw409AndNotMutate_when_targetItselfLeftConfirmedAfterHeaderLock() {
         setUpRescheduleItemFixtures();
         UUID targetId = UUID.randomUUID();
         OffsetDateTime start = OffsetDateTime.parse("2026-08-10T09:00:00Z");
@@ -1186,12 +1237,17 @@ class AppointmentTransitionServiceTest {
         when(appointmentRepository.findClientIdById(appointmentId)).thenReturn(Optional.of(clientId));
         when(bookingRepository.findByAppointmentIdWithGraph(appointmentId)).thenReturn(List.of(target));
         stubItemSlotAvailable(newStartsAt);
+        when(bookingRepository.acquireClientAdvisoryLockWithTimeout(clientId)).thenReturn(1);
+        when(bookingRepository.findFirstConflictingClientBookingIdExcluding(eq(clientId), any(), any(), eq(targetId)))
+                .thenReturn(Optional.empty());
+        when(bookingRepository.acquireAdvisoryLock(masterId)).thenReturn(1);
         // The header itself is still CONFIRMED — the lock succeeds...
         when(appointmentRepository.lockHeaderIfConfirmed(appointmentId)).thenReturn(Optional.of(appointmentId));
         // ...but THIS item concurrently left CONFIRMED (e.g. a per-item client cancel or provider
-        // decline of the SAME leg, fired near-concurrently at the sibling per-item endpoint) — F1's
-        // freshness probe reflects that directly, never a second entity load of target itself.
-        when(bookingRepository.existsConfirmedById(targetId)).thenReturn(false);
+        // decline of the SAME leg, fired near-concurrently at the sibling per-item endpoint) — the
+        // fused post-lock guard statement reports it directly, never a second entity load of target.
+        when(bookingRepository.findPostLockConfirmedAndOverlapExcluding(eq(masterId), any(), any(), eq(targetId)))
+                .thenReturn(PostLockRescheduleChecks.stale());
 
         assertThatThrownBy(() -> appointmentTransitionService.rescheduleAppointmentItem(
                 clientId, Role.CLIENT, appointmentId, targetId, req))
@@ -1202,8 +1258,6 @@ class AppointmentTransitionServiceTest {
         assertThat(target.getStartsAt())
                 .as("F1: a lost freshness race on the TARGET ITEM ITSELF must mutate nothing")
                 .isEqualTo(start);
-        verify(bookingRepository, never()).acquireClientAdvisoryLockWithTimeout(any());
-        verify(bookingRepository, never()).acquireAdvisoryLock(any());
         verify(bookingRepository, never()).saveAndFlush(any());
         verify(outboxService, never()).enqueueBookingRescheduled(any(), org.mockito.ArgumentMatchers.anyBoolean());
     }
@@ -1364,5 +1418,85 @@ class AppointmentTransitionServiceTest {
         verify(appointmentRepository, never()).lockHeaderIfConfirmed(any());
         verify(slotCalculationService, never()).getAvailableSlots(
                 any(), any(), any(UUID.class), nullable(MasterServiceAssignment.class));
+    }
+
+    // ── declineAppointmentItemsBulk (perf re-audit, 2026-09, Finding 1) ─────────────────────────
+    // Unit-level proof that the batched leg issues exactly the 3 statements its own Javadoc
+    // promises and wires them together correctly; MasterSelfDeleteBookingDisposalIT's real-Postgres
+    // statement-count test is the end-to-end proof that the count stays flat as visit count grows.
+
+    @Test
+    @DisplayName("declineAppointmentItemsBulk — an empty map issues NO query at all")
+    void should_issueNoQuery_when_bookingIdsByAppointmentIdIsEmpty() {
+        var result = appointmentTransitionService.declineAppointmentItemsBulk(
+                Map.of(), CancellationReason.PROVIDER_UNAVAILABLE, OffsetDateTime.now(clock));
+
+        assertThat(result).isEmpty();
+        verifyNoInteractions(appointmentRepository, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItemsBulk — exactly 3 statements for the whole batch: bulk "
+            + "header lock (every appointmentId), bulk conditional write (every flattened bookingId), "
+            + "bulk collapse (only the ids the lock step actually locked)")
+    void should_issueExactlyThreeStatements_forTheWholeBatch() {
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID appointmentId2 = UUID.randomUUID();
+        UUID bookingId1 = UUID.randomUUID();
+        UUID bookingId2 = UUID.randomUUID();
+        UUID bookingId3 = UUID.randomUUID();
+        OffsetDateTime now = OffsetDateTime.now(clock);
+        Map<UUID, List<UUID>> bookingIdsByAppointmentId = Map.of(
+                appointmentId1, List.of(bookingId1, bookingId2),
+                appointmentId2, List.of(bookingId3));
+
+        when(appointmentRepository.lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet()))
+                .thenReturn(List.of(appointmentId1, appointmentId2));
+        when(bookingRepository.declineConfirmedBulk(
+                argThatContainsExactlyInAnyOrder(bookingId1, bookingId2, bookingId3),
+                eq(CancellationReason.PROVIDER_UNAVAILABLE.name()), isNull(), eq(now.toInstant())))
+                .thenReturn(List.of(bookingId1, bookingId2, bookingId3));
+
+        var result = appointmentTransitionService.declineAppointmentItemsBulk(
+                bookingIdsByAppointmentId, CancellationReason.PROVIDER_UNAVAILABLE, now);
+
+        assertThat(result).containsExactlyInAnyOrder(bookingId1, bookingId2, bookingId3);
+        verify(appointmentRepository).lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet());
+        verify(bookingRepository).declineConfirmedBulk(any(), any(), isNull(), any());
+        verify(appointmentRepository).collapseHeadersIfNoConfirmedSiblingsRemainBulk(
+                eq(List.of(appointmentId1, appointmentId2)),
+                eq(BookingStatus.DECLINED.name()), eq(CancellationReason.PROVIDER_UNAVAILABLE.name()), isNull());
+        verifyNoMoreInteractions(appointmentRepository, bookingRepository);
+    }
+
+    @Test
+    @DisplayName("declineAppointmentItemsBulk — when NOTHING was locked (every header already left "
+            + "CONFIRMED before this call), the collapse statement is skipped entirely — a 0-row "
+            + "collapse over an empty id set would be a wasted round trip")
+    void should_skipCollapseStatement_when_noHeaderWasLocked() {
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID bookingId1 = UUID.randomUUID();
+        OffsetDateTime now = OffsetDateTime.now(clock);
+        Map<UUID, List<UUID>> bookingIdsByAppointmentId =
+                Map.of(appointmentId1, List.of(bookingId1));
+
+        when(appointmentRepository.lockHeadersIfConfirmedBulk(bookingIdsByAppointmentId.keySet()))
+                .thenReturn(List.of());
+        when(bookingRepository.declineConfirmedBulk(any(), any(), isNull(), any()))
+                .thenReturn(List.of());
+
+        var result = appointmentTransitionService.declineAppointmentItemsBulk(
+                bookingIdsByAppointmentId, CancellationReason.PROVIDER_UNAVAILABLE, now);
+
+        assertThat(result).isEmpty();
+        verify(appointmentRepository, never())
+                .collapseHeadersIfNoConfirmedSiblingsRemainBulk(any(), any(), any(), any());
+    }
+
+    /** {@code argThat} over a {@link Collection} that ignores element order. */
+    private static Collection<UUID> argThatContainsExactlyInAnyOrder(UUID... ids) {
+        return org.mockito.ArgumentMatchers.argThat(
+                actual -> actual != null && actual.size() == ids.length
+                        && actual.containsAll(List.of(ids)));
     }
 }

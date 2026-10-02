@@ -14,6 +14,7 @@ import com.beautica.common.PageResponse;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MasterReviewSummaryResponse;
 import com.beautica.review.dto.MyReviewResponse;
@@ -59,6 +60,9 @@ public class ReviewService {
     private final MasterRepository masterRepository;
     private final ApplicationEventPublisher eventPublisher;
     private final Clock clock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam,
+    // never derived from the eventPublisher/outbox side-effects above.
+    private final InAppNotificationService inAppNotificationService;
 
     /**
      * Absolute-instant "now" for {@link BookingClosureRule#isReviewEligible} — {@link
@@ -144,6 +148,11 @@ public class ReviewService {
                 masterUser != null ? masterUser.getId() : null,
                 salonId,
                 clientId));
+        // Phase 333, matrix row 8 — the rated master + the business owner (never admins). The
+        // reviewing CLIENT is the actor and is excluded. `booking` is already the caller's own
+        // loaded, managed entity (item 8 of the audit-fix cycle 1 backlog) — never reloaded
+        // (audit-fix cycle 1, finding 1).
+        inAppNotificationService.notifyReviewReceived(saved.getId(), booking, clientId);
         return ReviewResponse.from(saved);
     }
 

@@ -5,7 +5,7 @@ package com.beautica.notification.entity;
  *
  * <p>Values must match the DB CHECK constraint {@code chk_outbox_event}
  * defined in {@code V32__create_notification_outbox.sql} and last widened in
- * {@code V161} (via {@code V94}, {@code V109}, {@code V131}, {@code V156}) — keep this enum in
+ * {@code V184} (via {@code V94}, {@code V109}, {@code V131}, {@code V156}, {@code V161}) — keep this enum in
  * lockstep with the current CHECK, not just the V32 original.
  * Any divergence causes an {@link IllegalArgumentException} during Hibernate hydration.
  *
@@ -67,5 +67,17 @@ public enum OutboxEventType {
      * See {@code SalonService#removeMaster} and
      * {@code BookingService#declineFutureConfirmedBookingsForMasterRemoval}.
      */
-    MASTER_REMOVED
+    MASTER_REMOVED,
+
+    /**
+     * One Android push for ONE in-app feed row (Phase 339). {@code aggregate_id} is the
+     * {@code in_app_notification.id}; the row carries NO payload — ids only, the title/body are
+     * rendered at send time by {@code InAppPushDispatcher} so nothing personal sits in the outbox.
+     *
+     * <p>Written ONLY by the data-modifying-CTE twins in {@code InAppNotificationRepository}, in the
+     * same statement as the feed row (a deduplicated feed row never enqueues a push), and ONLY when
+     * {@code FIREBASE_ENABLED=true} — prod stays dark with zero outbox churn. Widened into the CHECK
+     * by {@code V184__outbox_event_type_inapp_push.sql}.
+     */
+    INAPP_PUSH
 }

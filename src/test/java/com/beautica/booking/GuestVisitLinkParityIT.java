@@ -526,14 +526,14 @@ class GuestVisitLinkParityIT extends AbstractIntegrationTest {
 
         AtomicBoolean blockerCommitted = new AtomicBoolean(false);
         doAnswer(invocation -> {
-            boolean overlapped = (boolean) forwardToRealRepository.answer(invocation);
+            Object result = forwardToRealRepository.answer(invocation);
             if (blockerCommitted.compareAndSet(false, true)) {
                 commitBlockerOnItsOwnConnection(masterId, svc2, clientId,
                         startsAt.plusMinutes(30).toOffsetDateTime(),
                         startsAt.plusMinutes(60).toOffsetDateTime());
             }
-            return overlapped;
-        }).when(bookingRepository).existsOverlap(any(UUID.class), any(), any());
+            return result;
+        }).when(bookingRepository).findPostLockBookabilityAndOverlap(any(UUID.class), any(), any());
 
         String ids = "\"" + svc1 + "\",\"" + svc2 + "\"";
         String body = """

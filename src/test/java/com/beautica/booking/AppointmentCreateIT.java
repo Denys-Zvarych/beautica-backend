@@ -482,18 +482,19 @@ class AppointmentCreateIT extends AbstractIntegrationTest {
         ZonedDateTime startsAt = ZonedDateTime.now(TimeZones.KYIV)
                 .plusDays(5).withHour(12).withMinute(0).withSecond(0).withNano(0);
 
-        // The interleaving. After the REAL existsOverlap has run, commit a guest (LINK) CONFIRMED booking
-        // over [13:00, 14:00) — where the visit's SECOND item lands. A GUEST blocker (client_id NULL)
-        // keeps this unambiguously about the master-busy path, never the client-conflict guard.
+        // The interleaving. After the REAL findPostLockBookabilityAndOverlap has run, commit a guest
+        // (LINK) CONFIRMED booking over [13:00, 14:00) — where the visit's SECOND item lands. A GUEST
+        // blocker (client_id NULL) keeps this unambiguously about the master-busy path, never the
+        // client-conflict guard.
         Answer<?> forwardToRealRepository = OverlapRaceSupport.forwardingAnswerOf(bookingRepository);
         AtomicBoolean blockerCommitted = new AtomicBoolean(false);
         doAnswer(invocation -> {
-            boolean overlapped = (boolean) forwardToRealRepository.answer(invocation);
+            Object result = forwardToRealRepository.answer(invocation);
             if (blockerCommitted.compareAndSet(false, true)) {
                 commitGuestBlockerOnItsOwnConnection(masterId, serviceB, startsAt.plusMinutes(60), 60);
             }
-            return overlapped;
-        }).when(bookingRepository).existsOverlap(any(UUID.class), any(), any());
+            return result;
+        }).when(bookingRepository).findPostLockBookabilityAndOverlap(any(UUID.class), any(), any());
 
         ResponseEntity<String> resp = postVisit(clientToken, masterId, startsAt, serviceA, serviceB);
 

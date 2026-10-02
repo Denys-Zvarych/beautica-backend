@@ -11,6 +11,7 @@ import com.beautica.common.exception.InviteTokenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.common.util.SchemeGuard;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
@@ -63,6 +64,8 @@ public class InviteService {
     private final String frontendBaseUrl;
     private final long tokenExpirationHours;
     private final Clock clock;
+    // Phase 333 — see InAppNotificationService's class javadoc for why this is a separate seam.
+    private final InAppNotificationService inAppNotificationService;
 
     public InviteService(
             InviteTokenRepository inviteTokenRepository,
@@ -75,7 +78,8 @@ public class InviteService {
             InvitePersistenceService invitePersistenceService,
             @Value("${app.frontend.base-url}") String frontendBaseUrl,
             @Value("${app.invite.token-expiration-hours:48}") long tokenExpirationHours,
-            Clock clock
+            Clock clock,
+            InAppNotificationService inAppNotificationService
     ) {
         this.inviteTokenRepository = inviteTokenRepository;
         this.userRepository = userRepository;
@@ -88,6 +92,7 @@ public class InviteService {
         this.frontendBaseUrl = frontendBaseUrl;
         this.tokenExpirationHours = tokenExpirationHours;
         this.clock = clock;
+        this.inAppNotificationService = inAppNotificationService;
     }
 
     /**
@@ -402,6 +407,13 @@ public class InviteService {
         if (token.getRole() == Role.SALON_MASTER) {
             masterService.createMasterFromInvite(savedUser.getId(), token.getSalonId());
         }
+
+        // Phase 333, matrix row 5 — after the membership row commits (savedUser above, plus the
+        // Master row just created for a SALON_MASTER invite). Owner + every OTHER active admin; the
+        // new teammate (savedUser) is the actor and is excluded, including from their own just-
+        // persisted SALON_ADMIN row. Both invitable roles (SALON_MASTER, SALON_ADMIN) are always
+        // salon-bound (SALON_BOUND_ROLES, asserted above), so token.getSalonId() is never null here.
+        inAppNotificationService.notifyInviteAccepted(token.getSalonId(), savedUser.getId());
 
         return buildAuthResponse(savedUser);
     }

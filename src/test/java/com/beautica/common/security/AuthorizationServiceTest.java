@@ -2,6 +2,7 @@ package com.beautica.common.security;
 
 import com.beautica.auth.Role;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.AppointmentCompletionAccess;
 import com.beautica.booking.repository.BookingCompletionAccess;
 import com.beautica.booking.repository.BookingReviewAccess;
 import com.beautica.booking.repository.BookingRepository;
@@ -2428,6 +2429,219 @@ class AuthorizationServiceTest {
                         + "actorB inherit actorA's cached TRUE answer for the same salonId")
                 .isInstanceOf(ForbiddenException.class);
         verify(salonRepository, times(1)).existsByIdAndOwnerId(salonId, actorB);
+    }
+
+    // ── enforceCanManageAppointments (actor, appointmentIds, memo) — batched ───
+    // ── sibling of enforceCanManageAppointment (perf MEDIUM, phase 337 cycle-2 ─
+    // ── audit): authorizes a WHOLE cascade of appointment-visits with a single ─
+    // ── findAllCompletionAccessByAppointmentIds statement instead of one ───────
+    // ── findAllCompletionAccessByAppointmentId statement per visit. ────────────
+
+    @Test
+    @DisplayName("enforceCanManageAppointments does not throw when every appointment in the "
+            + "batch is authorized, and issues exactly ONE batched projection statement for the "
+            + "whole set")
+    void should_notThrow_when_everyAppointmentInBatchIsAuthorized() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentId1 = UUID.randomUUID();
+        UUID appointmentId2 = UUID.randomUUID();
+        UUID masterUserId1 = UUID.randomUUID();
+        UUID masterUserId2 = UUID.randomUUID();
+        List<UUID> appointmentIds = List.of(appointmentId1, appointmentId2);
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(appointmentIds))
+                .thenReturn(List.of(
+                        new AppointmentCompletionAccess(appointmentId1, masterUserId1, salonId),
+                        new AppointmentCompletionAccess(appointmentId2, masterUserId2, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+        Map<AuthorizationService.MemoKey, Boolean> managementAccessMemo = new HashMap<>();
+
+        assertThatCode(() -> authorizationService.enforceCanManageAppointments(
+                actorId, appointmentIds, managementAccessMemo))
+                .doesNotThrowAnyException();
+
+        verify(bookingRepository, times(1)).findAllCompletionAccessByAppointmentIds(appointmentIds);
+        verify(bookingRepository, never()).findAllCompletionAccessByAppointmentId(any());
+        // the memo collapses the two visits' identical (actorId, salonId) ownership question to
+        // ONE existsByIdAndOwnerId statement — same contract as the single-id memo overload.
+        verify(salonRepository, times(1)).existsByIdAndOwnerId(salonId, actorId);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointments throws ForbiddenException when ANY appointment in "
+            + "the batch belongs to a salon the actor does not manage — a single foreign-salon "
+            + "appointment fails the WHOLE batch, exactly as calling the single-id overload for "
+            + "that one appointment would have")
+    void should_throwForbidden_when_oneAppointmentInBatchIsForeignSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID ownedSalonId = UUID.randomUUID();
+        UUID foreignSalonId = UUID.randomUUID();
+        UUID appointmentIdOwned = UUID.randomUUID();
+        UUID appointmentIdForeign = UUID.randomUUID();
+        UUID masterUserIdOwned = UUID.randomUUID();
+        UUID masterUserIdForeign = UUID.randomUUID();
+        List<UUID> appointmentIds = List.of(appointmentIdOwned, appointmentIdForeign);
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(appointmentIds))
+                .thenReturn(List.of(
+                        new AppointmentCompletionAccess(appointmentIdOwned, masterUserIdOwned, ownedSalonId),
+                        new AppointmentCompletionAccess(appointmentIdForeign, masterUserIdForeign, foreignSalonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(ownedSalonId, actorId)).thenReturn(true);
+        when(salonRepository.existsByIdAndOwnerId(foreignSalonId, actorId)).thenReturn(false);
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointments(
+                actorId, appointmentIds, new HashMap<>()))
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointments throws ForbiddenException for an appointment id "
+            + "that returns NO rows from the batched projection (missing/foreign/itemless) — never "
+            + "silently dropped, same fail-closed contract as the single-id overload's "
+            + "access.isEmpty() branch")
+    void should_throwForbidden_when_oneAppointmentIdIsMissingFromBatchedResult() {
+        UUID actorId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID appointmentIdMissing = UUID.randomUUID();
+        UUID appointmentIdPresent = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+        // appointmentIdMissing ordered FIRST so the failure is provably driven by the missing id
+        // itself, never by a later foreign-salon row masking it.
+        List<UUID> appointmentIds = List.of(appointmentIdMissing, appointmentIdPresent);
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(appointmentIds))
+                .thenReturn(List.of(new AppointmentCompletionAccess(appointmentIdPresent, masterUserId, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointments(
+                actorId, appointmentIds, new HashMap<>()))
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(salonRepository);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointments returns without any DB call for an empty "
+            + "appointmentIds collection — never issues the batched projection statement for "
+            + "nothing to authorize")
+    void should_notQuery_when_appointmentIdsIsEmpty() {
+        UUID actorId = UUID.randomUUID();
+
+        assertThatCode(() -> authorizationService.enforceCanManageAppointments(
+                actorId, List.of(), new HashMap<>()))
+                .doesNotThrowAnyException();
+
+        verifyNoInteractions(bookingRepository);
+    }
+
+    // ── enforceCanManageAppointments equivalence with the single-id overload ───
+    // ── (perf MEDIUM, phase 337 cycle-2 audit, Finding d) — same actor, same ───
+    // ── visit data, both methods must agree bit-for-bit: pass together or ──────
+    // ── throw together. ─────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("enforceCanManageAppointments agrees with enforceCanManageAppointment(actor, "
+            + "appointment) for a SALON_OWNER actor authorized over the visit's salon — both pass")
+    void should_agreeWithSingleIdOverload_when_actorIsAuthorizedSalonOwner() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserId, salonId)));
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(List.of(appointmentId)))
+                .thenReturn(List.of(new AppointmentCompletionAccess(appointmentId, masterUserId, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_OWNER"));
+        when(salonRepository.existsByIdAndOwnerId(salonId, actorId)).thenReturn(true);
+
+        assertThatCode(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .as("single-id overload")
+                .doesNotThrowAnyException();
+        assertThatCode(() -> authorizationService.enforceCanManageAppointments(
+                actorId, List.of(appointmentId), new HashMap<>()))
+                .as("batched overload — must agree with the single-id overload above")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointments agrees with enforceCanManageAppointment(actor, "
+            + "appointment) for a SALON_ADMIN assigned to the visit's own salon — both pass")
+    void should_agreeWithSingleIdOverload_when_actorIsAuthorizedSalonAdmin() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserId, salonId)));
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(List.of(appointmentId)))
+                .thenReturn(List.of(new AppointmentCompletionAccess(appointmentId, masterUserId, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(salonId));
+
+        assertThatCode(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .as("single-id overload")
+                .doesNotThrowAnyException();
+        assertThatCode(() -> authorizationService.enforceCanManageAppointments(
+                actorId, List.of(appointmentId), new HashMap<>()))
+                .as("batched overload — must agree with the single-id overload above")
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointments agrees with enforceCanManageAppointment(actor, "
+            + "appointment) for a SALON_ADMIN assigned to a DIFFERENT salon than the visit's own — "
+            + "both throw")
+    void should_agreeWithSingleIdOverload_when_actorIsAdminOfAnotherSalon() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID visitSalonId = UUID.randomUUID();
+        UUID actorsOwnSalonId = UUID.randomUUID();
+        UUID masterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(new BookingCompletionAccess(masterUserId, visitSalonId)));
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(List.of(appointmentId)))
+                .thenReturn(List.of(new AppointmentCompletionAccess(appointmentId, masterUserId, visitSalonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_ADMIN"));
+        when(userRepository.findSalonIdById(actorId)).thenReturn(Optional.of(actorsOwnSalonId));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .as("single-id overload")
+                .isInstanceOf(ForbiddenException.class);
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointments(
+                actorId, List.of(appointmentId), new HashMap<>()))
+                .as("batched overload — must agree with the single-id overload above")
+                .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    @DisplayName("enforceCanManageAppointments agrees with enforceCanManageAppointment(actor, "
+            + "appointment) for a SALON_MASTER actor (read-only, never a management-access role) — "
+            + "both throw, even though the visit's own master account matches nothing here")
+    void should_agreeWithSingleIdOverload_when_actorIsSalonMaster() {
+        UUID actorId = UUID.randomUUID();
+        UUID appointmentId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID otherMasterUserId = UUID.randomUUID();
+
+        when(bookingRepository.findAllCompletionAccessByAppointmentId(appointmentId))
+                .thenReturn(List.of(new BookingCompletionAccess(otherMasterUserId, salonId)));
+        when(bookingRepository.findAllCompletionAccessByAppointmentIds(List.of(appointmentId)))
+                .thenReturn(List.of(new AppointmentCompletionAccess(appointmentId, otherMasterUserId, salonId)));
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(actorId, "ROLE_SALON_MASTER"));
+
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointment(actorId, appointmentId))
+                .as("single-id overload")
+                .isInstanceOf(ForbiddenException.class);
+        assertThatThrownBy(() -> authorizationService.enforceCanManageAppointments(
+                actorId, List.of(appointmentId), new HashMap<>()))
+                .as("batched overload — must agree with the single-id overload above")
+                .isInstanceOf(ForbiddenException.class);
+        verifyNoInteractions(salonRepository, userRepository);
     }
 
     // ── canRescheduleAppointment (Phase 27.2 SpEL predicate, visit-level — no ──

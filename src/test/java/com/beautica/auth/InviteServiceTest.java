@@ -9,6 +9,7 @@ import com.beautica.common.exception.EmailAlreadyRegisteredException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.InviteTokenException;
 import com.beautica.master.service.MasterService;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.InviteToken;
@@ -77,6 +78,9 @@ class InviteServiceTest {
     @Mock
     private AuthResponseBuilder authResponseBuilder;
 
+    @Mock
+    private InAppNotificationService inAppNotificationService;
+
     private PasswordEncoder passwordEncoder;
     private InviteService inviteService;
 
@@ -94,7 +98,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://localhost:3000",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
     }
 
@@ -1069,7 +1074,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://example.com",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         assertThatThrownBy(service::validateConfig)
@@ -1091,7 +1097,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 null,
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         assertThatThrownBy(service::validateConfig)
@@ -1113,7 +1120,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "https://beautica.app",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         // Must not throw
@@ -1134,7 +1142,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://localhost:3000",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         // Must not throw — localhost dev URLs are allowed
@@ -1162,7 +1171,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://example.com",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1197,7 +1207,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "https://beautica.app",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1235,7 +1246,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://localhost.attacker.com",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1271,7 +1283,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://localhostXYZ",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");
@@ -1309,7 +1322,8 @@ class InviteServiceTest {
                 invitePersistenceService,
                 "http://localhost:3000",
                 48L,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                inAppNotificationService
         );
 
         when(tokenGenerator.generateToken()).thenReturn("raw-token");

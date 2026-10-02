@@ -6,6 +6,7 @@ import com.beautica.notification.crypto.OutboxPayloadCipher;
 import com.beautica.notification.entity.NotificationOutboxEntry;
 import com.beautica.notification.entity.OutboxEventType;
 import com.beautica.notification.entity.OutboxStatus;
+import com.beautica.notification.inapp.push.InAppPushDispatcher;
 import com.beautica.notification.repository.NotificationOutboxRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -27,6 +28,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -89,6 +91,7 @@ public class NotificationOutboxDrainWorker {
     private final BookingVisitResolver visitResolver;
     private final ObjectMapper objectMapper;
     private final OutboxPayloadCipher cipher;
+    private final InAppPushDispatcher inAppPushDispatcher;
 
     /**
      * Self-proxy reference so that {@link #drain()} (and {@link #persistResults(List)}, for
@@ -200,11 +203,13 @@ public class NotificationOutboxDrainWorker {
      * Returns the same entry objects annotated with their dispatch outcomes so
      * that Phase 3 can persist them without a second DB round-trip per entry.
      *
-     * <p><b>Every DB read this phase makes ON THE DRAIN THREAD happens in the pre-load block below,
-     * before the dispatch loop starts.</b> (Dispatch itself is not read-free end to end:
-     * {@code PushNotificationService} looks a recipient's device tokens up per push. That read runs
-     * on {@code pushExecutor}, never on this thread, so it cannot extend the drain thread's
-     * connection hold — batching it is tracked separately.)
+     * <p><b>Every DB read this phase makes happens in the pre-load block below, before the dispatch
+     * loop starts</b> — including the {@code INAPP_PUSH} feed rows, their recipients, the recipients'
+     * active device tokens and the rendered push copy ({@link InAppPushDispatcher#prepare}, a bounded
+     * number of statements for the whole batch). The push hand-off passes the pre-loaded tokens, so
+     * it triggers no lookup on the drain thread; the only DB read after the hand-off is the one indexed
+     * ownership re-check query per recipient that {@link PushNotificationService#sendToDevices} runs on
+     * {@code pushExecutor}.
      * That is the whole point of the phase: once the loop begins, each iteration
      * can block for ~40 s on SMTP + FCM, and holding (or re-acquiring) a Hikari connection across
      * that window is what the three-phase split exists to prevent. The visit hydration was briefly
@@ -217,7 +222,9 @@ public class NotificationOutboxDrainWorker {
     public List<EntryResult> dispatchAll(List<NotificationOutboxEntry> batch) {
         // Pre-load all booking IDs in one query to avoid N+1 (Fix Perf HIGH).
         Set<UUID> bookingIds = batch.stream()
-                .filter(e -> e.getEventType() != OutboxEventType.INVITE)
+                // INAPP_PUSH's aggregate_id is a feed-row id, not a booking id (phase 339).
+                .filter(e -> e.getEventType() != OutboxEventType.INVITE
+                        && e.getEventType() != OutboxEventType.INAPP_PUSH)
                 .map(NotificationOutboxEntry::getAggregateId)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
@@ -231,11 +238,46 @@ public class NotificationOutboxDrainWorker {
         // outbox rows of one visit share a single hydration instead of querying twice.
         Map<UUID, List<Booking>> visitSiblings = visitResolver.hydrate(visitAwareLeads(batch, bookingCache));
 
+        // Third pre-load: every INAPP_PUSH entry of the batch resolved to a ready-to-send push in a
+        // bounded number of statements (rows, recipients, device tokens — one each — then one batch
+        // assembler call for all recipients), never per entry or per recipient. See InAppPushDispatcher#prepare.
+        // A failure here must cost ONLY the INAPP_PUSH entries (each failed below, attempt + 1) — the
+        // batch's e-mail entries do not depend on it and must still be dispatched.
+        Map<UUID, InAppPushDispatcher.PushPlan> pushPlans = Map.of();
+        String pushPrepareError = null;
+        try {
+            pushPlans = inAppPushDispatcher.prepare(inAppPushIds(batch));
+        } catch (RuntimeException e) {
+            pushPrepareError = e.getClass().getSimpleName();
+            log.warn("INAPP_PUSH prepare failed, failing only the push entries of this batch: {}", pushPrepareError);
+        }
+
         List<EntryResult> results = new ArrayList<>(batch.size());
-        for (NotificationOutboxEntry entry : batch) {
+        for (int i = 0; i < batch.size(); i++) {
+            NotificationOutboxEntry entry = batch.get(i);
+            if (pushPrepareError != null && entry.getEventType() == OutboxEventType.INAPP_PUSH) {
+                results.add(failedAttempt(entry, pushPrepareError));
+                continue;
+            }
             try {
-                dispatch(entry, bookingCache, visitSiblings);
+                dispatch(entry, bookingCache, visitSiblings, pushPlans);
                 results.add(new EntryResult(entry, OutboxStatus.SENT, entry.getAttempts(), null));
+            } catch (RejectedExecutionException e) {
+                // Spring's TaskRejectedException (what @Async actually throws) extends it.
+                // NOTE: this catch is not push-specific — a RejectedExecutionException from ANY
+                // executor reached by dispatch(...), the e-mail executor included (AbortPolicy), lands
+                // here too and is deliberately handled the same way: the entry and the rest of the
+                // batch are re-queued without counting an attempt (so a persistently saturated
+                // e-mail executor is retried every tick and never walks the row to DEAD).
+                // Backpressure, not a delivery failure: the push executor (AbortPolicy, bounded queue)
+                // is saturated. Counting this as an attempt would walk healthy rows to DEAD during a
+                // burst, so this entry and every not-yet-dispatched one go back to PENDING with their
+                // attempts untouched, and the rest of the batch is NOT dispatched — the next tick
+                // retries them once the executor has drained.
+                log.warn("Push executor saturated at outbox entry [{}] — re-queueing {} entries without "
+                        + "counting an attempt: {}", entry.getId(), batch.size() - i, e.getClass().getSimpleName());
+                requeueRemaining(batch, i, results);
+                break;
             } catch (Exception e) {
                 int next = entry.getAttempts() + 1;
                 String error = sanitizeAndTruncate(e.getMessage(), MAX_ERROR_LENGTH);
@@ -246,6 +288,31 @@ public class NotificationOutboxDrainWorker {
             }
         }
         return results;
+    }
+
+    /** One counted failed attempt: PENDING for a retry, DEAD once {@code MAX_ATTEMPTS} is reached. */
+    private static EntryResult failedAttempt(NotificationOutboxEntry entry, String error) {
+        int next = entry.getAttempts() + 1;
+        OutboxStatus status = next >= MAX_ATTEMPTS ? OutboxStatus.DEAD : OutboxStatus.PENDING;
+        log.warn("Outbox dispatch failed [{}] attempt {}/{}: {}", entry.getId(), next, MAX_ATTEMPTS, error);
+        return new EntryResult(entry, status, next, error);
+    }
+
+    /** Marks {@code batch[from..]} PENDING with attempts unchanged — see the rejection catch above. */
+    private static void requeueRemaining(List<NotificationOutboxEntry> batch, int from, List<EntryResult> results) {
+        for (NotificationOutboxEntry entry : batch.subList(from, batch.size())) {
+            results.add(new EntryResult(entry, OutboxStatus.PENDING, entry.getAttempts(), null));
+        }
+    }
+
+    /** The feed-row ids of the batch's {@code INAPP_PUSH} entries (their {@code aggregate_id}). */
+    private static List<UUID> inAppPushIds(List<NotificationOutboxEntry> batch) {
+        return batch.stream()
+                .filter(e -> e.getEventType() == OutboxEventType.INAPP_PUSH)
+                .map(NotificationOutboxEntry::getAggregateId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
     }
 
     /**
@@ -337,7 +404,8 @@ public class NotificationOutboxDrainWorker {
     }
 
     private void dispatch(NotificationOutboxEntry entry, Map<UUID, Booking> bookingCache,
-                          Map<UUID, List<Booking>> visitSiblings) {
+                          Map<UUID, List<Booking>> visitSiblings,
+                          Map<UUID, InAppPushDispatcher.PushPlan> pushPlans) {
         switch (entry.getEventType()) {
             // The two visit-aware events: one outbox row describes the WHOLE visit, so the sibling
             // booking rows are hydrated here (see BookingVisitResolver) and threaded through every
@@ -357,6 +425,15 @@ public class NotificationOutboxDrainWorker {
             case CLOSURE_REMINDER -> notificationService.notifyClosureReminder(getBooking(entry, bookingCache));
             case SALON_CLOSED -> notificationService.notifySalonClosed(getVisit(entry, bookingCache, visitSiblings));
             case MASTER_REMOVED -> notificationService.notifyMasterRemoved(getVisit(entry, bookingCache, visitSiblings));
+            // Phase 339 — one Android push for one feed row; aggregate_id is the feed row id. The push
+            // was rendered from live data in the pre-load block; an id with no plan is a D8 skip
+            // (row gone/read, recipient gone or token-less) and is marked SENT without calling FCM.
+            case INAPP_PUSH -> {
+                InAppPushDispatcher.PushPlan plan = pushPlans.get(entry.getAggregateId());
+                if (plan != null) {
+                    inAppPushDispatcher.dispatch(plan);
+                }
+            }
             case INVITE -> {
                 Map<String, String> p = readJson(entry.getPayload());
                 // Decrypt inviteUrlSealed from payload (Phase 5.4a cipher); aggregateId is the

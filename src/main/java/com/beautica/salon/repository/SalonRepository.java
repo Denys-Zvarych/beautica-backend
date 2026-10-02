@@ -72,6 +72,22 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
     @Query("SELECT s.id FROM Salon s WHERE s.owner.id = :ownerId AND s.isActive = true")
     List<UUID> findIdsByOwnerIdAndIsActiveTrue(@Param("ownerId") UUID ownerId);
 
+    /** One (owner, active salon) pair — the projection of {@link #findOwnedActiveSalonPairs}. */
+    interface OwnerSalonPair {
+        UUID getOwnerId();
+
+        UUID getSalonId();
+    }
+
+    /**
+     * Batch sibling of {@link #findIdsByOwnerIdAndIsActiveTrue}: the active salons of EVERY owner in
+     * {@code ownerIds} in ONE statement (same predicate), for the push drain's multi-recipient
+     * assemble. Owners with no active salon simply contribute no pair.
+     */
+    @Query("SELECT s.owner.id AS ownerId, s.id AS salonId FROM Salon s "
+            + "WHERE s.owner.id IN :ownerIds AND s.isActive = true")
+    List<OwnerSalonPair> findOwnedActiveSalonPairs(@Param("ownerIds") Collection<UUID> ownerIds);
+
     /**
      * "Is {@code id} a salon owned by {@code ownerId}?" — the hottest authorization predicate in
      * the application: every {@code @PreAuthorize("@authz.canManageSalon(...)")} endpoint reaches

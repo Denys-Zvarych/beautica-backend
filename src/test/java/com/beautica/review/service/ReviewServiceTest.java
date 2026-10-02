@@ -8,6 +8,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.common.PageResponse;
 import com.beautica.review.dto.CreateReviewRequest;
 import com.beautica.review.dto.MyReviewResponse;
@@ -78,6 +79,11 @@ class ReviewServiceTest {
 
     @Mock
     private Clock clock;
+
+    // Phase 333 — a separate seam from eventPublisher; createReview calls it unconditionally on
+    // success, so it must be mocked (not null) for every success-path test below.
+    @Mock
+    private InAppNotificationService inAppNotificationService;
 
     @InjectMocks
     private ReviewService reviewService;

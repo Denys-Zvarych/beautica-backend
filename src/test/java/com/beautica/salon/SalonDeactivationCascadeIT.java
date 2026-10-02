@@ -27,6 +27,10 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -65,7 +69,16 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    @Autowired
+    /**
+     * {@code @SpyBean}, not plain {@code @Autowired} (perf MEDIUM, phase 337 cycle-2 audit): this
+     * class's own direct {@code declineConfirmedBulk}/{@code findAllCompletionAccessByAppointmentId(s)}
+     * calls (cases 19/20 and the two statement-count cases below) still go through the REAL
+     * repository — Spring's {@code @SpyBean} wraps rather than replaces it — but spying lets the
+     * statement-count cases below {@code verify(...)} exactly which projection method {@code
+     * SalonService#deactivateSalon}'s cascade calls, and how many times, without adding a second
+     * bean of the same type.
+     */
+    @SpyBean
     private BookingRepository bookingRepository;
 
     @Autowired
@@ -378,6 +391,40 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
         assertThat(bookingStatus(cancelledId))
                 .as("the already-terminal sibling in the SAME statement is completely untouched")
                 .isEqualTo("CANCELLED");
+    }
+
+    @Test
+    @DisplayName("perf MEDIUM (phase 337 cycle-2 audit) — a ONE-appointment-visit closure cascade "
+            + "authorizes via the batched projection exactly once, never the per-visit single-id form")
+    void should_issueOneBatchedAuthorizationStatement_when_cascadeHasOneAppointmentVisit() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        insertVisit(clientId, salon, FUTURE, 1);
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+
+        verify(bookingRepository, times(1)).findAllCompletionAccessByAppointmentIds(anyCollection());
+        verify(bookingRepository, never()).findAllCompletionAccessByAppointmentId(any());
+    }
+
+    @Test
+    @DisplayName("perf MEDIUM (phase 337 cycle-2 audit) — a TWENTY-appointment-visit closure "
+            + "cascade STILL authorizes via the batched projection exactly ONCE — the query count is "
+            + "FLAT in the number of visits. Before this fix, AuthorizationService#enforceCanManageAppointment "
+            + "(actor, appointmentId, memo) was called once per distinct appointment-visit, each issuing "
+            + "its own findAllCompletionAccessByAppointmentId statement — 20 statements for this fixture, "
+            + "not 1")
+    void should_issueOneBatchedAuthorizationStatement_when_cascadeHasTwentyAppointmentVisits() {
+        Salon salon = createSalon();
+        UUID clientId = createClient();
+        for (int i = 0; i < 20; i++) {
+            insertVisit(clientId, salon, FUTURE.plusHours(2L * i), 1);
+        }
+
+        salonService.deactivateSalon(salon.ownerId(), salon.salonId());
+
+        verify(bookingRepository, times(1)).findAllCompletionAccessByAppointmentIds(anyCollection());
+        verify(bookingRepository, never()).findAllCompletionAccessByAppointmentId(any());
     }
 
     // ── Phase 268 — catalogue deactivation, favourites hard-delete, media purge ───────────────

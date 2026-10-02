@@ -3,6 +3,7 @@ package com.beautica.common.security;
 import com.beautica.auth.Role;
 import com.beautica.booking.domain.MasterBookability;
 import com.beautica.booking.entity.Booking;
+import com.beautica.booking.repository.AppointmentCompletionAccess;
 import com.beautica.booking.repository.BookingCompletionAccess;
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.booking.repository.BookingReviewAccess;
@@ -23,11 +24,13 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 @Component("authz")
 @RequiredArgsConstructor
@@ -917,44 +920,66 @@ public class AuthorizationService {
         // Finding 2: role is derived from the SecurityContext (set by JwtAuthenticationFilter)
         // instead of from a cross-entity DB join, eliminating the Cartesian product.
         Role actorRole = roleFromAuthentication(auth);
-        return bookingRepository.findViewAccessById(bookingId).map(v -> {
-            // Management access: SALON_OWNER whose id matches the salon owner, or INDEPENDENT_MASTER
-            // whose user id matches the master's user id. Both checks use the projection fields
-            // resolved in a single JOIN — no second DB round-trip on any branch.
-            //
-            // SALON_OWNER-type master booking: both the salonOwnerUserId branch AND the masterUserId
-            // branch fire for the owner (the owner is the master's user), granting full client-data
-            // visibility under the salon-owner branch. There is no contradiction — both return true.
-            if (v.salonOwnerUserId() != null && v.salonOwnerUserId().equals(actorId)) {
-                return true;
-            }
-            // masterUserId null-guard: see canManageBooking above (V157 / phase 294 D1, 2026-09
-            // audit finding 7). Both reads in this method are guarded, not just the first.
-            if (v.masterUserId() != null && v.masterUserId().equals(actorId)
-                    && actorRole != Role.SALON_MASTER) {
-                return true;
-            }
-            if (actorRole == Role.CLIENT) {
-                // Guest (LINK) bookings have a null clientUserId (findViewAccessById now
-                // LEFT JOINs client, per the track 24.7 audit) — null-guard so a CLIENT
-                // probing a guest booking's id denies cleanly instead of NPEing.
-                return v.clientUserId() != null && v.clientUserId().equals(actorId);
-            }
-            if (actorRole == Role.SALON_MASTER) {
-                // SALON_MASTER may only view their own bookings — not all bookings at the salon,
-                // and only while they are still an ACTIVE master. masterIsActive leads for the
-                // same reason it leads in enforceCanViewBooking (whose javadoc carries the full
-                // rationale) and in isPerformingMasterOfRow: DELETE /masters/{masterId} flips
-                // masters.is_active and leaves the users row, its SALON_MASTER role and its login
-                // intact, so without this conjunct a deactivated stylist keeps reading every
-                // client name, phone and price they ever served. This is the ONLY branch of either
-                // BookingViewAccess consumer allowed to read that leg — the salon-owner arm above
-                // must keep admitting the owner of a deactivated master's booking.
-                return v.masterIsActive()
-                        && v.masterUserId() != null && v.masterUserId().equals(actorId);
-            }
-            return false;
-        }).orElse(false);
+        return bookingRepository.findViewAccessById(bookingId)
+                .map(v -> isViewAuthorized(actorRole, actorId, v.clientUserId(), v.masterUserId(),
+                        v.masterIsActive(), v.salonOwnerUserId()))
+                .orElse(false);
+    }
+
+    /**
+     * The pure booking-view decision {@link #canViewBooking} evaluates over a
+     * {@link com.beautica.booking.repository.BookingViewAccess} projection — extracted (audit-fix
+     * cycle 1, phase 334 finding 2) so {@code NotificationViewAssembler} can reuse the IDENTICAL
+     * rule over its own already-batch-loaded {@code Booking} entity graph instead of maintaining a
+     * hand-written copy that can silently drift from this one. No DB access — every fact the
+     * decision needs is a parameter.
+     *
+     * <p><b>Decision table (verbatim from {@code canViewBooking}, unchanged by this extraction):</b>
+     * <ul>
+     *   <li>{@code salonOwnerUserId == actorId} → admitted, any role (in practice only reachable by
+     *       {@code SALON_OWNER} — see {@code isAuthorizedToManageBooking}'s ID-based reasoning for
+     *       why no other role can satisfy this compare). Salon activity and the performing master's
+     *       {@code isActive} are NOT consulted — a salon owner keeps view over a booking whose
+     *       master has since been deactivated.</li>
+     *   <li>{@code masterUserId == actorId && actorRole != SALON_MASTER} → admitted (the
+     *       {@code INDEPENDENT_MASTER} arm, and the {@code SALON_OWNER}-type master's own booking,
+     *       already caught by the branch above). {@code masterIsActive} is NOT consulted here.</li>
+     *   <li>{@code actorRole == CLIENT} → {@code clientUserId == actorId} (null-safe: a guest/LINK
+     *       booking has no client).</li>
+     *   <li>{@code actorRole == SALON_MASTER} → {@code masterIsActive && masterUserId == actorId} —
+     *       the ONLY branch that reads {@code masterIsActive}, so a deactivated stylist loses view
+     *       of bookings they used to perform.</li>
+     *   <li>{@code SALON_ADMIN} → structurally excluded; no branch above admits it. Do NOT widen
+     *       this method to admit {@code SALON_ADMIN} — {@code NotificationViewAssembler} grants
+     *       admin visibility itself, via a live "still assigned to this salon" check that has no
+     *       equivalent here (see that class's {@code isVisible}/{@code managesSalon}), exactly the
+     *       divergence {@link #isAuthorizedToManageBooking}'s javadoc already documents between
+     *       "view" and "provider-action" authority.</li>
+     * </ul>
+     *
+     * <p><b>{@code NotificationViewAssembler} applies EXTRA, feed-specific liveness conditions on
+     * TOP of this predicate's result</b> (never by narrowing the predicate itself, which would
+     * change {@code canViewBooking}'s existing behaviour for every other caller): the feed also
+     * requires an {@code INDEPENDENT_MASTER}/{@code SALON_MASTER} recipient's master to be
+     * currently active, and a {@code SALON_OWNER} recipient's salon to be currently active —
+     * neither of which this method checks on those arms. See that class's {@code isVisible}.
+     */
+    public boolean isViewAuthorized(
+            Role actorRole, UUID actorId, UUID clientUserId, UUID masterUserId,
+            boolean masterIsActive, UUID salonOwnerUserId) {
+        if (salonOwnerUserId != null && salonOwnerUserId.equals(actorId)) {
+            return true;
+        }
+        if (masterUserId != null && masterUserId.equals(actorId) && actorRole != Role.SALON_MASTER) {
+            return true;
+        }
+        if (actorRole == Role.CLIENT) {
+            return clientUserId != null && clientUserId.equals(actorId);
+        }
+        if (actorRole == Role.SALON_MASTER) {
+            return masterIsActive && masterUserId != null && masterUserId.equals(actorId);
+        }
+        return false;
     }
 
     /**
@@ -1153,23 +1178,43 @@ public class AuthorizationService {
             throw new ForbiddenException("Access denied");
         }
         Role actorRole = roleFromCurrentAuthentication();
-        // Perf finding 2 (2026-09 audit): a visit's items share the same (masterUserId, salonId) by
-        // construction — VisitPlanner.planChainedItems resolves every chained item off one Master —
-        // so K items previously issued K identical hasManagementAccess/existsByIdAndOwnerId
-        // statements for the SAME salon/actor. Deduping the (independent-master flag, masterUserId,
-        // salonId) triple before the per-row check collapses that down to one statement per DISTINCT
-        // combination — normally 1, never fewer than this method's own "no DB constraint, don't
-        // trust single-master" guarantee requires: a mixed-master visit still gets its own authority
-        // check per distinct master/salon, so allMatch's result is bit-for-bit identical to the
-        // undeduped form, just cheaper to compute.
-        boolean authorizedForEveryItem = access.stream()
-                .map(v -> new AppointmentAuthorityKey(v.salonId() == null, v.masterUserId(), v.salonId()))
-                .distinct()
-                .allMatch(k -> hasProviderAuthorityOverBooking(
-                        k.independentMasterBooking(), k.masterUserId(), k.salonId(), actorUserId, actorRole));
-        if (!authorizedForEveryItem) {
+        if (!allRowsAuthorized(access, actorUserId,
+                sid -> hasManagementAccess(sid, actorUserId, actorRole))) {
             throw new ForbiddenException("Access denied");
         }
+    }
+
+    /**
+     * The shared per-visit authorization kernel behind every {@code enforceCanManageAppointment*}
+     * overload (2-arg, memo-carrying 3-arg, and the batched {@link #enforceCanManageAppointments})
+     * — extracted (perf MEDIUM, phase 337 cycle-2 audit) so the batched form can reuse the EXACT
+     * same decision logic rather than re-implementing it, and so the three overloads can never
+     * silently drift apart on what "authorized for a visit" means.
+     *
+     * <p>Perf finding 2 (2026-09 audit), preserved verbatim by this extraction: a visit's items
+     * share the same {@code (masterUserId, salonId)} by construction — {@code
+     * VisitPlanner.planChainedItems} resolves every chained item off one {@code Master} — so K items
+     * previously issued K identical management-access statements for the SAME salon/actor. Deduping
+     * the {@code (independent-master flag, masterUserId, salonId)} triple before the per-row check
+     * collapses that to one statement per DISTINCT combination — normally 1, never fewer than the
+     * "no DB constraint, don't trust single-master" guarantee requires: a mixed-master visit still
+     * gets its own authority check per distinct master/salon, so {@code allMatch}'s result is
+     * bit-for-bit identical to the undeduped form, just cheaper to compute.
+     *
+     * @param access         one visit's own {@link BookingCompletionAccess} rows — NEVER a mix of
+     *                        rows from more than one appointment; the caller is responsible for that
+     *                        grouping (see {@link #enforceCanManageAppointments}'s Javadoc)
+     * @param managementAccess how the salon arm resolves {@code hasManagementAccess} for this
+     *                        call — a direct statement for the 2-arg overload, a call-scoped memo
+     *                        lookup for the memo-carrying overloads
+     */
+    private boolean allRowsAuthorized(
+            List<BookingCompletionAccess> access, UUID actorUserId, Predicate<UUID> managementAccess) {
+        return access.stream()
+                .map(v -> new AppointmentAuthorityKey(v.salonId() == null, v.masterUserId(), v.salonId()))
+                .distinct()
+                .allMatch(k -> hasProviderAuthorityOverRow(
+                        k.independentMasterBooking(), k.masterUserId(), k.salonId(), actorUserId, managementAccess));
     }
 
     /**
@@ -1231,14 +1276,75 @@ public class AuthorizationService {
             throw new ForbiddenException("Access denied");
         }
         Role actorRole = roleFromCurrentAuthentication();
-        boolean authorizedForEveryItem = access.stream()
-                .map(v -> new AppointmentAuthorityKey(v.salonId() == null, v.masterUserId(), v.salonId()))
-                .distinct()
-                .allMatch(k -> hasProviderAuthorityOverRow(
-                        k.independentMasterBooking(), k.masterUserId(), k.salonId(), actorUserId,
-                        sid -> memoizedManagementAccess(sid, actorUserId, actorRole, managementAccessMemo)));
-        if (!authorizedForEveryItem) {
+        if (!allRowsAuthorized(access, actorUserId,
+                sid -> memoizedManagementAccess(sid, actorUserId, actorRole, managementAccessMemo))) {
             throw new ForbiddenException("Access denied");
+        }
+    }
+
+    /**
+     * Batched sibling of {@link #enforceCanManageAppointment(UUID, UUID, Map)} (perf MEDIUM, phase
+     * 337 cycle-2 audit) — authorizes MANY appointment-visits with O(1) statements instead of the
+     * memo-carrying overload's O(V) (one {@code findAllCompletionAccessByAppointmentId} statement
+     * per distinct appointment-visit).
+     *
+     * <p>Used by {@code BookingService#declineFutureConfirmed}'s owner-initiated cascades ({@code
+     * declineFutureConfirmedBookingsForSalonClosure}/{@code
+     * declineFutureConfirmedBookingsForMasterRemoval}), which previously called the single-id
+     * memo-carrying overload once per appointment-visit in a
+     * {@code for (List<SalonClosureBookingCandidate> visit : byVisit.values())} loop. {@link
+     * BookingRepository#findAllCompletionAccessByAppointmentId}'s own per-visit dedup (perf finding
+     * 2 above) already collapsed the management-access statement count to one per distinct salon —
+     * this fix collapses the REMAINING per-visit projection query itself, via {@link
+     * BookingRepository#findAllCompletionAccessByAppointmentIds}'s single {@code IN (...)} query.
+     *
+     * <p><b>Security-critical — semantics are IDENTICAL to calling the single-id overload once per
+     * {@code appointmentIds} entry.</b> The batched projection carries each row's OWN {@code
+     * appointmentId} ({@link AppointmentCompletionAccess}), so the very first step here is to
+     * regroup the flat result set back into one row list PER appointment — an appointment's
+     * authority is derived from ONLY its own rows, never a sibling's, exactly as the single-id
+     * overload derives it from only the rows a single {@code appointmentId} query would have
+     * returned. Each per-appointment row list is then handed to the exact same {@link
+     * #allRowsAuthorized} kernel the single-id overloads use — not a re-implementation of the rule,
+     * the SAME method. An {@code appointmentId} that is missing, itemless, or otherwise foreign
+     * contributes no rows to the batched result set and is treated identically to the single-id
+     * overload's {@code access.isEmpty()} branch: a {@link ForbiddenException}, never a silently
+     * skipped id. Validation is fail-fast, not exhaustive: this method throws on the FIRST
+     * unauthorized or missing {@code appointmentId} it hits, in {@code appointmentIds}' iteration
+     * order, and does not check the remaining ids in the set. That is still safe for the caller —
+     * this method either returns normally (every id authorized) or throws before returning, and the
+     * caller only proceeds to {@code AppointmentTransitionService#declineAppointmentItemsBulk} after
+     * a normal return, so a failure on any one id — first or last — always precedes the bulk write.
+     *
+     * @param managementAccessMemo same call-scoped memo contract as the single-id overload — see
+     *                              its Javadoc; the caller passes the SAME map instance it already
+     *                              seeds/reuses across the whole cascade
+     * @throws ForbiddenException any one of {@code appointmentIds} is not manageable by the actor,
+     *                             including an id that returns no rows at all (403)
+     */
+    public void enforceCanManageAppointments(
+            UUID actorUserId, Collection<UUID> appointmentIds, Map<MemoKey, Boolean> managementAccessMemo) {
+        if (appointmentIds.isEmpty()) {
+            return;
+        }
+        List<AppointmentCompletionAccess> access =
+                bookingRepository.findAllCompletionAccessByAppointmentIds(appointmentIds);
+        Map<UUID, List<BookingCompletionAccess>> rowsByAppointmentId = access.stream()
+                .collect(Collectors.groupingBy(
+                        AppointmentCompletionAccess::appointmentId,
+                        Collectors.mapping(
+                                v -> new BookingCompletionAccess(v.masterUserId(), v.salonId()),
+                                Collectors.toList())));
+        Role actorRole = roleFromCurrentAuthentication();
+        for (UUID appointmentId : appointmentIds) {
+            List<BookingCompletionAccess> visitRows = rowsByAppointmentId.get(appointmentId);
+            if (visitRows == null || visitRows.isEmpty()) {
+                throw new ForbiddenException("Access denied");
+            }
+            if (!allRowsAuthorized(visitRows, actorUserId,
+                    sid -> memoizedManagementAccess(sid, actorUserId, actorRole, managementAccessMemo))) {
+                throw new ForbiddenException("Access denied");
+            }
         }
     }
 

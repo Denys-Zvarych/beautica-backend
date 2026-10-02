@@ -1,0 +1,35 @@
+-- Phase 333 audit-fix cycle 1, finding 4 (LOW perf) — a composite/partial index matching the
+-- admin-fan-out predicate every in-app-notification recipient resolution query already runs:
+--   * InAppRecipientResolver#addOwnerAndAdmins -> UserRepository#findBySalonIdAndRoleAndIsActiveTrue
+--     (JPQL: WHERE u.salonId = :salonId AND u.role = :role AND u.isActive = true), called with
+--     role = SALON_ADMIN from every in-app-notification write path that fans out to the whole
+--     provider set (matrix rows 1, 2, 4);
+--   * InAppNotificationRepository#insertProviderSetBulk's LATERAL subquery's third leg:
+--     "SELECT u.id FROM users u WHERE u.salon_id = m.salon_id AND u.role = 'SALON_ADMIN'
+--      AND u.is_active = true" (the client self-delete cascade).
+--
+-- Existing indexes on `users` do not cover this shape: idx_users_salon_id (V2) is salon_id-only
+-- (no role/is_active predicate, so the planner must re-check both on every matching row) and
+-- idx_users_staff_role (V154) is role-only, scoped to BOTH staff roles (SALON_MASTER,
+-- SALON_ADMIN combined) with no salon_id or is_active predicate at all — neither index lets the
+-- planner jump straight to "this salon's active admins" the way this query needs.
+--
+-- PARTIAL, not composite-on-three-columns: role and is_active are always the SAME two literal
+-- values ('SALON_ADMIN', true) at every call site above, so folding them into the WHERE clause
+-- (rather than as leading/trailing index columns) keeps the index to exactly the rows that can
+-- ever match — inactive admins, non-admin staff and every CLIENT/SALON_OWNER/INDEPENDENT_MASTER
+-- row pay zero maintenance cost — while the single indexed column (salon_id) is all Postgres
+-- needs to answer the query with a pure index scan, no residual filter. This mirrors this
+-- project's own idx_users_staff_role (V154) and Master.java's idx_masters_salon_owner_active
+-- convention for a predicate a JPA @Table(indexes=...) cannot express.
+--
+-- Column-list-only @Table(indexes=...) note: same gap as V154 — ddl-auto=validate does not check
+-- partial WHERE predicates, so User.java's entity-level @Index annotation (if any) would
+-- misdescribe this as unconditional; this migration is the sole source of truth, per project
+-- convention (see V154's own note).
+--
+-- Plain CREATE INDEX, not CONCURRENTLY — matches V2/V8/V154 on this exact table; Flyway wraps
+-- each migration in one transaction, inside which CONCURRENTLY cannot run.
+CREATE INDEX idx_users_salon_admin_active
+    ON users (salon_id)
+    WHERE role = 'SALON_ADMIN' AND is_active = true;
