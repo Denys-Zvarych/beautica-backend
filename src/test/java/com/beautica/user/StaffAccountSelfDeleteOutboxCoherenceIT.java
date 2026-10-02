@@ -21,25 +21,23 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
- * Real-DB regression coverage for the self-delete orphan-{@code notification_outbox}-row bug on
- * the STAFF/MASTER track (sibling of {@link ClientAccountSelfDeleteOutboxCoherenceIT}, Phase 301
- * Q8). {@code BookingService#disposeFutureConfirmedForMasterSelfDelete} deliberately enqueues
- * NOTHING of its own (Q3 — a notice would name a booking destroyed microseconds later, the exact
- * phase-300 dead-letter bug) — this is belt-and-braces coverage for a PRE-EXISTING outbox row that
- * already points at a booking this cascade is about to hard-delete (e.g. a reminder enqueued before
- * the master self-deleted): {@code notificationOutboxRepository.deleteByAggregateIdIn} must still
- * run immediately before {@code bookingRepository.deleteAllByIdInBatch}, in the same transaction,
- * exactly as it does on the CLIENT track, because {@code declineConfirmedBulk} shares its statement
- * path with flows that DO enqueue.
+ * Real-DB regression coverage for outbox coherence on the STAFF/MASTER self-delete track (sibling
+ * of {@link ClientAccountSelfDeleteOutboxCoherenceIT}). Since Phase 337,
+ * {@code BookingService#disposeFutureConfirmedForMasterSelfDelete} DECLINES and KEEPS every future
+ * CONFIRMED booking (no hard delete) and enqueues one {@code MASTER_REMOVED} outbox row per visit.
+ * A PRE-EXISTING outbox row for such a booking (e.g. a reminder enqueued before the master
+ * self-deleted) therefore stays valid: the booking still exists, so the drain worker must resolve
+ * and dispatch both rows without dead-lettering anything or hitting "Booking not found".
  */
 @DisplayName("DELETE /api/v1/users/me — notification_outbox stays coherent after a SALON_MASTER "
-        + "self-delete (Phase 301 Q8, orphan-row regression)")
+        + "self-delete (Phase 337, future bookings declined and kept)")
 class StaffAccountSelfDeleteOutboxCoherenceIT extends AbstractIntegrationTest {
 
     private static final OffsetDateTime FUTURE = OffsetDateTime.now().plusDays(7);
@@ -73,12 +71,12 @@ class StaffAccountSelfDeleteOutboxCoherenceIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("no orphan outbox row survives for the hard-deleted future booking; the drain runs "
-            + "clean afterwards with no DEAD row; another master's row and this master's own "
-            + "detached-past-booking outbox row are untouched and remain dispatchable")
-    void should_leaveOutboxCoherent_when_masterSelfDeletesWithFutureAndPastBookings() throws Exception {
-        // Arrange — masterA: one future CONFIRMED booking with a PRE-EXISTING outbox row (the
-        // belt-and-braces case — this cascade itself enqueues nothing) and one past COMPLETED
+    @DisplayName("the future booking is DECLINED and kept with a MASTER_REMOVED row beside its "
+            + "pre-existing row; the drain runs clean with no DEAD row; another master's row and "
+            + "this master's own detached-past-booking outbox row are untouched and remain dispatchable")
+    void should_keepFutureBookingDeclinedWithMasterRemovedRow_when_masterSelfDeletes() throws Exception {
+        // Arrange — masterA: one future CONFIRMED booking with a PRE-EXISTING outbox row (the cascade
+        // adds a MASTER_REMOVED row beside it) and one past COMPLETED
         // booking (DETACHED, not deleted — its own pre-existing outbox row is the "sibling case").
         ClientSelfDeleteTestFixtures.Salon salonA = csd.createSalon();
         UUID clientId = csd.createClient();
@@ -96,18 +94,21 @@ class StaffAccountSelfDeleteOutboxCoherenceIT extends AbstractIntegrationTest {
 
         String masterAToken = fixtures.tokenFor(emailOf(salonA.masterUserId()));
 
-        // Act — masterA self-deletes. disposeFutureConfirmedForMasterSelfDelete bulk-declines then
-        // hard-deletes futureBookingId in the SAME transaction; the pre-existing outbox row for it
-        // must not survive to be claimed by the drain worker afterwards.
+        // Act — masterA self-deletes. disposeFutureConfirmedForMasterSelfDelete bulk-declines
+        // futureBookingId (kept, not deleted) and enqueues one MASTER_REMOVED row for the visit.
         ResponseEntity<Void> response = restTemplate.exchange(
                 "/api/v1/users/me", HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(masterAToken)), Void.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
 
-        // Assert 1 — no outbox row survives pointing at the hard-deleted future booking.
-        assertThat(countByAggregateId(futureBookingId))
-                .as("orphan STATUS_CHANGED row for the hard-deleted future booking")
-                .isZero();
+        // Assert 1 — the future booking is kept as DECLINED, with exactly the pre-existing
+        // STATUS_CHANGED row plus the cascade's one MASTER_REMOVED row (standalone booking: one visit).
+        assertThat(bookingStatusOf(futureBookingId))
+                .as("the future booking must be declined and kept, not hard-deleted")
+                .isEqualTo("DECLINED");
+        assertThat(eventTypesByAggregateId(futureBookingId))
+                .as("pre-existing STATUS_CHANGED row plus one MASTER_REMOVED row for the visit")
+                .containsExactlyInAnyOrder("STATUS_CHANGED", "MASTER_REMOVED");
 
         // Assert (scoping) — the other master's row and this master's own past-booking row must be
         // completely untouched.
@@ -126,7 +127,7 @@ class StaffAccountSelfDeleteOutboxCoherenceIT extends AbstractIntegrationTest {
         }).doesNotThrowAnyException();
 
         assertThat(countByStatus("DEAD"))
-                .as("no row may dead-letter — in particular not the future booking's would-be orphan")
+                .as("no row may dead-letter — the future booking still exists for both of its rows")
                 .isZero();
         assertThat(lastErrorMentionsMissingBooking())
                 .as("no row's last_error records a drain-worker IllegalStateException for a missing "
@@ -153,10 +154,13 @@ class StaffAccountSelfDeleteOutboxCoherenceIT extends AbstractIntegrationTest {
         return jdbcTemplate.queryForObject("SELECT email FROM users WHERE id = ?", String.class, userId);
     }
 
-    private long countByAggregateId(UUID aggregateId) {
-        Long count = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM notification_outbox WHERE aggregate_id = ?", Long.class, aggregateId);
-        return count == null ? -1 : count;
+    private List<String> eventTypesByAggregateId(UUID aggregateId) {
+        return jdbcTemplate.queryForList(
+                "SELECT event_type FROM notification_outbox WHERE aggregate_id = ?", String.class, aggregateId);
+    }
+
+    private String bookingStatusOf(UUID bookingId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM bookings WHERE id = ?", String.class, bookingId);
     }
 
     private long countByStatus(String status) {

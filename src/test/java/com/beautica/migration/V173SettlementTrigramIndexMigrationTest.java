@@ -225,8 +225,18 @@ class V173SettlementTrigramIndexMigrationTest extends AbstractIntegrationTest {
         @Test
         @DisplayName("pg_trgm.similarity_threshold is 0.3 — the floor the % operator applies")
         void should_useTheDefaultSimilarityThreshold_when_sessionIsUnmodified() {
-            String threshold = jdbcTemplate.queryForObject(
-                    "SHOW pg_trgm.similarity_threshold", String.class);
+            // pg_trgm.similarity_threshold is a GUC registered only when pg_trgm.so is loaded into
+            // the backend. A pooled connection that has not yet run a trigram function reports it as
+            // unrecognised, so load the library and SHOW on the SAME connection.
+            String threshold = jdbcTemplate.execute((ConnectionCallback<String>) con -> {
+                try (Statement st = con.createStatement()) {
+                    st.execute("SELECT similarity('a', 'a')");
+                    try (ResultSet rs = st.executeQuery("SHOW pg_trgm.similarity_threshold")) {
+                        rs.next();
+                        return rs.getString(1);
+                    }
+                }
+            });
 
             assertThat(Double.parseDouble(threshold))
                     .as("the indexable %% operator compares against this SESSION GUC, and the "

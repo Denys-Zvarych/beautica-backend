@@ -6,6 +6,7 @@ import com.beautica.config.CacheConfig;
 import com.beautica.config.ClockConfig;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.notification.inapp.service.InAppNotificationService;
 import com.beautica.review.dto.ReviewResponse;
 import com.beautica.review.dto.SalonReviewResponse;
 import com.beautica.review.dto.SalonReviewSort;
@@ -59,6 +60,7 @@ class ReviewServiceCacheTest {
     @MockBean SalonRepository salonRepository;
     @MockBean MasterRepository masterRepository;
     @MockBean ApplicationEventPublisher eventPublisher;
+    @MockBean InAppNotificationService inAppNotificationService;
 
     @Autowired ReviewService reviewService;
     @Autowired CacheManager cacheManager;
