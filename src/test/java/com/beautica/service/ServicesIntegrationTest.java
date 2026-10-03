@@ -13,7 +13,6 @@ import com.beautica.service.dto.MasterServiceResponse;
 import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
-import com.beautica.service.dto.UpdateServicePhotoRequest;
 import com.beautica.service.service.ServiceCatalogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -535,31 +534,6 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
         assertThat(body.data().name()).isEqualTo("Класичний манікюр (адмін)");
     }
 
-    @Test
-    @DisplayName("Phase 306 case 2: PATCH /services/{id}/photo — 200 when SALON_ADMIN of the salon sets the photo")
-    void should_return200_when_salonAdminPatchesServicePhoto() throws Exception {
-        // Arrange
-        String ownerToken = fixtures.createSalonOwnerAndGetToken(
-                "p306-owner-photo-" + System.nanoTime() + "@beautica.test");
-        UUID salonId = fixtures.createSalon(ownerToken, "P306 Admin Photo Salon");
-        UUID serviceDefId = fixtures.createServiceDefinition(ownerToken, salonId, "Педикюр");
-        String adminToken = fixtures.createSalonAdminAndGetToken(
-                salonId, "p306-admin-photo-" + System.nanoTime() + "@beautica.test");
-
-        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/photo.jpg");
-
-        // Act
-        log.debug("Act: PATCH /api/v1/services/{}/photo as SALON_ADMIN of the owning salon — must be allowed", serviceDefId);
-        ResponseEntity<String> resp = restTemplate.exchange(
-                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
-                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(adminToken)), String.class);
-
-        // Assert
-        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        var body = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<ServiceDefinitionResponse>>() {});
-        assertThat(body.data().photoUrl()).isEqualTo("https://cdn.beautica.test/photo.jpg");
-    }
 
     @Test
     @DisplayName("Phase 306 case 3: POST /salons/{s}/masters/{m}/services — 201 when SALON_ADMIN single-assigns a service to a master of their salon (D4)")
@@ -617,7 +591,7 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("Phase 306 case 6 (regression): SALON_OWNER retains full CRUD on services — create, single-assign, PATCH, photo, DELETE")
+    @DisplayName("Phase 306 case 6 (regression): SALON_OWNER retains full CRUD on services — create, single-assign, PATCH, DELETE")
     void should_retainAccess_when_salonOwnerPerformsFullServiceLifecycle() throws Exception {
         // Arrange
         String ownerToken = fixtures.createSalonOwnerAndGetToken(
@@ -643,15 +617,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 new HttpEntity<>(patch, fixtures.bearerHeaders(ownerToken)), String.class);
         assertThat(patchResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        // photo
-        var photoRequest = new UpdateServicePhotoRequest("https://cdn.beautica.test/owner-regress.jpg");
-        ResponseEntity<String> photoResp = restTemplate.exchange(
-                "/api/v1/services/" + serviceDefId + "/photo", HttpMethod.PATCH,
-                new HttpEntity<>(photoRequest, fixtures.bearerHeaders(ownerToken)), String.class);
-        assertThat(photoResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-
         // delete
-        log.debug("Act: full owner lifecycle on service {} — create/assign/patch/photo already passed, now DELETE", serviceDefId);
+        log.debug("Act: full owner lifecycle on service {} — create/assign/patch already passed, now DELETE", serviceDefId);
         ResponseEntity<String> deleteResp = restTemplate.exchange(
                 "/api/v1/services/" + serviceDefId, HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);

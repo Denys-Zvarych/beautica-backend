@@ -16,6 +16,9 @@ import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.service.StaffClientReferenceAuditService;
 import com.beautica.salon.service.StaffDisposalReason;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServicePhotoBlobPurger;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -78,6 +81,8 @@ public class StaffAccountSelfDeletionService {
     private final StaffClientReferenceAuditService staffClientReferenceAuditService;
     private final AuthService authService;
     private final AccountBlobPurgeRegistrar accountBlobPurgeRegistrar;
+    private final ServiceRepository serviceRepository;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     private static final Set<Role> SELF_DELETABLE_ROLES =
             Set.of(Role.SALON_ADMIN, Role.SALON_MASTER, Role.INDEPENDENT_MASTER);
@@ -154,6 +159,27 @@ public class StaffAccountSelfDeletionService {
                     .orElseThrow(() -> new ForbiddenException("Access denied"));
         }
 
+        // Step 5b — Phase 342 D6: an independent master's own service catalogue keeps uploaded photos in R2
+        // (service_definitions has no FK to the master, so nothing cascades). Row-lock the catalogue (id order)
+        // and read the keys from the LOCKED rows, null the pointers, and DEACTIVATE the definitions (never
+        // delete: historical bookings reference them — same semantics as SalonService#deactivateSalon). The
+        // deactivation is what makes a photo upload that takes the row lock after this commit answer 404 on
+        // its in-lock active re-check, so it can never write a pointer nobody will purge.
+        // LOCK ORDER (service_definitions BEFORE masters): ServiceCatalogService#deactivateServiceDefinition
+        // locks the definition then UPDATEs masters; the disposal below deletes the masters row, so the
+        // locks must be taken here, ahead of every masters write, to avoid a deadlock with a concurrent
+        // service delete.
+        List<ServicePhotoBlobPurger.ServicePhotoBlob> servicePhotoKeys = List.of();
+        if (master != null && user.getRole() == Role.INDEPENDENT_MASTER) {
+            servicePhotoKeys = serviceRepository
+                    .lockAllByOwnerOrderById(OwnerType.INDEPENDENT_MASTER, master.getId()).stream()
+                    .filter(sd -> sd.getPhotoR2Key() != null)
+                    .map(sd -> new ServicePhotoBlobPurger.ServicePhotoBlob(sd.getId(), sd.getPhotoR2Key()))
+                    .toList();
+            serviceRepository.clearPhotosByOwner(OwnerType.INDEPENDENT_MASTER, master.getId());
+            serviceRepository.deactivateAllByOwner(OwnerType.INDEPENDENT_MASTER, master.getId());
+        }
+
         // Step 6 — the master-role booking cascade (Q3). SALON_ADMIN skips this entirely — no
         // masters row, no provider bookings (Q3/Q6).
         //
@@ -212,6 +238,10 @@ public class StaffAccountSelfDeletionService {
         // that shared seam's other three callers (removeAdmin/removeMaster/deleteSalonStaff) leak
         // R2 blobs today (R6, pre-existing, out of scope); only THIS self-delete path sweeps.
         accountBlobPurgeRegistrar.registerAfterCommit(userId, avatarR2Key, mediaRows);
+
+        // Step 9b — Phase 342 D6: delete the independent master's service-photo blobs after commit. The keys
+        // were read from the row-locked catalogue in Step 5b (before any masters write).
+        servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
 
         // Step 10 — audit trail. Ids and counts only, never an email or any other PII.
         log.info("Staff/independent-master account self-delete: user {} (role {}) deleted, "

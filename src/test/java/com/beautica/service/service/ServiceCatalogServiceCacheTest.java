@@ -105,6 +105,7 @@ class ServiceCatalogServiceCacheTest {
     // per-assignment future-CONFIRMED-booking unassign guard. Not on the @SpringBootTest classes
     // list, so mock it to satisfy constructor wiring; no test below exercises unassignServiceFromMaster.
     @MockBean com.beautica.booking.repository.BookingRepository bookingRepository;
+    @MockBean com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
     // Phase 23.x (perf/security #2): ServiceCatalogService evicts the salon-service-catalog cache via
     // this collaborator on every definition mutation. It is a REAL bean here (on the @SpringBootTest
     // classes list) so its @CacheEvict fires through the AOP proxy — the salon-catalogue eviction tests
@@ -193,6 +194,8 @@ class ServiceCatalogServiceCacheTest {
                 .thenReturn(List.of());
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterId));
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         // Populate cache
@@ -398,6 +401,8 @@ class ServiceCatalogServiceCacheTest {
         delegateSlotEvictionToRealCache();
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterId));
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         // Act — no active Spring transaction here; eviction runs immediately in the else-branch.
@@ -736,6 +741,8 @@ class ServiceCatalogServiceCacheTest {
         // eviction must target. No performing masters keeps the other eviction paths no-ops.
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
         when(serviceRepository.findSalonOwnerId(serviceDefId)).thenReturn(Optional.of(salonA));
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         // Populate both salons' catalogue entries.

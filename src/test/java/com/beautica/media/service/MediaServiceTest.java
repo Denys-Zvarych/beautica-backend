@@ -66,6 +66,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
@@ -106,6 +107,9 @@ class MediaServiceTest {
     @Mock private TransactionTemplate txWrite;
     @Mock private CacheManager cacheManager;
     @Mock private Cache portfolioCache;
+    @Mock private com.beautica.service.repository.ServiceRepository serviceRepo;
+    @Mock private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
+    @Mock private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     private final Clock fixedClock = Clock.fixed(Instant.parse("2026-05-11T10:00:00Z"), ZoneOffset.UTC);
 
@@ -148,7 +152,8 @@ class MediaServiceTest {
         lenient().when(r2.isEnabled()).thenReturn(true);
         lenient().when(cacheManager.getCache("portfolio")).thenReturn(portfolioCache);
         lenient().when(portfolioCache.evictIfPresent(any())).thenReturn(true);
-        service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager);
+        service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager,
+                serviceRepo, serviceCatalogService, servicePhotoBlobPurger);
     }
 
     /** The storage-enabled probe ({@code isEnabled}) is allowed; any blob write/delete is not. */
@@ -1253,6 +1258,326 @@ class MediaServiceTest {
             }
         }
         throw new NoSuchFieldException(name);
+    }
+
+    // ------------------------------------------------------ service photo (phase 342)
+
+    private static com.beautica.service.entity.ServiceDefinition definition(
+            UUID id, String photoUrl, String photoR2Key) {
+        return definition(id, photoUrl, photoR2Key, true);
+    }
+
+    private static com.beautica.service.entity.ServiceDefinition definition(
+            UUID id, String photoUrl, String photoR2Key, boolean active) {
+        return com.beautica.service.entity.ServiceDefinition.builder()
+                .id(id)
+                .ownerType(com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER)
+                .ownerId(UUID.randomUUID())
+                .name("Manicure")
+                .baseDurationMinutes(60)
+                .photoUrl(photoUrl)
+                .photoR2Key(photoR2Key)
+                .priceType(com.beautica.service.entity.PriceType.FIXED)
+                .basePrice(new java.math.BigDecimal("100.00"))
+                .isActive(active)
+                .build();
+    }
+
+    /** Read-gate passes and the locked read returns {@code def}. */
+    private void givenActiveLockedDefinition(UUID id, com.beautica.service.entity.ServiceDefinition def) {
+        lenient().when(serviceRepo.findIdIfDefinitionAndOwnerActive(id)).thenReturn(Optional.of(id));
+        lenient().when(serviceRepo.findByIdForUpdate(id)).thenReturn(Optional.of(def));
+        lenient().when(serviceRepo.save(def)).thenReturn(def);
+        lenient().when(r2.buildPublicUrl(anyString())).thenAnswer(inv -> "https://cdn.test/" + inv.getArgument(0));
+    }
+
+    private String capturedUploadedKey() {
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        verify(r2).uploadFile(key.capture(), any(), anyLong(), anyString());
+        return key.getValue();
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto stores key + url on the definition and evicts caches post-commit")
+    void uploadServicePhoto_setsKeyAndUrl_andEvictsCaches() {
+        UUID id = UUID.randomUUID();
+        var def = definition(id, null, null);
+        givenActiveLockedDefinition(id, def);
+
+        var response = service.uploadServicePhoto(id, jpegFile());
+
+        assertThat(def.getPhotoR2Key()).startsWith("services/" + id + "/").endsWith(".jpg");
+        assertThat(def.getPhotoUrl()).isEqualTo("https://cdn.test/" + def.getPhotoR2Key());
+        assertThat(response.photoUrl()).isEqualTo(def.getPhotoUrl());
+        verify(r2, never()).deleteFile(any());
+        verify(servicePhotoBlobPurger).purgeAfterCommit(id, null);
+        verify(serviceCatalogService).evictServicePhotoCaches(id, def.getOwnerType(), def.getOwnerId());
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto on replace uploads the NEW blob first, then hands the superseded KEY to the purger")
+    void uploadServicePhoto_onReplace_uploadsThenPurgesSupersededKey() {
+        UUID id = UUID.randomUUID();
+        String oldKey = "services/" + id + "/1-old.jpg";
+        var def = definition(id, "https://cdn.test/" + oldKey, oldKey);
+        givenActiveLockedDefinition(id, def);
+
+        service.uploadServicePhoto(id, jpegFile());
+
+        var order = inOrder(r2, serviceRepo, servicePhotoBlobPurger);
+        order.verify(r2).uploadFile(anyString(), any(), anyLong(), eq("image/jpeg"));
+        order.verify(serviceRepo).findByIdForUpdate(id);
+        order.verify(servicePhotoBlobPurger).purgeAfterCommit(id, oldKey);
+        verify(r2, never()).deleteFile(any());
+        assertThat(def.getPhotoR2Key()).isNotEqualTo(oldKey);
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto on a legacy row (url, no key) purges nothing")
+    void uploadServicePhoto_onLegacyRow_purgesNothing() {
+        UUID id = UUID.randomUUID();
+        var def = definition(id, "https://legacy.test/p.jpg", null);
+        givenActiveLockedDefinition(id, def);
+
+        service.uploadServicePhoto(id, jpegFile());
+
+        verify(r2, never()).deleteFile(any());
+        verify(servicePhotoBlobPurger).purgeAfterCommit(id, null);
+        verify(r2).uploadFile(anyString(), any(), anyLong(), anyString());
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto when the R2 upload fails keeps the old photo and pointer intact")
+    void uploadServicePhoto_whenR2UploadFails_keepsOldPhoto() {
+        UUID id = UUID.randomUUID();
+        String oldKey = "services/" + id + "/1-old.jpg";
+        String oldUrl = "https://cdn.test/" + oldKey;
+        var def = definition(id, oldUrl, oldKey);
+        givenActiveLockedDefinition(id, def);
+        doThrow(new IllegalStateException("r2 down")).when(r2).uploadFile(anyString(), any(), anyLong(), anyString());
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(def.getPhotoR2Key()).isEqualTo(oldKey);
+        assertThat(def.getPhotoUrl()).isEqualTo(oldUrl);
+        verify(r2, never()).deleteFile(any());
+        verify(serviceRepo, never()).save(any());
+        verifyNoInteractions(servicePhotoBlobPurger, serviceCatalogService);
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto when the DB write fails after the upload deletes the NEW blob and keeps the old one")
+    void uploadServicePhoto_whenDbWriteFails_deletesNewBlob() {
+        UUID id = UUID.randomUUID();
+        String oldKey = "services/" + id + "/1-old.jpg";
+        var def = definition(id, "https://cdn.test/" + oldKey, oldKey);
+        givenActiveLockedDefinition(id, def);
+        when(serviceRepo.save(def)).thenThrow(new IllegalStateException("db down"));
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+                .isInstanceOf(IllegalStateException.class);
+
+        String uploadedKey = capturedUploadedKey();
+        verify(r2).deleteFile(uploadedKey);
+        verify(r2, never()).deleteFile(oldKey);
+        verifyNoInteractions(servicePhotoBlobPurger, serviceCatalogService);
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto when the failure surfaces AFTER the commit applied retains the NEW blob")
+    void should_retainNewBlob_when_failureSurfacesAfterCommitApplied() {
+        UUID id = UUID.randomUUID();
+        String oldKey = "services/" + id + "/1-old.jpg";
+        var def = definition(id, "https://cdn.test/" + oldKey, oldKey);
+        givenActiveLockedDefinition(id, def);
+        // Commit-ack ambiguity: the callback ran (row now holds the new key) but the commit
+        // acknowledgement failed — the exception reaches the service although the write is durable.
+        doAnswer(inv -> {
+            TransactionCallback<?> cb = inv.getArgument(0);
+            cb.doInTransaction(mock(TransactionStatus.class));
+            throw new IllegalStateException("commit ack lost");
+        }).when(txWrite).execute(any());
+        when(serviceRepo.findById(id)).thenReturn(Optional.of(def));
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(def.getPhotoR2Key()).isEqualTo(capturedUploadedKey());
+        verify(r2, never()).deleteFile(any());
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto when the commit state cannot be re-read retains the NEW blob")
+    void should_retainNewBlob_when_commitStateCannotBeVerified() {
+        UUID id = UUID.randomUUID();
+        String oldKey = "services/" + id + "/1-old.jpg";
+        var def = definition(id, "https://cdn.test/" + oldKey, oldKey);
+        givenActiveLockedDefinition(id, def);
+        when(serviceRepo.save(def)).thenThrow(new IllegalStateException("db down"));
+        when(serviceRepo.findById(id)).thenThrow(new IllegalStateException("db still down"));
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("db down");
+
+        verify(serviceRepo).findById(id);
+        verify(r2, never()).deleteFile(any());
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto when the definition went inactive inside the lock deletes the NEW blob and throws 404")
+    void uploadServicePhoto_whenDeactivatedInsideLock_deletesNewBlobAndThrowsNotFound() {
+        UUID id = UUID.randomUUID();
+        String oldKey = "services/" + id + "/1-old.jpg";
+        var def = definition(id, "https://cdn.test/" + oldKey, oldKey, false);
+        givenActiveLockedDefinition(id, def);
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+                .isInstanceOf(NotFoundException.class);
+
+        String uploadedKey = capturedUploadedKey();
+        verify(r2).deleteFile(uploadedKey);
+        assertThat(def.getPhotoR2Key()).isEqualTo(oldKey);
+        verify(serviceRepo, never()).save(any());
+        verifyNoInteractions(servicePhotoBlobPurger, serviceCatalogService);
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto twice (concurrent replace): each superseded blob is purged, none orphaned")
+    void uploadServicePhoto_concurrentReplace_purgesEverySupersededBlob() {
+        UUID id = UUID.randomUUID();
+        String originalKey = "services/" + id + "/1-orig.jpg";
+        var def = definition(id, "https://cdn.test/" + originalKey, originalKey);
+        givenActiveLockedDefinition(id, def);
+
+        // Both uploads pass the read-gate and upload before either write; the row lock then serialises the
+        // writes, so the second one reads the CURRENT key (the first writer's), not the original.
+        service.uploadServicePhoto(id, jpegFile());
+        String firstKey = def.getPhotoR2Key();
+        service.uploadServicePhoto(id, jpegFile());
+        String secondKey = def.getPhotoR2Key();
+
+        assertThat(firstKey).isNotEqualTo(originalKey);
+        assertThat(secondKey).isNotIn(originalKey, firstKey);
+        var order = inOrder(servicePhotoBlobPurger);
+        order.verify(servicePhotoBlobPurger).purgeAfterCommit(id, originalKey);
+        order.verify(servicePhotoBlobPurger).purgeAfterCommit(id, firstKey);
+        verify(r2, never()).deleteFile(any());
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto throws 503 before any repo read or R2 delete when storage is disabled")
+    void uploadServicePhoto_whenStorageDisabled_throws503BeforeAnyDelete() {
+        when(r2.isEnabled()).thenReturn(false);
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(UUID.randomUUID(), jpegFile()))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
+
+        verifyNoInteractions(serviceRepo, serviceCatalogService, servicePhotoBlobPurger);
+        verifyNoStorageWrites();
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto throws NotFound for an unknown/deactivated definition or salon and writes nothing to R2")
+    void uploadServicePhoto_inactiveOrUnknownDefinition_throwsNotFound() {
+        UUID id = UUID.randomUUID();
+        when(serviceRepo.findIdIfDefinitionAndOwnerActive(id)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(id, jpegFile()))
+                .isInstanceOf(NotFoundException.class);
+
+        verifyNoStorageWrites();
+        verify(serviceRepo, never()).findByIdForUpdate(any());
+    }
+
+    @Test
+    @DisplayName("uploadServicePhoto rejects an unsupported format with 400 before touching the repo")
+    void uploadServicePhoto_rejectsSvg() {
+        var svg = new MockMultipartFile("file", "a.svg", "image/svg+xml",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\"/>".getBytes(StandardCharsets.UTF_8));
+
+        assertThatThrownBy(() -> service.uploadServicePhoto(UUID.randomUUID(), svg))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST));
+
+        verifyNoInteractions(serviceRepo);
+        verifyNoStorageWrites();
+    }
+
+    @Test
+    @DisplayName("deleteServicePhoto clears the DB pointers first, then hands the key to the purger and evicts caches")
+    void deleteServicePhoto_clearsPointersThenPurgesKey() {
+        UUID id = UUID.randomUUID();
+        String key = "services/" + id + "/1-a.jpg";
+        var def = definition(id, "https://cdn.test/" + key, key);
+        givenActiveLockedDefinition(id, def);
+
+        service.deleteServicePhoto(id);
+
+        assertThat(def.getPhotoR2Key()).isNull();
+        assertThat(def.getPhotoUrl()).isNull();
+        var order = inOrder(serviceRepo, servicePhotoBlobPurger);
+        order.verify(serviceRepo).save(def);
+        order.verify(servicePhotoBlobPurger).purgeAfterCommit(id, key);
+        verify(r2, never()).deleteFile(any());
+        verify(serviceCatalogService).evictServicePhotoCaches(id, def.getOwnerType(), def.getOwnerId());
+    }
+
+    @Test
+    @DisplayName("deleteServicePhoto on a legacy row (url, no key) clears photo_url with no R2 call")
+    void deleteServicePhoto_legacyRow_clearsUrlWithoutR2() {
+        UUID id = UUID.randomUUID();
+        var def = definition(id, "https://legacy.test/p.jpg", null);
+        givenActiveLockedDefinition(id, def);
+
+        service.deleteServicePhoto(id);
+
+        assertThat(def.getPhotoUrl()).isNull();
+        verify(serviceRepo).save(def);
+        verifyNoStorageWrites();
+        verify(servicePhotoBlobPurger).purgeAfterCommit(id, null);
+        verify(serviceCatalogService).evictServicePhotoCaches(id, def.getOwnerType(), def.getOwnerId());
+    }
+
+    @Test
+    @DisplayName("deleteServicePhoto with no photo at all is a no-op (no R2 call, no write, no eviction)")
+    void deleteServicePhoto_noPhoto_isNoOp() {
+        UUID id = UUID.randomUUID();
+        givenActiveLockedDefinition(id, definition(id, null, null));
+
+        service.deleteServicePhoto(id);
+
+        verifyNoStorageWrites();
+        verify(serviceRepo, never()).save(any());
+        verifyNoInteractions(serviceCatalogService, servicePhotoBlobPurger);
+    }
+
+    @Test
+    @DisplayName("deleteServicePhoto throws NotFound for a deactivated definition/salon and changes nothing")
+    void deleteServicePhoto_inactive_throwsNotFound() {
+        UUID id = UUID.randomUUID();
+        when(serviceRepo.findIdIfDefinitionAndOwnerActive(id)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.deleteServicePhoto(id)).isInstanceOf(NotFoundException.class);
+
+        verify(serviceRepo, never()).save(any());
+        verifyNoInteractions(serviceCatalogService, servicePhotoBlobPurger);
+    }
+
+    @Test
+    @DisplayName("deleteServicePhoto when the definition went inactive inside the lock throws NotFound and changes nothing")
+    void deleteServicePhoto_deactivatedInsideLock_throwsNotFound() {
+        UUID id = UUID.randomUUID();
+        String key = "services/" + id + "/1-a.jpg";
+        var def = definition(id, "https://cdn.test/" + key, key, false);
+        givenActiveLockedDefinition(id, def);
+
+        assertThatThrownBy(() -> service.deleteServicePhoto(id)).isInstanceOf(NotFoundException.class);
+
+        assertThat(def.getPhotoR2Key()).isEqualTo(key);
+        verifyNoInteractions(servicePhotoBlobPurger, serviceCatalogService);
     }
 
     private static MockMultipartFile jpegFile() {

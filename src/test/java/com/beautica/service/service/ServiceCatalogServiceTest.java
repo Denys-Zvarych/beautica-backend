@@ -53,6 +53,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -133,6 +134,9 @@ class ServiceCatalogServiceTest {
 
     @Mock
     private java.time.Clock clock;
+
+    @Mock
+    private ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
@@ -1551,6 +1555,8 @@ class ServiceCatalogServiceTest {
         // refresh their min_effective_price after deactivation — stub must be present.
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterA, masterB));
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
@@ -1569,7 +1575,8 @@ class ServiceCatalogServiceTest {
     void should_throwNotFoundException_when_serviceDefinitionDoesNotExist() {
         UUID actorId = UUID.randomUUID();
         UUID missing = UUID.randomUUID();
-        when(serviceRepository.deactivateById(missing)).thenReturn(0);
+        // lock finds no row → 404 before any UPDATE
+        when(serviceRepository.findByIdForUpdate(missing)).thenReturn(java.util.Optional.empty());
 
         assertThatThrownBy(() -> serviceCatalogService.deactivateServiceDefinition(actorId, missing))
                 .isInstanceOf(NotFoundException.class)
@@ -1577,10 +1584,46 @@ class ServiceCatalogServiceTest {
     }
 
     @Test
+    @DisplayName("deactivate row-locks the definition BEFORE the UPDATE and purges the key read from the LOCKED row")
+    void should_purgeKeyFromLockedRow_when_deactivatingDefinitionWithPhoto() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        String key = "services/" + serviceDefId + "/1-a.jpg";
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(java.util.Optional.of(
+                ServiceDefinition.builder().id(serviceDefId).photoR2Key(key).build()));
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
+
+        var order = org.mockito.Mockito.inOrder(serviceRepository, servicePhotoBlobPurger);
+        order.verify(serviceRepository).findByIdForUpdate(serviceDefId);
+        order.verify(serviceRepository).deactivateById(serviceDefId);
+        order.verify(servicePhotoBlobPurger).purgeAfterCommit(serviceDefId, key);
+    }
+
+    @Test
+    @DisplayName("deactivate of a definition without an uploaded photo registers no blob purge")
+    void should_notPurge_when_deactivatedDefinitionHasNoPhotoKey() {
+        UUID actorId = UUID.randomUUID();
+        UUID serviceDefId = UUID.randomUUID();
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(java.util.Optional.of(
+                ServiceDefinition.builder().id(serviceDefId).build()));
+        when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
+
+        serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);
+
+        verifyNoInteractions(servicePhotoBlobPurger);
+    }
+
+    @Test
     @DisplayName("uses deactivateById (bulk UPDATE) rather than save — deactivation must not trigger a full entity replace")
     void should_useDeactivateById_not_save_when_deactivating() {
         UUID actorId = UUID.randomUUID();
         UUID serviceDefId = UUID.randomUUID();
+
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
 
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
@@ -1600,6 +1643,8 @@ class ServiceCatalogServiceTest {
         // No master performs it — the branch the guard exists for.
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of());
+        when(serviceRepository.findByIdForUpdate(serviceDefId)).thenReturn(
+                java.util.Optional.of(ServiceDefinition.builder().id(serviceDefId).build()));
         when(serviceRepository.deactivateById(serviceDefId)).thenReturn(1);
 
         serviceCatalogService.deactivateServiceDefinition(actorId, serviceDefId);

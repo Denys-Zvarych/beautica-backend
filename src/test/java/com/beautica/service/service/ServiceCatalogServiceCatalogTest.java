@@ -91,6 +91,7 @@ class ServiceCatalogServiceCatalogTest {
     @Mock private com.beautica.common.security.AuthorizationService authz;
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    @Mock private ServicePhotoBlobPurger servicePhotoBlobPurger;
     @Mock private com.beautica.booking.repository.BookingRepository bookingRepository;
 
     // Fixed, not mocked — this test class never exercises the D4 future-booking guard, so a real
@@ -118,6 +119,7 @@ class ServiceCatalogServiceCatalogTest {
                 authz,
                 slotCalculationService,
                 salonCatalogCacheEvictor,
+                servicePhotoBlobPurger,
                 bookingRepository,
                 clock
         );

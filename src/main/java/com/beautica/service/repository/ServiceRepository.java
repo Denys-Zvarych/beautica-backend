@@ -3,7 +3,9 @@ package com.beautica.service.repository;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import org.springframework.data.domain.Pageable;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -98,9 +100,65 @@ public interface ServiceRepository extends JpaRepository<ServiceDefinition, UUID
             """)
     Optional<ServiceDefinition> findByIdWithServiceType(@Param("id") UUID id);
 
+    /**
+     * Soft-deletes one definition AND nulls its photo pointers in the same UPDATE (Phase 342 F — a
+     * deactivated row keeps no live photo pointer; the caller reads the key from the row it
+     * locked via {@link #findByIdForUpdate} and purges the blob after commit). Bulk UPDATE: the persistence
+     * context is not refreshed, so callers must not rely on an already-loaded entity afterwards.
+     */
     @Modifying
-    @Query("UPDATE ServiceDefinition sd SET sd.isActive = false WHERE sd.id = :id")
+    @Query("UPDATE ServiceDefinition sd SET sd.isActive = false, sd.photoUrl = NULL, sd.photoR2Key = NULL "
+            + "WHERE sd.id = :id")
     int deactivateById(@Param("id") UUID id);
+
+    /**
+     * Row-locks (and returns) EVERY definition owned by {@code (ownerType, ownerId)} in {@code id} order
+     * ({@code SELECT ... FOR UPDATE}) for teardown sweeps (salon delete, independent-master self-delete).
+     * The caller reads each photo R2 key from the LOCKED row, so an upload that commits concurrently is
+     * either fully before the lock (its key is read and purged) or blocked until the teardown commits
+     * (then its in-lock active re-check answers 404) — no orphaned blob, no stale pre-read.
+     *
+     * <p>Lock order: ascending id. The upload/delete photo paths lock a single definition row, so they
+     * cannot form a cycle with this multi-row lock. Bounded by one owner's catalogue. All rows are
+     * locked (not only those with a key) because an upload may be about to give a keyless row one.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT sd FROM ServiceDefinition sd WHERE sd.ownerType = :ownerType AND sd.ownerId = :ownerId "
+            + "ORDER BY sd.id")
+    List<ServiceDefinition> lockAllByOwnerOrderById(
+            @Param("ownerType") OwnerType ownerType, @Param("ownerId") UUID ownerId);
+
+    /**
+     * Phase 342 B/G — the cheap service-layer gate for photo upload/delete: the id of the definition
+     * if (and only if) it is active AND, for a SALON-owned one, its salon is active too; empty otherwise
+     * (unknown id, deactivated definition, deactivated or missing salon) so the caller answers 404.
+     * Scalar projection — no entity, no join fetch.
+     */
+    @Query("""
+            SELECT sd.id FROM ServiceDefinition sd
+            LEFT JOIN Salon s ON s.id = sd.ownerId AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+            WHERE sd.id = :id AND sd.isActive = true
+              AND (sd.ownerType <> com.beautica.service.entity.OwnerType.SALON OR s.isActive = true)
+            """)
+    Optional<UUID> findIdIfDefinitionAndOwnerActive(@Param("id") UUID id);
+
+    /**
+     * Row-locks one definition ({@code SELECT ... FOR UPDATE}) for the photo write transactions —
+     * serialises concurrent replace/delete and the deactivate race. Deliberately NO join fetch: locking
+     * the shared {@code service_types} row would serialise every upload of that type.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT sd FROM ServiceDefinition sd WHERE sd.id = :id")
+    Optional<ServiceDefinition> findByIdForUpdate(@Param("id") UUID id);
+
+    /** Nulls both photo pointers of every definition owned by {@code (ownerType, ownerId)}. */
+    @Modifying
+    @Query("""
+            UPDATE ServiceDefinition sd SET sd.photoUrl = NULL, sd.photoR2Key = NULL
+            WHERE sd.ownerType = :ownerType AND sd.ownerId = :ownerId
+              AND (sd.photoUrl IS NOT NULL OR sd.photoR2Key IS NOT NULL)
+            """)
+    int clearPhotosByOwner(@Param("ownerType") OwnerType ownerType, @Param("ownerId") UUID ownerId);
 
     /**
      * Bulk-deactivates every ACTIVE service definition owned by {@code (ownerType, ownerId)} —

@@ -36,6 +36,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -324,71 +325,35 @@ class ServiceCatalogServiceUpdateTest {
         verify(serviceRepository, never()).saveAndFlush(any());
     }
 
-    // ── updateServicePhoto — happy path ───────────────────────────────────────
+    // ── evictServicePhotoCaches (Phase 342 — replaces updateServicePhoto) ──────
 
     @Test
-    @DisplayName("sets photoUrl and returns updated response when service definition exists")
-    void should_setPhotoUrl_when_serviceDefinitionExists() {
+    @DisplayName("evicts masterServices for every master using the definition after a photo change")
+    void should_evictMasterServicesCache_when_photoChanged() {
         UUID serviceDefId = UUID.randomUUID();
-        UUID ownerId = UUID.randomUUID();
-        String photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
-        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
-
-        ServiceDefinition saved = buildDefinition(serviceDefId, ownerId);
-        saved.setPhotoUrl(photoUrl);
-
-        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(saved);
-        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
-                .thenReturn(List.of());
-
-        ServiceDefinitionResponse result = serviceCatalogService.updateServicePhoto(serviceDefId, photoUrl);
-
-        assertThat(result).isNotNull();
-        assertThat(result.photoUrl()).isEqualTo(photoUrl);
-
-        ArgumentCaptor<ServiceDefinition> captor = ArgumentCaptor.forClass(ServiceDefinition.class);
-        verify(serviceRepository).save(captor.capture());
-        assertThat(captor.getValue().getPhotoUrl()).isEqualTo(photoUrl);
-    }
-
-    @Test
-    @DisplayName("evicts masterServices cache for affected masters after photo update")
-    void should_evictMasterServicesCache_when_photoUpdated() {
-        UUID serviceDefId = UUID.randomUUID();
-        UUID ownerId = UUID.randomUUID();
         UUID masterId = UUID.randomUUID();
-        String photoUrl = "https://example.com/photo.jpg";
-        ServiceDefinition existing = buildDefinition(serviceDefId, ownerId);
-
-        when(serviceRepository.findByIdWithServiceType(serviceDefId)).thenReturn(Optional.of(existing));
-        when(serviceRepository.save(any(ServiceDefinition.class))).thenReturn(existing);
+        var mockCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId))
                 .thenReturn(List.of(masterId));
-
-        var mockCache = org.mockito.Mockito.mock(org.springframework.cache.Cache.class);
         when(cacheManager.getCache("masterServices")).thenReturn(mockCache);
 
-        serviceCatalogService.updateServicePhoto(serviceDefId, photoUrl);
+        serviceCatalogService.evictServicePhotoCaches(serviceDefId, OwnerType.INDEPENDENT_MASTER, UUID.randomUUID());
 
-        verify(masterServiceRepository).findMasterIdsByServiceDefinitionId(serviceDefId);
+        verify(mockCache).evict(masterId);
+        verifyNoInteractions(salonCatalogCacheEvictor);
     }
 
-    // ── updateServicePhoto — error cases ──────────────────────────────────────
-
     @Test
-    @DisplayName("throws NotFoundException when service definition does not exist on photo update")
-    void should_throwNotFoundException_when_serviceDefinitionNotFoundOnPhotoUpdate() {
-        UUID nonExistentId = UUID.randomUUID();
+    @DisplayName("evicts the owning salon's catalogue entry for a SALON-owned definition")
+    void should_evictSalonCatalogue_when_salonOwnedPhotoChanged() {
+        UUID serviceDefId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId)).thenReturn(List.of());
+        when(cacheManager.getCache("masterServices")).thenReturn(null);
 
-        when(serviceRepository.findByIdWithServiceType(nonExistentId)).thenReturn(Optional.empty());
+        serviceCatalogService.evictServicePhotoCaches(serviceDefId, OwnerType.SALON, salonId);
 
-        assertThatThrownBy(() ->
-                serviceCatalogService.updateServicePhoto(nonExistentId, "https://example.com/photo.jpg"))
-                .isInstanceOf(NotFoundException.class)
-                .hasMessageContaining(nonExistentId.toString());
-
-        verify(serviceRepository, never()).save(any());
+        verify(salonCatalogCacheEvictor).evict(salonId);
     }
 
     // ── updateServiceDefinition — serviceTypeId PATCH (Phase 16.3) ─────────────

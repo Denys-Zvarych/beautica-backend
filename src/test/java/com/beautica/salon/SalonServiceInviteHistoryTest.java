@@ -153,6 +153,9 @@ class SalonServiceInviteHistoryTest {
     private com.beautica.media.service.MediaService mediaService;
 
     @Mock
+    private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+
+    @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
     // Phase 301: SalonService now delegates disposeStaffAccounts to the promoted
@@ -183,7 +186,7 @@ class SalonServiceInviteHistoryTest {
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,
                 bookingService, serviceRepository, favoriteRepository, mediaRepository,
-                mediaService, transactionManager, staffAccountDisposalService);
+                mediaService, servicePhotoBlobPurger, transactionManager, staffAccountDisposalService);
     }
 
     // ── the derivation ladder ─────────────────────────────────────────────────

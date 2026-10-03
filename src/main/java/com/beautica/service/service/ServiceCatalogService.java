@@ -109,6 +109,7 @@ public class ServiceCatalogService {
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     // Phase 307 D4 — the per-assignment future-CONFIRMED-booking guard on unassignServiceFromMaster.
     // Direct cross-feature repository injection, matching this class's existing MasterRepository/
     // SalonRepository fields above rather than a new booking-service seam (REUSE-FIRST — no new
@@ -1301,9 +1302,24 @@ public class ServiceCatalogService {
 
         // Step 3: execute the update; check after registration so the callback is a
         // no-op when the method throws (transaction rolls back, afterCommit never fires).
+        // Phase 342 D6: row-lock the definition FIRST (the same single-row FOR UPDATE the photo upload/delete
+        // use), read the photo's R2 key from the LOCKED row, then deactivate (the UPDATE nulls the pointers
+        // itself — Phase 342 F) and delete the blob after commit (best-effort). A pre-lock read left a window
+        // where an upload committing between the read and the UPDATE had its NEW pointer nulled while only
+        // the stale key was purged — an orphaned blob. Now such an upload either commits before the lock
+        // (its key is the one read) or blocks until this commit and then answers 404 on its in-lock
+        // active re-check.
+        ServiceDefinition locked = serviceRepository.findByIdForUpdate(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
+        String photoKey = locked.getPhotoR2Key();
+
         int updated = serviceRepository.deactivateById(serviceDefId);
         if (updated == 0) {
             throw new NotFoundException("Service definition not found: " + serviceDefId);
+        }
+
+        if (photoKey != null) {
+            servicePhotoBlobPurger.purgeAfterCommit(serviceDefId, photoKey);
         }
 
         // Fix MEDIUM-6 PERF: replace N individual UPDATE round-trips with a single bulk
@@ -1353,29 +1369,14 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Sets or replaces the photo URL for a {@link ServiceDefinition}.
-     *
-     * <p>Ownership is verified by the {@code @PreAuthorize} guard on the controller.
-     * After the update commits, the {@code masterServices} cache entries for all
-     * masters using this definition are evicted (anti-bug §F).
+     * Evicts the caches a service-photo change invalidates (Phase 342; the exact set the removed
+     * {@code updateServicePhoto} evicted): {@code masterServices} for every master using the definition
+     * and the owning salon's catalogue entry. Called by {@code MediaService} AFTER its write transaction
+     * has committed, so both evictors take their no-transaction (immediate) branch.
      */
-    @Transactional
-    // Ownership verified by @PreAuthorize("@authz.canManageServiceDefinition") on the controller.
-    public ServiceDefinitionResponse updateServicePhoto(UUID serviceDefId, String photoUrl) {
-        ServiceDefinition definition = serviceRepository.findByIdWithServiceType(serviceDefId)
-                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
-
-        definition.setPhotoUrl(photoUrl);
-
-        ServiceDefinition saved = serviceRepository.save(definition);
-
-        List<UUID> affectedMasterIds =
-                masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
-        evictMasterServicesCache(affectedMasterIds);
-        // A photo change alters the catalogue's rendered content (perf/security #2).
-        evictSalonCatalogAfterCommit(salonCatalogIdOf(saved));
-
-        return ServiceDefinitionResponse.from(saved);
+    public void evictServicePhotoCaches(UUID serviceDefId, OwnerType ownerType, UUID ownerId) {
+        evictMasterServicesCache(masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId));
+        evictSalonCatalogAfterCommit(ownerType == OwnerType.SALON ? ownerId : null);
     }
 
     /**

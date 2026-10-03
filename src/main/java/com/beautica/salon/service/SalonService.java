@@ -53,6 +53,7 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.repository.MasterServiceCountProjection;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServicePhotoBlobPurger;
 import com.beautica.user.InviteHistoryRow;
 import com.beautica.user.InviteToken;
 import com.beautica.user.InviteTokenRepository;
@@ -174,6 +175,7 @@ public class SalonService {
     private final FavoriteRepository favoriteRepository;
     private final MediaRepository mediaRepository;
     private final MediaService mediaService;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     private final PlatformTransactionManager transactionManager;
     private final StaffAccountDisposalService staffAccountDisposalService;
 
@@ -1329,6 +1331,20 @@ public class SalonService {
         final List<MediaFile> salonMediaRows =
                 mediaRepository.findByEntityTypeAndEntityId(EntityType.SALON, salonId);
 
+        // Phase 342 D6 — row-lock the salon's service catalogue (id order, single-row-lock-compatible with
+        // the photo upload path) and read the uploaded-photo keys from the LOCKED rows, so a concurrent
+        // upload cannot slip a new pointer in between the read and the clear below (orphaned blob).
+        // LOCK ORDER (service_definitions BEFORE masters): ServiceCatalogService#deactivateServiceDefinition
+        // locks the definition row and then bulk-UPDATEs masters (refreshMinEffectivePriceForAll). The staff
+        // cascade below (deleteSalonStaff) deletes/detaches masters rows, so taking the definition locks
+        // only AFTER it would be the opposite order and could deadlock against a concurrent service delete.
+        // Hence the lock is taken here, before any masters write.
+        List<ServicePhotoBlobPurger.ServicePhotoBlob> servicePhotoKeys = serviceRepository
+                .lockAllByOwnerOrderById(OwnerType.SALON, salonId).stream()
+                .filter(sd -> sd.getPhotoR2Key() != null)
+                .map(sd -> new ServicePhotoBlobPurger.ServicePhotoBlob(sd.getId(), sd.getPhotoR2Key()))
+                .toList();
+
         // Phase 269/293 — decline every future CONFIRMED booking at this salon and notify the
         // affected clients (one SALON_CLOSED entry per VISIT, D12). Runs inside THIS transaction,
         // after the idempotency guard and the fail-closed Phase 289 audit precondition above — a
@@ -1364,6 +1380,10 @@ public class SalonService {
         // record of anything that happened). Both are pure DB work, no network, so they run INSIDE
         // this transaction and roll back with everything else on failure — unlike the R2 sweep
         // below, which is deliberately outside it (D8).
+        // Phase 342 D6 — the catalogue was row-locked and its photo keys read ABOVE (before the decline /
+        // staff cascade, for lock-order reasons). Null the pointers in THIS transaction (rolls back with it);
+        // the blobs are deleted after commit via the shared purger (best-effort).
+        serviceRepository.clearPhotosByOwner(OwnerType.SALON, salonId);
         serviceRepository.deactivateAllByOwner(OwnerType.SALON, salonId);
         favoriteRepository.deleteAllByTargetTypeAndTargetId(FavoriteTargetType.SALON, salonId);
 
@@ -1385,6 +1405,7 @@ public class SalonService {
         // request thread but outside this transaction — see the field-block comment above and this
         // method's own javadoc.
         purgeSalonMediaAfterCommit(salonId, avatarUrlAtDeletion, coverImageUrlAtDeletion, salonMediaRows);
+        servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
     }
 
     /**

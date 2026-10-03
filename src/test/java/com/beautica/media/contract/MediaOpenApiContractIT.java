@@ -69,4 +69,35 @@ class MediaOpenApiContractIT extends AbstractIntegrationTest {
         assertThat(content.has("application/json")).as("no application/json").isFalse();
         assertThat(content.path(MULTIPART).toString()).contains("binary");
     }
+
+    @Test
+    @DisplayName("POST /api/v1/services/{serviceDefId}/photo declares multipart/form-data only (Phase 342)")
+    void should_declareMultipartOnly_when_servicePhotoUpload() {
+        JsonNode content = requestContent("/api/v1/services/{serviceDefId}/photo");
+
+        assertThat(content.has(MULTIPART)).as("multipart/form-data present").isTrue();
+        assertThat(content.has("application/json")).as("no application/json").isFalse();
+        assertThat(content.path(MULTIPART).toString()).contains("binary");
+    }
+
+    @Test
+    @DisplayName("PATCH /api/v1/services/{serviceDefId}/photo and UpdateServicePhotoRequest are gone (Phase 342)")
+    void should_notPublishPatchPhotoOrItsRequestSchema() {
+        JsonNode photoPath = spec.path("paths").path("/api/v1/services/{serviceDefId}/photo");
+
+        assertThat(photoPath.has("patch")).as("no PATCH operation").isFalse();
+        assertThat(photoPath.has("post")).as("POST present").isTrue();
+        assertThat(photoPath.has("delete")).as("DELETE present").isTrue();
+        assertThat(spec.path("components").path("schemas").has("UpdateServicePhotoRequest"))
+                .as("request schema removed").isFalse();
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/services/{serviceDefId}/photo documents a 204")
+    void should_documentNoContent_when_servicePhotoDelete() {
+        JsonNode responses = spec.path("paths").path("/api/v1/services/{serviceDefId}/photo")
+                .path("delete").path("responses");
+
+        assertThat(responses.has("204")).isTrue();
+    }
 }

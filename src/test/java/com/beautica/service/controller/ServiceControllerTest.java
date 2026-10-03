@@ -30,6 +30,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpMethod;
@@ -57,14 +58,16 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.authentication;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
-import com.beautica.service.dto.UpdateServicePhotoRequest;
+import com.beautica.media.service.MediaService;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -118,6 +121,9 @@ class ServiceControllerTest {
 
     @MockBean
     private ServiceCatalogService serviceCatalogService;
+
+    @MockBean
+    private MediaService mediaService;
 
     @MockBean(name = "authz")
     private AuthorizationService authorizationService;
@@ -2218,11 +2224,16 @@ class ServiceControllerTest {
                 .andExpect(status().isBadRequest());
     }
 
-    // ── PATCH /api/v1/services/{serviceDefId}/photo ────────────────────────────
+    // ── POST/DELETE /api/v1/services/{serviceDefId}/photo (Phase 342) ──────────
+
+    private static MockMultipartFile jpegPart() {
+        return new MockMultipartFile("file", "p.jpg", "image/jpeg",
+                new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, 0, 0, 0, 0, 0, 0, 0, 0});
+    }
 
     @Test
-    @DisplayName("PATCH /services/{id}/photo — 200 when owner sets photo URL")
-    void should_return200_when_ownerSetsServicePhoto() throws Exception {
+    @DisplayName("POST /services/{id}/photo — 200 when owner uploads a photo")
+    void should_return200_when_ownerUploadsServicePhoto() throws Exception {
         var userId = UUID.randomUUID();
         var serviceDefId = UUID.randomUUID();
         var photoUrl = "https://pub-abc123.r2.dev/services/photo.jpg";
@@ -2231,82 +2242,90 @@ class ServiceControllerTest {
                 PriceType.FIXED, new BigDecimal("350.00"), null, "350 ₴", null);
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-        when(serviceCatalogService.updateServicePhoto(eq(serviceDefId), eq(photoUrl)))
-                .thenReturn(stub);
+        when(mediaService.uploadServicePhoto(eq(serviceDefId), any())).thenReturn(stub);
 
-        log.debug("Act: PATCH /api/v1/services/{}/photo as SALON_OWNER — set photo URL", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
+        mockMvc.perform(multipart("/api/v1/services/" + serviceDefId + "/photo").file(jpegPart())
                         .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"" + photoUrl + "\"}"))
+                        .with(csrf()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.photoUrl").value(photoUrl));
     }
 
     @Test
-    @DisplayName("PATCH /services/{id}/photo — 403 when a different owner tries to set photo")
-    void should_return403_when_nonOwnerSetsServicePhoto() throws Exception {
-        var userId = UUID.randomUUID();
+    @DisplayName("POST /services/{id}/photo — 403 when caller may not manage the service")
+    void should_return403_when_nonOwnerUploadsServicePhoto() throws Exception {
         var serviceDefId = UUID.randomUUID();
 
         when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
 
-        log.debug("Act: PATCH /api/v1/services/{}/photo with wrong owner — must return 403", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "other@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https://example.com/photo.jpg\"}"))
+        mockMvc.perform(multipart("/api/v1/services/" + serviceDefId + "/photo").file(jpegPart())
+                        .with(authenticatedAs(UUID.randomUUID(), "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
                 .andExpect(status().isForbidden());
+        verifyNoInteractions(mediaService);
     }
 
     @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl uses plain HTTP (not HTTPS)")
-    void should_return400_when_photoUrlIsNotHttps() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with http:// URL — @Pattern must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"http://insecure.example.com/photo.jpg\"}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl is null")
-    void should_return400_when_photoUrlIsNull() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with null photoUrl — @NotNull must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":null}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 401 when no Authorization header is present")
-    void should_return401_when_patchPhotoWithoutAuth() throws Exception {
-        var anyId = UUID.randomUUID();
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo without Authorization header — must return 401", anyId);
-        mockMvc.perform(patch("/api/v1/services/" + anyId + "/photo")
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https://example.com/photo.jpg\"}"))
+    @DisplayName("POST /services/{id}/photo — 401 without authentication")
+    void should_return401_when_uploadPhotoWithoutAuth() throws Exception {
+        mockMvc.perform(multipart("/api/v1/services/" + UUID.randomUUID() + "/photo").file(jpegPart())
+                        .with(csrf()))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @DisplayName("POST /services/{id}/photo — 415 for a JSON body (multipart only)")
+    void should_return415_when_uploadPhotoIsJson() throws Exception {
+        var serviceDefId = UUID.randomUUID();
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+
+        mockMvc.perform(post("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"photoUrl\":\"https://example.com/p.jpg\"}"))
+                .andExpect(status().isUnsupportedMediaType());
+    }
+
+    @Test
+    @DisplayName("PATCH /services/{id}/photo — removed (405)")
+    void should_return405_when_patchPhoto() throws Exception {
+        var serviceDefId = UUID.randomUUID();
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+
+        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"photoUrl\":\"https://example.com/p.jpg\"}"))
+                .andExpect(status().isMethodNotAllowed());
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id}/photo — 204 when owner deletes the photo")
+    void should_return204_when_ownerDeletesServicePhoto() throws Exception {
+        var serviceDefId = UUID.randomUUID();
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
+
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "owner@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isNoContent());
+        verify(mediaService).deleteServicePhoto(serviceDefId);
+    }
+
+    @Test
+    @DisplayName("DELETE /services/{id}/photo — 403 when caller may not manage the service")
+    void should_return403_when_nonOwnerDeletesServicePhoto() throws Exception {
+        var serviceDefId = UUID.randomUUID();
+        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(false);
+
+        mockMvc.perform(delete("/api/v1/services/" + serviceDefId + "/photo")
+                        .with(authenticatedAs(UUID.randomUUID(), "other@beautica.test", Role.SALON_OWNER))
+                        .with(csrf()))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(mediaService);
     }
 
     // ── MEDIUM-2: empty-string name guard ─────────────────────────────────────
@@ -2325,42 +2344,6 @@ class ServiceControllerTest {
                         .with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"\"}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    // ── MEDIUM-3: tightened photo URL pattern ─────────────────────────────────
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl is 'https:// ' (bare scheme with space, MEDIUM-3)")
-    void should_return400_when_photoUrlIsHttpsSpaceOnly() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with photoUrl='https:// ' — @Pattern must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https:// \"}"))
-                .andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("PATCH /services/{id}/photo — 400 when photoUrl has no host after scheme (MEDIUM-3)")
-    void should_return400_when_photoUrlHasNoHost() throws Exception {
-        var userId = UUID.randomUUID();
-        var serviceDefId = UUID.randomUUID();
-
-        when(authorizationService.canManageServiceDefinition(any(), eq(serviceDefId))).thenReturn(true);
-
-        log.debug("Act: PATCH /api/v1/services/{}/photo with photoUrl='https://' — @Pattern must reject with 400", serviceDefId);
-        mockMvc.perform(patch("/api/v1/services/" + serviceDefId + "/photo")
-                        .with(authenticatedAs(userId, "owner@beautica.test", Role.SALON_OWNER))
-                        .with(csrf())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"photoUrl\":\"https://\"}"))
                 .andExpect(status().isBadRequest());
     }
 

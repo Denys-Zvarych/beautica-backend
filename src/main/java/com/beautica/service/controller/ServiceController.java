@@ -11,7 +11,7 @@ import com.beautica.service.dto.SalonServiceCatalogResponse;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
-import com.beautica.service.dto.UpdateServicePhotoRequest;
+import com.beautica.media.service.MediaService;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
@@ -23,6 +23,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.data.domain.PageRequest;
@@ -37,6 +38,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.UUID;
@@ -171,6 +173,7 @@ public class ServiceController {
                     + "machine-readable code.";
 
     private final ServiceCatalogService serviceCatalogService;
+    private final MediaService mediaService;
     private final MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
     private final SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
 
@@ -713,28 +716,36 @@ public class ServiceController {
     }
 
     /**
-     * Sets or replaces the photo URL for a service definition.
-     *
-     * <p>Accepts a presigned Cloudflare R2 URL or any direct HTTPS URL. Validation
-     * enforces {@code https://} scheme and a 2048-character length cap at the DTO
-     * boundary (anti-bug §A URL-field rule).
+     * Uploads (sets or replaces) the single photo of a service definition as multipart/form-data
+     * (Phase 342). Validation (JPEG/PNG/WebP by magic bytes, 5 MB), R2 storage and the 503-when-storage-off
+     * guard live in {@link MediaService}; this method is HTTP only.
      */
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
-            // Same lone-@ApiResponse guard as every other write endpoint in this file — see
-            // assignServiceToMaster above.
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "200", useReturnTypeSchema = true),
             @io.swagger.v3.oas.annotations.responses.ApiResponse(
                     responseCode = "429", description = RATE_LIMITED_429)
     })
-    @PatchMapping("/services/{serviceDefId}/photo")
+    @PostMapping(value = "/services/{serviceDefId}/photo", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
-    public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> updateServicePhoto(
+    public ResponseEntity<ApiResponse<ServiceDefinitionResponse>> uploadServicePhoto(
             @PathVariable UUID serviceDefId,
-            @Valid @RequestBody UpdateServicePhotoRequest request
+            @Parameter(content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE))
+            @RequestParam("file") MultipartFile file
     ) {
-        ServiceDefinitionResponse response =
-                serviceCatalogService.updateServicePhoto(serviceDefId, request.photoUrl());
-        return ResponseEntity.ok(ApiResponse.ok(response));
+        return ResponseEntity.ok(ApiResponse.ok(mediaService.uploadServicePhoto(serviceDefId, file)));
+    }
+
+    /** Removes the service photo and its R2 blob. Idempotent — 204 even when there is no photo. */
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "204"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429", description = RATE_LIMITED_429)
+    })
+    @DeleteMapping("/services/{serviceDefId}/photo")
+    @PreAuthorize("@authz.canManageServiceDefinition(authentication, #serviceDefId)")
+    public ResponseEntity<Void> deleteServicePhoto(@PathVariable UUID serviceDefId) {
+        mediaService.deleteServicePhoto(serviceDefId);
+        return ResponseEntity.noContent().build();
     }
 }

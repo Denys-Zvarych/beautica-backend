@@ -178,6 +178,11 @@ class SalonServiceTest {
     @Mock
     private com.beautica.media.service.MediaService mediaService;
 
+    // Phase 342: deactivateSalon hands the uploaded-photo keys (read from the row-locked catalogue)
+    // to the shared purger after commit.
+    @Mock
+    private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
@@ -1358,6 +1363,60 @@ class SalonServiceTest {
         verify(salonRepository, never()).save(any());
         verify(salonRepository, never()).findById(any());
         verify(salonRepository, never()).existsByIdAndOwnerId(any(), any());
+        // Phase 342 D6: the catalogue is row-locked, pointers cleared, then blobs purged — nothing else.
+        verify(serviceRepository).lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId);
+        verify(serviceRepository).clearPhotosByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+        verify(serviceRepository).deactivateAllByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+        verify(servicePhotoBlobPurger).purgeAfterCommit(List.of());
+        org.mockito.Mockito.verifyNoMoreInteractions(serviceRepository, servicePhotoBlobPurger);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — row-locks the service catalogue BEFORE the booking decline cascade, the first masters read of the staff cascade, and the photo clear / deactivate (deadlock lock order)")
+    void should_lockServiceCatalogueBeforeAnyMastersWrite_when_deactivateSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        var order = org.mockito.Mockito.inOrder(serviceRepository, bookingService, masterRepository);
+        order.verify(serviceRepository).lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId);
+        order.verify(bookingService).declineFutureConfirmedBookingsForSalonClosure(ownerId, salonId);
+        order.verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(eq(salonId), any());
+        order.verify(serviceRepository).clearPhotosByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+        order.verify(serviceRepository).deactivateAllByOwner(com.beautica.service.entity.OwnerType.SALON, salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — purges exactly the photo keys read from the locked catalogue rows, skipping rows without a photo")
+    void should_purgeLockedPhotoKeys_when_deactivateSalon() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        UUID withPhotoId = UUID.randomUUID();
+        var withPhoto = org.mockito.Mockito.mock(com.beautica.service.entity.ServiceDefinition.class);
+        when(withPhoto.getId()).thenReturn(withPhotoId);
+        when(withPhoto.getPhotoR2Key()).thenReturn("services/abc/photo.jpg");
+        var withoutPhoto = org.mockito.Mockito.mock(com.beautica.service.entity.ServiceDefinition.class);
+        when(withoutPhoto.getPhotoR2Key()).thenReturn(null);
+
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+        when(serviceRepository.lockAllByOwnerOrderById(com.beautica.service.entity.OwnerType.SALON, salonId))
+                .thenReturn(List.of(withPhoto, withoutPhoto));
+
+        salonService.deactivateSalon(ownerId, salonId);
+
+        verify(servicePhotoBlobPurger).purgeAfterCommit(List.of(
+                new com.beautica.service.service.ServicePhotoBlobPurger.ServicePhotoBlob(
+                        withPhotoId, "services/abc/photo.jpg")));
     }
 
     @Test

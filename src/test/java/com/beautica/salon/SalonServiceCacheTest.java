@@ -164,6 +164,8 @@ class SalonServiceCacheTest {
     @MockBean com.beautica.favorite.repository.FavoriteRepository favoriteRepository;
     @MockBean com.beautica.media.repository.MediaRepository mediaRepository;
     @MockBean com.beautica.media.service.MediaService mediaService;
+    // Phase 342: deactivateSalon purges uploaded service-photo blobs via the shared purger.
+    @MockBean com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
     // Commit ac0a19e: SalonService now constructor-depends on MasterScheduleService (parameter 8)
     // and ScheduleDateMath (parameter 9) for the salon-staff schedule read-through. WITHOUT BOTH
     // the whole context fails to load with "No qualifying bean of type ..." — and supplying only

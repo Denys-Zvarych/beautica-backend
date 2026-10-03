@@ -15,6 +15,12 @@ import com.beautica.media.entity.MediaType;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.service.dto.ServiceDefinitionResponse;
+import com.beautica.service.entity.OwnerType;
+import com.beautica.service.entity.ServiceDefinition;
+import com.beautica.service.repository.ServiceRepository;
+import com.beautica.service.service.ServiceCatalogService;
+import com.beautica.service.service.ServicePhotoBlobPurger;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -119,6 +125,9 @@ public class MediaService {
     private final TransactionTemplate txRead;
     private final TransactionTemplate txWrite;
     private final CacheManager cacheManager;
+    private final ServiceRepository serviceRepo;
+    private final ServiceCatalogService serviceCatalogService;
+    private final ServicePhotoBlobPurger servicePhotoBlobPurger;
 
     @Autowired
     public MediaService(R2StorageService r2,
@@ -128,7 +137,10 @@ public class MediaService {
                         MasterRepository masterRepo,
                         Clock clock,
                         PlatformTransactionManager transactionManager,
-                        CacheManager cacheManager) {
+                        CacheManager cacheManager,
+                        ServiceRepository serviceRepo,
+                        ServiceCatalogService serviceCatalogService,
+                        ServicePhotoBlobPurger servicePhotoBlobPurger) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -141,6 +153,9 @@ public class MediaService {
         this.txWrite = new TransactionTemplate(transactionManager);
         this.txWrite.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.cacheManager = cacheManager;
+        this.serviceRepo = serviceRepo;
+        this.serviceCatalogService = serviceCatalogService;
+        this.servicePhotoBlobPurger = servicePhotoBlobPurger;
     }
 
     /**
@@ -156,7 +171,10 @@ public class MediaService {
                  Clock clock,
                  TransactionTemplate txRead,
                  TransactionTemplate txWrite,
-                 CacheManager cacheManager) {
+                 CacheManager cacheManager,
+                 ServiceRepository serviceRepo,
+                 ServiceCatalogService serviceCatalogService,
+                 ServicePhotoBlobPurger servicePhotoBlobPurger) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -166,6 +184,9 @@ public class MediaService {
         this.txRead = txRead;
         this.txWrite = txWrite;
         this.cacheManager = cacheManager;
+        this.serviceRepo = serviceRepo;
+        this.serviceCatalogService = serviceCatalogService;
+        this.servicePhotoBlobPurger = servicePhotoBlobPurger;
     }
 
     /**
@@ -243,6 +264,163 @@ public class MediaService {
             userRepo.save(u);
             return null;
         });
+    }
+
+    // ----------------------------------------------------------- service photo
+
+    /**
+     * Sets or replaces the single photo of a service definition (Phase 342). Authorization
+     * ({@code canManageServiceDefinition}) is enforced by the controller's {@code @PreAuthorize}; an
+     * inactive definition (or one whose salon is inactive) answers 404 like every other service endpoint.
+     *
+     * <p><b>Deliberately NOT the avatar flow's "SEC-2 ordering"</b> (delete old blob, upload new, write
+     * row). That order loses the old photo when the upload fails, and two concurrent uploads both read the
+     * same old key so one orphans a blob. This flow is instead:
+     * <ol>
+     *   <li>read-gate (404 when inactive), no lock held;</li>
+     *   <li>upload the NEW blob under a fresh unique key, outside any transaction;</li>
+     *   <li>{@code txWrite}: row-lock the definition ({@code FOR UPDATE}), re-check it is still active
+     *       (race with deactivate), read the CURRENT key (whatever a concurrent upload committed), write
+     *       the new key/url;</li>
+     *   <li>after commit, delete exactly that superseded key via {@link ServicePhotoBlobPurger}
+     *       (best-effort — a failure is an accepted orphan, never a lost photo);</li>
+     *   <li>if the write fails or the definition went inactive, delete the NEW blob best-effort and
+     *       rethrow, so the old photo and its pointer stay intact — but ONLY after re-reading the row and
+     *       confirming it does not reference the new key (see {@link #discardBlobUnlessCommitted}): a
+     *       failure surfacing from the COMMIT acknowledgement may have actually committed.</li>
+     * </ol>
+     * Because unique keys are never reused and every committed writer deletes the key it replaced under
+     * the row lock, N concurrent uploads leave exactly one live blob.
+     */
+    public ServiceDefinitionResponse uploadServicePhoto(UUID serviceDefId, MultipartFile file) {
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadServicePhotoSniffed(serviceDefId, file, upload);
+        }
+    }
+
+    private ServiceDefinitionResponse uploadServicePhotoSniffed(
+            UUID serviceDefId, MultipartFile file, SniffedUpload upload) {
+        requireActiveServiceDefinition(serviceDefId);
+
+        String newKey = buildKey("services/" + serviceDefId + "/", upload.mime());
+        r2.uploadFile(newKey, upload.stream(), file.getSize(), upload.mime());
+        String newUrl = r2.buildPublicUrl(newKey);
+
+        PhotoResult result;
+        try {
+            result = txWrite.execute(status -> replacePhotoLocked(serviceDefId, newKey, newUrl));
+        } catch (RuntimeException ex) {
+            discardBlobUnlessCommitted(serviceDefId, newKey);
+            throw ex;
+        }
+
+        // Post-commit by construction (txWrite.execute returned) — same cache set the former PATCH evicted.
+        serviceCatalogService.evictServicePhotoCaches(serviceDefId, result.ownerType(), result.ownerId());
+        return result.body();
+    }
+
+    /** Locked write step of the replace: runs inside {@code txWrite}. */
+    private PhotoResult replacePhotoLocked(UUID serviceDefId, String newKey, String newUrl) {
+        ServiceDefinition definition = lockActiveDefinition(serviceDefId);
+        String supersededKey = definition.getPhotoR2Key();
+        definition.setPhotoR2Key(newKey);
+        definition.setPhotoUrl(newUrl);
+        ServiceDefinition saved = serviceRepo.save(definition);
+        // Registered as an afterCommit hook (we are inside txWrite); a rolled-back write never fires it.
+        servicePhotoBlobPurger.purgeAfterCommit(serviceDefId, supersededKey);
+        return toPhotoResult(saved);
+    }
+
+    /**
+     * Removes a service definition's photo. Idempotent: a definition with no photo is a no-op (204, no R2
+     * call). DB pointers are cleared FIRST under the row lock; the blob (by stored KEY) is deleted after
+     * commit via {@link ServicePhotoBlobPurger}, so an R2 failure still leaves the DB cleared (accepted
+     * orphan) and never a live pointer to a deleted blob. A legacy row (URL, no key) has its URL cleared
+     * and nothing deleted in R2.
+     */
+    public void deleteServicePhoto(UUID serviceDefId) {
+        requireActiveServiceDefinition(serviceDefId);
+
+        PhotoCleared cleared = txWrite.execute(status -> {
+            ServiceDefinition definition = lockActiveDefinition(serviceDefId);
+            if (definition.getPhotoR2Key() == null && definition.getPhotoUrl() == null) {
+                return null;
+            }
+            String key = definition.getPhotoR2Key();
+            definition.setPhotoR2Key(null);
+            definition.setPhotoUrl(null);
+            serviceRepo.save(definition);
+            servicePhotoBlobPurger.purgeAfterCommit(serviceDefId, key);
+            return new PhotoCleared(definition.getOwnerType(), definition.getOwnerId());
+        });
+
+        if (cleared != null) {
+            serviceCatalogService.evictServicePhotoCaches(serviceDefId, cleared.ownerType(), cleared.ownerId());
+        }
+    }
+
+    /** Read-gate: 404 unless the definition AND (for a salon-owned one) its salon are active. */
+    private void requireActiveServiceDefinition(UUID serviceDefId) {
+        txRead(() -> serviceRepo.findIdIfDefinitionAndOwnerActive(serviceDefId)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId)));
+    }
+
+    /**
+     * Row-locks the definition and re-checks it is still active — the in-lock half of the 404 rule (a
+     * deactivate that committed between the read-gate and here). An owning salon's deactivation
+     * deactivates all its definitions in the same transaction, so the definition's own flag covers it.
+     */
+    private ServiceDefinition lockActiveDefinition(UUID serviceDefId) {
+        return serviceRepo.findByIdForUpdate(serviceDefId)
+                .filter(ServiceDefinition::isActive)
+                .orElseThrow(() -> new NotFoundException("Service definition not found: " + serviceDefId));
+    }
+
+    /**
+     * Failure cleanup for the replace. A {@link RuntimeException} out of {@code txWrite.execute} does not
+     * prove the write rolled back: a failure on the COMMIT acknowledgement (connection drop, timeout) can
+     * leave the new key committed, and deleting that blob would leave the row pointing at a deleted object.
+     * So rather than classify exceptions as pre- or post-commit, re-read the row's current key in a fresh
+     * read transaction and delete the new blob ONLY when the row is positively known NOT to reference it.
+     * If the re-read itself fails the outcome is unknown, so the blob is kept: an orphaned blob is an
+     * accepted, harmless leak, a dangling pointer is user-visible data loss.
+     */
+    private void discardBlobUnlessCommitted(UUID serviceDefId, String newKey) {
+        boolean referenced;
+        try {
+            referenced = txRead(() -> serviceRepo.findById(serviceDefId)
+                    .map(ServiceDefinition::getPhotoR2Key)
+                    .filter(newKey::equals)
+                    .isPresent());
+        } catch (RuntimeException readEx) {
+            log.warn("Could not verify service photo commit state; keeping new blob (key=[key omitted]): {}",
+                    readEx.getClass().getSimpleName());
+            return;
+        }
+        if (!referenced) {
+            discardUnreferencedBlob(newKey);
+        }
+    }
+
+    /** Best-effort delete of a freshly uploaded blob that no committed row references. */
+    private void discardUnreferencedBlob(String key) {
+        try {
+            r2.deleteFile(key);
+        } catch (RuntimeException cleanupEx) {
+            // Key embeds the definition UUID — omit it from the log.
+            log.warn("Failed to discard unreferenced service photo blob (key=[key omitted]): {}",
+                    cleanupEx.getClass().getSimpleName());
+        }
+    }
+
+    private record PhotoCleared(OwnerType ownerType, UUID ownerId) {}
+
+    private record PhotoResult(ServiceDefinitionResponse body,
+                               OwnerType ownerType, UUID ownerId) {}
+
+    private static PhotoResult toPhotoResult(ServiceDefinition saved) {
+        return new PhotoResult(ServiceDefinitionResponse.from(saved), saved.getOwnerType(), saved.getOwnerId());
     }
 
     // --------------------------------------------------------------- portfolio
