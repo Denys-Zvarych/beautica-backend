@@ -2,6 +2,7 @@ package com.beautica.service.service;
 
 import com.beautica.booking.repository.BookingRepository;
 import com.beautica.common.exception.BusinessException;
+import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.common.exception.DuplicateServiceException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -882,7 +883,7 @@ public class ServiceCatalogService {
             // only the exception's simple class name, at DEBUG, for server-side triage.
             log.debug("Bulk-setup lock wait exceeded lock_timeout: {}", ex.getClass().getSimpleName());
             throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "Service setup is busy for this master, please retry");
+                    ServiceUnavailableMessages.SERVICE_SETUP_BUSY);
         }
         if (lockResult == null) {
             throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR,

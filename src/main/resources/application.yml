@@ -237,6 +237,8 @@ app:
     secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:}
     bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
     endpoint: ${CLOUDFLARE_R2_ENDPOINT:}
+    # Endpoint host must end with .r2.cloudflarestorage.com unless this opt-out is true.
+    allow-custom-endpoint: ${CLOUDFLARE_R2_ALLOW_CUSTOM_ENDPOINT:false}
     public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
   firebase:
     service-account: ${FIREBASE_SERVICE_ACCOUNT:}

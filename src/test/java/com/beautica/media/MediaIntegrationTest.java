@@ -1,8 +1,6 @@
 package com.beautica.media;
 
-import com.beautica.common.ApiResponse;
 import com.beautica.config.TestSecurityConfig;
-import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.repository.MediaRepository;
@@ -100,6 +98,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void configureClientAndR2() {
+        when(r2StorageService.isEnabled()).thenReturn(true);
         when(r2StorageService.buildPublicUrl(anyString()))
                 .thenAnswer(inv -> "https://cdn.example/" + inv.getArgument(0));
         doNothing().when(r2StorageService).uploadFile(anyString(), any(), anyLong(), anyString());
@@ -328,42 +327,5 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         assertThat(populatedItems)
                 .as("second GET — cache must have been evicted on upload, exposing the new row")
                 .hasSize(1);
-    }
-
-    // ── Fix 7 — r2Enabled=false shape test ───────────────────────────────────
-
-    @Test
-    @DisplayName("POST /media/avatar — 200 with valid avatarUrl shape when R2 is disabled (mock mode)")
-    void should_returnExpectedShape_when_r2IsDisabled_onAvatarUpload() throws Exception {
-        // Arrange — R2StorageService is @MockBean; buildPublicUrl returns a stub URL
-        // (configured in @BeforeEach). This exercises the full controller → service path
-        // with the feature-flag-disabled no-op stubs, confirming the response shape.
-        String email = "media-it-r2-off-" + System.nanoTime() + "@beautica.test";
-        insertClient(email);
-        String token = loginAndGetToken(email);
-
-        // Act
-        ResponseEntity<String> resp = restTemplate.exchange(
-                AVATAR_URL, HttpMethod.POST,
-                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)),
-                String.class);
-
-        // Assert — HTTP status
-        assertThat(resp.getStatusCode())
-                .as("avatar upload in disabled-R2 mode must still return 200")
-                .isEqualTo(HttpStatus.OK);
-
-        // Assert — response body shape
-        var body = objectMapper.readValue(
-                resp.getBody(), new TypeReference<ApiResponse<AvatarResponse>>() {});
-        assertThat(body.success())
-                .as("ApiResponse.success must be true")
-                .isTrue();
-        assertThat(body.data())
-                .as("AvatarResponse must be present")
-                .isNotNull();
-        assertThat(body.data().avatarUrl())
-                .as("avatarUrl must be non-blank — stub buildPublicUrl returns https://cdn.example/...")
-                .isNotBlank();
     }
 }

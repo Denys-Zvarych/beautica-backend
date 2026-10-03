@@ -311,6 +311,9 @@ public class GlobalExceptionHandler {
             // constants, SQL, IDs, or bound values — so echoing ex.getMessage() here is
             // safe and intended, unlike the genericised CONFLICT/BAD_REQUEST branches.
             case UNPROCESSABLE_ENTITY -> ex.getMessage();
+            // 503: echo only allow-listed fixed strings (ServiceUnavailableMessages); anything
+            // else collapses to a generic message so an ad-hoc 503 can never leak internals.
+            case SERVICE_UNAVAILABLE -> ServiceUnavailableMessages.safe(ex.getMessage());
             default -> "Request could not be completed";
         };
         return ResponseEntity

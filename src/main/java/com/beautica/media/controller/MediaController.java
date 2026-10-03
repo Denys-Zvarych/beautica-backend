@@ -8,7 +8,10 @@ import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.service.MediaService;
 import lombok.RequiredArgsConstructor;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -57,9 +60,10 @@ public class MediaController {
      * Replace the authenticated user's avatar. Any role may call this — every
      * user has exactly one avatar slot keyed by the JWT principal.
      */
-    @PostMapping("/media/avatar")
+    @PostMapping(value = "/media/avatar", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @PreAuthorize("isAuthenticated()")
     public ApiResponse<AvatarResponse> uploadAvatar(
+            @Parameter(content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE))
             @RequestParam("file") MultipartFile file,
             Authentication authentication
     ) {
@@ -77,10 +81,11 @@ public class MediaController {
 
     // ── portfolio (uploads — SALON_OWNER + INDEPENDENT_MASTER only) ───────────
 
-    @PostMapping("/media/portfolio")
+    @PostMapping(value = "/media/portfolio", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @PreAuthorize("hasAnyRole('SALON_OWNER', 'INDEPENDENT_MASTER')")
     @ResponseStatus(HttpStatus.CREATED)
     public ApiResponse<MediaFileResponse> uploadPortfolioPhoto(
+            @Parameter(content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE))
             @RequestParam("file") MultipartFile file,
             Authentication authentication
     ) {

@@ -112,7 +112,6 @@ app:
     access-key-id: test
     secret-access-key: test
     bucket: test-bucket
-    endpoint: http://localhost:9000
   firebase:
     service-account: test
   frontend:

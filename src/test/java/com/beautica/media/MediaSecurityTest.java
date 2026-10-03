@@ -97,6 +97,7 @@ class MediaSecurityTest extends AbstractMediaIntegrationTest {
 
     @BeforeEach
     void seedFixtures() {
+        when(r2StorageService.isEnabled()).thenReturn(true);
         // Stub R2 so test paths do not fan out to a real bucket. buildPublicUrl
         // returns a deterministic URL so MediaFileResponse.url has a value.
         when(r2StorageService.buildPublicUrl(anyString()))

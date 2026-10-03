@@ -4,6 +4,7 @@ import com.beautica.auth.Role;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
+import com.beautica.common.exception.ServiceUnavailableMessages;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.media.dto.AvatarResponse;
@@ -33,6 +34,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.Clock;
@@ -53,15 +55,17 @@ import java.util.function.Supplier;
  * The resulting key matches the pattern {@code [A-Za-z0-9/_\-.]{1,256}}, so the
  * defense-in-depth key validator in {@code R2StorageService} is not required here.
  *
- * <p><b>Content-type spoofing defense.</b> {@link #detectMimeType(MultipartFile)} reads
+ * <p><b>Content-type spoofing defense.</b> {@link #openAndSniff(MultipartFile)} reads
  * the first 12 bytes of the file and matches against the magic-byte signatures for
  * JPEG, PNG, and WebP. SVG is intentionally rejected (it is XML and can carry
  * {@code <script>}). The detected MIME — never {@code file.getContentType()} — is
  * what gets passed to {@link R2StorageService#uploadFile} and stored as the extension.
  *
- * <p><b>Stream lifecycle.</b> {@code MultipartFile.getInputStream()} returns a fresh
- * stream on each call. The AWS SDK's {@code RequestBody.fromInputStream} does not
- * close the caller's stream, so every call site in this class uses try-with-resources.
+ * <p><b>Stream lifecycle.</b> The upload stream is opened ONCE per upload
+ * ({@code getInputStream()} is called a single time): it is wrapped in a {@code BufferedInputStream},
+ * sniffed with mark/reset and passed on, rewound, to R2. The AWS SDK's
+ * {@code RequestBody.fromInputStream} does not close the caller's stream, so the upload methods
+ * close it via try-with-resources on {@code SniffedUpload}.
  *
  * <p><b>Transaction scoping (Perf MEDIUM #1 + #2).</b> There is no class-level
  * {@link Transactional} annotation — R2 HTTP calls (which can block up to the 30 s
@@ -101,6 +105,7 @@ public class MediaService {
 
     /** Number of bytes inspected for the magic-byte check. WebP's signature needs the 9th–12th. */
     private static final int HEADER_BYTES = 12;
+    private static final int SNIFF_BUFFER_BYTES = 8192;
 
     /** Cache name for the public portfolio listing — must match {@code CacheConfig.cacheManager()}. */
     static final String PORTFOLIO_CACHE = "portfolio";
@@ -163,10 +168,27 @@ public class MediaService {
         this.cacheManager = cacheManager;
     }
 
+    /**
+     * Uploads must fail loudly when storage is off — otherwise an empty URL and a key for a
+     * non-existent blob would be persisted. Deletes stay no-ops (account/salon sweeps).
+     */
+    private void requireStorageEnabled() {
+        if (!r2.isEnabled()) {
+            throw new BusinessException(HttpStatus.SERVICE_UNAVAILABLE, ServiceUnavailableMessages.MEDIA_STORAGE_NOT_CONFIGURED);
+        }
+    }
+
     // ------------------------------------------------------------------ avatar
 
     public AvatarResponse uploadAvatar(UUID userId, MultipartFile file) {
-        String detectedMime = detectMimeType(file);
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadAvatarSniffed(userId, file, upload);
+        }
+    }
+
+    private AvatarResponse uploadAvatarSniffed(UUID userId, MultipartFile file, SniffedUpload upload) {
+        String detectedMime = upload.mime();
 
         // Step 1 — short read tx: capture the existing avatar key (if any). The
         // connection is released before any R2 call is made.
@@ -182,12 +204,7 @@ public class MediaService {
         }
 
         String newKey = buildKey("avatars/" + userId + "/", detectedMime);
-        try (InputStream in = file.getInputStream()) {
-            r2.uploadFile(newKey, in, file.getSize(), detectedMime);
-        } catch (IOException ex) {
-            log.error("Failed to read avatar upload stream for user={}: {}", userId, ex.getClass().getSimpleName());
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Failed to read uploaded file");
-        }
+        r2.uploadFile(newKey, upload.stream(), file.getSize(), detectedMime);
         String newUrl = r2.buildPublicUrl(newKey);
 
         // Step 3 — short write tx: persist the new key/url. Re-load the user inside the
@@ -231,7 +248,15 @@ public class MediaService {
     // --------------------------------------------------------------- portfolio
 
     public MediaFileResponse uploadPortfolioPhoto(UUID actorId, Role actorRole, MultipartFile file) {
-        String detectedMime = detectMimeType(file);
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadPortfolioSniffed(actorId, actorRole, file, upload);
+        }
+    }
+
+    private MediaFileResponse uploadPortfolioSniffed(
+            UUID actorId, Role actorRole, MultipartFile file, SniffedUpload upload) {
+        String detectedMime = upload.mime();
 
         // Step 1 — read tx: resolve the owning entity from the authenticated principal.
         // SEC-1: never trust a UUID from the request body — the salon/master is resolved
@@ -240,12 +265,7 @@ public class MediaService {
 
         // Step 2 — R2 upload OUTSIDE any transaction.
         String key = buildKey(target.prefix(), detectedMime);
-        try (InputStream in = file.getInputStream()) {
-            r2.uploadFile(key, in, file.getSize(), detectedMime);
-        } catch (IOException ex) {
-            log.error("Failed to read portfolio upload stream for user={}: {}", actorId, ex.getClass().getSimpleName());
-            throw new BusinessException(HttpStatus.BAD_REQUEST, "Failed to read uploaded file");
-        }
+        r2.uploadFile(key, upload.stream(), file.getSize(), detectedMime);
         String publicUrl = r2.buildPublicUrl(key);
 
         // Step 3 — write tx: insert the row.
@@ -709,13 +729,28 @@ public class MediaService {
     private record PortfolioTarget(EntityType entityType, UUID entityId, String prefix) {}
 
     /**
-     * Inspect the first {@value #HEADER_BYTES} bytes of the upload and resolve the
-     * canonical MIME type. Validates size and emptiness up-front. Never trusts
-     * {@code file.getContentType()} or {@code file.getOriginalFilename()}.
-     *
-     * @throws BusinessException with HTTP 400 for every rejection path
+     * The upload stream, opened exactly once, positioned at byte 0 after the magic-byte sniff,
+     * together with the detected MIME. The caller passes {@link #stream()} straight to R2 and
+     * closes this holder (which closes the stream).
      */
-    private String detectMimeType(MultipartFile file) {
+    private record SniffedUpload(String mime, InputStream stream) implements AutoCloseable {
+        @Override
+        public void close() {
+            try {
+                stream.close();
+            } catch (IOException ex) {
+                log.warn("Failed to close upload stream: {}", ex.getClass().getSimpleName());
+            }
+        }
+    }
+
+    /**
+     * Opens the upload stream once, sniffs the magic bytes (mark/reset on a
+     * {@link BufferedInputStream}) and returns the stream rewound to byte 0 with the detected MIME.
+     * The buffer is larger than {@link #HEADER_BYTES}, which is also the mark limit, so
+     * {@code reset()} can never fail.
+     */
+    private SniffedUpload openAndSniff(MultipartFile file) {
         if (file.isEmpty()) {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "File must not be empty");
         }
@@ -723,17 +758,39 @@ public class MediaService {
             throw new BusinessException(HttpStatus.BAD_REQUEST, "File exceeds 5 MB limit");
         }
 
-        byte[] header = new byte[HEADER_BYTES];
-        try (InputStream in = file.getInputStream()) {
-            int read = in.read(header, 0, HEADER_BYTES);
+        InputStream in = null;
+        try {
+            in = new BufferedInputStream(file.getInputStream(), SNIFF_BUFFER_BYTES);
+            in.mark(HEADER_BYTES);
+            byte[] header = new byte[HEADER_BYTES];
+            int read = in.readNBytes(header, 0, HEADER_BYTES);
             if (read < 4) {
                 throw new BusinessException(HttpStatus.BAD_REQUEST, "File too small");
             }
+            in.reset();
+            return new SniffedUpload(detectMimeType(header), in);
         } catch (IOException ex) {
+            closeQuietly(in);
             log.warn("Failed to read upload header: {}", ex.getClass().getSimpleName());
             throw new BusinessException(HttpStatus.BAD_REQUEST, "Failed to read uploaded file");
+        } catch (BusinessException ex) {
+            closeQuietly(in);
+            throw ex;
         }
+    }
 
+    private static void closeQuietly(InputStream in) {
+        if (in == null) {
+            return;
+        }
+        try {
+            in.close();
+        } catch (IOException ignored) {
+            // best effort — already failing the request
+        }
+    }
+
+    private String detectMimeType(byte[] header) {
         // JPEG: FF D8 FF
         if ((header[0] & 0xFF) == 0xFF
                 && (header[1] & 0xFF) == 0xD8

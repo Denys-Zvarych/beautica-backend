@@ -41,10 +41,16 @@ app:
     access-token-expiration: 3600000      # 1 hour in ms
     refresh-token-expiration: 2592000000  # 30 days in ms
   cloudflare-r2:
-    access-key-id: local
-    secret-access-key: local
-    bucket: beautica-media
-    endpoint: http://localhost:9000
+    # Real R2 dev bucket. scripts/start-backend.sh exports these from the out-of-repo
+    # secrets dir (r2.env); see docs/backend-phases/r2-local-setup-guide.md. Disabled by default.
+    enabled: ${R2_ENABLED:false}
+    account-id: ${CLOUDFLARE_R2_ACCOUNT_ID:}
+    access-key-id: ${CLOUDFLARE_R2_ACCESS_KEY_ID:}
+    secret-access-key: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:}
+    bucket: ${CLOUDFLARE_R2_BUCKET:beautica-media}
+    endpoint: ${CLOUDFLARE_R2_ENDPOINT:}
+    allow-custom-endpoint: ${CLOUDFLARE_R2_ALLOW_CUSTOM_ENDPOINT:false}
+    public-url: ${CLOUDFLARE_R2_PUBLIC_URL:}
   firebase:
     # Empty by default (push stays dark). scripts/start-backend.sh exports FIREBASE_SERVICE_ACCOUNT
     # (base64) + FIREBASE_ENABLED=true from the out-of-repo secrets dir when the file exists.

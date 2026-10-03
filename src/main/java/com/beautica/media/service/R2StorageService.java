@@ -85,7 +85,7 @@ public class R2StorageService {
 
         if (r2Enabled) {
             if (!StringUtils.hasText(bucketName)) {
-                throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.bucket-name is blank");
+                throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.bucket is blank");
             }
             if (!StringUtils.hasText(publicUrlPrefix)) {
                 throw new IllegalStateException("R2 is enabled but app.cloudflare-r2.public-url is blank");
@@ -95,6 +95,11 @@ public class R2StorageService {
             log.warn("R2StorageService disabled — uploadFile/deleteFile are no-ops, "
                     + "buildPublicUrl returns empty string");
         }
+    }
+
+    /** {@code true} when a real {@link S3Client} is wired (R2 enabled). */
+    public boolean isEnabled() {
+        return r2Enabled;
     }
 
     /**

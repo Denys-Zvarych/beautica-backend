@@ -178,12 +178,20 @@ class R2StorageServiceTest {
     }
 
     @Test
+    @DisplayName("isEnabled reflects whether an S3Client is wired")
+    void should_reflectFlag_when_isEnabledCalled() {
+        assertThat(new R2StorageService(Optional.empty(), BUCKET, PUBLIC_URL).isEnabled()).isFalse();
+        assertThat(new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL).isEnabled()).isTrue();
+    }
+
+    @Test
     @DisplayName("throws IllegalStateException when R2 is enabled and bucket name is blank")
     void should_throwIllegalState_when_r2EnabledAndBucketNameIsBlank() {
         assertThatThrownBy(() ->
                 new R2StorageService(Optional.of(s3Client), "", PUBLIC_URL))
             .isInstanceOf(IllegalStateException.class)
-            .hasMessageContaining("bucket-name");
+            .hasMessageContaining("app.cloudflare-r2.bucket is blank")
+            .hasMessageNotContaining("bucket-name");
     }
 
     @Test

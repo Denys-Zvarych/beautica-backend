@@ -145,9 +145,50 @@ class MediaServiceTest {
         // Phase 7.7 — portfolio cache eviction is a no-op in unit tests; the IT suite
         // exercises the real Caffeine cache. lenient() because not every existing test
         // hits a portfolio write path.
+        lenient().when(r2.isEnabled()).thenReturn(true);
         lenient().when(cacheManager.getCache("portfolio")).thenReturn(portfolioCache);
         lenient().when(portfolioCache.evictIfPresent(any())).thenReturn(true);
         service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager);
+    }
+
+    /** The storage-enabled probe ({@code isEnabled}) is allowed; any blob write/delete is not. */
+    private void verifyNoStorageWrites() {
+        verify(r2, never()).uploadFile(any(), any(), anyLong(), any());
+        verify(r2, never()).deleteFile(any());
+        verify(r2, never()).deleteFiles(any());
+        verify(r2, never()).buildPublicUrl(any());
+    }
+
+    // ------------------------------------------------- storage disabled (phase 341)
+
+    @Test
+    @DisplayName("uploadAvatar throws 503 and never touches the user row or R2 when storage is disabled")
+    void uploadAvatar_whenStorageDisabled_throws503_andDoesNotTouchUserRow() {
+        when(r2.isEnabled()).thenReturn(false);
+
+        assertThatThrownBy(() -> service.uploadAvatar(UUID.randomUUID(), jpegFile()))
+                .isInstanceOfSatisfying(BusinessException.class, ex -> {
+                    assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+                    assertThat(ex.getMessage()).isEqualTo("Media storage is not configured");
+                });
+
+        verifyNoInteractions(userRepo, mediaRepo);
+        verify(r2, never()).deleteFile(any());
+        verify(r2, never()).uploadFile(any(), any(), anyLong(), any());
+    }
+
+    @Test
+    @DisplayName("uploadPortfolioPhoto throws 503 and never touches repositories or R2 when storage is disabled")
+    void uploadPortfolioPhoto_whenStorageDisabled_throws503_andDoesNotTouchRows() {
+        when(r2.isEnabled()).thenReturn(false);
+
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.SALON_OWNER, jpegFile()))
+                .isInstanceOfSatisfying(BusinessException.class,
+                        ex -> assertThat(ex.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE));
+
+        verifyNoInteractions(userRepo, mediaRepo, salonRepo, masterRepo);
+        verify(r2, never()).deleteFile(any());
+        verify(r2, never()).uploadFile(any(), any(), anyLong(), any());
     }
 
     // ---------------------------------------------------------------- magic bytes
@@ -192,6 +233,44 @@ class MediaServiceTest {
     }
 
     @Test
+    @DisplayName("opens the upload stream exactly once and hands R2 the full payload from byte 0")
+    void should_openStreamOnce_andUploadFullPayload_when_avatarUploaded() throws Exception {
+        UUID userId = UUID.randomUUID();
+        when(userRepo.findById(userId)).thenReturn(Optional.of(newUser(userId)));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatar.jpg");
+        byte[] payload = new byte[64];
+        payload[0] = (byte) 0xFF;
+        payload[1] = (byte) 0xD8;
+        payload[2] = (byte) 0xFF;
+        payload[40] = 7;
+        MultipartFile file = org.mockito.Mockito.spy(
+                new MockMultipartFile("file", "a.jpg", "image/jpeg", payload));
+        java.util.concurrent.atomic.AtomicReference<byte[]> uploaded = new java.util.concurrent.atomic.AtomicReference<>();
+        org.mockito.Mockito.doAnswer(inv -> {
+            uploaded.set(((java.io.InputStream) inv.getArgument(1)).readAllBytes());
+            return null;
+        }).when(r2).uploadFile(anyString(), any(), anyLong(), eq("image/jpeg"));
+
+        service.uploadAvatar(userId, file);
+
+        verify(file, times(1)).getInputStream();
+        assertThat(uploaded.get()).isEqualTo(payload);
+    }
+
+    @Test
+    @DisplayName("opens the upload stream exactly once on the portfolio path too")
+    void should_openStreamOnce_when_portfolioUploadRejectedAfterSniff() throws Exception {
+        MultipartFile file = org.mockito.Mockito.spy(
+                new MockMultipartFile("file", "a.svg", "image/svg+xml", "<svg xmlns='x'/>".getBytes()));
+
+        assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.SALON_OWNER, file))
+                .isInstanceOf(BusinessException.class);
+
+        verify(file, times(1)).getInputStream();
+        verify(r2, never()).uploadFile(any(), any(), anyLong(), any());
+    }
+
+    @Test
     @DisplayName("rejects unknown magic bytes (SVG content)")
     void should_throw400_when_fileMagicBytesAreUnrecognized() {
         MultipartFile svg = new MockMultipartFile(
@@ -202,7 +281,7 @@ class MediaServiceTest {
         assertThatThrownBy(() -> service.uploadAvatar(UUID.randomUUID(), svg))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unsupported image format");
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
     }
 
     @Test
@@ -216,7 +295,7 @@ class MediaServiceTest {
         assertThatThrownBy(() -> service.uploadAvatar(UUID.randomUUID(), spoofed))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("Unsupported image format");
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
     }
 
     @Test
@@ -232,7 +311,7 @@ class MediaServiceTest {
         assertThatThrownBy(() -> service.uploadAvatar(UUID.randomUUID(), huge))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("5 MB");
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
     }
 
     @Test
@@ -243,7 +322,7 @@ class MediaServiceTest {
         assertThatThrownBy(() -> service.uploadAvatar(UUID.randomUUID(), empty))
                 .isInstanceOf(BusinessException.class)
                 .hasMessageContaining("must not be empty");
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
     }
 
     // -------------------------------------------------------------------- avatar
@@ -323,7 +402,7 @@ class MediaServiceTest {
 
         service.deleteAvatar(userId);
 
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
         verify(userRepo, never()).save(any(User.class));
     }
 
@@ -439,7 +518,7 @@ class MediaServiceTest {
         assertThatThrownBy(() -> service.uploadPortfolioPhoto(UUID.randomUUID(), Role.CLIENT, jpegFile()))
                 .isInstanceOf(ForbiddenException.class);
 
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
         verifyNoInteractions(mediaRepo);
     }
 
@@ -692,7 +771,7 @@ class MediaServiceTest {
 
         service.deleteByUploader(uploaderId);
 
-        verifyNoInteractions(r2);
+        verifyNoStorageWrites();
     }
 
     @Test
