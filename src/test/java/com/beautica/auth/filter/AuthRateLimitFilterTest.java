@@ -75,6 +75,27 @@ class AuthRateLimitFilterTest {
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
+    private static LoadingCache<String, Bucket> realBuckets(long capacity) {
+        return com.github.benmanes.caffeine.cache.Caffeine.newBuilder().build(key -> Bucket.builder()
+                .addLimit(io.github.bucket4j.BandwidthBuilder.builder()
+                        .capacity(capacity)
+                        .refillIntervally(capacity, java.time.Duration.ofMinutes(1))
+                        .build())
+                .build());
+    }
+
+    /** Real filter whose media bucket holds {@code mediaCapacity} tokens; all 21 other buckets permissive. */
+    private static AuthRateLimitFilter filterWithMediaCapacity(long mediaCapacity) {
+        long open = 1_000_000;
+        return new AuthRateLimitFilter(
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(mediaCapacity), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
+                realBuckets(open), realBuckets(open));
+    }
+
     private MockHttpServletRequest postRequest(String uri) {
         var req = new MockHttpServletRequest("POST", uri);
         req.setRemoteAddr(REMOTE_ADDR);
@@ -346,6 +367,118 @@ class AuthRateLimitFilterTest {
             assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/portfolio")).isFalse();
             assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons//media/logo")).isFalse();
             assertThat(AuthRateLimitFilter.isSalonImagePath(null)).isFalse();
+        }
+
+        @Test
+        @DisplayName("Phase 342: POST /api/v1/services/{id}/photo returns 429 when mediaUploadBuckets is exhausted")
+        void should_return429_when_servicePhotoUploadExceedsBucket() throws Exception {
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(postRequest("/api/v1/services/" + java.util.UUID.randomUUID() + "/photo"), response, chain);
+
+            assertThat(response.getStatus())
+                    .as("an exhausted media bucket must 429 the service photo upload")
+                    .isEqualTo(429);
+            assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+            assertThat(response.getContentAsString()).isEqualTo("{\"error\":\"Too many requests\"}");
+            assertThat(chain.getRequest()).isNull();
+            verifyNoInteractions(serviceWriteBuckets);
+        }
+
+        @Test
+        @DisplayName("Phase 342: DELETE /api/v1/services/{id}/photo routes to mediaUploadBuckets, not serviceWriteBuckets")
+        void should_routeToMediaUploadBuckets_when_deleteServicePhoto() throws Exception {
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+            var chain = new MockFilterChain();
+
+            doFilter(deleteRequest("/api/v1/services/" + java.util.UUID.randomUUID() + "/photo"),
+                    new MockHttpServletResponse(), chain);
+
+            assertThat(chain.getRequest()).isNotNull();
+            verify(mediaUploadBuckets).get(REMOTE_ADDR);
+            verifyNoInteractions(serviceWriteBuckets);
+        }
+
+        @Test
+        @DisplayName("Phase 342: PATCH/DELETE /api/v1/services/{id} stay on serviceWriteBuckets")
+        void should_routeToServiceWriteBuckets_when_serviceDefMutateWithoutPhoto() throws Exception {
+            when(serviceWriteBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+            String path = "/api/v1/services/" + java.util.UUID.randomUUID();
+            var patch = new MockHttpServletRequest("PATCH", path);
+            patch.setRemoteAddr(REMOTE_ADDR);
+
+            doFilter(patch, new MockHttpServletResponse(), new MockFilterChain());
+            doFilter(deleteRequest(path), new MockHttpServletResponse(), new MockFilterChain());
+
+            verify(serviceWriteBuckets, times(2)).get(REMOTE_ADDR);
+            verifyNoInteractions(mediaUploadBuckets);
+        }
+
+        @org.junit.jupiter.params.ParameterizedTest(name = "POST {0} is charged to mediaUploadBuckets")
+        @org.junit.jupiter.params.provider.ValueSource(strings = {
+                "/api/v1/services/DEF/photo/",
+                "/api/v1/services/DEF/photo;jsessionid=abc",
+                "/api/v1/services/DEF;x=1/photo",
+                "/api/v1/services/DEF/phot%6f",
+                "/api/v1/services/DEF%2Fphoto",
+                "/api/v1/services/DEF/./photo",
+                "/api/v1/services/DEF/x/../photo",
+                "/api/v1//services/DEF//photo"
+        })
+        @DisplayName("Phase 342: encoded / trailing-slash / matrix / dot-segment spellings cannot bypass the media bucket")
+        void should_return429_when_servicePhotoPathVariantExceedsBucket(String template) throws Exception {
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(false);
+            var response = new MockHttpServletResponse();
+            var chain    = new MockFilterChain();
+
+            doFilter(postRequest(template.replace("DEF", java.util.UUID.randomUUID().toString())), response, chain);
+
+            assertThat(response.getStatus())
+                    .as("%s must normalise onto the service photo route and hit the exhausted media bucket", template)
+                    .isEqualTo(429);
+            assertThat(chain.getRequest()).isNull();
+        }
+
+        @Test
+        @DisplayName("Phase 342: isServicePhotoPath matches exactly /services/{id}/photo")
+        void should_matchOnlyServicePhotoShape_when_isServicePhotoPathChecked() {
+            String id = java.util.UUID.randomUUID().toString();
+
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services/" + id + "/photo")).isTrue();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services/" + id + "/photo/")).isTrue();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services/" + id)).isFalse();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services/" + id + "/photos")).isFalse();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services/" + id + "/photo/x")).isFalse();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services//photo")).isFalse();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/services/photo")).isFalse();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath("/api/v1/service-types/" + id + "/photo")).isFalse();
+            assertThat(AuthRateLimitFilter.isServicePhotoPath(null)).isFalse();
+        }
+
+        @Test
+        @DisplayName("Phase 342: service photo uploads share ONE per-IP bucket with avatar uploads")
+        void should_shareMediaBucketWithAvatar_when_avatarAndServicePhotoUploadsAreMixed() throws Exception {
+            // Real 2-token media bucket; every other bucket is permissive, so a 429 can only come
+            // from mediaUploadBuckets. Rotating avatar -> service photo must not double the budget.
+            AuthRateLimitFilter realFilter = filterWithMediaCapacity(2);
+            String photoPath = "/api/v1/services/" + java.util.UUID.randomUUID() + "/photo";
+            realFilter.doFilterInternal(postRequest("/api/v1/media/avatar"),
+                    new MockHttpServletResponse(), new MockFilterChain());
+            realFilter.doFilterInternal(postRequest(photoPath),
+                    new MockHttpServletResponse(), new MockFilterChain());
+            var third = new MockHttpServletResponse();
+
+            realFilter.doFilterInternal(postRequest(photoPath), third, new MockFilterChain());
+
+            assertThat(third.getStatus())
+                    .as("avatar + service photo must drain the same capacity-2 media bucket")
+                    .isEqualTo(429);
         }
 
         @Test

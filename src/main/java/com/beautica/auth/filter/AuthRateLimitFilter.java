@@ -89,10 +89,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     //        prefix+suffix rule covers the salon-side single-creates (same technique as
     //        BULK_SALON_SERVICES above). It cannot collide with the bulk route, which ends in
     //        "/services/bulk", nor with the salon-invite route, which ends in "/invite".
-    //   3. prefix PATCH/DELETE /api/v1/services/{serviceDefId} and .../{serviceDefId}/photo
-    //      — one prefix covers the update, photo-update and deactivate routes. It cannot collide
+    //   3. prefix PATCH/DELETE /api/v1/services/{serviceDefId}
+    //      — one prefix covers the update and deactivate routes. It cannot collide
     //        with /api/v1/service-categories/** or /api/v1/service-types/**, which do not start
     //        with the literal "services/" segment.
+    //      The photo routes POST/DELETE /api/v1/services/{serviceDefId}/photo are NOT in this
+    //      bucket: they are R2 image writes and share mediaUploadBuckets (see isServicePhotoPath),
+    //      matched by the earlier media branch so this prefix rule never sees them.
     //
     // Phase 309 added GET /api/v1/salons/{salonId}/masters/{masterId}/services (the salon
     // management read) at the SAME prefix+suffix as shape 2's salon single-create POST. It does
@@ -118,6 +121,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // prefix+suffix check is unambiguous here — no disambiguation helper needed.
     private static final String MASTER_SERVICES_PATH_SUFFIX = "/services";
     private static final String SERVICE_DEF_WRITE_PATH_PREFIX = "/api/v1/services/";
+    // Phase 342 service photo: POST/DELETE /api/v1/services/{serviceDefId}/photo. Same R2 upload cost
+    // class as /api/v1/media/*, so it shares mediaUploadBuckets (see isServicePhotoPath).
+    private static final String SERVICE_PHOTO_SEGMENT = "/photo";
     // Salon-scoped invite POST carries the {salonId} variable, so it is matched by prefix +
     // suffix (same technique as BULK_SALON_SERVICES above): /api/v1/salons/{salonId}/invite.
     // This is the actual HTTP path SalonController.inviteMaster exposes to SALON_OWNER and
@@ -529,7 +535,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // rejects a repeat caller), so an authenticated token-holder is a DoS amplifier
     // without this guard (10/min).
     private final LoadingCache<String, Bucket> bulkServiceSetupBuckets;
-    // Per-IP bucket for the SINGLE-item service write routes (create / update / photo / delete).
+    // Per-IP bucket for the SINGLE-item service write routes (create / update / delete). The
+    // service photo routes are R2 uploads and draw on mediaUploadBuckets instead.
     // Every one of them was previously unthrottled, which made single-create a strictly BETTER
     // service_definitions row-growth lever than the bulk endpoint bulkServiceSetupBuckets caps —
     // and one that skips the per-master advisory lock too. 60/min; see
@@ -916,6 +923,24 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 && tail.indexOf('/', SALON_IMAGE_SEGMENT.length()) < 0;
     }
 
+    /**
+     * True for exactly {@code /api/v1/services/{serviceDefId}/photo} — one non-empty {@code {serviceDefId}}
+     * segment followed by the literal {@code photo} segment, tolerating one trailing {@code /} (Phase 342).
+     * The input is the already decoded/normalized match path (see {@link #resolveMatchPath}), so
+     * {@code %2F}, {@code ;matrix} and {@code ./} spellings arrive here in canonical form.
+     */
+    static boolean isServicePhotoPath(String path) {
+        if (path == null || !path.startsWith(SERVICE_DEF_WRITE_PATH_PREFIX)) {
+            return false;
+        }
+        String rest = path.substring(SERVICE_DEF_WRITE_PATH_PREFIX.length());
+        if (rest.endsWith("/")) {
+            rest = rest.substring(0, rest.length() - 1);
+        }
+        int idEnd = rest.indexOf('/');
+        return idEnd > 0 && rest.substring(idEnd).equals(SERVICE_PHOTO_SEGMENT);
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
@@ -938,8 +963,13 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // rate-limited here — they're read-only and cached behind R2/CDN.
         // Phase 343: the salon logo/cover routes (/api/v1/salons/{salonId}/media/{slot}) share the same
         // bucket — one R2 upload per call, same abuse profile as the avatar.
+        // Phase 342: the service photo routes (/api/v1/services/{serviceDefId}/photo) join it too —
+        // POST uploads up to 6 MB to R2 and DELETE removes the R2 object, mirroring avatar POST/DELETE.
+        // Matched here, before the service-write PATCH/DELETE prefix branch, so DELETE .../photo is
+        // charged to the media bucket rather than serviceWriteBuckets.
         if ((HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))
-                && (path.startsWith(MEDIA_PATH_PREFIX) || isSalonImagePath(path))) {
+                && (path.startsWith(MEDIA_PATH_PREFIX) || isSalonImagePath(path)
+                        || isServicePhotoPath(path))) {
             applyRateLimit(request, response, filterChain, mediaUploadBuckets, RETRY_AFTER_SECONDS);
             return;
         }
@@ -1100,10 +1130,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        // Service-definition MUTATE rate-limit: PATCH /api/v1/services/{serviceDefId},
-        // PATCH /api/v1/services/{serviceDefId}/photo and DELETE /api/v1/services/{serviceDefId} —
-        // matched by prefix, which covers all three and cannot reach the sibling
-        // /api/v1/service-categories/** or /api/v1/service-types/** namespaces. Checked before the
+        // Service-definition MUTATE rate-limit: PATCH /api/v1/services/{serviceDefId} and
+        // DELETE /api/v1/services/{serviceDefId} — matched by prefix, which covers both and cannot
+        // reach the sibling /api/v1/service-categories/** or /api/v1/service-types/** namespaces.
+        // DELETE .../photo never reaches here: the media branch above claims it. Checked before the
         // POST-only guard below so these PATCH/DELETE routes are covered; without this branch they
         // fell through to it entirely unthrottled, the same gap as the creates above. They share
         // ONE bucket with the creates by design — same class of single-item catalogue write.
