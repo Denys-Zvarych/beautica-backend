@@ -30,8 +30,9 @@ import com.beautica.master.service.MasterScheduleService;
 import com.beautica.master.service.MasterService;
 import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.media.entity.EntityType;
-import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
+import com.beautica.media.service.AfterCommitBlobPurger;
 import com.beautica.media.service.MediaService;
 import com.beautica.salon.audit.AuditOutcome;
 import com.beautica.salon.audit.StaffClientReferenceAuditResult;
@@ -164,7 +165,7 @@ public class SalonService {
     // media_files.uploader_id and would otherwise vanish the moment that method hard-deletes the
     // uploader's users row, orphaning the R2 blob with no row left to name it (a gap the phase doc
     // itself did not cover — see deactivateSalon's javadoc). MediaService owns the actual R2 sweep
-    // (D3 REUSE-FIRST — the promoted deleteByUploader body) and runs strictly AFTER commit (D8):
+    // (D3 REUSE-FIRST — the shared sweepBlobs body) and runs strictly AFTER commit (D8):
     // its txRead/txWrite are PROPAGATION_REQUIRES_NEW TransactionTemplates, so calling it from
     // inside deactivateSalon's own @Transactional would join that transaction and hold a DB
     // connection across dozens of sequential R2 round-trips. transactionManager backs the tiny
@@ -178,6 +179,9 @@ public class SalonService {
     private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     private final PlatformTransactionManager transactionManager;
     private final StaffAccountDisposalService staffAccountDisposalService;
+    // Runs the whole after-commit salon purge body on blobPurgeExecutor (perf P-L2) so the committing
+    // thread neither holds its connection across the R2 batch nor opens the follow-up REQUIRES_NEW ones.
+    private final AfterCommitBlobPurger afterCommitBlobPurger;
 
     /**
      * Hard ceiling on rows returned by {@link #listSalonInvites}.
@@ -259,6 +263,7 @@ public class SalonService {
      */
     public static final int MAX_ACTIVE_SALONS_PER_OWNER = 50;
 
+    private static final String SALON_PURGE_CONTEXT = "salon-purge";
     private static final String MASTER_DETAIL_CACHE = "master-detail";
 
     /** Discovery caches a salon's locality change invalidates: its own and its masters'. */
@@ -635,6 +640,12 @@ public class SalonService {
      * After-commit makes that timeout structurally safe again: the R2 sweep runs with no
      * transaction — and therefore no held connection — open at all.
      *
+     * <p><b>Off the committing thread (perf P-L2).</b> The callback only SUBMITS the whole body to
+     * {@code blobPurgeExecutor} via {@link AfterCommitBlobPurger#dispatchTask} — an {@code afterCommit}
+     * callback still holds the committing transaction's connection, so running the R2 batch plus two
+     * REQUIRES_NEW transactions inline would pin two connections across R2. A rejected submit is an accepted
+     * orphan, WARN-logged with the key count only and counted on {@code beautica.blob_purge.rejected.keys}.
+     *
      * <p><b>Ordering: R2 first, THEN the DB pointer (D4).</b> {@code mediaService.deleteBySalon}
      * runs first; only once it returns does this method open its OWN short-lived
      * {@code PROPAGATION_REQUIRES_NEW} transaction (via {@code transactionManager}, not this
@@ -654,25 +665,52 @@ public class SalonService {
      * cheap, purely in-memory cache evictions from being registered first.
      */
     private void purgeSalonMediaAfterCommit(
-            UUID salonId, String avatarUrl, String coverImageUrl, List<MediaFile> salonMediaRows) {
+            UUID salonId, String avatarUrl, String coverImageUrl, List<MediaFileKey> salonMediaKeys) {
+        // Resolve (and own-prefix-check, S-M1) the logo/cover URLs NOW, so keyCount counts only blobs the task
+        // will actually delete — a rejected URL is WARN-logged once here and never reaches the task.
+        List<String> salonImageKeys = new ArrayList<>(2);
+        addIfPresent(salonImageKeys, mediaService.resolveSalonImageKey(salonId, avatarUrl));
+        addIfPresent(salonImageKeys, mediaService.resolveSalonImageKey(salonId, coverImageUrl));
+        int keyCount = salonMediaKeys.size() + salonImageKeys.size();
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            log.warn("Salon media purge skipped: no active transaction synchronization (salon={}, keyCount={}, "
+                    + "keys=[omitted])", salonId, keyCount);
             return;
         }
+        List<String> imageKeys = List.copyOf(salonImageKeys);
+        List<MediaFileKey> mediaKeys = List.copyOf(salonMediaKeys);
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                try {
-                    mediaService.deleteBySalon(salonId, avatarUrl, coverImageUrl, salonMediaRows);
-
-                    TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
-                    txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-                    txTemplate.executeWithoutResult(status -> salonRepository.nullImageUrls(salonId));
-                } catch (RuntimeException ex) {
-                    log.warn("Salon media purge failed after commit for salon {}: {}",
-                            salonId, ex.getClass().getSimpleName());
-                }
+                afterCommitBlobPurger.dispatchTask(
+                        () -> purgeSalonMedia(salonId, imageKeys, mediaKeys),
+                        keyCount, SALON_PURGE_CONTEXT);
             }
         });
+    }
+
+    private static void addIfPresent(List<String> keys, String key) {
+        if (key != null) {
+            keys.add(key);
+        }
+    }
+
+    /**
+     * The after-commit salon purge body, run as ONE task on {@code blobPurgeExecutor}: R2 sweep first, THEN
+     * the standalone REQUIRES_NEW pointer null (D4 order). Captures scalars only (P-L3 — no detached entity
+     * crosses threads). Never throws — it runs detached.
+     */
+    private void purgeSalonMedia(UUID salonId, List<String> salonImageKeys, List<MediaFileKey> salonMediaKeys) {
+        try {
+            mediaService.deleteBySalon(salonId, salonImageKeys, salonMediaKeys);
+
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+            txTemplate.executeWithoutResult(status -> salonRepository.nullImageUrls(salonId));
+        } catch (RuntimeException ex) {
+            log.warn("Salon media purge failed after commit for salon {}: {}",
+                    salonId, ex.getClass().getSimpleName());
+        }
     }
 
     /**
@@ -1328,8 +1366,8 @@ public class SalonService {
         // silently lose the row — and with it the only pointer left to reconcile its R2 blob against.
         final String avatarUrlAtDeletion = salon.getAvatarUrl();
         final String coverImageUrlAtDeletion = salon.getCoverImageUrl();
-        final List<MediaFile> salonMediaRows =
-                mediaRepository.findByEntityTypeAndEntityId(EntityType.SALON, salonId);
+        final List<MediaFileKey> salonMediaKeys =
+                mediaRepository.findMediaKeysByEntityTypeAndEntityId(EntityType.SALON, salonId);
 
         // Phase 342 D6 — row-lock the salon's service catalogue (id order, single-row-lock-compatible with
         // the photo upload path) and read the uploaded-photo keys from the LOCKED rows, so a concurrent
@@ -1404,7 +1442,7 @@ public class SalonService {
         // from being registered. Runs the actual R2 deletes + DB pointer null AFTER commit, on the
         // request thread but outside this transaction — see the field-block comment above and this
         // method's own javadoc.
-        purgeSalonMediaAfterCommit(salonId, avatarUrlAtDeletion, coverImageUrlAtDeletion, salonMediaRows);
+        purgeSalonMediaAfterCommit(salonId, avatarUrlAtDeletion, coverImageUrlAtDeletion, salonMediaKeys);
         servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
     }
 

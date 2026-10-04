@@ -89,9 +89,11 @@ public class User extends AuditableEntity {
      * R2 object key of this user's avatar blob. External-storage cleanup contract
      * (Anti-Bug Playbook §O8): this pointer lives on the {@code users} row itself, NOT in
      * {@code media_files}, so deleting the user does not reach it through any
-     * {@code ON DELETE CASCADE}. Any user-deletion flow MUST call
-     * {@code MediaService.deleteByUploader(userId)} before deleting the row — it sweeps this
-     * blob together with the user's {@code media_files} blobs. Skipping it leaves the avatar
+     * {@code ON DELETE CASCADE}. Any user-deletion flow MUST capture this pointer (and the user's
+     * {@code media_files} keys) BEFORE deleting the row and register
+     * {@code AccountBlobPurgeRegistrar#registerAfterCommit} — it purges this blob together with the
+     * user's portfolio blobs strictly after the delete commits
+     * ({@code MediaService#purgeUserBlobsAfterCommit}). Skipping it leaves the avatar
      * publicly retrievable at a URL that has been handed out as {@code clientAvatarUrl} to
      * every provider the user ever booked with.
      */

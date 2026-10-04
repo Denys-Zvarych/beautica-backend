@@ -8,7 +8,7 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
-import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.salon.service.StaffAccountDisposalService;
@@ -144,8 +144,8 @@ public class StaffAccountSelfDeletionService {
         }
 
         // Step 4 — pre-read external-storage pointers BEFORE anything cascades them away.
-        List<MediaFile> mediaRows = mediaRepository.findByUploaderId(userId);
-        String avatarR2Key = user.getAvatarR2Key();
+        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
+        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId));
         UUID salonId = user.getSalonId();
 
         // Step 5 — resolve the caller's OWN masters row, if any. SALON_ADMIN has none (D3 — no
@@ -234,10 +234,9 @@ public class StaffAccountSelfDeletionService {
 
         // Step 9 — R2 blob sweep, registered to run strictly after commit (Anti-Bug §O8), via the
         // promoted AccountBlobPurgeRegistrar (Phase 301 — shared with ClientAccountDeletionService,
-        // never re-typed). Deliberately NOT swept by staffAccountDisposalService.dispose itself —
-        // that shared seam's other three callers (removeAdmin/removeMaster/deleteSalonStaff) leak
-        // R2 blobs today (R6, pre-existing, out of scope); only THIS self-delete path sweeps.
-        accountBlobPurgeRegistrar.registerAfterCommit(userId, avatarR2Key, mediaRows);
+        // never re-typed). staffAccountDisposalService.dispose sweeps for the owner-initiated callers
+        // but skips StaffDisposalReason.SELF_DELETE, so this path is the only sweeper here (no double purge).
+        accountBlobPurgeRegistrar.registerAfterCommit(user, mediaRows);
 
         // Step 9b — Phase 342 D6: delete the independent master's service-photo blobs after commit. The keys
         // were read from the row-locked catalogue in Step 5b (before any masters write).

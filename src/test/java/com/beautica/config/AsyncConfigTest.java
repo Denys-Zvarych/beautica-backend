@@ -8,6 +8,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -826,5 +827,171 @@ class AsyncConfigTest {
                 .as("worker task did not run within 5s")
                 .isTrue();
         return name.get();
+    }
+
+    /**
+     * P-M2: after-commit R2 purges leave the committing thread (which still holds its JDBC connection) for
+     * this pool. Pins the production wiring the test profile replaces with a {@code SyncTaskExecutor}.
+     */
+    @Nested
+    @DisplayName("blobPurgeExecutor bean")
+    class BlobPurgeExecutor {
+
+        private final ThreadPoolTaskExecutor bean = (ThreadPoolTaskExecutor) asyncConfig.blobPurgeExecutor();
+        private final ThreadPoolExecutor pool = bean.getThreadPoolExecutor();
+
+        @Test
+        @DisplayName("blobPurgeExecutor — core equals max (2), idle threads time out")
+        void should_makeCoreEqualMax_when_blobPurgeExecutorBuilt() {
+            assertThat(pool.getCorePoolSize()).isEqualTo(pool.getMaximumPoolSize()).isEqualTo(2);
+            assertThat(pool.allowsCoreThreadTimeOut()).isTrue();
+        }
+
+        @Test
+        @DisplayName("blobPurgeExecutor — the queue is bounded at 500")
+        void should_boundTheQueue_when_blobPurgeExecutorBuilt() {
+            assertThat(pool.getQueue().remainingCapacity()).isEqualTo(500);
+        }
+
+        @Test
+        @DisplayName("blobPurgeExecutor — saturation ABORTS; the R2 call must never run on the committing thread")
+        void should_useAbortPolicy_when_blobPurgeExecutorSaturated() {
+            assertThat(pool.getRejectedExecutionHandler())
+                    .isInstanceOf(ThreadPoolExecutor.AbortPolicy.class)
+                    .isNotInstanceOf(ThreadPoolExecutor.CallerRunsPolicy.class)
+                    .isNotInstanceOf(AsyncConfig.CallerBlocksPolicy.class);
+        }
+
+        @Test
+        @DisplayName("blobPurgeExecutor — worker threads use the 'blob-purge-' name prefix")
+        void should_nameWorkerThreadsWithBlobPurgePrefix_when_taskSubmitted() throws InterruptedException {
+            assertThat(captureWorkerThreadName(bean)).startsWith("blob-purge-");
+        }
+
+        @Test
+        @DisplayName("blobPurgeExecutor — built as the loss-reporting executor, draining for 10 s")
+        void should_buildAsLossReportingExecutor_when_blobPurgeExecutorBuilt() {
+            assertThat(bean)
+                    .as("a plain executor abandons up to 500 queued purges silently on shutdown")
+                    .isInstanceOf(AsyncConfig.BlobPurgeLossReportingTaskExecutor.class);
+            assertThat(AsyncConfig.BLOB_PURGE_SHUTDOWN_GRACE_SECONDS).isEqualTo(10);
+        }
+
+        @AfterEach
+        void shutdownBean() {
+            bean.getThreadPoolExecutor().shutdownNow();
+        }
+    }
+
+    /**
+     * PERF-2: purges still queued when {@code blobPurgeExecutor}'s shutdown grace expires are orphaned blobs.
+     * The pool reports them (task + key counts) at WARN; a clean drain is silent.
+     */
+    @Nested
+    @DisplayName("blobPurgeExecutor — shutdown abandonment reporting")
+    class BlobPurgeShutdownLossReporting {
+
+        private static final int TEST_GRACE_SECONDS = 1;
+
+        private ListAppender<ILoggingEvent> logAppender;
+        private ch.qos.logback.classic.Logger configLogger;
+
+        @BeforeEach
+        void attachAppender() {
+            logAppender = new ListAppender<>();
+            logAppender.start();
+            configLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(AsyncConfig.class);
+            configLogger.addAppender(logAppender);
+        }
+
+        @AfterEach
+        void detachAppender() {
+            configLogger.detachAppender(logAppender);
+            logAppender.stop();
+        }
+
+        @Test
+        @DisplayName("an expired grace reports queued tasks, the orphaned KEY total, in-flight tasks and the grace at WARN")
+        void should_reportAbandonedPurgesAtWarn_when_theShutdownGraceExpires() throws Exception {
+            AsyncConfig.BlobPurgeLossReportingTaskExecutor executor = reportingExecutor();
+            CountDownLatch running = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            try {
+                executor.execute(new AsyncConfig.BlobPurgeTask(() -> {
+                    running.countDown();
+                    try {
+                        release.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }, 9));
+                assertThat(running.await(5, TimeUnit.SECONDS))
+                        .as("fixture: the single worker never picked up the gated task")
+                        .isTrue();
+                executor.execute(new AsyncConfig.BlobPurgeTask(keyBearingTask(), 3));
+                executor.execute(new AsyncConfig.BlobPurgeTask(keyBearingTask(), 4));
+                executor.execute(keyBearingTask()); // an un-wrapped task counts as a task, zero keys
+
+                executor.shutdown();
+            } finally {
+                release.countDown();
+                executor.getThreadPoolExecutor().shutdownNow();
+            }
+
+            List<ILoggingEvent> warns = logAppender.list.stream()
+                    .filter(e -> e.getLevel() == Level.WARN)
+                    .filter(e -> e.getFormattedMessage().contains(AsyncConfig.BlobPurgeLossReportingTaskExecutor.LOSS_EVENT))
+                    .toList();
+            assertThat(warns).as("exactly one abandonment report").hasSize(1);
+            assertThat(warns.get(0).getFormattedMessage())
+                    .contains("executor=blobPurgeExecutor")
+                    .contains("queuedTasksAbandoned=3")
+                    .contains("queuedKeysOrphaned=7")
+                    .contains("inFlightTasksKilled=1")
+                    .contains("graceSeconds=" + TEST_GRACE_SECONDS)
+                    .as("counts only — keys embed user/entity UUIDs")
+                    .doesNotContain("avatars/");
+        }
+
+        @Test
+        @DisplayName("a shutdown that drains every purge logs no abandonment report")
+        void should_logNothing_when_shutdownDrainsEveryPurge() {
+            AsyncConfig.BlobPurgeLossReportingTaskExecutor executor = reportingExecutor();
+            try {
+                executor.execute(new AsyncConfig.BlobPurgeTask(() -> { }, 2));
+            } finally {
+                executor.shutdown();
+            }
+
+            assertThat(logAppender.list)
+                    .noneSatisfy(e -> assertThat(e.getFormattedMessage())
+                            .contains(AsyncConfig.BlobPurgeLossReportingTaskExecutor.LOSS_EVENT));
+        }
+
+        private AsyncConfig.BlobPurgeLossReportingTaskExecutor reportingExecutor() {
+            AsyncConfig.BlobPurgeLossReportingTaskExecutor executor =
+                    new AsyncConfig.BlobPurgeLossReportingTaskExecutor(TEST_GRACE_SECONDS);
+            executor.setCorePoolSize(1);
+            executor.setMaxPoolSize(1);
+            executor.setQueueCapacity(50);
+            executor.setThreadNamePrefix("blob-purge-");
+            executor.initialize();
+            return executor;
+        }
+
+        /** A queued task whose rendering would leak a key — must never reach the log line. */
+        private static Runnable keyBearingTask() {
+            return new Runnable() {
+                @Override
+                public void run() {
+                    // never reached — abandoned at shutdown
+                }
+
+                @Override
+                public String toString() {
+                    return "avatars/" + UUID.randomUUID() + "/a.jpg";
+                }
+            };
+        }
     }
 }

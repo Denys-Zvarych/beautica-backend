@@ -14,7 +14,7 @@ import com.beautica.booking.service.BookingService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
-import com.beautica.media.entity.MediaFile;
+import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.review.repository.ClientReviewRepository;
 import lombok.RequiredArgsConstructor;
@@ -134,8 +134,8 @@ public class ClientAccountDeletionService {
 
         // Step 3 — pre-read external-storage pointers BEFORE anything cascades them away. Mirrors
         // SalonService's own pre-read-before-cascade pattern for salon media rows.
-        List<MediaFile> mediaRows = mediaRepository.findByUploaderId(clientUserId);
-        String avatarR2Key = user.getAvatarR2Key();
+        // Scalar projection (P-L1) — no MediaFile entities loaded into the persistence context.
+        List<UploaderMediaKey> mediaRows = mediaRepository.findMediaKeysByUploaderIdIn(List.of(clientUserId));
 
         Instant now = clock.instant();
 
@@ -266,13 +266,12 @@ public class ClientAccountDeletionService {
         authService.denylistAccessToken(accessToken);
 
         // Step 12 — R2 blob sweep, registered to run strictly after commit (D "external-storage
-        // cleanup contract", Anti-Bug Playbook §O8). Never called inline: MediaService#deleteByUploader
-        // opens its own PROPAGATION_REQUIRES_NEW transactions, so an outer rollback here would leave
-        // blobs already destroyed. See MediaService#purgeUserBlobsAfterCommit's own Javadoc for why
+        // cleanup contract", Anti-Bug Playbook §O8). Never purged inline: an R2 delete inside this
+        // transaction would leave a rolled-back account pointing at already-destroyed blobs. See MediaService#purgeUserBlobsAfterCommit's own Javadoc for why
         // this is R2-only (the DB rows are already gone via CASCADE by the time this callback runs).
         // Phase 301: promoted to AccountBlobPurgeRegistrar so the staff/independent-master
         // self-delete flow can share the identical after-commit registration shape.
-        accountBlobPurgeRegistrar.registerAfterCommit(clientUserId, avatarR2Key, mediaRows);
+        accountBlobPurgeRegistrar.registerAfterCommit(user, mediaRows);
 
         // Step 13 — audit trail. Ids and counts only, never an email or any other PII (this repo's
         // logging convention) — a hard delete of the account is the single most consequential

@@ -120,7 +120,7 @@ class StaffAccountSelfDeletionServiceTest {
         lenient().when(salonRepository.existsByOwnerId(userId)).thenReturn(false);
         lenient().when(staffClientReferenceAuditService.runAuditForStaffUserIds(List.of(userId)))
                 .thenReturn(StaffClientReferenceAuditResult.of(List.of(), Instant.EPOCH));
-        lenient().when(mediaRepository.findByUploaderId(userId)).thenReturn(List.of());
+        lenient().when(mediaRepository.findMediaKeysByUploaderIdIn(List.of(userId))).thenReturn(List.of());
     }
 
     // ── role guard ──────────────────────────────────────────────────────────────────────────
@@ -222,7 +222,7 @@ class StaffAccountSelfDeletionServiceTest {
         verify(staffAccountDisposalService)
                 .dispose(userId, salonId, List.of(userId), StaffDisposalReason.SELF_DELETE);
         verify(authService).denylistAccessToken("token-123");
-        verify(accountBlobPurgeRegistrar).registerAfterCommit(eq(userId), any(), eq(List.of()));
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(any(User.class), eq(List.of()));
     }
 
     // ── SALON_MASTER / INDEPENDENT_MASTER happy paths — booking cascade ────────────────────────
@@ -463,7 +463,7 @@ class StaffAccountSelfDeletionServiceTest {
 
         service.deleteOwnAccount(userId, "token");
 
-        verify(accountBlobPurgeRegistrar).registerAfterCommit(userId, "avatars/staff-key", List.of());
+        verify(accountBlobPurgeRegistrar).registerAfterCommit(user, List.of());
     }
 
     @Test

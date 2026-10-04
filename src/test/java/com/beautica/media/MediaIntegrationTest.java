@@ -162,7 +162,7 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         String firstKey = jdbcTemplate.queryForObject(
                 "SELECT avatar_r2_key FROM users WHERE id = ?", String.class, userId);
 
-        // Act — second upload (must trigger r2.deleteFile(firstKey) before writing)
+        // Act — second upload (the superseded first key is purged after commit via deleteFiles)
         log.debug("Act: POST {} second time as user={} — first key must be deleted", AVATAR_URL, userId);
         ResponseEntity<String> second = restTemplate.exchange(
                 AVATAR_URL, HttpMethod.POST,
@@ -180,9 +180,10 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
                 .isNotEqualTo(firstKey);
 
         // Assert — R2 delete invoked with the first (now-superseded) key
-        ArgumentCaptor<String> deletedKey = ArgumentCaptor.forClass(String.class);
-        verify(r2StorageService, atLeastOnce()).deleteFile(deletedKey.capture());
-        assertThat(deletedKey.getAllValues())
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<java.util.Collection<String>> deletedKeys = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(r2StorageService, atLeastOnce()).deleteFiles(deletedKeys.capture());
+        assertThat(deletedKeys.getAllValues().stream().flatMap(java.util.Collection::stream).toList())
                 .as("R2 delete must have been called with the original avatar key")
                 .contains(firstKey);
     }

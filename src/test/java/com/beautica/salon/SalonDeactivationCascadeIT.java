@@ -576,7 +576,7 @@ class SalonDeactivationCascadeIT extends AbstractIntegrationTest {
     @Test
     @DisplayName("phase 268 GAP fix, ordering pin — R2 delete is actually ATTEMPTED for a "
             + "staff-uploaded salon photo's key, proving deactivateSalon's pre-read "
-            + "(mediaRepository.findByEntityTypeAndEntityId, SalonService.java around line 957-958) "
+            + "(mediaRepository.findMediaKeysByEntityTypeAndEntityId in SalonService.deactivateSalon) "
             + "ran BEFORE deleteSalonStaff hard-deleted the uploader and cascaded the row away. "
             + "The row-count-only assertion in the previous test cannot tell these two orderings "
             + "apart — both end with the row gone, one via this sweep's own DB delete, the other "

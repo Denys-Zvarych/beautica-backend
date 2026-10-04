@@ -16,7 +16,9 @@ import com.beautica.media.dto.MediaFileResponse;
 import com.beautica.media.entity.EntityType;
 import com.beautica.media.entity.MediaFile;
 import com.beautica.media.entity.MediaType;
+import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
+import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.user.User;
@@ -31,6 +33,7 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.task.SyncTaskExecutor;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 // SimpleKey import removed — cache keys are now plain Strings (portfolioCacheKey contract)
@@ -38,6 +41,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -62,6 +67,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -72,6 +78,7 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -142,10 +149,12 @@ class MediaServiceTest {
             TransactionCallback<?> cb = inv.getArgument(0);
             return cb.doInTransaction(mock(TransactionStatus.class));
         });
-        lenient().when(txWrite.execute(any())).thenAnswer(inv -> {
-            TransactionCallback<?> cb = inv.getArgument(0);
-            return cb.doInTransaction(mock(TransactionStatus.class));
-        });
+        // txWrite simulates a REAL transaction boundary: synchronization is active inside the callback and the
+        // registered afterCommit hooks fire on success (never on a throw) — AfterCommitBlobPurger SKIPS a purge
+        // registered with no active synchronization, exactly as in production (item 7).
+        lenient().when(txWrite.execute(any())).thenAnswer(inv -> inSimulatedTransaction(inv.getArgument(0)));
+        // uploadAvatar's 404 read-gate is an existence probe (item 5); the unknown-user case overrides this.
+        lenient().when(userRepo.existsById(any(UUID.class))).thenReturn(true);
         // Phase 7.7 — portfolio cache eviction is a no-op in unit tests; the IT suite
         // exercises the real Caffeine cache. lenient() because not every existing test
         // hits a portfolio write path.
@@ -153,8 +162,12 @@ class MediaServiceTest {
         lenient().when(cacheManager.getCache("portfolio")).thenReturn(portfolioCache);
         lenient().when(portfolioCache.evictIfPresent(any())).thenReturn(true);
         service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager,
-                serviceRepo, serviceCatalogService, servicePhotoBlobPurger);
+                serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
+                new AfterCommitBlobPurger(r2, new SyncTaskExecutor(),
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
     }
+
+    private static final UUID MASTER_ID_FOR_PURGE = UUID.randomUUID();
 
     /** The storage-enabled probe ({@code isEnabled}) is allowed; any blob write/delete is not. */
     private void verifyNoStorageWrites() {
@@ -162,6 +175,19 @@ class MediaServiceTest {
         verify(r2, never()).deleteFile(any());
         verify(r2, never()).deleteFiles(any());
         verify(r2, never()).buildPublicUrl(any());
+    }
+
+    @Test
+    @DisplayName("uploadAvatar 404s on an unknown user via the existence probe — no entity load, no R2 upload")
+    void should_throwNotFound_when_uploadAvatarForUnknownUser() {
+        UUID userId = UUID.randomUUID();
+        when(userRepo.existsById(userId)).thenReturn(false);
+
+        assertThatThrownBy(() -> service.uploadAvatar(userId, jpegFile()))
+                .isInstanceOf(NotFoundException.class);
+
+        verify(userRepo, never()).findById(any(UUID.class));
+        verifyNoStorageWrites();
     }
 
     // ------------------------------------------------- storage disabled (phase 341)
@@ -203,7 +229,8 @@ class MediaServiceTest {
     void should_detectJpeg_when_fileStartsWithFfd8ff() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatar.jpg");
 
         service.uploadAvatar(userId, jpegFile());
@@ -216,7 +243,8 @@ class MediaServiceTest {
     void should_detectPng_when_fileStartsWithPngSignature() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatar.png");
 
         service.uploadAvatar(userId, pngFile());
@@ -229,7 +257,8 @@ class MediaServiceTest {
     void should_detectWebp_when_fileStartsWithRiffAndWebp() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatar.webp");
 
         service.uploadAvatar(userId, webpFile());
@@ -241,7 +270,8 @@ class MediaServiceTest {
     @DisplayName("opens the upload stream exactly once and hands R2 the full payload from byte 0")
     void should_openStreamOnce_andUploadFullPayload_when_avatarUploaded() throws Exception {
         UUID userId = UUID.randomUUID();
-        when(userRepo.findById(userId)).thenReturn(Optional.of(newUser(userId)));
+        User u247 = newUser(userId);
+        when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(u247));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatar.jpg");
         byte[] payload = new byte[64];
         payload[0] = (byte) 0xFF;
@@ -337,7 +367,8 @@ class MediaServiceTest {
     void should_uploadAvatar_when_validJpegFile() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
 
         AvatarResponse response = service.uploadAvatar(userId, jpegFile());
@@ -354,19 +385,107 @@ class MediaServiceTest {
     }
 
     @Test
-    @DisplayName("deletes old avatar from R2 BEFORE uploading the new one")
-    void should_deleteOldAvatarFirst_when_userAlreadyHasAvatar() {
+    @DisplayName("uploads the NEW avatar first and deletes the superseded one only after the DB write")
+    void should_uploadNewFirstThenDeleteOld_when_userAlreadyHasAvatar() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
         user.setAvatarR2Key("avatars/" + userId + "/old.jpg");
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/new.jpg");
 
         service.uploadAvatar(userId, jpegFile());
 
-        InOrder inOrder = inOrder(r2);
-        inOrder.verify(r2).deleteFile("avatars/" + userId + "/old.jpg");
+        // The locked write step (findByIdForUpdate on the MANAGED user — no save(), dirty checking flushes it)
+        // runs after the upload; the superseded blob is purged only after that write commits.
+        InOrder inOrder = inOrder(r2, userRepo);
         inOrder.verify(r2).uploadFile(anyString(), any(), anyLong(), eq("image/jpeg"));
+        inOrder.verify(userRepo).findByIdForUpdate(userId);
+        inOrder.verify(r2).deleteFiles(List.of("avatars/" + userId + "/old.jpg"));
+        assertThat(user.getAvatarR2Key()).startsWith("avatars/" + userId + "/").isNotEqualTo("avatars/" + userId + "/old.jpg");
+        verify(userRepo, never()).save(any(User.class));
+    }
+
+    @Test
+    @DisplayName("never deletes an avatar key outside the user's own avatars/<id>/ prefix")
+    void should_notDeleteForeignKey_when_storedKeyIsOutsideOwnPrefix() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        user.setAvatarR2Key("avatars/" + UUID.randomUUID() + "/other.jpg");
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/new.jpg");
+
+        service.uploadAvatar(userId, jpegFile());
+
+        verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
+    }
+
+    @Test
+    @DisplayName("replace of a legacy avatar (url only) deletes the URL-derived key")
+    void should_deleteUrlDerivedKey_when_legacyAvatarReplaced() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        user.setAvatarUrl("https://cdn/avatars/" + userId + "/legacy.jpg");
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.extractKeyFromPublicUrl(user.getAvatarUrl()))
+                .thenReturn(Optional.of("avatars/" + userId + "/legacy.jpg"));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/new.jpg");
+
+        service.uploadAvatar(userId, jpegFile());
+
+        verify(r2).deleteFiles(List.of("avatars/" + userId + "/legacy.jpg"));
+    }
+
+    @Test
+    @DisplayName("deleteAvatar of a legacy avatar deletes the derived key and nulls both pointers")
+    void should_clearBothPointersAndDeleteDerivedKey_when_legacyAvatarDeleted() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        user.setAvatarUrl("https://cdn/avatars/" + userId + "/legacy.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.extractKeyFromPublicUrl(user.getAvatarUrl()))
+                .thenReturn(Optional.of("avatars/" + userId + "/legacy.jpg"));
+
+        service.deleteAvatar(userId);
+
+        verify(r2).deleteFiles(List.of("avatars/" + userId + "/legacy.jpg"));
+        assertThat(user.getAvatarUrl()).isNull();
+        assertThat(user.getAvatarR2Key()).isNull();
+    }
+
+    @Test
+    @DisplayName("deleteAvatar of a legacy avatar whose URL is foreign nulls pointers but deletes nothing")
+    void should_notDeleteAnything_when_legacyUrlIsForeign() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        user.setAvatarUrl("https://evil.example/avatars/" + userId + "/x.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.extractKeyFromPublicUrl(anyString())).thenReturn(Optional.empty());
+
+        service.deleteAvatar(userId);
+
+        verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
+        assertThat(user.getAvatarUrl()).isNull();
+    }
+
+    @Test
+    @DisplayName("deleteAvatar with a url-derived key outside the user's prefix deletes nothing")
+    void should_notDeleteAnything_when_derivedKeyOutsideOwnPrefix() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        user.setAvatarUrl("https://cdn/avatars/" + UUID.randomUUID() + "/x.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.extractKeyFromPublicUrl(anyString())).thenReturn(Optional.of("services/abc/x.jpg"));
+
+        service.deleteAvatar(userId);
+
+        verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
+        assertThat(user.getAvatarUrl()).isNull();
     }
 
     @Test
@@ -374,12 +493,14 @@ class MediaServiceTest {
     void should_notCallDeleteFile_when_userHasNoExistingAvatar() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/new.jpg");
 
         service.uploadAvatar(userId, jpegFile());
 
         verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
     }
 
     @Test
@@ -389,11 +510,12 @@ class MediaServiceTest {
         User user = newUser(userId);
         user.setAvatarR2Key("avatars/" + userId + "/x.jpg");
         user.setAvatarUrl("https://r2/x.jpg");
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
 
         service.deleteAvatar(userId);
 
-        verify(r2).deleteFile("avatars/" + userId + "/x.jpg");
+        verify(r2).deleteFiles(List.of("avatars/" + userId + "/x.jpg"));
         assertThat(user.getAvatarR2Key()).isNull();
         assertThat(user.getAvatarUrl()).isNull();
     }
@@ -403,7 +525,8 @@ class MediaServiceTest {
     void should_doNothing_when_deleteAvatarCalledAndNoAvatarExists() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
 
         service.deleteAvatar(userId);
 
@@ -416,13 +539,15 @@ class MediaServiceTest {
     void should_throwNotFound_when_userNotFoundOnDeleteAvatar() {
         // Arrange
         UUID userId = UUID.randomUUID();
-        when(userRepo.findById(any(UUID.class))).thenReturn(Optional.empty());
+        lenient().when(userRepo.findById(any(UUID.class))).thenReturn(Optional.empty());
+        lenient().when(userRepo.findByIdForUpdate(any(UUID.class))).thenReturn(Optional.empty());
 
         // Act & Assert
         assertThatThrownBy(() -> service.deleteAvatar(userId))
                 .isInstanceOf(NotFoundException.class);
 
         verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
     }
 
     // ----------------------------------------------------------------- portfolio
@@ -528,26 +653,112 @@ class MediaServiceTest {
     }
 
     @Test
-    @DisplayName("deletes portfolio photo when uploader requests deletion")
+    @DisplayName("deletes portfolio photo when uploader requests deletion — row deleted, own key purged after commit")
     void should_deletePortfolioPhoto_when_uploaderRequests() {
         UUID actorId = UUID.randomUUID();
         UUID mediaId = UUID.randomUUID();
-        User uploader = newUser(actorId);
-        MediaFile mf = MediaFile.builder()
-                .id(mediaId)
-                .uploader(uploader)
-                .entityType(EntityType.MASTER)
-                .entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO)
-                .r2Key("portfolio/independent/x/y.jpg")
-                .r2Url("https://r2/y.jpg")
-                .build();
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(mf));
+        UUID masterId = UUID.randomUUID();
+        String ownKey = "portfolio/independent/" + masterId + "/y.jpg";
+        MediaFile row = portfolioRow(mediaId, actorId, EntityType.MASTER, masterId, ownKey);
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
 
         service.deletePortfolioPhoto(actorId, mediaId);
 
-        verify(r2).deleteFile("portfolio/independent/x/y.jpg");
-        verify(mediaRepo).deleteById(mediaId);
+        verify(mediaRepo).delete(row);
+        verify(r2).deleteFiles(List.of(ownKey));
+        verify(r2, never()).deleteFile(anyString());
+    }
+
+    @Test
+    @DisplayName("SEC-N1: a SALON row's key under its OWN portfolio root reaches R2 — only AFTER the row delete")
+    void should_deleteR2Blob_when_salonPortfolioKeyInsideOwnPrefix() {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        String ownKey = "portfolio/salons/" + salonId + "/p.jpg";
+        MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId, ownKey);
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+
+        service.deletePortfolioPhoto(actorId, mediaId);
+
+        InOrder order = inOrder(mediaRepo, r2);
+        order.verify(mediaRepo).delete(row);
+        order.verify(r2).deleteFiles(List.of(ownKey));
+    }
+
+    @Test
+    @DisplayName("SEC-N1: a key outside the row's own portfolio root never reaches R2 — the row is still deleted")
+    void should_skipR2Delete_when_portfolioKeyOutsideOwnPrefix() {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        // Three corrupted shapes: another salon's object, a user avatar, and a traversal under the own root.
+        List<String> foreignKeys = List.of(
+                "portfolio/salons/" + UUID.randomUUID() + "/p.jpg",
+                "avatars/" + UUID.randomUUID() + "/a.jpg",
+                "portfolio/salons/" + salonId + "/../../avatars/x/a.jpg");
+        for (String foreignKey : foreignKeys) {
+            reset(r2, mediaRepo);
+            MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId, foreignKey);
+            when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+
+            service.deletePortfolioPhoto(actorId, mediaId);
+
+            verify(r2, never()).deleteFile(anyString());
+            verify(r2, never()).deleteFiles(anyCollection());
+            verify(mediaRepo).delete(row);
+        }
+    }
+
+    @Test
+    @DisplayName("M1: the row delete fails (rollback) — R2 is never touched")
+    void should_notTouchR2_when_portfolioRowDeleteFails() {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId,
+                "portfolio/salons/" + salonId + "/p.jpg");
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+        doThrow(new org.springframework.dao.DataIntegrityViolationException("forced"))
+                .when(mediaRepo).delete(row);
+
+        assertThatThrownBy(() -> service.deletePortfolioPhoto(actorId, mediaId))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+
+        verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
+        verify(portfolioCache, never()).evictIfPresent(any());
+    }
+
+    @Test
+    @DisplayName("M1: the purge is registered inside the write tx and dispatched only when it commits")
+    void should_notPurgeBeforeCommit_when_portfolioPhotoDeleted() {
+        UUID actorId = UUID.randomUUID();
+        UUID mediaId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        String ownKey = "portfolio/salons/" + salonId + "/p.jpg";
+        MediaFile row = portfolioRow(mediaId, actorId, EntityType.SALON, salonId, ownKey);
+        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(row));
+        List<Boolean> r2CalledBeforeCommit = new java.util.ArrayList<>();
+        doAnswer(inv -> {
+            TransactionSynchronizationManager.initSynchronization();
+            try {
+                Object result = ((TransactionCallback<?>) inv.getArgument(0))
+                        .doInTransaction(mock(TransactionStatus.class));
+                r2CalledBeforeCommit.add(!org.mockito.Mockito.mockingDetails(r2).getInvocations().stream()
+                        .filter(i -> i.getMethod().getName().startsWith("delete")).toList().isEmpty());
+                TransactionSynchronizationManager.getSynchronizations()
+                        .forEach(TransactionSynchronization::afterCommit);
+                return result;
+            } finally {
+                TransactionSynchronizationManager.clearSynchronization();
+            }
+        }).when(txWrite).execute(any());
+
+        service.deletePortfolioPhoto(actorId, mediaId);
+
+        assertThat(r2CalledBeforeCommit).containsExactly(false);
+        verify(r2).deleteFiles(List.of(ownKey));
     }
 
     @Test
@@ -571,6 +782,7 @@ class MediaServiceTest {
                 .isInstanceOf(ForbiddenException.class);
 
         verify(r2, never()).deleteFile(anyString());
+        verify(r2, never()).deleteFiles(anyCollection());
         verify(mediaRepo, never()).deleteById(any(UUID.class));
         verify(mediaRepo, never()).delete(any(MediaFile.class));
     }
@@ -583,6 +795,8 @@ class MediaServiceTest {
 
         assertThatThrownBy(() -> service.deletePortfolioPhoto(UUID.randomUUID(), mediaId))
                 .isInstanceOf(NotFoundException.class);
+
+        verifyNoStorageWrites();
     }
 
     // ---------------------------------------------- Phase 7.7 — portfolio cache eviction
@@ -626,7 +840,7 @@ class MediaServiceTest {
                 .entityType(EntityType.MASTER)
                 .entityId(masterEntityId)
                 .mediaType(MediaType.PORTFOLIO)
-                .r2Key("portfolio/independent/x/y.jpg")
+                .r2Key("portfolio/independent/" + masterEntityId + "/y.jpg")
                 .r2Url("https://r2/y.jpg")
                 .build();
         when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(mf));
@@ -646,7 +860,7 @@ class MediaServiceTest {
     void should_neverUseClientFilename_when_buildingR2Key() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
         when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/x.jpg");
 
         // Filename packed with path-traversal + double-extension attacks.
@@ -666,143 +880,6 @@ class MediaServiceTest {
         assertThat(key).doesNotContain("passwd");
         assertThat(key).doesNotContain(".php");
         assertThat(key).startsWith("avatars/" + userId + "/").endsWith(".jpg");
-    }
-
-    // ----------------------------------------------------------------- SEC-2
-
-    @Test
-    @DisplayName("deletes R2 blob BEFORE deleting the media row")
-    void should_deleteR2Blob_when_mediaRowIsDeleted() {
-        UUID actorId = UUID.randomUUID();
-        UUID mediaId = UUID.randomUUID();
-        User uploader = newUser(actorId);
-        MediaFile mf = MediaFile.builder()
-                .id(mediaId)
-                .uploader(uploader)
-                .entityType(EntityType.MASTER)
-                .entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO)
-                .r2Key("portfolio/independent/m/file.jpg")
-                .r2Url("https://r2/file.jpg")
-                .build();
-        when(mediaRepo.findById(mediaId)).thenReturn(Optional.of(mf));
-
-        service.deletePortfolioPhoto(actorId, mediaId);
-
-        InOrder inOrder = inOrder(r2, mediaRepo);
-        inOrder.verify(r2).deleteFile("portfolio/independent/m/file.jpg");
-        inOrder.verify(mediaRepo).deleteById(mediaId);
-    }
-
-    @Test
-    @DisplayName("purges R2 avatars BEFORE deleting DB rows in deleteByUploader sweep")
-    void should_purgeR2Avatars_when_userIsDeletedBeforeCascade() {
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        MediaFile a = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-a").r2Url("u-a").build();
-        MediaFile b = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-b").r2Url("u-b").build();
-        MediaFile c = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-c").r2Url("u-c").build();
-        List<MediaFile> rows = List.of(a, b, c);
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(rows);
-
-        service.deleteByUploader(uploaderId);
-
-        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call for every row's key,
-        // still strictly BEFORE the DB batch delete.
-        InOrder inOrder = inOrder(r2, mediaRepo);
-        inOrder.verify(r2).deleteFiles(List.of("k-a", "k-b", "k-c"));
-        inOrder.verify(mediaRepo).deleteAll(rows);
-    }
-
-    // ------------------------------------- avatar blob coverage in the deleteByUploader sweep
-
-    @Test
-    @DisplayName("purges the users.avatar_r2_key blob and nulls both avatar columns in the deleteByUploader sweep")
-    void should_purgeAvatarBlob_when_deleteByUploaderSweeps() {
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        uploader.setAvatarR2Key("avatars/" + uploaderId + "/photo.jpg");
-        uploader.setAvatarUrl("https://r2/avatars/" + uploaderId + "/photo.jpg");
-        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-a").r2Url("u-a").build();
-        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(uploader));
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of(portfolio));
-
-        service.deleteByUploader(uploaderId);
-
-        // The avatar blob lives on the users row, not in media_files, and is swept separately
-        // (sweepAvatar, single-key) from the batched media_files row sweep (sweepBlobs) — a
-        // media-rows-only sweep would leave the avatar publicly retrievable after the account
-        // is deleted.
-        verify(r2).deleteFile("avatars/" + uploaderId + "/photo.jpg");
-        verify(r2).deleteFiles(List.of("k-a"));
-        assertThat(uploader.getAvatarR2Key()).isNull();
-        assertThat(uploader.getAvatarUrl()).isNull();
-        verify(userRepo).save(uploader);
-    }
-
-    @Test
-    @DisplayName("still purges the avatar blob when the uploader owns no media_files rows")
-    void should_purgeAvatarBlob_when_uploaderHasNoMediaRows() {
-        // Regression guard: the sweep's `rows.isEmpty()` short-circuit must not skip the
-        // avatar. A CLIENT with a profile photo and no portfolio is exactly this case.
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        uploader.setAvatarR2Key("avatars/" + uploaderId + "/photo.jpg");
-        uploader.setAvatarUrl("https://r2/avatars/" + uploaderId + "/photo.jpg");
-        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(uploader));
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of());
-
-        service.deleteByUploader(uploaderId);
-
-        verify(r2).deleteFile("avatars/" + uploaderId + "/photo.jpg");
-        assertThat(uploader.getAvatarR2Key()).isNull();
-        assertThat(uploader.getAvatarUrl()).isNull();
-    }
-
-    @Test
-    @DisplayName("does not touch R2 in the deleteByUploader sweep when the uploader has no avatar")
-    void should_skipAvatarSweep_when_uploaderHasNoAvatar() {
-        UUID uploaderId = UUID.randomUUID();
-        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(newUser(uploaderId)));
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of());
-
-        service.deleteByUploader(uploaderId);
-
-        verifyNoStorageWrites();
-    }
-
-    @Test
-    @DisplayName("continues the deleteByUploader sweep and redacts the key when the avatar R2 delete fails")
-    void should_continueSweep_when_avatarR2DeleteFails() {
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        String avatarKey = "avatars/" + uploaderId + "/photo.jpg";
-        uploader.setAvatarR2Key(avatarKey);
-        uploader.setAvatarUrl("https://r2/" + avatarKey);
-        when(userRepo.findById(uploaderId)).thenReturn(Optional.of(uploader));
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of());
-        doThrow(new RuntimeException("transient R2 outage")).when(r2).deleteFile(avatarKey);
-        listAppender.list.clear();
-
-        // Best-effort, mirroring the per-row policy: no throw, DB pointer dropped anyway.
-        service.deleteByUploader(uploaderId);
-
-        assertThat(uploader.getAvatarR2Key()).isNull();
-        List<ILoggingEvent> warns = listAppender.list.stream()
-                .filter(e -> e.getLevel() == Level.WARN)
-                .toList();
-        assertThat(warns).hasSize(1);
-        assertThat(warns.get(0).getFormattedMessage())
-                .contains("[key omitted]")
-                .doesNotContain(avatarKey);
     }
 
     // ---------------------------------------------------- QA MEDIUM #3 — getPortfolio
@@ -871,134 +948,49 @@ class MediaServiceTest {
     // ---------------------------------------------------- QA MEDIUM #4 — upload rollback
 
     @Test
-    @DisplayName("leaves DB unchanged when R2 upload fails after the old avatar is deleted")
-    void should_keepDbUnchanged_when_r2UploadThrowsAfterOldAvatarDeleted() {
+    @DisplayName("leaves DB unchanged and the OLD blob intact when the R2 upload fails")
+    void should_keepOldAvatarIntact_when_r2UploadThrows() {
         UUID userId = UUID.randomUUID();
         User user = newUser(userId);
         String oldKey = "avatars/" + userId + "/old.jpg";
         user.setAvatarR2Key(oldKey);
         user.setAvatarUrl("https://r2/old.jpg");
-        when(userRepo.findById(userId)).thenReturn(Optional.of(user));
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(user));
         doThrow(new BusinessException(HttpStatus.BAD_GATEWAY, "R2 upload failed"))
                 .when(r2).uploadFile(anyString(), any(), anyLong(), anyString());
 
         assertThatThrownBy(() -> service.uploadAvatar(userId, jpegFile()))
                 .isInstanceOf(BusinessException.class);
 
-        // SEC-2 ordering: old blob was attempted before the upload that failed.
-        verify(r2, times(1)).deleteFile(oldKey);
-        // Critically — the write tx (which would have rotated the DB key/url) never ran.
+        verify(r2, never()).deleteFile(anyString());
         verify(txWrite, never()).execute(any());
         verify(userRepo, never()).save(any(User.class));
-        // The User entity was never mutated in-memory either.
         assertThat(user.getAvatarR2Key()).isEqualTo(oldKey);
         assertThat(user.getAvatarUrl()).isEqualTo("https://r2/old.jpg");
     }
 
-    // ---------------------------------------------------- QA MEDIUM #5 — sweep resilience
-
     @Test
-    @DisplayName("continues the deleteByUploader sweep when one R2 delete fails")
-    void should_continueSweep_when_r2DeleteFailsOnOneRow() {
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        MediaFile a = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-a").r2Url("u-a").build();
-        MediaFile b = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-b").r2Url("u-b").build();
-        MediaFile c = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-c").r2Url("u-c").build();
-        List<MediaFile> rows = List.of(a, b, c);
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(rows);
-        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call carrying all three keys;
-        // R2 reports "k-b" as a per-key failure in the returned set (S3 DeleteObjects semantics —
-        // it does not throw for a partial batch failure).
-        when(r2.deleteFiles(List.of("k-a", "k-b", "k-c"))).thenReturn(Set.of("k-b"));
+    @DisplayName("deletes the NEW blob (not the old) when the DB write fails and the row does not reference it")
+    void should_discardNewBlobAndKeepOld_when_dbWriteFails() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        String oldKey = "avatars/" + userId + "/old.jpg";
+        user.setAvatarR2Key(oldKey);
+        // A fresh read after the rolled-back write still sees the OLD key (the locked entity above is rolled back).
+        User committedView = newUser(userId);
+        committedView.setAvatarR2Key(oldKey);
+        lenient().when(userRepo.findById(userId)).thenReturn(Optional.of(committedView));
+        // The write tx fails (no save() any more — the locked load is the write step's DB round-trip).
+        when(userRepo.findByIdForUpdate(userId)).thenThrow(new IllegalStateException("db down"));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/new.jpg");
 
-        // No throw — a single-key failure must not abort the sweep.
-        service.deleteByUploader(uploaderId);
+        assertThatThrownBy(() -> service.uploadAvatar(userId, jpegFile()))
+                .isInstanceOf(IllegalStateException.class);
 
-        verify(r2, times(1)).deleteFiles(List.of("k-a", "k-b", "k-c"));
-        // The DB batch delete still ran exactly once with the full row set, despite one key failing.
-        verify(mediaRepo, times(1)).deleteAll(rows);
-    }
-
-    // ---------------------------------------------------- MEDIUM-2 — sweep WARN log key redaction
-
-    @Test
-    @DisplayName("WARN log omits R2 key and contains '[key omitted]' when deleteByUploader R2 delete fails")
-    void should_omitKeyInWarnLog_when_deleteByUploaderFails() {
-        // Arrange
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        String mockedKey = "portfolio/salons/" + UUID.randomUUID() + "/avatar.jpg";
-        MediaFile mf = MediaFile.builder()
-                .id(UUID.randomUUID())
-                .uploader(uploader)
-                .entityType(EntityType.SALON)
-                .entityId(UUID.randomUUID())
-                .mediaType(MediaType.PORTFOLIO)
-                .r2Key(mockedKey)
-                .r2Url("https://r2/" + mockedKey)
-                .build();
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(List.of(mf));
-        // Batched (Phase 268 perf follow-up): R2 reports the key as failed in the returned set.
-        when(r2.deleteFiles(List.of(mockedKey))).thenReturn(Set.of(mockedKey));
-        listAppender.list.clear();
-
-        // Act — must not throw even though R2 delete fails
-        service.deleteByUploader(uploaderId);
-
-        // Assert
-        List<ILoggingEvent> warns = listAppender.list.stream()
-                .filter(e -> e.getLevel() == Level.WARN)
-                .toList();
-        assertThat(warns).as("exactly one WARN emitted when one R2 delete fails in sweep").hasSize(1);
-        String formattedMessage = warns.get(0).getFormattedMessage();
-        assertThat(formattedMessage)
-                .as("WARN log must contain '[key omitted]' sentinel")
-                .contains("[key omitted]");
-        assertThat(formattedMessage)
-                .as("WARN log must not contain the raw R2 key")
-                .doesNotContain(mockedKey);
-    }
-
-    // ---------------------------------------------- Phase 7.8/7.9 — sweep cache eviction
-
-    @Test
-    @DisplayName("evicts portfolio cache for each DISTINCT (entityType, entityId) when deleteByUploader succeeds")
-    void should_evictPortfolioCache_for_each_distinctEntity_when_deleteByUploaderSucceeds() {
-        UUID uploaderId = UUID.randomUUID();
-        User uploader = newUser(uploaderId);
-        UUID salonA = UUID.randomUUID();
-        UUID masterB = UUID.randomUUID();
-        // Two rows on (SALON, salonA) — must collapse to a single eviction call — and one
-        // row on (MASTER, masterB). Total: 2 distinct evictions.
-        MediaFile a1 = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(salonA)
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-a1").r2Url("u-a1").build();
-        MediaFile a2 = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.SALON).entityId(salonA)
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-a2").r2Url("u-a2").build();
-        MediaFile b1 = MediaFile.builder().id(UUID.randomUUID()).uploader(uploader)
-                .entityType(EntityType.MASTER).entityId(masterB)
-                .mediaType(MediaType.PORTFOLIO).r2Key("k-b1").r2Url("u-b1").build();
-        List<MediaFile> rows = List.of(a1, a2, b1);
-        when(mediaRepo.findByUploaderId(uploaderId)).thenReturn(rows);
-
-        service.deleteByUploader(uploaderId);
-
-        // The eviction must happen after the write tx (post-commit by construction).
-        InOrder order = inOrder(txWrite, portfolioCache);
-        order.verify(txWrite).execute(any());
-        // Exactly 2 eviction calls — duplicate (SALON, salonA) collapsed by Set.
-        // Cache keys are plain Strings: entityType.name() + '_' + entityId (portfolioCacheKey contract).
-        verify(portfolioCache, times(1)).evictIfPresent(EntityType.SALON.name() + "_" + salonA);
-        verify(portfolioCache, times(1)).evictIfPresent(EntityType.MASTER.name() + "_" + masterB);
-        verify(portfolioCache, times(2)).evictIfPresent(any());
+        ArgumentCaptor<String> uploaded = ArgumentCaptor.forClass(String.class);
+        verify(r2).uploadFile(uploaded.capture(), any(), anyLong(), anyString());
+        verify(r2).deleteFile(uploaded.getValue());
+        verify(r2, never()).deleteFile(oldKey);
     }
 
     // ------------------------------------------------ paginated getPortfolio — sort override
@@ -1041,88 +1033,240 @@ class MediaServiceTest {
         assertThat(captured.getPageSize()).isEqualTo(25);
     }
 
+    // ------------------------------------------------- S-M1 — salon image own-prefix guard
+
+    @Test
+    @DisplayName("S-M1: a salon image KEY outside salons/<salonId>/ (another salon, a user avatar, traversal) handed "
+            + "to deleteBySalon is NOT deleted — counts-only WARN; the portfolio rows are still swept")
+    void should_skipDelete_when_salonImageKeyOutsideSalonPrefix() {
+        UUID salonId = UUID.randomUUID();
+        String otherSalonKey = "salons/" + UUID.randomUUID() + "/logo/x.jpg";
+        String userAvatarKey = "avatars/" + UUID.randomUUID() + "/a.jpg";
+        String traversalKey = "salons/" + salonId + "/../avatars/u/a.jpg";
+        MediaFileKey portfolio = salonMediaKey(salonId, "portfolio/salons/" + salonId + "/p-1");
+        listAppender.list.clear();
+
+        service.deleteBySalon(salonId, List.of(otherSalonKey, userAvatarKey, traversalKey), List.of(portfolio));
+
+        verify(r2).deleteFiles(List.of("portfolio/salons/" + salonId + "/p-1"));
+        assertThat(listAppender.list).filteredOn(e -> e.getLevel() == Level.WARN)
+                .singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("skippedCount=3")
+                        .doesNotContain("logo/x.jpg").doesNotContain("/a.jpg"));
+    }
+
+    @Test
+    @DisplayName("S-M1: resolveSalonImageKey rejects a URL resolving outside salons/<salonId>/ with a WARN that "
+            + "omits the URL")
+    void should_returnNullAndWarn_when_salonImageUrlOutsideSalonPrefix() {
+        UUID salonId = UUID.randomUUID();
+        String otherSalonUrl = "https://pub.r2.dev/salons/" + UUID.randomUUID() + "/logo/x.jpg";
+        when(r2.extractKeyFromPublicUrl(otherSalonUrl))
+                .thenReturn(Optional.of(otherSalonUrl.substring("https://pub.r2.dev/".length())));
+        listAppender.list.clear();
+
+        String key = service.resolveSalonImageKey(salonId, otherSalonUrl);
+
+        assertThat(key).isNull();
+        assertThat(listAppender.list).filteredOn(e -> e.getLevel() == Level.WARN)
+                .singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("Salon image purge skipped")
+                        .doesNotContain("logo/x.jpg"));
+    }
+
+    @Test
+    @DisplayName("S-M1: resolveSalonImageKey returns the key for a URL under the salon's own prefix")
+    void should_returnKey_when_salonImageUrlUnderOwnPrefix() {
+        UUID salonId = UUID.randomUUID();
+        String logoKey = "salons/" + salonId + "/logo/l.jpg";
+        when(r2.extractKeyFromPublicUrl("https://pub.r2.dev/" + logoKey)).thenReturn(Optional.of(logoKey));
+
+        assertThat(service.resolveSalonImageKey(salonId, "https://pub.r2.dev/" + logoKey)).isEqualTo(logoKey);
+    }
+
+    @Test
+    @DisplayName("S-M1: logo + cover keys under the salon's own salons/<salonId>/ prefix ARE deleted")
+    void should_deleteSalonImageKeys_when_keysUnderOwnSalonPrefix() {
+        UUID salonId = UUID.randomUUID();
+        String logoKey = "salons/" + salonId + "/logo/l.jpg";
+        String coverKey = "salons/" + salonId + "/cover/c.jpg";
+
+        service.deleteBySalon(salonId, List.of(logoKey, coverKey), List.of());
+
+        verify(r2).deleteFiles(List.of(logoKey, coverKey));
+    }
+
+    @Test
+    @DisplayName("S-M1: resolveSalonImageKey rejects traversal under the own prefix and a null URL")
+    void should_returnNull_when_salonImageKeyHasTraversalOrUrlIsNull() {
+        UUID salonId = UUID.randomUUID();
+        String url = "https://pub.r2.dev/x";
+        when(r2.extractKeyFromPublicUrl(url)).thenReturn(Optional.of("salons/" + salonId + "/../avatars/u/a.jpg"));
+
+        assertThat(service.resolveSalonImageKey(salonId, url)).isNull();
+        assertThat(service.resolveSalonImageKey(salonId, null)).isNull();
+    }
+
+    // --------------------------------------------- account purge (S-L1, P-M1, P-M2 hand-off)
+
+    @Test
+    @DisplayName("S-L1: an account avatar key outside avatars/<userId>/ is skipped (WARN, key omitted); "
+            + "media keys are still purged")
+    void should_skipAvatarKey_when_accountAvatarOutsideOwnPrefix() {
+        UUID userId = UUID.randomUUID();
+        String foreignKey = "avatars/" + UUID.randomUUID() + "/x.jpg";
+        UploaderMediaKey media = new UploaderMediaKey(userId, "portfolio/independent/" + MASTER_ID_FOR_PURGE + "/m.jpg",
+                EntityType.MASTER, MASTER_ID_FOR_PURGE);
+        listAppender.list.clear();
+
+        service.purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(userId, foreignKey, null, List.of(media))));
+
+        verify(r2).deleteFiles(List.of("portfolio/independent/" + MASTER_ID_FOR_PURGE + "/m.jpg"));
+        assertThat(listAppender.list).filteredOn(e -> e.getLevel() == Level.WARN)
+                .singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("[omitted]").doesNotContain(foreignKey));
+    }
+
+    @Test
+    @DisplayName("P-M1: N accounts -> ONE deleteFiles call with every verified avatar (incl. legacy url-derived) "
+            + "and media key; each distinct portfolio cache entry evicted once")
+    void should_purgeAllAccountsInOneBatch_when_multipleAccounts() {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        when(r2.extractKeyFromPublicUrl("https://cdn/avatars/" + b + "/legacy.jpg"))
+                .thenReturn(Optional.of("avatars/" + b + "/legacy.jpg"));
+        UploaderMediaKey ma = new UploaderMediaKey(a, "portfolio/salons/" + salonId + "/a.jpg", EntityType.SALON, salonId);
+        UploaderMediaKey mb = new UploaderMediaKey(b, "portfolio/salons/" + salonId + "/b.jpg", EntityType.SALON, salonId);
+
+        service.purgeUserBlobsAfterCommit(List.of(
+                new AccountBlobPointers(a, "avatars/" + a + "/a.jpg", null, List.of(ma)),
+                new AccountBlobPointers(b, null, "https://cdn/avatars/" + b + "/legacy.jpg", List.of(mb))));
+
+        verify(r2, times(1)).deleteFiles(List.of(
+                "avatars/" + a + "/a.jpg", "portfolio/salons/" + salonId + "/a.jpg", "avatars/" + b + "/legacy.jpg", "portfolio/salons/" + salonId + "/b.jpg"));
+        verify(portfolioCache, times(1)).evictIfPresent(EntityType.SALON.name() + "_" + salonId);
+    }
+
+    // ----------------------------------- S-L5 — media_files key own-portfolio-prefix guard
+
+    @Test
+    @DisplayName("S-L5: account purge skips a media key outside its row's portfolio/<kind>/<entityId>/ prefix "
+            + "(another entity, wrong kind, traversal, USER entity) — WARN with a count only")
+    void should_skipMediaKey_when_outsideEntityPortfolioPrefix() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        String own = "portfolio/salons/" + salonId + "/1-own.jpg";
+        List<UploaderMediaKey> media = List.of(
+                new UploaderMediaKey(userId, own, EntityType.SALON, salonId),
+                new UploaderMediaKey(userId, "portfolio/salons/" + UUID.randomUUID() + "/1-foreign.jpg",
+                        EntityType.SALON, salonId),
+                new UploaderMediaKey(userId, "portfolio/independent/" + salonId + "/1-kind.jpg",
+                        EntityType.SALON, salonId),
+                new UploaderMediaKey(userId, "portfolio/independent/" + masterId + "/../x/1-trav.jpg",
+                        EntityType.MASTER, masterId),
+                new UploaderMediaKey(userId, "avatars/" + userId + "/1-user.jpg", EntityType.USER, userId));
+        listAppender.list.clear();
+
+        service.purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(userId, null, null, media)));
+
+        verify(r2).deleteFiles(List.of(own));
+        assertThat(listAppender.list).filteredOn(e -> e.getLevel() == Level.WARN).singleElement()
+                .satisfies(e -> assertThat(e.getFormattedMessage()).contains("skippedCount=4")
+                        .doesNotContain("foreign").doesNotContain("1-kind").doesNotContain("1-user"));
+    }
+
+    @Test
+    @DisplayName("S-L5: salon sweep deletes only rows under portfolio/salons/<salonId>/; a mismatched row's "
+            + "blob is skipped but the row itself is still removed from the DB")
+    void should_skipMediaKey_when_salonSweepRowOutsideEntityPortfolioPrefix() {
+        UUID salonId = UUID.randomUUID();
+        String own = "portfolio/salons/" + salonId + "/1-own.jpg";
+        List<MediaFileKey> rows = List.of(
+                salonMediaKey(salonId, own),
+                salonMediaKey(salonId, "avatars/" + UUID.randomUUID() + "/a.jpg"));
+
+        service.deleteBySalon(salonId, List.of(), rows);
+
+        verify(r2).deleteFiles(List.of(own));
+        verify(mediaRepo).deleteAllByIdInBatch(keyIdsOf(rows));
+    }
+
+    @Test
+    @DisplayName("S-L5: keys under their own SALON / MASTER portfolio prefix are accepted")
+    void should_acceptMediaKey_when_underOwnEntityPortfolioPrefix() {
+        UUID userId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        String salonKey = "portfolio/salons/" + salonId + "/1-s.jpg";
+        String masterKey = "portfolio/independent/" + masterId + "/1-m.jpg";
+
+        service.purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(userId, null, null, List.of(
+                new UploaderMediaKey(userId, salonKey, EntityType.SALON, salonId),
+                new UploaderMediaKey(userId, masterKey, EntityType.MASTER, masterId)))));
+
+        verify(r2).deleteFiles(List.of(salonKey, masterKey));
+    }
+
+    @Test
+    @DisplayName("account purge with nothing to delete makes no R2 call")
+    void should_notCallR2_when_accountHasNoBlobs() {
+        service.purgeUserBlobsAfterCommit(List.of(new AccountBlobPointers(UUID.randomUUID(), null, null, List.of())));
+
+        verify(r2, never()).deleteFiles(anyCollection());
+    }
+
     // ------------------------------------------------------- Phase 268 D3 — deleteBySalon sweep
 
     @Test
     @DisplayName("case 6 — deletes every SALON portfolio row's R2 blob and the row itself")
     void should_deleteSalonPortfolioPhotos_when_deleteBySalonCalled() {
         UUID salonId = UUID.randomUUID();
-        MediaFile p1 = MediaFile.builder().id(UUID.randomUUID())
-                .entityType(EntityType.SALON).entityId(salonId)
-                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
-        MediaFile p2 = MediaFile.builder().id(UUID.randomUUID())
-                .entityType(EntityType.SALON).entityId(salonId)
-                .mediaType(MediaType.PORTFOLIO).r2Key("p-2").r2Url("u-2").build();
-        List<MediaFile> rows = List.of(p1, p2);
+        List<MediaFileKey> rows = List.of(
+                salonMediaKey(salonId, "portfolio/salons/" + salonId + "/p-1"),
+                salonMediaKey(salonId, "portfolio/salons/" + salonId + "/p-2"));
 
-        service.deleteBySalon(salonId, null, null, rows);
+        service.deleteBySalon(salonId, List.of(), rows);
 
         // Batched (Phase 268 perf follow-up): one deleteFiles(...) call carrying both keys.
-        verify(r2).deleteFiles(List.of("p-1", "p-2"));
-        verify(mediaRepo).deleteAll(rows);
+        verify(r2).deleteFiles(List.of("portfolio/salons/" + salonId + "/p-1", "portfolio/salons/" + salonId + "/p-2"));
+        verify(mediaRepo).deleteAllByIdInBatch(keyIdsOf(rows));
     }
 
     @Test
-    @DisplayName("case 7 — deletes BOTH the avatar and cover R2 blobs, even with zero portfolio rows "
+    @DisplayName("case 7 — deletes BOTH the logo and cover R2 blobs, even with zero portfolio rows "
             + "(must not short-circuit on rows.isEmpty())")
     void should_deleteAvatarAndCoverBlobs_when_deleteBySalonCalledWithNoPortfolioRows() {
         UUID salonId = UUID.randomUUID();
-        String avatarUrl = "https://pub.r2.dev/portfolio/salons/" + salonId + "/avatar.jpg";
-        String coverUrl = "https://pub.r2.dev/portfolio/salons/" + salonId + "/cover.jpg";
-        when(r2.extractKeyFromPublicUrl(avatarUrl))
-                .thenReturn(Optional.of("portfolio/salons/" + salonId + "/avatar.jpg"));
-        when(r2.extractKeyFromPublicUrl(coverUrl))
-                .thenReturn(Optional.of("portfolio/salons/" + salonId + "/cover.jpg"));
+        String logoKey = "salons/" + salonId + "/logo/avatar.jpg";
+        String coverKey = "salons/" + salonId + "/cover/cover.jpg";
 
-        service.deleteBySalon(salonId, avatarUrl, coverUrl, List.of());
+        service.deleteBySalon(salonId, List.of(logoKey, coverKey), List.of());
 
         // Batched (Phase 268 perf follow-up): both extra keys in one deleteFiles(...) call.
-        verify(r2).deleteFiles(List.of(
-                "portfolio/salons/" + salonId + "/avatar.jpg",
-                "portfolio/salons/" + salonId + "/cover.jpg"));
+        verify(r2).deleteFiles(List.of(logoKey, coverKey));
         // No portfolio rows to delete — the DB write tx must never be invoked for an empty list.
-        verify(mediaRepo, never()).deleteAll(anyList());
+        verify(mediaRepo, never()).deleteAllByIdInBatch(anyList());
     }
 
     @Test
-    @DisplayName("case 9 — a foreign/malformed image URL yields NO deleteFile call for it (D2 safety "
-            + "guard); the portfolio rows are still swept")
-    void should_skipDelete_when_imageUrlLacksConfiguredPrefix() {
-        UUID salonId = UUID.randomUUID();
-        String foreignUrl = "https://evil.example.com/not-ours.jpg";
-        when(r2.extractKeyFromPublicUrl(foreignUrl)).thenReturn(Optional.empty());
-        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
-                .entityType(EntityType.SALON).entityId(salonId)
-                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
-
-        service.deleteBySalon(salonId, foreignUrl, null, List.of(portfolio));
-
-        // The batched call never carries anything derived from the foreign URL — only the
-        // legitimate portfolio row's key.
-        verify(r2).deleteFiles(List.of("p-1"));
-    }
-
-    @Test
-    @DisplayName("case 11 — one R2 delete failing (the avatar) does not abort the sweep: the cover "
+    @DisplayName("case 11 — one R2 delete failing (the logo) does not abort the sweep: the cover "
             + "and the portfolio row are still deleted, and the DB batch delete still runs")
     void should_continueSweep_when_oneR2DeleteThrowsDuringDeleteBySalon() {
         UUID salonId = UUID.randomUUID();
-        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
-        String coverUrl = "https://pub.r2.dev/cover.jpg";
-        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
-        when(r2.extractKeyFromPublicUrl(coverUrl)).thenReturn(Optional.of("cover-key"));
-        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
-                .entityType(EntityType.SALON).entityId(salonId)
-                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
-        // Batched (Phase 268 perf follow-up): one deleteFiles(...) call carrying all three keys;
-        // R2 reports only "avatar-key" as a per-key failure in the returned set.
-        when(r2.deleteFiles(List.of("avatar-key", "cover-key", "p-1"))).thenReturn(Set.of("avatar-key"));
+        String logoKey = "salons/" + salonId + "/logo/a.jpg";
+        String coverKey = "salons/" + salonId + "/cover/c.jpg";
+        String portfolioKey = "portfolio/salons/" + salonId + "/p-1";
+        MediaFileKey portfolio = salonMediaKey(salonId, portfolioKey);
+        // R2 reports only the logo as a per-key failure in the returned set.
+        when(r2.deleteFiles(List.of(logoKey, coverKey, portfolioKey))).thenReturn(Set.of(logoKey));
 
-        // No throw — the failing avatar delete must not abort the rest of the sweep.
-        service.deleteBySalon(salonId, avatarUrl, coverUrl, List.of(portfolio));
+        // No throw — the failing logo delete must not abort the rest of the sweep.
+        service.deleteBySalon(salonId, List.of(logoKey, coverKey), List.of(portfolio));
 
-        verify(r2).deleteFiles(List.of("avatar-key", "cover-key", "p-1"));
-        verify(mediaRepo).deleteAll(List.of(portfolio));
+        verify(r2).deleteFiles(List.of(logoKey, coverKey, portfolioKey));
+        verify(mediaRepo).deleteAllByIdInBatch(keyIdsOf(List.of(portfolio)));
     }
 
     @Test
@@ -1130,37 +1274,30 @@ class MediaServiceTest {
             + "R2 delete fails, so a salon deletion never rolls back on an R2 outage")
     void should_completeWithoutThrowing_when_everyR2DeleteFailsDuringDeleteBySalon() {
         UUID salonId = UUID.randomUUID();
-        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
-        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
-        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
-                .entityType(EntityType.SALON).entityId(salonId)
-                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
-        // Batched (Phase 268 perf follow-up): r2.deleteFiles never throws for a delete failure —
-        // it reports every requested key back as failed in the returned set (S3 DeleteObjects
-        // semantics), which is exactly "every single R2 delete fails" in the new contract.
-        when(r2.deleteFiles(List.of("avatar-key", "p-1"))).thenReturn(Set.of("avatar-key", "p-1"));
+        String logoKey = "salons/" + salonId + "/logo/a.jpg";
+        String portfolioKey = "portfolio/salons/" + salonId + "/p-1";
+        MediaFileKey portfolio = salonMediaKey(salonId, portfolioKey);
+        // r2.deleteFiles never throws for a delete failure — it reports every requested key back as failed.
+        when(r2.deleteFiles(List.of(logoKey, portfolioKey))).thenReturn(Set.of(logoKey, portfolioKey));
 
-        assertThatCode(() -> service.deleteBySalon(salonId, avatarUrl, null, List.of(portfolio)))
+        assertThatCode(() -> service.deleteBySalon(salonId, List.of(logoKey), List.of(portfolio)))
                 .as("R2 being entirely down must never propagate out of the sweep")
                 .doesNotThrowAnyException();
 
         // The DB pointer's row is still dropped — D4's accepted-orphan policy.
-        verify(mediaRepo).deleteAll(List.of(portfolio));
+        verify(mediaRepo).deleteAllByIdInBatch(keyIdsOf(List.of(portfolio)));
     }
 
     @Test
-    @DisplayName("case 13 — WARN log omits the R2 key and contains '[key omitted]' when an avatar/cover "
+    @DisplayName("case 13 — WARN log omits the R2 key and contains '[key omitted]' when a logo/cover "
             + "delete fails during deleteBySalon")
     void should_notLogR2Key_when_deleteBySalonAvatarDeleteFails() {
         UUID salonId = UUID.randomUUID();
-        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
-        String rawKey = "portfolio/salons/" + salonId + "/avatar.jpg";
-        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of(rawKey));
-        // Batched (Phase 268 perf follow-up): R2 reports the key as failed in the returned set.
+        String rawKey = "salons/" + salonId + "/logo/avatar.jpg";
         when(r2.deleteFiles(List.of(rawKey))).thenReturn(Set.of(rawKey));
         listAppender.list.clear();
 
-        service.deleteBySalon(salonId, avatarUrl, null, List.of());
+        service.deleteBySalon(salonId, List.of(rawKey), List.of());
 
         List<ILoggingEvent> warns = listAppender.list.stream()
                 .filter(e -> e.getLevel() == Level.WARN)
@@ -1169,7 +1306,6 @@ class MediaServiceTest {
         String formattedMessage = warns.get(0).getFormattedMessage();
         assertThat(formattedMessage).contains("[key omitted]");
         assertThat(formattedMessage).doesNotContain(rawKey);
-        assertThat(formattedMessage).doesNotContain(avatarUrl);
     }
 
     @Test
@@ -1177,36 +1313,27 @@ class MediaServiceTest {
             + "zero portfolio rows to derive the entity from")
     void should_evictSalonPortfolioCache_when_deleteBySalonCalledWithNoRows() {
         UUID salonId = UUID.randomUUID();
-        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
-        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
 
-        service.deleteBySalon(salonId, avatarUrl, null, List.of());
+        service.deleteBySalon(salonId, List.of("salons/" + salonId + "/logo/a.jpg"), List.of());
 
         verify(portfolioCache).evictIfPresent(EntityType.SALON.name() + "_" + salonId);
     }
 
     @Test
     @DisplayName("D4 pin, dedicated to deleteBySalon — R2 batch delete happens strictly BEFORE the "
-            + "DB pointer drop, proven independently of the shared deleteByUploader InOrder assertion")
+            + "DB row drop (the salon is already gone; no live pointer to protect)")
     void should_deleteR2BlobsBeforeDbRows_when_deleteBySalonCalled() {
         UUID salonId = UUID.randomUUID();
-        String avatarUrl = "https://pub.r2.dev/avatar.jpg";
-        String coverUrl = "https://pub.r2.dev/cover.jpg";
-        when(r2.extractKeyFromPublicUrl(avatarUrl)).thenReturn(Optional.of("avatar-key"));
-        when(r2.extractKeyFromPublicUrl(coverUrl)).thenReturn(Optional.of("cover-key"));
-        MediaFile portfolio = MediaFile.builder().id(UUID.randomUUID())
-                .entityType(EntityType.SALON).entityId(salonId)
-                .mediaType(MediaType.PORTFOLIO).r2Key("p-1").r2Url("u-1").build();
+        String logoKey = "salons/" + salonId + "/logo/a.jpg";
+        String coverKey = "salons/" + salonId + "/cover/c.jpg";
+        String portfolioKey = "portfolio/salons/" + salonId + "/p-1";
+        MediaFileKey portfolio = salonMediaKey(salonId, portfolioKey);
 
-        service.deleteBySalon(salonId, avatarUrl, coverUrl, List.of(portfolio));
+        service.deleteBySalon(salonId, List.of(logoKey, coverKey), List.of(portfolio));
 
-        // D4: R2-first-then-DB. sweepBlobs is shared with deleteByUploader (pinned separately by
-        // should_purgeR2Avatars_when_userIsDeletedBeforeCascade), but this pins the ordering by
-        // name for the SALON path specifically, so a future divergence between the two callers is
-        // caught even if one of them stops sharing sweepBlobs.
         InOrder inOrder = inOrder(r2, mediaRepo);
-        inOrder.verify(r2).deleteFiles(List.of("avatar-key", "cover-key", "p-1"));
-        inOrder.verify(mediaRepo).deleteAll(List.of(portfolio));
+        inOrder.verify(r2).deleteFiles(List.of(logoKey, coverKey, portfolioKey));
+        inOrder.verify(mediaRepo).deleteAllByIdInBatch(keyIdsOf(List.of(portfolio)));
     }
 
     @Test
@@ -1214,14 +1341,11 @@ class MediaServiceTest {
     void should_doNothing_when_deleteBySalonCalledWithNothingToSweep() {
         UUID salonId = UUID.randomUUID();
 
-        service.deleteBySalon(salonId, null, null, List.of());
+        service.deleteBySalon(salonId, List.of(), List.of());
 
-        // extractKeyFromPublicUrl(null) is still called for both URL params (it handles null
-        // gracefully and resolves no key) — the no-op guarantee is that NOTHING is ever handed to
-        // R2, and the DB batch delete never runs.
         verify(r2, never()).deleteFile(anyString());
         verify(r2, never()).deleteFiles(anyList());
-        verify(mediaRepo, never()).deleteAll(anyList());
+        verify(mediaRepo, never()).deleteAllByIdInBatch(anyList());
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1601,5 +1725,47 @@ class MediaServiceTest {
         bytes[0] = 0x52; bytes[1] = 0x49; bytes[2] = 0x46; bytes[3] = 0x46;
         bytes[8] = 0x57; bytes[9] = 0x45; bytes[10] = 0x42; bytes[11] = 0x50;
         return new MockMultipartFile("file", "img.webp", "image/webp", bytes);
+    }
+
+    /** PERF-1: the sweep deletes by id in ONE batch statement — the ids the verifications expect. */
+    private static MediaFileKey salonMediaKey(UUID salonId, String key) {
+        return new MediaFileKey(UUID.randomUUID(), key, EntityType.SALON, salonId);
+    }
+
+    private static List<UUID> keyIdsOf(List<MediaFileKey> rows) {
+        return rows.stream().map(MediaFileKey::id).toList();
+    }
+
+    private static MediaFile portfolioRow(UUID mediaId, UUID uploaderId, EntityType entityType, UUID entityId,
+                                          String key) {
+        return MediaFile.builder()
+                .id(mediaId)
+                .uploader(newUser(uploaderId))
+                .entityType(entityType)
+                .entityId(entityId)
+                .mediaType(MediaType.PORTFOLIO)
+                .r2Key(key)
+                .r2Url("https://r2/" + key)
+                .build();
+    }
+
+    /**
+     * Runs {@code cb} the way {@code TransactionTemplate} would around a commit: synchronization active during
+     * the callback, every registered {@code afterCommit} fired only when it returns normally, synchronization
+     * cleared either way. Joins an outer simulated transaction instead of nesting one.
+     */
+    private static Object inSimulatedTransaction(TransactionCallback<?> cb) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            return cb.doInTransaction(mock(TransactionStatus.class));
+        }
+        TransactionSynchronizationManager.initSynchronization();
+        try {
+            Object result = cb.doInTransaction(mock(TransactionStatus.class));
+            TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(TransactionSynchronization::afterCommit);
+            return result;
+        } finally {
+            TransactionSynchronizationManager.clearSynchronization();
+        }
     }
 }

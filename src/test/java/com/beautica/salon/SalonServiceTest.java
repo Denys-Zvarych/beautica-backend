@@ -183,6 +183,10 @@ class SalonServiceTest {
     @Mock
     private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
 
+    // Perf P-L2: the after-commit salon media purge is submitted as ONE task through this seam.
+    @Mock
+    private com.beautica.media.service.AfterCommitBlobPurger afterCommitBlobPurger;
+
     @Mock
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
@@ -1417,6 +1421,105 @@ class SalonServiceTest {
         verify(servicePhotoBlobPurger).purgeAfterCommit(List.of(
                 new com.beautica.service.service.ServicePhotoBlobPurger.ServicePhotoBlob(
                         withPhotoId, "services/abc/photo.jpg")));
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — afterCommit submits the WHOLE media purge as one blobPurgeExecutor task (R2 sweep, then pointer null), nothing inline")
+    void should_dispatchSalonPurgeAsOneTask_when_deactivateSalonCommits() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
+
+        try {
+            salonService.deactivateSalon(ownerId, salonId);
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+
+        verify(mediaService, never()).deleteBySalon(any(), any(), any());
+        verify(salonRepository, never()).nullImageUrls(any());
+        verify(afterCommitBlobPurger).dispatchTask(task.capture(), org.mockito.ArgumentMatchers.anyInt(),
+                eq("salon-purge"));
+        task.getValue().run();
+        var order = org.mockito.Mockito.inOrder(mediaService, salonRepository);
+        order.verify(mediaService).deleteBySalon(eq(salonId), any(), any());
+        order.verify(salonRepository).nullImageUrls(salonId);
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — keyCount counts only logo/cover keys that resolve under the salon's own prefix, "
+            + "and the task receives resolved keys + scalar media pointers (no entities)")
+    void should_countOnlyResolvedImageKeys_when_salonPurgeDispatched() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        String ownLogoUrl = "https://cdn.example/salons/" + salonId + "/logo/l.jpg";
+        String foreignCoverUrl = "https://cdn.example/salons/" + UUID.randomUUID() + "/cover/c.jpg";
+        ReflectionTestUtils.setField(salon, "avatarUrl", ownLogoUrl);
+        ReflectionTestUtils.setField(salon, "coverImageUrl", foreignCoverUrl);
+        String logoKey = "salons/" + salonId + "/logo/l.jpg";
+        var media = new com.beautica.media.repository.MediaFileKey(UUID.randomUUID(),
+                "portfolio/salons/" + salonId + "/p.jpg", com.beautica.media.entity.EntityType.SALON, salonId);
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        when(mediaRepository.findMediaKeysByEntityTypeAndEntityId(
+                com.beautica.media.entity.EntityType.SALON, salonId)).thenReturn(List.of(media));
+        when(mediaService.resolveSalonImageKey(salonId, ownLogoUrl)).thenReturn(logoKey);
+        when(mediaService.resolveSalonImageKey(salonId, foreignCoverUrl)).thenReturn(null);
+        stubCleanEmptyStaffCascade(salonId);
+        org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
+        ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
+
+        try {
+            salonService.deactivateSalon(ownerId, salonId);
+            org.springframework.transaction.support.TransactionSynchronizationManager.getSynchronizations()
+                    .forEach(org.springframework.transaction.support.TransactionSynchronization::afterCommit);
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clearSynchronization();
+        }
+        verify(afterCommitBlobPurger).dispatchTask(task.capture(), eq(2), eq("salon-purge"));
+        task.getValue().run();
+
+        verify(mediaService).deleteBySalon(salonId, List.of(logoKey), List.of(media));
+    }
+
+    @Test
+    @DisplayName("deactivateSalon — no active synchronization: the media purge is skipped (never dispatched)")
+    void should_skipSalonPurge_when_noSynchronizationActive() {
+        UUID ownerId = UUID.randomUUID();
+        UUID salonId = UUID.randomUUID();
+        User owner = buildUser(ownerId, "owner@beautica.com", Role.SALON_OWNER);
+        Salon salon = buildSalon(salonId, owner, "Active Salon");
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
+        stubCleanEmptyStaffCascade(salonId);
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(SalonService.class);
+        var appender = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        appender.start();
+        logger.addAppender(appender);
+
+        try {
+            salonService.deactivateSalon(ownerId, salonId);
+        } finally {
+            logger.detachAppender(appender);
+        }
+
+        verify(afterCommitBlobPurger, never()).dispatchTask(any(), org.mockito.ArgumentMatchers.anyInt(), any());
+        assertThat(appender.list).anySatisfy(e -> {
+            assertThat(e.getLevel()).isEqualTo(ch.qos.logback.classic.Level.WARN);
+            assertThat(e.getFormattedMessage()).contains("Salon media purge skipped").contains("keyCount=0")
+                    .doesNotContain("salons/");
+        });
     }
 
     @Test

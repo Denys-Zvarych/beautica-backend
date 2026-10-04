@@ -291,6 +291,8 @@ public class R2StorageService {
      *       be turned into a delete against a guessed key.</li>
      *   <li>The remainder after stripping the prefix is blank → empty. A bare prefix with nothing
      *       after it is not a key.</li>
+     *   <li>The remainder starts with {@code /}, contains {@code ..}, {@code ?}, {@code #}, a backslash
+     *       or a control character → empty (absolute path / traversal / non-key URL parts).</li>
      * </ol>
      *
      * @param url a previously-stored public URL, possibly {@code null}, blank, foreign, or
@@ -308,7 +310,14 @@ public class R2StorageService {
             return Optional.empty();
         }
         String key = url.substring(publicUrlPrefix.length() + 1);
-        return StringUtils.hasText(key) ? Optional.of(key) : Optional.empty();
+        if (!StringUtils.hasText(key) || key.startsWith("/") || key.contains("..")
+                || key.contains("?") || key.contains("#") || key.contains("\\")
+                || key.chars().anyMatch(Character::isISOControl)) {
+            // Prefix match proves the host (the prefix is scheme+host[+path]); the remainder must still be a
+            // plain relative key — never an absolute path, a traversal, a query/fragment or a control char.
+            return Optional.empty();
+        }
+        return Optional.of(key);
     }
 
     private static String stripTrailingSlash(String url) {

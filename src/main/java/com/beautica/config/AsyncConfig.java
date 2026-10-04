@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import java.util.Objects;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -23,14 +24,14 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
 /**
  * Async executors and their shutdown budget.
  *
- * <h4>Shutdown budget — sequential worst case ~160 s</h4>
+ * <h4>Shutdown budget — sequential worst case ~170 s</h4>
  * <p>Each pool drains in its own {@code destroy()}, and Spring runs those calls SEQUENTIALLY, so the
  * worst case is the SUM of every {@code awaitTerminationSeconds} (an idle pool returns at once; the sum
- * is reached only when every pool is still busy): 30+20+20+20+30+30+10 = 160 s.
+ * is reached only when every pool is still busy): 30+20+20+20+30+30+10+10 = 170 s.
  *
  * <p><b>The deploy platform's SIGTERM→SIGKILL window must be at least this worst case.</b> A shorter
  * window kills the JVM mid-drain, losing the non-recoverable work below AND the abandonment report. On
- * Railway set {@code RAILWAY_DEPLOYMENT_DRAINING_SECONDS} (&ge; 160) accordingly; the repo carries no such
+ * Railway set {@code RAILWAY_DEPLOYMENT_DRAINING_SECONDS} (&ge; 170) accordingly; the repo carries no such
  * configuration. The push pool must drain before {@code FirebaseConfig} is destroyed
  * ({@code @DependsOn}, see {@code AsyncConfigShutdownOrderingTest}).
  *
@@ -48,7 +49,10 @@ import org.springframework.security.task.DelegatingSecurityContextTaskExecutor;
  * smsReminderExecutor          30 s  guest 24h reminder SMS. NOT recoverable (reminderSent already
  *                                    committed); reported at ERROR. ~6 s drains a full queue at healthy RTT.
  * cacheEvictionExecutor        10 s  in-memory Caffeine scans; the cache dies with the JVM -> irrelevant.
- * total (sequential worst)    160 s
+ * blobPurgeExecutor            10 s  after-commit R2 deletes of already-dereferenced blobs; cut = accepted
+ *                                    orphan blob (never a dangling pointer), same policy as a failed delete;
+ *                                    reported at WARN with task + key counts.
+ * total (sequential worst)    170 s
  * </pre>
  * Outbox-driven work (invite/booking email, push fan-out) is re-queued by the outbox drain worker on the
  * next boot unless the hand-off was already accepted (push: see
@@ -65,6 +69,9 @@ public class AsyncConfig implements AsyncConfigurer {
     static final int PUSH_SHUTDOWN_GRACE_SECONDS = 30;
     static final int SMS_SEND_SHUTDOWN_GRACE_SECONDS = 20;
     static final int CACHE_EVICTION_SHUTDOWN_GRACE_SECONDS = 10;
+    static final int BLOB_PURGE_SHUTDOWN_GRACE_SECONDS = 10;
+    static final int BLOB_PURGE_POOL_SIZE = 2;
+    static final int BLOB_PURGE_QUEUE_CAPACITY = 500;
 
     /**
      * Shutdown grace of {@code smsReminderDispatchExecutor}: its task is a hand-off loop, not provider I/O.
@@ -625,6 +632,130 @@ public class AsyncConfig implements AsyncConfigurer {
     @Bean(name = "cacheEvictionExecutor")
     @Profile("test")
     public TaskExecutor syncCacheEvictionExecutor() {
+        return new SyncTaskExecutor();
+    }
+
+    /**
+     * Pool for after-commit R2 blob purges ({@code AfterCommitBlobPurger}) — backend-perf P-M2.
+     *
+     * <p>An {@code afterCommit} callback runs on the committing thread while it still holds its pooled
+     * Hikari connection (measurements on {@link #smsReminderDispatchExecutor()}), so an inline R2
+     * {@code DeleteObjects} round-trip (30 s socket cap) pinned one of the 10 production connections per
+     * avatar replace / account delete / staff removal. The callback now submits ONE task here and returns.
+     *
+     * <p><b>Why not an existing pool.</b> {@code cacheEvictionExecutor} is {@code CallerRunsPolicy} by design
+     * (in-memory work, a dropped eviction is a correctness bug) — under saturation it would run the R2
+     * round-trip right back on the committing thread. {@code emailExecutor}/{@code pushExecutor} are SMTP /
+     * FCM pools wrapped in a SecurityContext propagator; sharing them would let a slow R2 starve mail/push.
+     *
+     * <p><b>{@code AbortPolicy} + bounded queue.</b> A purge whose blob is already dereferenced in the DB is
+     * the cheapest possible loss — an orphan blob, the same outcome as a failed delete — so a rejection is
+     * dropped and logged by the submitter (key list omitted) instead of back-pressuring a request thread.
+     * {@code core == max} for the reason given on {@link #smsReminderExecutor()} (a pool only grows past its
+     * core once the queue is full); {@code allowCoreThreadTimeOut} lets both die back when idle.
+     *
+     * <p>No {@link DelegatingSecurityContextTaskExecutor}: the task takes a key list, nothing
+     * principal-derived. {@code @Profile("!test")} — see {@link #syncBlobPurgeExecutor()}.
+     */
+    @Bean(name = "blobPurgeExecutor")
+    @Profile("!test")
+    public TaskExecutor blobPurgeExecutor() {
+        // Loss-reporting subclass (perf PERF-2): the 10 s drain can abandon up to BLOB_PURGE_QUEUE_CAPACITY
+        // queued purges; without it they vanish behind Spring's count-less timeout warning.
+        ThreadPoolTaskExecutor executor = new BlobPurgeLossReportingTaskExecutor(BLOB_PURGE_SHUTDOWN_GRACE_SECONDS);
+        executor.setCorePoolSize(BLOB_PURGE_POOL_SIZE);
+        executor.setMaxPoolSize(BLOB_PURGE_POOL_SIZE);
+        executor.setAllowCoreThreadTimeOut(true);
+        executor.setKeepAliveSeconds(60);
+        executor.setQueueCapacity(BLOB_PURGE_QUEUE_CAPACITY);
+        executor.setThreadNamePrefix("blob-purge-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        executor.initialize();
+        return executor;
+    }
+
+    /**
+     * One {@code blobPurgeExecutor} task plus the number of R2 keys it would delete. {@code AfterCommitBlobPurger}
+     * submits every purge wrapped in this, so {@link BlobPurgeLossReportingTaskExecutor} can report how many
+     * KEYS a truncated shutdown orphaned, not just how many opaque tasks. Counts only — the body is never
+     * rendered (its {@code toString} is not called; keys embed user/entity UUIDs).
+     */
+    public record BlobPurgeTask(Runnable body, int keyCount) implements Runnable {
+
+        public BlobPurgeTask {
+            Objects.requireNonNull(body, "body");
+        }
+
+        @Override
+        public void run() {
+            body.run();
+        }
+    }
+
+    /**
+     * {@link ThreadPoolTaskExecutor} for {@link #blobPurgeExecutor()} that reports, at WARN, the purges its
+     * shutdown grace ABANDONED (perf PERF-2) — the same {@link #shutdown()} hook, for the same reason, as
+     * {@link ReminderLossReportingTaskExecutor}: only after {@code super.shutdown()} returns is the queue
+     * genuinely abandoned. WARN, not ERROR: an abandoned purge is an orphan blob (storage cost), never lost
+     * user data. Silent on a clean drain. Counts only ({@link #LOSS_EVENT}, queued tasks, the orphaned key
+     * total summed from {@link BlobPurgeTask#keyCount()}, in-flight tasks, grace).
+     */
+    static final class BlobPurgeLossReportingTaskExecutor extends ThreadPoolTaskExecutor {
+
+        /** Stable, machine-greppable alert token. Changing it silently disables downstream alerting. */
+        static final String LOSS_EVENT = "event=blob_purges_lost_on_shutdown";
+
+        private final int graceSeconds;
+
+        BlobPurgeLossReportingTaskExecutor(int graceSeconds) {
+            this.graceSeconds = graceSeconds;
+            setWaitForTasksToCompleteOnShutdown(true);
+            setAwaitTerminationSeconds(graceSeconds);
+        }
+
+        @Override
+        public void shutdown() {
+            super.shutdown();
+            reportAbandonedWork();
+        }
+
+        void reportAbandonedWork() {
+            int queuedTasksAbandoned;
+            long queuedKeysOrphaned = 0;
+            int inFlightTasksKilled;
+            try {
+                ThreadPoolExecutor pool = getThreadPoolExecutor();
+                Runnable[] queued = pool.getQueue().toArray(new Runnable[0]);
+                queuedTasksAbandoned = queued.length;
+                for (Runnable task : queued) {
+                    if (task instanceof BlobPurgeTask purge) {
+                        queuedKeysOrphaned += purge.keyCount();
+                    }
+                }
+                inFlightTasksKilled = pool.getActiveCount();
+            } catch (IllegalStateException e) {
+                return; // Never initialized — it cannot have been carrying work.
+            }
+            if (queuedTasksAbandoned == 0 && inFlightTasksKilled == 0) {
+                return;
+            }
+            log.warn("{} executor=blobPurgeExecutor queuedTasksAbandoned={} queuedKeysOrphaned={} "
+                            + "inFlightTasksKilled={} graceSeconds={} — queued blobs are already dereferenced "
+                            + "in the DB and are now orphaned in R2; in-flight deletes were cut, outcome unknown",
+                    LOSS_EVENT, queuedTasksAbandoned, queuedKeysOrphaned, inFlightTasksKilled, graceSeconds);
+        }
+    }
+
+    /**
+     * Test-profile counterpart of {@link #blobPurgeExecutor()}: purges run INLINE, so an integration test
+     * asserts on the mocked R2 the moment the request returns (Anti-Bug §M — no sleeps, no races). Same
+     * bean name, mutually exclusive profile, so the {@code @Qualifier} in {@code AfterCommitBlobPurger}
+     * resolves in every profile. The production pool is pinned by {@code AsyncConfigTest} and its
+     * off-thread hand-off by {@code AfterCommitBlobPurgerTest}.
+     */
+    @Bean(name = "blobPurgeExecutor")
+    @Profile("test")
+    public TaskExecutor syncBlobPurgeExecutor() {
         return new SyncTaskExecutor();
     }
 

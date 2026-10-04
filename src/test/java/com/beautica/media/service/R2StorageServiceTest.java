@@ -562,6 +562,21 @@ class R2StorageServiceTest {
         assertThat(key).isEmpty();
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {
+            "https://pub.example.r2.dev//abs/path.jpg",
+            "https://pub.example.r2.dev/avatars/../secrets/x.jpg",
+            "https://pub.example.r2.dev/avatars/u/x.jpg?token=1",
+            "https://pub.example.r2.dev/avatars/u/x.jpg#frag",
+            "https://pub.example.r2.dev/avatars/u\\x.jpg",
+            "https://pub.example.r2.dev.evil.com/avatars/u/x.jpg"})
+    @DisplayName("extractKeyFromPublicUrl rejects absolute paths, traversal, query/fragment, backslashes and look-alike hosts")
+    void should_returnEmpty_when_urlRemainderIsNotAPlainRelativeKey(String url) {
+        R2StorageService service = new R2StorageService(Optional.of(s3Client), BUCKET, PUBLIC_URL);
+
+        assertThat(service.extractKeyFromPublicUrl(url)).isEmpty();
+    }
+
     @Test
     @DisplayName("extractKeyFromPublicUrl returns empty for a null URL")
     void should_returnEmpty_when_urlIsNull() {
