@@ -64,6 +64,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private static final String WORKING_DAYS_PATH_SUFFIX = "/working-days";
     private static final String DEVICE_TOKEN_PATH = "/api/v1/devices/token";
     private static final String MEDIA_PATH_PREFIX = "/api/v1/media/";
+    // Phase 343 salon logo/cover: POST/DELETE /api/v1/salons/{salonId}/media/{slot}. Same R2 upload cost
+    // class as /api/v1/media/*, so it shares mediaUploadBuckets (see isSalonImagePath).
+    private static final String SALON_IMAGE_PATH_PREFIX = "/api/v1/salons/";
+    private static final String SALON_IMAGE_SEGMENT = "/media/";
     private static final String PROFILE_UPDATE_PATH = "/api/v1/independent-masters/me/profile";
     private static final String USER_ME_PATH = "/api/v1/users/me";
     private static final String IM_LOCALITY_PATH = "/api/v1/independent-masters/me";
@@ -893,6 +897,25 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .build();
     }
 
+    /**
+     * True for exactly {@code /api/v1/salons/{salonId}/media/{slot}} — one non-empty {@code {salonId}} segment,
+     * the literal {@code media} segment, one non-empty {@code {slot}} segment and nothing after it (Phase 343).
+     */
+    static boolean isSalonImagePath(String path) {
+        if (path == null || !path.startsWith(SALON_IMAGE_PATH_PREFIX)) {
+            return false;
+        }
+        String rest = path.substring(SALON_IMAGE_PATH_PREFIX.length());
+        int idEnd = rest.indexOf('/');
+        if (idEnd <= 0) {
+            return false;
+        }
+        String tail = rest.substring(idEnd);
+        return tail.startsWith(SALON_IMAGE_SEGMENT)
+                && tail.length() > SALON_IMAGE_SEGMENT.length()
+                && tail.indexOf('/', SALON_IMAGE_SEGMENT.length()) < 0;
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
@@ -913,8 +936,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // DELETE /api/v1/media/portfolio/{id} are also covered. Public GET
         // listings (/api/v1/salons/{id}/portfolio etc.) are intentionally NOT
         // rate-limited here — they're read-only and cached behind R2/CDN.
+        // Phase 343: the salon logo/cover routes (/api/v1/salons/{salonId}/media/{slot}) share the same
+        // bucket — one R2 upload per call, same abuse profile as the avatar.
         if ((HttpMethod.POST.matches(method) || HttpMethod.DELETE.matches(method))
-                && path.startsWith(MEDIA_PATH_PREFIX)) {
+                && (path.startsWith(MEDIA_PATH_PREFIX) || isSalonImagePath(path))) {
             applyRateLimit(request, response, filterChain, mediaUploadBuckets, RETRY_AFTER_SECONDS);
             return;
         }

@@ -679,7 +679,7 @@ public class GlobalExceptionHandler {
 
     /**
      * Thrown by the multipart resolver when an uploaded request body exceeds the
-     * configured {@code spring.servlet.multipart.max-*-size} (5 MB). Without this
+     * configured {@code spring.servlet.multipart.max-*-size} (5 MB per file, 6 MB per request). Without this
      * mapping the generic {@code Exception} fallback turns an oversized upload into
      * a 500. The correct status is 413 Payload Too Large. The static message does
      * not echo the configured limit (no internal-config disclosure, §I).

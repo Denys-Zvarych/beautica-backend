@@ -100,4 +100,51 @@ class MediaOpenApiContractIT extends AbstractIntegrationTest {
 
         assertThat(responses.has("204")).isTrue();
     }
+
+    private static final String SALON_IMAGE_PATH = "/api/v1/salons/{salonId}/media/{slot}";
+
+    @Test
+    @DisplayName("POST /api/v1/salons/{salonId}/media/{slot} is multipart-only with a binary `file` part (Phase 343)")
+    void should_declareMultipartFilePart_when_salonImageUpload() {
+        JsonNode content = requestContent(SALON_IMAGE_PATH);
+
+        assertThat(content.has(MULTIPART)).as("multipart/form-data present").isTrue();
+        assertThat(content.has("application/json")).as("no application/json").isFalse();
+        assertThat(content.path(MULTIPART).path("schema").path("properties").path("file").path("format").asText())
+                .as("the part is named `file` and is binary — the generated client and seed script send it so")
+                .isEqualTo("binary");
+    }
+
+    @Test
+    @DisplayName("salon image {slot} is published as the lowercase enum [logo, cover] on POST and DELETE; "
+            + "DELETE documents 204 (Phase 343)")
+    void should_publishLowercaseSlotEnumAndDelete204_when_salonImagePath() {
+        JsonNode path = spec.path("paths").path(SALON_IMAGE_PATH);
+
+        for (String verb : new String[]{"post", "delete"}) {
+            JsonNode slotParam = null;
+            for (JsonNode p : path.path(verb).path("parameters")) {
+                if ("slot".equals(p.path("name").asText())) {
+                    slotParam = p;
+                }
+            }
+            assertThat(slotParam).as("%s has a {slot} path parameter", verb).isNotNull();
+            assertThat(slotParam.path("schema").path("enum").toString())
+                    .as("%s slot enum", verb).isEqualTo("[\"logo\",\"cover\"]");
+        }
+        assertThat(path.path("delete").path("responses").has("204")).isTrue();
+    }
+
+    @Test
+    @DisplayName("SalonResponse and PublicSalonResponse both publish avatarUrl and coverImageUrl, never an R2 key "
+            + "(Phase 343)")
+    void should_publishImageUrlsWithoutKeys_when_salonSchemas() {
+        for (String schema : new String[]{"SalonResponse", "PublicSalonResponse"}) {
+            JsonNode props = spec.path("components").path("schemas").path(schema).path("properties");
+
+            assertThat(props.has("avatarUrl")).as("%s.avatarUrl", schema).isTrue();
+            assertThat(props.has("coverImageUrl")).as("%s.coverImageUrl", schema).isTrue();
+            assertThat(props.has("avatarR2Key") || props.has("coverR2Key")).as("%s exposes no R2 key", schema).isFalse();
+        }
+    }
 }

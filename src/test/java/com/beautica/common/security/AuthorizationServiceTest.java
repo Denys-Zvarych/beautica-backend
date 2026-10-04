@@ -4127,4 +4127,46 @@ class AuthorizationServiceTest {
     // the per-row cases above (should_*_hasProviderAuthorityOverBooking, ~line 1950 onward). What is
     // gone is only the coverage of the batched FORM of that rule, which no longer exists.
 
+    // ── Phase 343 — OWNER-only salon image gate (isOwnerOf) ─────────────────────────────────────
+
+    @Test
+    @DisplayName("Phase 343 TC-12: isOwnerOf is false for the SALON_ADMIN assigned to the salon — "
+            + "ownership only, the admin arm of hasManagementAccess is never consulted")
+    void should_returnFalse_when_isOwnerOfCalledByAssignedAdmin() {
+        UUID salonId = UUID.randomUUID();
+        UUID adminId = UUID.randomUUID();
+        SecurityContextHolder.getContext().setAuthentication(mockAuth(adminId, "ROLE_SALON_ADMIN"));
+        lenient().when(userRepository.findSalonIdById(adminId)).thenReturn(java.util.Optional.of(salonId));
+        when(salonRepository.existsByIdAndOwnerId(salonId, adminId)).thenReturn(false);
+
+        boolean owner = authorizationService.isOwnerOf(mockAuth(adminId, "ROLE_SALON_ADMIN"), salonId);
+
+        assertThat(owner).isFalse();
+        verify(userRepository, never()).findSalonIdById(any());
+    }
+
+    @Test
+    @DisplayName("Phase 343: isOwnerOf(Authentication, salonId) delegates to the ownership query with the principal id")
+    void should_returnOwnership_when_isOwnerOfCalledWithAuthentication() {
+        UUID salonId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(salonRepository.existsByIdAndOwnerId(salonId, ownerId)).thenReturn(true);
+
+        assertThat(authorizationService.isOwnerOf(mockAuth(ownerId, "ROLE_SALON_OWNER"), salonId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("Phase 343: isOwnerOf(Authentication, salonId) is false (never a throw, never a query) for a "
+            + "missing or non-UUID principal")
+    void should_returnFalse_when_isOwnerOfPrincipalMalformed() {
+        UUID salonId = UUID.randomUUID();
+        var noDetails = new UsernamePasswordAuthenticationToken("u", null,
+                List.of(new SimpleGrantedAuthority("ROLE_SALON_OWNER")));
+        noDetails.setDetails("not-a-uuid");
+
+        assertThat(authorizationService.isOwnerOf((Authentication) null, salonId)).isFalse();
+        assertThat(authorizationService.isOwnerOf(noDetails, salonId)).isFalse();
+        verifyNoInteractions(salonRepository);
+    }
+
 }

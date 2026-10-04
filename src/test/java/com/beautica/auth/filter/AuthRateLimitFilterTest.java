@@ -320,6 +320,35 @@ class AuthRateLimitFilterTest {
         }
 
         @Test
+        @DisplayName("Phase 343: POST and DELETE /api/v1/salons/{id}/media/{slot} route to mediaUploadBuckets")
+        void should_routeToMediaUploadBuckets_when_salonImagePostOrDelete() throws Exception {
+            when(mediaUploadBuckets.get(REMOTE_ADDR)).thenReturn(bucket);
+            when(bucket.tryConsume(1)).thenReturn(true);
+            String path = "/api/v1/salons/" + java.util.UUID.randomUUID() + "/media/cover";
+
+            doFilter(postRequest(path), new MockHttpServletResponse(), new MockFilterChain());
+            doFilter(deleteRequest(path), new MockHttpServletResponse(), new MockFilterChain());
+
+            verify(mediaUploadBuckets, org.mockito.Mockito.times(2)).get(REMOTE_ADDR);
+            verifyNoInteractions(loginBuckets);
+            verifyNoInteractions(slotsBuckets);
+        }
+
+        @Test
+        @DisplayName("Phase 343: isSalonImagePath matches exactly /salons/{id}/media/{slot}")
+        void should_matchOnlySalonImageShape_when_isSalonImagePathChecked() {
+            String id = java.util.UUID.randomUUID().toString();
+
+            assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/media/logo")).isTrue();
+            assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/media/cover")).isTrue();
+            assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/media/")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/media/logo/x")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons/" + id + "/portfolio")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonImagePath("/api/v1/salons//media/logo")).isFalse();
+            assertThat(AuthRateLimitFilter.isSalonImagePath(null)).isFalse();
+        }
+
+        @Test
         @DisplayName("GET /api/v1/salons/{id}/portfolio passes through without touching ANY bucket (not under /api/v1/media/)")
         void should_passThrough_when_getSalonsPortfolio() throws Exception {
             // Public read endpoint at /api/v1/salons/{id}/portfolio is NOT under /api/v1/media/

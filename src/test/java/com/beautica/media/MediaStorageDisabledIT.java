@@ -146,4 +146,37 @@ class MediaStorageDisabledIT extends AbstractMediaIntegrationTest {
         // Assert
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
     }
+
+    @org.junit.jupiter.params.ParameterizedTest(name = "TC-7: POST + DELETE /salons/<id>/media/{0} — 503, row unchanged")
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"logo", "cover"})
+    void should_return503AndLeaveSalonRowUntouched_when_salonImageWrittenWithStorageOff(String slot) throws Exception {
+        // Arrange — a salon that already carries a logo + cover, so a DELETE that slipped past the guard
+        // would visibly null them.
+        String email = "media-off-salon-" + slot + "-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(email);
+        UUID salonId = insertSalon(ownerId, "Storage Off Salon " + System.nanoTime());
+        String logo = "https://cdn.example/salons/" + salonId + "/logo/l.jpg";
+        String cover = "https://cdn.example/salons/" + salonId + "/cover/c.jpg";
+        jdbcTemplate.update("UPDATE salons SET avatar_url = ?, cover_image_url = ? WHERE id = ?", logo, cover, salonId);
+        String token = loginAndGetToken(email);
+        String url = "/api/v1/salons/" + salonId + "/media/" + slot;
+
+        // Act
+        ResponseEntity<String> post = restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBody(), bearerMultipartHeaders(token)), String.class);
+        ResponseEntity<String> delete = restTemplate.exchange(url, HttpMethod.DELETE,
+                new HttpEntity<>(authHeaders(token)), String.class);
+
+        // Assert
+        assertThat(post.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(post.getBody()).contains(NOT_CONFIGURED);
+        assertThat(delete.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(delete.getBody()).contains(NOT_CONFIGURED);
+        java.util.Map<String, Object> cols = jdbcTemplate.queryForMap(
+                "SELECT avatar_url, avatar_r2_key, cover_image_url, cover_r2_key FROM salons WHERE id = ?", salonId);
+        assertThat(cols.get("avatar_url")).isEqualTo(logo);
+        assertThat(cols.get("cover_image_url")).isEqualTo(cover);
+        assertThat(cols.get("avatar_r2_key")).isNull();
+        assertThat(cols.get("cover_r2_key")).isNull();
+    }
 }

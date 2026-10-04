@@ -84,9 +84,24 @@ public class AuthorizationService {
         return hasManagementAccess(salonId, actorId, actorRole);
     }
 
+    /**
+     * OWNERSHIP only — never admits a {@code SALON_ADMIN} (unlike {@link #hasManagementAccess} /
+     * {@link #canManageSalon}). The single predicate behind every OWNER-only salon gate (Phase 343: salon
+     * logo/cover). The service layer re-proves it against the locked salon row itself
+     * ({@code SalonService#lockOwnedActiveSalon}), so no query-issuing {@code enforce*} twin exists.
+     */
     public boolean isOwnerOf(UUID salonId, UUID actorId) {
-        if (salonId == null) return false;
+        if (salonId == null || actorId == null) return false;
         return salonRepository.existsByIdAndOwnerId(salonId, actorId);
+    }
+
+    /**
+     * SpEL form of {@link #isOwnerOf(UUID, UUID)} for {@code @PreAuthorize("hasRole('SALON_OWNER') and
+     * @authz.isOwnerOf(authentication, #salonId)")} (Phase 343 D2). A missing or non-UUID principal is
+     * simply "not the owner" (false → 403), never an exception thrown out of the SpEL evaluation.
+     */
+    public boolean isOwnerOf(Authentication auth, UUID salonId) {
+        return isOwnerOf(salonId, AuthenticationUtils.userIdOrNull(auth));
     }
 
     /**

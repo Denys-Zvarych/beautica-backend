@@ -48,7 +48,10 @@ import com.beautica.salon.dto.SalonStaffMemberResponse;
 import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.dto.UpdateSalonRequest;
 import com.beautica.salon.entity.Salon;
+import com.beautica.salon.entity.SalonImagePointer;
+import com.beautica.salon.entity.SalonImageSlot;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.search.dto.SalonSearchResult;
 import com.beautica.search.service.SearchCacheNames;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.repository.MasterServiceCountProjection;
@@ -72,6 +75,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -263,6 +267,8 @@ public class SalonService {
      */
     public static final int MAX_ACTIVE_SALONS_PER_OWNER = 50;
 
+    /** Same generic 403 message as {@code AuthorizationService}'s OWNER-only gate — no salon/owner detail echoed. */
+    private static final String ACCESS_DENIED = "Access denied";
     private static final String SALON_PURGE_CONTEXT = "salon-purge";
     private static final String MASTER_DETAIL_CACHE = "master-detail";
 
@@ -490,8 +496,12 @@ public class SalonService {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
-        List<MasterCacheKeys> keys = masterRepository.findCacheKeysBySalonId(salonId);
-        if (keys.isEmpty()) {
+        evictMasterDetailCachesAfterCommit(masterRepository.findCacheKeysBySalonId(salonId));
+    }
+
+    /** The after-commit per-key sweep behind {@link #evictAffiliatedMasterDetailCachesAfterCommit}. */
+    private void evictMasterDetailCachesAfterCommit(List<MasterCacheKeys> keys) {
+        if (keys.isEmpty() || !TransactionSynchronizationManager.isSynchronizationActive()) {
             return;
         }
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -665,12 +675,13 @@ public class SalonService {
      * cheap, purely in-memory cache evictions from being registered first.
      */
     private void purgeSalonMediaAfterCommit(
-            UUID salonId, String avatarUrl, String coverImageUrl, List<MediaFileKey> salonMediaKeys) {
-        // Resolve (and own-prefix-check, S-M1) the logo/cover URLs NOW, so keyCount counts only blobs the task
-        // will actually delete — a rejected URL is WARN-logged once here and never reaches the task.
+            UUID salonId, SalonImagePointer logo, SalonImagePointer cover, List<MediaFileKey> salonMediaKeys) {
+        // Resolve (and own-prefix-check, S-M1) the logo/cover pointers NOW, so keyCount counts only blobs the
+        // task will actually delete — a rejected pointer is WARN-logged once here and never reaches the task.
+        // Phase 343 D8: the stored R2 key wins; the URL is only the fallback for a legacy (key-less) row.
         List<String> salonImageKeys = new ArrayList<>(2);
-        addIfPresent(salonImageKeys, mediaService.resolveSalonImageKey(salonId, avatarUrl));
-        addIfPresent(salonImageKeys, mediaService.resolveSalonImageKey(salonId, coverImageUrl));
+        addIfPresent(salonImageKeys, mediaService.resolveSalonImageKey(salonId, logo.key(), logo.url()));
+        addIfPresent(salonImageKeys, mediaService.resolveSalonImageKey(salonId, cover.key(), cover.url()));
         int keyCount = salonMediaKeys.size() + salonImageKeys.size();
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             log.warn("Salon media purge skipped: no active transaction synchronization (salon={}, keyCount={}, "
@@ -716,9 +727,11 @@ public class SalonService {
     /**
      * After commit, clears the given discovery caches ({@link SearchCacheNames#SALONS_ALL} and/or
      * {@link SearchCacheNames#MASTERS_ALL} — the same partition lists {@code UserService} iterates
-     * for {@code search:masters}). A blanket {@code clear()} is the only option here: discovery
-     * keys are filter tuples, not salon ids, so the entries a salon appears in cannot be addressed
-     * per key. Callers register it LAST among their cache evictions.
+     * for {@code search:masters}). For MEMBERSHIP-changing writes (deactivate, locality) a blanket
+     * {@code clear()} is the only option: discovery keys are filter tuples, not salon ids, and a page
+     * that should newly include or drop the salon cannot be found by scanning for it. A row-only change
+     * uses {@link #evictSalonSearchPagesAfterCommit} instead. Callers register it LAST among their
+     * cache evictions.
      */
     private void evictSearchCachesAfterCommit(List<String> cacheNames) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -735,6 +748,48 @@ public class SalonService {
                 }
             }
         });
+    }
+
+    /**
+     * After commit, evicts from both salon discovery caches ({@link SearchCacheNames#SALONS_ALL}) only the
+     * cached pages that list {@code salonId} — the narrow form for a change that alters a salon's ROW but not
+     * its MEMBERSHIP in any result (a logo change: search rows carry {@code avatarUrl}). Keys are filter
+     * tuples, so the entries are found by value: each is the {@code Page<SalonSearchResult>} that
+     * {@code SearchService#searchSalons} returned, scanned for {@link SalonSearchResult#salonId()}. Every
+     * other salon's pages survive (§F-6: no thundering herd on a single-salon write). A non-Caffeine backend
+     * exposes no entry map and falls back to {@code clear()} — correct, if coarser (same shape as
+     * {@code MasterCachePrefixEvictor#evictOne}). Membership-changing writes (deactivate, locality) keep
+     * {@link #evictSearchCachesAfterCommit}'s full clear: a page that should newly include/exclude the
+     * salon cannot be found by scanning for it.
+     */
+    private void evictSalonSearchPagesAfterCommit(UUID salonId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                for (String cacheName : SearchCacheNames.SALONS_ALL) {
+                    evictSalonSearchPages(cacheManager.getCache(cacheName), salonId);
+                }
+            }
+        });
+    }
+
+    private static void evictSalonSearchPages(Cache cache, UUID salonId) {
+        if (cache == null) {
+            return;
+        }
+        if (cache.getNativeCache() instanceof com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache) {
+            caffeineCache.asMap().values().removeIf(cached -> pageListsSalon(cached, salonId));
+        } else {
+            cache.clear();
+        }
+    }
+
+    private static boolean pageListsSalon(Object cached, UUID salonId) {
+        return cached instanceof Page<?> page && page.getContent().stream()
+                .anyMatch(row -> row instanceof SalonSearchResult result && salonId.equals(result.salonId()));
     }
 
     @Transactional
@@ -859,6 +914,110 @@ public class SalonService {
         }
 
         return result;
+    }
+
+    // ── Phase 343 — salon logo / cover (SALON_OWNER only) ──────────────────────────────────────
+    // MediaService orchestrates the upload (storage gate, sniff, R2 upload outside any transaction,
+    // after-commit purge, discard-unless-committed); these three methods are its salon-side steps.
+    // They live here so the write reuses this class's cache-eviction helpers (D9) and response
+    // mapping instead of a parallel copy in the media package.
+
+    /**
+     * Read-gate before the R2 upload (Phase 343 D5 step 3), ONE query: ownership first (403 — the
+     * service-layer twin of the controller's OWNER-only gate, so a {@code SALON_ADMIN} never reaches R2 even
+     * from a non-HTTP caller), then the salon must be active (404). Same 403-then-404 order as
+     * {@link #lockOwnedActiveSalon}.
+     */
+    @Transactional(readOnly = true)
+    public void requireOwnedActiveSalon(UUID actorId, UUID salonId) {
+        boolean active = salonRepository.findIsActiveByIdAndOwnerId(salonId, actorId)
+                .orElseThrow(() -> new ForbiddenException(ACCESS_DENIED));
+        if (!active) {
+            throw new NotFoundException("Salon not found: " + salonId);
+        }
+    }
+
+    /**
+     * Locked write of a logo/cover replace (D5 step 5). MUST run inside the caller's write transaction
+     * ({@code MANDATORY}) — the row lock, the pointer write and the after-commit evictions all belong to it.
+     * Re-checks active + ownership under the lock (a deactivate or ownership change committed since the
+     * read-gate), writes the new pointers and returns the response plus the superseded pointer.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public SalonImageWrite replaceSalonImageLocked(
+            UUID actorId, UUID salonId, SalonImageSlot slot, String newUrl, String newKey) {
+        List<MasterCacheKeys> masterKeys = masterRepository.findCacheKeysBySalonId(salonId);
+        Salon salon = lockOwnedActiveSalon(actorId, salonId);
+        SalonImagePointer superseded = salon.replaceImage(slot, newUrl, newKey);
+        writeImagePointers(salonId, slot, newUrl, newKey);
+        evictSalonImageCachesAfterCommit(salon, slot, masterKeys);
+        SalonResponse body = SalonResponse.from(
+                salon, resolveOblastId(salon.getCityId()), resolveSettlement(salon.getCityId()));
+        return new SalonImageWrite(body, superseded);
+    }
+
+    /**
+     * Locked clear of a logo/cover (D7). {@code MANDATORY} like {@link #replaceSalonImageLocked}. An empty
+     * slot is a no-op (no write, no eviction) and returns {@link SalonImagePointer#EMPTY}; otherwise both
+     * pointers are nulled and the cleared pair is returned for the after-commit purge.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public SalonImagePointer clearSalonImageLocked(UUID actorId, UUID salonId, SalonImageSlot slot) {
+        List<MasterCacheKeys> masterKeys = masterRepository.findCacheKeysBySalonId(salonId);
+        Salon salon = lockOwnedActiveSalon(actorId, salonId);
+        if (salon.imagePointer(slot).isEmpty()) {
+            return SalonImagePointer.EMPTY;
+        }
+        SalonImagePointer cleared = salon.replaceImage(slot, null, null);
+        writeImagePointers(salonId, slot, null, null);
+        evictSalonImageCachesAfterCommit(salon, slot, masterKeys);
+        return cleared;
+    }
+
+    /** Result of {@link #replaceSalonImageLocked}: the response body and the pointer it superseded. */
+    public record SalonImageWrite(SalonResponse body, SalonImagePointer superseded) {}
+
+    /**
+     * Row-locks the salon ({@code FOR NO KEY UPDATE}, 3s {@code lock_timeout} → 409) and re-proves, under the
+     * lock, what the read-gate proved before the R2 upload — in the read-gate's order: ownership (403, compared
+     * in memory against the locked row's {@code owner_id}: no extra query) then active (404). A missing row is
+     * "not the owner", exactly as in {@link #requireOwnedActiveSalon}.
+     */
+    private Salon lockOwnedActiveSalon(UUID actorId, UUID salonId) {
+        Salon salon = salonRepository.findByIdForUpdate(salonId)
+                .filter(locked -> ownerIdOf(locked).equals(actorId))
+                .orElseThrow(() -> new ForbiddenException(ACCESS_DENIED));
+        if (!salon.isActive()) {
+            throw new NotFoundException("Salon not found: " + salonId);
+        }
+        return salon;
+    }
+
+    private void writeImagePointers(UUID salonId, SalonImageSlot slot, String url, String key) {
+        switch (slot) {
+            case LOGO -> salonRepository.writeLogoPointers(salonId, url, key);
+            case COVER -> salonRepository.writeCoverPointers(salonId, url, key);
+        }
+    }
+
+    /**
+     * After-commit evictions for a logo/cover change (D9) — the same per-key helpers {@link #updateSalon}
+     * uses, plus every other cache that renders the image: {@code ownerSalons} ({@code SalonResponse}),
+     * {@code salon-detail} ({@code PublicSalonResponse}: logo AND cover), the affiliated masters'
+     * {@code master-detail}/{@code master-detail-by-user} (their DTO embeds that {@code PublicSalonResponse}),
+     * and — LOGO only — the salon discovery caches (search rows carry {@code avatar_url}, never the cover).
+     * Favourites read the logo live (uncached), so they need nothing. {@code masterKeys} is read by the caller
+     * BEFORE the row lock, so the lock is held for no extra round trip. Discovery is evicted per salon
+     * ({@link #evictSalonSearchPagesAfterCommit}), never a blanket {@code clear()}.
+     */
+    private void evictSalonImageCachesAfterCommit(
+            Salon salon, SalonImageSlot slot, List<MasterCacheKeys> masterKeys) {
+        evictOwnerSalonsCacheAfterCommit(ownerIdOf(salon));
+        evictSalonDetailCacheAfterCommit(salon.getId());
+        evictMasterDetailCachesAfterCommit(masterKeys);
+        if (slot == SalonImageSlot.LOGO) {
+            evictSalonSearchPagesAfterCommit(salon.getId());
+        }
     }
 
     /**
@@ -1291,7 +1450,7 @@ public class SalonService {
      *       268 D1/D5) — both pure DB work, inside this same transaction;</li>
      *   <li>AFTER commit, the salon's R2 imagery (portfolio photos, avatar, cover) is permanently
      *       swept and the two image-URL columns are nulled — see
-     *       {@link #purgeSalonMediaAfterCommit(UUID, String, String, List)} for why this step runs
+     *       {@link #purgeSalonMediaAfterCommit(UUID, SalonImagePointer, SalonImagePointer, List)} for why this step runs
      *       outside the transaction (Phase 268 D2-D4/D8).</li>
      * </ol>
      * The salon row itself is only deactivated, never deleted: {@code reviews.salon_id} is
@@ -1304,7 +1463,7 @@ public class SalonService {
      * orphaning its R2 blob. The fix: this method reads the salon's {@code media_files} rows
      * (see the local variable block below {@code salon.setActive(false)}) BEFORE
      * {@link #deleteSalonStaff(UUID, UUID)} runs, and threads that pre-read list all the way into
-     * {@link #purgeSalonMediaAfterCommit(UUID, String, String, List)}.
+     * {@link #purgeSalonMediaAfterCommit(UUID, SalonImagePointer, SalonImagePointer, List)}.
      *
      * @throws NotFoundException             if {@code ownerId} does not resolve to a user, or if
      *                                        {@code salonId} does not resolve to a salon owned by
@@ -1364,8 +1523,18 @@ public class SalonService {
         // MUST be captured before deleteSalonStaff below: a staff-uploaded salon photo's row carries
         // ON DELETE CASCADE on media_files.uploader_id, so reading it after that hard-delete would
         // silently lose the row — and with it the only pointer left to reconcile its R2 blob against.
-        final String avatarUrlAtDeletion = salon.getAvatarUrl();
-        final String coverImageUrlAtDeletion = salon.getCoverImageUrl();
+        // Phase 343 D8: the logo/cover pointers are read from the FOR UPDATE-locked row (lockImagePointers),
+        // never from the unlocked `salon` snapshot above — a logo/cover upload that committed after that load
+        // would otherwise have its new blob orphaned. The lock is then held until this deletion commits, so a
+        // later upload re-checks is_active under the same lock and answers 404 (discarding its blob). An empty
+        // result means no row to lock (findByIdAndOwnerId above already rules that out) — nothing to purge.
+        var lockedImages = salonRepository.lockImagePointers(salonId);
+        final SalonImagePointer logoAtDeletion = lockedImages
+                .map(p -> new SalonImagePointer(p.getAvatarUrl(), p.getAvatarR2Key()))
+                .orElse(SalonImagePointer.EMPTY);
+        final SalonImagePointer coverAtDeletion = lockedImages
+                .map(p -> new SalonImagePointer(p.getCoverImageUrl(), p.getCoverR2Key()))
+                .orElse(SalonImagePointer.EMPTY);
         final List<MediaFileKey> salonMediaKeys =
                 mediaRepository.findMediaKeysByEntityTypeAndEntityId(EntityType.SALON, salonId);
 
@@ -1442,7 +1611,7 @@ public class SalonService {
         // from being registered. Runs the actual R2 deletes + DB pointer null AFTER commit, on the
         // request thread but outside this transaction — see the field-block comment above and this
         // method's own javadoc.
-        purgeSalonMediaAfterCommit(salonId, avatarUrlAtDeletion, coverImageUrlAtDeletion, salonMediaKeys);
+        purgeSalonMediaAfterCommit(salonId, logoAtDeletion, coverAtDeletion, salonMediaKeys);
         servicePhotoBlobPurger.purgeAfterCommit(servicePhotoKeys);
     }
 

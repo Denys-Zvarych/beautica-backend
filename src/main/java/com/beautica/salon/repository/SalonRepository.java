@@ -4,9 +4,12 @@ import com.beautica.salon.dto.SiblingSalonOption;
 import com.beautica.salon.entity.Salon;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import jakarta.persistence.QueryHint;
+import org.hibernate.jpa.HibernateHints;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 import java.util.Collection;
@@ -264,9 +267,93 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * sweep (D8) — so this is its own tiny transaction, not a mutation the caller's {@code @Transactional}
      * boundary covers.
      */
+    /*
+     * Phase 343: also nulls both R2-key columns (V189). Native, because the four image columns are
+     * updatable = false on the entity (see Salon's image field block) — the targeted native statements
+     * in this file are their only writers.
+     */
     @Modifying
-    @Query("UPDATE Salon s SET s.avatarUrl = null, s.coverImageUrl = null WHERE s.id = :salonId")
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            UPDATE salons
+            SET avatar_url = NULL, avatar_r2_key = NULL, cover_image_url = NULL, cover_r2_key = NULL
+            WHERE id = :salonId
+            """, nativeQuery = true)
     int nullImageUrls(@Param("salonId") UUID salonId);
+
+    /**
+     * Phase 343 read-gate in ONE statement: the salon's {@code is_active} flag, present only when
+     * {@code ownerId} owns it. Empty = not the owner (or no such salon) → 403; {@code false} = owned but
+     * deactivated → 404 — the same 403-before-404 order as the locked re-check.
+     */
+    @Query("SELECT s.isActive FROM Salon s WHERE s.id = :salonId AND s.owner.id = :ownerId")
+    Optional<Boolean> findIsActiveByIdAndOwnerId(@Param("salonId") UUID salonId, @Param("ownerId") UUID ownerId);
+
+    /**
+     * Row-locks a salon for the Phase 343 logo/cover write, so two concurrent uploads/deletes — or an upload
+     * and {@code deactivateSalon} (whose {@code is_active} UPDATE takes the same lock) — serialise and each
+     * reads the pointer the other committed.
+     *
+     * <p><b>{@code FOR NO KEY UPDATE}, never {@code FOR UPDATE} / {@code PESSIMISTIC_WRITE}</b> (perf audit
+     * cycle 1). {@code FOR UPDATE} conflicts with the {@code FOR KEY SHARE} every FK check takes on the
+     * referenced row, so it would stall each concurrent booking/appointment/review/notification insert that
+     * references this salon for as long as the upload transaction holds the lock. {@code NO KEY UPDATE} still
+     * conflicts with itself (and with a plain non-key {@code UPDATE}), which is all the serialisation needs.
+     * Pinned by {@code SalonImageIT#should_notBlockAppointmentInsert_when_uploadHoldsSalonLock}.
+     *
+     * <p><b>3s {@code lock_timeout}, fused into the same round trip</b> — the
+     * {@code set_config('lock_timeout', '3s', true)} shape of {@code BookingRepository
+     * #acquireAdvisoryLockWithTimeout} (transaction-scoped, reset at commit/rollback). A wait beyond it fails
+     * with {@code 55P03} → {@code CannotAcquireLockException} → 409 via
+     * {@code GlobalExceptionHandler#handlePessimisticLockingFailure}. The one-row config subquery is joined,
+     * so it is evaluated before {@code LockRows} attempts the row lock ({@code FOR NO KEY UPDATE OF s} locks
+     * only the salon row).
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.* FROM salons s
+            CROSS JOIN (SELECT set_config('lock_timeout', '3s', true)) lock_cfg
+            WHERE s.id = :salonId
+            FOR NO KEY UPDATE OF s
+            """, nativeQuery = true)
+    Optional<Salon> findByIdForUpdate(@Param("salonId") UUID salonId);
+
+    /** Phase 343 — persists the logo pointers. Caller holds the {@link #findByIdForUpdate} lock. */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "UPDATE salons SET avatar_url = :url, avatar_r2_key = :r2Key WHERE id = :salonId",
+            nativeQuery = true)
+    int writeLogoPointers(@Param("salonId") UUID salonId, @Param("url") String url, @Param("r2Key") String r2Key);
+
+    /** Phase 343 — persists the cover pointers. Caller holds the {@link #findByIdForUpdate} lock. */
+    @Modifying
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = "UPDATE salons SET cover_image_url = :url, cover_r2_key = :r2Key WHERE id = :salonId",
+            nativeQuery = true)
+    int writeCoverPointers(@Param("salonId") UUID salonId, @Param("url") String url, @Param("r2Key") String r2Key);
+
+    /**
+     * Row-locks the salon and returns its CURRENT image pointers (Phase 343 D8) — {@code deactivateSalon}'s
+     * pre-read for the after-commit R2 purge. A plain entity read would return the persistence context's
+     * snapshot, which a logo/cover upload committed in between could have superseded (its new blob would then
+     * be orphaned); the locking read waits for that upload and reads what it committed, and any later upload
+     * blocks until the deletion commits, then finds the salon inactive (404, new blob discarded).
+     *
+     * <p>{@code FOR NO KEY UPDATE}, the lock {@code deactivateSalon} already held before Phase 343 via its
+     * non-key {@code is_active} UPDATE (auto-flushed just before this query by the declared query space) —
+     * so this read adds no lock strength and FK inserts referencing the salon are never blocked by it. No
+     * {@code lock_timeout} here: the deletion's own 30s transaction timeout bounds it, unchanged since pre-343.
+     * Query space declared so Hibernate auto-flushes only pending {@code salons} changes (perf P-L3).
+     */
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_NATIVE_SPACES, value = "salons"))
+    @Query(value = """
+            SELECT s.avatar_url AS "avatarUrl", s.avatar_r2_key AS "avatarR2Key",
+                   s.cover_image_url AS "coverImageUrl", s.cover_r2_key AS "coverR2Key"
+            FROM salons s
+            WHERE s.id = :salonId
+            FOR NO KEY UPDATE
+            """, nativeQuery = true)
+    Optional<SalonImagePointers> lockImagePointers(@Param("salonId") UUID salonId);
 
     // True iff the given owner already has at least one salon (primary or not).
     // Used in SalonService.createSalon to decide is_primary = true/false.

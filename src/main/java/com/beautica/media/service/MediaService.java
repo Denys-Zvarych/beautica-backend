@@ -17,8 +17,12 @@ import com.beautica.media.entity.MediaType;
 import com.beautica.media.repository.MediaFileKey;
 import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.repository.UploaderMediaKey;
+import com.beautica.salon.dto.SalonResponse;
 import com.beautica.salon.entity.Salon;
+import com.beautica.salon.entity.SalonImagePointer;
+import com.beautica.salon.entity.SalonImageSlot;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.salon.service.SalonService;
 import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
@@ -28,6 +32,7 @@ import com.beautica.service.service.ServicePhotoBlobPurger;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -124,6 +129,7 @@ public class MediaService {
     private static final String AVATAR_PURGE_CONTEXT = "avatar";
     private static final String ACCOUNT_PURGE_CONTEXT = "account-delete";
     private static final String PORTFOLIO_PURGE_CONTEXT = "portfolio-delete";
+    private static final String SALON_IMAGE_PURGE_CONTEXT = "salon-image";
 
     /** Phase 343 D4 key root for salon logo/cover blobs: {@code salons/<salonId>/{logo,cover}/...}. */
     private static final String SALON_IMAGE_KEY_ROOT = "salons/";
@@ -146,6 +152,12 @@ public class MediaService {
     private final AfterCommitBlobPurger afterCommitBlobPurger;
     private final UserProfileCacheEvictor userProfileCacheEvictor;
     private final MasterProfileCacheEvictor masterProfileCacheEvictor;
+    /**
+     * Phase 343 salon-side steps (read-gate, locked pointer write, cache evictions, response mapping). Resolved
+     * lazily: {@code SalonService} already depends on this class (salon teardown sweep), so a direct constructor
+     * dependency would be a bean cycle.
+     */
+    private final Supplier<SalonService> salonService;
 
     @Autowired
     public MediaService(R2StorageService r2,
@@ -161,7 +173,8 @@ public class MediaService {
                         ServicePhotoBlobPurger servicePhotoBlobPurger,
                         AfterCommitBlobPurger afterCommitBlobPurger,
                         UserProfileCacheEvictor userProfileCacheEvictor,
-                        MasterProfileCacheEvictor masterProfileCacheEvictor) {
+                        MasterProfileCacheEvictor masterProfileCacheEvictor,
+                        ObjectProvider<SalonService> salonServiceProvider) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -180,6 +193,7 @@ public class MediaService {
         this.afterCommitBlobPurger = afterCommitBlobPurger;
         this.userProfileCacheEvictor = userProfileCacheEvictor;
         this.masterProfileCacheEvictor = masterProfileCacheEvictor;
+        this.salonService = salonServiceProvider::getObject;
     }
 
     /**
@@ -202,6 +216,28 @@ public class MediaService {
                  AfterCommitBlobPurger afterCommitBlobPurger,
                  UserProfileCacheEvictor userProfileCacheEvictor,
                  MasterProfileCacheEvictor masterProfileCacheEvictor) {
+        this(r2, mediaRepo, userRepo, salonRepo, masterRepo, clock, txRead, txWrite, cacheManager, serviceRepo,
+                serviceCatalogService, servicePhotoBlobPurger, afterCommitBlobPurger, userProfileCacheEvictor,
+                masterProfileCacheEvictor, null);
+    }
+
+    /** Test-only constructor with the Phase 343 {@link SalonService} collaborator ({@code null} = not wired). */
+    MediaService(R2StorageService r2,
+                 MediaRepository mediaRepo,
+                 UserRepository userRepo,
+                 SalonRepository salonRepo,
+                 MasterRepository masterRepo,
+                 Clock clock,
+                 TransactionTemplate txRead,
+                 TransactionTemplate txWrite,
+                 CacheManager cacheManager,
+                 ServiceRepository serviceRepo,
+                 ServiceCatalogService serviceCatalogService,
+                 ServicePhotoBlobPurger servicePhotoBlobPurger,
+                 AfterCommitBlobPurger afterCommitBlobPurger,
+                 UserProfileCacheEvictor userProfileCacheEvictor,
+                 MasterProfileCacheEvictor masterProfileCacheEvictor,
+                 SalonService salonService) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -217,6 +253,12 @@ public class MediaService {
         this.afterCommitBlobPurger = afterCommitBlobPurger;
         this.userProfileCacheEvictor = userProfileCacheEvictor;
         this.masterProfileCacheEvictor = masterProfileCacheEvictor;
+        this.salonService = () -> {
+            if (salonService == null) {
+                throw new IllegalStateException("SalonService not wired in this test fixture");
+            }
+            return salonService;
+        };
     }
 
     /**
@@ -288,20 +330,8 @@ public class MediaService {
      * row is re-read and the new blob deleted ONLY when positively known not to be referenced.
      */
     private void discardAvatarBlobUnlessCommitted(UUID userId, String newKey) {
-        boolean referenced;
-        try {
-            referenced = txRead(() -> userRepo.findById(userId)
-                    .map(User::getAvatarR2Key)
-                    .filter(newKey::equals)
-                    .isPresent());
-        } catch (RuntimeException readEx) {
-            log.warn("Could not verify avatar commit state; keeping new blob (key=[key omitted]): {}",
-                    readEx.getClass().getSimpleName());
-            return;
-        }
-        if (!referenced) {
-            discardUnreferencedBlob(newKey);
-        }
+        discardBlobUnlessReferenced(newKey, "avatar",
+                () -> userRepo.findById(userId).map(User::getAvatarR2Key).orElse(null));
     }
 
     /**
@@ -500,15 +530,26 @@ public class MediaService {
      * accepted, harmless leak, a dangling pointer is user-visible data loss.
      */
     private void discardBlobUnlessCommitted(UUID serviceDefId, String newKey) {
+        discardBlobUnlessReferenced(newKey, "service photo",
+                () -> serviceRepo.findById(serviceDefId).map(ServiceDefinition::getPhotoR2Key).orElse(null));
+    }
+
+    /**
+     * The shared "discard unless committed" body of every upload-first replace (avatar, service photo, salon
+     * logo/cover): re-reads the row's CURRENT key in a fresh read transaction and deletes {@code newKey} ONLY
+     * when the row is positively known not to reference it. An unreadable outcome keeps the blob (accepted
+     * orphan) — a dangling pointer would be user-visible data loss.
+     *
+     * @param label        non-PII log label ("avatar", "service photo", ...)
+     * @param currentKeyOf reads the row's current key ({@code null} when the row or key is absent)
+     */
+    private void discardBlobUnlessReferenced(String newKey, String label, Supplier<String> currentKeyOf) {
         boolean referenced;
         try {
-            referenced = txRead(() -> serviceRepo.findById(serviceDefId)
-                    .map(ServiceDefinition::getPhotoR2Key)
-                    .filter(newKey::equals)
-                    .isPresent());
+            referenced = newKey.equals(txRead(currentKeyOf));
         } catch (RuntimeException readEx) {
-            log.warn("Could not verify service photo commit state; keeping new blob (key=[key omitted]): {}",
-                    readEx.getClass().getSimpleName());
+            log.warn("Could not verify {} commit state; keeping new blob (key=[key omitted]): {}",
+                    label, readEx.getClass().getSimpleName());
             return;
         }
         if (!referenced) {
@@ -534,6 +575,89 @@ public class MediaService {
 
     private static PhotoResult toPhotoResult(ServiceDefinition saved) {
         return new PhotoResult(ServiceDefinitionResponse.from(saved), saved.getOwnerType(), saved.getOwnerId());
+    }
+
+    // ------------------------------------------------------- salon logo / cover
+
+    /**
+     * Sets or replaces a salon's logo or cover (Phase 343). OWNER only: the controller's
+     * {@code @PreAuthorize} admits only the salon's {@code SALON_OWNER}, and the salon-side steps re-prove
+     * ownership both before the R2 upload ({@link SalonService#requireOwnedActiveSalon}) and under the row
+     * lock ({@link SalonService#replaceSalonImageLocked}). Same flow as {@link #uploadServicePhoto}: storage
+     * gate (503), single-open sniff, read-gate (403/404), upload the NEW blob under a fresh unique key outside
+     * any transaction, then a short locked write that captures the superseded pointer; after commit, the
+     * superseded blob is purged (only under {@code salons/<salonId>/<slot>/}); a failed write discards the new
+     * blob unless the row is found to reference it ({@link #discardBlobUnlessReferenced}).
+     */
+    public SalonResponse uploadSalonImage(UUID actorId, UUID salonId, SalonImageSlot slot, MultipartFile file) {
+        requireStorageEnabled();
+        try (SniffedUpload upload = openAndSniff(file)) {
+            return uploadSalonImageSniffed(actorId, salonId, slot, file, upload);
+        }
+    }
+
+    private SalonResponse uploadSalonImageSniffed(
+            UUID actorId, UUID salonId, SalonImageSlot slot, MultipartFile file, SniffedUpload upload) {
+        salonService.get().requireOwnedActiveSalon(actorId, salonId);
+
+        String newKey = buildKey(slot.keyPrefix(salonId), upload.mime());
+        r2.uploadFile(newKey, upload.stream(), file.getSize(), upload.mime());
+        String newUrl = r2.buildPublicUrl(newKey);
+
+        try {
+            return txWrite.execute(status -> replaceSalonImageLocked(actorId, salonId, slot, newKey, newUrl));
+        } catch (RuntimeException ex) {
+            discardBlobUnlessReferenced(newKey, "salon image", () -> salonRepo.findById(salonId)
+                    .map(salon -> salon.imagePointer(slot).key())
+                    .orElse(null));
+            throw ex;
+        }
+    }
+
+    /** Locked write step of the salon-image replace: runs inside {@code txWrite}. */
+    private SalonResponse replaceSalonImageLocked(
+            UUID actorId, UUID salonId, SalonImageSlot slot, String newKey, String newUrl) {
+        SalonService.SalonImageWrite write =
+                salonService.get().replaceSalonImageLocked(actorId, salonId, slot, newUrl, newKey);
+        // Registered AFTER SalonService's cache evictions, so a throwing purge callback can never skip them.
+        purgeSalonImageKeyAfterCommit(salonId, slot, write.superseded());
+        return write.body();
+    }
+
+    /**
+     * Removes a salon's logo or cover (Phase 343 D7). Storage off answers 503 BEFORE any DB change (unlike the
+     * avatar delete, the salon images are R2-only, so clearing the pointer while the blob cannot be deleted is
+     * refused). An empty slot is a 204 no-op with no R2 call. Otherwise both pointers are cleared under the row
+     * lock and the blob is purged after commit.
+     */
+    public void deleteSalonImage(UUID actorId, UUID salonId, SalonImageSlot slot) {
+        requireStorageEnabled();
+        txWrite.execute(status -> {
+            SalonImagePointer cleared = salonService.get().clearSalonImageLocked(actorId, salonId, slot);
+            purgeSalonImageKeyAfterCommit(salonId, slot, cleared);
+            return null;
+        });
+    }
+
+    /**
+     * After-commit purge of a superseded/cleared salon image (D5 step 6, D6). Prefers the stored key; a legacy
+     * row (URL only) has its key recovered from the URL. Either way the key is purged ONLY under
+     * {@code salons/<salonId>/<slot>/} — anything else is an accepted orphan, WARN-logged without the URL/key.
+     */
+    private void purgeSalonImageKeyAfterCommit(UUID salonId, SalonImageSlot slot, SalonImagePointer pointer) {
+        if (pointer == null || pointer.isEmpty()) {
+            return;
+        }
+        String candidate = pointer.key() != null
+                ? pointer.key()
+                : r2.extractKeyFromPublicUrl(pointer.url()).orElse(null);
+        if (candidate == null || !candidate.startsWith(slot.keyPrefix(salonId)) || candidate.contains("..")) {
+            log.warn("Salon image purge skipped: superseded pointer outside the salon's own slot prefix; blob left "
+                    + "as an accepted orphan (salon={}, slot={}, pointer=[omitted])", salonId, slot);
+            return;
+        }
+        log.debug("Salon image purge registered (salon={}, slot={})", salonId, slot);
+        afterCommitBlobPurger.purgeAfterCommit(List.of(candidate), SALON_IMAGE_PURGE_CONTEXT);
     }
 
     // --------------------------------------------------------------- portfolio
@@ -818,7 +942,23 @@ public class MediaService {
      * the salon's own phase-343 root {@code salons/<salonId>/} — a foreign or corrupted pointer (another
      * salon's object, a user avatar, a portfolio key) must never become an arbitrary-object delete. A
      * mismatch is skipped with a WARN that omits the URL/key. Returns {@code null} when nothing is safe.
+     *
+     * <p>Phase 343 D8 key-first: the stored {@code r2Key} (V189) wins and is accepted only under
+     * {@code salons/<salonId>/}; a NULL key (legacy row) falls back to recovering it from {@code url}.
      */
+    public String resolveSalonImageKey(UUID salonId, String r2Key, String url) {
+        if (r2Key == null) {
+            return resolveSalonImageKey(salonId, url);
+        }
+        if (isOwnSalonImageKey(salonId, r2Key)) {
+            return r2Key;
+        }
+        log.warn("Salon image purge skipped: key outside the salon's own key prefix (salon={}, key=[omitted])",
+                salonId);
+        return null;
+    }
+
+    /** URL-only form of {@link #resolveSalonImageKey(UUID, String, String)} — a legacy (key-less) row. */
     public String resolveSalonImageKey(UUID salonId, String url) {
         if (url == null) {
             return null;

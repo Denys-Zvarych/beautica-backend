@@ -60,6 +60,13 @@ public record SalonResponse(
         String phone,
         String instagramUrl,
         String avatarUrl,
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Salon cover (banner) image URL, 16:9. Set only by the salon's "
+                        + "SALON_OWNER via POST /salons/{salonId}/media/cover (Phase 343); null "
+                        + "when unset.")
+        String coverImageUrl,
         boolean isActive,
         // Phase 12.1: isPrimary surfaces the DB-level one-primary-per-owner invariant
         // so callers can determine whether the salon created during registration is primary.
@@ -112,6 +119,7 @@ public record SalonResponse(
                 salon.getPhone(),
                 salon.getInstagramUrl(),
                 salon.getAvatarUrl(),
+                salon.getCoverImageUrl(),
                 salon.isActive(),
                 salon.isPrimary(),
                 salon.getCreatedAt(),

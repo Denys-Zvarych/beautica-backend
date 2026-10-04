@@ -1464,8 +1464,14 @@ class SalonServiceTest {
         Salon salon = buildSalon(salonId, owner, "Active Salon");
         String ownLogoUrl = "https://cdn.example/salons/" + salonId + "/logo/l.jpg";
         String foreignCoverUrl = "https://cdn.example/salons/" + UUID.randomUUID() + "/cover/c.jpg";
-        ReflectionTestUtils.setField(salon, "avatarUrl", ownLogoUrl);
-        ReflectionTestUtils.setField(salon, "coverImageUrl", foreignCoverUrl);
+        // Phase 343 D8: the pointers come from the FOR UPDATE-locked row (legacy url-only here), not the entity.
+        when(salonRepository.lockImagePointers(salonId)).thenReturn(Optional.of(
+                new com.beautica.salon.repository.SalonImagePointers() {
+                    @Override public String getAvatarUrl() { return ownLogoUrl; }
+                    @Override public String getAvatarR2Key() { return null; }
+                    @Override public String getCoverImageUrl() { return foreignCoverUrl; }
+                    @Override public String getCoverR2Key() { return null; }
+                }));
         String logoKey = "salons/" + salonId + "/logo/l.jpg";
         var media = new com.beautica.media.repository.MediaFileKey(UUID.randomUUID(),
                 "portfolio/salons/" + salonId + "/p.jpg", com.beautica.media.entity.EntityType.SALON, salonId);
@@ -1473,8 +1479,8 @@ class SalonServiceTest {
         when(salonRepository.findByIdAndOwnerId(salonId, ownerId)).thenReturn(Optional.of(salon));
         when(mediaRepository.findMediaKeysByEntityTypeAndEntityId(
                 com.beautica.media.entity.EntityType.SALON, salonId)).thenReturn(List.of(media));
-        when(mediaService.resolveSalonImageKey(salonId, ownLogoUrl)).thenReturn(logoKey);
-        when(mediaService.resolveSalonImageKey(salonId, foreignCoverUrl)).thenReturn(null);
+        when(mediaService.resolveSalonImageKey(salonId, null, ownLogoUrl)).thenReturn(logoKey);
+        when(mediaService.resolveSalonImageKey(salonId, null, foreignCoverUrl)).thenReturn(null);
         stubCleanEmptyStaffCascade(salonId);
         org.springframework.transaction.support.TransactionSynchronizationManager.initSynchronization();
         ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);

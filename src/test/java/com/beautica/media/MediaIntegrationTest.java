@@ -11,6 +11,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,6 +40,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.times;
@@ -328,5 +332,48 @@ class MediaIntegrationTest extends AbstractMediaIntegrationTest {
         assertThat(populatedItems)
                 .as("second GET — cache must have been evicted on upload, exposing the new row")
                 .hasSize(1);
+    }
+
+    // ── Phase 343 audit — multipart size boundary on the avatar + portfolio routes ──────────
+    // max-request-size (6MB) sits above max-file-size (5MB) so the multipart envelope no longer
+    // turns an exactly-5 MB image into a 413; the per-file cap still rejects 5 MB + 1 byte.
+
+    @ParameterizedTest(name = "{0} with an exactly-5 MB JPEG → {1}")
+    @CsvSource({AVATAR_URL + ", 200", PORTFOLIO_URL + ", 201"})
+    @DisplayName("boundary: an exactly-5 MB JPEG passes the multipart layer and the service cap")
+    void should_acceptUpload_when_fileIsExactlyFiveMegabytes(String url, int expectedStatus) throws Exception {
+        // Arrange
+        String token = salonOwnerToken("exact-5mb");
+
+        // Act
+        ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBodyOfSize(FIVE_MB), bearerMultipartHeaders(token)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode().value()).as("body=%s", resp.getBody()).isEqualTo(expectedStatus);
+        verify(r2StorageService).uploadFile(anyString(), any(), eq((long) FIVE_MB), anyString());
+    }
+
+    @ParameterizedTest(name = "{0} with a 5 MB + 1 byte JPEG → 413")
+    @ValueSource(strings = {AVATAR_URL, PORTFOLIO_URL})
+    @DisplayName("boundary: a 5 MB + 1 byte JPEG is rejected with 413 at the multipart layer, no R2 upload")
+    void should_return413_when_fileIsFiveMegabytesPlusOneByte(String url) throws Exception {
+        // Arrange
+        String token = salonOwnerToken("over-5mb");
+
+        // Act
+        ResponseEntity<String> resp = restTemplate.exchange(url, HttpMethod.POST,
+                new HttpEntity<>(jpegMultipartBodyOfSize(FIVE_MB + 1), bearerMultipartHeaders(token)), String.class);
+
+        // Assert
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.PAYLOAD_TOO_LARGE);
+        verify(r2StorageService, never()).uploadFile(anyString(), any(), anyLong(), anyString());
+    }
+
+    private String salonOwnerToken(String tag) throws Exception {
+        String email = "media-it-" + tag + "-" + System.nanoTime() + "@beautica.test";
+        UUID ownerId = insertSalonOwner(email);
+        insertSalon(ownerId, "Boundary Salon " + tag);
+        return loginAndGetToken(email);
     }
 }

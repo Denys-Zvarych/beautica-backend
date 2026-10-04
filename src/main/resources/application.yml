@@ -72,8 +72,12 @@ spring:
     multipart:
       # Image uploads are bounded at 5 MB — aligned with MediaService.MAX_FILE_BYTES (5 MB).
       # Oversized requests are rejected at the Tomcat layer before reaching the controller.
+      # max-request-size sits 1 MB above max-file-size: the request cap counts the multipart
+      # envelope (boundaries + part headers) too, so at 5MB an exactly-5 MB image got a 413.
+      # The per-file cap (and the service-level caps) still enforce 5 MB per file / per request
+      # total (SupportService.MAX_TOTAL_BYTES).
       max-file-size: 5MB
-      max-request-size: 5MB
+      max-request-size: 6MB
       # Explicit temp directory avoids platform-specific default locations on non-Railway hosts.
       location: ${java.io.tmpdir}/beautica-uploads
 
@@ -160,9 +164,9 @@ server:
     # effect immediately should a handler ever back-fill Content-Length.
     min-response-size: 1KB
   tomcat:
-    # Swallow up to 5 MB of an oversized request body so Tomcat returns a clean 413
-    # rather than aborting the TCP connection mid-stream. Matches the multipart cap above.
-    max-swallow-size: 5MB
+    # Swallow up to 6 MB of an oversized request body so Tomcat returns a clean 413
+    # rather than aborting the TCP connection mid-stream. Matches max-request-size above.
+    max-swallow-size: 6MB
 
 notification:
   outbox:
