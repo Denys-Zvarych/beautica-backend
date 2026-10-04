@@ -1273,10 +1273,8 @@ public class SearchService {
         sb.append("SELECT m.id AS master_id, ")
                 .append("u.first_name AS first_name, u.last_name AS last_name, ")
                 .append("m.avg_rating AS avg_rating, m.review_count AS review_count, ")
-                // Avatar column does not yet exist on users/masters as a search
-                // projection source. Emit NULL so the projection still maps
-                // cleanly until a future phase wires master avatar storage.
-                .append("CAST(NULL AS TEXT) AS avatar_url, ")
+                // Master avatar lives on users.avatar_url (V38); `u` is already joined.
+                .append("u.avatar_url AS avatar_url, ")
                 // Discovery-locality FK ids (district-primary via salon link
                 // for SALON_MASTER, else the user's own). Labels are resolved
                 // through the M2 seam; these carry the ids only.

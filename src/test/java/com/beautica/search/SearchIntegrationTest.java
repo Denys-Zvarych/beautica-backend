@@ -1954,6 +1954,58 @@ class SearchIntegrationTest extends AbstractIntegrationTest {
         assertThat(data.path("data").get(0).path("masterId").asText()).isEqualTo(match.toString());
     }
 
+    private static final String SEARCH_AVATAR = "https://cdn.beautica.test/avatars/search-avatar.jpg";
+
+    @Test
+    @DisplayName("GET /search/masters — avatarUrl is mapped per row (set -> value, unset -> null), plain listing")
+    void should_mapAvatarUrlPerRow_when_mastersListedPlain() throws Exception {
+        UUID[] ids = seedAvatarMasters();
+
+        JsonNode rows = objectMapper.readTree(restTemplate.exchange(
+                MASTERS_URL + "?location.cityId=" + majorCityIdByName("Київ") + "&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class).getBody()).path("data").path("data");
+
+        assertAvatarsForSeeded(rows, ids);
+    }
+
+    @Test
+    @DisplayName("GET /search/masters — avatarUrl is mapped per row (set -> value, unset -> null), ?q free-text")
+    void should_mapAvatarUrlPerRow_when_mastersListedByQ() throws Exception {
+        UUID[] ids = seedAvatarMasters();
+
+        JsonNode rows = objectMapper.readTree(restTemplate.exchange(
+                MASTERS_URL + "?q=avatar&page=0&size=20",
+                HttpMethod.GET, anonymous(), String.class).getBody()).path("data").path("data");
+
+        assertAvatarsForSeeded(rows, ids);
+    }
+
+    private UUID[] seedAvatarMasters() {
+        UUID withAvatar = seedNamedIndependentMaster("Київ", "4.50", "Avatarella", "Withpic");
+        UUID withoutAvatar = seedNamedIndependentMaster("Київ", "4.50", "Avatarina", "Nopic");
+        jdbcTemplate.update(
+                "UPDATE users SET avatar_url = ? WHERE id = (SELECT user_id FROM masters WHERE id = ?)",
+                SEARCH_AVATAR, withAvatar);
+        return new UUID[] {withAvatar, withoutAvatar};
+    }
+
+    private static void assertAvatarsForSeeded(JsonNode rows, UUID[] ids) {
+        java.util.Set<String> seeded = java.util.Set.of(ids[0].toString(), ids[1].toString());
+        java.util.List<JsonNode> scoped = new java.util.ArrayList<>();
+        rows.forEach(r -> {
+            if (seeded.contains(r.path("masterId").asText())) {
+                scoped.add(r);
+            }
+        });
+
+        assertThat(scoped)
+                .extracting(r -> r.path("masterId").asText(),
+                        r -> r.path("avatarUrl").isNull() ? null : r.path("avatarUrl").asText())
+                .containsExactlyInAnyOrder(
+                        org.assertj.core.api.Assertions.tuple(ids[0].toString(), SEARCH_AVATAR),
+                        org.assertj.core.api.Assertions.tuple(ids[1].toString(), null));
+    }
+
     @Test
     @DisplayName("GET /search/masters — a literal '%' in ?q is escaped (matches a literal percent, NOT used as a wildcard)")
     void should_treatPercentInQ_asLiteral_notWildcard() throws Exception {
