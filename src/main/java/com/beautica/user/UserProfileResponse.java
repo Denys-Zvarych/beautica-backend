@@ -103,7 +103,19 @@ public record UserProfileResponse(
          */
         @Schema(types = {"string", "null"}, nullable = true, description = "Bare hromada adjective of the saved settlement, "
                 + "populated only when its name is ambiguous within its oblast; null otherwise.")
-        String cityHromadaNameUk
+        String cityHromadaNameUk,
+
+        /**
+         * The caller's own avatar — {@code users.avatar_url} (Phase 344). {@code null} when no
+         * avatar is set. Read off the same {@code users} row as every other field here, so no
+         * extra query. Written ONLY by {@code POST/DELETE /api/v1/media/avatar}, which take the
+         * target from the JWT and nothing else — a personal avatar is self-only for every role.
+         * {@code PATCH /users/me} deliberately does not accept it ({@link UpdateProfileRequest}
+         * carries no such field).
+         */
+        @Schema(types = {"string", "null"}, nullable = true, description = "The caller's own avatar "
+                + "URL (https); null when no avatar is set. Written only via /api/v1/media/avatar.")
+        String avatarUrl
 ) {
 
     // NOTE — there is deliberately NO `from(User)` convenience overload.
@@ -163,7 +175,8 @@ public record UserProfileResponse(
                 user.getSalonId(),
                 hasMasterProfile,
                 settlement == null ? null : settlement.settlementType(),
-                settlement == null ? null : settlement.hromadaNameUk()
+                settlement == null ? null : settlement.hromadaNameUk(),
+                user.getAvatarUrl()
         );
     }
 }

@@ -218,6 +218,44 @@ class UserControllerIT extends AbstractIntegrationTest {
         assertThat(apiResponse.data().phoneNumber()).isEqualTo("+380633333333");
     }
 
+    // ── PATCH /api/v1/users/me — avatarUrl is not writable here (Phase 344 D2) ─
+
+    @Test
+    @DisplayName("PATCH /me with avatarUrl leaves users.avatar_url unchanged — /media/avatar is the only writer (Phase 344 TC-4)")
+    void should_leaveAvatarUrlUnchanged_when_patchCarriesAvatarUrl() throws Exception {
+        String email = "p344-patch-avatar@beautica.com";
+        String accessToken = registerAndGetToken(email, TEST_PASSWORD, "Olena", "Koval", null);
+        UUID userId = jdbcTemplate.queryForObject("SELECT id FROM users WHERE email = ?", UUID.class, email);
+        String key = "avatars/" + userId + "/own.jpg";
+        String ownUrl = "https://cdn.example/" + key;
+        jdbcTemplate.update("UPDATE users SET avatar_r2_key = ?, avatar_url = ? WHERE id = ?", key, ownUrl, userId);
+        String body = objectMapper.writeValueAsString(
+                java.util.Map.of("firstName", "Nova", "avatarUrl", "https://evil/x.jpg"));
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/users/me", HttpMethod.PATCH,
+                new HttpEntity<>(body, bearerHeaders(accessToken)), String.class);
+
+        assertThat(response.getStatusCode())
+                .as("an unknown avatarUrl property is ignored (Jackson default), the rest of the patch applies")
+                .isEqualTo(HttpStatus.OK);
+        var apiResponse = objectMapper.readValue(
+                response.getBody(), new TypeReference<ApiResponse<UserProfileResponse>>() {});
+        assertThat(apiResponse.data().firstName())
+                .as("the legitimate part of the patch must apply — proves the body was actually processed")
+                .isEqualTo("Nova");
+        assertThat(jdbcTemplate.queryForObject("SELECT avatar_url FROM users WHERE id = ?", String.class, userId))
+                .as("users.avatar_url must be unchanged — PATCH /users/me is not an avatar writer (D2)")
+                .isEqualTo(ownUrl);
+        assertThat(apiResponse.data().avatarUrl())
+                .as("the PATCH response must echo the stored avatar, not the smuggled one")
+                .isEqualTo(ownUrl);
+        assertThat(java.util.Arrays.stream(UpdateProfileRequest.class.getRecordComponents())
+                .map(java.lang.reflect.RecordComponent::getName))
+                .as("UpdateProfileRequest must never gain an avatar field (D2)")
+                .noneMatch(name -> name.toLowerCase().contains("avatar"));
+    }
+
     // ── PATCH /api/v1/users/me — validation ──────────────────────────────────
 
     @Test

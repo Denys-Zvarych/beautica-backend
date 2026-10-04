@@ -707,7 +707,9 @@ public class CacheConfig {
         // keyed on the slug. permitAll + uncached previously meant a DB master lookup +
         // bounded service-list query per hit (scrape / DB-amplification surface). A short
         // 60-sec TTL caps that fan-out while a freshly-edited profile self-heals within a
-        // minute, so NO @CacheEvict wiring is needed. sync=true on the @Cacheable annotation
+        // minute. Exception (Phase 344 c1): avatar writes evict the slug key after commit via
+        // MasterProfileCacheEvictor, because a replaced/deleted avatar's blob is purged — a stale
+        // entry would render a broken image, not just an old one. sync=true on the @Cacheable annotation
         // collapses the thundering herd when a popular slug expires (Anti-Bug §F-7).
         manager.registerCustomCache("booking-slug-info",
                 Caffeine.newBuilder()

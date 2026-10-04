@@ -10,6 +10,9 @@ import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
+import com.beautica.common.cache.MasterProfileCacheEvictor;
+import com.beautica.common.cache.UserProfileCacheEvictor;
+import com.beautica.master.repository.MasterCacheKeys;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.media.dto.AvatarResponse;
 import com.beautica.media.dto.MediaFileResponse;
@@ -21,6 +24,7 @@ import com.beautica.media.repository.MediaRepository;
 import com.beautica.media.repository.UploaderMediaKey;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
+import com.beautica.search.service.SearchCacheNames;
 import com.beautica.user.User;
 import com.beautica.user.UserRepository;
 import org.junit.jupiter.api.AfterEach;
@@ -28,6 +32,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -117,6 +124,8 @@ class MediaServiceTest {
     @Mock private com.beautica.service.repository.ServiceRepository serviceRepo;
     @Mock private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
     @Mock private com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+    @Mock private com.beautica.common.cache.UserProfileCacheEvictor userProfileCacheEvictor;
+    @Mock private com.beautica.common.cache.MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     private final Clock fixedClock = Clock.fixed(Instant.parse("2026-05-11T10:00:00Z"), ZoneOffset.UTC);
 
@@ -164,7 +173,8 @@ class MediaServiceTest {
         service = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock, txRead, txWrite, cacheManager,
                 serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
                 new AfterCommitBlobPurger(r2, new SyncTaskExecutor(),
-                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry()));
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
+                userProfileCacheEvictor, masterProfileCacheEvictor);
     }
 
     private static final UUID MASTER_ID_FOR_PURGE = UUID.randomUUID();
@@ -437,6 +447,206 @@ class MediaServiceTest {
         service.uploadAvatar(userId, jpegFile());
 
         verify(r2).deleteFiles(List.of("avatars/" + userId + "/legacy.jpg"));
+    }
+
+    // ---- Phase 344: GET /users/me carries avatarUrl, so every avatar write evicts user-profile
+
+    @Test
+    @DisplayName("uploadAvatar evicts the caller's user-profile cache entry (Phase 344)")
+    void should_evictUserProfileCache_when_avatarUploaded() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
+
+        service.uploadAvatar(userId, jpegFile());
+
+        verify(userProfileCacheEvictor).evictAfterCommit(userId);
+    }
+
+    @Test
+    @DisplayName("deleteAvatar evicts the caller's user-profile cache entry when an avatar was cleared (Phase 344)")
+    void should_evictUserProfileCache_when_avatarDeleted() {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId);
+        user.setAvatarR2Key("avatars/" + userId + "/a.jpg");
+        user.setAvatarUrl("https://cdn/avatars/" + userId + "/a.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+
+        service.deleteAvatar(userId);
+
+        verify(userProfileCacheEvictor).evictAfterCommit(userId);
+    }
+
+    @Test
+    @DisplayName("uploadAvatar by a master evicts the master-profile caches under the row's masterId and slug (344 c1)")
+    void should_evictMasterProfileCaches_when_masterUploadsAvatar() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        lenient().when(userRepo.findByIdForUpdate(userId))
+                .thenReturn(Optional.of(newUser(userId, Role.INDEPENDENT_MASTER)));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
+        when(masterRepo.findCacheKeysByUserId(userId))
+                .thenReturn(Optional.of(new MasterCacheKeys(masterId, userId, "olena-k-ab12")));
+
+        service.uploadAvatar(userId, jpegFile());
+
+        verify(masterProfileCacheEvictor)
+                .evictAfterCommit(userId, masterId, "olena-k-ab12", Role.INDEPENDENT_MASTER);
+    }
+
+    @Test
+    @DisplayName("deleteAvatar by a master evicts the master-profile caches under the row's masterId and slug (344 c1)")
+    void should_evictMasterProfileCaches_when_masterDeletesAvatar() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        User user = newUser(userId, Role.SALON_MASTER);
+        user.setAvatarR2Key("avatars/" + userId + "/a.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(masterRepo.findCacheKeysByUserId(userId))
+                .thenReturn(Optional.of(new MasterCacheKeys(masterId, userId, "olena-k-ab12")));
+
+        service.deleteAvatar(userId);
+
+        verify(masterProfileCacheEvictor).evictAfterCommit(userId, masterId, "olena-k-ab12", Role.SALON_MASTER);
+    }
+
+    @Test
+    @DisplayName("uploadAvatar by a user with no masters row evicts only user-profile (344 c1)")
+    void should_notEvictMasterProfileCaches_when_userHasNoMasterRow() {
+        UUID userId = UUID.randomUUID();
+        lenient().when(userRepo.findByIdForUpdate(userId))
+                .thenReturn(Optional.of(newUser(userId, Role.SALON_OWNER)));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
+        when(masterRepo.findCacheKeysByUserId(userId)).thenReturn(Optional.empty());
+
+        service.uploadAvatar(userId, jpegFile());
+
+        verify(userProfileCacheEvictor).evictAfterCommit(userId);
+        verifyNoInteractions(masterProfileCacheEvictor);
+    }
+
+    @Test
+    @DisplayName("deleteAvatar with no avatar set resolves no master keys and evicts no master cache (344 c1)")
+    void should_notEvictMasterProfileCaches_when_noAvatarToDelete() {
+        UUID userId = UUID.randomUUID();
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(newUser(userId)));
+
+        service.deleteAvatar(userId);
+
+        verify(masterRepo, never()).findCacheKeysByUserId(any());
+        verifyNoInteractions(masterProfileCacheEvictor);
+    }
+
+    @Test
+    @DisplayName("a throwing blob-purge after-commit callback cannot skip the cache evictions — they are registered first (344 c1)")
+    void should_stillEvictCaches_when_blobPurgeCallbackThrows() {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        User user = newUser(userId, Role.INDEPENDENT_MASTER);
+        user.setAvatarR2Key("avatars/" + userId + "/old.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(masterRepo.findCacheKeysByUserId(userId))
+                .thenReturn(Optional.of(new MasterCacheKeys(masterId, userId, "slug-ab12")));
+        Cache profileCache = mock(Cache.class);
+        Cache detailCache = mock(Cache.class);
+        // lenient: the evictors also look up caches this test does not observe (null → skipped).
+        lenient().when(cacheManager.getCache(UserProfileCacheEvictor.USER_PROFILE_CACHE)).thenReturn(profileCache);
+        lenient().when(cacheManager.getCache(MasterProfileCacheEvictor.MASTER_DETAIL_CACHE)).thenReturn(detailCache);
+        AfterCommitBlobPurger throwingPurger = mock(AfterCommitBlobPurger.class);
+        doAnswer(inv -> {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    throw new IllegalStateException("simulated purge-dispatch failure");
+                }
+            });
+            return null;
+        }).when(throwingPurger).purgeAfterCommit(anyCollection(), anyString());
+        MediaService withThrowingPurge = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock,
+                txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
+                throwingPurger, new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager));
+
+        assertThatThrownBy(() -> withThrowingPurge.deleteAvatar(userId))
+                .isInstanceOf(IllegalStateException.class);
+
+        verify(profileCache).evict(userId);
+        verify(detailCache).evict(masterId);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = Role.class, names = {"CLIENT", "SALON_ADMIN"})
+    @DisplayName("avatar write by a role that can never own a masters row skips the master-key lookup (344 c2)")
+    void should_skipMasterKeyLookup_when_roleCannotOwnMasterRow(Role role) {
+        UUID userId = UUID.randomUUID();
+        User user = newUser(userId, role);
+        user.setAvatarR2Key("avatars/" + userId + "/a.jpg");
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(user));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
+
+        service.uploadAvatar(userId, jpegFile());
+        service.deleteAvatar(userId);
+
+        verify(userProfileCacheEvictor, times(2)).evictAfterCommit(userId);
+        verify(masterRepo, never()).findCacheKeysByUserId(any());
+        verifyNoInteractions(masterProfileCacheEvictor);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = Role.class, names = {"INDEPENDENT_MASTER", "SALON_MASTER", "SALON_OWNER"})
+    @DisplayName("avatar write by a role that can own a masters row (owner-as-master included) resolves the master keys (344 c2)")
+    void should_lookUpMasterKeys_when_roleCanOwnMasterRow(Role role) {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(newUser(userId, role)));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
+        when(masterRepo.findCacheKeysByUserId(userId))
+                .thenReturn(Optional.of(new MasterCacheKeys(masterId, userId, "slug-ab12")));
+
+        service.uploadAvatar(userId, jpegFile());
+
+        verify(masterProfileCacheEvictor).evictAfterCommit(userId, masterId, "slug-ab12", role);
+    }
+
+    @ParameterizedTest(name = "{0} clears search = {1}")
+    @CsvSource({"INDEPENDENT_MASTER,true", "SALON_MASTER,false", "SALON_OWNER,false"})
+    @DisplayName("avatar write clears search:masters:* only for an INDEPENDENT_MASTER, per-key evicts for all (344 c2)")
+    void should_clearSearchCachesOnlyForIndependentMaster_when_masterUploadsAvatar(Role role, boolean cleared) {
+        UUID userId = UUID.randomUUID();
+        UUID masterId = UUID.randomUUID();
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(newUser(userId, role)));
+        when(r2.buildPublicUrl(anyString())).thenReturn("https://r2/avatars/u/file.jpg");
+        when(masterRepo.findCacheKeysByUserId(userId))
+                .thenReturn(Optional.of(new MasterCacheKeys(masterId, userId, "slug-ab12")));
+        Cache detailCache = mock(Cache.class);
+        Cache browse = mock(Cache.class);
+        Cache query = mock(Cache.class);
+        // lenient: the evictors also look up caches this test does not observe (null → skipped).
+        lenient().when(cacheManager.getCache(MasterProfileCacheEvictor.MASTER_DETAIL_CACHE)).thenReturn(detailCache);
+        lenient().when(cacheManager.getCache(SearchCacheNames.MASTERS_BROWSE)).thenReturn(browse);
+        lenient().when(cacheManager.getCache(SearchCacheNames.MASTERS_QUERY)).thenReturn(query);
+        MediaService withRealEvictors = new MediaService(r2, mediaRepo, userRepo, salonRepo, masterRepo, fixedClock,
+                txRead, txWrite, cacheManager, serviceRepo, serviceCatalogService, servicePhotoBlobPurger,
+                new AfterCommitBlobPurger(r2, new SyncTaskExecutor(),
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
+                new UserProfileCacheEvictor(cacheManager), new MasterProfileCacheEvictor(cacheManager));
+
+        withRealEvictors.uploadAvatar(userId, jpegFile());
+
+        verify(detailCache).evict(masterId);
+        verify(browse, times(cleared ? 1 : 0)).clear();
+        verify(query, times(cleared ? 1 : 0)).clear();
+    }
+
+    @Test
+    @DisplayName("deleteAvatar with no avatar set is a no-op and evicts nothing (Phase 344)")
+    void should_notEvictUserProfileCache_when_noAvatarToDelete() {
+        UUID userId = UUID.randomUUID();
+        lenient().when(userRepo.findByIdForUpdate(userId)).thenReturn(Optional.of(newUser(userId)));
+
+        service.deleteAvatar(userId);
+
+        verify(userProfileCacheEvictor, never()).evictAfterCommit(any());
     }
 
     @Test
@@ -1349,6 +1559,12 @@ class MediaServiceTest {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static User newUser(UUID id, Role role) {
+        User u = newUser(id);
+        setField(u, "role", role);
+        return u;
+    }
 
     private static User newUser(UUID id) {
         try {

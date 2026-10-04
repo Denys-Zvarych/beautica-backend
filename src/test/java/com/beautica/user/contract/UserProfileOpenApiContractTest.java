@@ -145,6 +145,22 @@ class UserProfileOpenApiContractTest extends AbstractIntegrationTest {
                 .endsWith("/ApiResponse" + SCHEMA_NAME);
     }
 
+    @Test
+    @DisplayName("components.schemas.UserProfileResponse publishes avatarUrl as a nullable string (Phase 344)")
+    void should_exposeNullableAvatarUrl_when_profileSchemaIsGenerated() {
+        JsonNode field = spec.path("components").path("schemas").path(SCHEMA_NAME)
+                .path("properties").path("avatarUrl");
+
+        assertThat(field.isMissingNode())
+                .as("%s.avatarUrl must be published — mobile 367's own-avatar editor maps it from the "
+                        + "generated client", SCHEMA_NAME)
+                .isFalse();
+        assertThat(typeNames(field))
+                .as("%s.avatarUrl must publish as a nullable string (null = no avatar); type node=%s",
+                        SCHEMA_NAME, field.path("type"))
+                .contains("string", "null");
+    }
+
     /**
      * The declared type(s) of a schema node, tolerating both the OpenAPI 3.1 array form
      * ({@code ["boolean","null"]}) and a single-string {@code type}.

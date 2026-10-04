@@ -27,6 +27,20 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Optional<UUID> findIdByUserId(@Param("userId") UUID userId);
 
     /**
+     * The {@code master-detail} / {@code booking-slug-info} cache keys of the {@code masters} row
+     * owned by a user, without loading the entity — for {@code users}-row writers whose field is
+     * rendered by those cached DTOs (Phase 344: {@code users.avatar_url}). Unfiltered by
+     * {@code isActive}: an evict of a key that holds nothing is a harmless no-op, while a missed
+     * evict serves a stale entry. {@code masters.user_id} is unique, so at most one row comes back.
+     */
+    @Query("""
+            SELECT new com.beautica.master.repository.MasterCacheKeys(m.id, m.user.id, m.bookingSlug)
+            FROM Master m
+            WHERE m.user.id = :userId
+            """)
+    Optional<MasterCacheKeys> findCacheKeysByUserId(@Param("userId") UUID userId);
+
+    /**
      * Same as {@link #findByUserId} but also JOIN FETCH-es the {@code salon} association,
      * eliminating the extra {@code SELECT * FROM salons WHERE id = ?} fired when callers
      * dereference {@code master.getSalon().getId()} (MEDIUM F2+F3).

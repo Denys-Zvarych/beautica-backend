@@ -1,6 +1,8 @@
 package com.beautica.media.service;
 
 import com.beautica.auth.Role;
+import com.beautica.common.cache.MasterProfileCacheEvictor;
+import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.common.exception.BusinessException;
 import com.beautica.common.exception.ForbiddenException;
 import com.beautica.common.exception.NotFoundException;
@@ -142,6 +144,8 @@ public class MediaService {
     private final ServiceCatalogService serviceCatalogService;
     private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     private final AfterCommitBlobPurger afterCommitBlobPurger;
+    private final UserProfileCacheEvictor userProfileCacheEvictor;
+    private final MasterProfileCacheEvictor masterProfileCacheEvictor;
 
     @Autowired
     public MediaService(R2StorageService r2,
@@ -155,7 +159,9 @@ public class MediaService {
                         ServiceRepository serviceRepo,
                         ServiceCatalogService serviceCatalogService,
                         ServicePhotoBlobPurger servicePhotoBlobPurger,
-                        AfterCommitBlobPurger afterCommitBlobPurger) {
+                        AfterCommitBlobPurger afterCommitBlobPurger,
+                        UserProfileCacheEvictor userProfileCacheEvictor,
+                        MasterProfileCacheEvictor masterProfileCacheEvictor) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -172,6 +178,8 @@ public class MediaService {
         this.serviceCatalogService = serviceCatalogService;
         this.servicePhotoBlobPurger = servicePhotoBlobPurger;
         this.afterCommitBlobPurger = afterCommitBlobPurger;
+        this.userProfileCacheEvictor = userProfileCacheEvictor;
+        this.masterProfileCacheEvictor = masterProfileCacheEvictor;
     }
 
     /**
@@ -191,7 +199,9 @@ public class MediaService {
                  ServiceRepository serviceRepo,
                  ServiceCatalogService serviceCatalogService,
                  ServicePhotoBlobPurger servicePhotoBlobPurger,
-                 AfterCommitBlobPurger afterCommitBlobPurger) {
+                 AfterCommitBlobPurger afterCommitBlobPurger,
+                 UserProfileCacheEvictor userProfileCacheEvictor,
+                 MasterProfileCacheEvictor masterProfileCacheEvictor) {
         this.r2 = r2;
         this.mediaRepo = mediaRepo;
         this.userRepo = userRepo;
@@ -205,6 +215,8 @@ public class MediaService {
         this.serviceCatalogService = serviceCatalogService;
         this.servicePhotoBlobPurger = servicePhotoBlobPurger;
         this.afterCommitBlobPurger = afterCommitBlobPurger;
+        this.userProfileCacheEvictor = userProfileCacheEvictor;
+        this.masterProfileCacheEvictor = masterProfileCacheEvictor;
     }
 
     /**
@@ -263,7 +275,9 @@ public class MediaService {
         u.setAvatarR2Key(newKey);
         u.setAvatarUrl(newUrl);
         // No save(): u is MANAGED (loaded by findByIdForUpdate in this tx) — dirty checking flushes it on commit.
-        // afterCommit hook (we are inside txWrite): a rolled-back write never fires it.
+        // afterCommit hooks (we are inside txWrite): a rolled-back write fires neither. Cache evictions are
+        // registered BEFORE the blob purge so a throwing purge callback can never skip them.
+        evictAvatarRenderingCachesAfterCommit(userId, u.getRole());
         purgeAvatarKeyAfterCommit(userId, supersededKey);
         return null;
     }
@@ -306,9 +320,31 @@ public class MediaService {
             u.setAvatarR2Key(null);
             u.setAvatarUrl(null);
             // No save(): u is MANAGED (findByIdForUpdate in this tx) — dirty checking flushes it on commit.
+            // Evictions registered BEFORE the blob purge so a throwing purge callback can never skip them.
+            evictAvatarRenderingCachesAfterCommit(userId, u.getRole());
             purgeAvatarKeyAfterCommit(userId, key);
             return null;
         });
+    }
+
+    /**
+     * Registers the after-commit eviction of every cache that renders {@code users.avatar_url} (Phase 344):
+     * {@code user-profile} for every role, plus — only when the user owns a {@code masters} row — the
+     * master-profile caches ({@code master-detail-by-user}, {@code master-by-user}, {@code master-detail},
+     * {@code booking-slug-info}; discovery only for an {@code INDEPENDENT_MASTER}). Must run inside
+     * {@code txWrite}: the master keys are resolved there and the evictions fire only if that transaction
+     * commits (§F-2). A role that can never own a {@code masters} row ({@link Role#canOwnMasterRow}) skips the
+     * key lookup — the same short-circuit {@code UserService} applies.
+     */
+    private void evictAvatarRenderingCachesAfterCommit(UUID userId, Role role) {
+        userProfileCacheEvictor.evictAfterCommit(userId);
+        // users.role is NOT NULL; a null here (unreachable) falls through to the lookup — a spare
+        // evict is harmless, a skipped one serves a stale avatar.
+        if (role != null && !role.canOwnMasterRow()) {
+            return;
+        }
+        masterRepo.findCacheKeysByUserId(userId).ifPresent(keys ->
+                masterProfileCacheEvictor.evictAfterCommit(userId, keys.masterId(), keys.bookingSlug(), role));
     }
 
     private static String avatarPrefix(UUID userId) {
