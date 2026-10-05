@@ -1,8 +1,6 @@
 package com.beautica.salon.service;
 
-import org.springframework.data.domain.Sort;
 import java.util.Set;
-import com.beautica.common.web.SortWhitelist;
 import com.beautica.auth.InviteService;
 import com.beautica.auth.Role;
 import com.beautica.auth.TokensValidAfterCache;
@@ -39,6 +37,7 @@ import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.audit.StaffClientReferenceViolation;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.PublicSalonResponse;
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonInviteHistoryResponse;
 import com.beautica.salon.dto.SalonInviteResponse;
@@ -105,6 +104,7 @@ public class SalonService {
     private final MasterServiceRepository masterServiceRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
+    private final BookingMasterService bookingMasterService;
     // Phase 321 — the salon roster board's effective-schedule read. MasterScheduleService is the
     // owner of the override-beats-template-beats-gap fold; this service resolves WHICH masters and
     // delegates the whole schedule verdict, never re-deriving it. ScheduleDateMath is the single
@@ -1083,6 +1083,18 @@ public class SalonService {
                 salon, resolveOblastId(salon.getCityId()), resolveSettlement(salon.getCityId()));
     }
 
+    /**
+     * The {@code bookable} flag of {@code GET /salons/{salonId}}: at least one master passes the
+     * strict free-slot verdict — exactly the set the public roster lists
+     * ({@link BookingMasterService#getBookableMasterIds(UUID)}, cached in
+     * {@code salon-bookable-masters} and evicted with the catalogue). Attached outside the
+     * {@code salon-detail} cache via {@code PublicSalonResponse#withBookable}.
+     */
+    @Transactional(readOnly = true)
+    public boolean isBookable(UUID salonId) {
+        return !bookingMasterService.getBookableMasterIds(salonId).isEmpty();
+    }
+
     @Transactional
     public InviteResponse inviteMaster(UUID actorId, UUID salonId, String email, Role role) {
         // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
@@ -1095,27 +1107,15 @@ public class SalonService {
     }
 
     /**
-     * Properties a caller may sort a salon's public master list by. Shares a repository method
-     * (and therefore a {@code Master} root with a {@code JOIN FETCH}ed {@code user}) with
-     * {@code MasterService#getMastersByPage}, so the two whitelists are deliberately identical —
-     * an unguarded dotted sort like {@code user.passwordHash} would otherwise resolve here and
-     * order rows by a credential hash (see {@link SortWhitelist}).
+     * Public salon roster for {@code GET /salons/{salonId}/masters}. Delegates to
+     * {@link MasterService#getMastersByPage} — the ONE bookability-gated roster implementation (and
+     * its sort whitelist), shared with {@code GET /masters/by-salon/{salonId}} so the two public
+     * endpoints cannot drift. Only masters bookable for at least one salon service are listed; the
+     * management roster {@link #getSalonStaff} stays deliberately unfiltered.
      */
-    private static final Set<String> SORTABLE_MASTER_PROPERTIES =
-            Set.of("avgRating", "reviewCount", "createdAt");
-
-    /** Applied when the caller supplies no {@code sort}; the query itself has no {@code ORDER BY}. */
-    private static final Sort DEFAULT_MASTER_SORT = Sort.by(Sort.Direction.DESC, "avgRating");
-
-    /** Mandatory unique trailing column, so OFFSET paging cannot duplicate or skip tied rows. */
-    private static final Sort MASTER_ID_TIEBREAKER = Sort.by(Sort.Direction.ASC, "id");
-
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersBySalon(UUID salonId, Pageable pageable) {
-        Pageable safePageable = SortWhitelist.apply(
-                pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
-        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
-                .map(MasterSummaryResponse::from);
+        return masterService.getMastersByPage(salonId, pageable);
     }
 
     /**
@@ -1124,8 +1124,9 @@ public class SalonService {
      * tab and staff-detail screen never need two round trips or two response shapes.
      *
      * <p>REUSE, not a parallel read path: masters are sourced via the SAME
-     * {@link MasterRepository#findBySalonIdAndIsActiveTrueWithUser} query
-     * {@link #getMastersBySalon} already uses (called with {@link Pageable#unpaged()} — a salon's
+     * {@link MasterRepository#findBySalonIdAndIsActiveTrueWithUser} query the public roster
+     * ({@link #getMastersBySalon}) narrows by bookability — this management roster is deliberately
+     * NOT bookability-gated (called with {@link Pageable#unpaged()} — a salon's
      * staff roster is bounded by the salon's actual headcount, never the unbounded-collection
      * concern §E-3 guards against; this is the same reasoning that already lets
      * {@link #listSalonInvites} returns a capped {@code List} for one salon). Admins are
@@ -1202,7 +1203,7 @@ public class SalonService {
      * <ul>
      *   <li><b>3 fixed</b> — the roster query ({@code masters}, via
      *       {@link MasterRepository#findIdsBySalonIdAndIsActiveTrue}: an id-only projection over the
-     *       same active-roster predicate {@link #getSalonStaff} and {@link #getMastersBySalon} read
+     *       same active-roster predicate {@link #getSalonStaff} reads
      *       through the graph finder. One statement, and — since the roster id-projection fix
      *       (backend-perf 2026-09-20) — no roster
      *       {@code Master}/{@code User} entities in the persistence context for a list of ids),

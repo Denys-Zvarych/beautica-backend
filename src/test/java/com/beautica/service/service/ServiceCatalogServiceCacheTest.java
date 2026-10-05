@@ -106,6 +106,9 @@ class ServiceCatalogServiceCacheTest {
     // list, so mock it to satisfy constructor wiring; no test below exercises unassignServiceFromMaster.
     @MockBean com.beautica.booking.repository.BookingRepository bookingRepository;
     @MockBean com.beautica.service.service.ServicePhotoBlobPurger servicePhotoBlobPurger;
+    // Audit 2026-10-05 (finding 1): assignment writes bracket their mutation with this guard; its
+    // own behaviour is covered by MasterSearchVisibilityGuardTest, so it is inert here.
+    @MockBean com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
     // Phase 23.x (perf/security #2): ServiceCatalogService evicts the salon-service-catalog cache via
     // this collaborator on every definition mutation. It is a REAL bean here (on the @SpringBootTest
     // classes list) so its @CacheEvict fires through the AOP proxy — the salon-catalogue eviction tests

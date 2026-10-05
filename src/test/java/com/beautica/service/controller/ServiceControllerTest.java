@@ -137,6 +137,9 @@ class ServiceControllerTest {
     @MockBean
     private SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
 
+    @MockBean
+    private com.beautica.service.service.MasterServiceBookabilityFilter masterServiceBookabilityFilter;
+
     /**
      * Default passthrough stub for every test that does not care about {@code isFavorite}
      * decoration — the vast majority of the {@code GET /masters/{id}/services} and
@@ -150,6 +153,10 @@ class ServiceControllerTest {
                 .thenAnswer(invocation -> invocation.getArgument(0));
         when(salonServiceFavoriteDecorator.decorate(any(), any()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
+        // Bookability narrowing is covered by MasterServiceBookabilityFilterTest and the
+        // MasterServicesTabVisibilityIT; this slice asserts the wiring, so pass through.
+        when(masterServiceBookabilityFilter.forViewer(any(), any(), any()))
+                .thenAnswer(invocation -> invocation.getArgument(1));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

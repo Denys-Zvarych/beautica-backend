@@ -46,6 +46,10 @@ public class RateLimitConfig {
      *   <li>{@code GET /api/v1/salons/{salonId}/services}</li>
      *   <li>{@code GET /api/v1/masters/{masterId}/services}</li>
      * </ul>
+     * and, since the bookability audit (2026-10-05, finding 2), the public profile reads that
+     * compute the strict free-slot verdict: {@code GET /api/v1/masters/{id}},
+     * {@code GET /api/v1/masters/by-salon/{salonId}}, {@code GET /api/v1/salons/{id}} and
+     * {@code GET /api/v1/salons/{id}/masters} — one bucket, so a full profile visit spends ~3 tokens.
      * Phase 314 audit finding (MEDIUM). Both are {@code permitAll()} in {@code SecurityConfig}.
      * {@code ServiceCatalogService}'s {@code @Cacheable(key = "#salonId"/"#masterId")} only
      * absorbs repeat hits on the SAME id — a caller sweeping distinct salon/master ids forces a
@@ -108,6 +112,54 @@ public class RateLimitConfig {
      */
     @Value("${app.rate-limit.salon-master-services-read-capacity:60}")
     private long salonMasterServicesReadCapacity;
+
+    /**
+     * Per-AUTHENTICATED-USER cap (60 s window) for the {@code permitAll} catalogue-browse and
+     * public-profile GETs ({@link #catalogueBrowseCapacity}'s routes) when the caller presents a
+     * token that authenticates — consumed by {@link BookingRateLimitFilter} (B8 regression fix,
+     * 2026-10-05).
+     *
+     * <p><b>Why.</b> The bookability audit (2026-10-05, finding 2) put {@code GET /salons/{id}} and
+     * {@code GET /masters/{id}} on the anonymous per-IP {@code catalogueBrowseBuckets}. The mobile
+     * salon owner/admin management screen ({@code salonManagementProfileProvider}) and the
+     * master/owner own-profile screens call those same routes with a token, so under carrier-grade
+     * NAT anonymous browse traffic from one egress IP would 429 a tenant's management UI — the
+     * exact starvation {@link #salonMasterServicesReadCapacity} records (cycle-2 audit, B8).
+     * {@code AuthRateLimitFilter} cannot key on the principal (it runs before the JWT filter), so a
+     * Bearer-carrying request is deferred and charged here; a token that does NOT authenticate
+     * falls back to the per-IP bucket, so a forged bearer buys no budget.
+     *
+     * <p><b>Sizing: 60/min, identical to {@code catalogueBrowseCapacity}</b> — the unit of work
+     * (cold-key strict bookable verdict, now cached 60s per master/salon) is unchanged, only the
+     * key is. One management-screen load spends one token; a full profile visit ~3.
+     */
+    @Value("${app.rate-limit.catalogue-browse-principal-capacity:60}")
+    private long catalogueBrowsePrincipalCapacity;
+
+    /**
+     * Per-IP CEILING (60 s window) on Bearer-carrying catalogue-browse / public-profile GETs
+     * ({@link #catalogueBrowseCapacity}'s routes), charged by {@link BookingRateLimitFilter} AFTER the
+     * JWT filter, only for a token that authenticated, and BEFORE
+     * {@link #catalogueBrowsePrincipalCapacity}'s per-user bucket (security re-audit 2026-10-05, LOW).
+     * Never charged pre-JWT: a forged-bearer flood from a shared CGNAT IP would otherwise drain it and
+     * 429 every genuine signed-in user behind that IP — forged/invalid bearers spend only the
+     * anonymous per-IP bucket.
+     *
+     * <p><b>Why.</b> The per-principal bucket alone is keyed on the user id, so a crawler that mints
+     * many CLIENT accounts behind one IP got a fresh 60/min budget per account — the throttle scaled
+     * with account creation instead of capping the source. This ceiling bounds the aggregate
+     * authenticated browse rate of one IP regardless of how many principals it rotates through.
+     *
+     * <p><b>Sizing: 600/min, 10× {@code catalogueBrowseCapacity}.</b> It must never bite real users
+     * behind carrier-grade NAT (the norm on Ukrainian mobile networks), where many genuine signed-in
+     * subscribers share one egress IP — the very starvation B8 moved authenticated traffic off the
+     * anonymous bucket to avoid. At ~3 tokens per profile visit, 600/min is ~200 profile visits a
+     * minute from one egress: ten simultaneously very active browsers, or dozens of ordinary ones.
+     * The per-principal bucket still caps each individual account at 60/min; this only caps the
+     * multiplication. Configurable so ITs and local seeding on 127.0.0.1 can raise it.
+     */
+    @Value("${app.rate-limit.catalogue-browse-authenticated-ip-capacity:600}")
+    private long catalogueBrowseAuthenticatedIpCapacity;
 
     /**
      * Per-AUTHENTICATED-USER cap (60 s window) for the three EXPENSIVE reads behind the mobile salon
@@ -710,6 +762,27 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-IP ceiling (see {@link #catalogueBrowseAuthenticatedIpCapacity}) for Bearer-carrying
+     * callers of the catalogue-browse / public-profile GETs, consumed by {@link BookingRateLimitFilter}
+     * for authenticated principals only.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, catalogueBrowseAuthenticatedIpCapacity, ONE_MINUTE);
+    }
+
+    /**
+     * Per-user bucket (see {@link #catalogueBrowsePrincipalCapacity}) for authenticated callers of
+     * the catalogue-browse / public-profile GETs, consumed by {@link BookingRateLimitFilter}.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> catalogueBrowsePrincipalBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE, STANDARD_EVICTION, catalogueBrowsePrincipalCapacity, ONE_MINUTE);
+    }
+
+    /**
      * Per-user bucket (see {@link #salonMasterServicesReadCapacity}) for the authenticated
      * salon-master-services management read, consumed by {@link BookingRateLimitFilter}.
      */
@@ -1161,7 +1234,8 @@ public class RateLimitConfig {
         return new BookingRateLimitFilter(
                 bookingWriteBuckets(), bookingDeclineBuckets(), scheduleOverrideWriteBuckets(),
                 staffBookingSmsBuckets(), selfDeleteBuckets(), salonMasterServicesReadBuckets(),
-                salonBoardReadBuckets(), notificationFeedBuckets(), objectMapper);
+                salonBoardReadBuckets(), notificationFeedBuckets(), catalogueBrowsePrincipalBuckets(),
+                catalogueBrowseBuckets(), catalogueBrowseAuthenticatedIpBuckets(), objectMapper);
     }
 
     /**

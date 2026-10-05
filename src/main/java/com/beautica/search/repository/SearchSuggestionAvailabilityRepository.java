@@ -1,5 +1,7 @@
 package com.beautica.search.repository;
 
+import com.beautica.master.repository.MasterBookabilitySql;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.salon.repository.SalonSearchSql;
 import com.beautica.search.service.SearchService;
 import jakarta.persistence.EntityManager;
@@ -67,6 +69,16 @@ public class SearchSuggestionAvailabilityRepository {
 
     @PersistenceContext
     private EntityManager entityManager;
+
+    /**
+     * Source of the bound Kyiv "today" both branches' bookability fragments read
+     * ({@link MasterBookabilitySql#TODAY_PARAM}) — the app clock, never the DB clock.
+     */
+    private final ScheduleDateMath scheduleDateMath;
+
+    public SearchSuggestionAvailabilityRepository(ScheduleDateMath scheduleDateMath) {
+        this.scheduleDateMath = scheduleDateMath;
+    }
 
     private static final String SQL =
             "SELECT DISTINCT sd.category AS category, sd.service_type_id AS service_type_id "
@@ -159,8 +171,10 @@ public class SearchSuggestionAvailabilityRepository {
             params.put("cityId", cityId);
         }
 
-        Query query = entityManager.createNativeQuery(buildAvailabilitySql(mode));
+        String sql = buildAvailabilitySql(mode);
+        Query query = entityManager.createNativeQuery(sql);
         params.forEach(query::setParameter);
+        bindToday(query, sql);
         return query.getResultList();
     }
 
@@ -177,7 +191,14 @@ public class SearchSuggestionAvailabilityRepository {
     public List<Object[]> findActivePlaces() {
         Query query = entityManager.createNativeQuery(ACTIVE_PLACES_SQL);
         query.setParameter("includedRole", SearchService.ROLE_INDEPENDENT_MASTER);
+        bindToday(query, ACTIVE_PLACES_SQL);
         return query.getResultList();
+    }
+
+    private void bindToday(Query query, String sql) {
+        if (MasterBookabilitySql.referencesToday(sql)) {
+            query.setParameter(MasterBookabilitySql.TODAY_PARAM, scheduleDateMath.today());
+        }
     }
 
     /**

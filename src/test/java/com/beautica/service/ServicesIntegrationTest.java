@@ -95,6 +95,8 @@ class ServicesIntegrationTest extends AbstractIntegrationTest {
                 "integ-owner-full-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Full Flow Salon");
         UUID masterId = fixtures.createSalonMaster(salonId);
+        // The public /masters/{id}/services lists only BOOKABLE services (2026-10-05) — needs hours.
+        fixtures.seedUsableSchedule(masterId);
 
         var createRequest = new CreateServiceDefinitionRequest(
                 "Shellac Manicure",

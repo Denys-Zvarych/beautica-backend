@@ -126,6 +126,9 @@ class ServiceCatalogServiceTest {
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
+
     // Phase 307 D4 — unassignServiceFromMaster's per-assignment future-CONFIRMED-booking guard.
     // Only the unassign tests below stub these; every other test in this class throws (or
     // succeeds) before that guard is reached, so they never touch either mock.

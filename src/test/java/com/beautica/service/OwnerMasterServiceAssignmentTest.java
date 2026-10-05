@@ -161,6 +161,8 @@ class OwnerMasterServiceAssignmentTest extends AbstractIntegrationTest {
                 new HttpEntity<>(assignRequest, fixtures.bearerHeaders(ownerToken)),
                 String.class);
         assertThat(assignResp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        // The anonymous view lists only BOOKABLE services (2026-10-05) — the owner-master needs hours.
+        fixtures.seedUsableSchedule(masterId);
 
         // Act — unauthenticated public read
         ResponseEntity<String> getResp = restTemplate.getForEntity(

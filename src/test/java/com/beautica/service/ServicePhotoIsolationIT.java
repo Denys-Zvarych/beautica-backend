@@ -106,6 +106,8 @@ class ServicePhotoIsolationIT extends AbstractServicePhotoIT {
         String token = fixtures.createIndependentMasterAndGetToken(email);
         UUID serviceDefId = fixtures.createIndependentMasterService(token, "Replace me");
         UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05).
+        fixtures.seedUsableSchedule(masterId);
         String listUrl = "/api/v1/masters/" + masterId + "/services";
         upload(serviceDefId, token);
         String firstKey = photoKey(serviceDefId);
@@ -126,6 +128,8 @@ class ServicePhotoIsolationIT extends AbstractServicePhotoIT {
         String token = fixtures.createIndependentMasterAndGetToken(email);
         UUID serviceDefId = fixtures.createIndependentMasterService(token, "Delete me");
         UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05).
+        fixtures.seedUsableSchedule(masterId);
         String listUrl = "/api/v1/masters/" + masterId + "/services";
         upload(serviceDefId, token);
         String key = photoKey(serviceDefId);

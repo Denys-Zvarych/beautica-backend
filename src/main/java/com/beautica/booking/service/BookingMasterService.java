@@ -10,24 +10,31 @@ import com.beautica.service.entity.OwnerType;
 import com.beautica.service.entity.ServiceDefinition;
 import com.beautica.service.repository.MasterServiceRepository;
 import com.beautica.service.repository.ServiceRepository;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Resolves which of a salon's masters are actually bookable for a given service (Phase 23.x —
  * {@code GET /salons/{salonId}/services/{serviceDefId}/masters}).
  *
- * <p><b>Why this exists.</b> {@code SalonService#getMastersBySalon} (the salon-profile roster)
- * and {@code ServiceCatalogService} (the service/assignment CRUD) both stopped at
- * "{@code is_active} + active assignment" — neither checked whether the master could actually be
+ * <p><b>Why this exists.</b> {@code ServiceCatalogService} (the service/assignment CRUD) stops at
+ * "{@code is_active} + active assignment" — it never checks whether the master can actually be
  * booked. That gap let a master with no usable schedule, or one whose calendar is fully booked out
  * across the entire horizon, appear as a selectable booking target whose slot picker then shows
- * nothing free. This service closes that gap for the booking-selection flow.
+ * nothing free. This service closes that gap for the booking-selection flow AND for the public
+ * salon roster ({@code GET /salons/{id}/masters} and {@code GET /masters/by-salon/{id}}, both routed
+ * through {@code MasterService#getMastersByPage} → {@link #getBookableMasterIds}) — an auto-enrolled
+ * owner-master or an invited master with no services or no working hours is not listed to clients.
+ * The management roster {@code SalonService#getSalonStaff} («Команда») stays deliberately unfiltered.
  *
  * <p><b>Bookability gate: the single shared free-slot verdict.</b> A candidate is "bookable" only
  * if {@link SlotCalculationService#hasBookableFutureSlot} — active assignment, active master, a
@@ -62,6 +69,13 @@ import java.util.UUID;
 @Service
 public class BookingMasterService {
 
+    /**
+     * Cache backing {@link #getBookableAssignmentIds}; registered in {@code CacheConfig}, evicted by
+     * master-prefix sweep ({@code SlotCalculationService}, {@code MasterScheduleService}) and by
+     * {@code ServiceCatalogService} on assignment writes.
+     */
+    public static final String BOOKABLE_ASSIGNMENTS_CACHE = "master-bookable-assignments";
+
     private final SalonRepository salonRepository;
     private final ServiceRepository serviceRepository;
     private final MasterServiceRepository masterServiceRepository;
@@ -79,6 +93,86 @@ public class BookingMasterService {
         this.masterServiceRepository = masterServiceRepository;
         this.slotCalculationService = slotCalculationService;
         this.kyivClock = clock.withZone(TimeZones.KYIV);
+    }
+
+    /**
+     * Ids of every master in {@code salonId} that is bookable for AT LEAST ONE of the salon's
+     * services — the public-roster gate behind {@code MasterService#getMastersByPage}.
+     *
+     * <p><b>One verdict, not a second predicate.</b> Candidates are the exact
+     * {@link MasterServiceRepository#findBookableAssignmentsBySalon} set the salon catalogue loads,
+     * grouped by master and passed through the same single
+     * {@link SlotCalculationService#filterBookableAssignmentsBatch} call
+     * ({@code ServiceCatalogService#bookableDefinitions}) — so a master is listed iff at least one of
+     * their services survives into {@code GET /salons/{id}/services}. A master with no assignments
+     * never enters the candidate set (zero cost); one with assignments but no working hours /
+     * no free slot is gated out by the batch.
+     *
+     * <p><b>Cost.</b> One assignment query + the batch's fixed two statements (Phase 315), never
+     * per master. Cached in {@code salon-bookable-masters} keyed on {@code salonId} (60-sec TTL,
+     * {@code sync=true} — §F-7, this backs two {@code permitAll} reads) and evicted afterCommit by
+     * {@code SalonCatalogCacheEvictor} alongside {@code salon-service-catalog}: every write that can
+     * flip the catalogue verdict (booking, schedule, assignment, master deactivation) flips this one,
+     * so it reuses that eviction wiring rather than adding a parallel one. Only ids are cached; the
+     * roster page itself (names, ratings, avatars) is always read live.
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = "salon-bookable-masters", key = "#salonId", sync = true)
+    public Set<UUID> getBookableMasterIds(UUID salonId) {
+        return mastersWithABookableAssignment(
+                bookableAssignmentsByMaster(masterServiceRepository.findBookableAssignmentsBySalon(salonId)));
+    }
+
+    /**
+     * Ids of {@code masterId}'s {@code master_services} rows that pass the strict free-slot verdict —
+     * the client view of {@code GET /masters/{id}/services} ({@code MasterServiceBookabilityFilter})
+     * and, via "non-empty", the {@code bookable} flag of {@code GET /masters/{id}}
+     * ({@code MasterService#isBookable}). Same verdict and loading strategy as
+     * {@link #getBookableMasterIds(UUID)}: candidates from
+     * {@link MasterServiceRepository#findBookableAssignmentsByMasterIds} (the master-scoped sibling
+     * of the salon finder, same ownership rule) through the single
+     * {@link SlotCalculationService#filterBookableAssignmentsBatch} call.
+     *
+     * <p><b>Cached (perf + security audit 2026-10-05, finding 2).</b> Both callers back
+     * {@code permitAll} reads, and the batch walks up to the 180-day horizon for a master with no
+     * free day — uncached, a crawler sweeping master ids drove that walk once per request. Cached in
+     * {@value #BOOKABLE_ASSIGNMENTS_CACHE} keyed {@code [masterId]} (60-sec TTL, {@code sync=true} —
+     * §F-7). The key is a one-element SpEL list on purpose: every per-master slot cache is keyed by a
+     * list whose FIRST element is the master id, so this cache rides the SAME afterCommit by-master
+     * sweeps — {@code SlotCalculationService#evictMasterAvailabilityCaches} (every booking
+     * create/cancel/transition, unassign, definition deactivation, master (de)activation) and
+     * {@code MasterScheduleService}'s schedule-write sweep — with no parallel eviction wiring; the
+     * assignment writes that add a bookable row evict the key directly with
+     * {@code masterServices} ({@code ServiceCatalogService#evictMasterServicesCache}).
+     */
+    @Transactional(readOnly = true)
+    @Cacheable(value = BOOKABLE_ASSIGNMENTS_CACHE, key = "{#masterId}", sync = true)
+    public Set<UUID> getBookableAssignmentIds(UUID masterId) {
+        return bookableAssignmentsByMaster(
+                masterServiceRepository.findBookableAssignmentsByMasterIds(List.of(masterId)))
+                .values().stream()
+                .flatMap(List::stream)
+                .map(MasterServiceAssignment::getId)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /** Groups candidates by master and applies the ONE shared free-slot batch gate. */
+    private Map<UUID, List<MasterServiceAssignment>> bookableAssignmentsByMaster(
+            List<MasterServiceAssignment> candidates) {
+        Map<UUID, List<MasterServiceAssignment>> candidatesByMaster = candidates.stream()
+                .collect(Collectors.groupingBy(a -> a.getMaster().getId()));
+        if (candidatesByMaster.isEmpty()) {
+            return Map.of();
+        }
+        return slotCalculationService.filterBookableAssignmentsBatch(candidatesByMaster);
+    }
+
+    private static Set<UUID> mastersWithABookableAssignment(
+            Map<UUID, List<MasterServiceAssignment>> gated) {
+        return gated.entrySet().stream()
+                .filter(entry -> !entry.getValue().isEmpty())
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toUnmodifiableSet());
     }
 
     /**

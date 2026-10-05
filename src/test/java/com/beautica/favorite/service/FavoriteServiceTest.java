@@ -18,6 +18,7 @@ import com.beautica.location.DiscoveryLocationResolver;
 import com.beautica.location.DiscoveryLocationResolver.DiscoveryLabels;
 import com.beautica.master.entity.Master;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.ScheduleDateMath;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.entity.MasterServiceAssignment;
@@ -34,6 +35,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
+import org.mockito.Spy;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -45,7 +47,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -109,6 +114,17 @@ class FavoriteServiceTest {
 
     @Mock
     private com.beautica.service.service.ServiceCatalogService serviceCatalogService;
+
+    /**
+     * Real date math on a fixed clock: 22:30Z on 5 Oct 2026 is already 6 Oct in Kyiv, so every
+     * favourites query stubbed with {@link #KYIV_TODAY} below also pins that the bookability "today"
+     * comes from the app clock's Kyiv date.
+     */
+    @Spy
+    private ScheduleDateMath scheduleDateMath =
+            new ScheduleDateMath(Clock.fixed(Instant.parse("2026-10-05T22:30:00Z"), ZoneOffset.UTC));
+
+    private static final LocalDate KYIV_TODAY = LocalDate.of(2026, 10, 6);
 
     @InjectMocks
     private FavoriteService favoriteService;
@@ -1147,7 +1163,7 @@ class FavoriteServiceTest {
                     // so the LEFT JOIN yields NULL for every one of them.
                     null, null, null, null, null, null, null
             };
-            when(favoriteRepository.findFavoriteMasterRows(clientId))
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY)))
                     .thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(
@@ -1178,7 +1194,7 @@ class FavoriteServiceTest {
             UUID masterId = UUID.randomUUID();
             Object[] row = {masterId, "Олена", "Коваль", null, null, null, null, null, null, null,
                     "INDEPENDENT_MASTER", null, null, null, null, null, null, null};
-            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(row));
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
 
@@ -1254,7 +1270,7 @@ class FavoriteServiceTest {
                     new BigDecimal("4.10"), "вул. Лесі Українки", "3", "домофон", "SALON_MASTER",
                     null, null,
                     salonCId, "Салон Nord", null, null, null};
-            when(favoriteRepository.findFavoriteMasterRows(clientId))
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY)))
                     .thenReturn(List.of(salonMaster, salonOwner, localitylessSalonMaster));
             // BOTH ids resolve to a label — so a fall-through to the master's own locality would
             // print «Полтава» rather than silently yielding null and passing this test anyway.
@@ -1326,7 +1342,7 @@ class FavoriteServiceTest {
             Object[] unknownType = {UUID.randomUUID(), "Б", "Б", null, null, null, null,
                     "вул. Тестова", "2", "нотатка", "FUTURE_MASTER_TYPE",
                     null, null, null, null, null, null, null};
-            when(favoriteRepository.findFavoriteMasterRows(clientId))
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY)))
                     .thenReturn(List.of(nullType, unknownType));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
@@ -1348,7 +1364,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("short-circuits with no label resolution when the client has no favorites (no N+1)")
         void should_returnEmpty_when_noFavorites() {
-            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.of());
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.of());
 
             List<FavoriteMasterResponse> result = favoriteService.listMasterFavorites(clientId);
 
@@ -1368,7 +1384,7 @@ class FavoriteServiceTest {
             Object[] r3 = {UUID.randomUUID(), "C", "C", null, null, null, null, null, null, null,
                     "SALON_OWNER", cityId, null,
                     UUID.randomUUID(), "Салон Mocha", null, null, null};
-            when(favoriteRepository.findFavoriteMasterRows(clientId))
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY)))
                     .thenReturn(List.of(r1, r2, r3));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(cityId, "Львів"), Map.of()));
@@ -1403,7 +1419,7 @@ class FavoriteServiceTest {
             Object[] row = {salonId, "Salon Bella", "https://cdn/s.png",
                     cityId, districtId, new BigDecimal("4.20"),
                     "вул. Дерибасівська", "7", "2-й поверх"};
-            when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(row));
+            when(favoriteRepository.findFavoriteSalonRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(
                             Map.of(cityId, "Одеса"), Map.of(districtId, "Приморський")));
@@ -1432,7 +1448,7 @@ class FavoriteServiceTest {
         void should_returnNullRating_when_salonNeverReviewed() {
             UUID salonId = UUID.randomUUID();
             Object[] row = {salonId, "New Salon", null, null, null, null, null, null, null};
-            when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(row));
+            when(favoriteRepository.findFavoriteSalonRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(row));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
 
@@ -1447,7 +1463,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("short-circuits with no label resolution when the client has no salon favorites")
         void should_returnEmpty_when_noSalonFavorites() {
-            when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.of());
+            when(favoriteRepository.findFavoriteSalonRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.of());
 
             List<FavoriteSalonResponse> result = favoriteService.listSalonFavorites(clientId);
 
@@ -1499,7 +1515,7 @@ class FavoriteServiceTest {
             UUID nails = UUID.randomUUID();
             UUID hair = UUID.randomUUID();
             UUID brows = UUID.randomUUID();
-            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(
                     masterRow(nails, "INDEPENDENT_MASTER"),
                     masterRow(hair, "INDEPENDENT_MASTER"),
                     masterRow(brows, "INDEPENDENT_MASTER")));
@@ -1528,7 +1544,7 @@ class FavoriteServiceTest {
             UUID makeupSalon = UUID.randomUUID();
             UUID lashSalon = UUID.randomUUID();
             UUID emptySalon = UUID.randomUUID();
-            when(favoriteRepository.findFavoriteSalonRows(clientId)).thenReturn(List.<Object[]>of(
+            when(favoriteRepository.findFavoriteSalonRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(
                     salonRow(makeupSalon), salonRow(lashSalon), salonRow(emptySalon)));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
@@ -1558,7 +1574,7 @@ class FavoriteServiceTest {
         @DisplayName("categories is EMPTY, never null, when the master offers nothing categorisable")
         void should_returnEmptyCategories_when_masterOffersNothing() {
             UUID masterId = UUID.randomUUID();
-            when(favoriteRepository.findFavoriteMasterRows(clientId))
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY)))
                     .thenReturn(List.<Object[]>of(masterRow(masterId, "INDEPENDENT_MASTER")));
             noLocalityLabels();
             when(favoriteCategoryResolver.resolveForMasters(anyCollection()))
@@ -1589,7 +1605,7 @@ class FavoriteServiceTest {
             Object[] row = masterRow(masterId, "SALON_MASTER");
             row[13] = salonId;
             row[14] = "Salon Bella";
-            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(row));
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(row));
             noLocalityLabels();
             when(favoriteCategoryResolver.resolveForMasters(anyCollection()))
                     .thenReturn(new FavoriteCategories(Map.of(
@@ -1621,7 +1637,7 @@ class FavoriteServiceTest {
             UUID first = UUID.randomUUID();
             UUID second = UUID.randomUUID();
             UUID third = UUID.randomUUID();
-            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.<Object[]>of(
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.<Object[]>of(
                     masterRow(first, "INDEPENDENT_MASTER"),
                     masterRow(second, "INDEPENDENT_MASTER"),
                     masterRow(third, "INDEPENDENT_MASTER")));
@@ -1650,7 +1666,7 @@ class FavoriteServiceTest {
         @DisplayName("routes a salon listing to the salon resolver method and never the master one")
         void should_useSalonResolverMethod_when_listingSalons() {
             UUID salonId = UUID.randomUUID();
-            when(favoriteRepository.findFavoriteSalonRows(clientId))
+            when(favoriteRepository.findFavoriteSalonRows(eq(clientId), eq(KYIV_TODAY)))
                     .thenReturn(List.<Object[]>of(salonRow(salonId)));
             when(discoveryLocationResolver.resolveLabels(anyCollection(), anyCollection()))
                     .thenReturn(new DiscoveryLabels(Map.of(), Map.of()));
@@ -1664,7 +1680,7 @@ class FavoriteServiceTest {
         @Test
         @DisplayName("never touches the category resolver for an empty page")
         void should_skipCategoryResolution_when_pageIsEmpty() {
-            when(favoriteRepository.findFavoriteMasterRows(clientId)).thenReturn(List.of());
+            when(favoriteRepository.findFavoriteMasterRows(eq(clientId), eq(KYIV_TODAY))).thenReturn(List.of());
 
             favoriteService.listMasterFavorites(clientId);
 

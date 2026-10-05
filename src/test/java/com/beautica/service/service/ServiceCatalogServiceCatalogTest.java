@@ -99,6 +99,9 @@ class ServiceCatalogServiceCatalogTest {
     private final java.time.Clock clock =
             java.time.Clock.fixed(java.time.Instant.parse("2026-09-09T00:00:00Z"), java.time.ZoneOffset.UTC);
 
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
+
     private ServiceCatalogService service;
 
     @BeforeEach
@@ -119,6 +122,7 @@ class ServiceCatalogServiceCatalogTest {
                 authz,
                 slotCalculationService,
                 salonCatalogCacheEvictor,
+                searchVisibilityGuard,
                 servicePhotoBlobPurger,
                 bookingRepository,
                 clock

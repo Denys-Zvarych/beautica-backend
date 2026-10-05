@@ -1,5 +1,6 @@
 package com.beautica.booking.filter;
 
+import com.beautica.auth.filter.AuthRateLimitFilter;
 import com.beautica.common.ApiResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.LoadingCache;
@@ -107,6 +108,15 @@ import java.util.UUID;
  *   cascade, which opens a real row lock on the caller's OWN {@code users} row for up to
  *   30s per attempt; a legitimate CLIENT self-deletes once, so the budget is small and
  *   hourly rather than shaped like the other, more frequent booking-write buckets above.</li>
+ *   <li><b>{@code catalogueBrowsePrincipalBuckets}:</b> the {@code permitAll} catalogue-browse and
+ *   public-profile GETs ({@code /salons/{id}}, {@code /salons/{id}/masters},
+ *   {@code /salons/{id}/services}, {@code /masters/{id}}, {@code /masters/by-salon/{id}},
+ *   {@code /masters/{id}/services}) when — and only when — they carry a {@code Bearer} token and
+ *   {@code AuthRateLimitFilter} therefore deferred them here (B8 regression fix, 2026-10-05). An
+ *   authenticated caller is charged on the per-IP ceiling {@code catalogueBrowseAuthenticatedIpBuckets}
+ *   and then per principal; a token that did not authenticate falls back to the anonymous per-IP
+ *   {@code catalogueBrowseBuckets} only. See
+ *   {@code applyDeferredCatalogueBrowseLimit}.</li>
  * </ul>
  *
  * <p><b>Why user-keyed, unlike every bucket in {@link com.beautica.auth.filter.AuthRateLimitFilter}:</b>
@@ -285,6 +295,13 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private static final int NOTIFICATION_FEED_RETRY_AFTER_SECONDS = 60;
 
     /**
+     * {@code Retry-After} for the deferred catalogue-browse / public-profile reads (B8 regression
+     * fix) — matches both the per-principal and the per-IP fallback bucket's 60s refill window,
+     * and {@code AuthRateLimitFilter}'s own catalogue-browse {@code Retry-After}.
+     */
+    private static final int CATALOGUE_BROWSE_RETRY_AFTER_SECONDS = 60;
+
+    /**
      * {@code Retry-After} for the CLIENT self-delete bucket — matches its 60-minute refill window
      * (see {@code RateLimitConfig#selfDeleteCapacity}'s javadoc for the sizing rationale).
      */
@@ -298,6 +315,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> salonMasterServicesReadBuckets;
     private final LoadingCache<String, Bucket> salonBoardReadBuckets;
     private final LoadingCache<String, Bucket> notificationFeedBuckets;
+    private final LoadingCache<String, Bucket> catalogueBrowsePrincipalBuckets;
+    private final LoadingCache<String, Bucket> catalogueBrowseBuckets;
+    private final LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets;
     private final ObjectMapper objectMapper;
 
     public BookingRateLimitFilter(
@@ -309,6 +329,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             LoadingCache<String, Bucket> salonMasterServicesReadBuckets,
             LoadingCache<String, Bucket> salonBoardReadBuckets,
             LoadingCache<String, Bucket> notificationFeedBuckets,
+            LoadingCache<String, Bucket> catalogueBrowsePrincipalBuckets,
+            LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            LoadingCache<String, Bucket> catalogueBrowseAuthenticatedIpBuckets,
             ObjectMapper objectMapper) {
         this.bookingWriteBuckets = bookingWriteBuckets;
         this.bookingDeclineBuckets = bookingDeclineBuckets;
@@ -318,6 +341,9 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
         this.salonMasterServicesReadBuckets = salonMasterServicesReadBuckets;
         this.salonBoardReadBuckets = salonBoardReadBuckets;
         this.notificationFeedBuckets = notificationFeedBuckets;
+        this.catalogueBrowsePrincipalBuckets = catalogueBrowsePrincipalBuckets;
+        this.catalogueBrowseBuckets = catalogueBrowseBuckets;
+        this.catalogueBrowseAuthenticatedIpBuckets = catalogueBrowseAuthenticatedIpBuckets;
         this.objectMapper = objectMapper;
     }
 
@@ -325,6 +351,11 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
     protected void doFilterInternal(
             HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
+        if (request.getAttribute(AuthRateLimitFilter.CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE)
+                instanceof String deferredIpKey) {
+            applyDeferredCatalogueBrowseLimit(request, response, filterChain, deferredIpKey);
+            return;
+        }
         BucketRoute route = selectRoute(request);
         if (route == null) {
             filterChain.doFilter(request, response);
@@ -342,6 +373,64 @@ public class BookingRateLimitFilter extends OncePerRequestFilter {
             filterChain.doFilter(request, response);
         } else {
             writeTooManyRequests(response, route.retryAfterSeconds());
+        }
+    }
+
+    /**
+     * Catalogue-browse / public-profile GETs that {@code AuthRateLimitFilter} DEFERRED because they
+     * carried a {@code Bearer} token (B8 regression fix, 2026-10-05 — see
+     * {@link AuthRateLimitFilter#CATALOGUE_BROWSE_DEFERRED_IP_KEY_ATTRIBUTE}). That filter already
+     * did the path matching, so the attribute alone identifies the route here — no second matcher
+     * to drift from the first.
+     *
+     * <ul>
+     *   <li><b>Authenticated</b> (the JWT filter set a UUID principal): charged FIRST on the caller's
+     *   own {@code catalogueBrowsePrincipalBuckets} entry, so anonymous browse traffic behind the same
+     *   carrier-grade-NAT egress IP can never 429 an owner's management UI; THEN — only if the
+     *   principal allowed it — on the per-IP ceiling {@code catalogueBrowseAuthenticatedIpBuckets}
+     *   under the deferred IP key (re-audit 2026-10-05, LOW: bounds N accounts minted behind one IP).
+     *   Principal-first matters: ceiling-first let ONE throttled account keep draining the shared
+     *   ceiling after its own bucket was empty, 429ing every other signed-in user on that IP
+     *   (follow-up LOW). When the ceiling then denies, the principal token just spent is REFUNDED
+     *   ({@code Bucket#addTokens(1)}, capped at capacity): otherwise, on a saturated CGNAT IP a
+     *   legitimate user stayed throttled on their own bucket for up to a minute after the ceiling
+     *   refilled (follow-up INFO). The ceiling is charged
+     *   HERE, post-JWT, and never in {@code AuthRateLimitFilter}: charged pre-JWT, a flood of junk
+     *   {@code Bearer x} headers from a shared CGNAT IP drained it and 429'd every genuine
+     *   signed-in user behind that IP (follow-up LOW).</li>
+     *   <li><b>Not authenticated</b> (forged/expired/revoked token, refresh token as bearer, deleted
+     *   account, …): charged on the ANONYMOUS per-IP {@code catalogueBrowseBuckets} under the IP key
+     *   {@code AuthRateLimitFilter} resolved — exactly the charge it would have made itself, so a
+     *   bogus bearer header buys no extra budget and never touches the authenticated ceiling.</li>
+     * </ul>
+     */
+    private void applyDeferredCatalogueBrowseLimit(
+            HttpServletRequest request, HttpServletResponse response, FilterChain filterChain,
+            String deferredIpKey) throws ServletException, IOException {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        boolean allowed;
+        if (auth != null && auth.getDetails() instanceof UUID userId) {
+            // Principal FIRST: a throttled account must not keep spending the shared per-IP ceiling
+            // after its own bucket is empty (short-circuit leaves the ceiling untouched).
+            Bucket principalBucket = catalogueBrowsePrincipalBuckets.get(userId.toString());
+            if (!principalBucket.tryConsume(1)) {
+                allowed = false;
+            } else if (catalogueBrowseAuthenticatedIpBuckets.get(deferredIpKey).tryConsume(1)) {
+                allowed = true;
+            } else {
+                // Ceiling denied AFTER the principal paid: refund it, so a saturated shared IP does
+                // not keep a legitimate user throttled after the ceiling refills. addTokens caps at
+                // capacity, so the refund can never over-credit.
+                principalBucket.addTokens(1);
+                allowed = false;
+            }
+        } else {
+            allowed = catalogueBrowseBuckets.get(deferredIpKey).tryConsume(1);
+        }
+        if (allowed) {
+            filterChain.doFilter(request, response);
+        } else {
+            writeTooManyRequests(response, CATALOGUE_BROWSE_RETRY_AFTER_SECONDS);
         }
     }
 

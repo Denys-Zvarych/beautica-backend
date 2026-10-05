@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.LocalDate;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -108,6 +109,56 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
         countQuery = "SELECT COUNT(m) FROM Master m WHERE m.salon.id = :salonId AND m.isActive = true"
     )
     Page<Master> findBySalonIdAndIsActiveTrueWithUser(@Param("salonId") UUID salonId, Pageable pageable);
+
+    /**
+     * The public, bookability-gated sibling of {@link #findBySalonIdAndIsActiveTrueWithUser}: the
+     * same {@code JOIN FETCH m.user} roster query and count query, narrowed to {@code ids} (the
+     * bookable set from {@code BookingMasterService#getBookableMasterIds}). Filtering in SQL keeps
+     * pagination and {@code totalElements} correct after gating — a post-page in-memory filter would
+     * return short pages and an inflated total. {@code ids} must be non-empty (callers short-circuit
+     * an empty set to an empty page without querying). Bounded by one salon's headcount, so the
+     * {@code IN} list never approaches the bind-parameter ceiling.
+     *
+     * <p>Not a non-graph duplicate (§E-1): it fetches the same graph; it exists because the
+     * management roster ({@code SalonService#getSalonStaff}) must stay ungated.
+     */
+    @Query(
+        value = """
+            SELECT m FROM Master m JOIN FETCH m.user
+            WHERE m.salon.id = :salonId AND m.isActive = true AND m.id IN :ids
+            """,
+        countQuery = """
+            SELECT COUNT(m) FROM Master m
+            WHERE m.salon.id = :salonId AND m.isActive = true AND m.id IN :ids
+            """
+    )
+    Page<Master> findBySalonIdAndIdInAndIsActiveTrueWithUser(
+            @Param("salonId") UUID salonId, @Param("ids") Collection<UUID> ids, Pageable pageable);
+
+    /**
+     * The CHEAP structural search-membership verdict ({@link MasterBookabilitySql#BOOKABLE_MASTER_M}
+     * on an active master) for each of {@code masterIds}, plus the master's current salon — the
+     * exact predicate discovery search lists masters/salons by. Read twice per write by
+     * {@code MasterSearchVisibilityGuard} (before and after, inside the write transaction) so the
+     * search caches are cleared only when the verdict actually flips. Bounded by the caller's id
+     * list (one master, or the masters assigned one service definition).
+     */
+    @Query(value = "SELECT m.id AS masterId, m.salon_id AS salonId, "
+            + "(m.is_active = true AND " + MasterBookabilitySql.BOOKABLE_MASTER_M + ") AS bookable "
+            + "FROM masters m WHERE m.id IN (:masterIds)",
+            nativeQuery = true)
+    List<SearchBookabilityRow> findSearchBookability(
+            @Param("masterIds") Collection<UUID> masterIds,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
+
+    /** Row of {@link #findSearchBookability}. */
+    interface SearchBookabilityRow {
+        UUID getMasterId();
+
+        UUID getSalonId();
+
+        Boolean getBookable();
+    }
 
     /**
      * Identifier-only projection of the same active roster {@link #findBySalonIdAndIsActiveTrueWithUser}

@@ -449,7 +449,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_DISTRICT_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_PRICE_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
@@ -468,7 +467,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("maxPrice") java.math.BigDecimal maxPrice,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -490,7 +490,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_DISTRICT_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
             + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
@@ -506,7 +505,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("q3") String q3,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -548,7 +548,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_CITY_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_PRICE_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
@@ -567,7 +566,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("maxPrice") java.math.BigDecimal maxPrice,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -581,7 +581,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
             + SalonSearchSql.STATIC_CITY_PREDICATE
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
             + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
@@ -597,7 +596,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("q3") String q3,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -625,7 +625,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * <p>Used exclusively by {@link SearchService#findSalonsByLocation}.
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_PRICE_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
@@ -643,7 +642,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("category") String category,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 
     /**
@@ -654,7 +654,6 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * both price bounds are null and no locality filter was supplied.
      */
     @Query(value = SalonSearchSql.STATIC_PROJECTION_HEAD
-            + SalonSearchSql.STATIC_CATEGORY_GATE
             + SalonSearchSql.STATIC_Q_GROUP_PREDICATE
             + SalonSearchSql.STATIC_ORDER_LIMIT_TAIL
             + SalonSearchSql.STATIC_NAME_PREVIEW_LATERAL
@@ -669,6 +668,7 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
             @Param("category") String category,
             @Param("sortMode") String sortMode,
             @Param("limit") int limit,
-            @Param("offset") long offset
+            @Param("offset") long offset,
+            @Param(com.beautica.master.repository.MasterBookabilitySql.TODAY_PARAM) java.time.LocalDate today
     );
 }

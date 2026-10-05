@@ -116,6 +116,9 @@ class ServiceValidationMessageContractTest {
     @MockBean
     private SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
 
+    @MockBean
+    private com.beautica.service.service.MasterServiceBookabilityFilter masterServiceBookabilityFilter;
+
     // ServiceController constructor-depends on MediaService since Phase 342 (service-photo upload); this slice
     // never exercises those routes, so a mock satisfies the wiring. Without it the context fails to load.
     @MockBean

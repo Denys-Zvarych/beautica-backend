@@ -112,6 +112,9 @@ class SalonServiceTest {
     private MasterService masterService;
 
     @Mock
+    private com.beautica.booking.service.BookingMasterService bookingMasterService;
+
+    @Mock
     // CacheManager: post-commit eviction uses TransactionSynchronizationManager,
     // which is inactive under MockitoExtension — tested via integration test.
     private CacheManager cacheManager;
@@ -1666,51 +1669,18 @@ class SalonServiceTest {
     }
 
     @Test
-    @DisplayName("getMastersBySalon — maps Page<Master> to Page<MasterSummaryResponse> via from() factory")
-    void should_returnMasterSummaries_when_getMastersBySalon() {
+    @DisplayName("getMastersBySalon — delegates to the single bookability-gated roster in MasterService#getMastersByPage")
+    void should_delegateToGatedMasterRoster_when_getMastersBySalon() {
         UUID salonId = UUID.randomUUID();
         Pageable pageable = Pageable.ofSize(10);
-
-        UUID masterId = UUID.randomUUID();
-        UUID userId = UUID.randomUUID();
-        User user = buildUser(userId, "master@beautica.test", Role.SALON_MASTER);
-        Master master = Master.builder()
-                .masterType(MasterType.SALON_MASTER)
-                .user(user)
-                .isActive(true)
-                .build();
-        ReflectionTestUtils.setField(master, "id", masterId);
-
-        // The service no longer forwards the caller's Pageable verbatim: SortWhitelist.apply
-        // validates it against SORTABLE_MASTER_PROPERTIES and, because the incoming Pageable is
-        // unsorted and the underlying query has no ORDER BY of its own, substitutes the default
-        // sort plus the mandatory unique `id` tiebreaker. Stubbing/verifying with this exact
-        // normalized instance (rather than any(Pageable.class)) is deliberate — it pins that
-        // contract, so silently dropping the whitelist or the tiebreaker reddens this test.
-        Pageable expectedNormalized = PageRequest.of(0, 10,
-                Sort.by(Sort.Direction.DESC, "avgRating").and(Sort.by(Sort.Direction.ASC, "id")));
-
-        Page<Master> pageOfMasters = new PageImpl<>(List.of(master), expectedNormalized, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized))
-                .thenReturn(pageOfMasters);
+        Page<MasterSummaryResponse> gated = new PageImpl<>(List.of(), pageable, 0);
+        when(masterService.getMastersByPage(salonId, pageable)).thenReturn(gated);
 
         var result = salonService.getMastersBySalon(salonId, pageable);
 
-        assertThat(result.getTotalElements()).isEqualTo(1);
-        assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
-        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized);
-    }
-
-    @Test
-    @DisplayName("getMastersBySalon rejects a dotted sort path with a 400 before touching the repository")
-    void should_throwBadRequest_when_getMastersBySalonSortIsDottedPath() {
-        UUID salonId = UUID.randomUUID();
-        Pageable oracleAttempt = PageRequest.of(0, 10, Sort.by(Sort.Direction.ASC, "user.passwordHash"));
-
-        assertThatThrownBy(() -> salonService.getMastersBySalon(salonId, oracleAttempt))
-                .isInstanceOf(BusinessException.class)
-                .hasFieldOrPropertyWithValue("status", HttpStatus.BAD_REQUEST);
-
+        assertThat(result).isSameAs(gated);
+        verify(masterService).getMastersByPage(salonId, pageable);
+        // No parallel, ungated roster read survives in SalonService.
         verifyNoInteractions(masterRepository);
     }
 
@@ -1766,4 +1736,29 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
         return salon;
     }
+
+    // ── isBookable — the GET /salons/{id} detail flag ────────────────────────────────────────
+
+    @Test
+    @DisplayName("isBookable — true when at least one master passes the strict salon verdict")
+    void should_reportBookable_when_salonHasABookableMaster() {
+        UUID salonId = UUID.randomUUID();
+        when(bookingMasterService.getBookableMasterIds(salonId)).thenReturn(java.util.Set.of(UUID.randomUUID()));
+
+        boolean bookable = salonService.isBookable(salonId);
+
+        assertThat(bookable).isTrue();
+    }
+
+    @Test
+    @DisplayName("isBookable — false when no master of the salon is bookable")
+    void should_reportNotBookable_when_salonHasNoBookableMaster() {
+        UUID salonId = UUID.randomUUID();
+        when(bookingMasterService.getBookableMasterIds(salonId)).thenReturn(java.util.Set.of());
+
+        boolean bookable = salonService.isBookable(salonId);
+
+        assertThat(bookable).isFalse();
+    }
+
 }

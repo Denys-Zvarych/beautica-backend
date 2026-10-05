@@ -9,6 +9,7 @@ import com.beautica.common.exception.NotFoundException;
 import com.beautica.master.entity.Master;
 import com.beautica.master.entity.MasterType;
 import com.beautica.master.repository.MasterRepository;
+import com.beautica.master.service.MasterSearchVisibilityGuard;
 import com.beautica.salon.repository.SalonRepository;
 import com.beautica.service.dto.AssignServiceToMasterRequest;
 import com.beautica.service.dto.BulkCreateServicesRequest;
@@ -109,6 +110,9 @@ public class ServiceCatalogService {
     private final com.beautica.common.security.AuthorizationService authz;
     private final com.beautica.booking.service.SlotCalculationService slotCalculationService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // Clears discovery search only when an assignment write flips a master's search membership
+    // (audit 2026-10-05, finding 1) — never on band, photo or definition-content edits.
+    private final MasterSearchVisibilityGuard searchVisibilityGuard;
     private final ServicePhotoBlobPurger servicePhotoBlobPurger;
     // Phase 307 D4 — the per-assignment future-CONFIRMED-booking guard on unassignServiceFromMaster.
     // Direct cross-feature repository injection, matching this class's existing MasterRepository/
@@ -192,6 +196,8 @@ public class ServiceCatalogService {
             throw new NotFoundException("Service definition not found: " + request.serviceDefId());
         }
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
+
         // Phase 307 D6 — ACTIVE-agnostic lookup, not existsByMasterIdAndServiceDefinitionId:
         // master_services' UNIQUE (master_id, service_def_id) is NOT partial, so an existing
         // INACTIVE row (the master previously unassigned this exact service via
@@ -237,6 +243,8 @@ public class ServiceCatalogService {
         // PERF-M2: keep the pre-computed min_effective_price in sync so the
         // search index reflects the new assignment immediately on next cache miss.
         masterRepository.refreshMinEffectivePrice(masterId);
+        // A master's first bookable service can make them (or their salon) discoverable.
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
 
         // Evict after commit so a parallel reader cannot repopulate the cache with
         // the pre-insert DB snapshot between eviction and commit (anti-bug §F).
@@ -491,10 +499,13 @@ public class ServiceCatalogService {
         evictBookableFutureSlotsCache(List.of(masterId));
         evictSalonCatalogAfterCommit(salonId);
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
         // D1 — soft unassign: flip is_active, never delete the row.
         assignment.setActive(false);
 
         masterRepository.refreshMinEffectivePrice(masterId);
+        // Losing the last active service drops the master (and maybe the salon) from search.
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
     }
 
     /**
@@ -532,6 +543,7 @@ public class ServiceCatalogService {
         // client a deep-linkable existingServiceDefId on the rare conflict. See the method javadoc.
         assertNoActiveDuplicate(OwnerType.INDEPENDENT_MASTER, master.getId(), serviceType, null);
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(master.getId()));
         ServiceDefinition definition = ServiceDefinition.builder()
                 .ownerType(OwnerType.INDEPENDENT_MASTER)
                 .ownerId(master.getId())
@@ -580,6 +592,7 @@ public class ServiceCatalogService {
         // PERF-M2: keep the pre-computed min_effective_price in sync for the
         // independent master's own search entry.
         masterRepository.refreshMinEffectivePrice(master.getId());
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
 
         // Evict only this master's cache entry after commit — replacing allEntries=true
         // to avoid cold-miss DB round-trips for all other masters (anti-bug §F).
@@ -814,6 +827,7 @@ public class ServiceCatalogService {
         // createSingleFromBulkItem's own javadoc has always claimed.
         Map<UUID, MasterServiceAssignment> reactivateAssignmentByTypeId =
                 loadReactivationTargets(reactivateAssignmentIdByTypeId);
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(master.getId()));
 
         List<MasterServiceResponse> created = request.items().stream()
                 .map(item -> createSingleFromBulkItem(
@@ -831,6 +845,7 @@ public class ServiceCatalogService {
         // Keep the pre-computed min_effective_price in sync for the master's search entry
         // (PERF-M2) and evict the master's services cache after commit (anti-bug §F).
         masterRepository.refreshMinEffectivePrice(master.getId());
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
         evictMasterServicesCache(List.of(master.getId()));
         // Phase 304 D1: a SALON-branch batch persists SALON-owned definitions/assignments, which
         // can change what GET /salons/{salonId}/services returns — evict that salon's catalogue
@@ -1271,6 +1286,8 @@ public class ServiceCatalogService {
         // every master (replacing allEntries=true, anti-bug §F).
         List<UUID> affectedMasterIds =
                 masterServiceRepository.findMasterIdsByServiceDefinitionId(serviceDefId);
+        // Deactivation CAN flip search membership (a master's last active service) — bracket it.
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(affectedMasterIds);
 
         // Step 2: register the targeted eviction to run after commit so a parallel
         // reader cannot repopulate stale entries between eviction and commit.
@@ -1327,6 +1344,7 @@ public class ServiceCatalogService {
         if (!affectedMasterIds.isEmpty()) {
             masterRepository.refreshMinEffectivePriceForAll(affectedMasterIds);
         }
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
     }
 
     /**
@@ -1921,13 +1939,20 @@ public class ServiceCatalogService {
     }
 
     /**
-     * Evicts the given master IDs from the "masterServices" cache.
+     * Evicts the given master IDs from the "masterServices" cache and from
+     * {@code master-bookable-assignments} (the strict per-master verdict behind the public services
+     * tab and the {@code GET /masters/{id}} bookable flag, keyed {@code [masterId]}) — an assignment
+     * write can add or remove a bookable service.
      *
      * <p>When a Spring transaction is active (the normal production path), the eviction is
      * deferred to {@code afterCommit} so a concurrent reader cannot repopulate the cache
      * with a pre-commit DB snapshot. When no transaction is active (e.g., in unit tests or
      * programmatic non-transactional callers), the eviction runs immediately — same net
      * effect as the former {@code @CacheEvict} annotation.
+     *
+     * <p>Discovery search is NOT cleared here: most callers (band, photo, definition-content edits)
+     * cannot change search membership. The writes that can bracket their mutation with
+     * {@link MasterSearchVisibilityGuard}, which clears only on an actual verdict flip.
      */
     private void evictMasterServicesCache(List<UUID> masterIds) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -1935,15 +1960,21 @@ public class ServiceCatalogService {
                     new TransactionSynchronization() {
                         @Override
                         public void afterCommit() {
-                            var cache = cacheManager.getCache("masterServices");
-                            if (cache != null) masterIds.forEach(cache::evict);
+                            evictMasterServicesNow(masterIds);
                         }
                     }
             );
         } else {
-            var cache = cacheManager.getCache("masterServices");
-            if (cache != null) masterIds.forEach(cache::evict);
+            evictMasterServicesNow(masterIds);
         }
+    }
+
+    private void evictMasterServicesNow(List<UUID> masterIds) {
+        var cache = cacheManager.getCache("masterServices");
+        if (cache != null) masterIds.forEach(cache::evict);
+        var bookable = cacheManager.getCache(
+                com.beautica.booking.service.BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE);
+        if (bookable != null) masterIds.forEach(id -> bookable.evict(List.of(id)));
     }
 
     /**

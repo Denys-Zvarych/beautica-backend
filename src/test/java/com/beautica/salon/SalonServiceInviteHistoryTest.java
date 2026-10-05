@@ -178,13 +178,16 @@ class SalonServiceInviteHistoryTest {
 
     private SalonService salonService;
 
+    @Mock
+    private com.beautica.booking.service.BookingMasterService bookingMasterService;
+
     @BeforeEach
     void setUp() {
         Clock fixedClock = Clock.fixed(FIXED_NOW, ZoneOffset.UTC);
         salonService = new SalonService(
                 salonRepository, userRepository, inviteService, inviteTokenRepository, masterRepository,
                 masterServiceRepository, localityWriteValidator, masterService,
-                masterScheduleService, scheduleDateMath,
+                bookingMasterService, masterScheduleService, scheduleDateMath,
                 new com.beautica.location.SettlementDisplayNameResolver(cityRepository),
                 locationQueryService, cacheManager, authorizationService, fixedClock,
                 userProfileCacheEvictor, staffClientReferenceAuditService, tokensValidAfterCache,

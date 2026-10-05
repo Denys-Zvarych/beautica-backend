@@ -12,6 +12,7 @@ import com.beautica.service.dto.ServiceDefinitionResponse;
 import com.beautica.service.dto.UpdateMasterServiceBandRequest;
 import com.beautica.service.dto.UpdateServiceDefinitionRequest;
 import com.beautica.media.service.MediaService;
+import com.beautica.service.service.MasterServiceBookabilityFilter;
 import com.beautica.service.service.MasterServiceFavoriteDecorator;
 import com.beautica.service.service.SalonServiceFavoriteDecorator;
 import com.beautica.service.service.ServiceCatalogService;
@@ -175,6 +176,7 @@ public class ServiceController {
     private final ServiceCatalogService serviceCatalogService;
     private final MediaService mediaService;
     private final MasterServiceFavoriteDecorator masterServiceFavoriteDecorator;
+    private final MasterServiceBookabilityFilter masterServiceBookabilityFilter;
     private final SalonServiceFavoriteDecorator salonServiceFavoriteDecorator;
 
     @io.swagger.v3.oas.annotations.responses.ApiResponses({
@@ -455,11 +457,16 @@ public class ServiceController {
      * here — lexically outside the {@code @Cacheable} method — so the per-client flag is applied
      * fresh on every request and never enters the cache. An authenticated CLIENT sees {@code true}/
      * {@code false} per row; every other caller (anonymous, or any other role) sees {@code null}.
+     *
+     * <p><strong>Bookability (2026-10-05).</strong> Clients and anonymous callers see only the
+     * services that pass the strict free-slot verdict; the master themself and their salon
+     * owner/admin see the full configured list — see {@link MasterServiceBookabilityFilter}.
      */
     @GetMapping("/masters/{masterId}/services")
     public ApiResponse<List<MasterServiceResponse>> getMasterServices(
             @PathVariable UUID masterId, Authentication authentication) {
-        List<MasterServiceResponse> services = serviceCatalogService.getMasterServices(masterId);
+        List<MasterServiceResponse> services = masterServiceBookabilityFilter.forViewer(
+                masterId, serviceCatalogService.getMasterServices(masterId), authentication);
         return ApiResponse.ok(masterServiceFavoriteDecorator.decorate(services, authentication));
     }
 

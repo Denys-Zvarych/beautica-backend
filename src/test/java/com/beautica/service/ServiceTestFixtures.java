@@ -363,18 +363,7 @@ class ServiceTestFixtures {
      * today's so the fixture cannot go stale when the suite runs after 17:00 local.
      */
     void seedUsableSchedule(UUID masterId) {
-        UUID scheduleId = UUID.randomUUID();
-        jdbcTemplate.update(
-                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
-                        + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
-                scheduleId, masterId, java.time.LocalDate.now(java.time.ZoneId.of("Europe/Kyiv")));
-        for (int isoDow = 1; isoDow <= 7; isoDow++) {
-            jdbcTemplate.update(
-                    "INSERT INTO working_intervals (id, schedule_id, day_of_week, start_time, end_time) "
-                            + "VALUES (?, ?, ?, ?, ?)",
-                    UUID.randomUUID(), scheduleId, isoDow,
-                    java.time.LocalTime.of(9, 0), java.time.LocalTime.of(17, 0));
-        }
+        com.beautica.support.BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
     }
 
     /**

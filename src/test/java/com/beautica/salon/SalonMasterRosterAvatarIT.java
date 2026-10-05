@@ -2,6 +2,7 @@ package com.beautica.salon;
 
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.config.TestSecurityConfig;
+import com.beautica.support.BookableMasterSeeder;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,6 +26,10 @@ import static org.assertj.core.api.Assertions.tuple;
  * Salon roster ({@code GET /salons/{id}/masters}, {@code GET /masters/by-salon/{id}}) must carry
  * each master's own {@code users.avatar_url} — {@code MasterSummaryResponse.from} hardcoded
  * {@code null}. Two masters, one with an avatar and one without, pin per-row mapping.
+ *
+ * <p>Both masters are made bookable (service + weekly hours via {@link BookableMasterSeeder}): the
+ * public roster lists only masters that pass the shared free-slot verdict, so unconfigured masters
+ * would be filtered out and the per-row avatar mapping would go unexercised.
  */
 @Import(TestSecurityConfig.class)
 @DisplayName("Salon master roster — avatarUrl mapping")
@@ -103,6 +108,7 @@ class SalonMasterRosterAvatarIT extends AbstractIntegrationTest {
                         + "is_active, created_at, updated_at) "
                         + "VALUES (?, ?, ?, 'SALON_MASTER', 0, 0, true, NOW(), NOW())",
                 masterId, userId, salonId);
+        BookableMasterSeeder.makeBookable(jdbcTemplate, salonId, masterId);
         return masterId;
     }
 

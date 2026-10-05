@@ -94,6 +94,8 @@ class MasterServiceTest {
     // afterCommit eviction callback NPEs the instant any deactivate/reactivate path is replayed
     // under an active transaction synchronization (see should_evict* guard tests below).
     @Mock private com.beautica.booking.service.SlotCalculationService slotCalculationService;
+    // Public-roster bookability gate (getMastersByPage) — the shared free-slot verdict.
+    @Mock private com.beautica.booking.service.BookingMasterService bookingMasterService;
     @Mock private com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     // Prefix-eviction fix: the master-calendar / available-slots afterCommit callbacks now delegate to
     // the shared evictor, so @InjectMocks must have one to wire or every deactivate/reactivate path
@@ -1699,7 +1701,9 @@ class MasterServiceTest {
                 Sort.by(Sort.Direction.DESC, "avgRating").and(Sort.by(Sort.Direction.ASC, "id")));
 
         Page<Master> masterPage = new PageImpl<>(List.of(master), expectedNormalized, 1);
-        when(masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized))
+        when(bookingMasterService.getBookableMasterIds(salonId)).thenReturn(Set.of(masterId));
+        when(masterRepository.findBySalonIdAndIdInAndIsActiveTrueWithUser(
+                salonId, Set.of(masterId), expectedNormalized))
                 .thenReturn(masterPage);
 
         Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, pageable);
@@ -1708,7 +1712,22 @@ class MasterServiceTest {
         assertThat(result.getContent()).hasSize(1);
         assertThat(result.getContent().get(0).masterId()).isEqualTo(masterId);
         assertThat(result.getContent().get(0).masterType()).isEqualTo(MasterType.SALON_MASTER);
-        verify(masterRepository).findBySalonIdAndIsActiveTrueWithUser(salonId, expectedNormalized);
+        verify(masterRepository).findBySalonIdAndIdInAndIsActiveTrueWithUser(
+                salonId, Set.of(masterId), expectedNormalized);
+        verify(masterRepository, never()).findBySalonIdAndIsActiveTrueWithUser(any(), any());
+    }
+
+    @Test
+    @DisplayName("getMastersByPage returns an empty page without a roster query when no master is bookable")
+    void should_returnEmptyPageWithoutRosterQuery_when_noMasterIsBookable() {
+        UUID salonId = UUID.randomUUID();
+        when(bookingMasterService.getBookableMasterIds(salonId)).thenReturn(Set.of());
+
+        Page<MasterSummaryResponse> result = masterService.getMastersByPage(salonId, Pageable.ofSize(10));
+
+        assertThat(result.getContent()).isEmpty();
+        assertThat(result.getTotalElements()).isZero();
+        verifyNoInteractions(masterRepository);
     }
 
     @Test
@@ -1836,4 +1855,29 @@ class MasterServiceTest {
         assertThat(from.getValue().toInstant()).isEqualTo(Instant.parse("2026-01-31T22:00:00Z"));
         assertThat(to.getValue().toInstant()).isEqualTo(Instant.parse("2026-02-28T22:00:00Z"));
     }
+
+    // ── isBookable — the GET /masters/{id} detail flag (strict verdict, master-scoped) ──────
+
+    @Test
+    @DisplayName("isBookable — true iff the cached per-master verdict keeps at least one assignment")
+    void should_reportBookable_when_verdictContainsMaster() {
+        UUID masterId = UUID.randomUUID();
+        when(bookingMasterService.getBookableAssignmentIds(masterId)).thenReturn(Set.of(UUID.randomUUID()));
+
+        boolean bookable = masterService.isBookable(masterId);
+
+        assertThat(bookable).isTrue();
+    }
+
+    @Test
+    @DisplayName("isBookable — false when the strict verdict excludes the master")
+    void should_reportNotBookable_when_verdictIsEmpty() {
+        UUID masterId = UUID.randomUUID();
+        when(bookingMasterService.getBookableAssignmentIds(masterId)).thenReturn(Set.of());
+
+        boolean bookable = masterService.isBookable(masterId);
+
+        assertThat(bookable).isFalse();
+    }
+
 }

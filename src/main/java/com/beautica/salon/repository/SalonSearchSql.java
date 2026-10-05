@@ -1,5 +1,7 @@
 package com.beautica.salon.repository;
 
+import com.beautica.master.repository.MasterBookabilitySql;
+
 /**
  * The <b>single</b> definition of the salon free-text ({@code q}) SQL, shared by
  * the two code paths that filter salons by {@code q}:
@@ -168,7 +170,8 @@ public final class SalonSearchSql {
                     + "JOIN masters mmq ON mmq.id = msq.master_id AND mmq.is_active = true "
                     + "AND mmq.salon_id = ";
     private static final String GATE_MID = ".id WHERE msq.service_def_id = ";
-    private static final String GATE_TAIL = ".id AND msq.is_active = true) ";
+    private static final String GATE_TAIL = ".id AND msq.is_active = true AND "
+            + MasterBookabilitySql.HAS_SCHEDULE_MMQ + ") ";
 
     /** Bookable gate for the WHERE-clause form: salon {@code s}, definition {@code sdq}. */
     private static final String BOOKABLE_MASTER_GATE = GATE_HEAD + "s" + GATE_MID + "sdq" + GATE_TAIL;
@@ -362,9 +365,9 @@ public final class SalonSearchSql {
 
     /**
      * Outer projection + the head of the inner Top-N derived table {@code t}, up to
-     * and including {@code WHERE s.is_active = true}. Callers append the location
-     * predicate, then {@link #STATIC_CATEGORY_GATE}, {@link #STATIC_Q_GROUP_PREDICATE},
-     * optionally {@link #STATIC_PRICE_PREDICATE}, then {@link #STATIC_ORDER_LIMIT_TAIL}.
+     * and including the salon-membership gate. Callers append the location predicate, then
+     * {@link #STATIC_Q_GROUP_PREDICATE}, optionally {@link #STATIC_PRICE_PREDICATE}, then
+     * {@link #STATIC_ORDER_LIMIT_TAIL}.
      *
      * <p>{@code COUNT(*) OVER()} is the single-query pagination window (see the class
      * Javadoc): Postgres evaluates it before the {@code LIMIT} on the same query
@@ -375,6 +378,24 @@ public final class SalonSearchSql {
      * {@code pmin}/{@code pmax} feed the price {@code WHERE} and the {@code ORDER BY}.
      * The two name laterals do not, so they are attached outside — see
      * {@link #STATIC_NAME_PREVIEW_LATERAL}.</p>
+     *
+     * <h2>Salon membership and the category gate — computed ONCE, by {@code pr} (perf audit
+     * 2026-10-05)</h2>
+     * <p>A salon is listed only when at least one active master of it performs an active salon
+     * service AND has a schedule ({@link MasterBookabilitySql}) — for browse, {@code q} and every
+     * filter alike — and, with {@code :category} bound, only when such a service is in that
+     * category. The {@code pr} lateral aggregates EXACTLY that row set: active
+     * {@code master_services} on an active, salon-owned definition, performed by an active master
+     * attached to this salon whose schedule passes {@link MasterBookabilitySql#HAS_SCHEDULE_MAD},
+     * narrowed to {@code :category} when bound. So {@code pr.bookable_rows > 0} IS the
+     * salon-membership gate ({@code MasterBookabilitySql#bookableSalon}: owner-type SALON and owner
+     * = the master's own salon is the same ownership rule) and, with a category, the category gate
+     * too. Both used to be separate correlated {@code EXISTS} blocks that re-ran the schedule check
+     * for the same masters 2–3 times per candidate salon; folding them into the aggregate the query
+     * already computes cut the measured inner Top-N by 25–55 % (5 000 salons / 30 000 masters,
+     * {@code EXPLAIN ANALYZE}, result sets proven identical with {@code EXCEPT} both ways for
+     * no-category and two categories). The {@code q} gate keeps its own {@code EXISTS}: it matches
+     * service NAMES across all categories, which a category-narrowed {@code pr} cannot answer.</p>
      *
      * <h2>The {@code pr} lateral's schedule gate (2026-09-13 audit, H4)</h2>
      * <p>The salon catalogue ({@code ServiceCatalogService#getSalonServiceCatalog}) prices a salon
@@ -401,61 +422,30 @@ public final class SalonSearchSql {
      *       {@code valid_from} upper bound is load-bearing, not decoration:
      *       {@code WeeklyScheduleRequest#validFrom} is only {@code @FutureOrPresent}, so a template
      *       starting in 2030 is reachable over the public API and the catalogue drops it.
-     *       <p><b>Both bounds resolve "today" as the <em>Europe/Kyiv</em> civil date, spelled
-     *       {@code (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date} — never bare
-     *       {@code CURRENT_DATE}</b> (and likewise for the exception arm below).
-     *       {@code CURRENT_DATE} resolves against the JDBC session's {@code TimeZone}, which
-     *       pgjdbc sets from the JVM default; Railway and Neon both run UTC, so between 00:00 and
-     *       03:00 Kyiv the session date is still <em>yesterday</em> in Kyiv. The catalogue half of
-     *       the contract this lateral mirrors resolves its own "today" from Kyiv unconditionally
-     *       ({@code ScheduleDateMath#today()}, built on {@code clock.withZone(TimeZones.KYIV)}),
-     *       so a bare {@code CURRENT_DATE} here let a master whose template expired
-     *       yesterday-Kyiv keep pricing the salon for three hours every night — search
-     *       advertising a floor the catalogue will not honour, i.e. a breach of the very
-     *       "salon price range = bookable masters only" rule this gate exists to uphold. Binding
-     *       the date as a {@code :today} parameter from {@code ScheduleDateMath} was rejected: it
-     *       would force a {@code @Param} onto all six {@code @Query} methods that share this SQL,
-     *       and the regression is pinned deterministically without it.</p>
-     *       <p><b>Two tests guard this, and they are not interchangeable.</b>
-     *       {@code SalonSearchPriceBandIT#should_excludeMasterWithExpiredScheduleFromTheSearchBand}
-     *       (case 22) is the end-to-end behavioural proof — it shows the advertised band actually
-     *       moves — but it reaches Postgres over the pooled connection whose session zone is the JVM
-     *       default, so it discriminates ONLY while that zone's civil date differs from Kyiv's:
-     *       180 minutes of a summer day, 120 of a winter one, and NEVER under
-     *       {@code TZ=Europe/Kyiv}. That is not a defect in case 22; it is unavoidable, because when
-     *       the two dates agree the broken and fixed predicates are literally the same comparison,
-     *       so no fixture value separates them. This defect duly shipped in PR #125 and stayed green
-     *       from 09:42Z to 19:16Z; only the 21:22Z run caught it.
-     *       {@code SalonSearchTodayResolutionIT} is the deterministic backstop: it extracts these
-     *       four operands from this very constant, pins the SQL clock source to a literal instant,
-     *       and sweeps every quarter-hour of four reference days under three session zones — so a
-     *       {@code CURRENT_DATE} revert is RED at every one of the 24 UTC hours (re-measured
-     *       2026-09-20 against a live revert: 1824 of the sweep's 4608 pinned evaluations fail —
-     *       456 per operand &times; 4 operands — and 4 of that class's 9 test methods go RED, while
-     *       {@code SalonSearchPriceBandIT} stays 13/13 green at the same instant. The AssertJ
-     *       failure listing is capped at 1000 elements, so do not read the printed list length as
-     *       the failure count), whatever time CI runs. <b>CI must still never be pinned
-     *       to {@code TZ=Europe/Kyiv}</b>, which would silence case 22 entirely and hide the defect
-     *       rather than fix it.</p>
-     *       <p><b>It mirrors the RANGE only, not the fold's working-day outcome — and that
-     *       remaining gap is deliberate (2026-09-13 cycle-3 audit, A6).</b>
-     *       {@code WeeklyScheduleRequest#days} carries only {@code @Size(max = 7)} with no
-     *       {@code min}, so {@code {"days":[]}} is reachable over the public API and persists a
-     *       {@code weekly_schedules} row with zero {@code working_intervals} and zero
-     *       {@code working_interval_times}. Such a master satisfies this {@code EXISTS} but the
-     *       catalogue's fold drops them, so they can still set a band the catalogue will not show.
-     *       Tightening the arm CORRECTLY would need {@code EXISTS working_intervals OR EXISTS
-     *       working_interval_times} correlated to {@code ws.id} — both, because an
-     *       {@code EXPLICIT_TIMES} weekday (V84) is bookable with zero {@code working_intervals}
-     *       rows, and probing only the former would drop a genuinely bookable master to a NULL
-     *       band, i.e. out of every price-bounded search: strictly worse than the gap, and the same
-     *       over-narrowing cycle 2 corrected as B1. That is two more correlated probes per
-     *       candidate row inside a paginated Top-N on the hottest public query, to remove a
-     *       band-too-wide case an empty template already makes degenerate. So the gap is accepted
-     *       and pinned rather than closed:
-     *       {@code SalonSearchPriceBandIT#should_keepTheSearchBand_when_theOnlyMasterTemplateHasNoWorkingIntervals_pinningTheEmptyTemplateGapAsDeliberate}
-     *       seeds exactly that master and asserts BOTH halves — the catalogue is empty, the search
-     *       band is not — so tightening the arm turns a test RED instead of silently passing.</p></li>
+     *       <p><b>Both bounds resolve "today" as the <em>Europe/Kyiv</em> civil date, BOUND as
+     *       {@code :}{@value MasterBookabilitySql#TODAY_PARAM} from {@code ScheduleDateMath#today()}
+     *       (and likewise for the exception arm below) — never bare {@code CURRENT_DATE}, and no
+     *       longer the DB clock at all.</b> {@code CURRENT_DATE} resolves against the JDBC session's
+     *       {@code TimeZone} (UTC on Railway and Neon), so between 00:00 and 03:00 Kyiv the session
+     *       date is still <em>yesterday</em> in Kyiv and a master whose template expired
+     *       yesterday-Kyiv kept pricing the salon (shipped in PR #125, caught only by a 21:22Z CI
+     *       run). The intermediate fix spelled {@code (CURRENT_TIMESTAMP AT TIME ZONE
+     *       'Europe/Kyiv')::date}, which got the zone right but still read the DATABASE clock while
+     *       the catalogue half of this contract reads the app's {@code kyivClock}; binding the
+     *       date from the same {@code Clock} makes the two halves agree by construction and lets a
+     *       fixed {@code Clock} pin it. Every {@code @Query} that splices this head therefore
+     *       declares the parameter. {@code SalonSearchTodayResolutionIT} pins that no SQL
+     *       now-source survives in any bookability form and that the bound value is the Kyiv civil
+     *       date of the app clock at every quarter-hour of four reference days; case 22 of
+     *       {@code SalonSearchPriceBandIT} stays the end-to-end behavioural proof. <b>CI must still
+     *       never be pinned to {@code TZ=Europe/Kyiv}.</b></p>
+     *       <p><b>Working hours are required (bookability decision 2026-10-05).</b> The arm also
+     *       demands at least one {@code working_intervals} OR {@code working_interval_times} row on
+     *       the template — both, because an {@code EXPLICIT_TIMES} weekday (V84) has zero
+     *       {@code working_intervals}. An empty template ({@code {"days":[]}}) is no longer a
+     *       schedule, closing the gap this paragraph used to pin as deliberate. The predicate lives
+     *       in {@link MasterBookabilitySql} and is the SAME one the salon-level membership gate, the
+     *       category gate, the name previews and favourites apply.</p></li>
      *   <li><b>Exception arm</b> — a master with ZERO {@code weekly_schedules} rows but a future
      *       working {@code schedule_exceptions} row (a {@code CUSTOM_HOURS} override) IS bookable
      *       and DOES reach the catalogue, because the override branch of the fold never consults a
@@ -530,25 +520,19 @@ public final class SalonSearchSql {
                     SELECT MIN(COALESCE(ms.price_override, sd.base_price)) AS pmin,
                            MAX(CASE WHEN COALESCE(ms.price_type_override, sd.price_type) = 'RANGE'
                                     THEN COALESCE(ms.price_max_override, sd.price_max)
-                                    ELSE COALESCE(ms.price_override, sd.base_price) END) AS pmax
+                                    ELSE COALESCE(ms.price_override, sd.base_price) END) AS pmax,
+                           COUNT(*) AS bookable_rows
                     FROM master_services ms
                     JOIN service_definitions sd ON sd.id = ms.service_def_id AND sd.is_active = true
                     JOIN masters mad ON mad.id = ms.master_id AND mad.is_active = true AND mad.salon_id = s.id
                     WHERE sd.owner_type = 'SALON'
                       AND sd.owner_id = s.id
                       AND ms.is_active = true
-                      AND (EXISTS (SELECT 1 FROM weekly_schedules ws
-                                    WHERE ws.master_id = mad.id
-                                      AND ws.valid_from <= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date + 180
-                                      AND (ws.valid_to IS NULL OR ws.valid_to >= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date))
-                           OR EXISTS (SELECT 1 FROM schedule_exceptions se
-                                       WHERE se.master_id = mad.id
-                                         AND se.date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date
-                                         AND se.date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Kyiv')::date + 180
-                                         AND se.kind = 'CUSTOM_HOURS'))
+                      AND """ + MasterBookabilitySql.HAS_SCHEDULE_MAD + """
                       AND (CAST(:category AS text) IS NULL OR sd.category = CAST(:category AS text))
                 ) pr ON true
                 WHERE s.is_active = true
+                  AND pr.bookable_rows > 0
             """;
 
     // ── the ONE ORDER BY definition, re-aliased for the inner and outer levels ────
@@ -578,54 +562,6 @@ public final class SalonSearchSql {
 
     /** City-level location predicate for the inner Top-N. */
     public static final String STATIC_CITY_PREDICATE = "      AND s.city_id = :cityId\n";
-
-    /**
-     * Category-membership gate: the salon owns at least one <em>assignable</em>
-     * service in the searched category. TRUE (and never evaluated) when
-     * {@code :category} is null.
-     *
-     * <h4>Three definitions of "bookable" coexist in this query, deliberately (2026-09-13 cycle-3
-     * audit, A5)</h4>
-     * <p>Since the {@code pr} lateral gained its two-armed schedule gate
-     * ({@link #STATIC_PROJECTION_HEAD}), this query carries <b>three</b> different membership
-     * predicates and they are NOT the same predicate:</p>
-     * <ul>
-     *   <li><b>{@code pr} price lateral</b> — active service + active assignment + active master
-     *       <em>AND</em> the master's schedule could resolve a working day in the next 180 days.</li>
-     *   <li><b>This category gate</b> — active service + active assignment + active master. No
-     *       schedule probe.</li>
-     *   <li><b>{@link #STATIC_NAME_PREVIEW_LATERAL}</b> — same as this gate. No schedule probe.</li>
-     * </ul>
-     * <p><b>The observable consequence:</b> a salon whose only master has no resolvable schedule
-     * still PASSES this category gate and still renders its service names on the card, but its
-     * {@code pr.pmin}/{@code pr.pmax} are NULL — so it sorts NULLS-LAST in both price directions
-     * and {@link #STATIC_PRICE_PREDICATE} excludes it from every price-bounded search. It appears
-     * in an unbounded category browse and vanishes the moment a price filter is applied.</p>
-     *
-     * <p><b>Why this is accepted rather than closed.</b> Copying the two-armed {@code EXISTS} into
-     * this gate and into the name lateral would TRIPLE the schedule probe on the hottest public
-     * query — three correlated subplans per candidate salon inside a paginated Top-N — to buy a
-     * cosmetic consistency (a card that would otherwise show names with no price). The honest
-     * alternative, a denormalised "has a bookable master" column maintained on every schedule
-     * write, is a write-path and migration change out of this batch's scope. Search is a discovery
-     * surface: showing a salon in a category browse and declining to price it is the conservative
-     * failure, and the catalogue — the "what can I book right now" surface — is already correct
-     * (Phase 305 D1). Pinned, not merely asserted here, by
-     * {@code SalonSearchPriceBandIT#should_stillPassTheCategoryGateAndPreviewNames_whenTheOnlyMasterHasNoResolvableSchedule_pinningTheThreeGateAsymmetryAsDeliberate}
-     * — the same convention the occupancy divergence uses (case 26): narrowing this gate in SQL
-     * turns a test RED rather than silently passing.</p>
-     */
-    public static final String STATIC_CATEGORY_GATE = """
-                  AND (CAST(:category AS text) IS NULL OR EXISTS (
-                      SELECT 1 FROM service_definitions sdc
-                      WHERE sdc.owner_type = 'SALON'
-                        AND sdc.owner_id = s.id
-                        AND sdc.is_active = true
-                        AND EXISTS (SELECT 1 FROM master_services msc
-                                    JOIN masters mmc ON mmc.id = msc.master_id AND mmc.is_active = true AND mmc.salon_id = s.id
-                                    WHERE msc.service_def_id = sdc.id AND msc.is_active = true)
-                        AND sdc.category = CAST(:category AS text)))
-            """;
 
     /** Price band-overlap predicate — spliced in only by the price-bound overloads. */
     public static final String STATIC_PRICE_PREDICATE = """
@@ -686,7 +622,9 @@ public final class SalonSearchSql {
                           AND sd2.is_active = true
                           AND EXISTS (SELECT 1 FROM master_services ms2
                                       JOIN masters mm2 ON mm2.id = ms2.master_id AND mm2.is_active = true AND mm2.salon_id = t.id
-                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true)
+                                      WHERE ms2.service_def_id = sd2.id AND ms2.is_active = true
+                                        AND """ + MasterBookabilitySql.HAS_SCHEDULE_MM2 + """
+                                      )
                           AND (CAST(:category AS text) IS NULL OR sd2.category = CAST(:category AS text))
                         ORDER BY sd2.name
                         LIMIT 3) z) pn ON true

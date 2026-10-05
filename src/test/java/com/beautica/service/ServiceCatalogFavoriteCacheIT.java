@@ -1,5 +1,6 @@
 package com.beautica.service;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.auth.dto.AuthResponse;
 import com.beautica.auth.dto.LoginRequest;
@@ -566,12 +567,15 @@ class ServiceCatalogFavoriteCacheIT extends AbstractIntegrationTest {
                         + "created_at, updated_at) "
                         + "VALUES (?, ?, 'INDEPENDENT_MASTER', 0.00, 0, true, NOW(), NOW())",
                 masterId, userId);
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05).
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         return masterId;
     }
 
     private UUID createMasterService(UUID masterId) {
-        UUID ownerId = jdbcTemplate.queryForObject(
-                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        // owner_id = masters.id — the production shape (ServiceCatalogService#addIndependentMasterService);
+        // the former users.id key was a stale fixture the bookability ownership rule rejects.
+        UUID ownerId = masterId;
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions (id, owner_type, owner_id, name, service_type_id, "

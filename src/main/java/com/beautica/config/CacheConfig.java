@@ -1,5 +1,6 @@
 package com.beautica.config;
 
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.client.service.ClientPassportService;
 import com.beautica.common.cache.UserProfileCacheEvictor;
 import com.beautica.location.SettlementDisplayNameResolver;
@@ -728,6 +729,25 @@ public class CacheConfig {
         registerMetered(manager, meterRegistry, "salon-service-catalog",
                 Caffeine.newBuilder()
                         .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Public salon roster gate (GET /salons/{id}/masters, GET /masters/by-salon/{id}) — the set of
+        // master ids bookable for >=1 salon service, keyed on salonId. Same verdict and same compute as
+        // salon-service-catalog, so the same config: 60-sec TTL backstop, sync=true on the @Cacheable,
+        // explicit afterCommit eviction via SalonCatalogCacheEvictor (which evicts both caches).
+        registerMetered(manager, meterRegistry, "salon-bookable-masters",
+                Caffeine.newBuilder()
+                        .maximumSize(500)
+                        .expireAfterWrite(60, TimeUnit.SECONDS));
+        // Strict per-master verdict (BookingMasterService#getBookableAssignmentIds) behind the public
+        // GET /masters/{id} bookable flag and the GET /masters/{id}/services client filter — keyed
+        // [masterId] (one-element list), so the existing by-master afterCommit sweeps
+        // (SlotCalculationService BOOKING_WRITE_CACHES, MasterScheduleService SCHEDULE_WRITE_CACHES)
+        // evict it with no parallel wiring; assignment writes evict the key directly. 60-sec TTL
+        // backstop, sync=true on the @Cacheable (both reads are permitAll — §F-7). Sized like
+        // master-service-bookable: one small id set per browsed master.
+        registerMetered(manager, meterRegistry, BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
+                Caffeine.newBuilder()
+                        .maximumSize(2000)
                         .expireAfterWrite(60, TimeUnit.SECONDS));
         // Phase 13.6 (perf follow-up) — approved+active PlatformCategory ordering backing
         // ServiceCatalogService#buildCategoryOrderAndNames. Mirrors service-categories's config: this

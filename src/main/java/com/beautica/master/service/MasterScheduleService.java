@@ -1,5 +1,6 @@
 package com.beautica.master.service;
 
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.common.DateRange;
 import com.beautica.common.cache.MasterCachePrefixEvictor;
 import com.beautica.common.exception.BusinessException;
@@ -106,6 +107,9 @@ public class MasterScheduleService {
             "master-usable-schedule",
             "master-service-bookable",
             "master-bookable-days",
+            // Strict per-master verdict behind the GET /masters/{id} bookable flag and the public
+            // services tab — keyed [masterId], so the same by-master sweep evicts it.
+            BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
     };
 
     private final WeeklyScheduleRepository weeklyScheduleRepository;
@@ -116,6 +120,7 @@ public class MasterScheduleService {
     private final ScheduleMapper scheduleMapper;
     private final MasterCachePrefixEvictor cacheEvictor;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    private final MasterSearchVisibilityGuard searchVisibilityGuard;
 
     // ---- Step 2: weekly-template upsert -------------------------------------------------
 
@@ -140,12 +145,14 @@ public class MasterScheduleService {
         days.forEach(this::validateDay);
         assertNoWindowOverlap(masterId, scheduleId, new DateRange(validFrom, request.validTo()));
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
         WeeklySchedule schedule = resolveScheduleForUpsert(scheduleId, master);
         schedule.setValidFrom(validFrom);
         schedule.setValidTo(request.validTo());
         replaceDayCollections(schedule, days);
 
         WeeklySchedule saved = weeklyScheduleRepository.save(schedule);
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
         evictSlotsAfterCommit(master);
         return scheduleMapper.toWeeklyScheduleResponse(saved);
     }
@@ -178,6 +185,7 @@ public class MasterScheduleService {
         assertEditable(request.date());
         validateOverrideConsistency(request);
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
         ScheduleException override = scheduleExceptionRepository
                 .findByMasterIdAndDateWithIntervals(masterId, request.date())
                 .orElseGet(() -> ScheduleException.builder().master(master).date(request.date()).build());
@@ -209,6 +217,7 @@ public class MasterScheduleService {
         replaceOverrideDiscreteTimes(override, explicitTimes ? request.times() : List.of());
 
         ScheduleException saved = scheduleExceptionRepository.save(override);
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
         evictSlotsAfterCommit(master);
         return scheduleMapper.toOverrideResponse(saved);
     }
@@ -253,7 +262,9 @@ public class MasterScheduleService {
             // Cross-master delete attempt — surface as not-found to avoid an existence oracle.
             throw new NotFoundException("Schedule not found");
         }
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
         weeklyScheduleRepository.delete(schedule);
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
         evictSlotsAfterCommit(master);
     }
 
@@ -296,8 +307,10 @@ public class MasterScheduleService {
         authz.enforceCanManageMasterSchedule(actorId, master);
         assertEditable(date);
 
+        MasterSearchVisibilityGuard.Snapshot searchBefore = searchVisibilityGuard.capture(List.of(masterId));
         scheduleExceptionRepository.findByMasterIdAndDate(masterId, date)
                 .ifPresent(scheduleExceptionRepository::delete);
+        searchVisibilityGuard.clearSearchCachesIfFlipped(searchBefore);
         evictSlotsAfterCommit(master);
     }
 
@@ -1169,6 +1182,11 @@ public class MasterScheduleService {
      * belongs to a salon ({@code master.salon} — JOIN-FETCHed by {@code loadActiveMaster}), the salon's
      * {@code salon-service-catalog} entry is evicted too; an independent master (null salon) owns no salon
      * catalogue entry. The salon id is captured before the callback, not read from the entity afterCommit.
+     *
+     * <p><b>Discovery search is NOT cleared here.</b> Search lists only masters with a schedule, but
+     * most schedule writes (a day off, a second interval, a moved window) leave that verdict as it
+     * was; the write paths bracket their mutation with {@link MasterSearchVisibilityGuard} instead,
+     * which clears search only when the master's verdict actually flips (audit 2026-10-05, finding 1).
      */
     private void evictSlotsAfterCommit(Master master) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {

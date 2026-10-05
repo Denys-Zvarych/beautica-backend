@@ -153,7 +153,7 @@ class MasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 null, null, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
     }
 
     // ── GET /{masterId} — public ───────────────────────────────────────────────
@@ -170,6 +170,31 @@ class MasterControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /{masterId} — bookable=true is attached from MasterService#isBookable (not from the cached DTO)")
+    void should_exposeBookableTrue_when_masterIsBookable() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+        when(masterService.isBookable(masterId)).thenReturn(true);
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.bookable").value(true));
+    }
+
+    @Test
+    @DisplayName("GET /{masterId} — a non-bookable master still loads (200) with bookable=false")
+    void should_exposeBookableFalse_when_masterIsNotBookable() throws Exception {
+        var masterId = UUID.randomUUID();
+        when(masterService.getMasterDetail(masterId)).thenReturn(stubMasterDetail(masterId, UUID.randomUUID()));
+        when(masterService.isBookable(masterId)).thenReturn(false);
+
+        mockMvc.perform(get(MASTERS_URL + "/" + masterId).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.masterId").value(masterId.toString()))
+                .andExpect(jsonPath("$.data.bookable").value(false));
     }
 
     @Test
@@ -201,7 +226,7 @@ class MasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 cityUuid, oblastUuid, districtUuid,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
         log.debug("Act: GET {}/{} without credentials — INDEPENDENT_MASTER address must stay unmasked", MASTERS_URL, masterId);
@@ -234,7 +259,7 @@ class MasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_MASTER, null, List.of(),
                 cityUuid, oblastUuid, districtUuid,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
         log.debug("Act: GET {}/{} without credentials — SALON_MASTER PII and locality ID fields must be masked", MASTERS_URL, masterId);
@@ -264,7 +289,7 @@ class MasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_OWNER, null, List.of(),
                 cityUuid, oblastUuid, districtUuid,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
         when(masterService.getMasterDetail(masterId)).thenReturn(fullDetail);
 
         log.debug("Act: GET {}/{} without credentials — SALON_OWNER PII and locality ID fields must be masked", MASTERS_URL, masterId);
@@ -294,7 +319,7 @@ class MasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 null, null, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
         when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(fullDetail));
 
         mockMvc.perform(get(MASTERS_URL + "/me")
@@ -321,7 +346,7 @@ class MasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.INDEPENDENT_MASTER, null, List.of(),
                 cityUuid, oblastUuid, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
         when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(fullDetail));
 
         mockMvc.perform(get(MASTERS_URL + "/me")
@@ -356,7 +381,7 @@ class MasterControllerTest {
                 List.of(workingHoursRow),
                 cityUuid, oblastUuid, districtUuid,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
 
         // Controller now delegates to a single getMyMasterDetail(UUID) call — stub that method only.
         when(masterService.findMyMasterDetail(userId)).thenReturn(Optional.of(fullDetail));

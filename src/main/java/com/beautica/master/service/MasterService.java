@@ -26,6 +26,7 @@ import com.beautica.master.entity.MasterType;
 import com.beautica.master.entity.WorkingHours;
 import com.beautica.master.repository.MasterRepository;
 import com.beautica.master.repository.WorkingHoursRepository;
+import com.beautica.booking.service.BookingMasterService;
 import com.beautica.booking.service.SlotCalculationService;
 import com.beautica.salon.entity.Salon;
 import com.beautica.salon.repository.SalonRepository;
@@ -79,6 +80,7 @@ public class MasterService {
     private final com.beautica.booking.service.BookingSlugService bookingSlugService;
     private final AuthorizationService authorizationService;
     private final SlotCalculationService slotCalculationService;
+    private final BookingMasterService bookingMasterService;
     private final SalonCatalogCacheEvictor salonCatalogCacheEvictor;
     // Audit-fix cycle 2 (LOW — GET /users/me caching). Every method in this class that
     // creates, reactivates or deactivates a `masters` row also flips
@@ -377,6 +379,18 @@ public class MasterService {
 
         var hours = workingHoursRepository.findByMasterIdAndIsActiveTrue(masterId);
         return toDetailResponse(master, hours);
+    }
+
+    /**
+     * The {@code bookable} flag of {@code GET /masters/{masterId}} — the strict free-slot verdict,
+     * derived from the SAME cached per-master set the services tab filters by
+     * ({@link BookingMasterService#getBookableAssignmentIds}, {@code master-bookable-assignments}):
+     * a master is bookable iff at least one of their services is. Attached outside the
+     * {@code master-detail} cache via {@code MasterDetailResponse#withBookable}.
+     */
+    @Transactional(readOnly = true)
+    public boolean isBookable(UUID masterId) {
+        return !bookingMasterService.getBookableAssignmentIds(masterId).isEmpty();
     }
 
     /**
@@ -1312,12 +1326,29 @@ public class MasterService {
      */
     private static final Set<String> SORTABLE_CALENDAR_PROPERTIES = Set.of("startsAt");
 
-    // Fix 8: use JOIN FETCH query to eliminate per-master user lazy-loads
+    /**
+     * The public salon roster — the single implementation behind both
+     * {@code GET /masters/by-salon/{salonId}} and {@code GET /salons/{salonId}/masters}
+     * ({@code SalonService#getMastersBySalon} delegates here).
+     *
+     * <p>Lists only masters bookable for at least one salon service — the shared free-slot verdict
+     * from {@link BookingMasterService#getBookableMasterIds} (same as the salon catalogue), so an
+     * auto-enrolled owner-master or an invited master without services / working hours is not shown
+     * to clients. No bookable master → empty page with no roster query. Otherwise the gate is
+     * applied in SQL ({@code m.id IN :ids}) so paging and {@code totalElements} stay exact; the
+     * {@code JOIN FETCH m.user} keeps the mapping N+1-free. The management roster
+     * ({@code SalonService#getSalonStaff}) is deliberately NOT gated.
+     */
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersByPage(UUID salonId, Pageable pageable) {
         Pageable safePageable = SortWhitelist.apply(
                 pageable, SORTABLE_MASTER_PROPERTIES, DEFAULT_MASTER_SORT, MASTER_ID_TIEBREAKER);
-        return masterRepository.findBySalonIdAndIsActiveTrueWithUser(salonId, safePageable)
+        Set<UUID> bookableMasterIds = bookingMasterService.getBookableMasterIds(salonId);
+        if (bookableMasterIds.isEmpty()) {
+            return Page.empty(safePageable);
+        }
+        return masterRepository
+                .findBySalonIdAndIdInAndIsActiveTrueWithUser(salonId, bookableMasterIds, safePageable)
                 .map(MasterSummaryResponse::from);
     }
 

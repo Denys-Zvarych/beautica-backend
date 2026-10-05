@@ -90,6 +90,9 @@ class ServiceCatalogServicePricingTest {
     @Mock
     private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
 
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
+
     @InjectMocks
     private ServiceCatalogService serviceCatalogService;
 

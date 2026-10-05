@@ -108,6 +108,7 @@ class SalonServiceCacheTest {
     @MockBean com.beautica.service.repository.MasterServiceRepository masterServiceRepository;
     @MockBean LocalityWriteValidator localityWriteValidator;
     @MockBean MasterService masterService;
+    @MockBean com.beautica.booking.service.BookingMasterService bookingMasterService;
     // Phase 21.3: SalonService now constructor-depends on AuthorizationService (rotateAdmin).
     // This slice does not exercise that path, so a mock satisfies the wiring.
     @MockBean AuthorizationService authorizationService;

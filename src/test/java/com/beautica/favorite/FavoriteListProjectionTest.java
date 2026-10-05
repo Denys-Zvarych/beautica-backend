@@ -1,5 +1,6 @@
 package com.beautica.favorite;
 
+import com.beautica.support.BookableMasterSeeder;
 import com.beautica.AbstractIntegrationTest;
 import com.beautica.favorite.entity.FavoriteTargetType;
 import com.beautica.favorite.service.FavoriteService;
@@ -169,6 +170,8 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
         UUID clientId = createClient("fav-salons-" + tag + "@beautica.test");
         for (int i = 0; i < n; i++) {
             UUID salon = createSalon("fav-salon-owner-" + tag + "-" + i + "@beautica.test");
+            // Favourites list only salons with a bookable master (2026-10-05).
+            BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salon);
             favoriteService.addFavorite(clientId, FavoriteTargetType.SALON, salon);
         }
 
@@ -527,19 +530,21 @@ class FavoriteListProjectionTest extends AbstractIntegrationTest {
                 "INSERT INTO masters (id, user_id, master_type, avg_rating, review_count, is_active, created_at, updated_at) "
                         + "VALUES (?, ?, 'INDEPENDENT_MASTER', 0.00, 0, true, NOW(), NOW())",
                 masterId, userId);
+        // Favourites list only bookable masters (hours + active service, 2026-10-05).
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         return masterId;
     }
 
     private UUID createIndependentMasterService(UUID masterId) {
-        UUID userId = jdbcTemplate.queryForObject(
-                "SELECT user_id FROM masters WHERE id = ?", UUID.class, masterId);
+        // owner_id = masters.id — the production shape (ServiceCatalogService#addIndependentMasterService);
+        // the former users.id key was a stale fixture the bookability ownership rule rejects.
         UUID serviceDefId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO service_definitions "
                         + "(id, owner_type, owner_id, name, service_type_id, base_duration_minutes, base_price, "
                         + "buffer_minutes_after, is_active, created_at, updated_at) "
                         + "VALUES (?, 'INDEPENDENT_MASTER', ?, 'Test Service', ?, 60, 500.00, 0, true, NOW(), NOW())",
-                serviceDefId, userId, resolveServiceTypeId());
+                serviceDefId, masterId, resolveServiceTypeId());
         UUID masterServiceId = UUID.randomUUID();
         jdbcTemplate.update(
                 "INSERT INTO master_services (id, master_id, service_def_id, is_active, created_at, updated_at) "

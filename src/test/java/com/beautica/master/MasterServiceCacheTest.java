@@ -110,6 +110,8 @@ class MasterServiceCacheTest {
     // in SalonPublicProfileIntegrationTest).
     @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+    // MasterService ctor dependency: public-roster bookability gate (getMastersByPage).
+    @MockBean com.beautica.booking.service.BookingMasterService bookingMasterService;
     // c4d69ac: MasterService now constructor-depends on UserProfileCacheEvictor (evicts the
     // GET /users/me cache on every create/reactivate/deactivate-master path, since
     // hasMasterProfile is derived from the masters table). None of these tests assert on

@@ -122,6 +122,9 @@ class ServiceCatalogServiceBulkCreateTest {
     // this collaborator (evictSalonCatalogAfterCommit -> salonCatalogCacheEvictor.evict). Mocked
     // (rather than left null) so that call is a no-op default-Mockito-stub instead of an NPE.
     @Mock private SalonCatalogCacheEvictor salonCatalogCacheEvictor;
+
+    @Mock
+    private com.beautica.master.service.MasterSearchVisibilityGuard searchVisibilityGuard;
     // 2026-09-13 audit (S1): bulkCreateSalonMasterServices now re-proves the controller's
     // canManageSalon gate at the service layer. Without this mock @InjectMocks injects NULL for the
     // parameter and EVERY salon-branch test below NPEs before reaching its own assertion — which is

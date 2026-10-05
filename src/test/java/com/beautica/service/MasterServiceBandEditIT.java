@@ -1082,17 +1082,25 @@ class MasterServiceBandEditIT extends AbstractIntegrationTest {
      * gate's {@code hasManagementAccessMemoised} and the service twin's
      * {@code enforceCanManageSalonMemoised} — and re-measuring), so re-adding the duplicate owner
      * read turns this RED.
+     *
+     * <p><b>Re-measured 2026-10-05: 8 with the memo.</b> The search-membership guard
+     * ({@code MasterSearchVisibilityGuard}, perf audit finding 1) adds exactly two single-row
+     * verdict reads — before and after the write — so search caches are cleared only on an actual
+     * flip instead of on every assignment write. Still bounded AT the measured figure, so the
+     * un-memoised duplicate owner read (9) stays RED.
      */
-    private static final long UNASSIGN_STATEMENT_BOUND = 6L;
+    private static final long UNASSIGN_STATEMENT_BOUND = 8L;
 
     /**
      * MEASURED bound for case 32's bulk POST, on the same measured-not-measured+1 reasoning as
      * {@link #UNASSIGN_STATEMENT_BOUND}. The bulk endpoint writes a {@code service_definitions} row
      * and a {@code master_services} row per item and re-reads the created rows for the response, so
      * its absolute figure is larger and more sensitive to unrelated changes than the DELETE's:
-     * MEASURED 10 with the memo, 11 without.
+     * MEASURED 10 with the memo, 11 without — re-measured 2026-10-05 at 12 with the memo after the
+     * search-membership guard's two verdict reads (see {@link #UNASSIGN_STATEMENT_BOUND}); the
+     * un-memoised path (13) stays RED.
      */
-    private static final long BULK_CREATE_STATEMENT_BOUND = 10L;
+    private static final long BULK_CREATE_STATEMENT_BOUND = 12L;
 
     @Test
     @DisplayName("Case 32 (A4): a SALON_OWNER bulk create (POST .../services/bulk) no longer "

@@ -275,6 +275,8 @@ class ServicePhotoIT extends AbstractServicePhotoIT {
         String token = fixtures.createIndependentMasterAndGetToken(email);
         UUID serviceDefId = fixtures.createIndependentMasterService(token, "Cached service");
         UUID masterId = fixtures.resolveMasterIdForUserEmail(email);
+        // The client view of /masters/{id}/services lists only BOOKABLE services (2026-10-05).
+        fixtures.seedUsableSchedule(masterId);
         String listUrl = "/api/v1/masters/" + masterId + "/services";
         ResponseEntity<String> before = restTemplate.getForEntity(listUrl, String.class);
         assertThat(before.getStatusCode()).isEqualTo(HttpStatus.OK);

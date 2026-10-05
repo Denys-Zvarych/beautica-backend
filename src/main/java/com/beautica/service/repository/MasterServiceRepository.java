@@ -497,6 +497,41 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
     List<MasterServiceAssignment> findBookableAssignmentsBySalon(@Param("salonId") UUID salonId);
 
     /**
+     * Master-scoped sibling of {@link #findBookableAssignmentsBySalon}: the strict-verdict
+     * candidates of each given master, for the detail {@code bookable} flags and the public
+     * {@code GET /masters/{id}/services} tab ({@code BookingMasterService#getBookableAssignmentIds}), which feed them to the same
+     * {@code SlotCalculationService#filterBookableAssignmentsBatch} the salon catalogue uses.
+     *
+     * <p>Ownership follows the master's CURRENT context, the same rule as
+     * {@code MasterBookabilitySql}: a salon-attached master's definition must be SALON-owned by that
+     * salon (closing the rotated-master / cross-salon leaks exactly as the salon finder does), a
+     * salon-less master's must be INDEPENDENT_MASTER-owned by that master. {@code s.isActive} is
+     * required for a salon-attached master because {@code SalonService.deactivateSalon} does not
+     * cascade to {@code masters.is_active} — the {@code MasterBookability#isBookable} rule.
+     *
+     * <p>{@code LEFT JOIN FETCH m.salon} keeps salon-less independent masters. Bounded by the caller's
+     * id set (one master for a detail read); callers MUST short-circuit an empty {@code masterIds}.
+     */
+    @Query("""
+            SELECT msa FROM MasterServiceAssignment msa
+            JOIN FETCH msa.serviceDefinition sd
+            JOIN FETCH msa.master m
+            LEFT JOIN FETCH m.salon s
+            WHERE m.id IN :masterIds
+              AND m.isActive = true
+              AND msa.isActive = true
+              AND sd.isActive = true
+              AND ((s IS NOT NULL AND s.isActive = true
+                    AND sd.ownerType = com.beautica.service.entity.OwnerType.SALON
+                    AND sd.ownerId = s.id)
+                OR (s IS NULL
+                    AND sd.ownerType = com.beautica.service.entity.OwnerType.INDEPENDENT_MASTER
+                    AND sd.ownerId = m.id))
+            """)
+    List<MasterServiceAssignment> findBookableAssignmentsByMasterIds(
+            @Param("masterIds") Collection<UUID> masterIds);
+
+    /**
      * Cross-salon sibling of {@link #findBookableAssignmentsBySalon}, keyed by a SET of SALON-owned
      * definition ids instead of one salon id — backs
      * {@code ServiceCatalogService#hullsForSalonServices}, which prices the wish list's SALON arm

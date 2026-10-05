@@ -136,7 +136,7 @@ class MasterMeSecurityMatcherTest {
         @SuppressWarnings("unchecked")
         BookingRateLimitFilter bookingRateLimitFilter(ObjectMapper objectMapper) {
             LoadingCache<String, Bucket> dummy = Mockito.mock(LoadingCache.class);
-            return new BookingRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, objectMapper) {
+            return new BookingRateLimitFilter(dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, dummy, objectMapper) {
                 @Override
                 protected void doFilterInternal(HttpServletRequest req,
                                                 HttpServletResponse res,
@@ -190,7 +190,7 @@ class MasterMeSecurityMatcherTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_OWNER, null, List.of(),
                 null, null, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null);
+                null, null, null, null, null);
     }
 
     @Test

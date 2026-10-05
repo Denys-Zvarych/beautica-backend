@@ -18,6 +18,7 @@ import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -478,121 +479,72 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
                 .isZero();
     }
 
-    // ── Cases 27-28 (2026-09-13 cycle-3 audit, A5/A6) — two MORE divergences that are deliberately
-    //    NOT closed, pinned the same way case 26 pins the occupancy one ─────────────────────────
+    // ── Cases 27-29 — the bookability decision (2026-10-05) CLOSED the two divergences cycle-3
+    //    (A5/A6) pinned as deliberate. A salon is a search result only with >=1 master who offers an
+    //    active service AND has a schedule with working hours (MasterBookabilitySql); every gate in
+    //    the query — membership, category, name preview, price band — now shares that one rule. ──
 
-    /**
-     * <h2>A5 — three definitions of "bookable" coexist in one query, on purpose</h2>
-     *
-     * <p>Since the {@code pr} price lateral gained its two-armed schedule gate, this query carries
-     * three different membership predicates: {@code pr} means "active service + active assignment +
-     * active master + a schedule that could resolve a working day", while
-     * {@code SalonSearchSql#STATIC_CATEGORY_GATE} and
-     * {@code SalonSearchSql#STATIC_NAME_PREVIEW_LATERAL} still mean only "active service + active
-     * assignment + active master".</p>
-     *
-     * <p>So a salon whose ONLY master has no resolvable schedule still passes the category gate and
-     * still renders its service names on the card — with a NULL band, which sorts NULLS-LAST in
-     * both price directions and is excluded by {@code STATIC_PRICE_PREDICATE} from every
-     * price-bounded search. The salon appears in an unbounded category browse and vanishes the
-     * instant a price filter is applied.</p>
-     *
-     * <p><b>Do not "fix" this by copying the two-armed EXISTS into the other two gates.</b> That
-     * triples the schedule probe on the hottest public query — three correlated subplans per
-     * candidate salon inside a paginated Top-N — to buy a card that shows no names instead of names
-     * with no price. The honest alternative is a denormalised "has a bookable master" column
-     * maintained on every schedule write, which is a write-path + migration change, not an
-     * adjustment to this SQL. If you are here because you narrowed one of those gates, this test is
-     * the contract you broke.</p>
-     */
     @Test
-    @DisplayName("Case 27 (A5): a salon whose ONLY master has no resolvable schedule still passes "
-            + "the category gate and still previews its service names, with a NULL price band — "
-            + "pinning the three-gate asymmetry as deliberate")
-    void should_stillPassTheCategoryGateAndPreviewNames_whenTheOnlyMasterHasNoResolvableSchedule_pinningTheThreeGateAsymmetryAsDeliberate() {
+    @DisplayName("Case 27 (A5 closed): a salon whose ONLY master has no schedule is not a search result "
+            + "at all — not in the category browse, not in the plain browse, not in a priced search")
+    void should_notListTheSalon_when_theOnlyMasterHasNoSchedule() {
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
-
-        // No weekly_schedules row and no schedule_exceptions row: the pr lateral's BOTH arms fail.
+        // No weekly_schedules row and no schedule_exceptions row.
         seedService(masterId, salonId, "FIXED", new BigDecimal("640.00"), null, null, null, null);
 
-        // 1. The CATEGORY gate still admits the salon — it never probes the schedule.
-        JsonNode categoryRow = onlySalonRow(restTemplate.exchange(
+        for (String query : List.of(
+                "&category=MANICURE", "", "&category=MANICURE&minPrice=1&maxPrice=100000")) {
+            JsonNode data = readData(restTemplate.exchange(
+                    SALONS_URL + "?location.cityId=" + testCityId() + query + "&page=0&size=20",
+                    HttpMethod.GET, anonymous(), String.class));
+
+            assertThat(data.path("data").findValuesAsText("salonId"))
+                    .as("query <%s>: the former three-gate asymmetry (listed, previewed, NULL band) "
+                            + "is gone — the salon has no bookable master", query)
+                    .doesNotContain(salonId.toString());
+        }
+    }
+
+    @Test
+    @DisplayName("Case 28 (A6 closed): a master whose ONLY weekly template carries ZERO working hours "
+            + "neither lists nor prices the salon — search now agrees with the empty catalogue")
+    void should_notListTheSalon_when_theOnlyMasterTemplateHasNoWorkingHours() {
+        UUID salonId = seedSalon();
+        UUID masterId = seedSalonMaster(salonId);
+        // The `{"days":[]}` shape: a template row overlapping the window, no intervals, no times.
+        seedEmptyTemplate(masterId);
+        seedService(masterId, salonId, "FIXED", new BigDecimal("512.00"), null, null, null, null);
+
+        JsonNode data = readData(restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + testCityId() + "&category=MANICURE&page=0&size=20",
-                HttpMethod.GET, anonymous(), String.class), salonId);
-
-        // 2. ...and the NAME PREVIEW lateral still renders the service, for the same reason.
-        assertThat(categoryRow.path("serviceNames"))
-                .as("DELIBERATE: STATIC_NAME_PREVIEW_LATERAL has no schedule probe, so the card "
-                        + "still advertises the service of an unbookable master")
-                .isNotEmpty();
-
-        // 3. ...but the PRICE lateral does probe it, so the band is NULL, not a number.
-        assertThat(categoryRow.path("priceMin").isNull() || categoryRow.path("priceMin").isMissingNode())
-                .as("DELIBERATE: pr DOES gate on the schedule, so this salon is priced at NULL "
-                        + "while being listed — the asymmetry this case exists to pin")
-                .isTrue();
-
-        // 4. The observable consequence: the same salon disappears the moment a price bound applies.
-        JsonNode pricedData = readData(restTemplate.exchange(
-                SALONS_URL + "?location.cityId=" + testCityId() + "&category=MANICURE"
-                        + "&minPrice=1&maxPrice=100000&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class));
-        assertThat(pricedData.path("data").findValuesAsText("salonId"))
-                .as("NULL fails both pr.pmax >= :minPrice and pr.pmin <= :maxPrice, so a "
-                        + "price-bounded search drops the very salon the category browse listed")
+        ResponseEntity<String> catalogueResp = restTemplate.getForEntity(
+                "/api/v1/salons/" + salonId + "/services", String.class);
+
+        assertThat(catalogueServiceCount(catalogueResp)).isZero();
+        assertThat(data.path("data").findValuesAsText("salonId"))
+                .as("an hour-less template is not a schedule (MasterBookabilitySql template arm)")
                 .doesNotContain(salonId.toString());
     }
 
-    /**
-     * <h2>A6 — the template arm mirrors the RANGE, not the fold's working-day outcome</h2>
-     *
-     * <p>{@code WeeklyScheduleRequest#days} carries only {@code @Size(max = 7)} with no
-     * {@code min}, so {@code {"days":[]}} is reachable over the public API and persists a
-     * {@code weekly_schedules} row with zero {@code working_intervals} and zero
-     * {@code working_interval_times}. Such a master satisfies the template arm's {@code EXISTS}
-     * (the ROW is there and its validity range overlaps the window) but the catalogue's fold
-     * resolves no working day and drops them — so they price a salon the catalogue will not stock.
-     *
-     * <p><b>Deliberately not tightened (cycle-3 decision).</b> Tightening correctly needs
-     * {@code EXISTS working_intervals OR EXISTS working_interval_times} correlated to
-     * {@code ws.id} — BOTH, because an {@code EXPLICIT_TIMES} weekday (V84) is genuinely bookable
-     * with zero {@code working_intervals} rows. Probing only the interval table would drop a
-     * bookable master to a NULL band, i.e. out of every price-bounded search: strictly worse than
-     * the gap, and exactly the over-narrowing cycle 2 corrected as B1. The correct form costs two
-     * more correlated probes per candidate row inside a paginated Top-N on the hottest public
-     * query, to remove a band-too-wide case that only arises from a provider saving an EMPTY
-     * schedule. So the residue is accepted and pinned here instead.</p>
-     */
     @Test
-    @DisplayName("Case 28 (A6): a master whose ONLY weekly template carries ZERO working intervals "
-            + "is dropped by the catalogue but STILL prices the salon in search — pinning the "
-            + "empty-template gap in the template arm as deliberate")
-    void should_keepTheSearchBand_when_theOnlyMasterTemplateHasNoWorkingIntervals_pinningTheEmptyTemplateGapAsDeliberate() {
+    @DisplayName("Case 29 (non-vacuity for case 28): a template whose only weekday is EXPLICIT_TIMES "
+            + "(working_interval_times, ZERO working_intervals) IS a schedule — the salon is listed "
+            + "and priced")
+    void should_listAndPriceTheSalon_when_theOnlyMasterTemplateIsExplicitTimesOnly() {
         UUID salonId = seedSalon();
         UUID masterId = seedSalonMaster(salonId);
-
-        // A weekly_schedules ROW whose validity range overlaps the window, but with no
-        // working_intervals and no working_interval_times — the `{"days":[]}` shape.
-        seedEmptyTemplate(masterId);
-        seedService(masterId, salonId, "FIXED", new BigDecimal("512.00"), null, null, null, null);
+        seedExplicitTimesOnlyTemplate(masterId);
+        seedService(masterId, salonId, "FIXED", new BigDecimal("333.00"), null, null, null, null);
 
         JsonNode searchRow = onlySalonRow(restTemplate.exchange(
                 SALONS_URL + "?location.cityId=" + testCityId() + "&category=MANICURE&page=0&size=20",
                 HttpMethod.GET, anonymous(), String.class), salonId);
-        ResponseEntity<String> catalogueResp = restTemplate.getForEntity(
-                "/api/v1/salons/" + salonId + "/services", String.class);
 
-        assertThat(catalogueServiceCount(catalogueResp))
-                .as("the fold resolves no working day from an interval-less template, so the "
-                        + "catalogue drops the master entirely")
-                .isZero();
         assertThat(searchRow.path("priceMin").decimalValue())
-                .as("DELIBERATE: the template arm mirrors the validity RANGE only, so the same "
-                        + "master still sets the search band. If you are here because you tightened "
-                        + "the arm, read this test's javadoc — probing working_intervals ALONE "
-                        + "would drop EXPLICIT_TIMES masters and is strictly worse than this gap.")
-                .isEqualByComparingTo(new BigDecimal("512.00"));
+                .as("probing working_intervals alone would drop this genuinely bookable master")
+                .isEqualByComparingTo(new BigDecimal("333.00"));
     }
 
     // ── seeding + HTTP plumbing ──────────────────────────────────────────────────────────────
@@ -713,13 +665,32 @@ class SalonSearchPriceBandIT extends AbstractIntegrationTest {
      * A weekly template whose validity range DOES overlap the booking window but which carries no
      * {@code working_intervals} and no {@code working_interval_times} at all — the
      * {@code {"days":[]}} shape {@code WeeklyScheduleRequest} permits. Structurally present for the
-     * search lateral's template arm, resolvable to nothing by the catalogue's fold (case 28 / A6).
+     * search gates and the catalogue's fold alike — not a schedule (case 28).
      */
     private void seedEmptyTemplate(UUID masterId) {
         jdbcTemplate.update(
                 "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
                         + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
                 UUID.randomUUID(), masterId, LocalDate.now(ZoneId.of("Europe/Kyiv")));
+    }
+
+    /**
+     * An open-ended weekly template with ONE discrete start time on every weekday
+     * ({@code working_interval_times}) and NO {@code working_intervals} — the V84
+     * {@code EXPLICIT_TIMES} shape (case 29).
+     */
+    private void seedExplicitTimesOnlyTemplate(UUID masterId) {
+        UUID scheduleId = UUID.randomUUID();
+        jdbcTemplate.update(
+                "INSERT INTO weekly_schedules (id, master_id, valid_from, valid_to, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, NULL, NOW(), NOW())",
+                scheduleId, masterId, LocalDate.now(ZoneId.of("Europe/Kyiv")));
+        for (int isoDow = 1; isoDow <= 7; isoDow++) {
+            jdbcTemplate.update(
+                    "INSERT INTO working_interval_times (id, schedule_id, day_of_week, slot_time) "
+                            + "VALUES (?, ?, ?, ?)",
+                    UUID.randomUUID(), scheduleId, isoDow, LocalTime.of(12, 0));
+        }
     }
 
     /**
