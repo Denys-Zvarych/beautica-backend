@@ -16,10 +16,19 @@ import java.util.UUID;
  * boundary of exactly ONE salon — the one in the path. The siblings are salons they hold no
  * assignment to and can otherwise only learn the identity of by attempting a rotation. Returning
  * the full {@code SalonResponse} handed them the whole portfolio's {@code description},
- * {@code phone}, {@code instagramUrl}, {@code avatarUrl}, legacy free-text city/region/address,
- * {@code isPrimary}, {@code createdAt} <em>and</em> the owner's UUID — none of which a destination
- * picker needs. Narrowing to id + name + short address keeps the endpoint's disclosure equal to
- * what the mutation it feeds already reveals.
+ * {@code phone}, {@code instagramUrl}, legacy free-text city/region/address, {@code isPrimary},
+ * {@code createdAt} <em>and</em> the owner's UUID — none of which a destination picker needs.
+ * Narrowing to id + name + short address + logo keeps the endpoint's disclosure equal to what the
+ * mutation it feeds already reveals.
+ *
+ * <p><b>{@code avatarUrl} (Phase 369 follow-up).</b> The salon logo URL ({@code salons.avatar_url}),
+ * added so the picker can render the logo like every other salon surface. It widens nothing: every
+ * row here is an ACTIVE salon, and an active salon's {@code avatarUrl} is already served to
+ * unauthenticated callers by {@code GET /salons/{id}} ({@code PublicSalonResponse}). The R2 object key
+ * ({@code salons.avatar_r2_key}) is deliberately NOT projected — it is a storage-internal pointer
+ * that no client surface carries. The key's value is not secret — the public URL is built as
+ * {@code <public-url-prefix>/<key>}, so the key is that URL's path; what is withheld is the separate
+ * key column, not the key itself. Nullable: a salon with no logo returns {@code null}.
  *
  * <p><b>No {@code ownerId}.</b> Every sibling shares the source salon's owner by construction, so
  * the field carried no information the caller could act on — only the owner's user UUID.
@@ -29,7 +38,8 @@ import java.util.UUID;
  * a salon persisted before Phase 10.6 may have neither — so the client must fall back to
  * {@code name} alone.
  */
-@Schema(description = "A salon offered as a rotate-admin destination: id, name and short address.")
+@Schema(description = "A salon offered as a rotate-admin destination: id, name, short address and "
+        + "logo URL.")
 public record SiblingSalonOption(
         @Schema(
                 format = "uuid",
@@ -47,12 +57,19 @@ public record SiblingSalonOption(
 
         @Schema(description = "Building number of the structured address (Phase 10.6). May be null "
                 + "for a salon persisted before that phase.")
-        String buildingNo
+        String buildingNo,
+
+        @Schema(
+                types = {"string", "null"},
+                nullable = true,
+                description = "Salon logo image URL (same value as SalonResponse.avatarUrl); null "
+                        + "when the salon has no logo.")
+        String avatarUrl
 ) {
     /*
      * No static from(Salon) mapper, deliberately (Perf LOW-B). This record is built by
      * SalonRepository#findActiveSiblingsBySalonId's JPQL constructor projection — Hibernate calls
-     * the canonical constructor with four scalars and never materialises a Salon entity — so a
+     * the canonical constructor with five scalars and never materialises a Salon entity — so a
      * mapper taking an entity would be dead code AND the one seam through which an association
      * dereference could creep back onto this path. If a second caller ever needs to build this
      * record from a loaded Salon, note that it would reintroduce the 22-column read this projection

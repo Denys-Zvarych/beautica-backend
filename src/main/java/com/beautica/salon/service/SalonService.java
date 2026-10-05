@@ -1372,7 +1372,10 @@ public class SalonService {
      * writers of the table: no {@code delete} path exists, and no other service holds a
      * {@code Salon} setter call. Every field {@code SiblingSalonOption} carries
      * ({@code name}/{@code street}/{@code buildingNo}) plus row membership ({@code isActive}) is
-     * therefore fully covered.
+     * therefore fully covered. {@code avatarUrl} is the one field written elsewhere — by this
+     * class's logo replace/clear path ({@code Salon#replaceImage}), which evicts through
+     * {@code evictSalonImageCachesAfterCommit}; a cache-backed rewrite must confirm that eviction
+     * covers {@code ownerSalons} before relying on it.
      *
      * <p><b>What blocks it now is that it is not actually cheaper for THIS endpoint's caller.</b>
      * The reuse shape is "resolve owner ({@link SalonRepository#findOwnerIdById}), then read the

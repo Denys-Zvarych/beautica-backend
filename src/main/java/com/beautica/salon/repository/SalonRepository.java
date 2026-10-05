@@ -211,8 +211,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      *
      * <p><b>Constructor projection, not an entity (Perf LOW-B).</b> Returning {@code Salon} made
      * Hibernate select all 22 {@code salons} columns and hydrate one managed entity per row just to
-     * build a 4-field {@code SiblingSalonOption}. {@code SELECT new …} emits exactly the four
-     * columns the DTO carries and hydrates nothing into the persistence context, so this finder is
+     * build a 5-field {@code SiblingSalonOption}. {@code SELECT new …} emits exactly the five
+     * columns the DTO carries ({@code avatar_url} included, {@code avatar_r2_key} never) and hydrates nothing into the persistence context, so this finder is
      * structurally incapable of dragging an association (or a widened row) back in — see
      * {@code SalonSiblingProjectionShapeIT}.
      *
@@ -225,7 +225,8 @@ public interface SalonRepository extends JpaRepository<Salon, UUID> {
      * path; it only narrows the heap fetch.
      */
     @Query("""
-            SELECT new com.beautica.salon.dto.SiblingSalonOption(s.id, s.name, s.street, s.buildingNo)
+            SELECT new com.beautica.salon.dto.SiblingSalonOption(
+                    s.id, s.name, s.street, s.buildingNo, s.avatarUrl)
             FROM Salon s
             WHERE s.isActive = true
               AND s.id <> :salonId

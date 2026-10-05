@@ -205,6 +205,6 @@ class SalonServiceSiblingSalonsTest {
 
     /** One projected picker row, as the repository's constructor projection would build it. */
     private SiblingSalonOption option(String name, String street, String buildingNo) {
-        return new SiblingSalonOption(UUID.randomUUID(), name, street, buildingNo);
+        return new SiblingSalonOption(UUID.randomUUID(), name, street, buildingNo, null);
     }
 }
