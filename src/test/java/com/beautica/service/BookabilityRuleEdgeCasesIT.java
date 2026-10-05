@@ -32,15 +32,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Edge cases of the locked bookability rule (product decision 2026-10-05), written from the RULE,
  * not the SQL: a master is shown to clients only with ≥1 active service AND a schedule; a salon only
- * with ≥1 such ACTIVE master. Every case asserts the two halves of the contract agree — the
- * structural search gate ({@code GET /search/masters|salons}) and the strict profile flag
- * ({@code GET /masters/{id}.bookable}, {@code GET /salons/{id}.bookable}) — so a master can never be
- * listed in search while its own profile says "not bookable", or vice versa.
+ * with ≥1 such ACTIVE master. Every salon case asserts the two client-visibility surfaces agree —
+ * salon search ({@code GET /search/salons}) and the public salon roster
+ * ({@code GET /salons/{id}/masters}), both gated by the same cheap rule — and every master case
+ * asserts search membership plus that the profile still loads (no {@code bookable} flag: removed).
  *
  * <p>Schedule shapes are seeded by JDBC where the API cannot produce them (an expired template, a
  * past override); the deactivation cases go through the real API so the cache-eviction path runs.
  */
-@DisplayName("Bookability rule edge cases — search membership and profile flag agree (full HTTP + real Postgres)")
+@DisplayName("Bookability rule edge cases — search membership and salon roster agree (full HTTP + real Postgres)")
 class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
 
     private static final ZoneId KYIV = ZoneId.of("Europe/Kyiv");
@@ -68,7 +68,7 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
 
     @Test
     @DisplayName("an independent master whose ONLY schedule is a future CUSTOM_HOURS override (set via "
-            + "the API) is bookable: listed in search (cache primed first), profile bookable=true")
+            + "the API) is bookable: listed in search (cache primed first), profile still loads")
     void should_listMaster_when_onlyScheduleIsCustomHoursOverride() throws Exception {
         String email = "custom-only-" + System.nanoTime() + "@beautica.test";
         String token = fixtures.createIndependentMasterAndGetToken(email);
@@ -87,12 +87,12 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         assertThat(put.getStatusCode()).as(put.getBody()).isEqualTo(HttpStatus.OK);
 
         assertThat(masterSearch("Zoriana")).containsExactly(masterId.toString());
-        assertThat(masterBookable(masterId)).isTrue();
+        assertProfileLoads(masterId);
     }
 
     @Test
     @DisplayName("a salon whose only master has just a future CUSTOM_HOURS override is listed, and its "
-            + "profile is bookable=true")
+            + "master is on its public roster")
     void should_listSalon_when_onlyMasterHasCustomHoursOverride() throws Exception {
         UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Orion Custom Hours");
         UUID masterId = BookableMasterSeeder.insertSalonMaster(jdbcTemplate, salonId);
@@ -100,34 +100,34 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         BookableMasterSeeder.seedCustomHoursOverride(jdbcTemplate, masterId, today().plusDays(5));
 
         assertThat(salonSearch("Orion")).containsExactly(salonId.toString());
-        assertThat(salonBookable(salonId)).isTrue();
+        assertThat(http.rosterIds(salonId)).containsExactly(masterId.toString());
     }
 
     @Test
-    @DisplayName("a master whose only override is a DAY_OFF has no schedule: hidden, bookable=false")
+    @DisplayName("a master whose only override is a DAY_OFF has no schedule: hidden, profile still loads")
     void should_hideMaster_when_onlyOverrideIsDayOff() throws Exception {
         UUID masterId = independentWithService("Dayoffa");
         BookableMasterSeeder.seedDayOffOverride(jdbcTemplate, masterId, today().plusDays(2));
 
         assertThat(masterSearch("Dayoffa")).isEmpty();
-        assertThat(masterBookable(masterId)).isFalse();
+        assertProfileLoads(masterId);
     }
 
     @Test
     @DisplayName("a master whose only CUSTOM_HOURS override is in the PAST has no schedule: hidden, "
-            + "bookable=false")
+            + "profile still loads")
     void should_hideMaster_when_onlyCustomHoursOverrideIsPast() throws Exception {
         UUID masterId = independentWithService("Pastella");
         BookableMasterSeeder.seedCustomHoursOverride(jdbcTemplate, masterId, today().minusDays(1));
 
         assertThat(masterSearch("Pastella")).isEmpty();
-        assertThat(masterBookable(masterId)).isFalse();
+        assertProfileLoads(masterId);
     }
 
     // ── schedule shapes: weekly templates ───────────────────────────────────────────────────
 
     @Test
-    @DisplayName("an EXPIRED weekly template (valid_to = yesterday) does not count: hidden, bookable=false, "
+    @DisplayName("an EXPIRED weekly template (valid_to = yesterday) does not count: hidden, profile still loads, "
             + "favourite hidden but kept")
     void should_hideMaster_when_weeklyTemplateExpired() throws Exception {
         UUID masterId = independentWithService("Expira");
@@ -137,14 +137,14 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         http.addFavorite(clientToken, FavoriteTargetType.MASTER, masterId);
 
         assertThat(masterSearch("Expira")).isEmpty();
-        assertThat(masterBookable(masterId)).isFalse();
+        assertProfileLoads(masterId);
         assertThat(ids(http.get("/api/v1/favorites/masters", clientToken), "masterId")).isEmpty();
         assertThat(jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM favorites WHERE target_id = ?", Long.class, masterId)).isEqualTo(1L);
     }
 
     @Test
-    @DisplayName("a weekly template ending TODAY still counts (boundary): listed, bookable=true")
+    @DisplayName("a weekly template ending TODAY still counts (boundary): listed")
     void should_listMaster_when_weeklyTemplateEndsToday() throws Exception {
         UUID masterId = independentWithService("Ultima");
         BookableMasterSeeder.seedWeeklyTemplate(jdbcTemplate, masterId, today().minusDays(30), today(), true);
@@ -154,8 +154,8 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
     }
 
     @Test
-    @DisplayName("a template starting exactly at the 180-day horizon counts (listed, bookable=true); one "
-            + "starting a day later does not (hidden, bookable=false)")
+    @DisplayName("a template starting exactly at the 180-day horizon counts (listed); one "
+            + "starting a day later does not (hidden)")
     void should_respectHorizon_when_templateStartsAtOrPastHorizon() throws Exception {
         UUID atHorizon = independentWithService("Horizonta");
         BookableMasterSeeder.seedWeeklyTemplate(jdbcTemplate, atHorizon,
@@ -165,38 +165,37 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
                 today().plusDays(HORIZON_DAYS + 1), null, true);
 
         assertThat(masterSearch("Horizonta")).containsExactly(atHorizon.toString());
-        assertThat(masterBookable(atHorizon)).isTrue();
+        assertProfileLoads(atHorizon);
         assertThat(masterSearch("Beyondia")).isEmpty();
-        assertThat(masterBookable(pastHorizon)).isFalse();
+        assertProfileLoads(pastHorizon);
     }
 
     @Test
     @DisplayName("an EMPTY weekly template (no working hours on any day) is not a schedule: hidden, "
-            + "bookable=false")
+            + "profile still loads")
     void should_hideMaster_when_weeklyTemplateHasNoHours() throws Exception {
         UUID masterId = independentWithService("Vacua");
         BookableMasterSeeder.seedWeeklyTemplate(jdbcTemplate, masterId, today(), null, false);
 
         assertThat(masterSearch("Vacua")).isEmpty();
-        assertThat(masterBookable(masterId)).isFalse();
+        assertProfileLoads(masterId);
     }
 
     @Test
-    @DisplayName("an EXPLICIT_TIMES weekly template (discrete start times, no intervals) counts: listed, "
-            + "bookable=true")
+    @DisplayName("an EXPLICIT_TIMES weekly template (discrete start times, no intervals) counts: listed")
     void should_listMaster_when_templateUsesExplicitTimes() throws Exception {
         UUID masterId = independentWithService("Discreta");
         BookableMasterSeeder.seedExplicitTimesTemplate(jdbcTemplate, masterId);
 
         assertThat(masterSearch("Discreta")).containsExactly(masterId.toString());
-        assertThat(masterBookable(masterId)).isTrue();
+        assertProfileLoads(masterId);
     }
 
     // ── services ────────────────────────────────────────────────────────────────────────────
 
     @Test
     @DisplayName("an independent master deactivating their ONLY service definition via DELETE "
-            + "/services/{id} drops out of the (already cached) search, profile bookable=false, "
+            + "/services/{id} drops out of the (already cached) search (profile still loads), "
             + "services tab empty, favourite hidden")
     void should_hideMaster_when_onlyServiceDefinitionDeactivated() throws Exception {
         String email = "deact-" + System.nanoTime() + "@beautica.test";
@@ -208,21 +207,22 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         String clientToken = fixtures.createClientAndGetToken("deact-c-" + System.nanoTime() + "@beautica.test");
         http.addFavorite(clientToken, FavoriteTargetType.MASTER, masterId);
         assertThat(masterSearch("Deactiva")).as("precondition: listed, page cached").containsExactly(masterId.toString());
-        assertThat(masterBookable(masterId)).as("precondition: bookable, verdict cached").isTrue();
+        assertThat(http.get("/api/v1/masters/" + masterId + "/services", null))
+                .as("precondition: services tab populated").isNotEmpty();
 
         ResponseEntity<String> deleted = restTemplate.exchange("/api/v1/services/" + defId, HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(token)), String.class);
         assertThat(deleted.getStatusCode()).as(deleted.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
 
         assertThat(masterSearch("Deactiva")).isEmpty();
-        assertThat(masterBookable(masterId)).isFalse();
+        assertProfileLoads(masterId);
         assertThat(http.get("/api/v1/masters/" + masterId + "/services", null)).isEmpty();
         assertThat(ids(http.get("/api/v1/favorites/masters", clientToken), "masterId")).isEmpty();
     }
 
     @Test
     @DisplayName("a salon owner deactivating the only bookable master's SALON definition drops the salon "
-            + "from the (already cached) salon search and flips GET /salons/{id}.bookable to false")
+            + "from the (already cached) salon search and from its public roster")
     void should_hideSalon_when_onlyBookableServiceDefinitionDeactivated() throws Exception {
         String ownerToken = fixtures.createSalonOwnerAndGetToken("owner-deact-" + System.nanoTime() + "@beautica.test");
         UUID salonId = fixtures.createSalon(ownerToken, "Deactivation Salon");
@@ -230,14 +230,14 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         UUID defId = BookableMasterSeeder.assignNewSalonService(jdbcTemplate, salonId, masterId);
         BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
         assertThat(salonSearch("Deactivation")).as("precondition: listed, page cached").containsExactly(salonId.toString());
-        assertThat(salonBookable(salonId)).as("precondition: bookable, verdict cached").isTrue();
+        assertThat(http.rosterIds(salonId)).as("precondition: on the roster").containsExactly(masterId.toString());
 
         ResponseEntity<String> deleted = restTemplate.exchange("/api/v1/services/" + defId, HttpMethod.DELETE,
                 new HttpEntity<>(fixtures.bearerHeaders(ownerToken)), String.class);
         assertThat(deleted.getStatusCode()).as(deleted.getBody()).isEqualTo(HttpStatus.NO_CONTENT);
 
         assertThat(salonSearch("Deactivation")).isEmpty();
-        assertThat(salonBookable(salonId)).isFalse();
+        assertThat(http.rosterIds(salonId)).isEmpty();
     }
 
     @Test
@@ -250,20 +250,56 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         BookableMasterSeeder.seedUsableSchedule(jdbcTemplate, masterId);
 
         assertThat(salonSearch("Staleowner")).isEmpty();
-        assertThat(salonBookable(salonId)).isFalse();
+        assertThat(http.rosterIds(salonId)).isEmpty();
     }
 
     // ── salon membership ────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("a salon whose only fully-configured master is DEACTIVATED is hidden and bookable=false")
+    @DisplayName("a salon whose only fully-configured master is DEACTIVATED is hidden and off its roster")
     void should_hideSalon_when_onlyConfiguredMasterInactive() throws Exception {
         UUID salonId = BookableMasterSeeder.insertSalon(jdbcTemplate, "Dormant Studio");
         UUID masterId = BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, salonId);
         jdbcTemplate.update("UPDATE masters SET is_active = false WHERE id = ?", masterId);
 
         assertThat(salonSearch("Dormant")).isEmpty();
-        assertThat(salonBookable(salonId)).isFalse();
+        assertThat(http.rosterIds(salonId)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("salon search lists a salon IFF its public client roster is non-empty — across a matrix "
+            + "of configurations (bookable, mixed, service-only, hours-only, no masters)")
+    void should_listSalonInSearch_iff_clientRosterIsNonEmpty() throws Exception {
+        String token = "Paritas";
+        UUID bookable = BookableMasterSeeder.insertSalon(jdbcTemplate, token + " Bookable");
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, bookable);
+        UUID mixed = BookableMasterSeeder.insertSalon(jdbcTemplate, token + " Mixed");
+        BookableMasterSeeder.addBookableSalonMaster(jdbcTemplate, mixed);
+        UUID mixedServiceOnly = BookableMasterSeeder.insertSalonMaster(jdbcTemplate, mixed);
+        BookableMasterSeeder.assignNewSalonService(jdbcTemplate, mixed, mixedServiceOnly);
+        UUID serviceOnly = BookableMasterSeeder.insertSalon(jdbcTemplate, token + " ServiceOnly");
+        BookableMasterSeeder.assignNewSalonService(jdbcTemplate, serviceOnly,
+                BookableMasterSeeder.insertSalonMaster(jdbcTemplate, serviceOnly));
+        UUID hoursOnly = BookableMasterSeeder.insertSalon(jdbcTemplate, token + " HoursOnly");
+        BookableMasterSeeder.seedUsableSchedule(jdbcTemplate,
+                BookableMasterSeeder.insertSalonMaster(jdbcTemplate, hoursOnly));
+        UUID empty = BookableMasterSeeder.insertSalon(jdbcTemplate, token + " Empty");
+
+        List<String> searched = salonSearch(token);
+        List<String> withNonEmptyRoster = new ArrayList<>();
+        for (UUID salonId : List.of(bookable, mixed, serviceOnly, hoursOnly, empty)) {
+            if (!http.rosterIds(salonId).isEmpty()) {
+                withNonEmptyRoster.add(salonId.toString());
+            }
+        }
+
+        assertThat(searched).as("search ⇔ non-empty roster")
+                .containsExactlyInAnyOrderElementsOf(withNonEmptyRoster);
+        assertThat(searched).as("rule outcome")
+                .containsExactlyInAnyOrder(bookable.toString(), mixed.toString());
+        assertThat(http.rosterIds(mixed)).as("mixed salon roster hides its service-only master")
+                .doesNotContain(mixedServiceOnly.toString())
+                .hasSize(1);
     }
 
     // ── category chips are reference data — never filtered by bookability ─────────────────
@@ -312,16 +348,8 @@ class BookabilityRuleEdgeCasesIT extends AbstractIntegrationTest {
         return ids(http.get("/api/v1/search/salons?q=" + q, null), "salonId");
     }
 
-    private boolean masterBookable(UUID masterId) throws Exception {
-        JsonNode node = http.get("/api/v1/masters/" + masterId, null);
-        assertThat(node.path("bookable").isBoolean()).as("bookable present on %s", node).isTrue();
-        return node.path("bookable").asBoolean();
-    }
-
-    private boolean salonBookable(UUID salonId) throws Exception {
-        JsonNode node = http.get("/api/v1/salons/" + salonId, null);
-        assertThat(node.path("bookable").isBoolean()).as("bookable present on %s", node).isTrue();
-        return node.path("bookable").asBoolean();
+    private void assertProfileLoads(UUID masterId) throws Exception {
+        http.getProfileWithoutBookableFlag("/api/v1/masters/" + masterId);
     }
 
     private static List<String> names(JsonNode list) {

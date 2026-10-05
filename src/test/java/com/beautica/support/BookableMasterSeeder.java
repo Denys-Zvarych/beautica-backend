@@ -192,6 +192,12 @@ public final class BookableMasterSeeder {
 
     /** Inserts a CUSTOM_HOURS override on {@code date} with one 10:00–12:00 interval. */
     public static void seedCustomHoursOverride(JdbcTemplate jdbc, UUID masterId, LocalDate date) {
+        seedCustomHoursOverride(jdbc, masterId, date, LocalTime.of(10, 0), LocalTime.of(12, 0));
+    }
+
+    /** Inserts a CUSTOM_HOURS override on {@code date} with one {@code [start, end)} interval. */
+    public static void seedCustomHoursOverride(JdbcTemplate jdbc, UUID masterId, LocalDate date,
+                                               LocalTime start, LocalTime end) {
         UUID exceptionId = UUID.randomUUID();
         jdbc.update(
                 "INSERT INTO schedule_exceptions (id, master_id, date, kind, created_at) "
@@ -200,7 +206,7 @@ public final class BookableMasterSeeder {
         jdbc.update(
                 "INSERT INTO schedule_exception_intervals (id, exception_id, start_time, end_time) "
                         + "VALUES (?, ?, ?, ?)",
-                UUID.randomUUID(), exceptionId, LocalTime.of(10, 0), LocalTime.of(12, 0));
+                UUID.randomUUID(), exceptionId, start, end);
     }
 
     /** Inserts a DAY_OFF override on {@code date}. */

@@ -39,12 +39,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>Finding 1</b> — a schedule write clears the discovery search caches ONLY when it flips
  *       the master's structural search verdict, and only the surface that master is listed on;</li>
  *   <li><b>Finding 2</b> — {@code master-bookable-assignments} (the cached strict verdict behind
- *       {@code GET /masters/{id}.bookable} and the public services tab) is evicted after commit by a
- *       booking that takes the master's last free slot, so the flag flips without waiting for the
- *       60-second TTL.</li>
+ *       the public services tab) is evicted after commit by a booking that takes the master's last
+ *       free slot, so the tab empties without waiting for the 60-second TTL.</li>
  * </ul>
  */
-@DisplayName("Bookability caches — search cleared only on a verdict flip; bookable flag evicted by booking")
+@DisplayName("Bookability caches — search cleared only on a verdict flip; strict services-tab verdict evicted by booking")
 class BookabilityCacheEvictionIT extends AbstractIntegrationTest {
 
     private static final String SENTINEL_KEY = "sentinel";
@@ -136,9 +135,9 @@ class BookabilityCacheEvictionIT extends AbstractIntegrationTest {
     // ── finding 2: the strict verdict cache is evicted by a booking write ────────────────────
 
     @Test
-    @DisplayName("a booking that takes the master's LAST free slot flips GET /masters/{id}.bookable and "
-            + "empties the public services tab immediately — no 60-second TTL wait")
-    void should_flipBookableFlag_when_bookingTakesLastSlot() throws Exception {
+    @DisplayName("a booking that takes the master's LAST free slot empties the public services tab "
+            + "immediately — no 60-second TTL wait")
+    void should_emptyServicesTab_when_bookingTakesLastSlot() throws Exception {
         Indep master = independentMasterWithServiceOnly();
         LocalDate day = kyivToday().plusDays(2);
         masterScheduleService.upsertOverride(master.userId(), master.masterId(), new ScheduleOverrideRequest(
@@ -147,9 +146,8 @@ class BookabilityCacheEvictionIT extends AbstractIntegrationTest {
         UUID assignmentId = jdbcTemplate.queryForObject(
                 "SELECT id FROM master_services WHERE master_id = ? AND is_active = true", UUID.class, master.masterId());
 
-        assertThat(http.get("/api/v1/masters/" + master.masterId()).path("bookable").asBoolean())
-                .as("one free 60-min slot (10:00-11:00) — bookable").isTrue();
-        assertThat(http.get("/api/v1/masters/" + master.masterId() + "/services")).hasSize(1);
+        assertThat(http.get("/api/v1/masters/" + master.masterId() + "/services"))
+                .as("one free 60-min slot (10:00-11:00) — the service is bookable").hasSize(1);
         assertThat(bookableAssignmentsCache().get(List.of(master.masterId())))
                 .as("arrange check — the verdict really is cached, so only an eviction can flip it")
                 .isNotNull();
@@ -162,10 +160,9 @@ class BookabilityCacheEvictionIT extends AbstractIntegrationTest {
                 String.class);
         assertThat(booked.getStatusCode()).as(booked.getBody()).isEqualTo(HttpStatus.CREATED);
 
-        assertThat(http.get("/api/v1/masters/" + master.masterId()).path("bookable").asBoolean())
-                .as("the only slot is taken — the cached 'true' must have been evicted after commit")
-                .isFalse();
-        assertThat(http.get("/api/v1/masters/" + master.masterId() + "/services")).isEmpty();
+        assertThat(http.get("/api/v1/masters/" + master.masterId() + "/services"))
+                .as("the only slot is taken — the cached verdict must have been evicted after commit")
+                .isEmpty();
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────────────────────

@@ -256,7 +256,9 @@ class SalonControllerTest {
                         .accept(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.success").value(true))
-                .andExpect(jsonPath("$.data.name").value("Public Salon"));
+                .andExpect(jsonPath("$.data.name").value("Public Salon"))
+                // The `bookable` flag was removed — client visibility lives in search/roster only.
+                .andExpect(jsonPath("$.data.bookable").doesNotExist());
     }
 
     @Test

@@ -129,7 +129,7 @@ class SalonMasterControllerTest {
                 null, null, null, null, BigDecimal.ZERO, 0, MasterType.SALON_OWNER, null, List.of(),
                 null, null, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null, null);
+                null, null, null, null);
     }
 
     private Master stubMasterEntity(UUID masterId) {

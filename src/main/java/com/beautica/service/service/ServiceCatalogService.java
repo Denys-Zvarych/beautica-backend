@@ -1941,7 +1941,7 @@ public class ServiceCatalogService {
     /**
      * Evicts the given master IDs from the "masterServices" cache and from
      * {@code master-bookable-assignments} (the strict per-master verdict behind the public services
-     * tab and the {@code GET /masters/{id}} bookable flag, keyed {@code [masterId]}) — an assignment
+     * tab, keyed {@code [masterId]}) — an assignment
      * write can add or remove a bookable service.
      *
      * <p>When a Spring transaction is active (the normal production path), the eviction is

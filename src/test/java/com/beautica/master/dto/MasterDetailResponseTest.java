@@ -61,7 +61,7 @@ class MasterDetailResponseTest {
                 null,
                 // region / citySettlementType / cityHromadaNameUk — non-null so a masking
                 // assertion can fail (a null fixture would pass a missing mask vacuously)
-                OWN_REGION, SettlementType.VILLAGE, OWN_HROMADA, null);
+                OWN_REGION, SettlementType.VILLAGE, OWN_HROMADA);
     }
 
     private static final String OWN_REGION = "Полтавська";
@@ -335,7 +335,7 @@ class MasterDetailResponseTest {
                 PROFESSIONAL_TITLE, "https://cdn.beautica.test/a.png",
                 null, 0, MasterType.SALON_MASTER, null, List.of(), null, null, null,
                 // bookingsThisMonth — self-read only (Qase defect #25)
-                null, null, null, null, null);
+                null, null, null, null);
 
         MasterDetailResponse publicView = MasterDetailResponse.fromPublic(full);
 

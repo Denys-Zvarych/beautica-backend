@@ -78,7 +78,7 @@ class IndependentMasterBookabilityJourneyIT extends AbstractIntegrationTest {
         UUID scheduleId = createWeeklySchedule(masterId, masterToken);
         assertThat(masterIds("/api/v1/search/masters?page=0&size=20")).as("browse").containsExactly(masterId.toString());
         assertThat(masterIds("/api/v1/search/masters?q=" + NAME)).as("by name").containsExactly(masterId.toString());
-        assertThat(http.get("/api/v1/masters/" + masterId, null).path("bookable").asBoolean()).isTrue();
+        http.getProfileWithoutBookableFlag("/api/v1/masters/" + masterId);
         assertThat(http.get("/api/v1/masters/" + masterId + "/services", null)).hasSize(1);
         http.addFavorite(clientToken, FavoriteTargetType.MASTER, masterId);
         assertThat(favouriteIds(clientToken)).containsExactly(masterId.toString());
@@ -96,16 +96,14 @@ class IndependentMasterBookabilityJourneyIT extends AbstractIntegrationTest {
                 .as("favourite row kept").isEqualTo(1L);
     }
 
-    /** Not in browse, not by name, profile still 200 with bookable=false, empty client services tab. */
+    /** Not in browse, not by name, profile still 200 (no bookable field), empty client services tab. */
     private void assertHidden(UUID masterId, String step) throws Exception {
         JsonNode browse = http.get("/api/v1/search/masters?page=0&size=20", null);
         assertThat(ids(browse, "masterId")).as("%s: browse", step).isEmpty();
         assertThat(browse.path("totalElements").asLong()).as("%s: browse total", step).isZero();
         assertThat(masterIds("/api/v1/search/masters?q=" + NAME)).as("%s: by name", step).isEmpty();
-        JsonNode profile = http.get("/api/v1/masters/" + masterId, null);
+        JsonNode profile = http.getProfileWithoutBookableFlag("/api/v1/masters/" + masterId);
         assertThat(profile.path("masterId").asText()).as("%s: profile loads", step).isEqualTo(masterId.toString());
-        assertThat(profile.path("bookable").isBoolean()).as("%s: flag present", step).isTrue();
-        assertThat(profile.path("bookable").asBoolean()).as("%s: bookable", step).isFalse();
         assertThat(http.get("/api/v1/masters/" + masterId + "/services", null)).as("%s: services tab", step).isEmpty();
     }
 

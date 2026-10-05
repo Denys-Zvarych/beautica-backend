@@ -498,7 +498,7 @@ public interface MasterServiceRepository extends JpaRepository<MasterServiceAssi
 
     /**
      * Master-scoped sibling of {@link #findBookableAssignmentsBySalon}: the strict-verdict
-     * candidates of each given master, for the detail {@code bookable} flags and the public
+     * candidates of each given master, for the public
      * {@code GET /masters/{id}/services} tab ({@code BookingMasterService#getBookableAssignmentIds}), which feed them to the same
      * {@code SlotCalculationService#filterBookableAssignmentsBatch} the salon catalogue uses.
      *

@@ -37,7 +37,6 @@ import com.beautica.salon.audit.StaffClientReferenceAuditResult;
 import com.beautica.salon.audit.StaffClientReferenceViolation;
 import com.beautica.salon.dto.CreateSalonRequest;
 import com.beautica.salon.dto.PublicSalonResponse;
-import com.beautica.booking.service.BookingMasterService;
 import com.beautica.salon.dto.SalonAdminResponse;
 import com.beautica.salon.dto.SalonInviteHistoryResponse;
 import com.beautica.salon.dto.SalonInviteResponse;
@@ -104,7 +103,6 @@ public class SalonService {
     private final MasterServiceRepository masterServiceRepository;
     private final LocalityWriteValidator localityWriteValidator;
     private final MasterService masterService;
-    private final BookingMasterService bookingMasterService;
     // Phase 321 — the salon roster board's effective-schedule read. MasterScheduleService is the
     // owner of the override-beats-template-beats-gap fold; this service resolves WHICH masters and
     // delegates the whole schedule verdict, never re-deriving it. ScheduleDateMath is the single
@@ -1083,18 +1081,6 @@ public class SalonService {
                 salon, resolveOblastId(salon.getCityId()), resolveSettlement(salon.getCityId()));
     }
 
-    /**
-     * The {@code bookable} flag of {@code GET /salons/{salonId}}: at least one master passes the
-     * strict free-slot verdict — exactly the set the public roster lists
-     * ({@link BookingMasterService#getBookableMasterIds(UUID)}, cached in
-     * {@code salon-bookable-masters} and evicted with the catalogue). Attached outside the
-     * {@code salon-detail} cache via {@code PublicSalonResponse#withBookable}.
-     */
-    @Transactional(readOnly = true)
-    public boolean isBookable(UUID salonId) {
-        return !bookingMasterService.getBookableMasterIds(salonId).isEmpty();
-    }
-
     @Transactional
     public InviteResponse inviteMaster(UUID actorId, UUID salonId, String email, Role role) {
         // Ownership already enforced by @PreAuthorize("... @authz.canManageSalon(...)") on
@@ -1110,8 +1096,9 @@ public class SalonService {
      * Public salon roster for {@code GET /salons/{salonId}/masters}. Delegates to
      * {@link MasterService#getMastersByPage} — the ONE bookability-gated roster implementation (and
      * its sort whitelist), shared with {@code GET /masters/by-salon/{salonId}} so the two public
-     * endpoints cannot drift. Only masters bookable for at least one salon service are listed; the
-     * management roster {@link #getSalonStaff} stays deliberately unfiltered.
+     * endpoints cannot drift. Only client-visible masters (≥1 active service AND working hours
+     * within 180 days — the cheap rule search applies) are listed; the management roster
+     * {@link #getSalonStaff} stays deliberately unfiltered.
      */
     @Transactional(readOnly = true)
     public Page<MasterSummaryResponse> getMastersBySalon(UUID salonId, Pageable pageable) {

@@ -132,8 +132,7 @@ public class MasterController {
      */
     @GetMapping("/{masterId}")
     public ApiResponse<MasterDetailResponse> getMasterDetail(@PathVariable UUID masterId) {
-        return ApiResponse.ok(MasterDetailResponse.fromPublic(masterService.getMasterDetail(masterId))
-                .withBookable(masterService.isBookable(masterId)));
+        return ApiResponse.ok(MasterDetailResponse.fromPublic(masterService.getMasterDetail(masterId)));
     }
 
     @GetMapping("/by-salon/{salonId}")

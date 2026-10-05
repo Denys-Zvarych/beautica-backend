@@ -85,23 +85,7 @@ public record MasterDetailResponse(
         @Schema(types = {"string", "null"}, nullable = true, description = "Bare hromada adjective of the master's own "
                 + "settlement, populated only when its name is ambiguous within its oblast; null "
                 + "otherwise and wherever cityId is masked.")
-        String cityHromadaNameUk,
-        /**
-         * Whether a client can book this master right now — the strict free-slot verdict
-         * ({@code BookingMasterService#getBookableAssignmentIds}: ≥1 active service AND a
-         * schedule with ≥1 free future slot). The profile of a non-bookable master still loads (a
-         * direct link must not 404); the client disables its booking CTA on {@code false}.
-         *
-         * <p>Populated ONLY on {@code GET /masters/{masterId}}, via {@link #withBookable} at the
-         * point of use — never inside a factory, so it is never stored in the {@code master-detail}
-         * cache (the verdict changes with every booking/schedule write). {@code null} on every other
-         * path that returns this DTO.
-         */
-        @Schema(types = {"boolean", "null"}, nullable = true, description = "Whether the master can "
-                + "currently be booked (>=1 active service and a schedule with a free future slot). "
-                + "Populated on GET /masters/{masterId}; null on every other endpoint returning this "
-                + "shape. false = profile still shown, booking disabled.")
-        Boolean bookable
+        String cityHromadaNameUk
 ) {
     /**
      * Builds a fully-populated response including locality cascade IDs.
@@ -159,9 +143,7 @@ public record MasterDetailResponse(
                 // the "null when no city is set" contract and leak onto the public path.
                 settlement == null ? null : settlement.region(),
                 settlement == null ? null : settlement.settlementType(),
-                settlement == null ? null : settlement.hromadaNameUk(),
-                // bookable — attached per request by withBookable, never cached with the profile.
-                null
+                settlement == null ? null : settlement.hromadaNameUk()
         );
     }
 
@@ -214,8 +196,7 @@ public record MasterDetailResponse(
                 // name while publishing the oblast/hromada would leak the locality they hide.
                 isIndependent ? full.region() : null,
                 isIndependent ? full.citySettlementType() : null,
-                isIndependent ? full.cityHromadaNameUk() : null,
-                full.bookable()
+                isIndependent ? full.cityHromadaNameUk() : null
         );
     }
 
@@ -232,19 +213,6 @@ public record MasterDetailResponse(
                 masterId, firstName, lastName, phoneNumber, city, street, buildingNo,
                 locationNote, bio, instagram, professionalTitle, avatarUrl, avgRating,
                 reviewCount, masterType, salon, workingHours, cityId, oblastId, districtId,
-                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk, bookable);
-    }
-
-    /**
-     * Returns a copy carrying {@code bookable} — the only supported way to populate it, for the same
-     * reason as {@link #withBookingsThisMonth}: the cached factory output must never hold a verdict
-     * that every booking/schedule write can flip.
-     */
-    public MasterDetailResponse withBookable(boolean bookable) {
-        return new MasterDetailResponse(
-                masterId, firstName, lastName, phoneNumber, city, street, buildingNo,
-                locationNote, bio, instagram, professionalTitle, avatarUrl, avgRating,
-                reviewCount, masterType, salon, workingHours, cityId, oblastId, districtId,
-                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk, bookable);
+                bookingsThisMonth, region, citySettlementType, cityHromadaNameUk);
     }
 }

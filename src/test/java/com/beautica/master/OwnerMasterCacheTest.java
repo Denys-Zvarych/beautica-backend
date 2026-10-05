@@ -129,8 +129,8 @@ class OwnerMasterCacheTest {
     // (bookable-master gating) and SalonCatalogCacheEvictor (salon-catalogue cache eviction).
     @MockBean com.beautica.booking.service.SlotCalculationService slotCalculationService;
     @MockBean com.beautica.service.service.SalonCatalogCacheEvictor salonCatalogCacheEvictor;
-    // MasterService ctor dependency: public-roster bookability gate (getMastersByPage).
-    @MockBean com.beautica.booking.service.BookingMasterService bookingMasterService;
+    // MasterService ctor dependency: public-roster gate's :bookableToday (getMastersByPage).
+    @MockBean com.beautica.master.service.ScheduleDateMath scheduleDateMath;
 
     @Autowired MasterService masterService;
     @Autowired CacheManager cacheManager;

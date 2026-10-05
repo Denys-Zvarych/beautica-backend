@@ -87,8 +87,7 @@ public class SalonController {
 
     @GetMapping("/{salonId}")
     public ApiResponse<PublicSalonResponse> getSalon(@PathVariable UUID salonId) {
-        return ApiResponse.ok(salonService.getPublicSalon(salonId)
-                .withBookable(salonService.isBookable(salonId)));
+        return ApiResponse.ok(salonService.getPublicSalon(salonId));
     }
 
     @PatchMapping("/{salonId}")

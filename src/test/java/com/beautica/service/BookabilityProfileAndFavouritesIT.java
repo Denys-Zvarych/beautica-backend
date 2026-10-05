@@ -10,8 +10,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.util.UUID;
@@ -23,7 +21,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Bookability on the client profile surfaces (locked product decision 2026-10-05):
  * <ul>
  *   <li>{@code GET /masters/{id}} and {@code GET /salons/{id}} still load for a non-bookable
- *       provider (a direct link must not 404) and carry {@code bookable} from the strict verdict;</li>
+ *       provider (a direct link must not 404) and carry no {@code bookable} flag; the public salon
+ *       roster ({@code GET /salons/{id}/masters}) lists only masters passing the cheap rule;</li>
  *   <li>{@code GET /favorites/masters|salons} (also the home favourites rail) HIDE a non-bookable
  *       favourite, keeping the row so it reappears once the provider is configured again;</li>
  *   <li>{@code GET /masters/{id}/services} shows clients only bookable services, while the master
@@ -45,9 +44,6 @@ class BookabilityProfileAndFavouritesIT extends AbstractIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    @Autowired
-    private CacheManager cacheManager;
-
     private ServiceTestFixtures fixtures;
     private BookabilityHttp http;
     private Fixture fx;
@@ -59,38 +55,34 @@ class BookabilityProfileAndFavouritesIT extends AbstractIntegrationTest {
         fx = seed();
     }
 
-    // ── detail flags ────────────────────────────────────────────────────────────────────────
+    // ── profiles + salon roster (the detail `bookable` flag was removed) ───────────────────
 
     @Test
-    @DisplayName("GET /masters/{id}: configured masters bookable=true; unscheduled masters still load "
-            + "with bookable=false (salon owner-master AND independent)")
-    void should_exposeBookableFlag_when_masterDetailRead() throws Exception {
-        assertThat(http.get("/api/v1/masters/" + fx.salonConfigured(), null).path("bookable").asBoolean()).isTrue();
-        assertThat(http.get("/api/v1/masters/" + fx.indepConfigured(), null).path("bookable").asBoolean()).isTrue();
+    @DisplayName("GET /masters/{id}: every master's profile loads with no bookable field — configured "
+            + "AND unscheduled (salon owner-master AND independent); the salon roster lists only the "
+            + "configured salon master, not the service-but-no-hours owner-master")
+    void should_loadProfilesAndGateRoster_when_masterDetailRead() throws Exception {
+        for (UUID masterId : java.util.List.of(fx.salonConfigured(), fx.indepConfigured(),
+                fx.ownerMaster(), fx.indepUnscheduled())) {
+            JsonNode profile = http.getProfileWithoutBookableFlag("/api/v1/masters/" + masterId);
+            assertThat(profile.path("masterId").asText()).isEqualTo(masterId.toString());
+        }
 
-        JsonNode owner = http.get("/api/v1/masters/" + fx.ownerMaster(), null);
-        JsonNode indep = http.get("/api/v1/masters/" + fx.indepUnscheduled(), null);
-
-        assertThat(owner.path("masterId").asText()).isEqualTo(fx.ownerMaster().toString());
-        assertThat(owner.path("bookable").isBoolean()).isTrue();
-        assertThat(owner.path("bookable").asBoolean()).isFalse();
-        assertThat(indep.path("bookable").isBoolean()).isTrue();
-        assertThat(indep.path("bookable").asBoolean()).isFalse();
+        assertThat(http.rosterIds(fx.salonId())).containsExactly(fx.salonConfigured().toString());
     }
 
     @Test
-    @DisplayName("GET /salons/{id}: true with one configured master; false (profile still 200) once "
-            + "that master loses their schedule")
-    void should_exposeBookableFlag_when_salonDetailRead() throws Exception {
-        assertThat(http.get("/api/v1/salons/" + fx.salonId(), null).path("bookable").asBoolean()).isTrue();
+    @DisplayName("GET /salons/{id}: profile loads with no bookable field; the roster lists the configured "
+            + "master, and drops it on the very next read once that master loses their schedule "
+            + "(profile still 200)")
+    void should_dropMasterFromRoster_when_scheduleRemoved() throws Exception {
+        assertThat(http.rosterIds(fx.salonId())).containsExactly(fx.salonConfigured().toString());
 
         BookableMasterSeeder.removeSchedule(jdbcTemplate, fx.salonConfigured());
-        evictSalonVerdict();
-        JsonNode salon = http.get("/api/v1/salons/" + fx.salonId(), null);
 
+        assertThat(http.rosterIds(fx.salonId())).isEmpty();
+        JsonNode salon = http.getProfileWithoutBookableFlag("/api/v1/salons/" + fx.salonId());
         assertThat(salon.path("id").asText()).isEqualTo(fx.salonId().toString());
-        assertThat(salon.path("bookable").isBoolean()).isTrue();
-        assertThat(salon.path("bookable").asBoolean()).isFalse();
     }
 
     // ── favourites (also the home favourites rail) ─────────────────────────────────────────
@@ -228,13 +220,6 @@ class BookabilityProfileAndFavouritesIT extends AbstractIntegrationTest {
 
         return new Fixture(salonId, ownerToken, ownerMaster, salonConfigured,
                 indepUnscheduled, indepToken, indepConfigured);
-    }
-
-    /** The salon verdict is cached 60 s; the JDBC schedule delete bypasses the write-path eviction. */
-    private void evictSalonVerdict() {
-        Cache cache = cacheManager.getCache("salon-bookable-masters");
-        assertThat(cache).isNotNull();
-        cache.evict(fx.salonId());
     }
 
     private record Fixture(UUID salonId, String ownerToken, UUID ownerMaster, UUID salonConfigured,

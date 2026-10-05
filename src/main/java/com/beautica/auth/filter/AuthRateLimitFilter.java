@@ -139,8 +139,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // route under that prefix ends in the literal "/services" (unlike the salon side), so a plain
     // prefix+suffix check is unambiguous here — no disambiguation helper needed.
     private static final String MASTER_SERVICES_PATH_SUFFIX = "/services";
-    // Public profile reads that compute the strict free-slot bookability verdict (audit 2026-10-05,
-    // finding 2): GET /api/v1/masters/{id}, GET /api/v1/masters/by-salon/{salonId},
+    // permitAll public profile/roster reads, throttled to cap id-sweeps (audit 2026-10-05,
+    // finding 2; the roster reads run an uncached bookability EXISTS gate per request via
+    // MasterRepository#findBookableIdsBySalonId): GET /api/v1/masters/{id}, GET /api/v1/masters/by-salon/{salonId},
     // GET /api/v1/salons/{id} and GET /api/v1/salons/{id}/masters. The {id} segment is captured as
     // ANY single segment ([^/]+) and accepted only if it parses as a UUID exactly the way Spring's
     // router does (see isUuidPathVariable) — NOT a bare prefix, so the authenticated siblings at the
@@ -1095,9 +1096,10 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         // bucket at the same 60/min capacity.
         //
         // Audit 2026-10-05 (finding 2) widened the bucket to the public PROFILE reads
-        // (PUBLIC_PROFILE_READ_PATH): GET /masters/{id} and GET /salons/{id} compute the strict
-        // free-slot `bookable` verdict, and GET /salons/{id}/masters + GET /masters/by-salon/{id}
-        // gate the roster on it — the same cold-key horizon walk an id sweep could drive. Same
+        // (PUBLIC_PROFILE_READ_PATH): GET /masters/{id}, GET /salons/{id}, GET /salons/{id}/masters
+        // and GET /masters/by-salon/{id} are permitAll, so the bucket caps id-sweeps against them;
+        // the two roster reads also run an UNCACHED bookability EXISTS gate on every request
+        // (MasterRepository#findBookableIdsBySalonId), which a sweep would otherwise drive. Same
         // per-IP capacity (app.rate-limit.catalogue-browse-capacity), deliberately ONE bucket: a
         // profile visit spends ~3 tokens (detail + services + roster), so a crawler is capped at
         // ~20 profiles/min per IP while a human never notices.

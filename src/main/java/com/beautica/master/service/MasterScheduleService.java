@@ -107,8 +107,8 @@ public class MasterScheduleService {
             "master-usable-schedule",
             "master-service-bookable",
             "master-bookable-days",
-            // Strict per-master verdict behind the GET /masters/{id} bookable flag and the public
-            // services tab — keyed [masterId], so the same by-master sweep evicts it.
+            // Strict per-master verdict behind the public services tab — keyed [masterId], so the
+            // same by-master sweep evicts it.
             BookingMasterService.BOOKABLE_ASSIGNMENTS_CACHE,
     };
 

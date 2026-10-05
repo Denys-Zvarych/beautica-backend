@@ -111,9 +111,31 @@ public interface MasterRepository extends JpaRepository<Master, UUID> {
     Page<Master> findBySalonIdAndIsActiveTrueWithUser(@Param("salonId") UUID salonId, Pageable pageable);
 
     /**
+     * Ids of {@code salonId}'s active masters that pass the CHEAP structural client-visibility rule
+     * ({@link MasterBookabilitySql#BOOKABLE_MASTER_M}: ≥1 active, correctly-owned service AND working
+     * hours within the 180-day horizon) — the same predicate discovery search lists masters by; a
+     * fully booked master passes. The public salon roster's gate, fed into
+     * {@link #findBySalonIdAndIdInAndIsActiveTrueWithUser}. A native id query because the predicate
+     * is native SQL while the roster page is a JPQL {@code JOIN FETCH} with an entity-property sort
+     * whitelist. Bounded by one salon's headcount. {@code today} is the Europe/Kyiv civil date from
+     * the app clock ({@code ScheduleDateMath#today()}), never the DB clock.
+     *
+     * <p><b>Planning cost.</b> The inlined predicate costs ~7 ms to PLAN vs ~0.3 ms to execute;
+     * pgjdbc server-prepares it after 5 uses ({@code prepareThreshold}), hiding that cost. See
+     * {@code DatabaseUrlNormalizerPostProcessor} — a pooled endpoint with {@code prepareThreshold=0}
+     * would make every request pay it.
+     */
+    @Query(value = "SELECT m.id FROM masters m WHERE m.salon_id = :salonId AND m.is_active = true AND "
+            + MasterBookabilitySql.BOOKABLE_MASTER_M,
+            nativeQuery = true)
+    List<UUID> findBookableIdsBySalonId(
+            @Param("salonId") UUID salonId,
+            @Param(MasterBookabilitySql.TODAY_PARAM) LocalDate today);
+
+    /**
      * The public, bookability-gated sibling of {@link #findBySalonIdAndIsActiveTrueWithUser}: the
      * same {@code JOIN FETCH m.user} roster query and count query, narrowed to {@code ids} (the
-     * bookable set from {@code BookingMasterService#getBookableMasterIds}). Filtering in SQL keeps
+     * client-visible set from {@link #findBookableIdsBySalonId}). Filtering in SQL keeps
      * pagination and {@code totalElements} correct after gating — a post-page in-memory filter would
      * return short pages and an inflated total. {@code ids} must be non-empty (callers short-circuit
      * an empty set to an empty page without querying). Bounded by one salon's headcount, so the

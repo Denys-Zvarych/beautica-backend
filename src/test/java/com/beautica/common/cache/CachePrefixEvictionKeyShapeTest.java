@@ -139,8 +139,6 @@ class CachePrefixEvictionKeyShapeTest {
     @MockBean BookingSlugService bookingSlugService;
     @MockBean AuthorizationService authorizationService;
     @MockBean SalonCatalogCacheEvictor salonCatalogCacheEvictor;
-    // MasterService ctor dependency: public-roster bookability gate (getMastersByPage).
-    @MockBean com.beautica.booking.service.BookingMasterService bookingMasterService;
 
     // SlotCalculationService collaborators
     @MockBean MasterServiceRepository masterServiceRepository;

@@ -112,9 +112,6 @@ class SalonServiceTest {
     private MasterService masterService;
 
     @Mock
-    private com.beautica.booking.service.BookingMasterService bookingMasterService;
-
-    @Mock
     // CacheManager: post-commit eviction uses TransactionSynchronizationManager,
     // which is inactive under MockitoExtension — tested via integration test.
     private CacheManager cacheManager;
@@ -1735,30 +1732,6 @@ class SalonServiceTest {
         ReflectionTestUtils.setField(salon, "id", id);
         ReflectionTestUtils.setField(salon, "createdAt", Instant.now());
         return salon;
-    }
-
-    // ── isBookable — the GET /salons/{id} detail flag ────────────────────────────────────────
-
-    @Test
-    @DisplayName("isBookable — true when at least one master passes the strict salon verdict")
-    void should_reportBookable_when_salonHasABookableMaster() {
-        UUID salonId = UUID.randomUUID();
-        when(bookingMasterService.getBookableMasterIds(salonId)).thenReturn(java.util.Set.of(UUID.randomUUID()));
-
-        boolean bookable = salonService.isBookable(salonId);
-
-        assertThat(bookable).isTrue();
-    }
-
-    @Test
-    @DisplayName("isBookable — false when no master of the salon is bookable")
-    void should_reportNotBookable_when_salonHasNoBookableMaster() {
-        UUID salonId = UUID.randomUUID();
-        when(bookingMasterService.getBookableMasterIds(salonId)).thenReturn(java.util.Set.of());
-
-        boolean bookable = salonService.isBookable(salonId);
-
-        assertThat(bookable).isFalse();
     }
 
 }

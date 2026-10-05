@@ -46,6 +46,25 @@ final class BookabilityHttp {
         return objectMapper.readTree(response.getBody()).path("data");
     }
 
+    /**
+     * Master ids on the public salon roster ({@code GET /salons/{id}/masters}, anonymous) — the
+     * per-salon client-visibility surface, gated by the same cheap rule as search.
+     */
+    List<String> rosterIds(UUID salonId) throws Exception {
+        return ids(get("/api/v1/salons/" + salonId + "/masters"), "masterId");
+    }
+
+    /**
+     * Anonymous GET of a public profile ({@code /masters/{id}} or {@code /salons/{id}}): it loads
+     * (200 — a direct link to a hidden provider must not 404) and carries no {@code bookable} field
+     * (the flag was removed; client visibility lives in search and the roster only).
+     */
+    JsonNode getProfileWithoutBookableFlag(String url) throws Exception {
+        JsonNode profile = get(url);
+        assertThat(profile.has("bookable")).as("no bookable field on %s", url).isFalse();
+        return profile;
+    }
+
     /** {@code POST /favorites} as the client; asserts 200. */
     void addFavorite(String clientToken, FavoriteTargetType type, UUID targetId) {
         ResponseEntity<String> response = restTemplate.exchange(

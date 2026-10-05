@@ -7,9 +7,9 @@ import java.util.regex.Pattern;
  * suggestions, favourites) — locked product decision 2026-10-05: a master is bookable when they
  * offer at least one active service AND have a schedule; a salon is bookable when at least one of
  * its active masters is. This is the cheap STRUCTURAL rule: it never walks the free-slot calendar
- * (a master who is merely fully booked right now stays visible). The strict free-slot verdict is
- * {@code BookingMasterService#getBookableMasterIds}, used by the detail {@code bookable} flags and
- * the per-salon rosters/catalogue.
+ * (a master who is merely fully booked right now stays visible). Also gates the public salon roster
+ * ({@code MasterRepository#findBookableIdsBySalonId}). The strict free-slot verdict is
+ * {@code BookingMasterService#getBookableAssignmentIds} / the salon catalogue's batch gate.
  *
  * <h3>What counts as a schedule</h3>
  * Override beats template beats gap ({@code MasterScheduleService#foldDates}), so both sources are

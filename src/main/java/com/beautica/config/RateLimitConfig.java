@@ -46,10 +46,13 @@ public class RateLimitConfig {
      *   <li>{@code GET /api/v1/salons/{salonId}/services}</li>
      *   <li>{@code GET /api/v1/masters/{masterId}/services}</li>
      * </ul>
-     * and, since the bookability audit (2026-10-05, finding 2), the public profile reads that
-     * compute the strict free-slot verdict: {@code GET /api/v1/masters/{id}},
+     * and, since the bookability audit (2026-10-05, finding 2), the {@code permitAll} public
+     * profile/roster reads {@code GET /api/v1/masters/{id}},
      * {@code GET /api/v1/masters/by-salon/{salonId}}, {@code GET /api/v1/salons/{id}} and
      * {@code GET /api/v1/salons/{id}/masters} — one bucket, so a full profile visit spends ~3 tokens.
+     * The throttle caps id-sweeps against these permitAll reads; the two roster reads additionally
+     * run an UNCACHED bookability {@code EXISTS} gate on every request
+     * ({@code MasterRepository#findBookableIdsBySalonId}).
      * Phase 314 audit finding (MEDIUM). Both are {@code permitAll()} in {@code SecurityConfig}.
      * {@code ServiceCatalogService}'s {@code @Cacheable(key = "#salonId"/"#masterId")} only
      * absorbs repeat hits on the SAME id — a caller sweeping distinct salon/master ids forces a
@@ -130,8 +133,8 @@ public class RateLimitConfig {
      * falls back to the per-IP bucket, so a forged bearer buys no budget.
      *
      * <p><b>Sizing: 60/min, identical to {@code catalogueBrowseCapacity}</b> — the unit of work
-     * (cold-key strict bookable verdict, now cached 60s per master/salon) is unchanged, only the
-     * key is. One management-screen load spends one token; a full profile visit ~3.
+     * (a permitAll profile read; for the roster, an uncached bookability {@code EXISTS} gate via
+     * {@code MasterRepository#findBookableIdsBySalonId}) is unchanged, only the key is. One management-screen load spends one token; a full profile visit ~3.
      */
     @Value("${app.rate-limit.catalogue-browse-principal-capacity:60}")
     private long catalogueBrowsePrincipalCapacity;

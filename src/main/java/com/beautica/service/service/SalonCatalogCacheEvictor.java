@@ -9,10 +9,7 @@ import java.util.UUID;
 
 /**
  * Dedicated single-key eviction for the {@code salon-service-catalog} cache backing
- * {@link ServiceCatalogService#getSalonServiceCatalog} AND the {@code salon-bookable-masters} cache
- * backing {@code BookingMasterService#getBookableMasterIds} (the public salon roster gate), both
- * keyed by {@code salonId}. The two are the same free-slot verdict viewed per service and per
- * master, so every write that can flip one flips the other — they share this single eviction.
+ * {@link ServiceCatalogService#getSalonServiceCatalog}, keyed by {@code salonId}.
  *
  * <p><b>Why a separate bean.</b> The catalogue verdict is invalidated from write paths in
  * three different packages — schedule writes ({@code MasterScheduleService}), booking writes
@@ -34,7 +31,7 @@ import java.util.UUID;
 public class SalonCatalogCacheEvictor {
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
-    @CacheEvict(value = {"salon-service-catalog", "salon-bookable-masters"}, key = "#salonId", condition = "#salonId != null")
+    @CacheEvict(value = "salon-service-catalog", key = "#salonId", condition = "#salonId != null")
     public void evict(UUID salonId) {
         // Intentionally empty: @CacheEvict performs the eviction. A null salonId is skipped
         // by the condition (independent masters own no salon catalogue entry).

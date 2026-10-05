@@ -102,25 +102,7 @@ public record PublicSalonResponse(
                         + "ONLY when its name is ambiguous within its oblast (same rule as "
                         + "GET /settlements hromadaNameUk); null otherwise. The oblast half of "
                         + "the label is `region`.")
-        String cityHromadaNameUk,
-        /**
-         * Whether a client can book at this salon right now: at least one of its masters passes
-         * the strict free-slot verdict ({@code BookingMasterService#getBookableMasterIds(UUID)},
-         * the same verdict the public roster and catalogue apply). The profile of a non-bookable
-         * salon still loads; the client shows its no-bookings state on {@code false}.
-         *
-         * <p>Populated ONLY on {@code GET /salons/{salonId}}, via {@link #withBookable} at the point
-         * of use — never inside {@link #from}, so it is never stored in the {@code salon-detail}
-         * cache nor in a master's cached detail that embeds this DTO. {@code null} elsewhere.
-         */
-        @Schema(
-                types = {"boolean", "null"},
-                nullable = true,
-                description = "Whether the salon can currently be booked (>=1 bookable master). "
-                        + "Populated on GET /salons/{salonId}; null where this shape is embedded "
-                        + "elsewhere (e.g. MasterDetailResponse.salon). false = profile still "
-                        + "shown, booking disabled.")
-        Boolean bookable
+        String cityHromadaNameUk
 ) {
     /**
      * @param salon    the salon entity
@@ -158,21 +140,8 @@ public record PublicSalonResponse(
                 salon.getReviewCount() == 0 ? null : salon.getAvgRating(),
                 salon.getReviewCount(),
                 settlement == null ? null : settlement.settlementType(),
-                settlement == null ? null : settlement.hromadaNameUk(),
-                // bookable — attached per request by withBookable, never cached.
-                null
+                settlement == null ? null : settlement.hromadaNameUk()
         );
-    }
-
-    /**
-     * Returns a copy carrying {@code bookable} — the only supported way to populate it, so the
-     * cached {@link #from} output never holds a verdict every booking/schedule write can flip.
-     */
-    public PublicSalonResponse withBookable(boolean bookable) {
-        return new PublicSalonResponse(
-                id, name, description, city, region, address, cityId, oblastId, districtId,
-                street, buildingNo, locationNote, phone, instagramUrl, avatarUrl, coverImageUrl,
-                avgRating, reviewCount, citySettlementType, cityHromadaNameUk, bookable);
     }
 
     /**
