@@ -76,7 +76,7 @@ class InviteAcceptPostRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(),
-                permissive(), tinyInviteAcceptCache(), permissive());
+                permissive(), tinyInviteAcceptCache(), permissive(), permissive());
     }
 
     private static MockHttpServletRequest postAccept(String remoteAddr) {

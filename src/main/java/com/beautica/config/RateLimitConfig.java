@@ -398,7 +398,7 @@ public class RateLimitConfig {
     // the occasional refresh after a network blip, with several people at the SAME office/family
     // behind one NAT egress doing that for their own separate invites within the same minute.
     // 30/min clears that comfortably while still capping a scripted flood to half a request per
-    // second. @Value-configurable (unlike the sibling inviteBuckets/salonInviteBuckets, which stay
+    // second. @Value-configurable (unlike the sibling salonInviteBuckets, which stays
     // internal to the filter) because InviteControllerIT alone drives several dozen real HTTP
     // calls against this exact path from 127.0.0.1 across its test methods — a fixed cap would
     // make the test suite itself trip the throttle. Raised in application-test.yml, mirroring
@@ -428,6 +428,19 @@ public class RateLimitConfig {
     private long inviteAcceptCapacity;
 
     private static final Duration INVITE_ACCEPT_WINDOW = Duration.ofMinutes(15);
+
+    // Per-IP cap for POST /api/v1/auth/invite (60-second window) — the compensating control for
+    // the residual timing/enumeration oracle in InviteService.sendInvite (the already-registered
+    // and active-invite branches do measurably less work) AND an invite-email flood guard (the
+    // happy path enqueues an outbox e-mail). 15/min is generous for a human onboarding their team
+    // one invite at a time. Previously a hardcoded constant inside AuthRateLimitFilter; now
+    // @Value-configurable (same pattern as invite-validate-capacity above) so the local demo-fleet
+    // seeder, which creates many salon masters through the real invite flow from one IP, can raise
+    // it via scripts/start-backend.sh. The production default is unchanged at 15.
+    @Value("${app.rate-limit.invite-capacity:15}")
+    private long inviteCapacity;
+
+    private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
 
     // Per-IP cap for POST /api/v1/support/contact (60-minute window).
     // Each successful call sends an email to the support inbox, so this is an
@@ -940,7 +953,7 @@ public class RateLimitConfig {
      * Per-IP bucket for {@code GET /api/v1/auth/invite/validate}. See
      * {@link #inviteValidateCapacity}'s field javadoc for sizing and for why this bucket is
      * {@code @Value}-configurable rather than built internally like its sibling
-     * {@code inviteBuckets} / {@code salonInviteBuckets} in {@code AuthRateLimitFilter}.
+     * {@code salonInviteBuckets} in {@code AuthRateLimitFilter}.
      * {@code expireAfterAccess} gives a 5-minute grace past the 60-second window so a bucket
      * entry is not evicted the instant the window rolls over.
      */
@@ -967,6 +980,20 @@ public class RateLimitConfig {
                 INVITE_ACCEPT_WINDOW.plus(EVICTION_GRACE),
                 inviteAcceptCapacity,
                 INVITE_ACCEPT_WINDOW);
+    }
+
+    /**
+     * Per-IP bucket for {@code POST /api/v1/auth/invite}. See {@link #inviteCapacity}'s field
+     * comment for sizing. {@code expireAfterAccess} gives a 5-minute grace past the 60-second
+     * window so a bucket entry is not evicted the instant the window rolls over.
+     */
+    @Bean
+    public LoadingCache<String, Bucket> inviteBuckets() {
+        return bucketCache(
+                DEFAULT_BUCKET_CACHE_SIZE,
+                INVITE_WINDOW.plus(EVICTION_GRACE),
+                inviteCapacity,
+                INVITE_WINDOW);
     }
 
     /**

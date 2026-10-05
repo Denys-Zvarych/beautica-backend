@@ -91,7 +91,7 @@ class ServiceWriteRateLimitRegressionTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), tinyServiceWriteCache(), permissive(), permissive(),
-                permissive());
+                permissive(), permissive());
     }
 
     private MockHttpServletRequest write(String method, String uri) {

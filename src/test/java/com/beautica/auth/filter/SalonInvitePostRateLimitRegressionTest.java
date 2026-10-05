@@ -59,16 +59,17 @@ class SalonInvitePostRateLimitRegressionTest {
     }
 
     private AuthRateLimitFilter realFilter() {
-        // 19 permissive caches — one positional arg per @Qualifier bucket on the production
-        // constructor (includes verifyPasswordResetOtpBuckets / changePasswordOtpBuckets, Phase
-        // A5). The salon-invite-POST throttle is internal to the filter (built like
-        // inviteBuckets), so this test references no new constructor arg beyond the count.
+        // 23 permissive caches — one positional arg per @Qualifier bucket on the production
+        // constructor (the last is the POST /auth/invite inviteBuckets). The salon-invite-POST
+        // throttle is internal to the filter, so this test references no new constructor arg
+        // beyond the count.
         return new AuthRateLimitFilter(
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
-                permissive(), permissive(), permissive(), permissive(), permissive(), permissive());
+                permissive(), permissive(), permissive(), permissive(), permissive(), permissive(),
+                permissive());
     }
 
     private MockHttpServletRequest postSalonInvite(UUID salonId) {

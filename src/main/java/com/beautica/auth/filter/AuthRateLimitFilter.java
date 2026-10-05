@@ -423,15 +423,12 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // is generous for a human onboarding their team one invite at a time while bounding both
     // automated probing and e-mail abuse; any abuse is still attributable to the authenticated
     // SALON_OWNER principal. IP-keyed for consistency with every other bucket here (JWT is
-    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). Built internally (not
-    // an injected @Qualifier bean) so the public 16-arg constructor — depended on by several
-    // slice/regression tests — stays unchanged.
-    private static final long INVITE_CAPACITY = 15;
-    private static final Duration INVITE_WINDOW = Duration.ofMinutes(1);
+    // parsed in JwtAuthenticationFilter, which runs AFTER this filter). The capacity/window now
+    // live in RateLimitConfig#inviteBuckets() (app.rate-limit.invite-capacity, default 15 / 60 s)
+    // so local seeding can raise it; the 429 path reuses RETRY_AFTER_SECONDS (60-second window).
     // Capacity/window for GET /api/v1/auth/invite/validate and POST /api/v1/auth/invite/accept
     // are @Value-configurable in RateLimitConfig (inviteValidateBuckets() / inviteAcceptBuckets(),
-    // defaults 30/60s and 20/15min) — UNLIKE inviteBuckets/salonInviteBuckets above, which are
-    // built internally. Reason for the split: InviteControllerIT alone drives dozens of real HTTP
+    // defaults 30/60s and 20/15min) — UNLIKE salonInviteBuckets below, which is built internally. Reason for the split: InviteControllerIT alone drives dozens of real HTTP
     // calls against these two exact endpoints from 127.0.0.1 across its test methods (unlike the
     // send-invite path, which existing integration coverage reaches only a handful of times), so a
     // fixed low cap would make the test suite itself trip the throttle. Making the cap
@@ -446,9 +443,9 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     // client honouring Retry-After would spin-retry every 60 s against a budget that will not
     // have refilled. The validate bucket reuses RETRY_AFTER_SECONDS (its window is 60 s).
     private static final int INVITE_ACCEPT_RETRY_AFTER_SECONDS = 900;
-    // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors INVITE_CAPACITY
-    // / INVITE_WINDOW above (kept as its own dedicated constants, not shared, so the two
-    // endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
+    // Per-IP cap for POST /api/v1/salons/{salonId}/invite (15 / 60 s) — mirrors the
+    // app.rate-limit.invite-capacity default for POST /auth/invite (kept as its own dedicated
+    // constants, not shared, so the two endpoints can be tuned independently). Phase 21.1 (multi-admin relaxation) widened the
     // population that can reach InviteService.sendInvite through this path from SALON_OWNER-only
     // to SALON_OWNER + SALON_ADMIN, so the residual already-registered/active-invite timing
     // side-channel documented on InviteService.sendInvite is now reachable by more principals.
@@ -588,8 +585,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
     private final LoadingCache<String, Bucket> searchSuggestionBuckets;
     // Per-IP bucket for POST /api/v1/auth/invite — the compensating control for the residual
     // timing oracle in InviteService.sendInvite (the already-registered / active-invite
-    // branches return fast). Built internally rather than injected so the public 16-arg
-    // constructor stays stable for the slice/regression tests that construct this filter directly.
+    // branches return fast). An injected @Qualifier bean (RateLimitConfig#inviteBuckets) so the
+    // capacity is configurable via app.rate-limit.invite-capacity (default 15 / 60 s).
     private final LoadingCache<String, Bucket> inviteBuckets;
     // Per-IP bucket for GET /api/v1/auth/invite/validate — the LOW-fix flood guard for the
     // permitAll() invite-preview read that previously fell through the unconditional non-POST
@@ -664,7 +661,8 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
             @Qualifier("serviceWriteBuckets") LoadingCache<String, Bucket> serviceWriteBuckets,
             @Qualifier("inviteValidateBuckets") LoadingCache<String, Bucket> inviteValidateBuckets,
             @Qualifier("inviteAcceptBuckets") LoadingCache<String, Bucket> inviteAcceptBuckets,
-            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets) {
+            @Qualifier("catalogueBrowseBuckets") LoadingCache<String, Bucket> catalogueBrowseBuckets,
+            @Qualifier("inviteBuckets") LoadingCache<String, Bucket> inviteBuckets) {
         this.registerBuckets = registerBuckets;
         this.loginBuckets = loginBuckets;
         this.refreshBuckets = refreshBuckets;
@@ -687,6 +685,7 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
         this.inviteValidateBuckets = inviteValidateBuckets;
         this.inviteAcceptBuckets = inviteAcceptBuckets;
         this.catalogueBrowseBuckets = catalogueBrowseBuckets;
+        this.inviteBuckets = inviteBuckets;
         this.otpVerifyBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
                 .expireAfterAccess(OTP_VERIFY_WINDOW.plusMinutes(5))
@@ -728,12 +727,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .expireAfterAccess(SEARCH_SUGGESTIONS_WINDOW.plusMinutes(5))
                 .build(key -> Bucket.builder()
                         .addLimit(searchSuggestionBandwidth())
-                        .build());
-        this.inviteBuckets = Caffeine.newBuilder()
-                .maximumSize(100_000)
-                .expireAfterAccess(INVITE_WINDOW.plusMinutes(5))
-                .build(key -> Bucket.builder()
-                        .addLimit(inviteBandwidth())
                         .build());
         this.salonInviteBuckets = Caffeine.newBuilder()
                 .maximumSize(100_000)
@@ -866,13 +859,6 @@ public class AuthRateLimitFilter extends OncePerRequestFilter {
                 .capacity(SEARCH_SUGGESTIONS_CAPACITY)
                 .refillGreedy(SEARCH_SUGGESTIONS_CAPACITY, SEARCH_SUGGESTIONS_WINDOW)
                 .initialTokens(SEARCH_SUGGESTIONS_INITIAL_TOKENS)
-                .build();
-    }
-
-    private static Bandwidth inviteBandwidth() {
-        return BandwidthBuilder.builder()
-                .capacity(INVITE_CAPACITY)
-                .refillIntervally(INVITE_CAPACITY, INVITE_WINDOW)
                 .build();
     }
 

@@ -56,6 +56,7 @@ class AuthRateLimitFilterTest {
     @Mock private LoadingCache<String, Bucket> inviteValidateBuckets;
     @Mock private LoadingCache<String, Bucket> inviteAcceptBuckets;
     @Mock private LoadingCache<String, Bucket> catalogueBrowseBuckets;
+    @Mock private LoadingCache<String, Bucket> inviteBuckets;
     @Mock private Bucket                        bucket;
 
     // ── subject ────────────────────────────────────────────────────────────────
@@ -70,7 +71,7 @@ class AuthRateLimitFilterTest {
                 categoryRequestBuckets, suggestServiceTypeBuckets, bulkServiceSetupBuckets,
                 supportContactBuckets, otpSendBuckets, verifyPasswordResetOtpBuckets,
                 changePasswordOtpBuckets, serviceWriteBuckets,
-                inviteValidateBuckets, inviteAcceptBuckets, catalogueBrowseBuckets);
+                inviteValidateBuckets, inviteAcceptBuckets, catalogueBrowseBuckets, inviteBuckets);
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
@@ -93,7 +94,7 @@ class AuthRateLimitFilterTest {
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
                 realBuckets(open), realBuckets(open), realBuckets(open), realBuckets(open),
-                realBuckets(open), realBuckets(open));
+                realBuckets(open), realBuckets(open), realBuckets(open));
     }
 
     private MockHttpServletRequest postRequest(String uri) {

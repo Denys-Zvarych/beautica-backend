@@ -77,7 +77,7 @@ class InviteValidateGetRateLimitTest {
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(), permissive(),
                 permissive(), permissive(), permissive(),
-                tinyInviteValidateCache(), permissive(), permissive());
+                tinyInviteValidateCache(), permissive(), permissive(), permissive());
     }
 
     private static MockHttpServletRequest get(String path, String remoteAddr) {

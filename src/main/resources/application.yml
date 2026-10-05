@@ -415,6 +415,10 @@ app:
     # Sends no email; higher cap tolerates legitimate new-password typo retries
     # against a single emailed token.
     reset-password-capacity: 10
+    # POST /api/v1/auth/invite — 15/min per IP (60 s window). Timing-oracle + invite-email
+    # flood guard (see RateLimitConfig#inviteCapacity). Local seeding raises it via
+    # scripts/start-backend.sh (APP_RATE_LIMIT_INVITE_CAPACITY); prod keeps 15.
+    invite-capacity: 15
   outbox:
     # Base64-encoded 32-byte (AES-256) symmetric key for OutboxPayloadCipher.
     # Generate with: openssl rand -base64 32
