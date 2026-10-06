@@ -53,6 +53,10 @@ regexes = [
   # 32-byte minimum and nothing more.
   '''test-secret-that-is-at-least-32-bytes-long-xx''',
 
+  # CatalogueBrowseBearerDeferralTest: throwaway HMAC key for signing test
+  # JWTs in a unit test (no Spring context). Spelled out in plain English.
+  '''catalogue-browse-deferral-test-secret-0123456789''',
+
   # EmailServiceTest: dummy query value asserting the rendered href is not
   # line-broken by the Thymeleaf template.
   '''tok-EN_unbroken-123''',
